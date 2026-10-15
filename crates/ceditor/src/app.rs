@@ -2308,15 +2308,28 @@ impl Editor {
         let worker_path = requested.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let mut snapshot = RepositoryService::system("git").snapshot(&root, &CancellationToken::default()).map_err(|error| error.to_string())?;
-                let target = worker_path.as_ref().map(|path| cagents::repository::include_revealed_path(&root, &mut snapshot.files, path)).transpose()?.flatten();
+                let mut snapshot = RepositoryService::system("git")
+                    .snapshot(&root, &CancellationToken::default())
+                    .map_err(|error| error.to_string())?;
+                let target = worker_path
+                    .as_ref()
+                    .map(|path| {
+                        cagents::repository::include_revealed_path(&root, &mut snapshot.files, path)
+                    })
+                    .transpose()?
+                    .flatten();
                 Ok((snapshot, target))
             })
             .await
             .map_err(|error| error.to_string())
             .and_then(|result| result);
             match (key, requested) {
-                (Some(key), Some(requested)) => Message::RevealedInFiles { card: id, key, requested, result },
+                (Some(key), Some(requested)) => Message::RevealedInFiles {
+                    card: id,
+                    key,
+                    requested,
+                    result,
+                },
                 _ => Message::Snapshot(id, result.map(|(snapshot, _)| snapshot)),
             }
         })
@@ -3606,32 +3619,52 @@ impl Application for Editor {
                     // Sidebar menus share command identities with the ADE,
                     // while this host owns its file mutations and preferences.
                     let action = match action {
-                        SidebarAction::RunChangeCommand { command, key, row, selection_revision } => {
-                            let target = sidebar::commands::CommandTarget::Changes { key, row, selection_revision };
-                            let resolved = self.current().and_then(|tab| target.resolve_in(&tab.sidebar, &tab.navigation, command));
+                        SidebarAction::RunChangeCommand {
+                            command,
+                            key,
+                            row,
+                            selection_revision,
+                        } => {
+                            let target = sidebar::commands::CommandTarget::Changes {
+                                key,
+                                row,
+                                selection_revision,
+                            };
+                            let resolved = self.current().and_then(|tab| {
+                                target.resolve_in(&tab.sidebar, &tab.navigation, command)
+                            });
                             let Some(action) = resolved else {
-                                self.notice = Some("The original change selection is no longer available.".into());
+                                self.notice = Some(
+                                    "The original change selection is no longer available.".into(),
+                                );
                                 return Task::none();
                             };
                             action
                         }
                         SidebarAction::RunCommand { command, action } => {
-                            let valid = cagents::sidebar::commands::command_id(&action) == Some(command)
+                            let valid = cagents::sidebar::commands::command_id(&action)
+                                == Some(command)
                                 && self.current().is_some_and(|tab| {
-                                    let SidebarAction::FileCommand { key, path, .. } = action.as_ref() else {
+                                    let SidebarAction::FileCommand { key, path, .. } =
+                                        action.as_ref()
+                                    else {
                                         return false;
                                     };
                                     tab.navigation.active_worktree() == Some(key)
-                                        && tab.sidebar.source_control.as_ref().is_some_and(|source| {
-                                            source.key == *key
-                                                && !source.is_reloading()
-                                                && !source.busy()
-                                                && cagents::sidebar::commands::file_rows(source)
-                                                    .any(|row| row.path == *path)
-                                        })
+                                        && tab.sidebar.source_control.as_ref().is_some_and(
+                                            |source| {
+                                                source.key == *key
+                                                    && !source.is_reloading()
+                                                    && !source.busy()
+                                                    && cagents::sidebar::commands::file_rows(source)
+                                                        .any(|row| row.path == *path)
+                                            },
+                                        )
                                 });
                             if !valid {
-                                self.notice = Some("The original file menu target is no longer available.".into());
+                                self.notice = Some(
+                                    "The original file menu target is no longer available.".into(),
+                                );
                                 return Task::none();
                             }
                             *action
@@ -3641,19 +3674,32 @@ impl Application for Editor {
                     // Both the captured menu and inline row controls resolve
                     // selection synchronously, then retain this host's existing
                     // save, mutation and discard-confirmation checks.
-                    let action = if let SidebarAction::InvokeChangeRows { key, row, command } = action {
-                        let resolved = self.current().and_then(|tab| {
-                            (tab.navigation.active_worktree() == Some(&key)).then_some(())?;
-                            let source = tab.sidebar.source_control.as_ref()?;
-                            if source.is_reloading() || source.busy() { return None; }
-                            sidebar::resolve_change_command(source, &tab.navigation, &key, &row, command)
-                        });
-                        let Some(action) = resolved else {
-                            self.notice = Some("The original change selection is no longer available.".into());
-                            return Task::none();
+                    let action =
+                        if let SidebarAction::InvokeChangeRows { key, row, command } = action {
+                            let resolved = self.current().and_then(|tab| {
+                                (tab.navigation.active_worktree() == Some(&key)).then_some(())?;
+                                let source = tab.sidebar.source_control.as_ref()?;
+                                if source.is_reloading() || source.busy() {
+                                    return None;
+                                }
+                                sidebar::resolve_change_command(
+                                    source,
+                                    &tab.navigation,
+                                    &key,
+                                    &row,
+                                    command,
+                                )
+                            });
+                            let Some(action) = resolved else {
+                                self.notice = Some(
+                                    "The original change selection is no longer available.".into(),
+                                );
+                                return Task::none();
+                            };
+                            action
+                        } else {
+                            action
                         };
-                        action
-                    } else { action };
                     if matches!(action, SidebarAction::OpenSettings) {
                         return self.update(Message::Settings);
                     }
@@ -3678,33 +3724,81 @@ impl Application for Editor {
                                 return self.open_working_change(id, path, *area);
                             }
                             SidebarAction::SelectChangeRows { key, row, intent }
-                                if self.tab(id).is_some_and(|tab| tab.navigation.active_worktree() == Some(key)) =>
+                                if self.tab(id).is_some_and(|tab| {
+                                    tab.navigation.active_worktree() == Some(key)
+                                }) =>
                             {
                                 let tab = self.tab_mut(id).unwrap();
-                                let Some(source) = tab.sidebar.source_control.as_ref() else { return Task::none(); };
-                                let order = sidebar::change_selection_order(source, &tab.navigation);
-                                tab.navigation.select_change_rows(row.clone(), *intent, &order);
-                                return iced::widget::operation::focus(sidebar::change_row_focus_id(key, row)).map(cosmic::Action::App);
+                                let Some(source) = tab.sidebar.source_control.as_ref() else {
+                                    return Task::none();
+                                };
+                                let order =
+                                    sidebar::change_selection_order(source, &tab.navigation);
+                                tab.navigation
+                                    .select_change_rows(row.clone(), *intent, &order);
+                                return iced::widget::operation::focus(
+                                    sidebar::change_row_focus_id(key, row),
+                                )
+                                .map(cosmic::Action::App);
                             }
-                            SidebarAction::NavigateChangeRow { key, row, direction, extend }
-                                if self.tab(id).is_some_and(|tab| tab.navigation.active_worktree() == Some(key)) =>
+                            SidebarAction::NavigateChangeRow {
+                                key,
+                                row,
+                                direction,
+                                extend,
+                            } if self.tab(id).is_some_and(|tab| {
+                                tab.navigation.active_worktree() == Some(key)
+                            }) =>
                             {
                                 let tab = self.tab_mut(id).unwrap();
-                                let Some(source) = tab.sidebar.source_control.as_ref() else { return Task::none(); };
-                                let order = sidebar::change_selection_order(source, &tab.navigation);
-                                let Some(position) = order.iter().position(|candidate| candidate == row) else { return Task::none(); };
+                                let Some(source) = tab.sidebar.source_control.as_ref() else {
+                                    return Task::none();
+                                };
+                                let order =
+                                    sidebar::change_selection_order(source, &tab.navigation);
+                                let Some(position) =
+                                    order.iter().position(|candidate| candidate == row)
+                                else {
+                                    return Task::none();
+                                };
                                 use iced::keyboard::key::Named;
                                 let next = match direction {
                                     Named::ArrowUp => position.saturating_sub(1),
-                                    Named::ArrowDown => (position + 1).min(order.len().saturating_sub(1)),
+                                    Named::ArrowDown => {
+                                        (position + 1).min(order.len().saturating_sub(1))
+                                    }
                                     Named::Home => 0,
                                     Named::End => order.len().saturating_sub(1),
                                     _ => return Task::none(),
                                 };
                                 let target = order[next].clone();
-                                tab.navigation.select_change_rows(target.clone(), if *extend { sidebar::SelectionIntent::Range { extend: false } } else { sidebar::SelectionIntent::Navigate }, &order);
-                                let scroll = tab.navigation.reveal_change_row(source, &target).map(|(id, y)| iced::widget::operation::scroll_to(id, iced::widget::operation::AbsoluteOffset { x: 0.0, y }).map(cosmic::Action::App)).unwrap_or_else(Task::none);
-                                return Task::batch([scroll, iced::widget::operation::focus(sidebar::change_row_focus_id(key, &target)).map(cosmic::Action::App)]);
+                                tab.navigation.select_change_rows(
+                                    target.clone(),
+                                    if *extend {
+                                        sidebar::SelectionIntent::Range { extend: false }
+                                    } else {
+                                        sidebar::SelectionIntent::Navigate
+                                    },
+                                    &order,
+                                );
+                                let scroll = tab
+                                    .navigation
+                                    .reveal_change_row(source, &target)
+                                    .map(|(id, y)| {
+                                        iced::widget::operation::scroll_to(
+                                            id,
+                                            iced::widget::operation::AbsoluteOffset { x: 0.0, y },
+                                        )
+                                        .map(cosmic::Action::App)
+                                    })
+                                    .unwrap_or_else(Task::none);
+                                return Task::batch([
+                                    scroll,
+                                    iced::widget::operation::focus(sidebar::change_row_focus_id(
+                                        key, &target,
+                                    ))
+                                    .map(cosmic::Action::App),
+                                ]);
                             }
                             SidebarAction::Stage { key, selection }
                                 if self.tab(id).is_some_and(|tab| {
@@ -3847,26 +3941,56 @@ impl Application for Editor {
                         }
                         SidebarAction::RequestStashDrop { entry, .. } => {
                             if let Some(source) = tab.sidebar.source_control.as_mut() {
-                                if entry.as_ref().is_none_or(|entry| source.stashes.contains(entry)) {
+                                if entry
+                                    .as_ref()
+                                    .is_none_or(|entry| source.stashes.contains(entry))
+                                {
                                     source.pending_stash_drop = entry;
                                 }
                             }
                             Task::none()
                         }
                         SidebarAction::GitOperation { operation, .. } => {
-                            let Some(source) = tab.sidebar.source_control.as_ref() else { return Task::none(); };
-                            if source.is_reloading() || source.busy() { return Task::none(); }
-                            if let cagents::repository::GitOperation::StashDrop { reference, expected_oid } = &operation {
-                                if !source.pending_stash_drop.as_ref().is_some_and(|entry| &entry.reference == reference && &entry.oid == expected_oid) {
-                                    self.notice = Some("Confirm the exact stash before dropping it.".into());
+                            let Some(source) = tab.sidebar.source_control.as_ref() else {
+                                return Task::none();
+                            };
+                            if source.is_reloading() || source.busy() {
+                                return Task::none();
+                            }
+                            if let cagents::repository::GitOperation::StashDrop {
+                                reference,
+                                expected_oid,
+                            } = &operation
+                            {
+                                if !source.pending_stash_drop.as_ref().is_some_and(|entry| {
+                                    &entry.reference == reference && &entry.oid == expected_oid
+                                }) {
+                                    self.notice =
+                                        Some("Confirm the exact stash before dropping it.".into());
                                     return Task::none();
                                 }
                             }
-                            let Some(worktree) = self.begin_mutation(id, MutationKind::Other) else { return Task::none(); };
-                            if let Some(source) = self.tab_mut(id).and_then(|tab| tab.sidebar.source_control.as_mut()) { source.pending_stash_drop = None; }
+                            let Some(worktree) = self.begin_mutation(id, MutationKind::Other)
+                            else {
+                                return Task::none();
+                            };
+                            if let Some(source) = self
+                                .tab_mut(id)
+                                .and_then(|tab| tab.sidebar.source_control.as_mut())
+                            {
+                                source.pending_stash_drop = None;
+                            }
                             cosmic::task::future(async move {
-                                let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").git_operation(&worktree, &operation, &CancellationToken::default()))
-                                    .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
+                                let result = tokio::task::spawn_blocking(move || {
+                                    RepositoryService::system("git").git_operation(
+                                        &worktree,
+                                        &operation,
+                                        &CancellationToken::default(),
+                                    )
+                                })
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result.map_err(|error| error.to_string()));
                                 Message::Mutation(id, result)
                             })
                         }
@@ -3932,11 +4056,31 @@ impl Application for Editor {
                             self.refresh_snapshot(id, true)
                         }
                         SidebarAction::IgnoreChangePath { path, .. } => {
-                            let eligible = tab.sidebar.source_control.as_ref().is_some_and(|source| source.group(cagents::repository::ChangeArea::Untracked).is_some_and(|group| group.rows().iter().any(|row| row.entry.path == path)));
-                            if !eligible { return Task::none(); }
-                            let Some(root) = self.begin_mutation(id, MutationKind::Other) else { return Task::none(); };
+                            let eligible =
+                                tab.sidebar.source_control.as_ref().is_some_and(|source| {
+                                    source
+                                        .group(cagents::repository::ChangeArea::Untracked)
+                                        .is_some_and(|group| {
+                                            group.rows().iter().any(|row| row.entry.path == path)
+                                        })
+                                });
+                            if !eligible {
+                                return Task::none();
+                            }
+                            let Some(root) = self.begin_mutation(id, MutationKind::Other) else {
+                                return Task::none();
+                            };
                             cosmic::task::future(async move {
-                                let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").git_operation(&root, &cagents::repository::GitOperation::IgnorePath { path }, &CancellationToken::default())).await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
+                                let result = tokio::task::spawn_blocking(move || {
+                                    RepositoryService::system("git").git_operation(
+                                        &root,
+                                        &cagents::repository::GitOperation::IgnorePath { path },
+                                        &CancellationToken::default(),
+                                    )
+                                })
+                                .await
+                                .map_err(|error| error.to_string())
+                                .and_then(|result| result.map_err(|error| error.to_string()));
                                 Message::Mutation(id, result)
                             })
                         }
@@ -4040,26 +4184,63 @@ impl Application for Editor {
                     }
                     Task::batch([task, report])
                 }
-                Message::RevealedInFiles { card, key, requested, result } => {
-                    let reveal_visible = self.active == Some(card) && self.sidebar_open && self.sidebar_panel == WorktreePanel::Files && !self.modal_open();
-                    let Some(tab) = self.tab_mut(card) else { return Task::none(); };
-                    if !tab.snapshot_loading { return Task::none(); }
+                Message::RevealedInFiles {
+                    card,
+                    key,
+                    requested,
+                    result,
+                } => {
+                    let reveal_visible = self.active == Some(card)
+                        && self.sidebar_open
+                        && self.sidebar_panel == WorktreePanel::Files
+                        && !self.modal_open();
+                    let Some(tab) = self.tab_mut(card) else {
+                        return Task::none();
+                    };
+                    if !tab.snapshot_loading {
+                        return Task::none();
+                    }
                     tab.snapshot_loading = false;
-                    if std::mem::take(&mut tab.snapshot_refresh_pending) { return self.refresh_snapshot(card, false); }
-                    if tab.navigation.active_worktree() != Some(&key) || tab.navigation.files_reveal_demand() != Some(&requested) { return Task::none(); }
+                    if std::mem::take(&mut tab.snapshot_refresh_pending) {
+                        return self.refresh_snapshot(card, false);
+                    }
+                    if tab.navigation.active_worktree() != Some(&key)
+                        || tab.navigation.files_reveal_demand() != Some(&requested)
+                    {
+                        return Task::none();
+                    }
                     match result {
                         Ok((snapshot, target)) => {
                             let mut source = SourceControlModel::ready(key, &snapshot);
                             source.revealed_path = target;
-                            if let Some(previous) = tab.sidebar.source_control.as_ref() { previous.carry_mutation_into(&mut source); }
+                            if let Some(previous) = tab.sidebar.source_control.as_ref() {
+                                previous.carry_mutation_into(&mut source);
+                            }
                             tab.navigation.reconcile_change_rows(&source);
-                            let focus = tab.navigation.finish_reveal_in_files(&source).filter(|_| reveal_visible);
+                            let focus = tab
+                                .navigation
+                                .finish_reveal_in_files(&source)
+                                .filter(|_| reveal_visible);
                             tab.sidebar.source_control = Some(source);
                             let root = tab.runtime.descriptor.worktree.clone();
-                            let sourced = tab.review.set_source(review_source(&root, Some(&snapshot))).map(move |action| Message::PullRequestReview(card, action)).map(cosmic::Action::App);
-                            Task::batch([sourced, self.apply_review_effects(card), focus.map_or_else(Task::none, |id| iced::widget::operation::focus(id).map(cosmic::Action::App))])
+                            let sourced = tab
+                                .review
+                                .set_source(review_source(&root, Some(&snapshot)))
+                                .map(move |action| Message::PullRequestReview(card, action))
+                                .map(cosmic::Action::App);
+                            Task::batch([
+                                sourced,
+                                self.apply_review_effects(card),
+                                focus.map_or_else(Task::none, |id| {
+                                    iced::widget::operation::focus(id).map(cosmic::Action::App)
+                                }),
+                            ])
                         }
-                        Err(error) => { self.notice = Some(format!("Could not reveal the requested path: {error}")); Task::none() }
+                        Err(error) => {
+                            self.notice =
+                                Some(format!("Could not reveal the requested path: {error}"));
+                            Task::none()
+                        }
                     }
                 }
                 Message::Snapshot(id, result) => {
@@ -4077,7 +4258,9 @@ impl Application for Editor {
                             Ok(snapshot) => {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
                                     let mut source = SourceControlModel::ready(key, &snapshot);
-                                    if let Some(previous) = tab.sidebar.source_control.as_ref() { previous.carry_mutation_into(&mut source); }
+                                    if let Some(previous) = tab.sidebar.source_control.as_ref() {
+                                        previous.carry_mutation_into(&mut source);
+                                    }
                                     source.set_mutation(tab.mutation);
                                     tab.navigation.reconcile_change_rows(&source);
                                     tab.sidebar.source_control = Some(source);
@@ -5789,31 +5972,126 @@ mod tests {
         let original_head = git(root, &["rev-parse", "HEAD"]);
         let mut app = editor();
         let id = open_real_git(&mut app, root, None);
-        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
-        sidebar_action(&mut app, SidebarAction::Commit { key: key.clone(), message: "Amended through shared controls".into(), amend: true });
+        let key = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        sidebar_action(
+            &mut app,
+            SidebarAction::Commit {
+                key: key.clone(),
+                message: "Amended through shared controls".into(),
+                amend: true,
+            },
+        );
         assert!(app.notice.is_none(), "{:?}", app.notice);
-        assert_eq!(git(root, &["log", "-1", "--format=%s"]), "Amended through shared controls");
+        assert_eq!(
+            git(root, &["log", "-1", "--format=%s"]),
+            "Amended through shared controls"
+        );
         assert_ne!(git(root, &["rev-parse", "HEAD"]), original_head);
-        assert_eq!(git(root, &["rev-list", "--count", "HEAD"]), "1", "amend replaces the commit");
+        assert_eq!(
+            git(root, &["rev-list", "--count", "HEAD"]),
+            "1",
+            "amend replaces the commit"
+        );
 
         std::fs::write(root.join("tracked.txt"), "stash me\n").unwrap();
         std::fs::write(root.join("new.txt"), "new file\n").unwrap();
-        sidebar_action(&mut app, SidebarAction::GitOperation { key: key.clone(), operation: GitOperation::StashPush { message: Some("shared control".into()), include_untracked: true } });
+        sidebar_action(
+            &mut app,
+            SidebarAction::GitOperation {
+                key: key.clone(),
+                operation: GitOperation::StashPush {
+                    message: Some("shared control".into()),
+                    include_untracked: true,
+                },
+            },
+        );
         assert!(app.notice.is_none(), "{:?}", app.notice);
         assert!(!root.join("new.txt").exists());
-        let stash = app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().stashes[0].clone();
+        let stash = app
+            .tab(id)
+            .unwrap()
+            .sidebar
+            .source_control
+            .as_ref()
+            .unwrap()
+            .stashes[0]
+            .clone();
         let mut stale = key.clone();
         stale.canonical_path = directory.path().join("replacement");
-        sidebar_action(&mut app, SidebarAction::GitOperation { key: stale, operation: GitOperation::StashApply { reference: stash.reference.clone(), expected_oid: stash.oid.clone(), pop: false } });
-        assert!(!root.join("new.txt").exists(), "stale worktree cannot apply a stash");
-        sidebar_action(&mut app, SidebarAction::GitOperation { key: key.clone(), operation: GitOperation::StashApply { reference: stash.reference.clone(), expected_oid: stash.oid.clone(), pop: false } });
+        sidebar_action(
+            &mut app,
+            SidebarAction::GitOperation {
+                key: stale,
+                operation: GitOperation::StashApply {
+                    reference: stash.reference.clone(),
+                    expected_oid: stash.oid.clone(),
+                    pop: false,
+                },
+            },
+        );
+        assert!(
+            !root.join("new.txt").exists(),
+            "stale worktree cannot apply a stash"
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::GitOperation {
+                key: key.clone(),
+                operation: GitOperation::StashApply {
+                    reference: stash.reference.clone(),
+                    expected_oid: stash.oid.clone(),
+                    pop: false,
+                },
+            },
+        );
         assert!(app.notice.is_none(), "{:?}", app.notice);
-        assert_eq!(std::fs::read_to_string(root.join("new.txt")).unwrap(), "new file\n");
-        sidebar_action(&mut app, SidebarAction::GitOperation { key: key.clone(), operation: GitOperation::StashDrop { reference: stash.reference.clone(), expected_oid: stash.oid.clone() } });
-        assert!(app.notice.as_deref().unwrap().contains("Confirm the exact stash"));
-        assert_eq!(git(root, &["stash", "list", "--format=%H"]), stash.oid.to_string());
-        sidebar_action(&mut app, SidebarAction::RequestStashDrop { key: key.clone(), entry: Some(stash.clone()) });
-        sidebar_action(&mut app, SidebarAction::GitOperation { key, operation: GitOperation::StashDrop { reference: stash.reference, expected_oid: stash.oid } });
+        assert_eq!(
+            std::fs::read_to_string(root.join("new.txt")).unwrap(),
+            "new file\n"
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::GitOperation {
+                key: key.clone(),
+                operation: GitOperation::StashDrop {
+                    reference: stash.reference.clone(),
+                    expected_oid: stash.oid.clone(),
+                },
+            },
+        );
+        assert!(
+            app.notice
+                .as_deref()
+                .unwrap()
+                .contains("Confirm the exact stash")
+        );
+        assert_eq!(
+            git(root, &["stash", "list", "--format=%H"]),
+            stash.oid.to_string()
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::RequestStashDrop {
+                key: key.clone(),
+                entry: Some(stash.clone()),
+            },
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::GitOperation {
+                key,
+                operation: GitOperation::StashDrop {
+                    reference: stash.reference,
+                    expected_oid: stash.oid,
+                },
+            },
+        );
         assert!(app.notice.is_none(), "{:?}", app.notice);
         assert!(git(root, &["stash", "list"]).is_empty());
     }
@@ -7348,62 +7626,157 @@ mod tests {
         std::fs::write(root.join("other.txt"), "second\n").unwrap();
         let mut app = editor();
         let id = open_real_git(&mut app, root, None);
-        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        let key = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
         let path = RepoPath::parse("nested/deep/a.txt").unwrap();
-        let row = sidebar::ChangeSelectionRow { area: cagents::repository::ChangeArea::Untracked, path: path.clone() };
-        let capture = |app: &Editor, command| SidebarAction::RunChangeCommand { command, key: key.clone(), row: row.clone(), selection_revision: app.tab(id).unwrap().navigation.change_selection_revision() };
+        let row = sidebar::ChangeSelectionRow {
+            area: cagents::repository::ChangeArea::Untracked,
+            path: path.clone(),
+        };
+        let capture = |app: &Editor, command| SidebarAction::RunChangeCommand {
+            command,
+            key: key.clone(),
+            row: row.clone(),
+            selection_revision: app.tab(id).unwrap().navigation.change_selection_revision(),
+        };
         let reveal = capture(&app, Command::RevealInFiles);
         sidebar_action(&mut app, reveal);
         assert_eq!(app.sidebar_panel, WorktreePanel::Files);
         assert_eq!(app.tab(id).unwrap().navigation.selected_file(), Some(&path));
-        assert!(app.tab(id).unwrap().navigation.directory_is_expanded(&RepoPath::parse("nested/deep").unwrap()));
+        assert!(
+            app.tab(id)
+                .unwrap()
+                .navigation
+                .directory_is_expanded(&RepoPath::parse("nested/deep").unwrap())
+        );
         let ignore = capture(&app, Command::IgnoreChangePath);
         sidebar_action(&mut app, ignore);
-        assert!(git(root, &["ls-files", "--others", "--exclude-standard", "--", "nested/deep/a.txt"]).is_empty());
-        assert_eq!(std::fs::read_to_string(root.join("other.txt")).unwrap(), "second\n");
-        assert!(std::fs::read_to_string(root.join(".gitignore")).unwrap().contains("a.txt"));
+        assert!(
+            git(
+                root,
+                &[
+                    "ls-files",
+                    "--others",
+                    "--exclude-standard",
+                    "--",
+                    "nested/deep/a.txt"
+                ]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("other.txt")).unwrap(),
+            "second\n"
+        );
+        assert!(
+            std::fs::read_to_string(root.join(".gitignore"))
+                .unwrap()
+                .contains("a.txt")
+        );
     }
 
     #[test]
     fn registered_change_menus_preserve_host_selection_and_discard_confirmation() {
-        use cagents::workspace_widget::GlobalShortcut as Command;
         use cagents::repository::ChangeArea;
+        use cagents::workspace_widget::GlobalShortcut as Command;
         let directory = git_fixture();
         let root = directory.path();
         std::fs::write(root.join("a.txt"), "first\n").unwrap();
         std::fs::write(root.join("b.txt"), "second\n").unwrap();
         let mut app = editor();
         let id = open_real_git(&mut app, root, None);
-        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
-        let row = |area, path| sidebar::ChangeSelectionRow { area, path: RepoPath::parse(path).unwrap() };
+        let key = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        let row = |area, path| sidebar::ChangeSelectionRow {
+            area,
+            path: RepoPath::parse(path).unwrap(),
+        };
         let a = row(ChangeArea::Untracked, "a.txt");
         let b = row(ChangeArea::Untracked, "b.txt");
-        let capture = |app: &Editor, row: sidebar::ChangeSelectionRow, command| SidebarAction::RunChangeCommand {
-            command, key: key.clone(), row,
-            selection_revision: app.tab(id).unwrap().navigation.change_selection_revision(),
+        let capture = |app: &Editor, row: sidebar::ChangeSelectionRow, command| {
+            SidebarAction::RunChangeCommand {
+                command,
+                key: key.clone(),
+                row,
+                selection_revision: app.tab(id).unwrap().navigation.change_selection_revision(),
+            }
         };
-        sidebar_action(&mut app, SidebarAction::SelectChangeRows { key: key.clone(), row: a.clone(), intent: sidebar::SelectionIntent::Toggle });
+        sidebar_action(
+            &mut app,
+            SidebarAction::SelectChangeRows {
+                key: key.clone(),
+                row: a.clone(),
+                intent: sidebar::SelectionIntent::Toggle,
+            },
+        );
         let stale = capture(&app, a.clone(), Command::StageSelectedChanges);
-        sidebar_action(&mut app, SidebarAction::SelectChangeRows { key: key.clone(), row: a.clone(), intent: sidebar::SelectionIntent::Toggle });
-        sidebar_action(&mut app, SidebarAction::SelectChangeRows { key: key.clone(), row: b.clone(), intent: sidebar::SelectionIntent::Toggle });
+        sidebar_action(
+            &mut app,
+            SidebarAction::SelectChangeRows {
+                key: key.clone(),
+                row: a.clone(),
+                intent: sidebar::SelectionIntent::Toggle,
+            },
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::SelectChangeRows {
+                key: key.clone(),
+                row: b.clone(),
+                intent: sidebar::SelectionIntent::Toggle,
+            },
+        );
         sidebar_action(&mut app, stale);
-        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty(), "a replacement selection cannot retarget a captured menu");
-        sidebar_action(&mut app, SidebarAction::ClearChangeSelection { key: key.clone() });
+        assert!(
+            git(root, &["diff", "--cached", "--name-only"]).is_empty(),
+            "a replacement selection cannot retarget a captured menu"
+        );
+        sidebar_action(
+            &mut app,
+            SidebarAction::ClearChangeSelection { key: key.clone() },
+        );
         let stage = capture(&app, a.clone(), Command::StageSelectedChanges);
         sidebar_action(&mut app, stage);
         assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "a.txt");
-        let unstage = capture(&app, row(ChangeArea::Staged, "a.txt"), Command::UnstageSelectedChanges);
+        let unstage = capture(
+            &app,
+            row(ChangeArea::Staged, "a.txt"),
+            Command::UnstageSelectedChanges,
+        );
         sidebar_action(&mut app, unstage);
         assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
         let discard = capture(&app, a, Command::DiscardSelectedChanges);
         sidebar_action(&mut app, discard);
-        assert!(root.join("a.txt").exists(), "opening discard must not mutate disk");
-        let mut request = app.tab(id).unwrap().navigation.pending_discard().expect("existing host confirmation").request.clone();
+        assert!(
+            root.join("a.txt").exists(),
+            "opening discard must not mutate disk"
+        );
+        let mut request = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .pending_discard()
+            .expect("existing host confirmation")
+            .request
+            .clone();
         assert_eq!(request.untracked, [RepoPath::parse("a.txt").unwrap()]);
         request.confirmed = true;
         sidebar_action(&mut app, SidebarAction::ConfirmDiscard { key, request });
         assert!(!root.join("a.txt").exists());
-        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "second\n");
+        assert_eq!(
+            std::fs::read_to_string(root.join("b.txt")).unwrap(),
+            "second\n"
+        );
     }
 
     #[test]
@@ -7413,41 +7786,83 @@ mod tests {
         std::fs::write(root.join("a.txt"), "saved").unwrap();
         let mut app = editor();
         let id = add(&mut app, root.to_str().unwrap(), None);
-        drop(app.update(Message::Repository(RepositoryAction::FilesLoaded {
-            identity: AsyncIdentity {
-                card: id,
-                worktree: root.to_path_buf(),
-                path: ".".into(),
-                generation: 1,
-            },
-            result: repository_widget::load_directory_files(root),
-        })));
-        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        drop(
+            app.update(Message::Repository(RepositoryAction::FilesLoaded {
+                identity: AsyncIdentity {
+                    card: id,
+                    worktree: root.to_path_buf(),
+                    path: ".".into(),
+                    generation: 1,
+                },
+                result: repository_widget::load_directory_files(root),
+            })),
+        );
+        let key = app
+            .tab(id)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
         let path = cagents::repository::RepoPath::parse("a.txt").unwrap();
         for command in [FileCommand::Rename, FileCommand::CopyFile] {
-            let action = SidebarAction::FileCommand { key: key.clone(), path: path.clone(), command };
+            let action = SidebarAction::FileCommand {
+                key: key.clone(),
+                path: path.clone(),
+                command,
+            };
             drop(app.update(Message::Sidebar(sidebar::commands::registered(action))));
-            let dialog = app.file_dialog.as_ref().expect("the host file operation opens");
+            let dialog = app
+                .file_dialog
+                .as_ref()
+                .expect("the host file operation opens");
             assert_eq!(dialog.source, Path::new("a.txt"));
             assert_eq!(dialog.duplicate, command == FileCommand::CopyFile);
             drop(app.update(Message::CancelFileOperation));
         }
-        let action = SidebarAction::FileCommand { key: key.clone(), path: path.clone(), command: FileCommand::Rename };
+        let action = SidebarAction::FileCommand {
+            key: key.clone(),
+            path: path.clone(),
+            command: FileCommand::Rename,
+        };
         drop(app.update(Message::Sidebar(SidebarAction::RunCommand {
             command: workspace_widget::GlobalShortcut::DuplicateFile,
             action: Box::new(action.clone()),
         })));
-        assert!(app.file_dialog.is_none(), "a mismatched identity cannot invoke a mutation");
+        assert!(
+            app.file_dialog.is_none(),
+            "a mismatched identity cannot invoke a mutation"
+        );
         let mut stale_key = key;
         stale_key.canonical_path = root.join("replaced-worktree");
-        drop(app.update(Message::Sidebar(sidebar::commands::registered(SidebarAction::FileCommand {
-            key: stale_key, path, command: FileCommand::Rename,
-        }))));
-        assert!(app.file_dialog.is_none(), "the original worktree binding is required");
-        app.tab_mut(id).unwrap().sidebar.source_control.as_mut().unwrap().files.clear();
+        drop(app.update(Message::Sidebar(sidebar::commands::registered(
+            SidebarAction::FileCommand {
+                key: stale_key,
+                path,
+                command: FileCommand::Rename,
+            },
+        ))));
+        assert!(
+            app.file_dialog.is_none(),
+            "the original worktree binding is required"
+        );
+        app.tab_mut(id)
+            .unwrap()
+            .sidebar
+            .source_control
+            .as_mut()
+            .unwrap()
+            .files
+            .clear();
         drop(app.update(Message::Sidebar(sidebar::commands::registered(action))));
-        assert!(app.file_dialog.is_none(), "a removed row cannot invoke its old menu");
-        assert_eq!(std::fs::read_to_string(root.join("a.txt")).unwrap(), "saved");
+        assert!(
+            app.file_dialog.is_none(),
+            "a removed row cannot invoke its old menu"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "saved"
+        );
     }
 
     #[test]

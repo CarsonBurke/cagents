@@ -6,7 +6,10 @@
 //! therefore empty almost all of the time. Shared context-menu actions and
 //! keyboard deletion target the group only when the user explicitly selects it.
 
-use std::{collections::BTreeSet, sync::{Arc, OnceLock}};
+use std::{
+    collections::BTreeSet,
+    sync::{Arc, OnceLock},
+};
 
 use crate::model::{ChannelId, ProjectId, WorktreeId};
 
@@ -65,7 +68,9 @@ pub(super) struct Selection {
 }
 
 impl PartialEq for Selection {
-    fn eq(&self, other: &Self) -> bool { self.rows == other.rows && self.anchor == other.anchor }
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows && self.anchor == other.anchor
+    }
 }
 impl Eq for Selection {}
 
@@ -85,7 +90,12 @@ impl Selection {
         if !self.contains(row) || self.rows.len() == 1 {
             return Some(Arc::clone(SINGLE.get_or_init(Arc::default)));
         }
-        self.group_size(row).map(|_| Arc::clone(self.context_snapshot.get_or_init(|| self.rows.iter().copied().collect())))
+        self.group_size(row).map(|_| {
+            Arc::clone(
+                self.context_snapshot
+                    .get_or_init(|| self.rows.iter().copied().collect()),
+            )
+        })
     }
 
     pub(super) fn group_size(&self, row: Row) -> Option<usize> {

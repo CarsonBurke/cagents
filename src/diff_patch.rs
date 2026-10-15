@@ -18,7 +18,8 @@ pub fn selected_content(
     selected: Range<usize>,
     undo: bool,
 ) -> Option<String> {
-    if after != model.after.as_ref() || selected.is_empty() || selected.end > model.row_count(mode) {
+    if after != model.after.as_ref() || selected.is_empty() || selected.end > model.row_count(mode)
+    {
         return None;
     }
     let mut deleted = BTreeSet::new();

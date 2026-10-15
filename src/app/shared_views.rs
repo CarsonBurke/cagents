@@ -385,13 +385,33 @@ impl Cagents {
     fn pane_transfer_source(&self, card: CardId) -> Option<(&View, &Path)> {
         if self.focused_repository_is_saving()
             || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
-        { return None; }
-        if !self.card_state(card).is_some_and(|state| state.existence.is_open() && !state.kind.is_utility())
-            || self.shared_views.requested_transfers.values().any(|pending| *pending == card)
-            || self.shared_views.pending.iter().any(|(_, _, change)| matches!(change, Change::Transfer { id, .. } if *id == card))
-        { return None; }
-        let source = self.workspace_model.views.iter().find(|view| view.panes.iter().any(|pane| pane.id == card))?;
-        if self.shared_views.blocked.contains(&source.scope) { return None; }
+        {
+            return None;
+        }
+        if !self
+            .card_state(card)
+            .is_some_and(|state| state.existence.is_open() && !state.kind.is_utility())
+            || self
+                .shared_views
+                .requested_transfers
+                .values()
+                .any(|pending| *pending == card)
+            || self
+                .shared_views
+                .pending
+                .iter()
+                .any(|(_, _, change)| matches!(change, Change::Transfer { id, .. } if *id == card))
+        {
+            return None;
+        }
+        let source = self
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.panes.iter().any(|pane| pane.id == card))?;
+        if self.shared_views.blocked.contains(&source.scope) {
+            return None;
+        }
         let repository = match &source.scope {
             Scope::Channel(id) => &self.workspace_model.channel(*id)?.repository,
             Scope::Worktree { repository, .. } => repository,
@@ -399,14 +419,27 @@ impl Cagents {
         Some((source, repository))
     }
 
-    fn pane_move_destination_allowed(&self, source: &Scope, repository: &Path,
-        destination: &crate::workspace_model::ModelChannel) -> bool {
-        *source != Scope::Channel(destination.id) && repository == destination.repository.as_path()
-            && !self.shared_views.blocked.contains(&Scope::Channel(destination.id))
-            && !self.channel_ui.is_deleting(destination.id) && !self.channel_ui.was_deleted(destination.id)
+    fn pane_move_destination_allowed(
+        &self,
+        source: &Scope,
+        repository: &Path,
+        destination: &crate::workspace_model::ModelChannel,
+    ) -> bool {
+        *source != Scope::Channel(destination.id)
+            && repository == destination.repository.as_path()
+            && !self
+                .shared_views
+                .blocked
+                .contains(&Scope::Channel(destination.id))
+            && !self.channel_ui.is_deleting(destination.id)
+            && !self.channel_ui.was_deleted(destination.id)
     }
 
-    fn pane_channel_transfer(&self, card: CardId, channel: crate::model::ChannelId) -> Option<(Scope, u64)> {
+    fn pane_channel_transfer(
+        &self,
+        card: CardId,
+        channel: crate::model::ChannelId,
+    ) -> Option<(Scope, u64)> {
         let (source, repository) = self.pane_transfer_source(card)?;
         let destination = self.workspace_model.channel(channel)?;
         self.pane_move_destination_allowed(&source.scope, repository, destination)
@@ -414,27 +447,49 @@ impl Cagents {
     }
 
     pub(super) fn pane_has_move_destination(&self, card: CardId) -> bool {
-        self.pane_transfer_source(card).is_some_and(|(source, repository)| {
-            self.workspace_model.channels.iter().any(|channel| self.pane_move_destination_allowed(&source.scope, repository, channel))
-        })
+        self.pane_transfer_source(card)
+            .is_some_and(|(source, repository)| {
+                self.workspace_model.channels.iter().any(|channel| {
+                    self.pane_move_destination_allowed(&source.scope, repository, channel)
+                })
+            })
     }
 
     /// Authoritative channel metadata includes destinations this window has
     /// never opened. The pane can originate in either kind of shared view.
-    pub(super) fn pane_move_destinations(&self, card: CardId) -> Vec<&crate::workspace_model::ModelChannel> {
-        let Some((source, repository)) = self.pane_transfer_source(card) else { return Vec::new(); };
-        let mut channels: Vec<_> = self.workspace_model.channels.iter()
-            .filter(|channel| self.pane_move_destination_allowed(&source.scope, repository, channel))
+    pub(super) fn pane_move_destinations(
+        &self,
+        card: CardId,
+    ) -> Vec<&crate::workspace_model::ModelChannel> {
+        let Some((source, repository)) = self.pane_transfer_source(card) else {
+            return Vec::new();
+        };
+        let mut channels: Vec<_> = self
+            .workspace_model
+            .channels
+            .iter()
+            .filter(|channel| {
+                self.pane_move_destination_allowed(&source.scope, repository, channel)
+            })
             .collect();
         channels.sort_by_key(|channel| (std::cmp::Reverse(channel.ordinal), channel.id));
         channels
     }
 
-    pub(super) fn pane_move_destination_label<'a>(&self, channel: &'a crate::workspace_model::ModelChannel) -> Cow<'a, str> {
-        let title = if channel.title.is_empty() { "New channel" } else { &channel.title };
-        if self.workspace_model.channels.iter().any(|other| other.id != channel.id
-            && other.repository == channel.repository && other.title == channel.title)
-        {
+    pub(super) fn pane_move_destination_label<'a>(
+        &self,
+        channel: &'a crate::workspace_model::ModelChannel,
+    ) -> Cow<'a, str> {
+        let title = if channel.title.is_empty() {
+            "New channel"
+        } else {
+            &channel.title
+        };
+        if self.workspace_model.channels.iter().any(|other| {
+            other.id != channel.id
+                && other.repository == channel.repository
+                && other.title == channel.title
+        }) {
             Cow::Owned(format!("{title} · {}", channel.ordinal))
         } else {
             Cow::Borrowed(title)
@@ -442,24 +497,48 @@ impl Cagents {
     }
 
     pub(super) fn pane_transfer_pending(&self, card: CardId) -> bool {
-        self.shared_views.requested_transfers.values().any(|pending| *pending == card)
+        self.shared_views
+            .requested_transfers
+            .values()
+            .any(|pending| *pending == card)
     }
 
-    pub(super) fn can_move_pane_to_channel(&self, card: CardId, channel: crate::model::ChannelId) -> bool {
+    pub(super) fn can_move_pane_to_channel(
+        &self,
+        card: CardId,
+        channel: crate::model::ChannelId,
+    ) -> bool {
         self.pane_channel_transfer(card, channel).is_some()
     }
 
-    pub(super) fn move_pane_to_channel(&mut self, card: CardId, channel: crate::model::ChannelId) -> Task<Message> {
-        if self.workspace_inputs_blocked() { return Task::none(); }
+    pub(super) fn move_pane_to_channel(
+        &mut self,
+        card: CardId,
+        channel: crate::model::ChannelId,
+    ) -> Task<Message> {
+        if self.workspace_inputs_blocked() {
+            return Task::none();
+        }
         let Some((scope, expected_revision)) = self.pane_channel_transfer(card, channel) else {
-            self.status = Some(TransientNotice::warning("Choose another channel in the pane's project"));
+            self.status = Some(TransientNotice::warning(
+                "Choose another channel in the pane's project",
+            ));
             return Task::none();
         };
         let operation = uuid::Uuid::new_v4();
-        let change = Change::Transfer { id: card, destination: Scope::Channel(channel), before: None };
-        self.shared_views.requested_transfers.insert(operation, card);
+        let change = Change::Transfer {
+            id: card,
+            destination: Scope::Channel(channel),
+            before: None,
+        };
+        self.shared_views
+            .requested_transfers
+            .insert(operation, card);
         if let Err(error) = self.workspace_model_tx.try_send(ModelEdit::ChangeView {
-            scope, expected_revision, operation, change,
+            scope,
+            expected_revision,
+            operation,
+            change,
         }) {
             self.reject_pane_transfer(operation, format!("Could not queue the move: {error}"));
         }
@@ -470,7 +549,9 @@ impl Cagents {
 
     pub(super) fn reject_pane_transfer(&mut self, operation: uuid::Uuid, error: String) {
         self.shared_views.refused(operation);
-        self.status = Some(TransientNotice::warning(format!("Could not move pane: {error}")));
+        self.status = Some(TransientNotice::warning(format!(
+            "Could not move pane: {error}"
+        )));
     }
 
     pub(super) fn publish_view_changes(&mut self) {
@@ -1427,10 +1508,16 @@ mod tests {
 
     fn channel_move_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
         let (mut app, source, destination, pane) = fixture();
-        app.workspace_model.channels = [source, destination].into_iter().map(|id| crate::workspace_model::ModelChannel {
-            id, repository: PathBuf::from("/repo/.git"), title: "Channel".into(),
-            title_source: Default::default(), ordinal: 1,
-        }).collect();
+        app.workspace_model.channels = [source, destination]
+            .into_iter()
+            .map(|id| crate::workspace_model::ModelChannel {
+                id,
+                repository: PathBuf::from("/repo/.git"),
+                title: "Channel".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect();
         let mut source_view = View::empty(source);
         source_view.revision = 17;
         source_view.panes.push(pane.clone());
@@ -1447,20 +1534,36 @@ mod tests {
         app.workspace_model_tx = tx;
         assert!(app.pane_has_move_destination(pane.id));
         let (runtime, _) = RepositoryRuntime::post_persist_failure_fixture(pane.id);
-        app.cards.insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
+        app.cards
+            .insert(pane.id, CardRuntime::Repository(Box::new(runtime)));
         assert!(app.focused_repository_is_saving());
         assert!(!app.pane_has_move_destination(pane.id));
         assert!(app.pane_move_destinations(pane.id).is_empty());
         assert!(!app.command_available(workspace_widget::GlobalShortcut::MovePaneToChannel));
         drop(app.move_pane_to_channel(pane.id, destination));
-        drop(app.update(Message::MovePaneToChannel { card: pane.id, channel: destination }));
-        drop(app.update(Message::PaneDropToChannel { generation: app.workspace_view_generation, card: pane.id, channel: destination }));
+        drop(app.update(Message::MovePaneToChannel {
+            card: pane.id,
+            channel: destination,
+        }));
+        drop(app.update(Message::PaneDropToChannel {
+            generation: app.workspace_view_generation,
+            card: pane.id,
+            channel: destination,
+        }));
         drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
         assert!(!app.palette.is_open());
         assert!(rx.try_recv().is_err());
         assert!(!app.pane_transfer_pending(pane.id));
         assert_eq!(app.durable.active_channel, Some(source));
-        assert!(app.durable.channels.iter().find(|channel| channel.id == source).unwrap().cards.contains(&pane.id));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
     }
 
     #[test]
@@ -1469,17 +1572,40 @@ mod tests {
         let exact = ChannelId::new();
         let prefix = ChannelId::new();
         let repository = PathBuf::from("/repo/.git");
-        app.workspace_model.channels.iter_mut().find(|channel| channel.id == loose).unwrap().title = "r e f a c t o r".into();
+        app.workspace_model
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == loose)
+            .unwrap()
+            .title = "r e f a c t o r".into();
         for (id, title, ordinal) in [(exact, "refactor", 1), (prefix, "refactor ui", 2)] {
-            app.workspace_model.channels.push(crate::workspace_model::ModelChannel { id, repository: repository.clone(), title: title.into(), title_source: Default::default(), ordinal });
+            app.workspace_model
+                .channels
+                .push(crate::workspace_model::ModelChannel {
+                    id,
+                    repository: repository.clone(),
+                    title: title.into(),
+                    title_source: Default::default(),
+                    ordinal,
+                });
         }
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
         drop(app.update_palette(super::super::palette_ui::Action::Query("refactor".into())));
         drop(app.update_palette(super::super::palette_ui::Action::Submit));
-        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView { scope: Scope::Channel(from), change: Change::Transfer { destination: Scope::Channel(to), .. }, .. } if from == source && to == exact));
-        assert!(app.durable.channels.iter().find(|channel| channel.id == source).unwrap().cards.contains(&pane.id));
+        assert!(
+            matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView { scope: Scope::Channel(from), change: Change::Transfer { destination: Scope::Channel(to), .. }, .. } if from == source && to == exact)
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
     }
 
     #[test]
@@ -1490,29 +1616,84 @@ mod tests {
         let kind = app.card_state(pane.id).unwrap().kind.clone();
         let runtime = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
         drop(app.move_pane_to_channel(pane.id, destination));
-        let ModelEdit::ChangeView { scope, expected_revision, operation, change } = rx.try_recv().unwrap() else {
+        let ModelEdit::ChangeView {
+            scope,
+            expected_revision,
+            operation,
+            change,
+        } = rx.try_recv().unwrap()
+        else {
             panic!("a transfer request");
         };
         assert_eq!(scope, Scope::Channel(source));
         assert_eq!(expected_revision, 17);
-        assert!(matches!(change, Change::Transfer { id, destination: Scope::Channel(to), before: None }
-            if id == pane.id && to == destination));
-        assert!(!app.can_move_pane_to_channel(pane.id, destination), "duplicate pending move is disabled");
+        assert!(
+            matches!(change, Change::Transfer { id, destination: Scope::Channel(to), before: None }
+            if id == pane.id && to == destination)
+        );
+        assert!(
+            !app.can_move_pane_to_channel(pane.id, destination),
+            "duplicate pending move is disabled"
+        );
         drop(app.begin_card_close(pane.id));
-        assert!(app.card_state(pane.id).unwrap().existence.is_open(),
-            "closing against the old scope must wait for the transfer acknowledgment");
-        assert!(app.status.as_ref().unwrap().message.contains("moving to a channel"));
-        assert!(rx.try_recv().is_err(), "a pending move must not publish a stale-scope removal");
+        assert!(
+            app.card_state(pane.id).unwrap().existence.is_open(),
+            "closing against the old scope must wait for the transfer acknowledgment"
+        );
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("moving to a channel")
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a pending move must not publish a stale-scope removal"
+        );
         drop(app.reconcile_shared_views());
-        assert!(app.durable.channels.iter().find(|c| c.id == source).unwrap().cards.contains(&pane.id));
-        assert!(app.durable.channels.iter().find(|c| c.id == destination).unwrap().cards.is_empty());
-        views::transfer(&mut app.workspace_model.views, &Scope::Channel(source), pane.id,
-            &Scope::Channel(destination), None).unwrap();
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|c| c.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|c| c.id == destination)
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+        views::transfer(
+            &mut app.workspace_model.views,
+            &Scope::Channel(source),
+            pane.id,
+            &Scope::Channel(destination),
+            None,
+        )
+        .unwrap();
         app.acknowledge_view_edit(scope, Some(operation));
         drop(app.reconcile_shared_views());
         assert_eq!(app.card_state(pane.id).unwrap().kind, kind);
-        assert_eq!(app.cards.get(&pane.id).unwrap() as *const CardRuntime, runtime);
-        assert!(app.durable.channels.iter().find(|c| c.id == destination).unwrap().cards.contains(&pane.id));
+        assert_eq!(
+            app.cards.get(&pane.id).unwrap() as *const CardRuntime,
+            runtime
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|c| c.id == destination)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
     }
 
     #[test]
@@ -1520,20 +1701,49 @@ mod tests {
         let (mut app, source, destination, pane) = channel_move_fixture();
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
-        app.workspace_model.channels.iter_mut().find(|c| c.id == destination).unwrap().repository = PathBuf::from("/other/.git");
+        app.workspace_model
+            .channels
+            .iter_mut()
+            .find(|c| c.id == destination)
+            .unwrap()
+            .repository = PathBuf::from("/other/.git");
         assert!(!app.can_move_pane_to_channel(pane.id, destination));
         drop(app.move_pane_to_channel(pane.id, destination));
         assert!(rx.try_recv().is_err());
         assert!(!app.can_move_pane_to_channel(CardId::new(), destination));
-        app.workspace_model.channels.iter_mut().find(|c| c.id == destination).unwrap().repository = PathBuf::from("/repo/.git");
+        app.workspace_model
+            .channels
+            .iter_mut()
+            .find(|c| c.id == destination)
+            .unwrap()
+            .repository = PathBuf::from("/repo/.git");
         drop(app.move_pane_to_channel(pane.id, destination));
-        let ModelEdit::ChangeView { operation, .. } = rx.try_recv().unwrap() else { panic!("transfer"); };
-        drop(app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::PaneTransferFailed {
-            operation, error: "destination no longer exists".into(),
-        }));
+        let ModelEdit::ChangeView { operation, .. } = rx.try_recv().unwrap() else {
+            panic!("transfer");
+        };
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::PaneTransferFailed {
+                operation,
+                error: "destination no longer exists".into(),
+            },
+        ));
         assert!(app.shared_views.requested_transfers.is_empty());
-        assert!(app.status.as_ref().unwrap().message.contains("destination no longer exists"));
-        assert!(app.durable.channels.iter().find(|c| c.id == source).unwrap().cards.contains(&pane.id));
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .message
+                .contains("destination no longer exists")
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|c| c.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
         assert!(app.can_move_pane_to_channel(pane.id, destination));
     }
 
@@ -1544,22 +1754,64 @@ mod tests {
         let rename = uuid::Uuid::new_v4();
         let mut renamed = pane.clone();
         renamed.title = "Keep my pending rename".into();
-        app.shared_views.pending.push((refused, Scope::Channel(source), Change::Transfer {
-            id: pane.id, destination: Scope::Channel(destination), before: None,
-        }));
-        app.shared_views.pending.push((rename, Scope::Channel(source), Change::Update {
-            before: pane.clone(), pane: renamed,
-        }));
+        app.shared_views.pending.push((
+            refused,
+            Scope::Channel(source),
+            Change::Transfer {
+                id: pane.id,
+                destination: Scope::Channel(destination),
+                before: None,
+            },
+        ));
+        app.shared_views.pending.push((
+            rename,
+            Scope::Channel(source),
+            Change::Update {
+                before: pane.clone(),
+                pane: renamed,
+            },
+        ));
         drop(app.reconcile_shared_views());
-        assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.contains(&pane.id));
-        drop(app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::ViewRefused {
-            scope: Scope::Channel(source), operation: refused, error: "destination was removed".into(),
-        }));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == destination)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::ViewRefused {
+                scope: Scope::Channel(source),
+                operation: refused,
+                error: "destination was removed".into(),
+            },
+        ));
         assert_eq!(app.shared_views.pending.len(), 1);
         assert_eq!(app.shared_views.pending[0].0, rename);
-        assert!(app.durable.channels.iter().find(|channel| channel.id == source).unwrap().cards.contains(&pane.id));
-        assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.is_empty());
-        assert_eq!(app.card_state(pane.id).unwrap().title, "Keep my pending rename");
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id)
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == destination)
+                .unwrap()
+                .cards
+                .is_empty()
+        );
+        assert_eq!(
+            app.card_state(pane.id).unwrap().title,
+            "Keep my pending rename"
+        );
         assert!(app.card_state(pane.id).unwrap().existence.is_open());
     }
 
@@ -1567,16 +1819,26 @@ mod tests {
     fn worktree_panes_can_choose_authoritative_unvisited_channels() {
         let (mut app, source, destination, pane) = channel_move_fixture();
         let worktree = Scope::Worktree {
-            repository: PathBuf::from("/repo/.git"), path: PathBuf::from("/repo/worktree"),
+            repository: PathBuf::from("/repo/.git"),
+            path: PathBuf::from("/repo/worktree"),
         };
-        app.workspace_model.views.iter_mut().find(|view| view.scope == Scope::Channel(source)).unwrap().scope = worktree.clone();
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .scope = worktree.clone();
         let durable = Arc::make_mut(&mut app.durable);
         durable.active_channel = None;
         durable.channels.clear();
-        durable.card_scopes.insert(pane.id, PathBuf::from("/repo/worktree"));
+        durable
+            .card_scopes
+            .insert(pane.id, PathBuf::from("/repo/worktree"));
         let destinations = app.pane_move_destinations(pane.id);
-        assert!(destinations.iter().any(|channel| channel.id == destination),
-            "authoritative channels remain selectable without a local channel descriptor");
+        assert!(
+            destinations.iter().any(|channel| channel.id == destination),
+            "authoritative channels remain selectable without a local channel descriptor"
+        );
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         drop(app.move_pane_to_channel(pane.id, destination));
@@ -1589,20 +1851,40 @@ mod tests {
     #[test]
     fn move_palette_filters_destinations_and_waits_for_host_acceptance() {
         let (mut app, source, destination, pane) = channel_move_fixture();
-        app.workspace_model.channels.iter_mut().find(|channel| channel.id == destination).unwrap().title = "Destination needle".into();
+        app.workspace_model
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == destination)
+            .unwrap()
+            .title = "Destination needle".into();
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
         assert!(app.palette.is_open());
         drop(app.update_palette(super::super::palette_ui::Action::Query("needle".into())));
         drop(app.update_palette(super::super::palette_ui::Action::Submit));
-        assert!(!app.palette.is_open(), "dismiss before dispatch so the move passes the modal guard");
-        assert_eq!(app.settings.palette_recents.first().map(String::as_str), Some("command:move_pane_to_channel"), "parameterized destinations share the reachable command's recent identity");
+        assert!(
+            !app.palette.is_open(),
+            "dismiss before dispatch so the move passes the modal guard"
+        );
+        assert_eq!(
+            app.settings.palette_recents.first().map(String::as_str),
+            Some("command:move_pane_to_channel"),
+            "parameterized destinations share the reachable command's recent identity"
+        );
         assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
             scope: Scope::Channel(from), change: Change::Transfer { id, destination: Scope::Channel(to), .. }, ..
         } if from == source && id == pane.id && to == destination));
-        assert!(app.durable.channels.iter().find(|channel| channel.id == source).unwrap().cards.contains(&pane.id),
-            "choosing a destination must not optimistically detach the live pane");
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap()
+                .cards
+                .contains(&pane.id),
+            "choosing a destination must not optimistically detach the live pane"
+        );
         assert!(app.pane_transfer_pending(pane.id));
     }
 
@@ -1613,19 +1895,39 @@ mod tests {
             let (tx, rx) = async_channel::unbounded();
             app.workspace_model_tx = tx;
             drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
-            let mut replacement = app.workspace_model.channels.iter().find(|channel| channel.id == destination).unwrap().clone();
+            let mut replacement = app
+                .workspace_model
+                .channels
+                .iter()
+                .find(|channel| channel.id == destination)
+                .unwrap()
+                .clone();
             replacement.id = ChannelId::new();
             replacement.ordinal = 99;
-            if remove_original { app.workspace_model.channels.retain(|channel| channel.id != destination); }
+            if remove_original {
+                app.workspace_model
+                    .channels
+                    .retain(|channel| channel.id != destination);
+            }
             app.workspace_model.channels.push(replacement);
             app.workspace_model.sequence += 1;
             drop(app.update_palette(super::super::palette_ui::Action::Submit));
             if remove_original {
-                assert!(rx.try_recv().is_err(), "a vanished target cannot be replaced by the new channel at the same index");
+                assert!(
+                    rx.try_recv().is_err(),
+                    "a vanished target cannot be replaced by the new channel at the same index"
+                );
                 assert!(!app.pane_transfer_pending(pane.id));
-                assert!(app.notices.recent().any(|entry| entry.notice.message.contains("Choose another channel")));
+                assert!(
+                    app.notices
+                        .recent()
+                        .any(|entry| entry.notice.message.contains("Choose another channel"))
+                );
             } else {
-                assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView { scope: Scope::Channel(from), change: Change::Transfer { destination: Scope::Channel(to), .. }, .. } if from == source && to == destination), "Enter retains the originally shown target even when a newer channel sorts first");
+                assert!(
+                    matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView { scope: Scope::Channel(from), change: Change::Transfer { destination: Scope::Channel(to), .. }, .. } if from == source && to == destination),
+                    "Enter retains the originally shown target even when a newer channel sorts first"
+                );
             }
         }
     }
@@ -1636,7 +1938,9 @@ mod tests {
         let (tx, rx) = async_channel::unbounded();
         app.workspace_model_tx = tx;
         drop(app.update(Message::PaneDropToChannel {
-            generation: app.workspace_view_generation.wrapping_add(1), card: pane.id, channel: destination,
+            generation: app.workspace_view_generation.wrapping_add(1),
+            card: pane.id,
+            channel: destination,
         }));
         assert!(rx.try_recv().is_err());
         assert!(!app.pane_transfer_pending(pane.id));

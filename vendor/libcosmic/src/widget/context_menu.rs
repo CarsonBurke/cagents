@@ -26,11 +26,15 @@ pub fn context_menu<'a, Message: 'static + Clone>(
     let mut this = ContextMenu {
         content: content.into(),
         context_menu: context_menu.map(|menus| {
-            let width = menus.iter().map(menu::Tree::preferred_width).max().unwrap_or(240);
-            vec![menu::Tree::with_children(
-                crate::Element::from(crate::widget::Row::new()),
-                menus,
-            ).width(width)]
+            let width = menus
+                .iter()
+                .map(menu::Tree::preferred_width)
+                .max()
+                .unwrap_or(240);
+            vec![
+                menu::Tree::with_children(crate::Element::from(crate::widget::Row::new()), menus)
+                    .width(width),
+            ]
         }),
         close_on_escape: true,
         window_id: window::Id::RESERVED,

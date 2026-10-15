@@ -295,7 +295,9 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             continue;
         };
-        if let Some(found) = recorded_model(&value) { model = Some(found); }
+        if let Some(found) = recorded_model(&value) {
+            model = Some(found);
+        }
         if wants_identity && let Some(declared) = declaration(provider, &value) {
             // The first record to declare a conversation decides what the
             // file holds; a subagent's is not resumed on its own.
@@ -342,7 +344,9 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
     for line in lines.filter(|line| holds_title(line) || line.contains("model")) {
         if let Ok(value) = serde_json::from_str::<Value>(line) {
             titles.note(&value);
-            if let Some(found) = recorded_model(&value) { model = Some(found); }
+            if let Some(found) = recorded_model(&value) {
+                model = Some(found);
+            }
         }
     }
     Some(answer(titles, model))
@@ -350,8 +354,10 @@ fn header(provider: Provider, path: &Path) -> Option<Header> {
 
 fn recorded_model(value: &Value) -> Option<String> {
     ["/message/model", "/payload/model", "/model", "/modelId"]
-        .into_iter().find_map(|path| value.pointer(path).and_then(Value::as_str))
-        .map(str::trim).filter(|model| !model.is_empty() && *model != "<synthetic>")
+        .into_iter()
+        .find_map(|path| value.pointer(path).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|model| !model.is_empty() && *model != "<synthetic>")
         .map(str::to_owned)
 }
 
@@ -516,7 +522,9 @@ pub fn session(seed: &chat::Session, found: &Found) -> Option<chat::Session> {
     session.launch.recipe.working_directory = found.directory.clone();
     session.launch.session_id = Some(found.id.clone());
     super::super::chat_ui::closing::clear_model(&mut session.launch.recipe);
-    if let Some(model) = &found.model { super::super::chat_ui::closing::set_model(&mut session.launch.recipe, model); }
+    if let Some(model) = &found.model {
+        super::super::chat_ui::closing::set_model(&mut session.launch.recipe, model);
+    }
     if provider == Provider::Omp {
         let args = &mut session.launch.recipe.arguments;
         let mut index = 0;
@@ -564,8 +572,13 @@ mod tests {
             serde_json::json!({"type":"assistant","message":{"model":"claude-recorded"}}),
             serde_json::json!({"type":"turn_context","payload":{"model":"codex-recorded"}}),
             serde_json::json!({"type":"model_change","modelId":"omp-recorded"}),
-        ] { assert!(recorded_model(&value).unwrap().ends_with("recorded")); }
-        assert_eq!(recorded_model(&serde_json::json!({"message":{"model":"<synthetic>"}})), None);
+        ] {
+            assert!(recorded_model(&value).unwrap().ends_with("recorded"));
+        }
+        assert_eq!(
+            recorded_model(&serde_json::json!({"message":{"model":"<synthetic>"}})),
+            None
+        );
     }
 
     #[test]

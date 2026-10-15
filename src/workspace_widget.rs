@@ -1,4 +1,11 @@
-use std::{cell::Cell, collections::HashMap, mem, rc::Rc, sync::{Arc, LazyLock}, time::Duration};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    mem,
+    rc::Rc,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
@@ -170,7 +177,6 @@ pub enum GlobalShortcut {
     PdfFit,
     PdfToggleColors,
 
-
     CommandPalette,
     NewThread,
     ChatAccount,
@@ -280,15 +286,35 @@ impl GlobalShortcut {
     /// Native editing and focus-only sidebar actions can continue during saves.
     pub fn blocked_during_save(self) -> bool {
         let id = self.id();
-        (id.starts_with("git_") && !matches!(self, Self::GitStashes | Self::GitOutput | Self::GitRefresh | Self::GitAmend)) || id.starts_with("settings_") || id.starts_with("focus_project_")
+        (id.starts_with("git_")
+            && !matches!(
+                self,
+                Self::GitStashes | Self::GitOutput | Self::GitRefresh | Self::GitAmend
+            ))
+            || id.starts_with("settings_")
+            || id.starts_with("focus_project_")
             || id.starts_with("focus_pane_")
-            || matches!(self, Self::NewTerminal | Self::NewThread | Self::NewBrowser
-                | Self::NewChannel | Self::NewWorktree | Self::ClonePane | Self::ReopenPane
-                | Self::OpenSettings | Self::ToggleInspector | Self::FocusLastPane
-                | Self::FocusAdjacent(_) | Self::CycleWorkspace(_)
-                | Self::NextAttention | Self::PreviousAttention
-                | Self::MovePaneToChannel | Self::DiffOpenInEditor | Self::OpenFile
-                | Self::DeleteChannel)
+            || matches!(
+                self,
+                Self::NewTerminal
+                    | Self::NewThread
+                    | Self::NewBrowser
+                    | Self::NewChannel
+                    | Self::NewWorktree
+                    | Self::ClonePane
+                    | Self::ReopenPane
+                    | Self::OpenSettings
+                    | Self::ToggleInspector
+                    | Self::FocusLastPane
+                    | Self::FocusAdjacent(_)
+                    | Self::CycleWorkspace(_)
+                    | Self::NextAttention
+                    | Self::PreviousAttention
+                    | Self::MovePaneToChannel
+                    | Self::DiffOpenInEditor
+                    | Self::OpenFile
+                    | Self::DeleteChannel
+            )
     }
 
     pub const fn id(self) -> &'static str {
@@ -491,12 +517,15 @@ pub enum ShortcutScope {
 }
 
 impl ShortcutScope {
-    pub fn is_native_editor(self) -> bool { matches!(self, Self::Editor | Self::EditorHistory) }
+    pub fn is_native_editor(self) -> bool {
+        matches!(self, Self::Editor | Self::EditorHistory)
+    }
 
     /// These scopes implement editing vocabulary on the actual content surface.
     fn owns_editing_chord(self, focused: FocusedPane) -> bool {
         (focused == FocusedPane::Editor && self.is_native_editor())
-            || (focused == FocusedPane::WorkingDiff && matches!(self, Self::EditorHistory | Self::Review))
+            || (focused == FocusedPane::WorkingDiff
+                && matches!(self, Self::EditorHistory | Self::Review))
     }
 
     /// Whether an action of this scope acts, and so withholds its chord from
@@ -506,12 +535,23 @@ impl ShortcutScope {
             Self::Workspace => true,
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::OutsideTextInput => !focused.is_text_editing(),
-            Self::Sidebar => matches!(focused, FocusedPane::SidebarRows | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges),
+            Self::Sidebar => matches!(
+                focused,
+                FocusedPane::SidebarRows | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges
+            ),
             Self::Review => matches!(focused, FocusedPane::Review | FocusedPane::WorkingDiff),
             Self::Chat => matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
             Self::Editor => focused == FocusedPane::Editor,
-            Self::EditorHistory => matches!(focused, FocusedPane::Editor | FocusedPane::WorkingDiff),
-            Self::Repository => matches!(focused, FocusedPane::Editor | FocusedPane::Review | FocusedPane::WorkingDiff | FocusedPane::RepositoryPane),
+            Self::EditorHistory => {
+                matches!(focused, FocusedPane::Editor | FocusedPane::WorkingDiff)
+            }
+            Self::Repository => matches!(
+                focused,
+                FocusedPane::Editor
+                    | FocusedPane::Review
+                    | FocusedPane::WorkingDiff
+                    | FocusedPane::RepositoryPane
+            ),
         }
     }
 }
@@ -547,7 +587,10 @@ pub enum FocusedPane {
 
 impl FocusedPane {
     pub fn is_text_editing(self) -> bool {
-        matches!(self, Self::Editor | Self::WorkingDiff | Self::Chat | Self::TextInput)
+        matches!(
+            self,
+            Self::Editor | Self::WorkingDiff | Self::Chat | Self::TextInput
+        )
     }
 }
 
@@ -602,7 +645,8 @@ pub struct CommandContext {
 }
 
 /// Display order shared by the Keyboard table and its registry coverage checks.
-pub const SHORTCUT_CATEGORIES: [&str; 6] = ["Panes", "Navigation", "Chat", "Review", "Editor", "Git"];
+pub const SHORTCUT_CATEGORIES: [&str; 6] =
+    ["Panes", "Navigation", "Chat", "Review", "Editor", "Git"];
 
 impl ShortcutDescriptor {
     pub const fn id(self) -> &'static str {
@@ -610,8 +654,12 @@ impl ShortcutDescriptor {
     }
 
     pub fn category(self) -> &'static str {
-        if self.id().starts_with("git_") { return "Git"; }
-        if self.scope == ShortcutScope::Sidebar { return "Navigation"; }
+        if self.id().starts_with("git_") {
+            return "Git";
+        }
+        if self.scope == ShortcutScope::Sidebar {
+            return "Navigation";
+        }
         let id = self.id();
         if id.starts_with("settings_")
             || matches!(
@@ -641,10 +689,16 @@ impl ShortcutDescriptor {
         {
             "Navigation"
         } else if self.scope == ShortcutScope::Chat
-            || matches!(self.action, GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread)
+            || matches!(
+                self.action,
+                GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread
+            )
         {
             "Chat"
-        } else if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository) {
+        } else if matches!(
+            self.scope,
+            ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository
+        ) {
             "Editor"
         } else if self.scope == ShortcutScope::Review {
             "Review"
@@ -658,38 +712,63 @@ impl ShortcutDescriptor {
     }
 
     pub fn available(self, context: &CommandContext) -> bool {
-        if context.save_in_flight && self.action.blocked_during_save() { return false; }
-        if let Some(bit) = git_command_bit(self.action) { return context.git_commands & bit != 0; }
+        if context.save_in_flight && self.action.blocked_during_save() {
+            return false;
+        }
+        if let Some(bit) = git_command_bit(self.action) {
+            return context.git_commands & bit != 0;
+        }
         if let Some(mask) = context.sidebar_commands
             && let Some(bit) = self.action.sidebar_command_bit()
-        { return mask & bit != 0; }
-        if self.scope == ShortcutScope::Sidebar { return false; }
+        {
+            return mask & bit != 0;
+        }
+        if self.scope == ShortcutScope::Sidebar {
+            return false;
+        }
         // OutsideTerminal controls chord reservation; explicit palette
         // invocation remains available when the terminal has its own finder.
-        if matches!(self.scope, ShortcutScope::Chat | ShortcutScope::Review | ShortcutScope::Editor | ShortcutScope::EditorHistory)
-            && !self.scope.applies_to(context.focused)
+        if matches!(
+            self.scope,
+            ShortcutScope::Chat
+                | ShortcutScope::Review
+                | ShortcutScope::Editor
+                | ShortcutScope::EditorHistory
+        ) && !self.scope.applies_to(context.focused)
         {
             return false;
         }
-        if let Some(bit) = review_command_bit(self.action) { return context.review_commands & bit != 0; }
+        if let Some(bit) = review_command_bit(self.action) {
+            return context.review_commands & bit != 0;
+        }
         if let Some(bit) = diff_command_bit(self.action) {
             return context.diff_commands & bit != 0;
         }
-        if let Some(bit) = editor_language_command_bit(self.action) { return context.editor_language_commands & bit != 0; }
-        if let Some(bit) = pdf_command_bit(self.action) { return context.pdf_commands & bit != 0; }
-        if let Some(bit) = editor_surface_command_bit(self.action) { return context.editor_surface_commands & bit != 0; }
+        if let Some(bit) = editor_language_command_bit(self.action) {
+            return context.editor_language_commands & bit != 0;
+        }
+        if let Some(bit) = pdf_command_bit(self.action) {
+            return context.pdf_commands & bit != 0;
+        }
+        if let Some(bit) = editor_surface_command_bit(self.action) {
+            return context.editor_surface_commands & bit != 0;
+        }
         if let Some(bit) = editor_command_bit(self.action) {
             return context.editor_commands & bit != 0;
         }
         let pane = context.pane_index.is_some();
         match self.action {
-            GlobalShortcut::NextDiagnostic | GlobalShortcut::PreviousDiagnostic => context.can_navigate_diagnostics,
+            GlobalShortcut::NextDiagnostic | GlobalShortcut::PreviousDiagnostic => {
+                context.can_navigate_diagnostics
+            }
             GlobalShortcut::MovePaneToChannel => context.pane_moveable,
             GlobalShortcut::OpenInExternalEditor => context.pane_external_editor,
             GlobalShortcut::NewWorktree => context.active_git_project,
             GlobalShortcut::EndConversation => context.can_end_conversation,
             GlobalShortcut::MarkAllRead => context.has_unread,
-            GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => context.has_attention,
+            GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => {
+                context.has_attention
+            }
             GlobalShortcut::CycleWorkspace(_) => context.can_cycle_workspace,
             GlobalShortcut::SearchInProject => context.can_search_project,
             GlobalShortcut::ChatAccount => context.chat_account,
@@ -1197,7 +1276,6 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
-
     ShortcutDescriptor {
         action: GlobalShortcut::DiffCopy,
         label: "Copy",
@@ -1240,7 +1318,6 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Review,
     },
-
     ShortcutDescriptor {
         action: GlobalShortcut::NextDiagnostic,
         label: "Next diagnostic",
@@ -1253,14 +1330,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: true,
         scope: ShortcutScope::Editor,
     },
-
     ShortcutDescriptor {
         action: GlobalShortcut::EndConversation,
         label: "Close conversation…",
         repeatable: false,
         scope: ShortcutScope::Chat,
     },
-
     ShortcutDescriptor {
         action: GlobalShortcut::EditorUndo,
         label: "Undo",
@@ -1297,7 +1372,6 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Editor,
     },
-
     ShortcutDescriptor {
         action: GlobalShortcut::MarkAllRead,
         label: "Mark all as read",
@@ -1316,73 +1390,382 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
-
-    ShortcutDescriptor { action: GlobalShortcut::CopyBranch, label: "Copy branch", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::OpenOrCreatePullRequest, label: "Open or create pull request…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::NewWorktreeFromBranch, label: "New worktree from this branch…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::MoveProjectUp, label: "Move project up", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::MoveProjectDown, label: "Move project down", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::ResetSidebarOrder, label: "Reset sidebar order", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::RevealInFileManager, label: "Reveal in file manager", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::OpenRepositoryUrl, label: "Open repository on GitHub", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::OpenInExternalEditor, label: "Open in external editor", repeatable: false, scope: ShortcutScope::OutsideTerminal },
-    ShortcutDescriptor { action: GlobalShortcut::DeleteWorktree, label: "Delete worktree…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::RemoveProject, label: "Remove project…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::DeleteSelectedRows, label: "Delete selected sidebar rows…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::RenameChannel, label: "Rename channel…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::MarkChannelRead, label: "Mark channel read", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::DeleteChannel, label: "Delete channel…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::MarkWorktreeRead, label: "Mark worktree read", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::RenameFile, label: "Rename file…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::DuplicateFile, label: "Duplicate file…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::CopyRelativePath, label: "Copy relative path", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::StageSelectedChanges, label: "Stage selected changes", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::UnstageSelectedChanges, label: "Unstage selected changes", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::DiscardSelectedChanges, label: "Discard selected changes…", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::OpenFile, label: "Open file", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::RevealInFiles, label: "Reveal in Files", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::IgnoreChangePath, label: "Add to .gitignore", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::GitFetch, label: "Fetch", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitPush, label: "Push", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitPublish, label: "Publish branch…", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitSync, label: "Sync", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitSyncRebase, label: "Sync with rebase", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitStash, label: "Stash changes", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitStashUntracked, label: "Stash including new files", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitStashes, label: "Show or hide stashes", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitApplyStash, label: "Apply stash…", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitPopStash, label: "Pop stash…", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitDropStash, label: "Drop stash…", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitCommit, label: "Commit changes", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitAmend, label: "Toggle amend commit", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitRefresh, label: "Refresh Git status", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitAbort, label: "Abort Git operation", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitContinue, label: "Continue Git operation", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitOutput, label: "Show or hide Git output", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitAcceptOurs, label: "Accept ours and stage", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::GitAcceptTheirs, label: "Accept theirs and stage", repeatable: false, scope: ShortcutScope::Sidebar },
-    ShortcutDescriptor { action: GlobalShortcut::EditorComplete, label: "Trigger completion", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::GoToDefinition, label: "Go to definition", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::FindReferences, label: "Find references", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::ShowHover, label: "Show hover information", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::ShowDiagnostics, label: "Show diagnostics", repeatable: false, scope: ShortcutScope::Editor },
-    ShortcutDescriptor { action: GlobalShortcut::EditorSave, label: "Save file", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::EditorDiscardEdits, label: "Discard unsaved edits", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::EditorEdit, label: "Edit file", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::EditorPreview, label: "Preview file", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::EditorDiff, label: "View diff", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfFirstPage, label: "First PDF page", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfPreviousPage, label: "Previous PDF page", repeatable: true, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfNextPage, label: "Next PDF page", repeatable: true, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfLastPage, label: "Last PDF page", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfZoomOut, label: "Zoom PDF out", repeatable: true, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfZoomIn, label: "Zoom PDF in", repeatable: true, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfFit, label: "Fit PDF page to pane", repeatable: false, scope: ShortcutScope::Repository },
-    ShortcutDescriptor { action: GlobalShortcut::PdfToggleColors, label: "Toggle PDF adapted colors", repeatable: false, scope: ShortcutScope::Repository },
-
+    ShortcutDescriptor {
+        action: GlobalShortcut::CopyBranch,
+        label: "Copy branch",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenOrCreatePullRequest,
+        label: "Open or create pull request…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NewWorktreeFromBranch,
+        label: "New worktree from this branch…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MoveProjectUp,
+        label: "Move project up",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MoveProjectDown,
+        label: "Move project down",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ResetSidebarOrder,
+        label: "Reset sidebar order",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RevealInFileManager,
+        label: "Reveal in file manager",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenRepositoryUrl,
+        label: "Open repository on GitHub",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenInExternalEditor,
+        label: "Open in external editor",
+        repeatable: false,
+        scope: ShortcutScope::OutsideTerminal,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DeleteWorktree,
+        label: "Delete worktree…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RemoveProject,
+        label: "Remove project…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DeleteSelectedRows,
+        label: "Delete selected sidebar rows…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RenameChannel,
+        label: "Rename channel…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MarkChannelRead,
+        label: "Mark channel read",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DeleteChannel,
+        label: "Delete channel…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MarkWorktreeRead,
+        label: "Mark worktree read",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RenameFile,
+        label: "Rename file…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DuplicateFile,
+        label: "Duplicate file…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CopyRelativePath,
+        label: "Copy relative path",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::StageSelectedChanges,
+        label: "Stage selected changes",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::UnstageSelectedChanges,
+        label: "Unstage selected changes",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiscardSelectedChanges,
+        label: "Discard selected changes…",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenFile,
+        label: "Open file",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RevealInFiles,
+        label: "Reveal in Files",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::IgnoreChangePath,
+        label: "Add to .gitignore",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitFetch,
+        label: "Fetch",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitPush,
+        label: "Push",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitPublish,
+        label: "Publish branch…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitSync,
+        label: "Sync",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitSyncRebase,
+        label: "Sync with rebase",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStash,
+        label: "Stash changes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStashUntracked,
+        label: "Stash including new files",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStashes,
+        label: "Show or hide stashes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitApplyStash,
+        label: "Apply stash…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitPopStash,
+        label: "Pop stash…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitDropStash,
+        label: "Drop stash…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitCommit,
+        label: "Commit changes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitAmend,
+        label: "Toggle amend commit",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitRefresh,
+        label: "Refresh Git status",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitAbort,
+        label: "Abort Git operation",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitContinue,
+        label: "Continue Git operation",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitOutput,
+        label: "Show or hide Git output",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitAcceptOurs,
+        label: "Accept ours and stage",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitAcceptTheirs,
+        label: "Accept theirs and stage",
+        repeatable: false,
+        scope: ShortcutScope::Sidebar,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorComplete,
+        label: "Trigger completion",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GoToDefinition,
+        label: "Go to definition",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FindReferences,
+        label: "Find references",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ShowHover,
+        label: "Show hover information",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ShowDiagnostics,
+        label: "Show diagnostics",
+        repeatable: false,
+        scope: ShortcutScope::Editor,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorSave,
+        label: "Save file",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorDiscardEdits,
+        label: "Discard unsaved edits",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorEdit,
+        label: "Edit file",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorPreview,
+        label: "Preview file",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::EditorDiff,
+        label: "View diff",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfFirstPage,
+        label: "First PDF page",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfPreviousPage,
+        label: "Previous PDF page",
+        repeatable: true,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfNextPage,
+        label: "Next PDF page",
+        repeatable: true,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfLastPage,
+        label: "Last PDF page",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfZoomOut,
+        label: "Zoom PDF out",
+        repeatable: true,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfZoomIn,
+        label: "Zoom PDF in",
+        repeatable: true,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfFit,
+        label: "Fit PDF page to pane",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::PdfToggleColors,
+        label: "Toggle PDF adapted colors",
+        repeatable: false,
+        scope: ShortcutScope::Repository,
+    },
 ];
 
-static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> = LazyLock::new(KeyboardShortcuts::default);
+static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
+    LazyLock::new(KeyboardShortcuts::default);
 
 pub fn default_shortcut_keys(action: GlobalShortcut) -> &'static [String] {
     shortcut_keys(action, &DEFAULT_KEYBOARD_SHORTCUTS)
@@ -1520,7 +1903,6 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::PdfZoomIn => &shortcuts.pdf_zoom_in,
         GlobalShortcut::PdfFit => &shortcuts.pdf_fit,
         GlobalShortcut::PdfToggleColors => &shortcuts.pdf_toggle_colors,
-
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -1868,8 +2250,10 @@ pub fn global_shortcut(
     else {
         return None;
     };
-    let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts, focused)?;
-    if focused.is_text_editing() && !descriptor.scope.owns_editing_chord(focused)
+    let descriptor =
+        global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts, focused)?;
+    if focused.is_text_editing()
+        && !descriptor.scope.owns_editing_chord(focused)
         && text_editing_conflict(descriptor.action, key, *physical_key, *modifiers)
     {
         return None;
@@ -1900,8 +2284,10 @@ pub(crate) fn is_global_shortcut_chord(
     crate::tab_history::is_chord(key, modifiers)
         || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts, focused).is_some_and(
             |descriptor| {
-                !(focused == FocusedPane::Editor && descriptor.scope.is_native_editor()) && !(focused.is_text_editing() && !descriptor.scope.owns_editing_chord(focused)
-                    && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
+                !(focused == FocusedPane::Editor && descriptor.scope.is_native_editor())
+                    && !(focused.is_text_editing()
+                        && !descriptor.scope.owns_editing_chord(focused)
+                        && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
                     && shortcut_applies(descriptor, focused, shortcuts)
             },
         )
@@ -1983,21 +2369,27 @@ fn shortcut_applies(
     // Sidebar rows may reuse NewThread for their captured worktree. Other
     // pane commands must not act on the background selected card. The app's
     // current row capability mask rejects project/channel/stale NewThread.
-    let outside_pane = matches!(focused,
-        FocusedPane::TextInput | FocusedPane::OutsideWorkspace
-            | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges)
-        || (focused == FocusedPane::SidebarRows && descriptor.action != GlobalShortcut::NewThread);
-    if outside_pane && matches!(
-        descriptor.action,
-        GlobalShortcut::FindInPane
-            | GlobalShortcut::NewThread
-            | GlobalShortcut::RenamePane
-            | GlobalShortcut::CloseFocusedCard
-            | GlobalShortcut::ClonePane
-            | GlobalShortcut::ChatAccount
-            | GlobalShortcut::ChatModel
-            | GlobalShortcut::ChatPermissions
-    ) {
+    let outside_pane = matches!(
+        focused,
+        FocusedPane::TextInput
+            | FocusedPane::OutsideWorkspace
+            | FocusedPane::SidebarFiles
+            | FocusedPane::SidebarChanges
+    ) || (focused == FocusedPane::SidebarRows
+        && descriptor.action != GlobalShortcut::NewThread);
+    if outside_pane
+        && matches!(
+            descriptor.action,
+            GlobalShortcut::FindInPane
+                | GlobalShortcut::NewThread
+                | GlobalShortcut::RenamePane
+                | GlobalShortcut::CloseFocusedCard
+                | GlobalShortcut::ClonePane
+                | GlobalShortcut::ChatAccount
+                | GlobalShortcut::ChatModel
+                | GlobalShortcut::ChatPermissions
+        )
+    {
         return false;
     }
     // The saved list is the explicit per-action terminal policy. Removing a
@@ -2017,10 +2409,16 @@ fn global_shortcut_descriptor(
 ) -> Option<&'static ShortcutDescriptor> {
     GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| {
         shortcut_applies(descriptor, focused, shortcuts)
-            && !(focused.is_text_editing() && !descriptor.scope.owns_editing_chord(focused) && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
-            && shortcut_keys(descriptor.action, shortcuts).iter().any(|chord| {
-                parse_shortcut(chord).is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
-            })
+            && !(focused.is_text_editing()
+                && !descriptor.scope.owns_editing_chord(focused)
+                && text_editing_conflict(descriptor.action, key, physical_key, modifiers))
+            && shortcut_keys(descriptor.action, shortcuts)
+                .iter()
+                .any(|chord| {
+                    parse_shortcut(chord).is_ok_and(|binding| {
+                        shortcut_matches(binding, key, physical_key, modifiers)
+                    })
+                })
     })
 }
 
@@ -2050,7 +2448,9 @@ pub const fn diff_command_bit(command: GlobalShortcut) -> Option<u8> {
 }
 
 pub fn shortcut_descriptor_by_id(id: &str) -> Option<&'static ShortcutDescriptor> {
-    GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| descriptor.id() == id)
+    GLOBAL_SHORTCUT_DESCRIPTORS
+        .iter()
+        .find(|descriptor| descriptor.id() == id)
 }
 
 pub const fn editor_language_command_bit(command: GlobalShortcut) -> Option<u8> {
@@ -2064,7 +2464,16 @@ pub const fn editor_language_command_bit(command: GlobalShortcut) -> Option<u8> 
     }
 }
 
-pub const PDF_COMMANDS: [GlobalShortcut; 8] = [GlobalShortcut::PdfFirstPage, GlobalShortcut::PdfPreviousPage, GlobalShortcut::PdfNextPage, GlobalShortcut::PdfLastPage, GlobalShortcut::PdfZoomOut, GlobalShortcut::PdfZoomIn, GlobalShortcut::PdfFit, GlobalShortcut::PdfToggleColors];
+pub const PDF_COMMANDS: [GlobalShortcut; 8] = [
+    GlobalShortcut::PdfFirstPage,
+    GlobalShortcut::PdfPreviousPage,
+    GlobalShortcut::PdfNextPage,
+    GlobalShortcut::PdfLastPage,
+    GlobalShortcut::PdfZoomOut,
+    GlobalShortcut::PdfZoomIn,
+    GlobalShortcut::PdfFit,
+    GlobalShortcut::PdfToggleColors,
+];
 
 pub const fn pdf_command_bit(command: GlobalShortcut) -> Option<u8> {
     match command {
@@ -2105,9 +2514,15 @@ pub const fn editor_command_bit(command: GlobalShortcut) -> Option<u8> {
 
 /// Native code-buffer widgets dispatch registered editing actions once, before
 /// the application sees the same captured event.
-pub fn editor_shortcut(key: &keyboard::Key, physical: keyboard::key::Physical, modifiers: keyboard::Modifiers, shortcuts: &KeyboardShortcuts) -> Option<GlobalShortcut> {
+pub fn editor_shortcut(
+    key: &keyboard::Key,
+    physical: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+    shortcuts: &KeyboardShortcuts,
+) -> Option<GlobalShortcut> {
     global_shortcut_descriptor(key, physical, modifiers, shortcuts, FocusedPane::Editor)
-        .filter(|descriptor| descriptor.scope.is_native_editor()).map(|descriptor| descriptor.action)
+        .filter(|descriptor| descriptor.scope.is_native_editor())
+        .map(|descriptor| descriptor.action)
 }
 
 fn shortcut_matches(
@@ -2147,7 +2562,12 @@ fn shortcut_matches(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::Tab)
             ),
-            ShortcutKey::Space => matches!(key.as_ref(), keyboard::Key::Named(keyboard::key::Named::Space)) || matches!(key.as_ref(), keyboard::Key::Character(value) if value == " "),
+            ShortcutKey::Space => {
+                matches!(
+                    key.as_ref(),
+                    keyboard::Key::Named(keyboard::key::Named::Space)
+                ) || matches!(key.as_ref(), keyboard::Key::Character(value) if value == " ")
+            }
             ShortcutKey::PageUp => matches!(
                 key.as_ref(),
                 keyboard::Key::Named(keyboard::key::Named::PageUp)
@@ -3342,7 +3762,13 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
             Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::InputMethod(_)
         ) && matches!(
             self.input.keyboard_focus(),
-            Some(FocusedPane::TextInput | FocusedPane::OutsideWorkspace | FocusedPane::SidebarRows | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges)
+            Some(
+                FocusedPane::TextInput
+                    | FocusedPane::OutsideWorkspace
+                    | FocusedPane::SidebarRows
+                    | FocusedPane::SidebarFiles
+                    | FocusedPane::SidebarChanges
+            )
         ) && self.input.keyboard_card().is_none()
         {
             return;
@@ -4534,7 +4960,10 @@ mod tests {
             FocusedPane::Chat,
             FocusedPane::TextInput,
         ] {
-            assert_eq!(global_shortcut(&redo, &shortcuts, focused), (focused == FocusedPane::Editor).then_some(GlobalShortcut::EditorRedo));
+            assert_eq!(
+                global_shortcut(&redo, &shortcuts, focused),
+                (focused == FocusedPane::Editor).then_some(GlobalShortcut::EditorRedo)
+            );
             assert!(!is_global_shortcut_chord(
                 &keyboard::Key::Character("z".into()),
                 keyboard::key::Physical::Code(Code::KeyZ),
@@ -5204,12 +5633,38 @@ mod tests {
     #[test]
     fn sidebar_regions_resolve_row_commands_without_background_pane_actions() {
         let shortcuts = KeyboardShortcuts::default();
-        for focused in [FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges] {
-            for action in [GlobalShortcut::RenamePane, GlobalShortcut::CloseFocusedCard, GlobalShortcut::ClonePane, GlobalShortcut::ChatAccount, GlobalShortcut::ChatModel, GlobalShortcut::ChatPermissions, GlobalShortcut::FindInPane] {
-                assert!(!shortcut_applies(shortcut_descriptor(action), focused, &shortcuts), "{action:?} must not target a background pane from {focused:?}");
+        for focused in [
+            FocusedPane::SidebarRows,
+            FocusedPane::SidebarFiles,
+            FocusedPane::SidebarChanges,
+        ] {
+            for action in [
+                GlobalShortcut::RenamePane,
+                GlobalShortcut::CloseFocusedCard,
+                GlobalShortcut::ClonePane,
+                GlobalShortcut::ChatAccount,
+                GlobalShortcut::ChatModel,
+                GlobalShortcut::ChatPermissions,
+                GlobalShortcut::FindInPane,
+            ] {
+                assert!(
+                    !shortcut_applies(shortcut_descriptor(action), focused, &shortcuts),
+                    "{action:?} must not target a background pane from {focused:?}"
+                );
             }
-            assert!(shortcut_applies(shortcut_descriptor(GlobalShortcut::NewTerminal), focused, &shortcuts));
-            assert_eq!(shortcut_applies(shortcut_descriptor(GlobalShortcut::NewThread), focused, &shortcuts), focused == FocusedPane::SidebarRows);
+            assert!(shortcut_applies(
+                shortcut_descriptor(GlobalShortcut::NewTerminal),
+                focused,
+                &shortcuts
+            ));
+            assert_eq!(
+                shortcut_applies(
+                    shortcut_descriptor(GlobalShortcut::NewThread),
+                    focused,
+                    &shortcuts
+                ),
+                focused == FocusedPane::SidebarRows
+            );
         }
     }
 
@@ -5351,7 +5806,9 @@ mod tests {
             );
             for event in [
                 Event::Keyboard(key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false)),
-                Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit("input".into())),
+                Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit(
+                    "input".into(),
+                )),
             ] {
                 let mut messages = Vec::new();
                 let mut shell = Shell::new(&mut messages);
@@ -6277,21 +6734,61 @@ mod tests {
     fn diff_clipboard_bindings_remap_and_respect_text_input_focus() {
         use keyboard::key::Code;
         let mut shortcuts = KeyboardShortcuts::default();
-        for (key, code, action) in [("c", Code::KeyC, GlobalShortcut::DiffCopy), ("a", Code::KeyA, GlobalShortcut::DiffSelectAll)] {
+        for (key, code, action) in [
+            ("c", Code::KeyC, GlobalShortcut::DiffCopy),
+            ("a", Code::KeyA, GlobalShortcut::DiffSelectAll),
+        ] {
             let event = key_press(key, code, keyboard::Modifiers::CTRL, false);
-            assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Review), Some(action));
-            for focused in [FocusedPane::TextInput, FocusedPane::Chat, FocusedPane::Terminal, FocusedPane::Other] {
+            assert_eq!(
+                global_shortcut(&event, &shortcuts, FocusedPane::Review),
+                Some(action)
+            );
+            for focused in [
+                FocusedPane::TextInput,
+                FocusedPane::Chat,
+                FocusedPane::Terminal,
+                FocusedPane::Other,
+            ] {
                 assert_eq!(global_shortcut(&event, &shortcuts, focused), None);
             }
         }
         shortcuts.diff_copy = vec!["Ctrl+Alt+C".into()];
         shortcuts.diff_select_all.clear();
         assert!(shortcuts.fault().is_none());
-        assert_eq!(global_shortcut(&key_press("c", Code::KeyC, keyboard::Modifiers::CTRL, false), &shortcuts, FocusedPane::Review), None);
-        assert_eq!(global_shortcut(&key_press("a", Code::KeyA, keyboard::Modifiers::CTRL, false), &shortcuts, FocusedPane::Review), None);
-        assert_eq!(global_shortcut(&key_press("c", Code::KeyC, keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT, false), &shortcuts, FocusedPane::Review), Some(GlobalShortcut::DiffCopy));
+        assert_eq!(
+            global_shortcut(
+                &key_press("c", Code::KeyC, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+                FocusedPane::Review
+            ),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press("a", Code::KeyA, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+                FocusedPane::Review
+            ),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press(
+                    "c",
+                    Code::KeyC,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT,
+                    false
+                ),
+                &shortcuts,
+                FocusedPane::Review
+            ),
+            Some(GlobalShortcut::DiffCopy)
+        );
         let descriptor = shortcut_descriptor(GlobalShortcut::DiffCopy);
-        let mut context = CommandContext { focused: FocusedPane::Review, ..Default::default() };
+        let mut context = CommandContext {
+            focused: FocusedPane::Review,
+            ..Default::default()
+        };
         assert!(!descriptor.available(&context));
         context.diff_commands = diff_command_bit(GlobalShortcut::DiffCopy).unwrap();
         assert!(descriptor.available(&context));
@@ -6304,19 +6801,66 @@ mod tests {
         use keyboard::key::Code;
         let mut shortcuts = KeyboardShortcuts::default();
         let undo = key_press("z", Code::KeyZ, keyboard::Modifiers::CTRL, false);
-        let redo = key_press("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, false);
-        assert_eq!(global_shortcut(&undo, &shortcuts, FocusedPane::WorkingDiff), Some(GlobalShortcut::EditorUndo));
-        assert_eq!(global_shortcut(&redo, &shortcuts, FocusedPane::WorkingDiff), Some(GlobalShortcut::EditorRedo));
-        assert_eq!(global_shortcut(&redo, &shortcuts, FocusedPane::Review), Some(GlobalShortcut::ReopenPane));
-        assert!(is_global_shortcut_chord(&keyboard::Key::Character("z".into()), keyboard::key::Physical::Code(Code::KeyZ), keyboard::Modifiers::CTRL, &shortcuts, FocusedPane::WorkingDiff));
-        assert!(!is_global_shortcut_chord(&keyboard::Key::Character("z".into()), keyboard::key::Physical::Code(Code::KeyZ), keyboard::Modifiers::CTRL, &shortcuts, FocusedPane::Editor));
-        assert_eq!(global_shortcut(&key_press("c", Code::KeyC, keyboard::Modifiers::CTRL, false), &shortcuts, FocusedPane::WorkingDiff), Some(GlobalShortcut::DiffCopy));
-        for focused in [FocusedPane::TextInput, FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges, FocusedPane::Chat, FocusedPane::Terminal] {
-            assert_ne!(global_shortcut(&undo, &shortcuts, focused), Some(GlobalShortcut::EditorUndo));
+        let redo = key_press(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        assert_eq!(
+            global_shortcut(&undo, &shortcuts, FocusedPane::WorkingDiff),
+            Some(GlobalShortcut::EditorUndo)
+        );
+        assert_eq!(
+            global_shortcut(&redo, &shortcuts, FocusedPane::WorkingDiff),
+            Some(GlobalShortcut::EditorRedo)
+        );
+        assert_eq!(
+            global_shortcut(&redo, &shortcuts, FocusedPane::Review),
+            Some(GlobalShortcut::ReopenPane)
+        );
+        assert!(is_global_shortcut_chord(
+            &keyboard::Key::Character("z".into()),
+            keyboard::key::Physical::Code(Code::KeyZ),
+            keyboard::Modifiers::CTRL,
+            &shortcuts,
+            FocusedPane::WorkingDiff
+        ));
+        assert!(!is_global_shortcut_chord(
+            &keyboard::Key::Character("z".into()),
+            keyboard::key::Physical::Code(Code::KeyZ),
+            keyboard::Modifiers::CTRL,
+            &shortcuts,
+            FocusedPane::Editor
+        ));
+        assert_eq!(
+            global_shortcut(
+                &key_press("c", Code::KeyC, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+                FocusedPane::WorkingDiff
+            ),
+            Some(GlobalShortcut::DiffCopy)
+        );
+        for focused in [
+            FocusedPane::TextInput,
+            FocusedPane::SidebarRows,
+            FocusedPane::SidebarFiles,
+            FocusedPane::SidebarChanges,
+            FocusedPane::Chat,
+            FocusedPane::Terminal,
+        ] {
+            assert_ne!(
+                global_shortcut(&undo, &shortcuts, focused),
+                Some(GlobalShortcut::EditorUndo)
+            );
         }
         shortcuts.editor_undo = vec!["Alt+F9".into()];
         assert!(global_shortcut(&undo, &shortcuts, FocusedPane::WorkingDiff).is_none());
-        let mut context = CommandContext { focused: FocusedPane::WorkingDiff, editor_commands: 1, ..Default::default() };
+        let mut context = CommandContext {
+            focused: FocusedPane::WorkingDiff,
+            editor_commands: 1,
+            ..Default::default()
+        };
         assert!(shortcut_descriptor(GlobalShortcut::EditorUndo).available(&context));
         context.editor_commands = 0;
         assert!(!shortcut_descriptor(GlobalShortcut::EditorUndo).available(&context));
@@ -6328,13 +6872,34 @@ mod tests {
         let mut shortcuts = KeyboardShortcuts::default();
         shortcuts.pdf_next_page = vec!["Alt+F9".into()];
         assert!(shortcuts.fault().is_none());
-        let event = keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::F9), modified_key: keyboard::Key::Named(keyboard::key::Named::F9), physical_key: keyboard::key::Physical::Code(Code::F9), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false };
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane), Some(GlobalShortcut::PdfNextPage));
-        for focused in [FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::TextInput, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges, FocusedPane::OutsideWorkspace] {
+        let event = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::F9),
+            modified_key: keyboard::Key::Named(keyboard::key::Named::F9),
+            physical_key: keyboard::key::Physical::Code(Code::F9),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::ALT,
+            text: None,
+            repeat: false,
+        };
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane),
+            Some(GlobalShortcut::PdfNextPage)
+        );
+        for focused in [
+            FocusedPane::Terminal,
+            FocusedPane::Chat,
+            FocusedPane::TextInput,
+            FocusedPane::SidebarFiles,
+            FocusedPane::SidebarChanges,
+            FocusedPane::OutsideWorkspace,
+        ] {
             assert_eq!(global_shortcut(&event, &shortcuts, focused), None);
         }
         shortcuts.pdf_next_page.clear();
-        assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane), None);
+        assert_eq!(
+            global_shortcut(&event, &shortcuts, FocusedPane::RepositoryPane),
+            None
+        );
         for command in PDF_COMMANDS {
             assert!(shortcut_keys(command, &KeyboardShortcuts::default()).is_empty());
             assert!(pdf_command_bit(command).is_some());
@@ -6344,18 +6909,40 @@ mod tests {
     #[test]
     fn every_shortcut_descriptor_has_a_unique_configurable_binding() {
         let shortcuts = KeyboardShortcuts::default();
-        assert!(shortcuts.fault().is_none(), "defaults obey binding scope and reservation policy");
+        assert!(
+            shortcuts.fault().is_none(),
+            "defaults obey binding scope and reservation policy"
+        );
         let mut identities = HashSet::new();
         for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
             assert!(!descriptor.label.is_empty());
-            assert!(identities.insert(descriptor.id()), "registered IDs are unique");
-            assert_eq!(descriptor.scope.is_native_editor(), crate::settings::is_editor_command(descriptor.id()), "native keyboard routing and configuration share the editor scope for {}", descriptor.id());
-            assert_eq!(descriptor.scope == ShortcutScope::Review, crate::settings::is_review_command(descriptor.id()), "shared review overlap classification for {}", descriptor.id());
-            let index = KeyboardShortcuts::action_names().iter().position(|id| *id == descriptor.id()).expect("every descriptor is configurable");
+            assert!(
+                identities.insert(descriptor.id()),
+                "registered IDs are unique"
+            );
+            assert_eq!(
+                descriptor.scope.is_native_editor(),
+                crate::settings::is_editor_command(descriptor.id()),
+                "native keyboard routing and configuration share the editor scope for {}",
+                descriptor.id()
+            );
+            assert_eq!(
+                descriptor.scope == ShortcutScope::Review,
+                crate::settings::is_review_command(descriptor.id()),
+                "shared review overlap classification for {}",
+                descriptor.id()
+            );
+            let index = KeyboardShortcuts::action_names()
+                .iter()
+                .position(|id| *id == descriptor.id())
+                .expect("every descriptor is configurable");
             let keys = shortcut_keys(descriptor.action, &shortcuts);
             assert_eq!(keys, shortcuts.actions()[index]);
             if keys.is_empty() {
-                assert!(!crate::settings::shortcut_required(index), "only optional actions may start unbound");
+                assert!(
+                    !crate::settings::shortcut_required(index),
+                    "only optional actions may start unbound"
+                );
             }
             for chord in keys {
                 assert!(parse_shortcut(chord).is_ok());

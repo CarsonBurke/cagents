@@ -404,7 +404,6 @@ pub struct KeyboardShortcuts {
     pub pdf_fit: Vec<String>,
     pub pdf_toggle_colors: Vec<String>,
 
-
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
 }
@@ -502,7 +501,7 @@ impl Default for KeyboardShortcuts {
             end_conversation: vec![],
 
             editor_undo: vec!["Ctrl+Z".into()],
-            editor_redo: vec!["Ctrl+Shift+Z".into(),"Ctrl+Y".into()],
+            editor_redo: vec!["Ctrl+Shift+Z".into(), "Ctrl+Y".into()],
             editor_cut: vec!["Ctrl+X".into()],
             editor_copy: vec!["Ctrl+C".into()],
             editor_paste: vec!["Ctrl+V".into()],
@@ -573,7 +572,6 @@ impl Default for KeyboardShortcuts {
             pdf_zoom_in: Vec::new(),
             pdf_fit: Vec::new(),
             pdf_toggle_colors: Vec::new(),
-
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -683,7 +681,6 @@ impl KeyboardShortcuts {
             &self.settings_notifications,
             &self.settings_about,
             &self.move_pane_to_channel,
-
             &self.diff_copy,
             &self.diff_copy_old,
             &self.diff_copy_new,
@@ -691,19 +688,15 @@ impl KeyboardShortcuts {
             &self.diff_copy_line_reference,
             &self.diff_open_in_editor,
             &self.diff_select_all,
-
             &self.next_diagnostic,
             &self.previous_diagnostic,
-
             &self.end_conversation,
-
             &self.editor_undo,
             &self.editor_redo,
             &self.editor_cut,
             &self.editor_copy,
             &self.editor_paste,
             &self.editor_select_all,
-
             &self.mark_all_read,
             &self.search_in_project,
             &self.clone_repository,
@@ -769,8 +762,6 @@ impl KeyboardShortcuts {
             &self.pdf_zoom_in,
             &self.pdf_fit,
             &self.pdf_toggle_colors,
-
-
         ]
     }
 
@@ -934,12 +925,15 @@ impl KeyboardShortcuts {
             &mut self.pdf_zoom_in,
             &mut self.pdf_fit,
             &mut self.pdf_toggle_colors,
-
         ]
     }
 
     pub fn set_action(&mut self, index: usize, chords: Vec<String>) {
-        *self.actions_mut().into_iter().nth(index).expect("known shortcut action") = chords;
+        *self
+            .actions_mut()
+            .into_iter()
+            .nth(index)
+            .expect("known shortcut action") = chords;
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
@@ -970,10 +964,18 @@ impl KeyboardShortcuts {
                     Ok(binding) => binding,
                     Err(error) => return fault(error, None),
                 };
-                if let Some(message) = shortcut_chord_refusal_for(SHORTCUT_ACTIONS[index], binding) {
+                if let Some(message) = shortcut_chord_refusal_for(SHORTCUT_ACTIONS[index], binding)
+                {
                     return fault(message, None);
                 }
-                if let Some(&(_, owner)) = parsed.iter().find(|(other, owner)| *other == binding && shortcut_binding_conflicts(SHORTCUT_ACTIONS[index], SHORTCUT_ACTIONS[*owner], binding)) {
+                if let Some(&(_, owner)) = parsed.iter().find(|(other, owner)| {
+                    *other == binding
+                        && shortcut_binding_conflicts(
+                            SHORTCUT_ACTIONS[index],
+                            SHORTCUT_ACTIONS[*owner],
+                            binding,
+                        )
+                }) {
                     return fault("keyboard shortcuts must not conflict", Some(owner));
                 }
                 parsed.push((binding, index));
@@ -1060,7 +1062,6 @@ const SHORTCUT_ACTIONS: [&str; 156] = [
     "settings_notifications",
     "settings_about",
     "move_pane_to_channel",
-
     "diff_copy",
     "diff_copy_old",
     "diff_copy_new",
@@ -1068,19 +1069,15 @@ const SHORTCUT_ACTIONS: [&str; 156] = [
     "diff_copy_line_reference",
     "diff_open_in_editor",
     "diff_select_all",
-
     "next_diagnostic",
     "previous_diagnostic",
-
     "end_conversation",
-
     "editor_undo",
     "editor_redo",
     "editor_cut",
     "editor_copy",
     "editor_paste",
     "editor_select_all",
-
     "mark_all_read",
     "search_in_project",
     "clone_repository",
@@ -1146,8 +1143,6 @@ const SHORTCUT_ACTIONS: [&str; 156] = [
     "pdf_zoom_in",
     "pdf_fit",
     "pdf_toggle_colors",
-
-
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1282,40 +1277,92 @@ pub fn text_editing_shortcut_conflict(binding: ShortcutBinding) -> Option<&'stat
 /// Native code-buffer actions have a narrower scope than workspace actions.
 /// Ordinary text controls and shells keep their own editing commands.
 pub fn is_editor_command(action: &str) -> bool {
-    matches!(action, "editor_undo" | "editor_redo" | "editor_cut" | "editor_copy" | "editor_paste" | "editor_select_all" | "next_diagnostic" | "previous_diagnostic" | "editor_complete" | "go_to_definition" | "find_references" | "show_hover" | "show_diagnostics")
+    matches!(
+        action,
+        "editor_undo"
+            | "editor_redo"
+            | "editor_cut"
+            | "editor_copy"
+            | "editor_paste"
+            | "editor_select_all"
+            | "next_diagnostic"
+            | "previous_diagnostic"
+            | "editor_complete"
+            | "go_to_definition"
+            | "find_references"
+            | "show_hover"
+            | "show_diagnostics"
+    )
 }
 
-pub fn text_editing_shortcut_conflict_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
+pub fn text_editing_shortcut_conflict_for(
+    action: &str,
+    binding: ShortcutBinding,
+) -> Option<&'static str> {
     if is_editor_command(action)
         || (action == "find_in_pane" && parse_shortcut("Ctrl+F").ok() == Some(binding))
-    { None } else { text_editing_shortcut_conflict(binding) }
+    {
+        None
+    } else {
+        text_editing_shortcut_conflict(binding)
+    }
 }
 
 /// Review vocabulary also owns editing chords on a live working comparison.
 /// History bindings must therefore collide with it even though ordinary native
 /// editor commands are disjoint from immutable review surfaces.
 pub fn is_review_command(action: &str) -> bool {
-    matches!(action, "review_toggle_viewed" | "review_next_file" | "review_previous_file" | "review_next_unviewed" | "review_next_change" | "review_previous_change" | "diff_copy" | "diff_copy_old" | "diff_copy_new" | "diff_copy_patch" | "diff_copy_line_reference" | "diff_open_in_editor" | "diff_select_all")
+    matches!(
+        action,
+        "review_toggle_viewed"
+            | "review_next_file"
+            | "review_previous_file"
+            | "review_next_unviewed"
+            | "review_next_change"
+            | "review_previous_change"
+            | "diff_copy"
+            | "diff_copy_old"
+            | "diff_copy_new"
+            | "diff_copy_patch"
+            | "diff_copy_line_reference"
+            | "diff_open_in_editor"
+            | "diff_select_all"
+    )
 }
 
 pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBinding) -> bool {
     if (matches!(left, "editor_undo" | "editor_redo") && is_review_command(right))
         || (matches!(right, "editor_undo" | "editor_redo") && is_review_command(left))
-    { return true; }
+    {
+        return true;
+    }
 
     // Native editing chords already suppress ordinary workspace bindings in
     // an editable buffer; Reopen pane and Redo can therefore share CtrlShiftZ.
     let editor_left = is_editor_command(left);
     let editor_right = is_editor_command(right);
     let outside = if editor_left { right } else { left };
-    !(editor_left != editor_right && SHORTCUT_ACTIONS.contains(&outside)
+    !(editor_left != editor_right
+        && SHORTCUT_ACTIONS.contains(&outside)
         && text_editing_shortcut_conflict_for(outside, binding).is_some())
 }
 
 pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
     // Registered editor/repository commands never capture a terminal's flow
     // control. Ctrl+S is an ordinary configurable chord in those scopes.
-    if (is_editor_command(action) || matches!(action, "editor_save" | "editor_discard_edits" | "editor_edit" | "editor_preview" | "editor_diff")) && parse_shortcut("Ctrl+S").ok() == Some(binding) { return None; }
+    if (is_editor_command(action)
+        || matches!(
+            action,
+            "editor_save"
+                | "editor_discard_edits"
+                | "editor_edit"
+                | "editor_preview"
+                | "editor_diff"
+        ))
+        && parse_shortcut("Ctrl+S").ok() == Some(binding)
+    {
+        return None;
+    }
     if (is_editor_command(action) && text_editing_shortcut_conflict(binding).is_some())
         || (action == "diff_copy" && parse_shortcut("Ctrl+C").ok() == Some(binding))
         || (action == "diff_select_all" && parse_shortcut("Ctrl+A").ok() == Some(binding))
@@ -1594,7 +1641,9 @@ const fn default_show_status_bar() -> bool {
     true
 }
 
-const fn default_git_status_limit() -> usize { 10_000 }
+const fn default_git_status_limit() -> usize {
+    10_000
+}
 
 const fn default_show_worktree_changes_icons() -> bool {
     true
@@ -2329,11 +2378,23 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
         return;
     }
     let defaults = default_chords(action);
-    let free: Vec<_> = defaults.iter().filter(|chord| {
-        parse_shortcut(chord).is_ok_and(|binding| !shortcuts.iter().any(|(other, chords)| {
-            shortcut_binding_conflicts(action, other, binding) && chords.as_array().is_some_and(|chords| chords.iter().filter_map(toml::Value::as_str).any(|chord| parse_shortcut(chord).ok() == Some(binding)))
-        }))
-    }).cloned().collect();
+    let free: Vec<_> = defaults
+        .iter()
+        .filter(|chord| {
+            parse_shortcut(chord).is_ok_and(|binding| {
+                !shortcuts.iter().any(|(other, chords)| {
+                    shortcut_binding_conflicts(action, other, binding)
+                        && chords.as_array().is_some_and(|chords| {
+                            chords
+                                .iter()
+                                .filter_map(toml::Value::as_str)
+                                .any(|chord| parse_shortcut(chord).ok() == Some(binding))
+                        })
+                })
+            })
+        })
+        .cloned()
+        .collect();
     if free != defaults {
         shortcuts.insert(action.into(), free.into());
     }
@@ -2412,7 +2473,6 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 151] = [
     "settings_notifications",
     "settings_about",
     "move_pane_to_channel",
-
     "diff_copy",
     "diff_copy_old",
     "diff_copy_new",
@@ -2420,19 +2480,15 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 151] = [
     "diff_copy_line_reference",
     "diff_open_in_editor",
     "diff_select_all",
-
     "next_diagnostic",
     "previous_diagnostic",
-
     "end_conversation",
-
     "editor_undo",
     "editor_redo",
     "editor_cut",
     "editor_copy",
     "editor_paste",
     "editor_select_all",
-
     "mark_all_read",
     "search_in_project",
     "clone_repository",
@@ -2498,8 +2554,6 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 151] = [
     "pdf_zoom_in",
     "pdf_fit",
     "pdf_toggle_colors",
-
-
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -3929,11 +3983,25 @@ mod tests {
         let shortcuts = KeyboardShortcuts::default();
         assert!(shortcuts.fault().is_none());
         let binding = parse_shortcut("Ctrl+Shift+Z").unwrap();
-        assert!(!shortcut_binding_conflicts("editor_redo", "reopen_pane", binding));
-        assert!(shortcut_binding_conflicts("editor_redo", "editor_undo", binding));
-        assert!(shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+C").unwrap()).is_none());
-        assert!(shortcut_chord_refusal_for("rename_pane", parse_shortcut("Ctrl+C").unwrap()).is_some());
-        assert!(shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_none());
+        assert!(!shortcut_binding_conflicts(
+            "editor_redo",
+            "reopen_pane",
+            binding
+        ));
+        assert!(shortcut_binding_conflicts(
+            "editor_redo",
+            "editor_undo",
+            binding
+        ));
+        assert!(
+            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+C").unwrap()).is_none()
+        );
+        assert!(
+            shortcut_chord_refusal_for("rename_pane", parse_shortcut("Ctrl+C").unwrap()).is_some()
+        );
+        assert!(
+            shortcut_chord_refusal_for("editor_copy", parse_shortcut("Ctrl+S").unwrap()).is_none()
+        );
         let mut sparse = toml::Table::new();
         sparse.insert("reopen_pane".into(), vec!["Ctrl+Shift+Z"].into());
         preserve_introduced_shortcuts(&mut sparse);
@@ -3946,36 +4014,77 @@ mod tests {
     #[test]
     fn editor_chords_conflict_with_find_when_find_owns_the_editor_binding() {
         let binding = parse_shortcut("Ctrl+F").unwrap();
-        assert!(shortcut_binding_conflicts("editor_redo", "find_in_pane", binding));
-        assert!(shortcut_binding_conflicts("find_in_pane", "editor_redo", binding));
+        assert!(shortcut_binding_conflicts(
+            "editor_redo",
+            "find_in_pane",
+            binding
+        ));
+        assert!(shortcut_binding_conflicts(
+            "find_in_pane",
+            "editor_redo",
+            binding
+        ));
         assert!(text_editing_shortcut_conflict_for("find_in_pane", binding).is_none());
         let mut shortcuts = KeyboardShortcuts::default();
         shortcuts.editor_redo = vec!["Ctrl+F".into()];
-        assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()));
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some())
+        );
         shortcuts.find_in_pane = vec!["Ctrl+Alt+G".into()];
         assert!(shortcuts.fault().is_none());
         shortcuts.next_diagnostic = vec!["Ctrl+Z".into()];
-        assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()), "two native editor commands cannot share Undo");
-        assert!(shortcut_binding_conflicts("editor_undo", "future_editor_action", parse_shortcut("Ctrl+Z").unwrap()), "an unknown future scope is preserved conservatively");
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some()),
+            "two native editor commands cannot share Undo"
+        );
+        assert!(
+            shortcut_binding_conflicts(
+                "editor_undo",
+                "future_editor_action",
+                parse_shortcut("Ctrl+Z").unwrap()
+            ),
+            "an unknown future scope is preserved conservatively"
+        );
     }
 
     #[test]
     fn working_diff_history_conflicts_with_review_vocabulary_but_not_reopen() {
         for history in ["editor_undo", "editor_redo"] {
-            for review in SHORTCUT_ACTIONS.into_iter().filter(|action| is_review_command(action)) {
+            for review in SHORTCUT_ACTIONS
+                .into_iter()
+                .filter(|action| is_review_command(action))
+            {
                 for chord in ["Ctrl+C", "Ctrl+Z", "Ctrl+Shift+Z", "Alt+F9"] {
                     let binding = parse_shortcut(chord).unwrap();
-                    assert!(shortcut_binding_conflicts(history, review, binding), "{history}/{review}/{chord}");
-                    assert!(shortcut_binding_conflicts(review, history, binding), "{review}/{history}/{chord}");
+                    assert!(
+                        shortcut_binding_conflicts(history, review, binding),
+                        "{history}/{review}/{chord}"
+                    );
+                    assert!(
+                        shortcut_binding_conflicts(review, history, binding),
+                        "{review}/{history}/{chord}"
+                    );
                 }
             }
         }
         let mut shortcuts = KeyboardShortcuts::default();
         shortcuts.editor_undo = vec!["Ctrl+C".into()];
-        assert!(shortcuts.fault().is_some_and(|fault| fault.conflicts_with.is_some()));
+        assert!(
+            shortcuts
+                .fault()
+                .is_some_and(|fault| fault.conflicts_with.is_some())
+        );
         shortcuts.diff_copy.clear();
         assert!(shortcuts.fault().is_none());
-        assert!(!shortcut_binding_conflicts("editor_redo", "reopen_pane", parse_shortcut("Ctrl+Shift+Z").unwrap()));
+        assert!(!shortcut_binding_conflicts(
+            "editor_redo",
+            "reopen_pane",
+            parse_shortcut("Ctrl+Shift+Z").unwrap()
+        ));
     }
 
     #[test]
@@ -3985,7 +4094,10 @@ mod tests {
             let chords = vec!["Ctrl+Alt+Shift+K".to_owned()];
             shortcuts.set_action(index, chords.clone());
             let serialized = toml::Value::try_from(&shortcuts).unwrap();
-            assert_eq!(serialized.get(*name).unwrap().as_array().unwrap(), &[toml::Value::String(chords[0].clone())]);
+            assert_eq!(
+                serialized.get(*name).unwrap().as_array().unwrap(),
+                &[toml::Value::String(chords[0].clone())]
+            );
             assert_eq!(shortcuts.actions()[index], &chords);
         }
     }
@@ -6016,14 +6128,22 @@ new_thread = "Alt+Shift+G"
             .unwrap()
             .iter()
             .filter(|(name, _)| name.as_str() != "terminal_passthrough_actions")
-            .flat_map(|(name, chords)| chords.as_array().unwrap().iter().map(move |chord| {
-                (name.as_str(), parse_shortcut(chord.as_str().unwrap()).unwrap())
-            }))
+            .flat_map(|(name, chords)| {
+                chords.as_array().unwrap().iter().map(move |chord| {
+                    (
+                        name.as_str(),
+                        parse_shortcut(chord.as_str().unwrap()).unwrap(),
+                    )
+                })
+            })
             .collect();
         for (index, (action, binding)) in bindings.iter().enumerate() {
-            assert!(!bindings[..index].iter().any(|(previous, other)| {
-                other == binding && shortcut_binding_conflicts(action, previous, *binding)
-            }), "{file:#?}");
+            assert!(
+                !bindings[..index].iter().any(|(previous, other)| {
+                    other == binding && shortcut_binding_conflicts(action, previous, *binding)
+                }),
+                "{file:#?}"
+            );
         }
         assert_eq!(load(&path).unwrap(), desired);
     }

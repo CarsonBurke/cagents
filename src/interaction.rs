@@ -17,15 +17,23 @@ use serde::Deserialize;
 
 mod context_menu;
 mod list_navigation;
-pub use list_navigation::{reveal_list_selection, reveal_list_region};
+pub use list_navigation::{reveal_list_region, reveal_list_selection};
 
 use crate::design::space;
 
 /// Native menu hints come from the same grammar as shortcut dispatch.
-pub(crate) fn menu_shortcuts<'a, A: Clone + 'a>(bindings: impl IntoIterator<Item = (&'a [String], A)>) -> std::collections::HashMap<widget::menu::KeyBind, A> {
-    bindings.into_iter().filter_map(|(chords, action)| {
-        chords.iter().find_map(|chord| crate::workspace_widget::menu_keybind(chord)).map(|key| (key, action))
-    }).collect()
+pub(crate) fn menu_shortcuts<'a, A: Clone + 'a>(
+    bindings: impl IntoIterator<Item = (&'a [String], A)>,
+) -> std::collections::HashMap<widget::menu::KeyBind, A> {
+    bindings
+        .into_iter()
+        .filter_map(|(chords, action)| {
+            chords
+                .iter()
+                .find_map(|chord| crate::workspace_widget::menu_keybind(chord))
+                .map(|key| (key, action))
+        })
+        .collect()
 }
 
 /// How far a tooltip sits from the control it names, and how wide it may
@@ -443,7 +451,8 @@ pub fn context_menu_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + 'stati
         kind: Kind::ContextMenu,
         tip: None,
         on_escape: None,
-    }.into()
+    }
+    .into()
 }
 
 /// Lazy menu construction with the same target lifetime as [`context_menu_keyed`].
@@ -453,11 +462,15 @@ pub fn context_menu_lazy_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + '
     builder: impl Fn() -> Vec<widget::menu::Tree<Message>> + 'a,
 ) -> Element<'a, Message> {
     Effect {
-        content: layer(content.into(), context_menu::lazy_surface_keyed(key, builder)),
+        content: layer(
+            content.into(),
+            context_menu::lazy_surface_keyed(key, builder),
+        ),
         kind: Kind::ContextMenu,
         tip: None,
         on_escape: None,
-    }.into()
+    }
+    .into()
 }
 
 /// Keeps every key from the layers beneath a transient surface that the
@@ -1585,8 +1598,13 @@ impl<'a, Message: 'a> Widget<Message, Theme, Renderer> for Effect<'a, Message> {
             state.inspect_control = false;
         }
         inside &= !state.disabled;
-        if matches!(self.kind, Kind::Tooltip) && inside
-            && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)) | Event::Touch(cosmic::iced::touch::Event::FingerPressed { .. }))
+        if matches!(self.kind, Kind::Tooltip)
+            && inside
+            && matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonPressed(_))
+                    | Event::Touch(cosmic::iced::touch::Event::FingerPressed { .. })
+            )
         {
             state.tip_suppressed = true;
             state.entered = None;
@@ -1843,18 +1861,37 @@ mod tests {
         assert_eq!(bindings.len(), 1);
         let (key, action) = bindings.iter().next().unwrap();
         assert_eq!(*action, 7);
-        assert!(key.matches(Modifiers::CTRL | Modifiers::ALT, &Key::Named(cosmic::iced::keyboard::key::Named::F5), None));
+        assert!(key.matches(
+            Modifiers::CTRL | Modifiers::ALT,
+            &Key::Named(cosmic::iced::keyboard::key::Named::F5),
+            None
+        ));
         assert!(!key.to_string().is_empty());
     }
 
     #[test]
     fn pressed_tooltip_stays_hidden_until_pointer_leaves() {
         use cosmic::iced::advanced::{clipboard, renderer::Headless};
-        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            .block_on(Renderer::new(cosmic::iced::Font::default(), cosmic::iced::Pixels(14.0), Some("tiny-skia"))).unwrap();
-        let mut element = tooltip(cosmic::widget::button::text("Settings").on_press(1u8), "Open settings");
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
+        let mut element = tooltip(
+            cosmic::widget::button::text("Settings").on_press(1u8),
+            "Open settings",
+        );
         let mut tree = Tree::new(&element);
-        let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+        );
         let bounds = Rectangle::with_size(Size::new(300.0, 100.0));
         let pointer = mouse::Cursor::Available(node.bounds().center());
         let state = tree.state.downcast_mut::<State>();
@@ -1862,17 +1899,59 @@ mod tests {
         state.tooltip = Animation::new(true).duration(HOVER_DURATION);
         state.entered = Some(Instant::now() - TOOLTIP_DELAY);
         let mut messages = Vec::new();
-        for event in [Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Event::Window(window::Event::RedrawRequested(Instant::now() + TOOLTIP_DELAY))] {
-            element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), pointer, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        for event in [
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + TOOLTIP_DELAY,
+            )),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                pointer,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
             assert!(!tree.state.downcast_ref::<State>().tip_open);
             assert!(tree.state.downcast_ref::<State>().tip_suppressed);
         }
-        element.as_widget_mut().update(&mut tree, &Event::Mouse(mouse::Event::CursorLeft), Layout::new(&node), mouse::Cursor::Unavailable, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::CursorLeft),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
         assert!(!tree.state.downcast_ref::<State>().tip_suppressed);
-        for event in [Event::Mouse(mouse::Event::CursorMoved { position: node.bounds().center() }), Event::Window(window::Event::RedrawRequested(Instant::now() + TOOLTIP_DELAY + Duration::from_millis(1)))] {
-            element.as_widget_mut().update(&mut tree, &event, Layout::new(&node), pointer, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        for event in [
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: node.bounds().center(),
+            }),
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + TOOLTIP_DELAY + Duration::from_millis(1),
+            )),
+        ] {
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                pointer,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &bounds,
+            );
         }
-        assert!(tree.state.downcast_ref::<State>().tip_open, "a fresh hover can show the tooltip again");
+        assert!(
+            tree.state.downcast_ref::<State>().tip_open,
+            "a fresh hover can show the tooltip again"
+        );
     }
 
     use super::*;

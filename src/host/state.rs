@@ -634,7 +634,11 @@ impl HostState {
             if let ModelEdit::ChangeView { scope, change, .. } = &edit {
                 match registry.view_change_refusal(scope, change) {
                     Ok(Some(reason)) => {
-                        return ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false);
+                        return ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            reason,
+                            false,
+                        );
                     }
                     Err(storage) => return model_unavailable(storage),
                     Ok(None) => {}

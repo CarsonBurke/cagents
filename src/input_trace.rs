@@ -236,7 +236,11 @@ struct KeyboardFocus {
 }
 impl Operation for KeyboardFocus {
     fn container(&mut self, id: Option<&cosmic::iced::widget::Id>, _bounds: Rectangle) {
-        self.pending_region = Some(id.and_then(|id| self.known_regions.get(id)).copied().or(self.current_region));
+        self.pending_region = Some(
+            id.and_then(|id| self.known_regions.get(id))
+                .copied()
+                .or(self.current_region),
+        );
     }
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
         let previous = self.current_region;
@@ -301,7 +305,11 @@ impl KeyboardFocus {
                 (region.card.is_none()
                     && matches!(
                         region.pane,
-                        FocusedPane::TextInput | FocusedPane::OutsideWorkspace | FocusedPane::SidebarRows | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges
+                        FocusedPane::TextInput
+                            | FocusedPane::OutsideWorkspace
+                            | FocusedPane::SidebarRows
+                            | FocusedPane::SidebarFiles
+                            | FocusedPane::SidebarChanges
                     ))
                 .then_some((candidate, region))
             })
@@ -338,11 +346,18 @@ impl KeyboardFocus {
     ) -> KeyboardRegion {
         let direct = if self.known_regions.is_empty() {
             // Direct operation fixtures may supply regions after traversal.
-            regions.iter().find(|(candidate, _)| Some(candidate) == id.as_ref()).map(|(_, region)| *region)
+            regions
+                .iter()
+                .find(|(candidate, _)| Some(candidate) == id.as_ref())
+                .map(|(_, region)| *region)
         } else {
-            id.as_ref().and_then(|id| self.known_regions.get(id)).copied()
+            id.as_ref()
+                .and_then(|id| self.known_regions.get(id))
+                .copied()
         };
-        if let Some(region) = direct { return region; }
+        if let Some(region) = direct {
+            return region;
+        }
         let container = inherited.unwrap_or_else(|| FocusedPane::OutsideWorkspace.into());
         if self
             .inputs
@@ -460,7 +475,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
         if let Event::Keyboard(event) = event
             && let Some(callback) = &self.keyboard_callback
         {
-            shell.publish(callback(event.clone(), shell.is_event_captured(), region, widget));
+            shell.publish(callback(
+                event.clone(),
+                shell.is_event_captured(),
+                region,
+                widget,
+            ));
         }
     }
 
@@ -741,13 +761,30 @@ mod tests {
         assert_eq!(reversed.region(&regions), FocusedPane::TextInput.into());
         assert_eq!(reversed.widget_id(&regions), Some(sidebar));
 
-        for pane in [FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges] {
+        for pane in [
+            FocusedPane::SidebarRows,
+            FocusedPane::SidebarFiles,
+            FocusedPane::SidebarChanges,
+        ] {
             let row = cosmic::iced::widget::Id::unique();
             let region = KeyboardRegion::from(pane);
-            let regions = [(editor.clone(), KeyboardRegion { pane: FocusedPane::Editor, card: Some(CardId::new()) }), (row.clone(), region)];
+            let regions = [
+                (
+                    editor.clone(),
+                    KeyboardRegion {
+                        pane: FocusedPane::Editor,
+                        card: Some(CardId::new()),
+                    },
+                ),
+                (row.clone(), region),
+            ];
             for external_first in [true, false] {
                 let mut query = KeyboardFocus::default();
-                for id in if external_first { [&row, &editor] } else { [&editor, &row] } {
+                for id in if external_first {
+                    [&row, &editor]
+                } else {
+                    [&editor, &row]
+                } {
                     query.focusable(Some(id), bounds, &mut Focus(true));
                 }
                 assert_eq!(query.region(&regions), region);

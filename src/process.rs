@@ -1232,11 +1232,16 @@ sys.exit(7)
         let directory = tempfile::tempdir().unwrap();
         let marker = directory.path().join("listing-finished");
         let command = CommandSpec::new("/bin/sh")
-            .args(["-c", "head -c 20971520 /dev/zero; printf finished > \"$MARKER\""])
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf finished > \"$MARKER\"",
+            ])
             .env("MARKER", marker.as_os_str())
             .stdout_record_limit(10_000)
             .timeout(Duration::from_secs(10));
-        let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
         assert!(output.success);
         assert!(output.stdout_truncated);
         assert_eq!(output.stdout, vec![0; 10_000]);
@@ -1253,24 +1258,36 @@ sys.exit(7)
         let observed = marker.clone();
         let canceller = std::thread::spawn(move || {
             for _ in 0..300 {
-                if observed.exists() { cancel.cancel(); return; }
+                if observed.exists() {
+                    cancel.cancel();
+                    return;
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             panic!("listing did not finish draining before cancellation");
         });
         let command = CommandSpec::new("/bin/sh")
-            .args(["-c", "head -c 20971520 /dev/zero; printf ready > \"$MARKER\"; sleep 10"])
-            .env("MARKER", marker.as_os_str()).stdout_record_limit(100)
+            .args([
+                "-c",
+                "head -c 20971520 /dev/zero; printf ready > \"$MARKER\"; sleep 10",
+            ])
+            .env("MARKER", marker.as_os_str())
+            .stdout_record_limit(100)
             .timeout(Duration::from_secs(5));
-        let failure = SystemProcessExecutor.execute(&command, &cancellation).unwrap_err();
+        let failure = SystemProcessExecutor
+            .execute(&command, &cancellation)
+            .unwrap_err();
         canceller.join().unwrap();
         assert_eq!(failure.kind, ProcessFailureKind::Cancelled);
         assert_eq!(failure.stdout.len(), 100);
 
         let command = CommandSpec::new("/bin/sh")
             .args(["-c", "head -c 4096 /dev/zero; head -c 4096 /dev/zero >&2"])
-            .stdout_record_limit(100).output_limits(1024, 32);
-        let failure = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap_err();
+            .stdout_record_limit(100)
+            .output_limits(1024, 32);
+        let failure = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap_err();
         assert_eq!(failure.kind, ProcessFailureKind::OutputLimit);
         assert!(failure.message.contains("stderr exceeded"));
     }

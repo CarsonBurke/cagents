@@ -67,7 +67,9 @@ impl<Message: Clone + 'static> MenuTree<Message> {
     }
 
     /// Preferred width used by context-menu placement.
-    pub fn preferred_width(&self) -> u16 { self.width.unwrap_or(240) }
+    pub fn preferred_width(&self) -> u16 {
+        self.width.unwrap_or(240)
+    }
 
     /// Sets the width of the menu tree.
     /// See [`ItemWidth`]
@@ -255,7 +257,8 @@ pub fn menu_items<
                 MenuItem::Button(label, icon, action) => {
                     let l: Cow<'static, str> = label.into();
                     let key = find_key(&action, key_binds);
-                    let width = ((l.chars().count() + key.chars().count()) as f32 * 8.5 + 80.0).clamp(240.0, 480.0) as u16;
+                    let width = ((l.chars().count() + key.chars().count()) as f32 * 8.5 + 80.0)
+                        .clamp(240.0, 480.0) as u16;
                     let mut items = vec![
                         widget::text(l)
                             .ellipsize(iced_core::text::Ellipsize::Middle(
@@ -279,7 +282,10 @@ pub fn menu_items<
                         );
                     } else {
                         items.insert(0, widget::space::horizontal().width(14).into());
-                        items.insert(1, widget::space::horizontal().width(spacing.space_xxs).into());
+                        items.insert(
+                            1,
+                            widget::space::horizontal().width(spacing.space_xxs).into(),
+                        );
                     }
 
                     let menu_button = menu_button(items).on_press(action.message());
@@ -290,7 +296,8 @@ pub fn menu_items<
                     let l: Cow<'static, str> = label.into();
 
                     let key = find_key(&action, key_binds);
-                    let width = ((l.chars().count() + key.chars().count()) as f32 * 8.5 + 80.0).clamp(240.0, 480.0) as u16;
+                    let width = ((l.chars().count() + key.chars().count()) as f32 * 8.5 + 80.0)
+                        .clamp(240.0, 480.0) as u16;
 
                     let mut items = vec![
                         widget::text(l)
@@ -315,7 +322,10 @@ pub fn menu_items<
                         );
                     } else {
                         items.insert(0, widget::space::horizontal().width(14).into());
-                        items.insert(1, widget::space::horizontal().width(spacing.space_xxs).into());
+                        items.insert(
+                            1,
+                            widget::space::horizontal().width(spacing.space_xxs).into(),
+                        );
                     }
 
                     let menu_button = menu_button(items);

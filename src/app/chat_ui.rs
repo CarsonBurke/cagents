@@ -3309,17 +3309,38 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
-    pub(super) fn chat_control_available(&self, card: CardId, command: crate::workspace_widget::GlobalShortcut) -> bool {
+    pub(super) fn chat_control_available(
+        &self,
+        card: CardId,
+        command: crate::workspace_widget::GlobalShortcut,
+    ) -> bool {
         use crate::workspace_widget::GlobalShortcut;
-        if self.chat_start_pending(card) { return false; }
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else { return false; };
+        if self.chat_start_pending(card) {
+            return false;
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return false;
+        };
         match command {
-            GlobalShortcut::ChatAccount => runtime.choosing()
-                && self.chat_accounts(runtime.session.launch.provider, &runtime.session.launch.recipe).is_some(),
-            GlobalShortcut::ChatModel => runtime.is_draft()
-                || (runtime.snapshot.capabilities.model_selection && !runtime.snapshot.models.is_empty()),
-            GlobalShortcut::ChatPermissions => !runtime.snapshot.capabilities.permission_modes.is_empty()
-                && !(runtime.session.launch.provider == Provider::Codex && runtime.snapshot.busy),
+            GlobalShortcut::ChatAccount => {
+                runtime.choosing()
+                    && self
+                        .chat_accounts(
+                            runtime.session.launch.provider,
+                            &runtime.session.launch.recipe,
+                        )
+                        .is_some()
+            }
+            GlobalShortcut::ChatModel => {
+                runtime.is_draft()
+                    || (runtime.snapshot.capabilities.model_selection
+                        && !runtime.snapshot.models.is_empty())
+            }
+            GlobalShortcut::ChatPermissions => {
+                !runtime.snapshot.capabilities.permission_modes.is_empty()
+                    && !(runtime.session.launch.provider == Provider::Codex
+                        && runtime.snapshot.busy)
+            }
             _ => false,
         }
     }
@@ -3334,13 +3355,21 @@ impl Cagents {
         let Some(card) = self.workspace.focused() else {
             return Task::none();
         };
-        if !self.chat_control_available(card, command) { return Task::none(); }
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else { return Task::none(); };
+        if !self.chat_control_available(card, command) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
         let target = runtime.target;
         let action = match command {
             GlobalShortcut::ChatAccount => Action::AccountPicker(target, !runtime.account_picker),
-            GlobalShortcut::ChatModel => Action::ModelPicker(target, runtime.model_picker.is_none()),
-            GlobalShortcut::ChatPermissions => Action::PermissionPicker(target, !runtime.permission_picker),
+            GlobalShortcut::ChatModel => {
+                Action::ModelPicker(target, runtime.model_picker.is_none())
+            }
+            GlobalShortcut::ChatPermissions => {
+                Action::PermissionPicker(target, !runtime.permission_picker)
+            }
             _ => return Task::none(),
         };
         let permission_controls = runtime.permission_controls(
@@ -4253,14 +4282,26 @@ impl Cagents {
         for (card, draft) in &chat_drafts {
             if let Some(CardKind::Chat(session)) = self.card_state(*card).map(|card| &card.kind)
                 && let Some(key) = closing::draft_key(session)
-            { conversation_drafts.insert(key, draft.clone()); }
+            {
+                conversation_drafts.insert(key, draft.clone());
+            }
         }
         for runtime in self.chat_ui.parked.values() {
             if let Some(key) = closing::draft_key(&runtime.session) {
-                if let Some(model) = runtime.snapshot.selected_model.as_ref().or(runtime.recorded_model.as_ref()) { conversation_models.insert(key.clone(), model.clone()); }
+                if let Some(model) = runtime
+                    .snapshot
+                    .selected_model
+                    .as_ref()
+                    .or(runtime.recorded_model.as_ref())
+                {
+                    conversation_models.insert(key.clone(), model.clone());
+                }
                 let draft = runtime.unsent_text();
-                if draft.is_empty() { conversation_drafts.remove(&key); }
-                else { conversation_drafts.insert(key, draft); }
+                if draft.is_empty() {
+                    conversation_drafts.remove(&key);
+                } else {
+                    conversation_drafts.insert(key, draft);
+                }
             }
         }
         for (card, state) in &self.cards {
@@ -4268,10 +4309,20 @@ impl Cagents {
                 && let Some(session) = self.chat_return_session(*card)
                 && let Some(key) = closing::draft_key(&session)
             {
-                if let Some(model) = runtime.snapshot.selected_model.as_ref().or(runtime.recorded_model.as_ref()) { conversation_models.insert(key.clone(), model.clone()); }
+                if let Some(model) = runtime
+                    .snapshot
+                    .selected_model
+                    .as_ref()
+                    .or(runtime.recorded_model.as_ref())
+                {
+                    conversation_models.insert(key.clone(), model.clone());
+                }
                 let draft = runtime.unsent_text();
-                if draft.is_empty() { conversation_drafts.remove(&key); }
-                else { conversation_drafts.insert(key, draft); }
+                if draft.is_empty() {
+                    conversation_drafts.remove(&key);
+                } else {
+                    conversation_drafts.insert(key, draft);
+                }
             }
         }
         let editors = self
@@ -4482,7 +4533,9 @@ impl Cagents {
         let card_id = CardId::new();
         if let Some(key) = closing::draft_key(&session)
             && let Some(draft) = self.durable.conversation_drafts.get(&key)
-        { self.chat_ui.drafts.insert(card_id, draft.clone()); }
+        {
+            self.chat_ui.drafts.insert(card_id, draft.clone());
+        }
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "chat");
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
@@ -6345,7 +6398,9 @@ impl Cagents {
                             );
                             if let Some(key) = closing::draft_key(&session)
                                 && let Some(model) = self.durable.conversation_models.get(&key)
-                            { runtime.recorded_model = Some(model.clone()); }
+                            {
+                                runtime.recorded_model = Some(model.clone());
+                            }
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
@@ -11332,8 +11387,15 @@ mod tests {
             snapshot.capabilities.model_selection = false;
             snapshot.capabilities.permission_modes.clear();
         }
-        for command in [Command::ChatAccount, Command::ChatModel, Command::ChatPermissions] {
-            assert!(!app.command_available(command), "unavailable live control: {command:?}");
+        for command in [
+            Command::ChatAccount,
+            Command::ChatModel,
+            Command::ChatPermissions,
+        ] {
+            assert!(
+                !app.command_available(command),
+                "unavailable live control: {command:?}"
+            );
         }
         {
             let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
@@ -11344,12 +11406,27 @@ mod tests {
         }
         assert!(app.command_available(Command::ChatModel));
         assert!(app.command_available(Command::ChatPermissions));
-        assert!(!app.command_available(Command::ChatAccount), "live conversations cannot select a draft account");
+        assert!(
+            !app.command_available(Command::ChatAccount),
+            "live conversations cannot select a draft account"
+        );
         Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
-        assert!(!app.command_available(Command::ChatPermissions), "busy Codex cannot change permissions");
-        app.chat_runtime_mut(target).unwrap().attachment_chooser_pending = true;
-        for command in [Command::ChatAccount, Command::ChatModel, Command::ChatPermissions] {
-            assert!(!app.command_available(command), "pending start control: {command:?}");
+        assert!(
+            !app.command_available(Command::ChatPermissions),
+            "busy Codex cannot change permissions"
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachment_chooser_pending = true;
+        for command in [
+            Command::ChatAccount,
+            Command::ChatModel,
+            Command::ChatPermissions,
+        ] {
+            assert!(
+                !app.command_available(command),
+                "pending start control: {command:?}"
+            );
         }
     }
 
@@ -12872,7 +12949,14 @@ mod tests {
     /// Explicitly end a conversation through its confirmation flow.
     fn request_end_chat(app: &mut Cagents, card: CardId) {
         drop(app.update(Message::ChatClose(closing::Action::End(card))));
-        if let Some(target) = app.chat_ui.close_dialog.as_ref().map(closing::Confirmation::target) { drop(app.update(Message::ChatClose(closing::Action::Confirm(target)))); }
+        if let Some(target) = app
+            .chat_ui
+            .close_dialog
+            .as_ref()
+            .map(closing::Confirmation::target)
+        {
+            drop(app.update(Message::ChatClose(closing::Action::Confirm(target))));
+        }
     }
 
     fn close_chat(app: &mut Cagents, card: CardId) {

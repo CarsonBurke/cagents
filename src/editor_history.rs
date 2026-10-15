@@ -172,7 +172,9 @@ impl History {
 
     /// Identifies this exact point in the undo graph, independent of stack
     /// length, pruning and coalescing. Saving seals the active transaction.
-    pub fn revision(&self) -> u64 { self.revision }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
 
     fn advance_revision(&mut self) -> (u64, u64) {
         let before = self.revision;
@@ -185,11 +187,13 @@ impl History {
     /// (for example Discard edits restored the saved contents).
     pub fn adopt_revision(&mut self, known: u64) {
         if let Some(transaction) = self.undo.back_mut()
-            && transaction.after_revision == self.revision {
+            && transaction.after_revision == self.revision
+        {
             transaction.after_revision = known;
         }
         if let Some(transaction) = self.redo.last_mut()
-            && transaction.before_revision == self.revision {
+            && transaction.before_revision == self.revision
+        {
             transaction.before_revision = known;
         }
         self.revision = known;
@@ -882,7 +886,11 @@ mod tests {
         assert_eq!(history.revision(), later);
         assert_eq!(history.undo(&mut model), Replay::Applied);
         model.type_text(&mut history, "?", now);
-        assert_ne!(history.revision(), later, "a branch cannot reuse a redo state identity");
+        assert_ne!(
+            history.revision(),
+            later,
+            "a branch cannot reuse a redo state identity"
+        );
         assert_eq!(history.undo(&mut model), Replay::Applied);
         assert_eq!(history.revision(), saved);
         assert_eq!(history.undo(&mut model), Replay::Applied);

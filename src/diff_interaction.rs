@@ -460,34 +460,51 @@ impl SearchSnapshot {
     /// Capture immutable sources and rows without scanning the model on the UI
     /// thread. The first worker search builds the reusable coordinate map.
     pub fn new(model: std::sync::Arc<DiffModel>, mode: DiffMode) -> Self {
-        Self { model, mode, coordinates: std::sync::OnceLock::new() }
+        Self {
+            model,
+            mode,
+            coordinates: std::sync::OnceLock::new(),
+        }
     }
 
     fn coordinates(&self, cancelled: &impl Fn() -> bool) -> Option<&[Coordinate]> {
-        if cancelled() { return None; }
+        if cancelled() {
+            return None;
+        }
         if self.coordinates.get().is_none() {
             let model = &self.model;
             let mut coordinates = Vec::with_capacity(model.row_count(self.mode));
             let mut append = |row, side, line: Option<u32>| {
-                if let Some(line) = line { coordinates.push(Coordinate { row, side, line }); }
+                if let Some(line) = line {
+                    coordinates.push(Coordinate { row, side, line });
+                }
             };
             match self.mode {
                 DiffMode::Inline => {
                     for (row, line) in model.inline_rows.iter().enumerate() {
-                        if row % 256 == 0 && cancelled() { return None; }
-                        if line.new_line.is_some() { append(row, Side::New, line.new_line); }
-                        else { append(row, Side::Old, line.old_line); }
+                        if row % 256 == 0 && cancelled() {
+                            return None;
+                        }
+                        if line.new_line.is_some() {
+                            append(row, Side::New, line.new_line);
+                        } else {
+                            append(row, Side::Old, line.old_line);
+                        }
                     }
                 }
                 DiffMode::Split => {
                     for (row, line) in model.split_rows.iter().enumerate() {
-                        if row % 256 == 0 && cancelled() { return None; }
+                        if row % 256 == 0 && cancelled() {
+                            return None;
+                        }
                         append(row, Side::Old, line.old_line);
                         append(row, Side::New, line.new_line);
                     }
                 }
             }
-            if cancelled() { return None; }
+            if cancelled() {
+                return None;
+            }
             // At most one runtime search is active, but the snapshot is also
             // safe to share: another worker may win initialization harmlessly.
             let _ = self.coordinates.set(coordinates);
@@ -501,7 +518,9 @@ impl SearchSnapshot {
         options: crate::editor_search::FindOptions,
         cancelled: impl Fn() -> bool,
     ) -> Result<Option<Vec<Match>>, String> {
-        let Some(coordinates) = self.coordinates(&cancelled) else { return Ok(None); };
+        let Some(coordinates) = self.coordinates(&cancelled) else {
+            return Ok(None);
+        };
         let old = self.model.before.lines().collect::<Vec<_>>();
         let new = self.model.after.lines().collect::<Vec<_>>();
         let text = coordinates.iter().map(|at| {
@@ -549,9 +568,24 @@ mod find_tests {
         for mode in [DiffMode::Inline, DiffMode::Split] {
             let snapshot = SearchSnapshot::new(model.clone(), mode);
             assert!(std::sync::Arc::ptr_eq(&snapshot.model, &model));
-            assert!(snapshot.coordinates.get().is_none(), "UI capture must not scan model rows");
-            assert!(snapshot.find("needle", crate::editor_search::FindOptions::default(), || true).unwrap().is_none());
-            assert!(snapshot.coordinates.get().is_none(), "cancelled search must not populate coordinates");
+            assert!(
+                snapshot.coordinates.get().is_none(),
+                "UI capture must not scan model rows"
+            );
+            assert!(
+                snapshot
+                    .find(
+                        "needle",
+                        crate::editor_search::FindOptions::default(),
+                        || true
+                    )
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                snapshot.coordinates.get().is_none(),
+                "cancelled search must not populate coordinates"
+            );
             let found = snapshot
                 .find(
                     "STRASSE",
@@ -567,8 +601,21 @@ mod find_tests {
                 assert_eq!(found.range, 0..7);
                 assert_eq!(model.new_line_at_row(mode, found.row), Some(101));
             }
-            assert!(snapshot.find("needle", crate::editor_search::FindOptions::default(), || false).unwrap().is_some());
-            assert_eq!(snapshot.coordinates.get().unwrap().as_ptr(), coordinates, "queries on the same model reuse worker coordinates");
+            assert!(
+                snapshot
+                    .find(
+                        "needle",
+                        crate::editor_search::FindOptions::default(),
+                        || false
+                    )
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                snapshot.coordinates.get().unwrap().as_ptr(),
+                coordinates,
+                "queries on the same model reuse worker coordinates"
+            );
             assert!(
                 snapshot
                     .find(

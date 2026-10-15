@@ -1231,7 +1231,8 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
 }
 
 fn shortcut_group(field: SettingsField) -> &'static str {
-    workspace_widget::shortcut_descriptor(field.shortcut_action().expect("shortcut field")).category()
+    workspace_widget::shortcut_descriptor(field.shortcut_action().expect("shortcut field"))
+        .category()
 }
 
 fn keyboard_groups<'a>(
@@ -1249,7 +1250,11 @@ fn keyboard_groups<'a>(
             .filter(|field| shortcut_group(*field) == group)
             .map(|field| {
                 let action = field.shortcut_action().expect("shortcut field");
-                let value = shortcut_values.iter().find(|(candidate, _)| *candidate == action).expect("registered draft").1;
+                let value = shortcut_values
+                    .iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered draft")
+                    .1;
                 shortcut_input(
                     workspace_widget::shortcut_descriptor(action).label,
                     value,
@@ -1350,14 +1355,19 @@ fn shortcut_input<'a>(
                     break;
                 }
                 Ok(binding) => {
-                    if let Some(reason) = settings::shortcut_chord_refusal_for(action.id(), binding) {
+                    if let Some(reason) = settings::shortcut_chord_refusal_for(action.id(), binding)
+                    {
                         error = Some(sentence(reason));
                         break;
                     }
                     if let Some((other, _)) =
                         draft.shortcut_values().into_iter().find(|(other, value)| {
                             *other != action
-                                && settings::shortcut_binding_conflicts(action.id(), other.id(), binding)
+                                && settings::shortcut_binding_conflicts(
+                                    action.id(),
+                                    other.id(),
+                                    binding,
+                                )
                                 && settings::parse_chords(value).iter().any(|chord| {
                                     settings::parse_shortcut(chord)
                                         .is_ok_and(|candidate| candidate == binding)
@@ -1375,27 +1385,39 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
-        design::body(format!("{label}{required}")).width(Length::FillPortion(3)).into(),
-        widget::row::with_children(controls).spacing(2).align_y(Alignment::Center).width(Length::FillPortion(4)).into(),
+        design::body(format!("{label}{required}"))
+            .width(Length::FillPortion(3))
+            .into(),
+        widget::row::with_children(controls)
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .width(Length::FillPortion(4))
+            .into(),
         design::caption(source).width(64).into(),
         {
             let scope = workspace_widget::shortcut_descriptor(action).scope;
-            if scope.applies_to(workspace_widget::FocusedPane::Terminal) || scope == workspace_widget::ShortcutScope::OutsideTerminal {
-            let action_key = KeyboardShortcuts::action_names()[index];
-            crate::ui_controls::field::checkbox(
-                draft
-                    .terminal_passthrough_actions
-                    .iter()
-                    .any(|name| name == action_key),
-            )
-            .label("Send to terminal")
-            .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough {
-                action: action_key.to_owned(),
-                enabled,
-            })
-            .into()
+            if scope.applies_to(workspace_widget::FocusedPane::Terminal)
+                || scope == workspace_widget::ShortcutScope::OutsideTerminal
+            {
+                let action_key = KeyboardShortcuts::action_names()[index];
+                crate::ui_controls::field::checkbox(
+                    draft
+                        .terminal_passthrough_actions
+                        .iter()
+                        .any(|name| name == action_key),
+                )
+                .label("Send to terminal")
+                .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough {
+                    action: action_key.to_owned(),
+                    enabled,
+                })
+                .into()
             } else {
-                crate::interaction::tooltip(design::caption("Scoped"), "Applies only in its pane context; terminals keep these keys").into()
+                crate::interaction::tooltip(
+                    design::caption("Scoped"),
+                    "Applies only in its pane context; terminals keep these keys",
+                )
+                .into()
             }
         },
     ])
@@ -1545,7 +1567,14 @@ mod keyboard_table_tests {
     fn git_commands_are_mounted_in_the_keyboard_settings_table() {
         let draft = SettingsDraft::from_settings(&AppSettings::default());
         for label in ["Fetch", "Accept ours and stage", "Trigger completion"] {
-            assert_eq!(keyboard_groups(&draft, &HashMap::new()).into_iter().filter_map(|group| group.view("Keyboard", label)).count(), 1, "registered command {label} must have a visible settings row");
+            assert_eq!(
+                keyboard_groups(&draft, &HashMap::new())
+                    .into_iter()
+                    .filter_map(|group| group.view("Keyboard", label))
+                    .count(),
+                1,
+                "registered command {label} must have a visible settings row"
+            );
         }
     }
 

@@ -107,9 +107,16 @@ fn execute_clone(
         .map_err(|error| clone_failure_detail(&error))
 }
 
-fn onboarding_shortcut_detail(command: workspace_widget::GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
+fn onboarding_shortcut_detail(
+    command: workspace_widget::GlobalShortcut,
+    shortcuts: &KeyboardShortcuts,
+) -> String {
     let chords = workspace_widget::shortcut_chords(command, shortcuts);
-    if chords.is_empty() { "Enter to open the focused action".into() } else { chords }
+    if chords.is_empty() {
+        "Enter to open the focused action".into()
+    } else {
+        chords
+    }
 }
 
 impl Cagents {
@@ -217,14 +224,20 @@ impl Cagents {
             for (label, detail, icon, id, message) in [
                 (
                     "Open folder",
-                    onboarding_shortcut_detail(workspace_widget::GlobalShortcut::OpenFolder, &self.settings.keyboard_shortcuts),
+                    onboarding_shortcut_detail(
+                        workspace_widget::GlobalShortcut::OpenFolder,
+                        &self.settings.keyboard_shortcuts,
+                    ),
                     Icon::OpenFolder,
                     "onboarding.open-folder",
                     Message::OpenRepository,
                 ),
                 (
                     "Clone repository",
-                    onboarding_shortcut_detail(workspace_widget::GlobalShortcut::CloneRepository, &self.settings.keyboard_shortcuts),
+                    onboarding_shortcut_detail(
+                        workspace_widget::GlobalShortcut::CloneRepository,
+                        &self.settings.keyboard_shortcuts,
+                    ),
                     Icon::Tree,
                     "onboarding.clone",
                     Message::Onboarding(Action::Clone),
@@ -408,12 +421,20 @@ impl Cagents {
             }
             Action::Cancel => {
                 self.chrome_ui.clone_repository = None;
-                let target = if self.workspace.cards().is_empty() && self.active_workspace.is_none() && self.durable.active_channel.is_none() {
+                let target = if self.workspace.cards().is_empty()
+                    && self.active_workspace.is_none()
+                    && self.durable.active_channel.is_none()
+                {
                     Some(widget::Id::new("onboarding.clone"))
                 } else {
-                    self.workspace.focused().map(|card| self.card_keyboard_focus(card)).or_else(|| Some(widget::Id::new(TOOLBAR_FOCUS_ID)))
+                    self.workspace
+                        .focused()
+                        .map(|card| self.card_keyboard_focus(card))
+                        .or_else(|| Some(widget::Id::new(TOOLBAR_FOCUS_ID)))
                 };
-                target.map_or_else(Task::none, |target| iced::widget::operation::focus(target).map(cosmic::Action::App))
+                target.map_or_else(Task::none, |target| {
+                    iced::widget::operation::focus(target).map(cosmic::Action::App)
+                })
             }
             Action::Submit => {
                 let Some(dialog) = self
@@ -600,16 +621,25 @@ mod tests {
         use workspace_widget::GlobalShortcut as Command;
         let mut app = super::super::tests::context_inspector_test_app(false);
         for command in [Command::OpenFolder, Command::CloneRepository] {
-            assert_eq!(onboarding_shortcut_detail(command, &app.settings.keyboard_shortcuts), "Enter to open the focused action");
+            assert_eq!(
+                onboarding_shortcut_detail(command, &app.settings.keyboard_shortcuts),
+                "Enter to open the focused action"
+            );
         }
         app.settings.keyboard_shortcuts.open_folder = vec!["Ctrl+Alt+O".into()];
         app.settings.keyboard_shortcuts.clone_repository = vec!["Ctrl+Alt+L".into()];
         let rendered = labels(app.empty_workspace_view());
         for chord in ["Ctrl+Alt+O", "Ctrl+Alt+L"] {
-            assert!(rendered.iter().any(|label| label == chord), "configured first-run hint is visible: {chord}");
+            assert!(
+                rendered.iter().any(|label| label == chord),
+                "configured first-run hint is visible: {chord}"
+            );
         }
         app.settings.keyboard_shortcuts.open_folder.clear();
-        assert_eq!(onboarding_shortcut_detail(Command::OpenFolder, &app.settings.keyboard_shortcuts), "Enter to open the focused action");
+        assert_eq!(
+            onboarding_shortcut_detail(Command::OpenFolder, &app.settings.keyboard_shortcuts),
+            "Enter to open the focused action"
+        );
     }
 
     #[test]

@@ -1487,30 +1487,56 @@ impl State {
     /// Moves the selection through the tree's file rows. With nothing
     /// selected, forward selects the first file and backward the last.
     fn step_file_target(&self, direction: isize) -> Option<usize> {
-        let current = self.selected.as_ref().and_then(|path| self.file_index(path))
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|path| self.file_index(path))
             .and_then(|index| self.rows.iter().position(|row| row.file == Some(index)));
         let visible = |index: &usize| !self.hide_viewed || !self.files[*index].viewed;
         if direction > 0 {
-            self.rows.iter().skip(current.map_or(0, |position| position + 1))
-                .filter_map(|row| row.file).find(visible)
+            self.rows
+                .iter()
+                .skip(current.map_or(0, |position| position + 1))
+                .filter_map(|row| row.file)
+                .find(visible)
         } else {
-            self.rows[..current.unwrap_or(self.rows.len())].iter().rev()
-                .filter_map(|row| row.file).find(visible)
+            self.rows[..current.unwrap_or(self.rows.len())]
+                .iter()
+                .rev()
+                .filter_map(|row| row.file)
+                .find(visible)
         }
     }
 
     pub fn can_step_file(&self, forward: bool) -> bool {
-        self.range.is_some() && self.step_file_target(if forward { 1 } else { -1 }).is_some()
+        self.range.is_some()
+            && self
+                .step_file_target(if forward { 1 } else { -1 })
+                .is_some()
     }
 
     pub fn can_next_unviewed(&self) -> bool {
-        self.range.is_some() && self.rows.iter().filter_map(|row| row.file).any(|index| !self.files[index].viewed)
+        self.range.is_some()
+            && self
+                .rows
+                .iter()
+                .filter_map(|row| row.file)
+                .any(|index| !self.files[index].viewed)
     }
 
     pub fn can_toggle_selected_viewed(&self) -> bool {
-        self.target.is_some() && self.context.is_some() && self.selected.as_ref()
-            .and_then(|path| self.file_index(path))
-            .is_some_and(|index| !matches!(self.files[index].sync, ViewedSync::Pending | ViewedSync::Unknown))
+        self.target.is_some()
+            && self.context.is_some()
+            && self
+                .selected
+                .as_ref()
+                .and_then(|path| self.file_index(path))
+                .is_some_and(|index| {
+                    !matches!(
+                        self.files[index].sync,
+                        ViewedSync::Pending | ViewedSync::Unknown
+                    )
+                })
     }
 
     fn step_file(&mut self, direction: isize) {
@@ -3589,7 +3615,16 @@ pub(crate) mod tests {
         assert!(!state.can_step_file(true));
         assert!(!state.can_next_unviewed());
         assert!(!state.can_toggle_selected_viewed());
-        open_with(&mut state, loaded(vec![entry("a.rs", ChangeKind::Modified), entry("b.rs", ChangeKind::Modified)], vec![]));
+        open_with(
+            &mut state,
+            loaded(
+                vec![
+                    entry("a.rs", ChangeKind::Modified),
+                    entry("b.rs", ChangeKind::Modified),
+                ],
+                vec![],
+            ),
+        );
         state.select_file(path("a.rs"));
         assert!(!state.can_step_file(false));
         assert!(state.can_step_file(true));

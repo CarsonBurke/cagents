@@ -266,9 +266,15 @@ impl MenuBounds {
         let width = match item_width {
             ItemWidth::Uniform(width) => width,
             ItemWidth::Static(fallback) => menu_tree.width.unwrap_or(fallback),
-        }.min(viewport_size.width.max(1.0) as u16);
-        let (children_size, child_positions, child_sizes) =
-            get_children_layout(menu_tree, renderer, ItemWidth::Uniform(width), item_height, tree);
+        }
+        .min(viewport_size.width.max(1.0) as u16);
+        let (children_size, child_positions, child_sizes) = get_children_layout(
+            menu_tree,
+            renderer,
+            ItemWidth::Uniform(width),
+            item_height,
+            tree,
+        );
 
         // viewport space parent bounds
         let view_parent_bounds = parent_bounds + overlay_offset;

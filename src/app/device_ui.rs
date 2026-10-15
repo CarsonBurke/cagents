@@ -11,7 +11,9 @@ pub(super) fn file_editor_id() -> widget::Id {
 
 /// Navigation presentation and device-owned row opening never need desktop Git or files.
 pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
-    if let SidebarAction::RunCommand { action, .. } = action { return supports_sidebar_action(action); }
+    if let SidebarAction::RunCommand { action, .. } = action {
+        return supports_sidebar_action(action);
+    }
     matches!(
         action,
         SidebarAction::ReorderMember { .. }

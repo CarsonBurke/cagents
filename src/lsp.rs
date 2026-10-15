@@ -251,7 +251,8 @@ pub fn shift_diagnostics(items: &mut [LspDiagnostic], edits: &[LspTextEdit]) {
         // final line contains no LF, so only its scalar count is used above.
         for item in items.iter_mut() {
             let point = item.range.start == item.range.end;
-            item.range.start = shift_diagnostic_position(item.range.start, edit.range, ending, true);
+            item.range.start =
+                shift_diagnostic_position(item.range.start, edit.range, ending, true);
             item.range.end = shift_diagnostic_position(item.range.end, edit.range, ending, point);
             item.range.end = item.range.end.max(item.range.start);
         }
@@ -259,9 +260,14 @@ pub fn shift_diagnostics(items: &mut [LspDiagnostic], edits: &[LspTextEdit]) {
 }
 
 fn shift_diagnostic_position(
-    at: LspPosition, old: LspRange, new_end: LspPosition, right: bool,
+    at: LspPosition,
+    old: LspRange,
+    new_end: LspPosition,
+    right: bool,
 ) -> LspPosition {
-    if at < old.start { return at; }
+    if at < old.start {
+        return at;
+    }
     if old.start == old.end && at == old.start {
         return if right { new_end } else { old.start };
     }
@@ -269,9 +275,19 @@ fn shift_diagnostic_position(
         return if right { old.start } else { new_end };
     }
     if at.line == old.end.line {
-        LspPosition::new(new_end.line, new_end.character.saturating_add(at.character.saturating_sub(old.end.character)))
+        LspPosition::new(
+            new_end.line,
+            new_end
+                .character
+                .saturating_add(at.character.saturating_sub(old.end.character)),
+        )
     } else {
-        LspPosition::new(new_end.line.saturating_add(at.line.saturating_sub(old.end.line)), at.character)
+        LspPosition::new(
+            new_end
+                .line
+                .saturating_add(at.line.saturating_sub(old.end.line)),
+            at.character,
+        )
     }
 }
 
@@ -4750,27 +4766,93 @@ mod tests {
 
     #[test]
     fn diagnostic_ranges_follow_insert_delete_and_multiline_replacements() {
-        fn diagnostic(start: (u32,u32), end: (u32,u32)) -> LspDiagnostic {
-            LspDiagnostic { range: LspRange::new(LspPosition::new(start.0,start.1),LspPosition::new(end.0,end.1)), severity:LspSeverity::Error, message:"error".into(), source:None, code:None }
+        fn diagnostic(start: (u32, u32), end: (u32, u32)) -> LspDiagnostic {
+            LspDiagnostic {
+                range: LspRange::new(
+                    LspPosition::new(start.0, start.1),
+                    LspPosition::new(end.0, end.1),
+                ),
+                severity: LspSeverity::Error,
+                message: "error".into(),
+                source: None,
+                code: None,
+            }
         }
-        let mut items = vec![diagnostic((2,3),(2,8)), diagnostic((0,0),(0,2))];
-        shift_diagnostics(&mut items, &[LspTextEdit {range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,0)),new_text:"α\r\nβ\n".into()}]);
-        assert_eq!(items[0].range, LspRange::new(LspPosition::new(4,3),LspPosition::new(4,8)));
-        assert_eq!(items[1].range, LspRange::new(LspPosition::new(0,0),LspPosition::new(0,2)));
-        shift_diagnostics(&mut items, &[LspTextEdit {range:LspRange::new(LspPosition::new(1,0),LspPosition::new(3,0)),new_text:String::new()}]);
-        assert_eq!(items[0].range, LspRange::new(LspPosition::new(2,3),LspPosition::new(2,8)));
-        shift_diagnostics(&mut items, &[LspTextEdit {range:LspRange::new(LspPosition::new(2,5),LspPosition::new(2,7)),new_text:"x\ny".into()}]);
-        assert_eq!(items[0].range, LspRange::new(LspPosition::new(2,3),LspPosition::new(3,2)));
+        let mut items = vec![diagnostic((2, 3), (2, 8)), diagnostic((0, 0), (0, 2))];
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 0)),
+                new_text: "α\r\nβ\n".into(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(4, 3), LspPosition::new(4, 8))
+        );
+        assert_eq!(
+            items[1].range,
+            LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 2))
+        );
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(3, 0)),
+                new_text: String::new(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(2, 3), LspPosition::new(2, 8))
+        );
+        shift_diagnostics(
+            &mut items,
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(2, 5), LspPosition::new(2, 7)),
+                new_text: "x\ny".into(),
+            }],
+        );
+        assert_eq!(
+            items[0].range,
+            LspRange::new(LspPosition::new(2, 3), LspPosition::new(3, 2))
+        );
     }
 
     #[test]
     fn diagnostic_insert_affinity_and_complete_deletion_remain_valid() {
-        let mut item = LspDiagnostic { range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,5)),severity:LspSeverity::Error,message:"error".into(),source:None,code:None };
-        shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,2)),new_text:"α".into()}]);
-        assert_eq!(item.range, LspRange::new(LspPosition::new(0,3),LspPosition::new(0,6)));
-        shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,6),LspPosition::new(0,6)),new_text:"z".into()}]);
-        assert_eq!(item.range.end, LspPosition::new(0,6));
-        shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,0),LspPosition::new(1,0)),new_text:String::new()}]);
+        let mut item = LspDiagnostic {
+            range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 5)),
+            severity: LspSeverity::Error,
+            message: "error".into(),
+            source: None,
+            code: None,
+        };
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 2), LspPosition::new(0, 2)),
+                new_text: "α".into(),
+            }],
+        );
+        assert_eq!(
+            item.range,
+            LspRange::new(LspPosition::new(0, 3), LspPosition::new(0, 6))
+        );
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 6), LspPosition::new(0, 6)),
+                new_text: "z".into(),
+            }],
+        );
+        assert_eq!(item.range.end, LspPosition::new(0, 6));
+        shift_diagnostics(
+            std::slice::from_mut(&mut item),
+            &[LspTextEdit {
+                range: LspRange::new(LspPosition::new(0, 0), LspPosition::new(1, 0)),
+                new_text: String::new(),
+            }],
+        );
         assert_eq!(item.range, LspRange::default());
     }
 

@@ -23,7 +23,11 @@ pub(super) fn surface_keyed<'a, Message: Clone + 'static, Key: Clone + Eq + 'sta
     menu: Vec<widget::menu::Tree<Message>>,
 ) -> Element<'a, Message> {
     let items = menu.len();
-    let width = menu.iter().map(widget::menu::Tree::preferred_width).max().unwrap_or(240);
+    let width = menu
+        .iter()
+        .map(widget::menu::Tree::preferred_width)
+        .max()
+        .unwrap_or(240);
     Element::new(MenuSurface {
         identity,
         native: widget::context_menu(
@@ -89,7 +93,11 @@ impl<Message: Clone + 'static, Key> MenuSurface<'_, Message, Key> {
         if let Some(builder) = &self.builder {
             let menu = builder();
             self.items = menu.len();
-            self.width = menu.iter().map(widget::menu::Tree::preferred_width).max().unwrap_or(240);
+            self.width = menu
+                .iter()
+                .map(widget::menu::Tree::preferred_width)
+                .max()
+                .unwrap_or(240);
             self.native = widget::context_menu(
                 cosmic::iced::widget::Space::new()
                     .width(Length::Fill)
@@ -114,7 +122,9 @@ impl<Message: Clone + 'static, Key> MenuSurface<'_, Message, Key> {
     }
 }
 
-impl<Message: Clone + 'static, Key: Clone + Eq + 'static> Widget<Message, Theme, Renderer> for MenuSurface<'_, Message, Key> {
+impl<Message: Clone + 'static, Key: Clone + Eq + 'static> Widget<Message, Theme, Renderer>
+    for MenuSurface<'_, Message, Key>
+{
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<MenuItems<Key>>()
     }
@@ -349,64 +359,161 @@ mod tests {
     struct RowAction(usize);
     impl widget::menu::Action for RowAction {
         type Message = usize;
-        fn message(&self) -> usize { self.0 }
+        fn message(&self) -> usize {
+            self.0
+        }
     }
 
     #[test]
     fn tall_menu_scroll_reaches_its_last_action_at_the_bottom_edge() {
-        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
-            .block_on(Renderer::new(cosmic::iced::Font::default(), cosmic::iced::Pixels(14.0), Some("tiny-skia"))).unwrap();
+        let renderer = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
+            .unwrap();
         let window = Size::new(900.0, 900.0);
         let viewport = Rectangle::with_size(window);
         let anchor = Point::new(850.0, 850.0);
         let chords = vec!["Ctrl+Alt+F5".to_owned()];
         let bindings = menu_shortcuts([(chords.as_slice(), RowAction(39))]);
         let hint = bindings.keys().next().unwrap().to_string();
-        let mut element = surface(widget::menu::items(&bindings,
-            (0..40).map(|index| widget::menu::Item::Button(if index == 0 { "New worktree from this branch…".into() } else { format!("Action {index}") }, None, RowAction(index))).collect()));
+        let mut element = surface(widget::menu::items(
+            &bindings,
+            (0..40)
+                .map(|index| {
+                    widget::menu::Item::Button(
+                        if index == 0 {
+                            "New worktree from this branch…".into()
+                        } else {
+                            format!("Action {index}")
+                        },
+                        None,
+                        RowAction(index),
+                    )
+                })
+                .collect(),
+        ));
         let widget = element.as_widget_mut();
         let mut tree = Tree::new(&*widget);
         widget.diff(&mut tree);
         let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
         let mut messages = Vec::new();
-        widget.update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&row), mouse::Cursor::Available(anchor), &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
-        let mut popup = widget.overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO).unwrap();
+        widget.update(
+            &mut tree,
+            &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+            Layout::new(&row),
+            mouse::Cursor::Available(anchor),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &viewport,
+        );
+        let mut popup = widget
+            .overlay(
+                &mut tree,
+                Layout::new(&row),
+                &renderer,
+                &viewport,
+                Vector::ZERO,
+            )
+            .unwrap();
         let node = popup.as_overlay_mut().layout(&renderer, window);
-        popup.as_overlay_mut().update(&Event::Window(window::Event::RedrawRequested(Instant::now())), Layout::new(&node), mouse::Cursor::Available(anchor), &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        popup.as_overlay_mut().update(
+            &Event::Window(window::Event::RedrawRequested(Instant::now())),
+            Layout::new(&node),
+            mouse::Cursor::Available(anchor),
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+        );
         let node = popup.as_overlay_mut().layout(&renderer, window);
         let menu = node.children().first().unwrap().bounds();
         assert!(menu.x >= 0.0 && menu.x + menu.width <= window.width);
-        assert!(menu.width > 240.0, "long labels grow the shared menu beyond its old fixed width");
+        assert!(
+            menu.width > 240.0,
+            "long labels grow the shared menu beyond its old fixed width"
+        );
         let pointer = mouse::Cursor::Available(Point::new(menu.x + 30.0, window.height - 18.0));
         // No pointer motion is required before the first wheel event.
-        popup.as_overlay_mut().update(&Event::Mouse(mouse::Event::WheelScrolled { delta: mouse::ScrollDelta::Lines { x: 0.0, y: -100.0 } }), Layout::new(&node), pointer, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        popup.as_overlay_mut().update(
+            &Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: -100.0 },
+            }),
+            Layout::new(&node),
+            pointer,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+        );
         let node = popup.as_overlay_mut().layout(&renderer, window);
-        #[derive(Default)] struct Texts(Vec<String>);
+        #[derive(Default)]
+        struct Texts(Vec<String>);
         impl Operation for Texts {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-            fn text(&mut self, _: Option<&Id>, _: Rectangle, text: &str) { self.0.push(text.to_owned()); }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&Id>, _: Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
         }
         let mut texts = Texts::default();
-        popup.as_overlay_mut().operate(Layout::new(&node), &renderer, &mut texts);
-        assert!(texts.0.iter().any(|text| text == &hint), "the rendered trailing action must expose its configured chord: {:?}", texts.0);
-        for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
-            popup.as_overlay_mut().update(&Event::Mouse(event), Layout::new(&node), pointer, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+        popup
+            .as_overlay_mut()
+            .operate(Layout::new(&node), &renderer, &mut texts);
+        assert!(
+            texts.0.iter().any(|text| text == &hint),
+            "the rendered trailing action must expose its configured chord: {:?}",
+            texts.0
+        );
+        for event in [
+            mouse::Event::ButtonPressed(mouse::Button::Left),
+            mouse::Event::ButtonReleased(mouse::Button::Left),
+        ] {
+            popup.as_overlay_mut().update(
+                &Event::Mouse(event),
+                Layout::new(&node),
+                pointer,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+            );
         }
-        assert_eq!(messages, [39], "the destructive trailing item must remain reachable");
+        assert_eq!(
+            messages,
+            [39],
+            "the destructive trailing item must remain reachable"
+        );
     }
 
     #[test]
     fn diff_context_menu_identity_closes_same_count_recycled_targets() {
         let renderer = tokio::runtime::Builder::new_current_thread()
-            .enable_all().build().unwrap()
-            .block_on(Renderer::new(cosmic::iced::Font::default(), cosmic::iced::Pixels(14.0), Some("tiny-skia")))
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(Renderer::new(
+                cosmic::iced::Font::default(),
+                cosmic::iced::Pixels(14.0),
+                Some("tiny-skia"),
+            ))
             .unwrap();
         fn menu() -> Vec<widget::menu::Tree<()>> {
-            widget::menu::items(&std::collections::HashMap::new(), vec![widget::menu::Item::Button("Action", None, Action)])
+            widget::menu::items(
+                &std::collections::HashMap::new(),
+                vec![widget::menu::Item::Button("Action", None, Action)],
+            )
         }
         let make = |lazy, key| -> Element<'static, ()> {
-            if lazy { lazy_surface_keyed(key, menu) }
-            else { surface_keyed(key, menu()) }
+            if lazy {
+                lazy_surface_keyed(key, menu)
+            } else {
+                surface_keyed(key, menu())
+            }
         };
         let window = Size::new(400.0, 200.0);
         let viewport = Rectangle::with_size(window);
@@ -415,26 +522,63 @@ mod tests {
         // item counts deliberately cannot distinguish these target changes.
         let original = (1_u64, 10_usize, 2_u64);
         for lazy in [false, true] {
-            for replacement in [(2,10,2), (1,11,2), (1,10,3)] {
+            for replacement in [(2, 10, 2), (1, 11, 2), (1, 10, 3)] {
                 let mut element = make(lazy, original);
                 let widget = element.as_widget_mut();
                 let mut tree = Tree::new(&*widget);
                 widget.diff(&mut tree);
                 let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
                 let mut messages = Vec::new();
-                widget.update(&mut tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)), Layout::new(&row), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+                widget.update(
+                    &mut tree,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&row),
+                    cursor,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
                 {
-                    let mut popup = widget.overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO).expect("menu opens for original target");
+                    let mut popup = widget
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&row),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO,
+                        )
+                        .expect("menu opens for original target");
                     let popup_node = popup.as_overlay_mut().layout(&renderer, window);
-                    popup.as_overlay_mut().update(&Event::Window(window::Event::RedrawRequested(Instant::now())), Layout::new(&popup_node), cursor, &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages));
+                    popup.as_overlay_mut().update(
+                        &Event::Window(window::Event::RedrawRequested(Instant::now())),
+                        Layout::new(&popup_node),
+                        cursor,
+                        &renderer,
+                        &mut clipboard::Null,
+                        &mut Shell::new(&mut messages),
+                    );
                 }
                 for key in [original, replacement] {
                     let mut next = make(lazy, key);
                     let widget = next.as_widget_mut();
                     widget.diff(&mut tree);
-                    let row = widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
-                    let open = widget.overlay(&mut tree, Layout::new(&row), &renderer, &viewport, Vector::ZERO).is_some();
-                    assert_eq!(open, key == original, "lazy={lazy}, key={key:?}: unrelated frames preserve the menu; changed targets close it");
+                    let row =
+                        widget.layout(&mut tree, &renderer, &layout::Limits::new(window, window));
+                    let open = widget
+                        .overlay(
+                            &mut tree,
+                            Layout::new(&row),
+                            &renderer,
+                            &viewport,
+                            Vector::ZERO,
+                        )
+                        .is_some();
+                    assert_eq!(
+                        open,
+                        key == original,
+                        "lazy={lazy}, key={key:?}: unrelated frames preserve the menu; changed targets close it"
+                    );
                 }
             }
         }
@@ -561,7 +705,10 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for PointerAwareMenu<'_
         shell: &mut Shell<'_, Message>,
     ) {
         let press = match event {
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left) | mouse::Event::WheelScrolled { .. }) => cursor.position(),
+            Event::Mouse(
+                mouse::Event::ButtonPressed(mouse::Button::Left)
+                | mouse::Event::WheelScrolled { .. },
+            ) => cursor.position(),
             _ => None,
         };
         let mut messages = Vec::new();

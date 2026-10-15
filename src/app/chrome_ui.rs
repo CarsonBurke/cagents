@@ -81,9 +81,15 @@ mod tests {
 
     #[test]
     fn pane_menu_closes_when_equal_size_channel_destinations_change_or_reorder() {
-        use iced::{Event, Point, Rectangle, Size, Vector, mouse,
-            advanced::{Layout, Shell, clipboard, layout, widget::Tree}};
-        use crate::workspace_model::{ModelChannel, views::{Pane, View}};
+        use crate::workspace_model::{
+            ModelChannel,
+            views::{Pane, View},
+        };
+        use iced::{
+            Event, Point, Rectangle, Size, Vector,
+            advanced::{Layout, Shell, clipboard, layout, widget::Tree},
+            mouse,
+        };
         let renderer = super::super::tests::headless_renderer();
         let mut app = tab_fixture(1, 900.0);
         let id = app.workspace.order().next().unwrap();
@@ -92,40 +98,78 @@ mod tests {
         let destination = crate::model::ChannelId::new();
         let other = crate::model::ChannelId::new();
         let mut view = View::empty(source);
-        view.panes.push(Pane { id, title: card.title.clone(), user_title: None,
-            pending_terminal_start: false, width_fraction: 0.5, scope: None, kind: card.kind.clone() });
+        view.panes.push(Pane {
+            id,
+            title: card.title.clone(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: card.kind.clone(),
+        });
         app.workspace_model.views = vec![view];
         app.workspace_model.identity = uuid::Uuid::new_v4();
-        app.workspace_model.channels = [source, destination, other].into_iter().enumerate().map(|(index, id)| ModelChannel {
-            id, repository: PathBuf::from("/repo/.git"), title: format!("Channel {index}"), title_source: Default::default(), ordinal: index as u32,
-        }).collect();
+        app.workspace_model.channels = [source, destination, other]
+            .into_iter()
+            .enumerate()
+            .map(|(index, id)| ModelChannel {
+                id,
+                repository: PathBuf::from("/repo/.git"),
+                title: format!("Channel {index}"),
+                title_source: Default::default(),
+                ordinal: index as u32,
+            })
+            .collect();
         assert_eq!(app.pane_move_destinations(id).len(), 2);
         let window = Size::new(900.0, 600.0);
         let viewport = Rectangle::with_size(window);
         let probe = |app: &Cagents, tree: &mut Tree, open: bool| {
             let mut header = app.column_header(id, true, 320.0);
             header.as_widget_mut().diff(tree);
-            let node = header.as_widget_mut().layout(tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+            let node = header.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, window),
+            );
             if open {
-                header.as_widget_mut().update(tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
-                    Layout::new(&node), mouse::Cursor::Available(Point::new(80.0, 16.0)), &renderer,
-                    &mut clipboard::Null, &mut Shell::new(&mut Vec::new()), &viewport);
+                header.as_widget_mut().update(
+                    tree,
+                    &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&node),
+                    mouse::Cursor::Available(Point::new(80.0, 16.0)),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut Vec::new()),
+                    &viewport,
+                );
             }
-            let open = header.as_widget_mut().overlay(tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some();
+            let open = header
+                .as_widget_mut()
+                .overlay(tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO)
+                .is_some();
             open
         };
         let header = app.column_header(id, true, 320.0);
         let mut tree = Tree::new(header.as_widget());
         drop(header);
         assert!(probe(&app, &mut tree, true));
-        assert!(probe(&app, &mut tree, false), "unchanged destinations retain an open menu");
+        assert!(
+            probe(&app, &mut tree, false),
+            "unchanged destinations retain an open menu"
+        );
         app.workspace_model.channels[1].id = crate::model::ChannelId::new();
         app.workspace_model.sequence += 1;
-        assert!(!probe(&app, &mut tree, false), "equal-count replacement retires the original menu");
+        assert!(
+            !probe(&app, &mut tree, false),
+            "equal-count replacement retires the original menu"
+        );
         assert!(probe(&app, &mut tree, true));
         app.workspace_model.channels[1].ordinal = 99;
         app.workspace_model.sequence += 1;
-        assert!(!probe(&app, &mut tree, false), "same-width reordered destinations cannot replace open actions");
+        assert!(
+            !probe(&app, &mut tree, false),
+            "same-width reordered destinations cannot replace open actions"
+        );
     }
 
     #[test]
@@ -1079,16 +1123,25 @@ mod command_registry_tests {
                 Message::Palette(palette_ui::Action::RunPane(id, command)) => {
                     assert_eq!(id, card);
                     assert_eq!(command, menu.command());
-                    assert!(!matches!(menu, PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)));
+                    assert!(!matches!(
+                        menu,
+                        PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)
+                    ));
                 }
                 Message::Palette(palette_ui::Action::MovePaneToChannel(id, channel)) => {
                     assert_eq!(id, card);
                     assert!(menu == PaneMenuCommand::MoveTo(channel));
                 }
                 Message::Palette(palette_ui::Action::RunChatPane(actual, command)) => {
-                    assert_eq!(actual, target, "retain the conversation generation captured by the menu");
+                    assert_eq!(
+                        actual, target,
+                        "retain the conversation generation captured by the menu"
+                    );
                     assert_eq!(command, menu.command());
-                    assert!(matches!(menu, PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)));
+                    assert!(matches!(
+                        menu,
+                        PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)
+                    ));
                 }
                 _ => panic!("pane menu must use the registered command dispatcher"),
             }
@@ -1100,8 +1153,12 @@ impl widget::menu::Action for PaneMenu {
     type Message = Message;
     fn message(&self) -> Message {
         let action = match self.1 {
-            PaneMenuCommand::MoveTo(channel) => palette_ui::Action::MovePaneToChannel(self.0, channel),
-            PaneMenuCommand::Fork(target) | PaneMenuCommand::ReviewChanges(target) => palette_ui::Action::RunChatPane(target, self.1.command()),
+            PaneMenuCommand::MoveTo(channel) => {
+                palette_ui::Action::MovePaneToChannel(self.0, channel)
+            }
+            PaneMenuCommand::Fork(target) | PaneMenuCommand::ReviewChanges(target) => {
+                palette_ui::Action::RunChatPane(target, self.1.command())
+            }
             _ => palette_ui::Action::RunPane(self.0, self.1.command()),
         };
         Message::Palette(action)
@@ -1877,7 +1934,10 @@ impl Cagents {
     }
 
     pub(super) fn inspector_owns_window_controls(&self) -> bool {
-        matches!(self.context_inspector_mount(), Some(InspectorLayout::Docked))
+        matches!(
+            self.context_inspector_mount(),
+            Some(InspectorLayout::Docked)
+        )
     }
 
     /// The workspace header's window controls stay above an inspector overlay.
@@ -2435,11 +2495,16 @@ impl Cagents {
         // Destination metadata can change without changing this pane. The
         // daemon's model epoch retires an open menu before its Move payloads
         // could be replaced under the pointer, without cloning every channel.
-        let menu_identity = (self.workspace_model.identity, self.workspace_model.sequence,
-            id, card.map(|card| card.generation), match self.cards.get(&id) {
-            Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
-            _ => self.parked_chat_runtime(id).map(|runtime| runtime.target),
-        });
+        let menu_identity = (
+            self.workspace_model.identity,
+            self.workspace_model.sequence,
+            id,
+            card.map(|card| card.generation),
+            match self.cards.get(&id) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+                _ => self.parked_chat_runtime(id).map(|runtime| runtime.target),
+            },
+        );
         crate::interaction::context_menu_lazy_keyed(tab, menu_identity, move || {
             let mut entries: Vec<widget::menu::Item<PaneMenu, String>> = vec![
                 widget::menu::Item::Button(
@@ -2478,9 +2543,15 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::Close),
                 ),
             ];
-            if self.card_state(id).is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) {
-                entries.push(widget::menu::Item::Button("Close conversation…".into(), None,
-                    PaneMenu(id, PaneMenuCommand::EndConversation)));
+            if self
+                .card_state(id)
+                .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+            {
+                entries.push(widget::menu::Item::Button(
+                    "Close conversation…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::EndConversation),
+                ));
             }
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
                 entries.push(widget::menu::Item::Button(
@@ -2532,9 +2603,14 @@ impl Cagents {
             fn group(entry: &widget::menu::Item<PaneMenu, String>) -> u8 {
                 match entry {
                     widget::menu::Item::Button(_, _, PaneMenu(_, command)) => match command {
-                        PaneMenuCommand::Rename | PaneMenuCommand::Clone | PaneMenuCommand::Fork(_) => 0,
+                        PaneMenuCommand::Rename
+                        | PaneMenuCommand::Clone
+                        | PaneMenuCommand::Fork(_) => 0,
                         PaneMenuCommand::CopyPath => 1,
-                        PaneMenuCommand::CloseOthers | PaneMenuCommand::CloseToRight | PaneMenuCommand::Close | PaneMenuCommand::EndConversation => 3,
+                        PaneMenuCommand::CloseOthers
+                        | PaneMenuCommand::CloseToRight
+                        | PaneMenuCommand::Close
+                        | PaneMenuCommand::EndConversation => 3,
                         _ => 2,
                     },
                     _ => 2,
@@ -2545,7 +2621,9 @@ impl Cagents {
             let mut previous = None;
             for entry in entries {
                 let current = group(&entry);
-                if previous.is_some_and(|previous| previous != current) { grouped.push(widget::menu::Item::Divider); }
+                if previous.is_some_and(|previous| previous != current) {
+                    grouped.push(widget::menu::Item::Divider);
+                }
                 previous = Some(current);
                 grouped.push(entry);
             }
@@ -2556,7 +2634,9 @@ impl Cagents {
                     let widget::menu::Item::Button(_, _, action) = entry else {
                         return None;
                     };
-                    if matches!(action.1, PaneMenuCommand::MoveTo(_)) { return None; }
+                    if matches!(action.1, PaneMenuCommand::MoveTo(_)) {
+                        return None;
+                    }
                     workspace_widget::menu_shortcut(
                         action.1.command(),
                         &self.settings.keyboard_shortcuts,
@@ -2566,7 +2646,9 @@ impl Cagents {
                 .collect::<HashMap<_, _>>();
             for entry in &mut entries {
                 if let widget::menu::Item::Button(label, _, action) = entry {
-                    if matches!(action.1, PaneMenuCommand::MoveTo(_)) { continue; }
+                    if matches!(action.1, PaneMenuCommand::MoveTo(_)) {
+                        continue;
+                    }
                     *label = workspace_widget::shortcut_descriptor(action.1.command())
                         .label
                         .to_owned();

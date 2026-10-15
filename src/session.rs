@@ -2885,7 +2885,7 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
-        agent_updates: BTreeMap::new(),
+            agent_updates: BTreeMap::new(),
             conversation_drafts: HashMap::new(),
             conversation_models: HashMap::new(),
             conversation_channels: HashMap::new(),

@@ -2637,8 +2637,17 @@ impl Runtime {
             controls.push(self.account_picker(accounts, transitioning, shortcuts));
         }
         let draft = self.is_draft();
-        let selected_model = snapshot.selected_model.as_ref().or_else(|| if draft { None } else { self.recorded_model.as_ref() });
-        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft || selected_model.is_some() {
+        let selected_model = snapshot.selected_model.as_ref().or_else(|| {
+            if draft {
+                None
+            } else {
+                self.recorded_model.as_ref()
+            }
+        });
+        if (snapshot.capabilities.model_selection && !snapshot.models.is_empty())
+            || draft
+            || selected_model.is_some()
+        {
             let label: Cow<'a, str> = match snapshot
                 .models
                 .iter()
@@ -2657,7 +2666,10 @@ impl Runtime {
                     None => "Model".into(),
                 },
             };
-            if transitioning || (!draft && (!snapshot.capabilities.model_selection || snapshot.models.is_empty())) {
+            if transitioning
+                || (!draft
+                    && (!snapshot.capabilities.model_selection || snapshot.models.is_empty()))
+            {
                 controls.push(design::caption(label).into());
             } else {
                 controls.push(self.model_picker(label, offers, shortcuts));
@@ -4732,23 +4744,72 @@ mod tests {
         let mut session = app.chat_return_session(card).unwrap();
         session.launch.session_id = Some("recorded-conversation".into());
         super::super::closing::set_model(&mut session.launch.recipe, "recorded-model");
-        let handle = Arc::new(ClientHandle::fixture(session.clone(), Snapshot { session_id: Some("recorded-conversation".into()), ..Snapshot::default() }));
-        let mut runtime = Runtime::new(Target { card, generation: 1 }, session, Connection::Live(Arc::clone(&handle)), true, Default::default());
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                session_id: Some("recorded-conversation".into()),
+                ..Snapshot::default()
+            },
+        ));
+        let mut runtime = Runtime::new(
+            Target {
+                card,
+                generation: 1,
+            },
+            session,
+            Connection::Live(Arc::clone(&handle)),
+            true,
+            Default::default(),
+        );
         runtime.refresh();
         assert!(runtime.snapshot.selected_model.is_none());
-        assert!(Arc::ptr_eq(&runtime.snapshot, &handle.snapshot()), "display metadata must not copy a transcript snapshot on every refresh");
-        let mut element: Element<'_, Message> = widget::column::with_children(runtime.session_controls(false, None, Vec::new(), &crate::settings::KeyboardShortcuts::default())).into();
+        assert!(
+            Arc::ptr_eq(&runtime.snapshot, &handle.snapshot()),
+            "display metadata must not copy a transcript snapshot on every refresh"
+        );
+        let mut element: Element<'_, Message> =
+            widget::column::with_children(runtime.session_controls(
+                false,
+                None,
+                Vec::new(),
+                &crate::settings::KeyboardShortcuts::default(),
+            ))
+            .into();
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = cosmic::iced::advanced::widget::Tree::new(&element);
-        let node = element.as_widget_mut().layout(&mut tree, &renderer, &cosmic::iced::advanced::layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 100.0)));
-        #[derive(Default)] struct Texts(Vec<String>);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &cosmic::iced::advanced::layout::Limits::new(
+                iced::Size::ZERO,
+                iced::Size::new(800.0, 100.0),
+            ),
+        );
+        #[derive(Default)]
+        struct Texts(Vec<String>);
         impl cosmic::iced::advanced::widget::Operation for Texts {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation)) { visit(self); }
-            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) { self.0.push(text.to_owned()); }
+            fn traverse(
+                &mut self,
+                visit: &mut dyn FnMut(&mut dyn cosmic::iced::advanced::widget::Operation),
+            ) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
         }
         let mut texts = Texts::default();
-        element.as_widget_mut().operate(&mut tree, cosmic::iced::advanced::Layout::new(&node), &renderer, &mut texts);
-        assert!(texts.0.iter().any(|text| text == "recorded-model"), "{:?}", texts.0);
+        element.as_widget_mut().operate(
+            &mut tree,
+            cosmic::iced::advanced::Layout::new(&node),
+            &renderer,
+            &mut texts,
+        );
+        assert!(
+            texts.0.iter().any(|text| text == "recorded-model"),
+            "{:?}",
+            texts.0
+        );
         assert!(!texts.0.iter().any(|text| text == "Model"));
     }
 

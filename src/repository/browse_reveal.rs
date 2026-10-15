@@ -14,7 +14,9 @@ pub fn include(
 ) -> Result<Option<RepoPath>, String> {
     let root = fs_safety::Root::open(worktree).map_err(|error| error.to_string())?;
     for candidate in requested.as_path().ancestors() {
-        if candidate.as_os_str().is_empty() { return Ok(None); }
+        if candidate.as_os_str().is_empty() {
+            return Ok(None);
+        }
         let metadata = match fs_safety::metadata_beneath(&root, candidate) {
             Ok(metadata) => metadata,
             Err(error) if error.is_not_found() => continue,
@@ -28,7 +30,9 @@ pub fn include(
         } else {
             return Err("the requested path is not a file or directory".into());
         };
-        if let Err(index) = list.binary_search(&candidate) { list.insert(index, candidate.clone()); }
+        if let Err(index) = list.binary_search(&candidate) {
+            list.insert(index, candidate.clone());
+        }
         return Ok(Some(candidate));
     }
     Ok(None)
@@ -44,9 +48,18 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::create_dir_all(root.path().join("outside/capped")).unwrap();
         fs::write(root.path().join("outside/capped/target.txt"), "target").unwrap();
-        let mut files = WorkingFiles { paths: vec![RepoPath::parse("first.txt").unwrap()], tracked_count: 1, ..Default::default() };
+        let mut files = WorkingFiles {
+            paths: vec![RepoPath::parse("first.txt").unwrap()],
+            tracked_count: 1,
+            ..Default::default()
+        };
         let target = RepoPath::parse("outside/capped/target.txt").unwrap();
-        for _ in 0..2 { assert_eq!(include(root.path(), &mut files, &target).unwrap(), Some(target.clone())); }
+        for _ in 0..2 {
+            assert_eq!(
+                include(root.path(), &mut files, &target).unwrap(),
+                Some(target.clone())
+            );
+        }
         assert_eq!(files.paths.len(), 2);
         assert_eq!(files.tracked_count, 1);
         assert_eq!(files.paths[1], target);
@@ -59,10 +72,21 @@ mod tests {
         let mut files = WorkingFiles::default();
         let requested = RepoPath::parse("parent/empty/missing/deleted.txt").unwrap();
         let parent = RepoPath::parse("parent/empty").unwrap();
-        assert_eq!(include(root.path(), &mut files, &requested).unwrap(), Some(parent.clone()));
+        assert_eq!(
+            include(root.path(), &mut files, &requested).unwrap(),
+            Some(parent.clone())
+        );
         assert_eq!(files.directories, [parent]);
         assert!(files.paths.is_empty());
-        assert_eq!(include(root.path(), &mut files, &RepoPath::parse("deleted.txt").unwrap()).unwrap(), None);
+        assert_eq!(
+            include(
+                root.path(),
+                &mut files,
+                &RepoPath::parse("deleted.txt").unwrap()
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -72,7 +96,14 @@ mod tests {
         fs::write(outside.path().join("secret.txt"), "secret").unwrap();
         std::os::unix::fs::symlink(outside.path(), root.path().join("link")).unwrap();
         let mut files = WorkingFiles::default();
-        assert!(include(root.path(), &mut files, &RepoPath::parse("link/secret.txt").unwrap()).is_err());
+        assert!(
+            include(
+                root.path(),
+                &mut files,
+                &RepoPath::parse("link/secret.txt").unwrap()
+            )
+            .is_err()
+        );
         assert!(files.paths.is_empty() && files.directories.is_empty());
     }
 }

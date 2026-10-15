@@ -56,7 +56,10 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
-    PaneTransferFailed { operation: uuid::Uuid, error: String },
+    PaneTransferFailed {
+        operation: uuid::Uuid,
+        error: String,
+    },
     ViewRefused {
         scope: crate::workspace_model::views::Scope,
         operation: uuid::Uuid,
@@ -213,9 +216,14 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if let ModelEdit::ChangeView { scope, operation, .. } = &request {
+                    if let ModelEdit::ChangeView {
+                        scope, operation, ..
+                    } = &request
+                    {
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
-                            scope: scope.clone(), operation: *operation, error: error.to_string(),
+                            scope: scope.clone(),
+                            operation: *operation,
+                            error: error.to_string(),
                         });
                     }
                     if let ModelEdit::ReopenProject { repository, .. } = request {
@@ -410,13 +418,19 @@ impl Cagents {
                 self.reject_pane_transfer(operation, error);
                 self.reconcile_shared_views()
             }
-            ModelUpdate::ViewRefused { scope, operation, error } => {
+            ModelUpdate::ViewRefused {
+                scope,
+                operation,
+                error,
+            } => {
                 tracing::warn!(?scope, %operation, %error, "the registry refused a view edit");
                 if self.shared_views.is_requested_transfer(operation) {
                     self.reject_pane_transfer(operation, error);
                 } else {
                     self.shared_views.refused(operation);
-                    self.status = Some(TransientNotice::warning(format!("The pane change was not applied: {error}")));
+                    self.status = Some(TransientNotice::warning(format!(
+                        "The pane change was not applied: {error}"
+                    )));
                 }
                 self.reconcile_shared_views()
             }

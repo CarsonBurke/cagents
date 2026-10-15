@@ -3296,7 +3296,11 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:workspace_history"),
         &to_json(&state.workspace_history)?,
     )?;
-    set_metadata(transaction, &format!("workspace:{workspace_id}:navigation:agent_updates"), &to_json(&state.agent_updates)?)?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:agent_updates"),
+        &to_json(&state.agent_updates)?,
+    )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:chat_drafts"),
@@ -4660,8 +4664,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace editor navigation", &value))
         .transpose()?
         .unwrap_or_default(),
-        agent_updates: metadata(connection, &format!("workspace:{id}:navigation:agent_updates"))?
-            .map(|value| from_json("workspace unread agent updates", &value)).transpose()?.unwrap_or_default(),
+        agent_updates: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:agent_updates"),
+        )?
+        .map(|value| from_json("workspace unread agent updates", &value))
+        .transpose()?
+        .unwrap_or_default(),
         chat_drafts: metadata(
             connection,
             &format!("workspace:{id}:navigation:chat_drafts"),
@@ -6250,15 +6259,31 @@ mod tests {
         let store = StateStore::open(&database, boot_id.clone()).unwrap();
         let mut workspace = workspace_with_terminal(&boot_id);
         let card = workspace.cards[0].id;
-        workspace.agent_updates.insert(card, Some((ProjectId::new(), WorktreeId::new())));
+        workspace
+            .agent_updates
+            .insert(card, Some((ProjectId::new(), WorktreeId::new())));
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         drop(store);
         let store = StateStore::open(&database, boot_id).unwrap();
-        assert_eq!(store.load_workspace(workspace.id, None).unwrap().unwrap().agent_updates, workspace.agent_updates);
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates,
+            workspace.agent_updates
+        );
         workspace.agent_updates.clear();
         lane.save(&store, &workspace).unwrap();
-        assert!(store.load_workspace(workspace.id, None).unwrap().unwrap().agent_updates.is_empty());
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates
+                .is_empty()
+        );
     }
 
     #[test]
@@ -6267,9 +6292,15 @@ mod tests {
         let database = directory.path().join("conversation-drafts.sqlite3");
         let boot_id = boot("conversation-drafts");
         let mut workspace = workspace_with_terminal(&boot_id);
-        workspace.conversation_drafts.insert("Codex:session-id".into(), "retained prompt".into());
-        workspace.conversation_models.insert("Codex:session-id".into(), "recorded-model".into());
-        workspace.conversation_channels.insert("Codex:session-id".into(), ChannelId::new());
+        workspace
+            .conversation_drafts
+            .insert("Codex:session-id".into(), "retained prompt".into());
+        workspace
+            .conversation_models
+            .insert("Codex:session-id".into(), "recorded-model".into());
+        workspace
+            .conversation_channels
+            .insert("Codex:session-id".into(), ChannelId::new());
         let store = StateStore::open(&database, boot_id).unwrap();
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
@@ -6278,12 +6309,31 @@ mod tests {
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.conversation_drafts, workspace.conversation_drafts);
         assert_eq!(restored.conversation_models, workspace.conversation_models);
-        assert_eq!(restored.conversation_channels, workspace.conversation_channels);
-        assert_eq!(store.load_workspace_manifest(workspace.id).unwrap().unwrap().conversation_drafts, workspace.conversation_drafts);
+        assert_eq!(
+            restored.conversation_channels,
+            workspace.conversation_channels
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_drafts,
+            workspace.conversation_drafts
+        );
         let mut legacy = serde_json::to_value(&workspace).unwrap();
-        legacy.as_object_mut().unwrap().remove("conversation_drafts");
-        legacy.as_object_mut().unwrap().remove("conversation_models");
-        legacy.as_object_mut().unwrap().remove("conversation_channels");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_drafts");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_models");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_channels");
         let legacy = serde_json::from_value::<WorkspaceState>(legacy).unwrap();
         assert!(legacy.conversation_drafts.is_empty());
         assert!(legacy.conversation_models.is_empty());
