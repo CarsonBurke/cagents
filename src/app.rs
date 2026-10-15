@@ -13212,6 +13212,9 @@ impl Application for Cagents {
     fn update(&mut self, message: Message) -> Task<Message> {
         self.reconcile_terminal_review_owner();
         self.terminal_review_input.flush_orphans(self.terminal_review_card.is_some());
+        for reason in self.terminal_review_input.take_failures() {
+            self.notices.record(TransientNotice::warning(format!("Terminal input was refused or could not be confirmed: {reason}")));
+        }
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
         }

@@ -128,14 +128,79 @@ struct ConsumedInputs {
     buttons: Vec<mouse::Button>,
     owned: Vec<OwnedKey>,
     native_review: Option<crate::model::TerminalId>,
+    retiring: Vec<RetiringKey>,
+    failures: Vec<String>,
 }
 const MAX_OWNED_KEYS: usize = 512;
 struct OwnedKey {
     physical: keyboard::key::Physical,
     surface: super::TerminalSurface,
-    proof: Option<crate::model::HostSessionProof>,
+    authority: Option<KeyAuthority>,
+    press: crate::terminal::HostedKeyReceipt,
+    confirmed: bool,
     input: super::KeyInput,
     orphaned: bool,
+}
+struct RetiringKey {
+    // Keep the original actor, never resolve an ID into a later attachment.
+    _surface: super::TerminalSurface,
+    receipt: crate::terminal::HostedKeyReceipt,
+}
+/// The attachment pointer identifies the original actor even before its first
+/// handshake. Once confirmed, authority also includes the authenticated host
+/// and immutable emulator/PTY instance; a later actor cannot inherit a lease.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeyAuthority {
+    terminal: crate::model::TerminalId,
+    worker: uuid::Uuid,
+    host: crate::model::HostSessionProof,
+}
+impl KeyAuthority {
+    fn capture(surface: &super::TerminalSurface) -> Option<Self> {
+        let worker = surface.execution_instance().filter(|worker| !worker.is_nil())?;
+        let host = surface.host_proof().filter(|host| host.is_complete())?;
+        Some(Self { terminal: surface.terminal_id(), worker, host })
+    }
+    fn receipt(surface: &super::TerminalSurface, binding: &crate::terminal::HostedTerminalBinding) -> Option<Self> {
+        let actual = Self::capture(surface)?;
+        (actual.terminal == binding.source.id && actual.worker == binding.execution_instance).then_some(actual)
+    }
+}
+impl ConsumedInputs {
+    fn failure(&mut self, reason: String) {
+        tracing::warn!(%reason, "terminal key admission failed or was not confirmed");
+        if self.failures.len() < 8 && !self.failures.contains(&reason) { self.failures.push(reason); }
+    }
+    fn reap(&mut self) {
+        let mut failures = Vec::new();
+        self.retiring.retain(|key| match key.receipt.try_recv() {
+            Ok(Ok(_)) => false,
+            Ok(Err(reason)) => { failures.push(reason); false }
+            Err(_) => true,
+        });
+        self.owned.retain_mut(|key| {
+            // Admission is immutable. Do not clone a full TerminalSession on
+            // every application event after this press has been confirmed.
+            if key.confirmed { return true; }
+            match key.press.try_recv() {
+            Err(_) => true,
+            Ok(Err(reason)) => { failures.push(reason); false }
+            Ok(Ok(binding)) => {
+                let authority = KeyAuthority::receipt(&key.surface, &binding);
+                if authority.is_none() || key.authority.as_ref().is_some_and(|expected| Some(expected) != authority.as_ref()) {
+                    failures.push("terminal key admission returned a different or unknown worker authority".into());
+                    return false;
+                }
+                // PendingFirstAuthority is bound only by this original actor's
+                // authenticated press receipt, never by a replacement handle.
+                key.authority = authority;
+                key.confirmed = true;
+                true
+            }
+        }});
+        for reason in failures { self.failure(reason); }
+    }
+    fn occupied(&self) -> usize { self.owned.len() + self.retiring.len() }
 }
 /// One barrier per application window, shared across mounted cards and retained
 /// while cards unmount. A review key-up must not become input to a new focus.
@@ -151,26 +216,63 @@ impl ReviewInputBarrier {
         let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
         if current.is_some() || shared.native_review==previous { shared.native_review=current; }
     }
-    pub(super) fn can_admit(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface) -> bool {
-        let shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
-        match shared.owned.iter().find(|key| key.physical==physical) {
-            Some(key) => !key.orphaned && key.surface.same_attachment(surface),
-            None => shared.owned.len()<MAX_OWNED_KEYS,
+    /// Queues both initial presses and repeats under the window ownership
+    /// budget. Repeats depend on the original press and never replace its
+    /// admission evidence, including when a repeat itself is refused.
+    pub(super) fn press(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface, input: super::KeyInput) -> Result<(), super::TerminalSendError> {
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        shared.reap();
+        if shared.occupied() >= MAX_OWNED_KEYS { return Err(super::TerminalSendError::Full); }
+        if let Some(key) = shared.owned.iter().find(|key| key.physical == physical) {
+            if key.orphaned || !key.surface.same_attachment(surface) { return Err(super::TerminalSendError::Full); }
+            let receipt = surface.key_after_receipt(input, &key.press)?;
+            shared.retiring.push(RetiringKey { _surface: surface.clone(), receipt });
+            return Ok(());
         }
-    }
-    pub(super) fn admitted(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface, input: super::KeyInput) {
-        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(key)=shared.owned.iter_mut().find(|key| key.physical==physical) { key.input=input; return; }
-        debug_assert!(shared.owned.len()<MAX_OWNED_KEYS,"admission must reserve a bounded slot");
-        shared.owned.push(OwnedKey { physical,surface:surface.clone(),proof:surface.host_proof(),input,orphaned:false });
+        let authority = KeyAuthority::capture(surface);
+        let press = surface.key_with_receipt(input.clone())?;
+        shared.owned.push(OwnedKey { physical, surface: surface.clone(), authority, press, confirmed: false, input, orphaned: false });
+        Ok(())
     }
     pub(super) fn owns_admitted(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface) -> bool {
-        self.0.lock().unwrap_or_else(|error| error.into_inner()).owned.iter()
-            .any(|key| key.physical==physical && key.surface.same_attachment(surface))
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        shared.reap();
+        shared.owned.iter().any(|key| key.physical == physical && key.surface.same_attachment(surface))
     }
-    pub(super) fn paired(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface) {
-        self.0.lock().unwrap_or_else(|error| error.into_inner()).owned.retain(|key|
-            key.physical!=physical || !key.surface.same_attachment(surface));
+    /// Local enqueue moves a lease to retiring, rather than declaring it
+    /// delivered. The transport retains the actor until the exact worker ACKs
+    /// or permanently fails. A later press of this physical key is independent.
+    pub(super) fn release(&self, physical: keyboard::key::Physical, surface: &super::TerminalSurface, input: super::KeyInput) -> Result<(), super::TerminalSendError> {
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        shared.reap();
+        let Some(index) = shared.owned.iter().position(|key| key.physical == physical && key.surface.same_attachment(surface)) else { return Ok(()); };
+        let key = &shared.owned[index];
+        match surface.key_after_receipt(input, &key.press) {
+            Ok(receipt) => {
+                shared.retiring.push(RetiringKey { _surface: surface.clone(), receipt });
+                shared.owned.swap_remove(index);
+                Ok(())
+            }
+            Err(super::TerminalSendError::Full) => Err(super::TerminalSendError::Full),
+            Err(error) => {
+                shared.owned.swap_remove(index);
+                shared.failure(format!("could not confirm a terminal key release: {error}"));
+                // Retire local state as FAILED, never replay through another
+                // actor. The warning is surfaced by the application boundary.
+                Ok(())
+            }
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn pending_counts(&self) -> (usize, usize) {
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        shared.reap();
+        (shared.owned.len(), shared.retiring.len())
+    }
+    pub(crate) fn take_failures(&self) -> Vec<String> {
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        shared.reap();
+        std::mem::take(&mut shared.failures)
     }
     pub(super) fn unmounted(&self, surface: &super::TerminalSurface) {
         let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
@@ -196,15 +298,28 @@ impl ReviewInputBarrier {
     /// Drops stale attachments rather than forwarding an old owned release to
     /// a replacement host. A full client queue retains the exact bounded pair.
     pub(crate) fn flush_orphans(&self, review_active: bool) {
-        if review_active { return; }
-        let mut shared=self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if shared.native_review.is_some() { return; }
-        shared.owned.retain_mut(|key| {
-            if !key.orphaned { return true; }
-            if key.proof.as_ref().is_some_and(|proof| key.surface.host_proof().as_ref().is_some_and(|current| current!=proof)) { return false; }
-            let mut input=key.input.clone(); input.action=super::KeyAction::Release; input.text=None;
-            matches!(key.surface.key(input),Err(super::TerminalSendError::Full))
-        });
+        let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        // Completion is reaped during Review too; reaping never emits input.
+        shared.reap();
+        if review_active || shared.native_review.is_some() { return; }
+        let mut index = 0;
+        while index < shared.owned.len() {
+            let key = &shared.owned[index];
+            if !key.orphaned { index += 1; continue; }
+            let mut input = key.input.clone(); input.action = super::KeyAction::Release; input.text = None;
+            match key.surface.key_after_receipt(input, &key.press) {
+                Ok(receipt) => {
+                    let surface = key.surface.clone();
+                    shared.retiring.push(RetiringKey { _surface: surface, receipt });
+                    shared.owned.swap_remove(index);
+                }
+                Err(super::TerminalSendError::Full) => { index += 1; }
+                Err(error) => {
+                    shared.owned.swap_remove(index);
+                    shared.failure(format!("could not pair an unmounted terminal key: {error}"));
+                }
+            }
+        }
     }
     pub fn owns_keyboard(&self, event: &Event) -> bool {
         let physical = match event {
