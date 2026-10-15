@@ -198,6 +198,12 @@ fn transfer_agent(
         if agent.spec.target.repository != repository {
             return Err("The agent pane belongs to another project".into());
         }
+        // A native agent can also own a separately saved console pane. Its
+        // current display is the canonical agent card; moving another proved
+        // surface must not relocate that card on the next window adoption.
+        if pane.id != crate::model::CardId::from_uuid(agent.id.as_uuid()) {
+            return Ok(());
+        }
         agent.placement = destination.clone();
         db.execute(
             "UPDATE agents SET record=?2 WHERE id=?1",
@@ -1043,6 +1049,7 @@ mod tests {
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
             };
             let p = Pane {
+                id: CardId::from_uuid(original.id.as_uuid()),
                 kind: presentation(&source),
                 ..pane()
             };
@@ -1199,6 +1206,13 @@ mod tests {
                 HostedSession::Terminal(terminal)
             };
             let original = r.bind_agent(accepted.agent.id, None, live.clone()).unwrap();
+            let console = if let HostedSession::Chat(session) = &live {
+                let terminal = session.terminal.clone().unwrap();
+                r.bind_agent_console(original.id, &live, terminal.clone()).unwrap();
+                Some(Pane { kind: CardKind::Terminal(terminal), ..pane() })
+            } else {
+                None
+            };
             let started = r
                 .update_agent_run(
                     accepted.run.id,
@@ -1235,8 +1249,23 @@ mod tests {
                 HostedSession::Chat(session) => CardKind::Chat(session.clone()),
                 HostedSession::Terminal(session) => CardKind::Terminal(session.clone()),
             };
-            let p = Pane { kind, ..pane() };
-            seed(&mut r, a, vec![p.clone()]);
+            let p = Pane { id: CardId::from_uuid(original.id.as_uuid()), kind, ..pane() };
+            let mut panes = vec![p.clone()];
+            panes.extend(console.clone());
+            seed(&mut r, a, panes);
+            if let Some(console) = &console {
+                let before = r.agent(original.id).unwrap();
+                let transfer = edit(&mut r, a, Change::Transfer {
+                    id: console.id,
+                    destination: Scope::Channel(b),
+                    before: None,
+                });
+                assert!(r.apply(&transfer).unwrap().changed);
+                assert_eq!(r.agent(original.id).unwrap(), before,
+                    "moving a separate proved console must preserve the canonical agent placement and execution");
+                assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(a)));
+                assert_eq!(owner(&r.db, console.id).unwrap(), Some(Scope::Channel(b)));
+            }
             let transfer = edit(
                 &mut r,
                 a,
@@ -1277,7 +1306,7 @@ mod tests {
             assert_eq!(owner(&r.db, p.id).unwrap(), Some(Scope::Channel(b)));
             assert_eq!(
                 read(&r.db, &Scope::Channel(b)).unwrap().panes,
-                vec![p.clone()]
+                console.into_iter().chain(std::iter::once(p.clone())).collect::<Vec<_>>()
             );
             assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
             assert!(!r.apply(&transfer).unwrap().changed);
