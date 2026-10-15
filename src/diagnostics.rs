@@ -676,9 +676,9 @@ pub struct Report {
 }
 impl Report {
     pub fn human(&self) -> String {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |time| {
-            time.as_millis().min(u64::MAX as u128) as u64
-        });
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |time| time.as_millis().min(u64::MAX as u128) as u64);
         self.human_at(now)
     }
 
@@ -725,7 +725,11 @@ impl Report {
                 holder.pid,
                 holder.terminal,
                 holder.version.as_deref().unwrap_or("unknown"),
-                if holder.outdated { "outdated" } else { "current" },
+                if holder.outdated {
+                    "outdated"
+                } else {
+                    "current"
+                },
                 holder
                     .zombie_children
                     .map_or_else(|| "unknown".into(), |count| count.to_string())
@@ -737,60 +741,110 @@ impl Report {
 
 fn relative_time(at: u64, now: u64) -> String {
     let seconds = at.abs_diff(now) / 1000;
-    if seconds == 0 { return "just now".into(); }
+    if seconds == 0 {
+        return "just now".into();
+    }
     let (amount, unit) = match seconds {
         1..=59 => (seconds, "sec"),
         60..=3599 => (seconds / 60, "min"),
         3600..=86399 => (seconds / 3600, "hr"),
         _ => (seconds / 86400, "day"),
     };
-    let plural = if unit == "day" && amount != 1 { "s" } else { "" };
-    if at > now { format!("in {amount} {unit}{plural}") } else { format!("{amount} {unit}{plural} ago") }
+    let plural = if unit == "day" && amount != 1 {
+        "s"
+    } else {
+        ""
+    };
+    if at > now {
+        format!("in {amount} {unit}{plural}")
+    } else {
+        format!("{amount} {unit}{plural} ago")
+    }
 }
 
 fn lifecycle_label(value: Lifecycle) -> &'static str {
     match value {
-        Lifecycle::Unknown => "unknown", Lifecycle::Started => "started",
-        Lifecycle::Ready => "ready", Lifecycle::StartupFailed => "startup failed",
-        Lifecycle::Panicked => "panicked", Lifecycle::Exited => "exited",
+        Lifecycle::Unknown => "unknown",
+        Lifecycle::Started => "started",
+        Lifecycle::Ready => "ready",
+        Lifecycle::StartupFailed => "startup failed",
+        Lifecycle::Panicked => "panicked",
+        Lifecycle::Exited => "exited",
     }
 }
 
 fn persistence_label(value: Persistence) -> &'static str {
     match value {
-        Persistence::Unknown => "unknown", Persistence::Pending => "pending",
-        Persistence::Failed => "failed", Persistence::Recovered => "recovered",
+        Persistence::Unknown => "unknown",
+        Persistence::Pending => "pending",
+        Persistence::Failed => "failed",
+        Persistence::Recovered => "recovered",
         Persistence::Complete => "complete",
     }
 }
 
 fn failure_label(value: Failure) -> &'static str {
     match value {
-        Failure::Busy => "busy", Failure::ReadOnly => "read only",
-        Failure::DiskFull => "disk full", Failure::PermissionDenied => "permission denied",
-        Failure::StorageUnavailable => "storage unavailable", Failure::Corrupt => "corrupt",
-        Failure::Conflict => "conflict", Failure::Serialization => "serialization",
-        Failure::InvalidData => "invalid data", Failure::Io => "I/O",
-        Failure::Database => "database", Failure::Unknown => "unknown",
+        Failure::Busy => "busy",
+        Failure::ReadOnly => "read only",
+        Failure::DiskFull => "disk full",
+        Failure::PermissionDenied => "permission denied",
+        Failure::StorageUnavailable => "storage unavailable",
+        Failure::Corrupt => "corrupt",
+        Failure::Conflict => "conflict",
+        Failure::Serialization => "serialization",
+        Failure::InvalidData => "invalid data",
+        Failure::Io => "I/O",
+        Failure::Database => "database",
+        Failure::Unknown => "unknown",
     }
 }
 
 fn event_label(value: Event) -> String {
     match value {
-        Event::Startup => "startup".into(), Event::Ready => "ready".into(),
+        Event::Startup => "startup".into(),
+        Event::Ready => "ready".into(),
         Event::StartupFailed => "startup failed".into(),
         Event::Exit { success } => if success { "clean exit" } else { "failed exit" }.into(),
-        Event::Panic { recovered } => if recovered { "panic (recovered)" } else { "panic (unrecovered)" }.into(),
+        Event::Panic { recovered } => if recovered {
+            "panic (recovered)"
+        } else {
+            "panic (unrecovered)"
+        }
+        .into(),
         Event::PersistenceStarted => "persistence started".into(),
-        Event::PersistenceFailed { category, exhausted } => format!("persistence failed: {}{}", failure_label(category), if exhausted { " (retries exhausted)" } else { "" }),
+        Event::PersistenceFailed {
+            category,
+            exhausted,
+        } => format!(
+            "persistence failed: {}{}",
+            failure_label(category),
+            if exhausted {
+                " (retries exhausted)"
+            } else {
+                ""
+            }
+        ),
         Event::PersistenceRecovered => "persistence recovered".into(),
         Event::WriterUnavailable => "writer unavailable".into(),
-        Event::FinalFlush { complete, unsaved, refused, category } => {
-            let mut label = format!("final flush {}: {unsaved} unsaved, {refused} refused", if complete { "complete" } else { "incomplete" });
-            if let Some(category) = category { label.push_str(&format!("; {}", failure_label(category))); }
+        Event::FinalFlush {
+            complete,
+            unsaved,
+            refused,
+            category,
+        } => {
+            let mut label = format!(
+                "final flush {}: {unsaved} unsaved, {refused} refused",
+                if complete { "complete" } else { "incomplete" }
+            );
+            if let Some(category) = category {
+                label.push_str(&format!("; {}", failure_label(category)));
+            }
             label
         }
-        Event::SettingsFailed { category } => format!("settings failed: {}", failure_label(category)),
+        Event::SettingsFailed { category } => {
+            format!("settings failed: {}", failure_label(category))
+        }
         Event::ProtocolMismatch => "protocol mismatch".into(),
         Event::EventsSkipped { count } => format!("{count} skipped events"),
     }
@@ -1016,12 +1070,26 @@ mod tests {
         let (_root, path) = fixture();
         let mut recorder = Recorder::open(&path, Product::Daemon).unwrap();
         recorder.append(Event::Startup).unwrap();
-        recorder.append(Event::FinalFlush { complete: false, unsaved: 3, refused: 2, category: Some(Failure::DiskFull) }).unwrap();
+        recorder
+            .append(Event::FinalFlush {
+                complete: false,
+                unsaved: 3,
+                refused: 2,
+                category: Some(Failure::DiskFull),
+            })
+            .unwrap();
         let report = inspect_at(path).unwrap();
-        let at = report.products[1].last_observed.as_ref().unwrap().at_unix_ms;
+        let at = report.products[1]
+            .last_observed
+            .as_ref()
+            .unwrap()
+            .at_unix_ms;
         let human = report.human_at(at + 180_000);
         assert!(human.contains("3 min ago"), "{human}");
-        assert!(human.contains("final flush incomplete: 3 unsaved, 2 refused; disk full"), "{human}");
+        assert!(
+            human.contains("final flush incomplete: 3 unsaved, 2 refused; disk full"),
+            "{human}"
+        );
         for debug in ["Some(", "None", "FinalFlush", "at_unix_ms="] {
             assert!(!human.contains(debug), "{human}");
         }
