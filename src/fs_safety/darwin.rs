@@ -192,13 +192,21 @@ mod tests {
         let acl = Acl(unsafe { acl_get_fd_np(file.as_raw_fd(), ACL_TYPE_EXTENDED) });
         if acl.0.is_null() {
             let error = io::Error::last_os_error();
-            assert_eq!(error.raw_os_error(), Some(libc::ENOENT), "read native ACL: {error}");
+            assert_eq!(
+                error.raw_os_error(),
+                Some(libc::ENOENT),
+                "read native ACL: {error}"
+            );
             return None;
         }
         let mut length = 0;
         // SAFETY: ACL is live and length points to caller-owned output storage.
         let text = unsafe { acl_to_text(acl.0, &mut length) };
-        assert!(!text.is_null() && length >= 0, "format native ACL: {}", io::Error::last_os_error());
+        assert!(
+            !text.is_null() && length >= 0,
+            "format native ACL: {}",
+            io::Error::last_os_error()
+        );
         // SAFETY: acl_to_text allocated exactly the returned readable length.
         let value = unsafe { std::slice::from_raw_parts(text.cast(), length as usize) }.to_vec();
         // SAFETY: ACL text is an independently allocated native ACL buffer.
@@ -214,7 +222,11 @@ mod tests {
         fs::write(&source_path, b"source contents").unwrap();
         fs::write(&destination_path, b"replacement contents").unwrap();
         let source = File::open(&source_path).unwrap();
-        let destination = File::options().read(true).write(true).open(&destination_path).unwrap();
+        let destination = File::options()
+            .read(true)
+            .write(true)
+            .open(&destination_path)
+            .unwrap();
         let identity = Command::new("/usr/bin/id").arg("-un").output().unwrap();
         assert!(identity.status.success());
         let username = String::from_utf8(identity.stdout).unwrap();
@@ -223,19 +235,44 @@ mod tests {
         // Colon delimiters preserve usernames containing spaces. chmod's ACL
         // parser resolves a username, so use the actual account name.
         let entry = format!("user:{username}:allow:read,readattr,readextattr,readsecurity");
-        assert!(Command::new("/bin/chmod").args(["+a", &entry]).arg(&source_path).status().unwrap().success());
+        assert!(
+            Command::new("/bin/chmod")
+                .args(["+a", &entry])
+                .arg(&source_path)
+                .status()
+                .unwrap()
+                .success()
+        );
         let expected = acl_text(&source);
         assert!(expected.is_some(), "fixture must install an explicit ACL");
-        assert_ne!(expected, acl_text(&destination), "fixture must establish distinct native access control");
+        assert_ne!(
+            expected,
+            acl_text(&destination),
+            "fixture must establish distinct native access control"
+        );
         copy_access_acl(&source, &destination).expect("preserve explicit native ACL");
         assert_eq!(acl_text(&destination), expected);
 
-        assert!(Command::new("/bin/chmod").arg("-N").arg(&source_path).status().unwrap().success());
+        assert!(
+            Command::new("/bin/chmod")
+                .arg("-N")
+                .arg(&source_path)
+                .status()
+                .unwrap()
+                .success()
+        );
         let absent = acl_text(&source);
         assert!(absent.is_none(), "fixture must remove the source ACL");
-        assert_ne!(absent, acl_text(&destination), "replacement still carries the previously installed ACL");
+        assert_ne!(
+            absent,
+            acl_text(&destination),
+            "replacement still carries the previously installed ACL"
+        );
         copy_access_acl(&source, &destination).expect("remove inherited or previous native ACL");
         assert_eq!(acl_text(&destination), absent);
-        assert_eq!(fs::read(&destination_path).unwrap(), b"replacement contents");
+        assert_eq!(
+            fs::read(&destination_path).unwrap(),
+            b"replacement contents"
+        );
     }
 }
