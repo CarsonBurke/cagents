@@ -331,6 +331,10 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     }
     let retained_source = source.clone();
     let recovery = Recovery {
+        launch_account_scope: crate::account::scope::LaunchAccountScope::resolve(
+            source.launch.provider, &spec.working_directory,
+            |name| spec.environment.get(name).map(std::ffi::OsString::from),
+        ).ok(),
         source,
         execution_console: None,
         paired_holder: None,

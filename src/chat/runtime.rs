@@ -182,6 +182,7 @@ struct Inner {
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    launch_account_scope:Result<crate::account::scope::LaunchAccountScope,String>,
     recovery_environment: BTreeMap<String, String>,
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
@@ -193,6 +194,10 @@ struct Inner {
     stderr_lease: Arc<Mutex<Option<super::stderr_log::Lease>>>,
 }
 
+fn capture_account_scope(spec:&ProcessSpec,provider:crate::agent::Provider)->Result<crate::account::scope::LaunchAccountScope,String> {
+    if matches!(spec.transport,TransportSpec::History) {return Err("Read-only history has no authenticated provider launch scope".into());}
+    crate::account::scope::LaunchAccountScope::resolve(provider,&spec.working_directory,|name|(!spec.unset_environment.contains(name)).then(||spec.environment.get(name).map(std::ffi::OsString::from)).flatten())
+}
 enum NativeOwnership {
     New(super::Session, BTreeMap<String, String>),
     Adopted(
@@ -210,7 +215,7 @@ impl LocalHandle {
         session_id: Option<String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        Self::start_inner(spec, adapter, initial, store, None, session_id, None, true, notify)
+        Self::start_inner(spec, adapter, initial, store, None, session_id, None, true, Err("This actor has no typed provider launch scope".into()), notify)
     }
 
     pub(crate) fn start_owned(
@@ -224,6 +229,7 @@ impl LocalHandle {
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
+        let launch_account_scope=capture_account_scope(&spec,source.launch.provider);
         Self::start_inner(
             spec,
             adapter,
@@ -233,6 +239,7 @@ impl LocalHandle {
             id,
             Some(NativeOwnership::New(source, recovery_environment)),
             true,
+            launch_account_scope,
             notify,
         )
     }
@@ -251,6 +258,7 @@ impl LocalHandle {
             .server_process
             .ok_or("Missing retained app-server process identity")?;
         spec.environment = recovery.execution_environment.0;
+        let launch_account_scope=recovery.launch_account_scope.ok_or_else(||"The retained provider has no captured credential-directory scope".to_owned());
         Self::start_inner(
             spec,
             adapter,
@@ -260,6 +268,7 @@ impl LocalHandle {
             recovery.confirmed_thread,
             Some(NativeOwnership::Adopted(holder, server)),
             true,
+            launch_account_scope,
             notify,
         )
     }
@@ -273,6 +282,7 @@ impl LocalHandle {
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
         manage_launch_ownership:bool,
+        launch_account_scope:Result<crate::account::scope::LaunchAccountScope,String>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         spec.remove_unset_environment();
@@ -375,6 +385,7 @@ impl LocalHandle {
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
                 spec.environment.clone(),
             ),
+            launch_account_scope,
             recovery_environment,
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
@@ -1113,6 +1124,7 @@ impl LocalHandle {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+    pub(crate) fn launch_account_scope(&self)->Result<&crate::account::scope::LaunchAccountScope,&str> {self.0.launch_account_scope.as_ref().map_err(String::as_str)}
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
     }
@@ -3550,6 +3562,41 @@ fn trim_subagent(agent: &mut Subagent) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn account_scope_captures_actual_startup_environment_after_unsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let home = directory.path().join("home");
+        let selected = home.join(".claude");
+        std::fs::create_dir_all(&selected).unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(), arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+                ("CLAUDE_CONFIG_DIR".into(), directory.path().join("removed-override").to_string_lossy().into_owned()),
+            ]),
+            unset_environment: ["CLAUDE_CONFIG_DIR".into()].into(),
+        };
+        let spec = ProcessSpec::from(&recipe);
+        let source = super::super::Session {
+            id: crate::model::TerminalId::new(), proof: None, terminal: None,
+            native_continuity: Default::default(), owned_codex_listener: None,
+            launch: super::super::Launch { provider: crate::agent::Provider::Claude, recipe, session_id: None },
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start_owned(spec, adapter, initial, store, source, Default::default(), None, |_| {}).unwrap();
+        let captured = handle.launch_account_scope().unwrap().clone();
+        assert_eq!(captured.canonical_home, selected.canonicalize().unwrap());
+        assert!(!handle.execution_environment().0.contains_key("CLAUDE_CONFIG_DIR"));
+        handle.command(Command::Refresh).unwrap();
+        assert_eq!(handle.launch_account_scope().unwrap(), &captured);
+        std::fs::rename(&selected, home.join("old-claude")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        assert!(handle.launch_account_scope().unwrap().revalidate().is_err());
+        handle.close().unwrap();
+    }
+    #[test]
     fn unchanged_idle_activity_publishes_new_outcomes_once_with_their_reason() {
         struct ActivityFixture;
         impl Adapter for ActivityFixture {
@@ -5203,7 +5250,7 @@ mod tests {
         let spec=ProcessSpec {execution:Some(context.clone()),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
         let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
         let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start_inner(spec,Box::new(Echo),initial,store,None,None,None,false,|_|{}).unwrap();
+        let handle=LocalHandle::start_inner(spec,Box::new(Echo),initial,store,None,None,None,false,Err("fixture has no account scope".into()),|_|{}).unwrap();
         let alive=handle.resource_lifetime();
         assert!(alive());drop(handle);
         assert!(!alive(),"a helper owns the actor directly; its policy context must not form an inner-handle cycle");
@@ -5215,7 +5262,7 @@ mod tests {
         let context=Arc::new(super::super::protocol::ExecutionContext::new(None));
         let spec=ProcessSpec {execution:Some(context),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:old.clone(),environment:BTreeMap::new()};
         let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start_inner(spec,Box::new(Echo),initial,store,None,None,None,false,|_|{}).unwrap();
+        let handle=LocalHandle::start_inner(spec,Box::new(Echo),initial,store,None,None,None,false,Err("fixture has no account scope".into()),|_|{}).unwrap();
         std::fs::rename(&old,&moved).unwrap();std::fs::create_dir(&old).unwrap();
         let proof=handle.capture_execution_directory(&moved).unwrap();
         assert_eq!(proof.identity,crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(&moved).unwrap()));
