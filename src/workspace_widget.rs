@@ -191,6 +191,9 @@ pub enum GlobalShortcut {
     DiffStageSelection,
     DiffUnstageSelection,
     DiffRevertSelection,
+    DiffStageHunk,
+    DiffUnstageHunk,
+    DiffRevertHunk,
 
     CommandPalette,
     NewThread,
@@ -331,6 +334,7 @@ impl GlobalShortcut {
                     | Self::DeleteChannel
                 | Self::StageFile | Self::UnstageFile | Self::StageOrUnstageFile
                 | Self::DiffStageSelection | Self::DiffUnstageSelection | Self::DiffRevertSelection | Self::DiffRevert
+                | Self::DiffStageHunk | Self::DiffUnstageHunk | Self::DiffRevertHunk
             )
     }
 
@@ -473,6 +477,9 @@ impl GlobalShortcut {
             Self::DiffStageSelection => "diff_stage_selection",
             Self::DiffUnstageSelection => "diff_unstage_selection",
             Self::DiffRevertSelection => "diff_revert_selection",
+            Self::DiffStageHunk => "diff_stage_hunk",
+            Self::DiffUnstageHunk => "diff_unstage_hunk",
+            Self::DiffRevertHunk => "diff_revert_hunk",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -667,6 +674,7 @@ pub struct CommandContext {
     pub editor_commands: u8,
     pub diff_presentation_commands: u16,
     pub diff_selection_commands: u8,
+    pub diff_hunk_commands: u8,
     pub pdf_commands: u8,
     pub editor_surface_commands: u8,
     pub editor_language_commands: u8,
@@ -781,6 +789,7 @@ impl ShortcutDescriptor {
         }
         if let Some(bit) = diff_presentation_command_bit(self.action) { return context.diff_presentation_commands & bit != 0; }
         if let Some(bit) = diff_selection_command_bit(self.action) { return context.diff_selection_commands & bit != 0; }
+        if let Some(bit) = diff_hunk_command_bit(self.action) { return context.diff_hunk_commands & bit != 0; }
         if let Some(bit) = editor_language_command_bit(self.action) {
             return context.editor_language_commands & bit != 0;
         }
@@ -1814,6 +1823,9 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::DiffStageSelection, label: "Stage selected diff rows", repeatable: false, scope: ShortcutScope::Review },
     ShortcutDescriptor { action: GlobalShortcut::DiffUnstageSelection, label: "Unstage selected diff rows", repeatable: false, scope: ShortcutScope::Review },
     ShortcutDescriptor { action: GlobalShortcut::DiffRevertSelection, label: "Revert selected diff rows", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffStageHunk, label: "Stage current diff hunk", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffUnstageHunk, label: "Unstage current diff hunk", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::DiffRevertHunk, label: "Revert current diff hunk", repeatable: false, scope: ShortcutScope::Review },
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -1970,6 +1982,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::DiffStageSelection => &shortcuts.diff_stage_selection,
         GlobalShortcut::DiffUnstageSelection => &shortcuts.diff_unstage_selection,
         GlobalShortcut::DiffRevertSelection => &shortcuts.diff_revert_selection,
+        GlobalShortcut::DiffStageHunk => &shortcuts.diff_stage_hunk,
+        GlobalShortcut::DiffUnstageHunk => &shortcuts.diff_unstage_hunk,
+        GlobalShortcut::DiffRevertHunk => &shortcuts.diff_revert_hunk,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -2586,6 +2601,34 @@ pub const fn diff_selection_command_bit(command: GlobalShortcut) -> Option<u8> {
         GlobalShortcut::DiffUnstageSelection => Some(1 << 1),
         GlobalShortcut::DiffRevertSelection => Some(1 << 2),
         _ => None,
+    }
+}
+
+pub const DIFF_HUNK_COMMANDS: [GlobalShortcut; 3] = [GlobalShortcut::DiffStageHunk, GlobalShortcut::DiffUnstageHunk, GlobalShortcut::DiffRevertHunk];
+pub const fn diff_hunk_command_kind(command: GlobalShortcut) -> Option<crate::git_patch::Kind> {
+    match command {
+        GlobalShortcut::DiffStageHunk => Some(crate::git_patch::Kind::Stage),
+        GlobalShortcut::DiffUnstageHunk => Some(crate::git_patch::Kind::Unstage),
+        GlobalShortcut::DiffRevertHunk => Some(crate::git_patch::Kind::Revert),
+        _ => None,
+    }
+}
+pub const fn diff_hunk_command_bit(command: GlobalShortcut) -> Option<u8> {
+    match command {
+        GlobalShortcut::DiffStageHunk => Some(1 << 0),
+        GlobalShortcut::DiffUnstageHunk => Some(1 << 1),
+        GlobalShortcut::DiffRevertHunk => Some(1 << 2),
+        _ => None,
+    }
+}
+pub const fn diff_mutation_registry_command(kind: crate::git_patch::Kind, selection: bool) -> GlobalShortcut {
+    match (kind, selection) {
+        (crate::git_patch::Kind::Stage, true) => GlobalShortcut::DiffStageSelection,
+        (crate::git_patch::Kind::Unstage, true) => GlobalShortcut::DiffUnstageSelection,
+        (crate::git_patch::Kind::Revert, true) => GlobalShortcut::DiffRevertSelection,
+        (crate::git_patch::Kind::Stage, false) => GlobalShortcut::DiffStageHunk,
+        (crate::git_patch::Kind::Unstage, false) => GlobalShortcut::DiffUnstageHunk,
+        (crate::git_patch::Kind::Revert, false) => GlobalShortcut::DiffRevertHunk,
     }
 }
 

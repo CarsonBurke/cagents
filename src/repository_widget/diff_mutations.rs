@@ -364,21 +364,16 @@ pub(super) fn selection_controls<'a>(
         (false, true) => "Stage selected lines",
         (false, false) => "Stage current hunk",
     };
-    let mut controls = vec![
-        crate::ui_controls::button::secondary(label)
-            .on_press_maybe(runtime.diff_mutation_control_action(card, primary))
-            .into(),
-    ];
+    let button = crate::ui_controls::button::secondary(label)
+        .on_press_maybe(runtime.diff_mutation_control_action(card, primary));
+    let command = crate::workspace_widget::diff_mutation_registry_command(primary, selection);
+    let mut controls = vec![crate::interaction::tooltip(button, registered_command_hint(runtime, command, label))];
     if !staged {
-        controls.push(
-            crate::ui_controls::button::quiet(if selection {
-                "Revert selected lines"
-            } else {
-                "Revert current hunk"
-            })
-            .on_press_maybe(runtime.diff_mutation_control_action(card, git_patch::Kind::Revert))
-            .into(),
-        );
+        let label = if selection { "Revert selected lines" } else { "Revert current hunk" };
+        let button = crate::ui_controls::button::quiet(label)
+            .on_press_maybe(runtime.diff_mutation_control_action(card, git_patch::Kind::Revert));
+        let command = crate::workspace_widget::diff_mutation_registry_command(git_patch::Kind::Revert, selection);
+        controls.push(crate::interaction::tooltip(button, registered_command_hint(runtime, command, label)));
     }
     widget::row::with_children(controls)
         .spacing(space::XS)

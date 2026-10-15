@@ -2967,11 +2967,14 @@ pub enum SettingsField {
     ShortcutDiffStageSelection,
     ShortcutDiffUnstageSelection,
     ShortcutDiffRevertSelection,
+    ShortcutDiffStageHunk,
+    ShortcutDiffUnstageHunk,
+    ShortcutDiffRevertHunk,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 171] = [
+    const SHORTCUTS: [Self; 174] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3143,6 +3146,9 @@ impl SettingsField {
         Self::ShortcutDiffStageSelection,
         Self::ShortcutDiffUnstageSelection,
         Self::ShortcutDiffRevertSelection,
+        Self::ShortcutDiffStageHunk,
+        Self::ShortcutDiffUnstageHunk,
+        Self::ShortcutDiffRevertHunk,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3323,6 +3329,9 @@ impl SettingsField {
             Self::ShortcutDiffStageSelection => "Stage selected diff rows",
             Self::ShortcutDiffUnstageSelection => "Unstage selected diff rows",
             Self::ShortcutDiffRevertSelection => "Revert selected diff rows",
+            Self::ShortcutDiffStageHunk => "Stage current diff hunk",
+            Self::ShortcutDiffUnstageHunk => "Unstage current diff hunk",
+            Self::ShortcutDiffRevertHunk => "Revert current diff hunk",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3557,6 +3566,9 @@ impl SettingsField {
             | Self::ShortcutDiffStageSelection
             | Self::ShortcutDiffUnstageSelection
             | Self::ShortcutDiffRevertSelection
+            | Self::ShortcutDiffStageHunk
+            | Self::ShortcutDiffUnstageHunk
+            | Self::ShortcutDiffRevertHunk
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3755,6 +3767,9 @@ struct ShortcutDraft {
     diff_stage_selection: String,
     diff_unstage_selection: String,
     diff_revert_selection: String,
+    diff_stage_hunk: String,
+    diff_unstage_hunk: String,
+    diff_revert_hunk: String,
 
     command_palette: String,
     new_native_thread: String,
@@ -3942,6 +3957,9 @@ impl ShortcutDraft {
             diff_stage_selection: settings::format_chords(&shortcuts.diff_stage_selection),
             diff_unstage_selection: settings::format_chords(&shortcuts.diff_unstage_selection),
             diff_revert_selection: settings::format_chords(&shortcuts.diff_revert_selection),
+            diff_stage_hunk: settings::format_chords(&shortcuts.diff_stage_hunk),
+            diff_unstage_hunk: settings::format_chords(&shortcuts.diff_unstage_hunk),
+            diff_revert_hunk: settings::format_chords(&shortcuts.diff_revert_hunk),
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -4410,6 +4428,9 @@ impl SettingsDraft {
             SettingsField::ShortcutDiffStageSelection => self.keyboard_shortcuts.diff_stage_selection = value,
             SettingsField::ShortcutDiffUnstageSelection => self.keyboard_shortcuts.diff_unstage_selection = value,
             SettingsField::ShortcutDiffRevertSelection => self.keyboard_shortcuts.diff_revert_selection = value,
+            SettingsField::ShortcutDiffStageHunk => self.keyboard_shortcuts.diff_stage_hunk = value,
+            SettingsField::ShortcutDiffUnstageHunk => self.keyboard_shortcuts.diff_unstage_hunk = value,
+            SettingsField::ShortcutDiffRevertHunk => self.keyboard_shortcuts.diff_revert_hunk = value,
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -4989,6 +5010,9 @@ fn settings_update(
         SettingsField::ShortcutDiffStageSelection => { next.keyboard_shortcuts.diff_stage_selection = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutDiffUnstageSelection => { next.keyboard_shortcuts.diff_unstage_selection = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutDiffRevertSelection => { next.keyboard_shortcuts.diff_revert_selection = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffStageHunk => { next.keyboard_shortcuts.diff_stage_hunk = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffUnstageHunk => { next.keyboard_shortcuts.diff_unstage_hunk = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiffRevertHunk => { next.keyboard_shortcuts.diff_revert_hunk = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);

@@ -418,6 +418,9 @@ pub struct KeyboardShortcuts {
     pub diff_stage_selection: Vec<String>,
     pub diff_unstage_selection: Vec<String>,
     pub diff_revert_selection: Vec<String>,
+    pub diff_stage_hunk: Vec<String>,
+    pub diff_unstage_hunk: Vec<String>,
+    pub diff_revert_hunk: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -602,6 +605,9 @@ impl Default for KeyboardShortcuts {
             diff_stage_selection: Vec::new(),
             diff_unstage_selection: Vec::new(),
             diff_revert_selection: Vec::new(),
+            diff_stage_hunk: Vec::new(),
+            diff_unstage_hunk: Vec::new(),
+            diff_revert_hunk: Vec::new(),
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -634,7 +640,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 171] {
+    pub fn actions(&self) -> [&Vec<String>; 174] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -807,12 +813,15 @@ impl KeyboardShortcuts {
             &self.diff_stage_selection,
             &self.diff_unstage_selection,
             &self.diff_revert_selection,
+            &self.diff_stage_hunk,
+            &self.diff_unstage_hunk,
+            &self.diff_revert_hunk,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 171] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 174] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -985,6 +994,9 @@ impl KeyboardShortcuts {
             &mut self.diff_stage_selection,
             &mut self.diff_unstage_selection,
             &mut self.diff_revert_selection,
+            &mut self.diff_stage_hunk,
+            &mut self.diff_unstage_hunk,
+            &mut self.diff_revert_hunk,
         ]
     }
 
@@ -1046,7 +1058,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 171] = [
+const SHORTCUT_ACTIONS: [&str; 174] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1218,6 +1230,9 @@ const SHORTCUT_ACTIONS: [&str; 171] = [
     "diff_stage_selection",
     "diff_unstage_selection",
     "diff_revert_selection",
+    "diff_stage_hunk",
+    "diff_unstage_hunk",
+    "diff_revert_hunk",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1381,7 +1396,7 @@ pub fn text_editing_shortcut_conflict_for(
 /// History bindings must therefore collide with it even though ordinary native
 /// editor commands are disjoint from immutable review surfaces.
 pub fn is_review_command(action: &str) -> bool {
-    if matches!(action, "diff_unified" | "diff_split" | "diff_ignore_whitespace" | "diff_revert" | "diff_retry" | "diff_stage_selection" | "diff_unstage_selection" | "diff_revert_selection") { return true; }
+    if matches!(action, "diff_unified" | "diff_split" | "diff_ignore_whitespace" | "diff_revert" | "diff_retry" | "diff_stage_selection" | "diff_unstage_selection" | "diff_revert_selection" | "diff_stage_hunk" | "diff_unstage_hunk" | "diff_revert_hunk") { return true; }
     matches!(
         action,
         "review_toggle_viewed"
@@ -2472,7 +2487,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 166] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 169] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2639,6 +2654,9 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 166] = [
     "diff_stage_selection",
     "diff_unstage_selection",
     "diff_revert_selection",
+    "diff_stage_hunk",
+    "diff_unstage_hunk",
+    "diff_revert_hunk",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
