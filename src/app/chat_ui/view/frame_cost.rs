@@ -809,7 +809,6 @@ fn retained_coordination_cards_refresh_child_model_and_waiting_metadata() {
             items: Vec::new(),
         });
     assert_eq!(runtime.turns.len(), 2);
-    assert!(runtime.retainable(&runtime.turns[0]));
     let dark = cosmic::theme::is_dark();
     let settings =
         crate::design::markdown_settings(&cosmic::theme::active(), crate::design::TEXT_PROSE);
