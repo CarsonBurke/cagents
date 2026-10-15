@@ -113,7 +113,10 @@ fn recoverable_shell(recipe: &LaunchRecipe) -> bool {
 /// upgrade replay. The marker is classification, not execution authority.
 #[cfg(any(feature = "host", test))]
 pub(crate) fn is_worktree_setup_recipe(recipe: &LaunchRecipe) -> bool {
-    recipe.environment.get("CAGENTS_WORKTREE_SETUP").is_some_and(|value| value == "1")
+    recipe
+        .environment
+        .get("CAGENTS_WORKTREE_SETUP")
+        .is_some_and(|value| value == "1")
 }
 
 #[cfg(any(feature = "host", test))]
@@ -703,8 +706,7 @@ pub(crate) mod handoff {
                 } else {
                     checkpoint_recipe(&terminal.source, &terminal.relaunches)? == terminal.recipe
                 };
-                if !ids.insert(terminal.source.id) || !recipe_matches
-                {
+                if !ids.insert(terminal.source.id) || !recipe_matches {
                     return Err("Upgrade terminal source or safe recipe is inconsistent".into());
                 }
                 lineage(
@@ -1262,7 +1264,10 @@ pub(crate) mod handoff {
         /// checkpoint in the daemon's boot path or replacing older evidence.
         #[cfg(feature = "host")]
         pub fn archive_interrupted_setup(&self) -> Result<PathBuf, String> {
-            self.archive_as(&format!("daemon-upgrade.interrupted-setup.{}.json", uuid::Uuid::new_v4()))
+            self.archive_as(&format!(
+                "daemon-upgrade.interrupted-setup.{}.json",
+                uuid::Uuid::new_v4()
+            ))
         }
 
         fn archive_as(&self, archive: &str) -> Result<PathBuf, String> {
