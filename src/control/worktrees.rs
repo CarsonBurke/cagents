@@ -96,9 +96,8 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
                     wait_for_setup(&mut client,terminal.id).map_err(|error|AppError { kind:"worktree_setup",message:format!("Worktree was created at {}, but its agent was not started: {error}",worktree.path.display()),details:Some(data.clone()) })?;
                 }
                 use crate::agent_execution::{Destination,Operation as AgentOperation,Reply as AgentReply,Spec,Submit,Surface,Target};
-                // The new project and exact worktree view must exist before the
-                // delegated agent is accepted, including calls made without a UI.
-                client.edit_workspace_model(ModelEdit::ReopenProject {repository:repository.clone(),name:repository_display_name(&repository),kind:crate::model::ProjectKind::Git}).map_err(protocol_error)?;
+                // Creation publishes its project before returning, including
+                // calls without a UI. Preserve that project's current label.
                 let accepted=client.agent(Authority::from_environment(),AgentOperation::Submit(Submit {
                     name:None,destination:Destination::New(Spec {
                         provider,account:None,target:Target {repository:repository.clone(),directory:worktree.path.clone(),placement:Some(crate::workspace_model::views::Scope::Worktree {repository,path:worktree.path.clone()})},

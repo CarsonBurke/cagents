@@ -320,6 +320,14 @@ pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError
     Ok(())
 }
 
+fn reopen_worktree_project(host:&SharedHost,repository:&std::path::Path)->Result<(),ProtocolError> {
+    let mut state=host.lock().unwrap_or_else(|poison|poison.into_inner());
+    let existing=state.read_model()?.projects.into_iter().find(|project|project.repository==repository);
+    let (name,kind)=existing.map(|project|(project.name,project.kind)).unwrap_or_else(||(crate::workspace_model::repository_display_name(repository),crate::model::ProjectKind::Git));
+    state.edit_model(0,crate::workspace_model::ModelEdit::ReopenProject {repository:repository.to_path_buf(),name,kind})?;
+    Ok(())
+}
+
 fn start_worktree_setup(
     host: &SharedHost,
     repository: &std::path::Path,
@@ -338,11 +346,11 @@ fn start_worktree_setup(
         environment:std::collections::BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),run_id.to_string()),("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(),creation_id.to_string()),("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(),started.to_string())]),unset_environment:Default::default(),
     };
     super::state::verify_worktree_setup_generation(&recipe)?;
+    reopen_worktree_project(host,repository)?;
     let session=TerminalSession {id:TerminalId::new(),owned_codex_listener:None,recovery_origin:None,predecessor:None,launch:recipe.clone(),transcript_path:None,resume_hint:None,continuity:TerminalContinuity::RelaunchAvailable {recipe,last_exit:None}};
     let pane=CardId::new();
     {
         let mut state=host.lock().unwrap_or_else(|poison|poison.into_inner());
-        state.edit_model(0,ModelEdit::ReopenProject {repository:repository.to_path_buf(),name:crate::workspace_model::repository_display_name(repository),kind:crate::model::ProjectKind::Git})?;
         let scope=Scope::Worktree {repository:repository.to_path_buf(),path:path.to_path_buf()};
         let revision=state.read_model()?.views.iter().find(|view|view.scope==scope).map_or(0,|view|view.revision);
         state.edit_model(0,ModelEdit::ChangeView {scope,expected_revision:revision,operation:uuid::Uuid::new_v4(),change:Change::Insert {
@@ -490,9 +498,7 @@ pub(super) fn process_request(
             });
             if let Ok(crate::worktree_control::service::Execution {reply:crate::worktree_control::Reply::Created {warnings,..},..})=&mut result {
                 if let Some(repository)=&repository {
-                    if let Err(error)=host.lock().unwrap_or_else(|poison|poison.into_inner()).edit_model(0,crate::workspace_model::ModelEdit::ReopenProject {
-                        repository:repository.clone(),name:crate::workspace_model::repository_display_name(repository),kind:crate::model::ProjectKind::Git,
-                    }) {warnings.push(format!("Worktree was created, but its project could not be opened in the sidebar: {error}"));}
+                    if let Err(error)=reopen_worktree_project(host,repository) {warnings.push(format!("Worktree was created, but its project could not be opened in the sidebar: {error}"));}
                 }
             }
             // Publish the project before its inventory edge, so a window can

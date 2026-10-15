@@ -73,6 +73,12 @@ impl Fixture {
         let payload:String=connection.query_row("SELECT payload_json FROM pending_operations WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?1",[path.to_str().unwrap()],|row|row.get(0)).unwrap();
         serde_json::from_str::<Value>(&payload).unwrap()["request"]["setup_intent"].clone()
     }
+    fn project_name(&self,set:Option<&str>)->String {
+        let socket=self.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+        let mut client=cagents::control::ControlClient::connect(&socket).unwrap();let repository=self.root.path().join("project/.git");
+        if let Some(name)=set {client.edit_workspace_model(cagents::workspace_model::ModelEdit::ReopenProject {repository:repository.clone(),name:name.into(),kind:cagents::model::ProjectKind::Git}).unwrap();}
+        client.read_workspace_model().unwrap().projects.into_iter().find(|project|project.repository==repository).unwrap().name
+    }
     fn refusal(&self,target:&str,contains:&str) {
         let output=self.output(&["worktree","remove",target]);assert!(!output.status.success(),"{output:?}");
         let value:Value=serde_json::from_slice(&output.stdout).unwrap();assert_eq!(value["ok"],false);assert!(value.to_string().contains(contains),"{value}");
@@ -91,6 +97,7 @@ impl Drop for Fixture {
 #[test]
 fn creates_lists_and_removes_in_configured_location_and_retains_branch_by_default() {
     let fixture=Fixture::new();
+    assert_eq!(fixture.project_name(Some("Custom project label")),"Custom project label");
     let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
     let mut observer=cagents::control::ControlClient::connect(&socket).unwrap();
     observer.watch_workspace_model().unwrap();
@@ -103,6 +110,7 @@ fn creates_lists_and_removes_in_configured_location_and_retains_branch_by_defaul
         }
     });
     let path=fixture.create("feat-one");
+    assert_eq!(fixture.project_name(None),"Custom project label");
     let event=receive.recv_timeout(Duration::from_secs(5)).expect("create must publish a sidebar refresh immediately").unwrap();
     assert!(matches!(event,cagents::control::WorkspaceModelEvent::WorktreesChanged {repository} if repository==fixture.root.path().join("project/.git")));
     watcher.join().unwrap();
@@ -220,6 +228,7 @@ fn linear_context_is_committed_with_the_created_worktree() {
 #[test]
 fn optional_agent_uses_new_worktree_and_waits_for_setup() {
     let fixture=Fixture::new();let project=fixture.root.path().join("project");
+    assert_eq!(fixture.project_name(Some("Agent project label")),"Agent project label");
     fs::create_dir(project.join(".cagents")).unwrap();
     fs::write(project.join(".cagents/worktree.toml"),"setup = \"sleep 0.05; printf ready > setup-ready\"\n").unwrap();
     let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
@@ -229,6 +238,7 @@ fn optional_agent_uses_new_worktree_and_waits_for_setup() {
     fs::write(&provider,format!("#!/bin/sh\nset -eu\n[ -f setup-ready ] || exit 18\nprintf '%s' \"$PWD\" > \"$HOME/../spawn-directory\"\n{}",include_str!("fixtures/automation-claude.sh"))).unwrap();
     fs::set_permissions(provider,fs::Permissions::from_mode(0o700)).unwrap();
     let data=fixture.cli(&["worktree","create","with-agent","--spawn-agent","claude","--model","haiku","--prompt","Reply ready"]);
+    assert_eq!(fixture.project_name(None),"Agent project label");
     let path=Path::new(data["worktree"]["path"].as_str().unwrap());
     assert!(path.join("setup-ready").is_file());
     assert_eq!(data["agent"]["agent"]["spec"]["target"]["directory"],path.to_str().unwrap());
