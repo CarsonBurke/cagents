@@ -14371,15 +14371,26 @@ mod worktree_journal_tests {
         service: RepositoryService,
     }
 
+    fn fixture_git_command(repository: &Path) -> Command {
+        let mut command = Command::new("git");
+        for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+            command.env_remove(name);
+        }
+        command.arg("-C").arg(repository).args([
+            "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+            "-c", "init.templateDir=",
+        ]).env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        command
+    }
+
     impl Fixture {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
             let repository = directory.path().join("repo");
             fs::create_dir(&repository).unwrap();
             let git = |arguments: &[&str]| {
-                let output = Command::new("git")
-                    .arg("-C")
-                    .arg(&repository)
+                let output = fixture_git_command(&repository)
                     .args(arguments)
                     .env("GIT_CONFIG_NOSYSTEM", "1")
                     .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -14473,9 +14484,7 @@ mod worktree_journal_tests {
         }
 
         fn git(&self, arguments: &[&str]) -> String {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(&self.request.repository)
+            let output = fixture_git_command(&self.request.repository)
                 .args([
                     "-c",
                     "user.name=Test",
@@ -14850,7 +14859,7 @@ mod worktree_journal_tests {
                 && !self.attempted.swap(true, Ordering::SeqCst)
             {
                 if let Some(replacement) = &self.replacement {
-                    let output = Command::new("git").arg("-C").arg(&self.repository)
+                    let output = fixture_git_command(&self.repository)
                         .args(["update-ref", "refs/heads/feature", replacement, &self.old])
                         .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1")
                         .output().unwrap();
