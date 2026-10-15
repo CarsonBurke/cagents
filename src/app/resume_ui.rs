@@ -5,6 +5,7 @@ use crate::persistence::SavedConversation;
 use cosmic::iced::futures::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 mod catalog;
+pub(in crate::app) mod placement;
 
 /// Conversations read before the first found ones are listed, so the newest
 /// appear at once, and between later listings.
