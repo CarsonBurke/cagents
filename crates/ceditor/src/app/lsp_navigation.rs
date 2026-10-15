@@ -4,6 +4,20 @@ use cagents::repository_widget::EditorLspAction;
 use std::collections::HashMap;
 
 const RESULT_LIMIT: usize = 512;
+const LABEL_CHAR_LIMIT: usize = 256;
+
+// The typed target remains intact for activation. Only bounded prefixes and
+// suffixes enter native text layout, even for a very large non-file URI.
+fn location_label_path(text: &str) -> String {
+    let mut prefix = text.chars().take(LABEL_CHAR_LIMIT + 1).collect::<Vec<_>>();
+    if prefix.len() <= LABEL_CHAR_LIMIT {
+        return prefix.into_iter().map(|ch| if ch.is_control() { ' ' } else { ch }).collect();
+    }
+    prefix.truncate(LABEL_CHAR_LIMIT / 2);
+    let suffix = text.chars().rev().take(LABEL_CHAR_LIMIT / 2).collect::<Vec<_>>();
+    prefix.into_iter().chain(std::iter::once('…')).chain(suffix.into_iter().rev())
+        .map(|ch| if ch.is_control() { ' ' } else { ch }).collect()
+}
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -184,8 +198,8 @@ impl Editor {
         if results.items.is_empty() { rows.push(design::caption("No locations found").into()); }
         for (index, item) in results.items.iter().enumerate() {
             let (path, local) = match &item.target {
-                LspTarget::Workspace { path } | LspTarget::External { path } => (path.to_string_lossy().into_owned(), true),
-                LspTarget::Uri { uri } => (uri.clone(), false),
+                LspTarget::Workspace { path } | LspTarget::External { path } => (location_label_path(&path.to_string_lossy()), true),
+                LspTarget::Uri { uri } => (location_label_path(uri), false),
             };
             let label = format!("{}:{}:{}", path, item.range.start.line.saturating_add(1), item.range.start.character.saturating_add(1));
             rows.push(widget::button::text(label).on_press_maybe(local.then_some(Message::Navigation(Action::Select { card, request: results.origin.request, index }))).into());
@@ -204,6 +218,19 @@ mod tests {
         let task = app.add(Opened { root: root.to_path_buf(), file: Some(path.into()), snapshot: None }, true);
         run_tasks(app, task);
         app.active.unwrap()
+    }
+
+    #[test]
+    fn location_labels_bound_unicode_layout_without_copying_the_full_target() {
+        let text = format!("file:/{}/tail😀.rs", "a😀é\n".repeat(300_000));
+        let label = location_label_path(&text);
+        assert!(label.chars().count() <= LABEL_CHAR_LIMIT + 1);
+        assert!(label.starts_with("file:/"));
+        assert!(label.ends_with("/tail😀.rs"));
+        assert!(label.contains('…'));
+        assert!(!label.contains('\n'));
+        assert_eq!(location_label_path("short/é.rs"), "short/é.rs");
+        assert_eq!(location_label_path(&"é".repeat(LABEL_CHAR_LIMIT)).chars().count(), LABEL_CHAR_LIMIT);
     }
 
     #[test]
