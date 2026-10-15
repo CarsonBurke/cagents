@@ -32,7 +32,8 @@ pub struct Snapshot {
 impl Snapshot {
     /// Independent read streams order row authority by read start, rather than
     /// callback delivery. A delayed result cannot overwrite newer accepted facts.
-    fn preserve_newer_status(&mut self, current: &Self) {
+    fn preserve_newer_status(&mut self, current: &Self) -> HashSet<WorktreeId> {
+        let mut preserved = HashSet::new();
         let current_rows = current
             .worktrees
             .iter()
@@ -55,6 +56,7 @@ impl Snapshot {
             {
                 return true;
             }
+            preserved.insert(id);
             self.status_updates.remove(&id);
             self.status_reads.insert(id, latest_at);
             if let Some(error) = current.status_errors.get(&id) {
@@ -94,6 +96,7 @@ impl Snapshot {
                 continue;
             }
             self.worktrees.push(row.clone());
+            preserved.insert(id);
             self.status_updates.remove(&id);
             self.status_reads.insert(id, latest);
             if let Some(error) = current.status_errors.get(&id) {
@@ -107,7 +110,30 @@ impl Snapshot {
                 self.operations.remove(&id);
             }
         }
+        preserved
     }
+}
+
+/// A stale listing can also carry stale watch coverage. Keep previously planned
+/// coverage for rows whose newer status won, without doing filesystem work on
+/// the UI thread. Only missing coverage needs one coalesced worker replan.
+fn reconcile_watch_plan(
+    plan: &mut git_watch::Project,
+    previous: Option<&git_watch::Project>,
+    snapshot: &Snapshot,
+    preserved: &HashSet<WorktreeId>,
+) -> BTreeSet<WorktreeId> {
+    let roots = snapshot.worktrees.iter().filter(|(record, _)| !record.bare)
+        .map(|(record, _)| (record.id, &record.path)).collect::<HashMap<_, _>>();
+    let replacements = previous.into_iter().flat_map(|project| &project.worktrees)
+        .filter(|worktree| preserved.contains(&worktree.id) && roots.get(&worktree.id).is_some_and(|root| **root == worktree.root))
+        .collect::<Vec<_>>();
+    let replacement_ids = replacements.iter().map(|worktree| worktree.id).collect::<HashSet<_>>();
+    plan.worktrees.retain(|worktree| !replacement_ids.contains(&worktree.id)
+        && roots.get(&worktree.id).is_some_and(|root| **root == worktree.root));
+    plan.worktrees.extend(replacements.into_iter().cloned());
+    let covered = plan.worktrees.iter().map(|worktree| worktree.id).collect::<HashSet<_>>();
+    preserved.iter().copied().filter(|id| roots.contains_key(id) && !covered.contains(id)).collect()
 }
 
 struct Entry {
@@ -597,9 +623,13 @@ impl Cagents {
                 if self.repository_generations.get(&project) != Some(&generation) {
                     return self.start_git_reads();
                 }
+                let mut repair = BTreeSet::new();
                 match result {
-                    Ok((mut snapshot, plan)) => {
-                        snapshot.preserve_newer_status(&entry.snapshot);
+                    Ok((mut snapshot, mut plan)) => {
+                        let preserved = snapshot.preserve_newer_status(&entry.snapshot);
+                        if let Some(plan) = plan.as_mut() {
+                            repair = reconcile_watch_plan(plan, entry.plan.as_deref(), &snapshot, &preserved);
+                        }
                         if entry.read_full_scan {
                             entry.read_failure = None;
                         }
@@ -659,6 +689,11 @@ impl Cagents {
                         }
                         entry.read_failure = Some(error);
                     }
+                }
+                if !repair.is_empty() {
+                    self.refresh_ui.git.changed(project, git_watch::Change {
+                        worktrees: repair, membership: true, ..Default::default()
+                    });
                 }
             }
         }
@@ -1568,7 +1603,7 @@ mod tests {
             );
             let project_id = ProjectId::new();
             let cancel = CancellationToken::default();
-            let (baseline, _) = read_local(
+            let (baseline, baseline_plan) = read_local(
                 project_id,
                 initial,
                 git_watch::Change {
@@ -1592,7 +1627,7 @@ mod tests {
             };
             let parked = directory.path().join("parked");
             fs::rename(&linked, &parked).unwrap();
-            let (removed, _) = read_local(
+            let (removed, removed_plan) = read_local(
                 project_id,
                 baseline.clone(),
                 git_watch::Change {
@@ -1613,6 +1648,10 @@ mod tests {
                 removed.status_reads.contains_key(&worktree),
                 "omission has its own read authority"
             );
+            let baseline_plan = baseline_plan.unwrap();
+            let removed_plan = removed_plan.unwrap();
+            assert!(baseline_plan.worktrees.iter().any(|record| record.id == worktree));
+            assert!(!removed_plan.worktrees.iter().any(|record| record.id == worktree));
             fs::rename(&parked, &linked).unwrap();
             fs::write(linked.join("new.txt"), "recovered content\n").unwrap();
             let read = next_status_read();
@@ -1620,11 +1659,13 @@ mod tests {
                 .snapshot(&linked, &cancel)
                 .unwrap();
             let mut app = app_with_status_snapshot(baseline, &key);
+            app.refresh_ui.git.entries.get_mut(&project_id).unwrap().plan = Some(Arc::new(baseline_plan));
+            app.refresh_ui.git.monitor = Some(git_watch::Monitor::start().unwrap());
             drop(app.update(bound_status_message(&key, 7, snapshot, read)));
             drop(app.update(Message::GitUi(Action::Read {
                 project: project_id,
                 generation: 9,
-                result: Ok((removed, None)),
+                result: Ok((removed, Some(removed_plan))),
             })));
             let row = app.sidebar_model.projects[0]
                 .worktrees
@@ -1640,6 +1681,36 @@ mod tests {
                     .iter()
                     .any(|(record, _)| record.id == worktree)
             );
+            let plan = app.refresh_ui.git.entries[&project_id].plan.as_ref().unwrap();
+            assert!(plan.worktrees.iter().any(|record| record.id == worktree && record.root == linked),
+                "recovered B keeps its content and private metadata coverage");
+            // No prior coverage must request one worker repair; a newer
+            // removal must also strip any stale incoming registration.
+            let current = &app.refresh_ui.git.entries[&project_id].snapshot;
+            let preserved = [worktree].into_iter().collect();
+            let mut absent_plan = (**plan).clone();
+            absent_plan.worktrees.retain(|row| row.id != worktree);
+            assert_eq!(reconcile_watch_plan(&mut absent_plan, None, current, &preserved), [worktree].into());
+            let mut without_b = current.clone();
+            without_b.worktrees.retain(|(record, _)| record.id != worktree);
+            let mut stale_plan = (**plan).clone();
+            assert!(reconcile_watch_plan(&mut stale_plan, Some(plan), &without_b, &preserved).is_empty());
+            assert!(!stale_plan.worktrees.iter().any(|record| record.id == worktree));
+            let monitor = app.refresh_ui.git.monitor.as_ref().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if monitor.drain().get(&project_id).is_some_and(|change| change.coverage == Some(true)) { break; }
+                assert!(Instant::now() < deadline, "reconciled native watch coverage was not acknowledged");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            monitor.drain();
+            fs::write(linked.join("new.txt"), "edit after recovery\n").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if monitor.drain().get(&project_id).is_some_and(|change| change.worktrees.contains(&worktree)) { break; }
+                assert!(Instant::now() < deadline, "recovered worktree lost subsequent native events");
+                std::thread::sleep(Duration::from_millis(10));
+            }
         }
     }
 
