@@ -623,7 +623,7 @@ impl Cagents {
                 self.reset_palette_selection();
                 self.reveal_palette_selection()
             }
-            Action::Run(MessageBox(message)) => self.run_palette_command(*message),
+            Action::Run(MessageBox(message)) => self.activate_palette_entry(*message),
             Action::RunChatPane(target, command) => {
                 let current = match command {
                     Command::ForkConversation => self.chat_fork_target(target.card),
@@ -676,19 +676,19 @@ impl Cagents {
                 let Some(message) = self.palette.selected_message.clone() else {
                     return self.update_palette(Action::Close);
                 };
-                if !self
-                    .palette_entries()
-                    .iter()
-                    .any(|(_, _, candidate)| same_palette_entry(&message, candidate))
-                {
-                    self.status = Some(TransientNotice::warning(
-                        "The selected result is no longer available; choose another result",
-                    ));
-                    return Task::none();
-                }
-                self.run_palette_command(message)
+                self.activate_palette_entry(message)
             }
         }
+    }
+
+    /// Click and Enter activate the captured row only while that exact target
+    /// remains among the current results. Never substitute a refreshed row.
+    fn activate_palette_entry(&mut self, message: Message) -> Task<Message> {
+        if !self.palette.is_open() || !self.palette_entries().iter().any(|(_, _, candidate)| same_palette_entry(&message, candidate)) {
+            self.status = Some(TransientNotice::warning("The selected result is no longer available; choose another result"));
+            return Task::none();
+        }
+        self.run_palette_command(message)
     }
 
     fn run_palette_command(&mut self, message: Message) -> Task<Message> {
@@ -3704,8 +3704,8 @@ mod tests {
     }
 
     #[test]
-    fn enter_refuses_same_id_workspace_targets_after_their_paths_change() {
-        for folder in [false, true] {
+    fn enter_and_click_refuse_same_id_workspace_targets_after_their_paths_change() {
+        for (folder, click) in [false, true].into_iter().flat_map(|folder| [false, true].map(move |click| (folder, click))) {
             let mut app = settings_focus_fixture();
             app.sidebar_model = sidebar::tests::panel_model();
             app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
@@ -3729,6 +3729,7 @@ mod tests {
                     _ => false,
                 })
                 .unwrap();
+            let captured = entries[index].2.clone();
             app.select_palette_entry(index, &entries);
             if folder {
                 app.sidebar_model.projects[0].repository = "/relocated-project".into();
@@ -3758,7 +3759,7 @@ mod tests {
             assert!(app.palette_selection_index(&refreshed).is_none());
             let active = app.active_workspace.clone();
             let before = app.settings.palette_recents.clone();
-            drop(app.update_palette(Action::Submit));
+            drop(app.update_palette(if click { Action::Run(MessageBox(Box::new(captured))) } else { Action::Submit }));
             assert!(app.palette.is_open());
             assert_eq!(
                 app.active_workspace, active,
@@ -3771,6 +3772,25 @@ mod tests {
                     .is_some_and(|notice| notice.message.contains("selected result"))
             );
         }
+    }
+
+    #[test]
+    fn stale_pointer_command_keeps_the_palette_and_recents_when_capability_disappears() {
+        let mut app = settings_focus_fixture();
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_state.observe_agent_update(card, ProjectId::new(), crate::model::WorktreeId::new());
+        assert!(app.command_available(Command::MarkAllRead));
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query(">mark all read".into())));
+        let captured = app.palette_entries().into_iter().find_map(|(_, _, message)| matches!(message, Message::RunCommand(Command::MarkAllRead)).then_some(message)).unwrap();
+        let recents = app.settings.palette_recents.clone();
+        app.sidebar_state.acknowledge_agent_update(card);
+        assert!(!app.command_available(Command::MarkAllRead));
+        drop(app.update_palette(Action::Run(MessageBox(Box::new(captured)))));
+        assert!(app.palette.is_open());
+        assert_eq!(app.palette.query.as_deref(), Some(">mark all read"));
+        assert_eq!(app.settings.palette_recents, recents);
+        assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("selected result")));
     }
 
     #[test]
@@ -5008,7 +5028,7 @@ mod settings_recorder_tests {
             }];
         drop(app.update_palette(Action::Open));
         assert!(app.command_available(Command::GitApplyStash));
-        drop(app.run_palette_command(Message::RunCommand(Command::GitApplyStash)));
+        drop(app.update_palette(Action::Run(MessageBox(Box::new(Message::RunCommand(Command::GitApplyStash))))));
         assert!(app.palette.query.is_some());
         assert!(app.palette.git_captured);
         assert_eq!(app.palette.stash_picker, Some(Command::GitApplyStash));
