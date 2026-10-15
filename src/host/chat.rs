@@ -4950,7 +4950,7 @@ done
 
     #[test]
     fn hidden_source_authority_reaches_framed_eof_after_actual_store_failure() {
-        for (intent,completed_reader,clock_exhausted) in [(false,false,false),(true,false,false),(false,true,false),(false,true,true)] {
+        for (intent,completed_reader,clock_exhausted,revocation_failed) in [(false,false,false,false),(true,false,false,false),(false,true,false,false),(false,true,true,false),(false,true,false,true)] {
             struct ResetAdapter;
             impl Adapter for ResetAdapter {
                 fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
@@ -4994,14 +4994,15 @@ done
                 handle.close().unwrap();
                 // Actual SQLITE_DENY on ROLLBACK permanently poisons this
                 // completed Store. No live actor remains to emit the scalar.
+                if revocation_failed {handle.fail_source_revocation_for_test();}
                 handle.deny_source_release_for_test(clock_exhausted);
                 let response=process(&host,1,ClientRequest::ChatCommand {chat_id:id,command:Command::LoadSource {query:chat::cache::SourceQuery {
                     source:chat::cache::SourceKey {agent_id:None,source_id:"private".into()},offset:0,limit:64,expected_epoch:None,until:None,
                 }}}).unwrap();
                 assert!(matches!(response,ServerResponse::ChatSource {result:Err(_),..}));
-                if clock_exhausted {
+                if clock_exhausted || revocation_failed {
                     assert!(handle.source_authority().is_none());
-                    assert_eq!(handle.source_authority_unavailable(),Some(chat::SourceAuthorityUnavailableCause::ClockExhausted));
+                    assert_eq!(handle.source_authority_unavailable(),Some(if revocation_failed {chat::SourceAuthorityUnavailableCause::RevocationFailed} else {chat::SourceAuthorityUnavailableCause::ClockExhausted}));
                     None
                 } else {
                     let pair=handle.source_authority().unwrap();
@@ -5031,8 +5032,9 @@ done
                         ServerMessage::ChatSourceAuthority {incarnation,generation,..}=> {
                             assert_eq!(Some((incarnation,generation)),revoked);seen=true;
                         }
-                        ServerMessage::ChatSourceAuthorityUnavailable {cause:chat::SourceAuthorityUnavailableCause::ClockExhausted,..}=> {
-                            assert!(clock_exhausted && revoked.is_none());seen=true;
+                        ServerMessage::ChatSourceAuthorityUnavailable {cause,..}=> {
+                            assert!((clock_exhausted || revocation_failed) && revoked.is_none());
+                            assert_eq!(cause,if revocation_failed {chat::SourceAuthorityUnavailableCause::RevocationFailed} else {chat::SourceAuthorityUnavailableCause::ClockExhausted});seen=true;
                         }
                         ServerMessage::ChatActivity {..}|ServerMessage::ChatObserved {..}=>{}
                         other=>panic!("hidden reset hydrated a body: {other:?}"),

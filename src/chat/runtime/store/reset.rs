@@ -83,10 +83,14 @@ impl Store {
     /// Metadata still describes the process; no retained private body is republished.
     pub(in crate::chat::runtime) fn publish_source_authority(&mut self, state: &mut crate::chat::Snapshot) {
         if let Err(reason) = self.source_guard() {
-            if !self.reset_pending {
-                self.reset_pending = true;
-                self.canonical_generation = uuid::Uuid::new_v4();
-                self.source_incarnation = uuid::Uuid::new_v4();
+            if !self.reset_pending && self.source_authority_unavailable().is_none() {
+                match self.rotate_source_incarnation() {
+                    Ok(()) => {
+                        self.reset_pending = true;
+                        self.canonical_generation = uuid::Uuid::new_v4();
+                    }
+                    Err(revocation) => tracing::warn!(reason=%crate::chat::protocol::preview(revocation.as_bytes(),1024),"Source kernel revocation was refused; no replacement identity was issued"),
+                }
             }
             self.dirty = true;
             state.items.clear();
@@ -108,19 +112,19 @@ impl Store {
             for child in &mut state.subagents {child.items.clear();}
             state.source_parts.clear();state.raw_source_parts.clear();
             state.file_changes=Default::default();
-            state.error=Some(error);
+            if state.error.is_none() { state.error=Some(error); }
         }
     }
     pub(super) fn reset_all(&mut self, reason: String) -> Result<Vec<Event>, String> {
         if !self.source_clock_available() {
-            return Err("Reset was refused before source mutation because its authority clock is exhausted".into());
+            return Err("Reset was refused before source mutation because source authority is unavailable".into());
         }
         // Revoke local readers BEFORE even attempting the durable reservation.
         // Failed intent persistence is an explicit unacknowledged Reset, never
         // a claim that a future reopen can discover an unwritten intent.
+        self.rotate_source_incarnation()?;
         self.reset_pending = true;
         self.canonical_generation = uuid::Uuid::new_v4();
-        self.source_incarnation = uuid::Uuid::new_v4();
         self.dirty = true;
         self.presentation = None;
         self.presented_generation = None;

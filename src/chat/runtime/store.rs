@@ -10,6 +10,7 @@ mod raw;
 mod reset;
 mod read_lease;
 mod source_authority;
+mod source_revocation;
 mod source;
 
 use super::observed_at;
@@ -69,6 +70,7 @@ pub(crate) struct Store {
     reset_pending: bool,
     source_reads: read_lease::State,
     source_authority: source_authority::Clock,
+    source_revocation: crate::transcript_cache::export::SourceRevocationEpoch,
     raw_sources: raw::State,
     file_revision: u64,
     child_file_ordinal: i64,
@@ -175,12 +177,16 @@ impl Store {
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             let raw_sources = raw::initialize_with(&mut db, child_tools::initialize_in)?;
+            let source_incarnation = uuid::Uuid::new_v4();
+            let source_revocation = crate::transcript_cache::export::SourceRevocationEpoch::new(source_incarnation)
+                .map_err(|error| error.to_string())?;
             Ok(Self {
                 raw_sources,
                 canonical_generation: uuid::Uuid::new_v4(),
                 reset_pending: false,
                 source_reads: Default::default(),
                 source_authority: Default::default(),
+                source_revocation,
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -213,7 +219,7 @@ impl Store {
                 child_tools_have_revocations: false,
                 pending_child_source: None,
                 source_revision: 0,
-                source_incarnation: uuid::Uuid::new_v4(),
+                source_incarnation,
             })
         })();
         if result.is_err() {

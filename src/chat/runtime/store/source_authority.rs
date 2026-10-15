@@ -11,6 +11,11 @@ pub(super) struct Clock {
     observer:std::sync::Weak<crate::chat::runtime::Inner>,
 }
 impl Store {
+    pub(super) fn refuse_source_revocation(&mut self) {
+        self.source_authority.unavailable.get_or_insert(crate::chat::SourceAuthorityUnavailableCause::RevocationFailed);
+        self.source_reads.poison();
+    }
+
     pub(in crate::chat::runtime) fn register_source_authority_observer(&mut self,observer:std::sync::Weak<crate::chat::runtime::Inner>) {
         self.source_authority.observer=observer;
     }
@@ -28,7 +33,7 @@ impl Store {
     pub(in crate::chat::runtime) fn source_authority_unavailable(&self)->Option<crate::chat::SourceAuthorityUnavailableCause> {self.source_authority.unavailable}
     pub(super) fn source_clock_available(&self)->bool {self.source_authority.unavailable.is_none() && self.source_authority.floor<=u64::MAX-2}
     pub(super) fn record_source_authority(&mut self,state:&mut crate::chat::Snapshot)->Result<(),String> {
-        if self.source_authority.unavailable.is_some() {return Err("Source authority clock is exhausted".into());}
+        if self.source_authority.unavailable.is_some() {return Err("Source authority is unavailable".into());}
         self.note_source_generation_floor(state.generation);
         let clock=&mut self.source_authority;
         if clock.last.is_none_or(|last|last.incarnation!=self.source_incarnation) {
@@ -61,7 +66,7 @@ mod tests {
         store.publish_source_authority(&mut replacement);
         assert_eq!(store.source_authority(),Some(pair));
         assert!(replacement.generation>=900);
-        store.source_incarnation=uuid::Uuid::new_v4();
+        store.rotate_source_incarnation().unwrap();
         store.publish_source_authority(&mut replacement);
         let next=store.source_authority().unwrap();
         assert_ne!(next.incarnation,pair.incarnation);

@@ -15,7 +15,7 @@ use std::{
     process::{Child, Command as Process, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -127,6 +127,21 @@ pub(crate) enum Update {
     SourceAuthorityUnavailable {cause:super::SourceAuthorityUnavailableCause},
 }
 
+fn source_unavailable_code(cause:super::SourceAuthorityUnavailableCause)->u8 {
+    match cause {
+        super::SourceAuthorityUnavailableCause::ClockExhausted=>1,
+        super::SourceAuthorityUnavailableCause::RevocationFailed=>2,
+    }
+}
+fn source_unavailable_cause(code:u8)->Option<super::SourceAuthorityUnavailableCause> {
+    match code {
+        0=>None,
+        1=>Some(super::SourceAuthorityUnavailableCause::ClockExhausted),
+        2=>Some(super::SourceAuthorityUnavailableCause::RevocationFailed),
+        _=>unreachable!("only typed source causes enter this atomic cache"),
+    }
+}
+
 #[derive(Clone)]
 pub struct Handle(Arc<Inner>);
 
@@ -155,8 +170,12 @@ impl Handle {
         }
         store.deny_source_release_for_test();
     }
+    #[cfg(test)]
+    pub(crate) fn fail_source_revocation_for_test(&self) {
+        self.0.store.lock().unwrap().fail_source_revocation_for_test();
+    }
     pub(crate) fn source_authority_unavailable(&self)->Option<super::SourceAuthorityUnavailableCause> {
-        self.0.source_unavailable.load(Ordering::Acquire).then_some(super::SourceAuthorityUnavailableCause::ClockExhausted)
+        source_unavailable_cause(self.0.source_unavailable.load(Ordering::Acquire))
     }
     /// Local Store clocks cannot issue a contradiction. Remote facades retain
     /// and expose exact contradictions received from a helper.
@@ -176,7 +195,7 @@ struct SourceRefreshContext {
     state:Arc<Mutex<Snapshot>>,
     source_authority:Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty:Arc<AtomicBool>,
-    source_unavailable:Arc<AtomicBool>,
+    source_unavailable:Arc<AtomicU8>,
     wake:Arc<UnixStream>,
 }
 impl SourceRefreshContext {
@@ -198,8 +217,8 @@ impl SourceRefreshContext {
             store.publish_source_authority(&mut state);
             (store.source_authority(),store.source_authority_unavailable())
         };
-        if unavailable.is_some() {
-            if !self.source_unavailable.swap(true,Ordering::AcqRel) {
+        if let Some(cause)=unavailable {
+            if self.source_unavailable.compare_exchange(0,source_unavailable_code(cause),Ordering::AcqRel,Ordering::Acquire).is_ok() {
                 self.source_dirty.store(true,Ordering::Release);
                 self.wake();
             }
@@ -259,7 +278,7 @@ struct Inner {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
-    source_unavailable: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicU8>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -444,7 +463,7 @@ impl Handle {
         };
         let source_authority = Arc::new(Mutex::new(initial_authority));
         let source_dirty = Arc::new(AtomicBool::new(false));
-        let source_unavailable = Arc::new(AtomicBool::new(initial_unavailable.is_some()));
+        let source_unavailable = Arc::new(AtomicU8::new(initial_unavailable.map_or(0,source_unavailable_code)));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -496,7 +515,7 @@ impl Handle {
             store.register_source_authority_observer(Arc::downgrade(&inner));
             store.publish_source_authority(&mut state);
             *inner.source_authority.lock().unwrap_or_else(|p|p.into_inner())=store.source_authority();
-            inner.source_unavailable.store(store.source_authority_unavailable().is_some(),Ordering::Release);
+            inner.source_unavailable.store(store.source_authority_unavailable().map_or(0,source_unavailable_code),Ordering::Release);
         }
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -2033,7 +2052,7 @@ struct Actor {
     confirmed_session: Arc<Mutex<Option<String>>>,
     source_authority: Arc<Mutex<Option<SourceAuthority>>>,
     source_dirty: Arc<AtomicBool>,
-    source_unavailable: Arc<AtomicBool>,
+    source_unavailable: Arc<AtomicU8>,
     source_notified: Option<SourceAuthority>,
     source_unavailable_notified: bool,
     store: Arc<Mutex<Store>>,
@@ -2808,7 +2827,7 @@ impl Actor {
             (store.source_authority(),store.source_authority_unavailable())
         };
         if let Some(cause)=unavailable {
-            self.source_unavailable.store(true,Ordering::Release);
+            let _=self.source_unavailable.compare_exchange(0,source_unavailable_code(cause),Ordering::AcqRel,Ordering::Acquire);
             if !self.source_unavailable_notified {
                 self.source_unavailable_notified=true;
                 (self.notify)(Update::SourceAuthorityUnavailable {cause});

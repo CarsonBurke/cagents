@@ -867,7 +867,12 @@ impl PromptSuggestion {
 /// source identity, semantic acknowledgement or process-cleanup authority.
 #[derive(Clone,Copy,Debug,Eq,PartialEq,Serialize,Deserialize)]
 #[serde(rename_all="snake_case")]
-pub enum SourceAuthorityUnavailableCause {ClockExhausted}
+pub enum SourceAuthorityUnavailableCause {
+    ClockExhausted,
+    /// The actual Store could not establish its kernel source revocation.
+    /// This grants no replacement source identity and never acknowledges Reset.
+    RevocationFailed,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
