@@ -95,6 +95,19 @@ fn highlighted<'a, Message: 'a>(
     size: f32,
     line_height: f32,
 ) -> Element<'a, Message> {
+    iced::widget::rich_text(highlighted_spans(&text, query, font))
+        .size(size)
+        .line_height(iced::widget::text::LineHeight::Absolute(line_height.into()))
+        .width(Length::Fill)
+        .into()
+}
+
+/// The native rich-text builder consumes these exact render properties.
+fn highlighted_spans(
+    text: &str,
+    query: &str,
+    font: iced::Font,
+) -> Vec<iced::widget::text::Span<'static, ()>> {
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut spans = Vec::new();
     let boundaries: Vec<_> = text
@@ -117,19 +130,18 @@ fn highlighted<'a, Message: 'a>(
         let span: iced::widget::text::Span<'_, ()> =
             iced::widget::text::Span::new(text[range[0]..range[1]].to_owned());
         spans.push(if highlighted[range[0]] {
+            // Title roles already use Bold. Underline distinguishes a match
+            // without changing the role's font size or line box.
             span.font(iced::Font {
                 weight: iced::font::Weight::Bold,
                 ..font
             })
+            .underline(true)
         } else {
             span.font(font)
         });
     }
-    iced::widget::rich_text(spans)
-        .size(size)
-        .line_height(iced::widget::text::LineHeight::Absolute(line_height.into()))
-        .width(Length::Fill)
-        .into()
+    spans
 }
 
 pub fn matches(text: &str, query: &str) -> bool {
@@ -347,6 +359,35 @@ mod tests {
             assert_eq!(
                 node.children()[0].children()[0].size().height,
                 design::LINE_TITLE,
+            );
+        }
+    }
+
+    #[test]
+    fn search_matches_remain_visible_when_the_title_is_already_bold() {
+        for (label, query, matched) in [
+            ("Editor > Font", "editor", "Editor"),
+            ("Editor > naïve fonts", "NAÏVE", "naïve"),
+        ] {
+            let font = design::title_font();
+            assert_eq!(font.weight, iced::font::Weight::Bold);
+            let spans = highlighted_spans(label, query, font);
+            assert_eq!(
+                spans.iter().map(|span| span.text.as_ref()).collect::<String>(),
+                label,
+            );
+            assert_eq!(
+                spans.iter().filter(|span| span.underline)
+                    .map(|span| span.text.as_ref()).collect::<String>(),
+                matched,
+            );
+            assert!(
+                spans.iter().any(|span| !span.underline),
+                "context outside the match keeps its ordinary role",
+            );
+            assert!(spans.iter().all(|span| span.font == Some(font)));
+            assert!(
+                highlighted_spans(label, "", font).iter().all(|span| !span.underline),
             );
         }
     }
