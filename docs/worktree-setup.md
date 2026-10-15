@@ -45,3 +45,7 @@ journal. Callers supply the exact prior intent and the updated intent; both this
 expectation and a whole-payload compare-and-swap must match. A stale callback
 cannot overwrite a newer resumed run. This method performs no Git, filesystem or
 shell effects; callers still verify configuration/trust before explicit setup.
+
+Copies preserve source access ACLs as well as mode bits and remove inherited
+access ACLs when the source has none. An ACL-copy error prevents publication of
+the temporary copy; the created worktree is retained for inspection.
