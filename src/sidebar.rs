@@ -5475,21 +5475,20 @@ fn project_identity(name: &str) -> (String, cosmic::iced::Color) {
     (initials, cosmic::iced::Color::from_rgb(r + 0.08, g + 0.08, b + 0.08))
 }
 
-fn compact_project_attention(project: &SidebarProject, state: &SidebarState) -> (Option<crate::agent::ActivityState>, bool) {
-    use crate::agent::ActivityState;
-    let activities = project.channels.iter().filter_map(|row| row.activity)
-        .chain(project.worktrees.iter().filter_map(|row| state.agent_activity(project.id, row.id)));
-    let mut activity = None;
-    for candidate in activities {
-        if candidate == ActivityState::Waiting {
-            activity = Some(candidate);
-            break;
-        }
-        if candidate == ActivityState::Working { activity = Some(candidate); }
+fn compact_project_attention(project: &SidebarProject, state: &SidebarState) -> Option<AttentionState> {
+    project.channels.iter().filter_map(|channel| {
+        attention_state(channel.activity, channel.unread, channel.outcome.as_ref())
+    }).chain(project.worktrees.iter().filter_map(|row| state.worktree_attention(project.id, row.id))).max()
+}
+
+fn attention_description(attention: AttentionState) -> &'static str {
+    match attention {
+        AttentionState::Waiting => "agent needs input",
+        AttentionState::Failed => "agent failed",
+        AttentionState::Working => "agent working",
+        AttentionState::Unread => "unread agent update",
+        AttentionState::Cancelled => "agent cancelled",
     }
-    let unread = project.channels.iter().any(|row| row.unread)
-        || project.worktrees.iter().any(|row| state.has_agent_update(project.id, row.id));
-    (activity, unread)
 }
 
 fn compact_project_identity(project: &SidebarProject, selected: bool, modal_open: bool, state: &SidebarState) -> Element<'static, SidebarAction> {
@@ -5512,21 +5511,28 @@ fn compact_project_identity(project: &SidebarProject, selected: bool, modal_open
             },
             ..Default::default()
         }));
-    let (activity, unread) = compact_project_attention(project, state);
+    let attention = compact_project_attention(project, state);
     let mut description = project.name.clone();
     for worktree in &project.worktrees {
         use std::fmt::Write as _;
         let selected = state.selection == Some(SidebarSelection::Worktree { project_id: project.id, worktree_id: worktree.id });
         let _ = write!(description, "\n{}{}: {}", if selected { "Selected " } else { "" }, worktree.label(),
             status_summary(worktree.detached, worktree.locked, worktree.dirty.as_ref(), worktree.untracked_omitted, worktree.ahead, worktree.behind));
-        if state.agent_activity(project.id, worktree.id) == Some(crate::agent::ActivityState::Waiting) {
-            description.push_str(", agent needs input");
+        if let Some(attention) = state.worktree_attention(project.id, worktree.id) {
+            let _ = write!(description, ", {}", attention_description(attention));
+        }
+        if let Some(outcome) = state.worktree_outcome(project.id, worktree.id) {
+            if let Some(reason) = outcome.reason() { let _ = write!(description, ": {reason}"); }
         }
     }
-    if unread { description.push_str("\nUnread agent update"); }
-    if activity == Some(crate::agent::ActivityState::Waiting) { description.push_str("\nAn agent is waiting for input"); }
+    for channel in &project.channels {
+        if let Some(attention) = attention_state(channel.activity, channel.unread, channel.outcome.as_ref()) {
+            use std::fmt::Write as _;
+            let _ = write!(description, "\n{}: {}", channel.title, attention_description(attention));
+        }
+    }
     let grid = RowGrid::child(true);
-    let control = grid.control(grid.content(chip, None, agent_indicator(activity, unread)), selected)
+    let control = grid.control(grid.content(chip, None, attention_indicator(attention)), selected)
         .id(project.chrome.open_id.clone())
         .name(description.clone())
         .on_press_maybe(project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open)));
@@ -11531,9 +11537,23 @@ pub(crate) mod tests {
         let mut state = SidebarState::default();
         state.set_agent_activity(CardId::new(), project.id, project.worktrees[0].id,
             crate::agent::Activity { provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Waiting });
-        let (activity, unread) = compact_project_attention(&project, &state);
-        assert_eq!(activity, Some(crate::agent::ActivityState::Waiting));
-        assert!(agent_indicator(activity, unread).is_some());
+        let attention = compact_project_attention(&project, &state);
+        assert_eq!(attention, Some(AttentionState::Waiting));
+        assert!(attention_indicator(attention).is_some());
+    }
+
+    #[test]
+    fn compact_project_badge_uses_the_shared_failed_over_working_ranking() {
+        let mut project = project();
+        let mut channel = SidebarChannel::new(ChannelId::new(), "failed task".into(), false,
+            None, true, 1, true, 1);
+        channel.outcome = Some(crate::agent::ActivityOutcome::Failed { reason: "fixture failure".into() });
+        project.channels.push(channel);
+        let mut state = SidebarState::default();
+        state.set_agent_activity(CardId::new(), project.id, project.worktrees[0].id,
+            crate::agent::Activity { provider: crate::agent::Provider::Codex, state: crate::agent::ActivityState::Working });
+        assert_eq!(compact_project_attention(&project, &state), Some(AttentionState::Failed));
+        assert!(attention_indicator(compact_project_attention(&project, &state)).is_some());
     }
 
     #[test]
