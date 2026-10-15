@@ -36,6 +36,11 @@
 //!
 //! # Removal
 //!
+//! The current host admission foundation retains managed files until the
+//! complete ownership/deletion permit is composed. Existing local UI cleanup
+//! APIs below are outside this daemon admission cut; discovery grants no new
+//! cleanup authority.
+//!
 //! A home is removed by renaming it aside within its provider directory and
 //! then deleting the renamed tree. Nothing is followed on the way:
 //! the path is rebuilt from the account's key rather than taken from
@@ -55,6 +60,9 @@ use std::{
 use uuid::Uuid;
 
 use crate::agent::Provider;
+
+mod creation;
+pub(crate) use creation::NewHomeCreationReceipt;
 
 /// Where a removal parks a home while it is deleted, so a removal that is
 /// interrupted leaves a name nothing else uses, and the next start finishes
@@ -115,6 +123,15 @@ impl Homes {
         crate::instance::owned_lock(&self.root.join(".lifecycle.lock"), libc::LOCK_EX)
     }
 
+    /// Host short admission must never wait behind another process's flock.
+    pub(crate) fn try_lifecycle_lock(&self) -> io::Result<crate::instance::OwnedLock> {
+        crate::secure_file::prepare_private_directory(&self.root)?;
+        crate::instance::owned_lock(
+            &self.root.join(".lifecycle.lock"),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+    }
+
     fn provider_directory(&self, provider: Provider) -> PathBuf {
         self.root.join(provider.executable())
     }
@@ -147,18 +164,56 @@ impl Homes {
         system_home: Option<&Path>,
         codex_config: CodexConfig,
     ) -> io::Result<(Uuid, PathBuf)> {
-        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        self.create_with_config_initialized(provider, system_home, codex_config, |_| Ok(()))
+    }
+
+    /// Genuine fresh mkdir provenance, before seeded configuration, shared
+    /// links or publication. Existing directories are never adopted here.
+    /// Store callers hold registry/lifecycle leases: initialize must not
+    /// reenter Store::load/update or acquire export federation locks. The host
+    /// callback only enrolls its actual directory in the existing reservation;
+    /// no production export bootstrap or read grant is enabled here.
+    pub(crate) fn create_with_config_initialized(
+        &self,
+        provider: Provider,
+        system_home: Option<&Path>,
+        codex_config: CodexConfig,
+        initialize: impl FnOnce(&NewHomeCreationReceipt) -> io::Result<()>,
+    ) -> io::Result<(Uuid, PathBuf)> {
+        self.create_planned_with_config_initialized(
+            provider,
+            Uuid::new_v4(),
+            system_home,
+            codex_config,
+            initialize,
+        )
+    }
+
+    /// Host admission chooses the fresh UUID before mkdir so its exact future
+    /// home can be reserved. This argument grants no creation/read authority;
+    /// the nonrecursive mkdir must still succeed and mint the actual receipt.
+    pub(crate) fn create_planned_with_config_initialized(
+        &self,
+        provider: Provider,
+        key: Uuid,
+        system_home: Option<&Path>,
+        codex_config: CodexConfig,
+        initialize: impl FnOnce(&NewHomeCreationReceipt) -> io::Result<()>,
+    ) -> io::Result<(Uuid, PathBuf)> {
         let parent = self.provider_directory(provider);
         crate::secure_file::prepare_private_directory(&self.root)?;
         crate::secure_file::prepare_private_directory(&parent)?;
-        let key = Uuid::new_v4();
         let path = self.path(provider, key);
-        fs::DirBuilder::new().mode(0o700).create(&path)?;
-        crate::secure_file::reject_symlink_components(&path)?;
-        crate::secure_file::validate_owned_directory(&path)?;
-        // The mode given at creation is narrowed by the umask, never widened;
-        // setting it again states it exactly.
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        let created = creation::create(&parent, provider, key)?;
+        if let Err(error) = initialize(&created).and_then(|()| created.revalidate()) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!(
+                    "Account initialization failed; files were retained at {} for explicit recovery: {error}",
+                    path.display(),
+                ),
+            ));
+        }
         if let Some(system_home) = system_home {
             let seeded = match provider {
                 Provider::Claude => seed_claude(system_home, &path),
@@ -168,11 +223,14 @@ impl Homes {
                 _ => Ok(()),
             };
             if let Err(error) = seeded {
-                let _ = self.remove(provider, key);
-                return Err(error);
+                return Err(io::Error::other(format!(
+                    "{error}; the new home was retained at {} for recovery",
+                    path.display()
+                )));
             }
             link_shared(provider, system_home, &path);
         }
+        created.revalidate()?;
         Ok((key, path))
     }
 
@@ -209,6 +267,7 @@ impl Homes {
     /// Called only with a supported, existing registry and both locks held.
     /// A grace period also protects homes being created by an older window
     /// that predates atomic creation/registration.
+    #[cfg(test)]
     pub(crate) fn park_orphans(&self, registry: &super::registry::Registry) -> io::Result<()> {
         for provider in super::Account::PROVIDERS {
             let directory = self.provider_directory(provider);
@@ -567,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_seed_removes_the_unregistered_home() {
+    fn a_failed_seed_retains_the_unregistered_home_for_proved_recovery() {
         let directory = tempfile::tempdir().unwrap();
         let system = directory.path().join("system");
         fs::create_dir_all(system.join("settings.json")).unwrap();
@@ -577,7 +636,7 @@ mod tests {
             fs::read_dir(directory.path().join("accounts/claude"))
                 .unwrap()
                 .count(),
-            0
+            1
         );
     }
 

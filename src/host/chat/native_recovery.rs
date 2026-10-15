@@ -79,6 +79,8 @@ pub(super) fn restore(
     client: ClientId,
     source: &Session,
 ) -> Result<ServerResponse, String> {
+    // Main's durable holder format has no immutable account-home proof.
+    super::super::account_lifecycle::ensure_idle(host).map_err(|error| error.message)?;
     let proof = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
