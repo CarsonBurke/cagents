@@ -1501,6 +1501,7 @@ pub(super) struct Runtime {
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
+    presentation_revision: u64,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
     /// The palette the cache's code blocks are highlighted in.
@@ -2096,6 +2097,7 @@ impl Runtime {
             interrupt_armed: None,
             drop_hover: false,
             cache: HashMap::new(),
+            presentation_revision: 0,
             preview_request: None,
             syntax_theme,
             turns: Vec::new(),
@@ -2270,6 +2272,7 @@ impl Runtime {
     /// Prepare parent grouping metadata and only the currently selected
     /// child's presentation. Hidden children keep no Markdown/highlight cache.
     fn prepare_transcript_cache(&mut self, snapshot: &Snapshot) {
+        let mut presentation_changed = false;
         // Each transcript has its own streaming lifecycle: a child can keep
         // running after the parent finishes. Only its newest item can grow;
         // older items release their parser and highlighter continuation.
@@ -2310,7 +2313,9 @@ impl Runtime {
                 if unchanged {
                     cached.item = Some(item.clone());
                     if !growing {
+                        let previous_revision = cached.revision;
                         cached.settle(&item.content, self.syntax_theme);
+                        presentation_changed |= cached.revision != previous_revision;
                     }
                     continue;
                 }
@@ -2319,6 +2324,7 @@ impl Runtime {
                     && let Some(body) = cached.token.appended(text, &item.content)
                 {
                     cached.extend(body, growing, self.syntax_theme);
+                    presentation_changed = true;
                     cached.token = token;
                     cached.item = Some(item.clone());
                     continue;
@@ -2339,7 +2345,9 @@ impl Runtime {
             }
             cached.item = Some(item.clone());
             self.cache.insert(item.id.clone(), cached);
+            presentation_changed = true;
         }
+        if presentation_changed { self.presentation_revision = self.presentation_revision.wrapping_add(1); }
     }
 
     fn refresh(&mut self) {
@@ -2435,6 +2443,7 @@ impl Runtime {
         if !same_ids(&self.snapshot.items, &snapshot.items)
             || !same_ids(previous_selected.map_or(&[], |agent| agent.items.as_slice()), selected.map_or(&[], |agent| agent.items.as_slice())) {
             self.cache.retain(|id, _| snapshot.items.iter().chain(selected.into_iter().flat_map(|agent| &agent.items)).any(|item| &item.id == id));
+            self.presentation_revision = self.presentation_revision.wrapping_add(1);
         }
         // Rare disclosure-budget pruning can inspect all raw identities;
         // ordinary streaming refreshes need no newly allocated ID HashSet.
