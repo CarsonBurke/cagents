@@ -18160,13 +18160,16 @@ mod tests {
         }));
         assert_eq!(runtime.find_total, 2);
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.content.move_to(text_editor::Cursor {
+            // Native move_to(None) preserves an existing selection. A click
+            // places a fresh caret, so replace the selected Find match here.
+            document.content.set_cursor(text_editor::Cursor {
                 position: text_editor::Position {
                     line: 0,
                     column: 11,
                 },
                 selection: None,
             });
+            assert!(document.content.selection().is_none());
         }
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
@@ -18673,7 +18676,20 @@ mod tests {
         let DocumentState::Editable(document) = &runtime.document else {
             unreachable!();
         };
-        assert_eq!(document.content.selection().as_deref(), Some("alpha"));
+        assert_eq!(document.content.cursor().position.column, 17);
+        assert!(
+            document.content.selection().is_none(),
+            "refreshing matches preserves the clamped editing caret instead of selecting another occurrence"
+        );
+        drop(runtime.update(RepositoryAction::FindNext { card }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            unreachable!();
+        };
+        assert_eq!(
+            document.content.selection().as_deref(),
+            Some("alpha"),
+            "explicit Find navigation still selects the next occurrence"
+        );
     }
 
     #[test]
