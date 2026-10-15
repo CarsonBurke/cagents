@@ -816,9 +816,11 @@ impl Cagents {
         if changed {
             self.sort_durable_channels();
             self.refresh_sidebar_channels();
-            self.persist();
             tasks.push(self.sync_chrome());
         }
+        // Reconciliation persists the completed projection. Publishing here
+        // would pair old local descriptors with pending-start flags from the
+        // newly received model, before its pane sources have been adopted.
         tasks.push(self.reconcile_shared_views());
         Task::batch(tasks)
     }

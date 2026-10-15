@@ -2259,6 +2259,13 @@ mod tests {
         });
         while rx.try_recv().is_ok() {}
         let mut model = app.workspace_model.clone();
+        // Metadata adoption must not publish the old pane before projection.
+        model
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == source)
+            .unwrap()
+            .title = "Renamed source while moving".into();
         views::transfer(
             &mut model.views,
             &Scope::Channel(source),
@@ -2290,6 +2297,15 @@ mod tests {
             panic!("presentation retry");
         };
         assert_eq!(scope, Scope::Channel(destination));
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == source)
+                .unwrap()
+                .title,
+            "Renamed source while moving"
+        );
         let Change::Update {
             before,
             pane: after,
@@ -2319,7 +2335,8 @@ mod tests {
                 .message
                 .contains("incoming session update could not be verified")
         }));
-        assert!(rx.try_recv().is_err());
+        let unexpected = rx.try_recv();
+        assert!(unexpected.is_err(), "unexpected publication: {unexpected:?}");
     }
 
     #[test]
