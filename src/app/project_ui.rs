@@ -30,8 +30,8 @@ pub struct State {
     close_started: HashMap<ProjectId, Instant>,
     close_in_flight: HashSet<ProjectId>,
     close_failed: HashSet<ProjectId>,
-    // A completed teardown must not be repeated merely because file recovery
-    // arrived while it ran. Only its original local close generation may finish.
+    // A completed teardown must not be repeated merely because an editor
+    // acquired work while it ran. Only its original close generation may finish.
     recovery_closures: HashMap<ProjectId, (u64, ProjectSessionClosure)>,
     close_cancellations: HashMap<ProjectId, CancellationToken>,
     pub(super) close_generation: HashMap<ProjectId, u64>,
@@ -748,13 +748,13 @@ impl Cagents {
         id: ProjectId,
         closure: ProjectSessionClosure,
     ) -> Task<Message> {
-        if self.project_ui.closing.contains_key(&id) && self.project_has_editor_recovery(id) {
+        if self.project_ui.closing.contains_key(&id) && self.project_has_unsaved_editors(id) {
             self.project_ui.close_in_flight.remove(&id);
             if let Some(generation) = self.project_ui.close_generation.get(&id).copied() {
                 self.project_ui.recovery_closures.insert(id, (generation, closure));
             }
             self.status = Some(TransientNotice::warning(
-                "Project sessions have closed. Editors were kept until file recovery finishes.",
+                "Project sessions have closed. Finish saving or applying edits and resolve file recovery before removing the editors.",
             ));
             return Task::none();
         }
@@ -1483,9 +1483,9 @@ impl Cagents {
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
                     // a second close request: dropping a runtime only detaches.
-                    let retained_recovery = self.durable.cards.iter().any(|card| {
+                    let retained_editors = self.durable.cards.iter().any(|card| {
                         card.existence.is_open() && card_belongs_to(card, &target.path)
-                            && self.card_has_editor_recovery(card.id)
+                            && (self.card_has_editor_recovery(card.id) || self.card_has_project_editor_write(card.id))
                     });
                     let ids = self
                         .durable
@@ -1494,6 +1494,7 @@ impl Cagents {
                         .filter(|card| {
                             card.existence.is_open() && card_belongs_to(card, &target.path)
                                 && !self.card_has_editor_recovery(card.id)
+                                && !self.card_has_project_editor_write(card.id)
                         })
                         .map(|card| card.id)
                         .collect::<Vec<_>>();
@@ -1569,8 +1570,8 @@ impl Cagents {
                         }
                     };
                     self.persist();
-                    self.status = Some(if retained_recovery {
-                        TransientNotice::warning("The worktree was removed. Editors with pending file recovery were kept.")
+                    self.status = Some(if retained_editors {
+                        TransientNotice::warning("The worktree was removed. Editors were kept to finish saving, applying edits or file recovery.")
                     } else {
                         TransientNotice::success("Worktree deleted; branch retained.")
                     });
@@ -1743,6 +1744,14 @@ impl Cagents {
             .flat_map(|project| &mut project.worktrees)
         {
             worktree.deletion = self.project_ui.row_deletion(worktree.id);
+        }
+    }
+
+    fn card_has_project_editor_write(&self, card: CardId) -> bool {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.is_saving(),
+            Some(CardRuntime::PullRequests(pane)) => pane.runtime.is_saving(),
+            _ => false,
         }
     }
 
@@ -2937,6 +2946,33 @@ mod tests {
         drop(app.complete_closed_projects());
         assert!(!app.project_ui.recovery_closures.contains_key(&project));
         assert!(app.sidebar_model.project(project).is_none());assert!(!app.cards.contains_key(&card));
+    }
+
+    #[test]
+    fn late_project_and_worktree_completion_preserve_an_admitted_editor_write() {
+        for worktree_completion in [false,true] {
+            let repository=PathBuf::from("/pending-write-project");
+            let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+            let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+            let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+            drop(app.add_terminal(linked.path.clone()));let card=app.durable.cards.last().unwrap().id;
+            let (mut runtime,_held_completion)=RepositoryRuntime::post_persist_failure_fixture(card);
+            runtime.descriptor.project=project;runtime.descriptor.repository=repository.clone();runtime.descriptor.worktree=linked.path.clone();
+            app.card_state_mut(card).unwrap().kind=CardKind::Repository(runtime.descriptor.clone());
+            assert!(runtime.is_saving());
+            app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));
+            if worktree_completion {
+                let target=app.project_target(project,Some(linked.id)).unwrap();
+                drop(app.handle_project_action(Action::Deleted{target,result:Ok(())}));
+                assert!(row(&app,linked.id).is_none());
+            } else {
+                app.project_ui.closing.insert(project,repository.clone());app.project_ui.close_generation.insert(project,7);
+                drop(app.finish_closed_project(project,ProjectSessionClosure::for_roots(vec![repository])));
+                assert!(app.sidebar_model.project(project).is_some());assert!(app.project_ui.recovery_closures.contains_key(&project));
+            }
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.card_has_project_editor_write(card));assert!(app.cards.contains_key(&card));
+        }
     }
 
     #[test]
