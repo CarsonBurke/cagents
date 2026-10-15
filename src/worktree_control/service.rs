@@ -179,7 +179,11 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
         Operation::SetDisposableIgnoredDirectories {repository,path,directories} => {
             same_repository(&service,&repository,&path,&cancellation)?;
             service.set_disposable_ignored_directories(&path,&directories,&cancellation).map_err(|error|error.to_string())?;
-            inspect(&service,&repository,&path,&cancellation)
+            Ok(Reply::DisposableIgnoredDirectories {directories:service.disposable_ignored_directories(&path,&cancellation).map_err(|error|error.to_string())?})
+        }
+        Operation::GetDisposableIgnoredDirectories {repository,path}=> {
+            same_repository(&service,&repository,&path,&cancellation)?;
+            Ok(Reply::DisposableIgnoredDirectories {directories:service.disposable_ignored_directories(&path,&cancellation).map_err(|error|error.to_string())?})
         }
     }
 }

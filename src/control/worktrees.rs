@@ -115,6 +115,7 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
         Reply::BranchDeleted {..}|Reply::BranchDeleteRefused {..}=>return Err(AppError::new("protocol","Unexpected branch-deletion response")),
         Reply::StaleLock {..}=>return Err(AppError::new("protocol","Unexpected stale-lock response")),
         Reply::ResolvedProject {..}=>return Err(AppError::new("protocol","Unexpected project-ID response")),
+        Reply::DisposableIgnoredDirectories {..}=>return Err(AppError::new("protocol","Unexpected policy response")),
         Reply::Inspected {..}=>return Err(AppError::new("protocol","Unexpected worktree inspection response")),
         Reply::Removed {path,branch_deleted,warnings,branch_error}=> {
             let data=json!({"schema_version":1,"path":path,"branch_deleted":branch_deleted,"warnings":warnings,"branch_error":branch_error});

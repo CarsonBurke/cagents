@@ -249,3 +249,24 @@ fn removal_refuses_a_canonical_path_that_cannot_be_encoded_exactly() {
     assert!(value.to_string().contains("refusing a lossy removal target"),"{value}");
     assert!(raw.join("tracked").is_file());
 }
+
+#[test]
+fn policy_read_and_write_do_not_depend_on_a_successful_safety_census() {
+    use cagents::{device_service,worktree_control::{Operation,Reply}};
+    let fixture=Fixture::new();let path=fixture.create("policy");
+    let admin=fixture.git(&path,&["rev-parse","--absolute-git-dir"]);
+    let index=Path::new(admin.trim()).join("index");
+    fs::rename(&index,index.with_extension("fixture-backup")).unwrap();
+    fs::create_dir(&index).unwrap();
+    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();
+    let repository=fixture.root.path().join("project/.git");
+    assert!(client.device_operation(device_service::Operation::Worktree {operation:Operation::Inspect {repository:repository.clone(),path:path.clone()}}).is_err());
+    let read=client.device_operation(device_service::Operation::Worktree {operation:Operation::GetDisposableIgnoredDirectories {repository:repository.clone(),path:path.clone()}}).unwrap();
+    let device_service::Reply::Worktree(Reply::DisposableIgnoredDirectories {mut directories})=read else {panic!("wrong policy reply")};
+    directories.push("private-cache".into());
+    let saved=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetDisposableIgnoredDirectories {repository:repository.clone(),path:path.clone(),directories:directories.clone()}}).unwrap();
+    assert_eq!(saved,device_service::Reply::Worktree(Reply::DisposableIgnoredDirectories {directories:directories.clone()}));
+    let read=client.device_operation(device_service::Operation::Worktree {operation:Operation::GetDisposableIgnoredDirectories {repository,path}}).unwrap();
+    assert_eq!(read,saved);
+}
