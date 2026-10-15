@@ -63,7 +63,7 @@ enum Destination {
     Edit(String),
 }
 
-pub(super) struct Composer {
+struct Composer {
     authority: Authority,
     destination: Destination,
     content: text_editor::Content<cosmic::Renderer>,
@@ -87,7 +87,7 @@ pub(super) struct DiscussionState {
     threads: HashMap<String, FileThreads>,
     markdown: HashMap<String, Vec<markdown::Item>>,
     expanded: BTreeSet<String>,
-    pub(super) composer: Option<Composer>,
+    composer: Option<Composer>,
     /// The submission surface is disclosed on demand rather than parked
     /// under every diff.
     review_open: bool,
