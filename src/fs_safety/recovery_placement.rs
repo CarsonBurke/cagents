@@ -11,6 +11,19 @@ use std::{collections::HashSet, os::unix::fs::MetadataExt, sync::Arc};
 const MAX_EXCLUDED_ROOTS: usize = 256;
 const MAX_ANCESTORS: usize = 256;
 
+/// An observation of an already-held directory, not creation/effect authority.
+/// Keep its original Root alive to prevent inode reuse while comparing stamps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RecoveryDirectoryStamp {
+    pub device: u64,
+    pub inode: u64,
+    pub mount_id: u64,
+}
+pub fn recovery_directory_stamp(root: &Root) -> io::Result<RecoveryDirectoryStamp> {
+    let (device, inode) = identity(root)?;
+    Ok(RecoveryDirectoryStamp { device, inode, mount_id: mount_identity(root)? })
+}
+
 /// Worker-only logical registration/current-root validation. The caller must
 /// retain its actual epoch/lease, reject adoption of a source enclosing pending
 /// payloads, and invalidate writes when that authority changes. A fresh always-
@@ -121,6 +134,16 @@ impl RecoveryPlacement {
     /// and retry. Failure retains the old authority; it never authorizes a new
     /// root or replacement path. Callers must preserve typed creation failures.
     pub fn validate(&self) -> io::Result<()> {
+        self.validate_against_roots(&[])
+    }
+    /// Worker-only current census proof for registry/adoption reservation. The
+    /// caller retains these fresh Roots and its admission authority through the
+    /// subsequent effect. Do not call while holding a lock/IPC turn that the
+    /// registry callback itself needs; this method invokes that check twice.
+    pub fn validate_against_roots(&self, current_roots: &[Arc<Root>]) -> io::Result<()> {
+        if current_roots.len() > MAX_EXCLUDED_ROOTS {
+            return Err(unsupported("The current recovery root census exceeds its bounded inspection."));
+        }
         (self.registry.check)()?;
         if identity(&self.source)? != self.source_identity || identity(&self.parent)? != self.parent_identity
             || mount_identity(&self.source)? != self.source_mount || mount_identity(&self.parent)? != self.parent_mount {
@@ -128,6 +151,10 @@ impl RecoveryPlacement {
         }
         let mut excluded = HashSet::from([self.source_identity]);
         for root in self.excluded.iter() { excluded.insert(identity(root)?); }
+        for root in current_roots { excluded.insert(identity(root)?); }
+        if excluded.len() > MAX_EXCLUDED_ROOTS {
+            return Err(unsupported("The combined recovery root census exceeds its bounded inspection."));
+        }
         let mut cursor = self.parent.try_clone()?;
         for _ in 0..MAX_ANCESTORS {
             let current = identity(&cursor)?;
@@ -221,6 +248,19 @@ mod tests {
         fs::create_dir(tree.path().join(".git")).unwrap();
         assert!(placement.validate().is_err());
         assert!(!tree.path().join("outside/holding").exists());
+    }
+
+    #[test]
+    fn current_adoption_census_refuses_enclosing_root_but_allows_unrelated_root() {
+        let tree = tempfile::tempdir().unwrap();
+        for path in ["source", "outside", "unrelated"] { fs::create_dir(tree.path().join(path)).unwrap(); }
+        let source = root(&tree.path().join("source"));
+        let placement = RecoveryPlacement::acquire(root(&tree.path().join("outside")), source.clone(), Arc::from([]), registry()).unwrap();
+        placement.validate_against_roots(&[root(&tree.path().join("unrelated"))]).unwrap();
+        assert!(placement.validate_against_roots(&[root(tree.path())]).is_err());
+        assert_eq!(recovery_directory_stamp(&source).unwrap(), recovery_directory_stamp(&source.try_clone().unwrap()).unwrap());
+        placement.validate_for_source(&source).unwrap();
+        assert!(placement.validate_for_source(&root(&tree.path().join("unrelated"))).is_err());
     }
 
     #[test]
