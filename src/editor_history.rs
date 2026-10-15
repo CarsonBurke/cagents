@@ -174,10 +174,18 @@ impl History {
     /// length, pruning and coalescing. Saving seals the active transaction.
     pub fn revision(&self) -> u64 { self.revision }
 
+    /// Reserves an identity for an external disk baseline without claiming
+    /// that the current buffer or any existing undo state contains its bytes.
+    /// The caller may adopt it only after verifying the corresponding text.
+    pub fn reserve_revision(&mut self) -> u64 {
+        let reserved = self.next_revision;
+        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        reserved
+    }
+
     fn advance_revision(&mut self) -> (u64, u64) {
         let before = self.revision;
-        self.revision = self.next_revision;
-        self.next_revision = self.next_revision.wrapping_add(1).max(1);
+        self.revision = self.reserve_revision();
         (before, self.revision)
     }
 
@@ -887,6 +895,36 @@ mod tests {
         assert_eq!(history.revision(), saved);
         assert_eq!(history.undo(&mut model), Replay::Applied);
         assert_eq!(history.revision(), initial);
+    }
+
+    #[test]
+    fn external_baseline_identity_does_not_alias_undo_or_future_edits() {
+        let mut history = History::default();
+        let mut model = Model::new("A");
+        let initial = history.revision();
+        let now = Instant::now();
+        model.edit(&mut history, 0, 1, "B", EditKind::Other, now);
+        let mine = history.revision();
+        let external = history.reserve_revision();
+        assert_eq!(history.revision(), mine, "Keep mine must retain the buffer's identity");
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "A");
+        assert_eq!(history.revision(), initial);
+        assert_ne!(history.revision(), external, "Undo to A is dirty against external disk C");
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "B");
+        assert_eq!(history.revision(), mine);
+        assert_ne!(history.revision(), external);
+        model.edit(&mut history, 0, 1, "C", EditKind::Other, now);
+        assert_ne!(history.revision(), external, "future edits cannot consume the reserved identity");
+        // A byte comparison now proves that this state equals disk C.
+        history.adopt_revision(external);
+        assert_eq!(history.undo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "B");
+        assert_ne!(history.revision(), external);
+        assert_eq!(history.redo(&mut model), Replay::Applied);
+        assert_eq!(model.text, "C");
+        assert_eq!(history.revision(), external);
     }
 
     #[test]
