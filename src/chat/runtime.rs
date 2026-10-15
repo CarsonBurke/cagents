@@ -1325,7 +1325,13 @@ impl Handle {
                 }
             } else {Some(false)};
             if retained==Some(false) && detached==Some(false) && !self.0.native_reconciling.load(Ordering::Acquire) {
-                self.0.close_state.lock().unwrap_or_else(|p|p.into_inner()).unobserved_native=false;
+                let mut close=match self.0.close_state.try_lock() {
+                    Ok(close)=>close,
+                    Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock)=>return Err("Native cleanup is proved; resident metadata is busy, retry exact cleanup publication".into()),
+                };
+                close.unobserved_native=false;
+                drop(close);
                 return self.close_result();
             }
             if retained==Some(true) || detached==Some(true) {
@@ -3352,6 +3358,24 @@ mod tests {
         context.observe_provider_directory(path).unwrap();
         context
     }
+    #[test]
+    fn completed_stop_cleanup_does_not_wait_for_resident_proof_publication() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        let metadata=handle.0.close_state.lock().unwrap();
+        let stopped=handle.clone();let (reply,result)=crossbeam_channel::bounded(1);
+        let call=thread::spawn(move|| {let started=Instant::now();let outcome=stopped.close_until(started+Duration::from_millis(40));let _=reply.send((outcome,started.elapsed()));});
+        let bounded=result.recv_timeout(Duration::from_millis(250));
+        drop(metadata);call.join().unwrap();
+        let (outcome,elapsed)=bounded.expect("completed cleanup must not wait past its budget on held metadata");
+        assert!(outcome.is_err(),"contended proof publication is retryable, never false success");
+        assert!(elapsed<Duration::from_millis(250));
+        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+    }
+
     #[test]
     fn session_stop_deadline_does_not_wait_for_resident_identity_publication() {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
