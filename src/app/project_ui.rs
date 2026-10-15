@@ -3851,8 +3851,15 @@ impl StopAuthorization {
         }
         let mut client = self.connection.client.lock()
             .map_err(|_| "The original inspection connection is unavailable. Cancel and review again.")?;
+        if self.connection.device != stop_device_key() {
+            return Err("The selected device changed while waiting for its connection. Cancel and review again.".into());
+        }
         // No reconnect/retry: disconnect invalidates this connection's receipt.
-        request_on_stop_client(&mut client, operation)
+        let reply = request_on_stop_client(&mut client, operation)?;
+        if self.connection.device != stop_device_key() {
+            return Err("The selected device changed during the request. Refresh before continuing.".into());
+        }
+        Ok(reply)
     }
 }
 
