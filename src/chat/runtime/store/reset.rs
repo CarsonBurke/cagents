@@ -326,6 +326,13 @@ mod tests {
         let mut store=crate::chat::runtime::preflight(&spec,&mut initial).unwrap();
         populate(&mut store);
         let handle=crate::chat::runtime::Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+        loop {
+            let ready={let state=handle.0.state.lock().unwrap();state.ready && state.session_id.as_deref()==Some("same-native-session")};
+            if ready {break;}
+            assert!(std::time::Instant::now()<deadline,"initial actual session/readiness was not applied before baseline");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         let baseline=handle.snapshot(None).unwrap();
         assert!(!baseline.items.is_empty());
         let token=baseline.source_incarnation.unwrap();

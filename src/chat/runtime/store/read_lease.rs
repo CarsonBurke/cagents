@@ -240,6 +240,11 @@ mod tests {
         let mut initial=Step {events:vec![Event::Ready(true)],..Step::default()};
         let store=crate::chat::runtime::preflight(&spec,&mut initial).unwrap();
         let handle=crate::chat::runtime::Handle::start(spec,Box::new(Controls(observed)),initial,store,None,|_|{}).unwrap();
+        let deadline=std::time::Instant::now()+std::time::Duration::from_secs(2);
+        while !handle.0.state.lock().unwrap().ready {
+            assert!(std::time::Instant::now()<deadline,"initial provider readiness was not applied before source fault");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
         {
             let store=handle.0.store.lock().unwrap();
             let hook=RollbackFault::install(&store);
