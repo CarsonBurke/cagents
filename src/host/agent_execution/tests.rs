@@ -3398,8 +3398,7 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
     .unwrap();
     let discovery_after = store.lock().unwrap().model().unwrap();
     assert!(
-        discovery_after.automation_archive_sequence
-            > discovery_before.automation_archive_sequence,
+        discovery_after.automation_archive_sequence > discovery_before.automation_archive_sequence,
         "the confirmed close publishes the first discoverable archive edge"
     );
     let page = store
@@ -3414,7 +3413,10 @@ fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart()
             session.proof.clone().unwrap(),
         )
         .unwrap();
-    assert_eq!(page.agents.iter().map(|agent| agent.id).collect::<Vec<_>>(), vec![agent.id]);
+    assert_eq!(
+        page.agents.iter().map(|agent| agent.id).collect::<Vec<_>>(),
+        vec![agent.id]
+    );
     let closed =
         crate::host::chat::process(&host, 17, ClientRequest::ChatAttach { session }).unwrap_err();
     assert!(
