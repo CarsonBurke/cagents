@@ -61,7 +61,7 @@ impl Store {
     /// Publish only identities/ranges for the bounded resident window. Child
     /// metadata is reused on status-only publications; changed keys are fetched
     /// in bounded indexed batches, never by scanning older child transcripts.
-    pub(super) fn publish_source_parts(
+    pub(in crate::chat::runtime) fn publish_source_parts(
         &mut self,
         state: &mut crate::chat::Snapshot,
     ) -> Result<(), String> {
