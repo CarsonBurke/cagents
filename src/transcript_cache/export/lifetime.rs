@@ -72,6 +72,14 @@ impl RevocationEpoch {
         if fd < 0 { return Err(io::Error::last_os_error().into()); }
         Ok(Self { incarnation, signal: unsafe { File::from_raw_fd(fd) } })
     }
+    #[cfg(test)]
+    pub(crate) fn inject_revoke_failure_for_test(&mut self) -> Result<()> {
+        // Valid owned read-only FD: writing the epoch fails with EBADF without
+        // closing/reusing an arbitrary raw descriptor. Existing probes retain
+        // the original live eventfd and remain unrevoked for abort tests.
+        self.signal = File::open("/dev/null")?;
+        Ok(())
+    }
     pub(crate) fn probe(&self) -> Result<RevocationProbe> {
         Ok(RevocationProbe { incarnation: self.incarnation, signal: self.signal.try_clone()? })
     }

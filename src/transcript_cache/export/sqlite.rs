@@ -3,7 +3,7 @@
 //! are not exported read grants.
 use super::{Error, Result, FileIdentity, SourceReadProofData, fs::Directory, lifetime::RevocationProbe};
 use rusqlite::{Connection, OpenFlags, ffi};
-use std::{ffi::CStr, fs::File, os::unix::fs::MetadataExt, time::{Duration, Instant}};
+use std::{ffi::CStr, fs::File, os::unix::{ffi::OsStrExt, fs::MetadataExt}, time::{Duration, Instant}};
 use uuid::Uuid;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,8 +52,10 @@ pub(super) fn verify_open_connection(db: &Connection, directory: &Directory, dat
     let path = directory.current_path()?.join("transcript.sqlite");
     let current = directory.open_file(std::ffi::OsStr::new("transcript.sqlite"), false)?;
     if id(&current)? != id(database)? { return Err(Error::Incomplete("Export database pin changed")); }
-    let opened_path = db.path().ok_or(Error::Unsupported("SQLite export has no physical main database"))?;
-    if std::path::Path::new(opened_path) != path {
+    let opened_path = unsafe { ffi::sqlite3_db_filename(db.handle(), c"main".as_ptr()) };
+    if opened_path.is_null() { return Err(Error::Unsupported("SQLite export has no physical main database")); }
+    let opened_path = unsafe { CStr::from_ptr(opened_path).to_bytes() };
+    if std::path::Path::new(std::ffi::OsStr::from_bytes(opened_path)) != path {
         return Err(Error::Incomplete("SQLite export opened a different locator"));
     }
     supported_vfs(db)?;
