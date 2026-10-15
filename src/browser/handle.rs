@@ -29,12 +29,17 @@ static BROWSER_FOCUS: LazyLock<Arc<DesiredFocus>> = LazyLock::new(|| Arc::new(De
 struct DesiredFocus(Mutex<u64>);
 
 impl DesiredFocus {
-    fn request(&self, mailbox: u64, focused: bool, engine_gone: &AtomicBool) -> Result<(), BrowserError> {
+    fn request(&self, mailbox: u64, focused: bool, engine_gone: &AtomicBool,
+        publish: impl FnOnce() -> Result<(), BrowserError>) -> Result<(), BrowserError> {
         let mut owner = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if engine_gone.load(Ordering::Acquire) { return Err(BrowserError::ThreadStopped); }
         if focused { *owner = mailbox; }
         else if *owner == mailbox { *owner = 0; }
-        Ok(())
+        // Publish metadata in this same order. Otherwise an older false can
+        // overwrite a newer true after the desired owner has already changed.
+        let result = publish();
+        drop(owner);
+        result
     }
 
     fn release(&self, mailbox: u64) {
@@ -254,8 +259,8 @@ impl CommandMailbox {
 
     fn request_focus(&self, focused: bool) -> Result<(), BrowserError> {
         self.check_live()?;
-        self.desired_focus.request(self.focus_id, focused, &self.engine_gone)?;
-        self.update_coalesced(|state| state.focused = Some(focused))
+        self.desired_focus.request(self.focus_id, focused, &self.engine_gone,
+            || self.update_coalesced(|state| state.focused = Some(focused)))
     }
 
     pub(crate) fn wants_focus(&self) -> bool {
@@ -923,6 +928,37 @@ mod tests {
         let mailbox = CommandMailbox::new();
         mailbox.begin_key_session();
         mailbox
+    }
+
+    #[test]
+    fn same_mailbox_focus_metadata_cannot_overtake_desired_authority() {
+        let mailbox = CommandMailbox::new();
+        mailbox.request_focus(true).unwrap();
+        let (paused, pause) = crossbeam_channel::bounded(1);
+        let (resume, resumed) = crossbeam_channel::bounded(1);
+        let (started, starting) = crossbeam_channel::bounded(1);
+        std::thread::scope(|scope| {
+            let old = scope.spawn(|| mailbox.desired_focus.request(mailbox.focus_id, false,
+                &mailbox.engine_gone, || {
+                    paused.send(()).unwrap();
+                    resumed.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                    mailbox.update_coalesced(|state| state.focused = Some(false))
+                }));
+            pause.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert!(matches!(mailbox.desired_focus.0.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)),
+                "authority remains serialized through metadata publication");
+            let newer = scope.spawn(|| {
+                started.send(()).unwrap();
+                mailbox.request_focus(true)
+            });
+            starting.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            resume.send(()).unwrap();
+            old.join().unwrap().unwrap();
+            newer.join().unwrap().unwrap();
+        });
+        assert!(mailbox.wants_focus());
+        assert_eq!(mailbox.drain_coalesced().focused, Some(true));
     }
 
     #[test]

@@ -141,7 +141,6 @@ fn lock_registry() -> std::sync::MutexGuard<'static, Option<(u64, Sender<Registr
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The shared Servo runtime and every browser card it serves.
 /// Servo's blur operation has no WebViewId and clears every webview. Track
 /// the exact session whose focus this engine requested before emitting it.
 #[derive(Debug)]
@@ -166,6 +165,7 @@ impl<T: Copy + Eq> FocusOwner<T> {
     }
 }
 
+/// The shared Servo runtime and every browser card it serves.
 struct Engine {
     generation: u64,
     /// Declared ahead of `servo` deliberately: fields drop in declaration
