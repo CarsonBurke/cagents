@@ -1227,14 +1227,17 @@ mod source_authority_tests {
     use super::super::{Journal, SourceAuthority};
     #[test]
     fn clock_exhaustion_disposition_is_sticky_without_sql_or_invented_pair() {
-        let root=tempfile::tempdir_in("/var/tmp").unwrap();
-        let mut journal=Journal::open(root.path()).unwrap();
-        journal.db.execute_batch("DROP TABLE metadata; DROP TABLE outcomes;").unwrap();
-        let cause=crate::chat::SourceAuthorityUnavailableCause::ClockExhausted;
-        journal.append(&Update::SourceAuthorityUnavailable {cause}).unwrap();
-        assert_eq!(journal.source_authority_unavailable(),Some(cause));
-        assert!(journal.source_authority().is_none());
-        assert_eq!(journal.latest().unwrap(),0); assert_eq!(journal.acknowledged().unwrap(),0);
+        use crate::chat::SourceAuthorityUnavailableCause::{ClockExhausted,RevocationFailed};
+        for cause in [ClockExhausted,RevocationFailed] {
+            let root=tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal=Journal::open(root.path()).unwrap();
+            journal.db.execute_batch("DROP TABLE metadata; DROP TABLE outcomes;").unwrap();
+            journal.append(&Update::SourceAuthorityUnavailable {cause}).unwrap();
+            journal.append(&Update::SourceAuthorityUnavailable {cause:if cause==ClockExhausted {RevocationFailed} else {ClockExhausted}}).unwrap();
+            assert_eq!(journal.source_authority_unavailable(),Some(cause),"first actual cause survives repeated dispositions without SQL");
+            assert!(journal.source_authority().is_none());
+            assert_eq!(journal.latest().unwrap(),0); assert_eq!(journal.acknowledged().unwrap(),0);
+        }
     }
     #[test]
     fn explicit_historical_conflict_is_retained_after_a_higher_scalar_without_semantic_ack() {
