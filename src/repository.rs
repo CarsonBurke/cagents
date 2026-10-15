@@ -14418,6 +14418,9 @@ mod worktree_journal_tests {
 
     #[cfg(target_os = "linux")]
     fn isolated_creation_fixture(name: &str) -> bool {
+        // Same test-only correction as producer6934731d2: libtest names do
+        // not contain the compile-time crate prefix from module_path!().
+        let name=name.strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::")).unwrap_or(name);
         const MARKER: &str = "CAGENTS_RETAINED_CREATION_FIXTURE";
         if std::env::var_os(MARKER).as_deref() == Some(OsStr::new(name)) { return false; }
         let mut command = CommandSpec::new(std::env::current_exe().unwrap())
