@@ -815,6 +815,75 @@ mod tests {
     }
 
     #[test]
+    fn parked_actor_cleanup_resumes_only_the_terminal_worker_captured_before_cleanup() {
+        for replacement in [false, true] {
+            for initially_bound in [false, true] {
+                let (mut app, card, _directory) = fixture();
+                let session = attach_durable_owner(&mut app, card);
+                let proof = session.proof.clone().unwrap();
+                let mut terminal = return_terminal(&session).unwrap();
+                terminal.continuity = TerminalContinuity::Live {host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone()};
+                app.card_state_mut(card).unwrap().kind = CardKind::Terminal(terminal.clone());
+                let Some(CardRuntime::Chat(mut runtime)) = app.cards.remove(&card) else { panic!("live chat"); };
+                runtime.session.terminal = Some(terminal.clone());
+                app.chat_ui.parked.insert(card, runtime);
+                let original_worker = uuid::Uuid::new_v4();
+                if initially_bound {
+                    app.record_terminal_close_binding_for_test(card, crate::terminal::HostedTerminalBinding {source: terminal.clone(), execution_instance: original_worker}, proof.clone(), false);
+                }
+                drop(app.update(Message::CloseCard(card)));
+                let target = pending_end(&app, card);
+                assert!(app.chat_ui.end_requests[&target].paired_terminal.is_some());
+                if replacement {
+                    app.record_terminal_close_binding_for_test(card, crate::terminal::HostedTerminalBinding {source: terminal.clone(), execution_instance: uuid::Uuid::new_v4()}, proof.clone(), true);
+                }
+                let delivery = queued(app.update(Message::ChatUi(super::super::Action::CloseFinished(target, Ok(())))));
+                assert!(!app.chat_ui.parked.contains_key(&card));
+                drop(app.update(delivery));
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert_eq!(app.card_state(card).unwrap().kind, CardKind::Terminal(terminal));
+                assert!(app.workspace.pending_close().is_none());
+                if replacement {
+                    assert!(app.terminal_close.is_none(), "old actor cleanup cannot acquire consent to the new CLI worker");
+                } else {
+                    assert_eq!(app.terminal_close.as_ref().map(|intent| intent.card), Some(card), "unchanged captured source reaches the normal terminal close handshake");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_changed_paired_cli_cannot_inherit_an_earlier_end_cleanup() {
+        for (descriptor, observed) in [(true, true), (true, false), (false, true)] {
+            let (mut app, card, _directory) = fixture();
+            let source = attach_durable_owner(&mut app, card);
+            write(&mut app, card, "preserve paired conversation", false);
+            drop(app.update(Message::ChatClose(Action::End(card))));
+            let decision = emitted_confirm(&app);
+            drop(app.update(decision));
+            let target = pending_end(&app, card);
+            let replacement = fresh_terminal_session(source.launch.recipe.clone());
+            if descriptor {
+                let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else { panic!("descriptor"); };
+                session.terminal = Some(replacement.clone());
+            }
+            if observed {
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("runtime"); };
+                runtime.session.terminal = Some(replacement);
+            }
+            let before = app.card_state(card).unwrap().clone();
+            let runtime_source = app.chat_return_session(card);
+            drop(app.update(Message::ChatUi(super::super::Action::RetainedCloseFinished(target, source, Ok(())))));
+            assert_eq!(app.card_state(card), Some(&before));
+            assert_eq!(app.chat_return_session(card), runtime_source);
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.workspace.order().any(|id| id == card));
+            assert!(app.workspace.pending_close().is_none());
+            assert!(app.recently_closed.is_empty());
+        }
+    }
+
+    #[test]
     fn held_widget_consent_cannot_end_another_conversation_or_configuration_on_the_same_card() {
         for changed in 0..7 {
             let (mut app, card, _directory) = fixture();
