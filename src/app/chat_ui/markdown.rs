@@ -48,6 +48,9 @@ pub struct Content {
     open_plain: bool,
     /// Raw EOF spaces become rendered only when later nonspace arrives.
     pending_spaces: usize,
+    // A partially typed table row can temporarily parse as a following
+    // paragraph. Keep both items in the unfinished source until separated.
+    reparse_items: usize,
     #[cfg(test)]
     parsed_bytes: usize,
 }
@@ -138,11 +141,26 @@ impl Content {
         }
         // Retain only enough prior parser state to prove a rendered styled
         // prefix after reparsing. Raw-source append alone is insufficient.
-        let previous_index = self.items.len().saturating_sub(1);
-        let previous = self.items.pop();
+        let reparse = self.reparse_items.max(1).min(self.items.len());
+        let previous_index = self.items.len().saturating_sub(reparse);
+        let previous = (reparse == 1).then(|| self.items.pop()).flatten();
+        self.items.truncate(previous_index);
+        self.incomplete.retain(|index, _| *index < previous_index);
+        let mut table_tail = None;
 
-        // Re-parse last item and new text
+        // Re-parse the unfinished source, including a table whose next row
+        // was not yet recognizable at the preceding publication boundary.
         for (item, source, broken_links) in parse_with(&mut self.state, input) {
+            let start = source.as_ptr().addr() - input.as_ptr().addr();
+            if matches!(&item, Item::Table { .. }) {
+                table_tail = Some((self.items.len(), start));
+            } else if table_tail.is_some() {
+                let prefix = input[..start].strip_suffix('\n').unwrap_or(&input[..start]);
+                let separated = prefix.rsplit('\n').next().is_some_and(|line| line.trim().is_empty());
+                if separated || !matches!(&item, Item::Paragraph(_)) {
+                    table_tail = None;
+                }
+            }
             if !broken_links.is_empty() {
                 let _ = self.incomplete.insert(
                     self.items.len(),
@@ -156,6 +174,14 @@ impl Content {
             self.items.push(item);
         }
 
+        self.reparse_items = 1;
+        if let Some((index, start)) = table_tail {
+            let count = self.items.len() - index;
+            if count > 1 {
+                self.state.leftover = input[start..].to_owned();
+                self.reparse_items = count;
+            }
+        }
         self.state.leftover.push_str(&leftover[input.len()..]);
 
         self.open_fence = self.items.last().and_then(|item| {
@@ -1359,6 +1385,25 @@ mod tests {
                 if let Item::CodeBlock { lines, .. } = item {
                     assert!(lines.is_empty());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_table_rows_keep_their_header_context_at_every_utf8_boundary() {
+        for source in [
+            "| alpha | beta |\n| :--- | ---: |\n| a | **b** |\n| | empty |\n",
+            "| H | B |\n|---|---|\n| V | W |\n\nOutside table.\n",
+            "| H | B |\n|---|---|\n| V | W |\n  \nOutside table.\n",
+        ] {
+            let mut streamed = Content::new();
+            let mut previous = 0;
+            for end in (1..=source.len()).filter(|end| source.is_char_boundary(*end)) {
+                streamed.push_str(&source[previous..end]);
+                assert_eq!(native_outline(streamed.items()),
+                    native_outline(Content::parse(&source[..end]).items()),
+                    "table prefix {:?}", &source[..end]);
+                previous = end;
             }
         }
     }
