@@ -167,6 +167,7 @@ impl LocalHandle {
     }
 }
 struct Inner {
+    pinned_directory:Arc<Mutex<Option<Arc<std::fs::File>>>>,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     commands: crossbeam_channel::Sender<CommandRequest>,
     urgent_commands: crossbeam_channel::Sender<CommandRequest>,
@@ -374,7 +375,9 @@ impl LocalHandle {
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let provider_process=Arc::new(Mutex::new(None));
+        let pinned_directory=Arc::new(Mutex::new(spec.execution.as_ref().and_then(|context|context.directory_descriptor())));
         let inner = Arc::new(Inner {
+            pinned_directory:pinned_directory.clone(),
             provider_process:provider_process.clone(),
             commands,
             urgent_commands,
@@ -413,6 +416,7 @@ impl LocalHandle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    pinned_directory,
                     launch_context: spec.execution.clone(),
                     working_directory: spec.working_directory.clone(),
                     child: None,
@@ -1738,6 +1742,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    pinned_directory:Arc<Mutex<Option<Arc<std::fs::File>>>>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
@@ -2259,6 +2264,7 @@ impl Actor {
                         }
                         self.record_execution_directory(&directory);
                         self.working_directory = directory;
+                        self.dirty=true;
                         Ok(())
                     })();
                     let _ = reply.send(result);
@@ -3576,6 +3582,17 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn completed_actor_retains_only_the_original_directory_pin_after_a_move() {
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();let original=root.path().join("original");std::fs::create_dir(&original).unwrap();
+        let spec=ProcessSpec {execution:Some(Arc::new(super::super::protocol::ExecutionContext::capture(&original).unwrap())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:original.clone(),environment:BTreeMap::new()};
+        let mut adapter:Box<dyn Adapter>=Box::new(Echo);let mut initial=adapter.initialize().unwrap();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,adapter,initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);handle.close().unwrap();
+        let moved=root.path().join("moved");std::fs::rename(&original,&moved).unwrap();std::fs::create_dir(&original).unwrap();
+        assert!(handle.pinned_execution_directory(&moved).is_ok());assert!(handle.pinned_execution_directory(&original).is_err());
+        let alive=handle.resource_lifetime();drop(handle);assert!(!alive(),"the retained FD does not create a context/Handle ownership cycle");
+    }
+
     #[test]
     fn retained_input_classifies_idle_and_directory_refusal_before_effects() {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
