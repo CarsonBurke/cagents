@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        Arc, Mutex,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
@@ -22,6 +22,31 @@ const EVENT_CAPACITY: usize = 128;
 const CRITICAL_EVENT_RESERVE: usize = 8;
 const ADMITTED_KEY_LIMIT: usize = 512;
 static EVENT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
+static MAILBOX_FOCUS_ID: AtomicU64 = AtomicU64::new(1);
+static BROWSER_FOCUS: LazyLock<Arc<DesiredFocus>> = LazyLock::new(|| Arc::new(DesiredFocus::default()));
+
+#[derive(Debug, Default)]
+struct DesiredFocus(Mutex<u64>);
+
+impl DesiredFocus {
+    fn request(&self, mailbox: u64, focused: bool, engine_gone: &AtomicBool) -> Result<(), BrowserError> {
+        let mut owner = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if engine_gone.load(Ordering::Acquire) { return Err(BrowserError::ThreadStopped); }
+        if focused { *owner = mailbox; }
+        else if *owner == mailbox { *owner = 0; }
+        Ok(())
+    }
+
+    fn release(&self, mailbox: u64) {
+        let mut owner = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A delayed old-card blur/teardown cannot revoke a newer request.
+        if *owner == mailbox { *owner = 0; }
+    }
+
+    fn owns(&self, mailbox: u64) -> bool {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) == mailbox
+    }
+}
 
 #[derive(Debug, Default)]
 struct KeyboardInput {
@@ -134,6 +159,8 @@ pub(crate) struct CommandMailbox {
     deferred_releases: Mutex<VecDeque<OwnedKeyInput>>,
     /// Even means no live session; odd identifies the current session.
     key_session: AtomicU64,
+    desired_focus: Arc<DesiredFocus>,
+    focus_id: u64,
     wake_admission: Mutex<()>,
     wake_pending: AtomicBool,
     shutdown_requested: AtomicBool,
@@ -145,6 +172,14 @@ pub(crate) struct CommandMailbox {
 
 impl CommandMailbox {
     pub(crate) fn new() -> Arc<Self> {
+        Self::with_focus(Arc::new(DesiredFocus::default()))
+    }
+
+    fn shared() -> Arc<Self> {
+        Self::with_focus(BROWSER_FOCUS.clone())
+    }
+
+    fn with_focus(desired_focus: Arc<DesiredFocus>) -> Arc<Self> {
         let (tx, rx) = crossbeam_channel::bounded(COMMAND_CAPACITY);
         Arc::new(Self {
             tx,
@@ -153,6 +188,8 @@ impl CommandMailbox {
             keyboard: Mutex::new(KeyboardInput::default()),
             deferred_releases: Mutex::new(VecDeque::new()),
             key_session: AtomicU64::new(0),
+            desired_focus,
+            focus_id: MAILBOX_FOCUS_ID.fetch_add(1, Ordering::Relaxed),
             wake_admission: Mutex::new(()),
             wake_pending: AtomicBool::new(false),
             shutdown_requested: AtomicBool::new(false),
@@ -213,6 +250,16 @@ impl CommandMailbox {
         if needs_wake {
             let _ = self.wake_coalesced();
         }
+    }
+
+    fn request_focus(&self, focused: bool) -> Result<(), BrowserError> {
+        self.check_live()?;
+        self.desired_focus.request(self.focus_id, focused, &self.engine_gone)?;
+        self.update_coalesced(|state| state.focused = Some(focused))
+    }
+
+    pub(crate) fn wants_focus(&self) -> bool {
+        self.desired_focus.owns(self.focus_id)
     }
 
     /// Engine-thread publication after a new CardSession has been installed.
@@ -400,6 +447,7 @@ impl CommandMailbox {
     /// queueing into a channel nobody will ever read again.
     pub(crate) fn mark_engine_gone(&self) {
         self.engine_gone.store(true, Ordering::Release);
+        self.desired_focus.release(self.focus_id);
     }
 
     fn check_live(&self) -> Result<(), BrowserError> {
@@ -651,7 +699,7 @@ impl BrowserHandle {
                 ));
             }
         }
-        let mailbox = CommandMailbox::new();
+        let mailbox = CommandMailbox::shared();
         let events = EventBus::new();
         let (teardown, teardown_done) = crossbeam_channel::bounded(0);
         runtime::register(runtime::Registration {
@@ -747,8 +795,7 @@ impl BrowserHandle {
         if !focused {
             self.mailbox.release_pressed_keys();
         }
-        self.mailbox
-            .update_coalesced(|state| state.focused = Some(focused))
+        self.mailbox.request_focus(focused)
     }
 
     pub fn input(&self, input: BrowserInput) -> Result<(), BrowserError> {
@@ -876,6 +923,35 @@ mod tests {
         let mailbox = CommandMailbox::new();
         mailbox.begin_key_session();
         mailbox
+    }
+
+    #[test]
+    fn delayed_old_focus_release_cannot_revoke_the_new_mailbox() {
+        let desired = Arc::new(DesiredFocus::default());
+        let old = CommandMailbox::with_focus(desired.clone());
+        let new = CommandMailbox::with_focus(desired);
+        old.request_focus(true).unwrap();
+        assert!(old.wants_focus());
+        new.request_focus(true).unwrap();
+        old.request_focus(false).unwrap();
+        assert!(!old.wants_focus());
+        assert!(new.wants_focus());
+        // A restored old session must read this authority, rather than its
+        // cached Card.focused flag, before reasserting native engine focus.
+        old.begin_key_session();
+        old.end_key_session();
+        old.begin_key_session();
+        assert!(!old.wants_focus());
+        assert!(new.wants_focus());
+        new.request_focus(false).unwrap();
+        assert!(!new.wants_focus());
+        new.request_focus(true).unwrap();
+        old.mark_engine_gone();
+        assert!(new.wants_focus(), "old teardown cannot revoke new focus");
+        assert_eq!(old.request_focus(true), Err(BrowserError::ThreadStopped));
+        assert!(new.wants_focus(), "a retired mailbox cannot claim focus again");
+        new.mark_engine_gone();
+        assert!(!new.wants_focus());
     }
 
     #[test]

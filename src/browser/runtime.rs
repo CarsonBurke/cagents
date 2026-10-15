@@ -142,6 +142,30 @@ fn lock_registry() -> std::sync::MutexGuard<'static, Option<(u64, Sender<Registr
 }
 
 /// The shared Servo runtime and every browser card it serves.
+/// Servo's blur operation has no WebViewId and clears every webview. Track
+/// the exact session whose focus this engine requested before emitting it.
+#[derive(Debug)]
+struct FocusOwner<T>(Cell<Option<T>>);
+
+impl<T> Default for FocusOwner<T> {
+    fn default() -> Self { Self(Cell::new(None)) }
+}
+
+impl<T: Copy + Eq> FocusOwner<T> {
+    fn request(&self, session: T, focused: bool) -> bool {
+        if focused {
+            if self.0.get() == Some(session) { return false; }
+            self.0.set(Some(session));
+            true
+        } else if self.0.get() == Some(session) {
+            self.0.set(None);
+            true
+        } else {
+            false
+        }
+    }
+}
+
 struct Engine {
     generation: u64,
     /// Declared ahead of `servo` deliberately: fields drop in declaration
@@ -150,6 +174,7 @@ struct Engine {
     /// engine thread that unwinds then gets the same ordering `run` applies by
     /// hand on its way out.
     cards: Vec<Card>,
+    focus_owner: Rc<FocusOwner<servo::WebViewId>>,
     /// One runtime for every card, kept for the life of this thread.
     ///
     /// `servo::Servo` is `!Send`/`!Sync` — it is `Rc<ServoInner>` over
@@ -208,6 +233,7 @@ impl Engine {
         let mut engine = Engine {
             generation,
             cards: Vec::new(),
+            focus_owner: Rc::new(FocusOwner::default()),
             servo: None,
             import: None,
             registrations: Some(registrations),
@@ -327,6 +353,7 @@ impl Engine {
         } = registration;
         let restore = restore.normalized();
         self.cards.push(Card {
+            focus_owner: self.focus_owner.clone(),
             mailbox,
             events,
             lifecycle: LifecycleMachine::new(visible),
@@ -522,6 +549,7 @@ enum CardRequest {
 }
 
 struct Card {
+    focus_owner: Rc<FocusOwner<servo::WebViewId>>,
     mailbox: Arc<CommandMailbox>,
     events: Arc<EventBus>,
     restore: BrowserRestoreState,
@@ -705,13 +733,7 @@ impl Card {
         }
         if let Some(focused) = commands.focused {
             self.focused = focused;
-            if let Some(session) = &self.session {
-                if focused {
-                    session.webview.focus();
-                } else {
-                    session.webview.blur();
-                }
-            }
+            self.synchronize_session_focus();
         }
         for event in [
             commands.pointer_motion,
@@ -724,6 +746,16 @@ impl Card {
             self.forward_input(event);
         }
         request
+    }
+
+    fn synchronize_session_focus(&self) {
+        let Some(session) = &self.session else { return; };
+        // Coalesced card messages and restore requests arrive from independent
+        // mailboxes. Cached per-card focus alone is not current UI authority.
+        let focused = self.focused && self.mailbox.wants_focus();
+        if self.focus_owner.request(session.webview.id(), focused) {
+            if focused { session.webview.focus(); } else { session.webview.blur(); }
+        }
     }
 
     fn forward_input(&mut self, event: BrowserInput) {
@@ -848,11 +880,7 @@ impl Card {
         });
         self.events
             .semantic(BrowserEvent::LifecycleChanged(self.lifecycle.state()));
-        if self.focused
-            && let Some(session) = &self.session
-        {
-            session.webview.focus();
-        }
+        self.synchronize_session_focus();
     }
 
     fn fail_initialization(&mut self, error: BrowserError) {
@@ -878,6 +906,9 @@ impl Card {
     fn destroy_session(&mut self) {
         self.mailbox.end_key_session();
         if let Some(session) = self.session.take() {
+            if self.focus_owner.request(session.webview.id(), false) {
+                session.webview.blur();
+            }
             session.store_navigation(&mut self.restore);
             session.shutdown();
         }
@@ -1481,6 +1512,7 @@ mod tests {
     fn card_with_teardown(visible: bool) -> (Card, Receiver<()>) {
         let (teardown, teardown_done) = crossbeam_channel::bounded(0);
         let card = Card {
+            focus_owner: Rc::new(FocusOwner::default()),
             mailbox: CommandMailbox::new(),
             events: EventBus::new(),
             restore: restore_state(),
@@ -1496,6 +1528,20 @@ mod tests {
             closed: false,
         };
         (card, teardown_done)
+    }
+
+    #[test]
+    fn stale_session_blur_never_clears_the_new_engine_focus() {
+        let focus = FocusOwner::<u64>::default();
+        assert!(focus.request(1, true));
+        assert!(focus.request(2, true));
+        assert!(!focus.request(1, false), "Servo blur is global: old session must not emit it");
+        assert_eq!(focus.0.get(), Some(2));
+        assert!(focus.request(2, false));
+        assert!(!focus.request(2, false), "ordinary redraw must not duplicate blur");
+        assert!(focus.request(3, true));
+        assert!(!focus.request(2, false), "destroying an old generation must not blur its replacement");
+        assert_eq!(focus.0.get(), Some(3));
     }
 
     #[test]
@@ -1728,6 +1774,7 @@ mod tests {
         drop(Engine {
             generation: 0,
             cards: vec![card],
+            focus_owner: Rc::new(FocusOwner::default()),
             servo: None,
             import: None,
             registrations: Some(engine_registrations),
