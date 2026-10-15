@@ -192,6 +192,19 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_custom_names_can_be_numeric_or_emoji() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let cwd = Path::new("/work");
+        for name in ["1341", "🔐", "🧑‍💻"] {
+            let mut file = tempfile::tempfile().unwrap();
+            append(&mut file, json!({"type":"user","sessionId":id,"cwd":cwd,"message":{}}));
+            file.seek(SeekFrom::End(0)).unwrap();
+            append(&mut file, json!({"type":"custom-title","sessionId":id,"customTitle":name}));
+            assert_eq!(named_title(&mut file, &id, cwd).as_deref(), Some(name));
+        }
+    }
+
+    #[test]
     fn wrong_session_directory_and_sidechain_cannot_name_parent() {
         let mut file = tempfile::tempfile().unwrap();
         let id = uuid::Uuid::new_v4().to_string();

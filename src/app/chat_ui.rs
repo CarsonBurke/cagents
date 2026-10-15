@@ -10063,6 +10063,13 @@ mod tests {
                 crate::model::ChannelTitleSource::Provider
             ))
         );
+        for title in ["1341", "🔐", "🧑‍💻"] {
+            snapshot.title = Some(title.into());
+            assert_eq!(
+                snapshot_channel_name(&snapshot),
+                Some((title.into(), crate::model::ChannelTitleSource::Provider))
+            );
+        }
         snapshot.title = Some("\u{202e}\u{2066}".into());
         assert_eq!(
             snapshot_channel_name(&snapshot).unwrap().0,

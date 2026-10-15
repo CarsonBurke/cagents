@@ -7,11 +7,8 @@ const INPUT_LINES: usize = 128;
 
 pub fn channel_title(text: &str) -> Option<String> {
     let title = crate::names::normalize_card_name(text)?;
-    // A pasted quote, separator or opaque command reference is not a useful
-    // conversation name. Explicit user renames use their own path.
-    if !title.chars().any(char::is_alphabetic) {
-        return None;
-    }
+    // Provider names can be numeric or emoji-only. Task meaningfulness belongs
+    // to the prompt candidate policy, not this authoritative label sanitizer.
     if title.chars().count() <= 80 {
         return Some(title);
     }
@@ -270,10 +267,20 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_names_preserve_numeric_and_emoji_labels() {
+        for name in ["1341", "🔐", "🧑‍💻", "\"\""] {
+            assert_eq!(channel_title(name).as_deref(), Some(name));
+            assert!(channel_title_from_prompt(name).is_none());
+        }
+        assert_eq!(channel_title(" \u{202e}1341\n ").as_deref(), Some("1341"));
+        assert!(channel_title(" \u{202e}\n ").is_none());
+    }
+
+    #[test]
     fn unicode_titles_are_bounded_and_complete() {
         let title = channel_title(&"修复会话标题与恢复列表 ".repeat(30)).unwrap();
         assert!(title.chars().count() <= 80);
         assert!(title.ends_with('…'));
-        assert!(channel_title("\"\"").is_none());
+        assert!(channel_title_from_prompt("\"\"").is_none());
     }
 }

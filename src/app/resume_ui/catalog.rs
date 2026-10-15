@@ -717,6 +717,14 @@ mod tests {
             header(Provider::Claude, &path).unwrap().title.as_deref(),
             Some("My bundle project")
         );
+        for title in ["1341", "🔐", "🧑‍💻"] {
+            let custom = json!({"type":"custom-title","sessionId":id,"customTitle":title});
+            std::fs::write(&path, format!("{prompt}\n{custom}\n")).unwrap();
+            let found = header(Provider::Claude, &path).unwrap();
+            assert_eq!(found.title.as_deref(), Some(title));
+            assert!(found.named);
+            assert_eq!(found.title, crate::workspace_model::channel_title(title));
+        }
         std::fs::write(&path, format!("{prompt}\n")).unwrap();
         let found = header(Provider::Claude, &path).unwrap();
         assert_eq!(

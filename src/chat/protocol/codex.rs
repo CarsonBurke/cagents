@@ -3907,6 +3907,8 @@ mod tests {
         for name in [
             Some("Bundle throughput audit"),
             Some("My custom bundle review"),
+            Some("1341"),
+            Some("🔐"),
             None,
         ] {
             let mut params = json!({"threadId":"thread-exact"});
