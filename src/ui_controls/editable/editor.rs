@@ -504,6 +504,7 @@ mod tests {
     enum Message {
         Edit(text_editor::Action),
         Cursor(text_editor::Cursor),
+        Keyboard(cosmic::iced::keyboard::Event, bool, crate::input_trace::KeyboardRegion),
     }
     #[test]
     fn native_composer_keys_undo_and_redo_without_a_workspace_action() {
@@ -519,6 +520,7 @@ mod tests {
         let mut content = text_editor::Content::new();
         let id = Id::new("test.chat-composer");
         let trace = input_trace::InputTrace::default();
+        let owning_card = crate::model::CardId::new();
         let mut tree = Tree::empty();
         for (key, code, modifiers, text, expected) in [
             (
@@ -552,10 +554,11 @@ mod tests {
                     .id(id.clone())
                     .on_action(Message::Edit)
                     .on_cursor(Message::Cursor);
-                let mut element = input_trace::observe_keyboard_focus(
+                let mut element = input_trace::observe_keyboard_events(
                     editor,
                     &trace,
-                    vec![(id.clone(), FocusedPane::Chat)],
+                    vec![(id.clone(), input_trace::KeyboardRegion { pane: FocusedPane::Chat, card: Some(owning_card) })],
+                    Message::Keyboard,
                 );
                 tree.diff(element.as_widget_mut());
                 let node = element.as_widget_mut().layout(
@@ -587,11 +590,17 @@ mod tests {
                 match message {
                     Message::Edit(action) => content.perform(action),
                     Message::Cursor(cursor) => content.move_to(cursor),
+                    Message::Keyboard(delivered, captured, region) => {
+                        assert_eq!(delivered, event);
+                        assert!(captured, "the text widget handles each tested edit chord");
+                        if modifiers.control() { assert_eq!(region.card, Some(owning_card)); assert_eq!(region.pane, FocusedPane::Chat); }
+                    }
                 }
             }
             assert_eq!(content.text(), expected);
             if modifiers.control() {
                 assert_eq!(trace.keyboard_focus(), Some(FocusedPane::Chat));
+                assert_eq!(trace.keyboard_card(), Some(owning_card));
                 assert_eq!(
                     workspace_widget::global_shortcut(
                         &event,

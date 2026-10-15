@@ -12,7 +12,7 @@
 
 use std::{cell::Cell, rc::Rc};
 
-use crate::workspace_widget::FocusedPane;
+use crate::{model::CardId, workspace_widget::FocusedPane};
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
     widget::{Operation, Tree},
@@ -25,7 +25,7 @@ use cosmic::{Element, Renderer, Theme};
 /// Cloning shares the record. It is cheap to hand to every widget that reads
 /// it, and costs one copy of a few words per recorded event.
 #[derive(Clone, Default)]
-pub struct InputTrace(Rc<Cell<Sample>>, Rc<Cell<Option<FocusedPane>>>);
+pub struct InputTrace(Rc<Cell<Sample>>, Rc<Cell<Option<KeyboardRegion>>>);
 
 #[derive(Clone, Copy, Default)]
 struct Sample {
@@ -39,7 +39,18 @@ struct Sample {
 impl InputTrace {
     /// Actual widget focus sampled immediately before this keyboard event.
     pub fn keyboard_focus(&self) -> Option<FocusedPane> {
-        self.1.get()
+        self.1.get().map(|region| region.pane)
+    }
+
+    pub fn keyboard_card(&self) -> Option<CardId> {
+        self.1.get().and_then(|region| region.card)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_keyboard_region(region: KeyboardRegion) -> Self {
+        let trace = Self::default();
+        trace.1.set(Some(region));
+        trace
     }
 
     /// Records one event the window delivered.
@@ -103,7 +114,18 @@ pub fn observe<'a, Message: 'a>(
         content: content.into(),
         trace: trace.clone(),
         focus_regions: None,
+        keyboard_callback: None,
     })
+}
+
+/// Both scope and action target come from the widget holding native focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardRegion {
+    pub pane: FocusedPane,
+    pub card: Option<CardId>,
+}
+impl From<FocusedPane> for KeyboardRegion {
+    fn from(pane: FocusedPane) -> Self { Self { pane, card: None } }
 }
 
 /// Sample native widget focus before workspace interception. IDs identify
@@ -112,13 +134,41 @@ pub fn observe<'a, Message: 'a>(
 pub fn observe_keyboard_focus<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     trace: &InputTrace,
-    regions: Vec<(cosmic::iced::widget::Id, FocusedPane)>,
+    regions: Vec<(cosmic::iced::widget::Id, KeyboardRegion)>,
 ) -> Element<'a, Message> {
     Element::new(Observed {
         content: content.into(),
         trace: trace.clone(),
         focus_regions: Some(regions),
+        keyboard_callback: None,
     })
+}
+
+type KeyboardCallback<Message> = fn(keyboard::Event, bool, KeyboardRegion) -> Message;
+
+/// Publish each keyboard event with its own native focus snapshot. Iced
+/// batches widget events before subscription messages, so reading a shared
+/// "latest focus" later can route an earlier chord to a different region.
+pub fn observe_keyboard_events<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    trace: &InputTrace,
+    regions: Vec<(cosmic::iced::widget::Id, KeyboardRegion)>,
+    on_key: KeyboardCallback<Message>,
+) -> Element<'a, Message> {
+    Element::new(Observed { content: content.into(), trace: trace.clone(), focus_regions: Some(regions), keyboard_callback: Some(on_key) })
+}
+
+pub(crate) struct ScopedKeyboardRegion {
+    focus: Rc<Cell<Option<KeyboardRegion>>>,
+    previous: Option<KeyboardRegion>,
+}
+impl Drop for ScopedKeyboardRegion {
+    fn drop(&mut self) { self.focus.set(self.previous); }
+}
+impl InputTrace {
+    pub(crate) fn scoped_keyboard_region(&self, region: KeyboardRegion) -> ScopedKeyboardRegion {
+        ScopedKeyboardRegion { focus: Rc::clone(&self.1), previous: self.1.replace(Some(region)) }
+    }
 }
 
 fn keyboard_event_needs_focus(event: &Event) -> bool {
@@ -133,8 +183,8 @@ pub(crate) struct TextEditing;
 struct KeyboardFocus {
     focused: Option<(Option<cosmic::iced::widget::Id>, Rectangle)>,
     inputs: Vec<(Option<cosmic::iced::widget::Id>, Rectangle)>,
-    known_regions: Vec<(cosmic::iced::widget::Id, FocusedPane)>,
-    containers: Vec<(FocusedPane, Rectangle)>,
+    known_regions: Vec<(cosmic::iced::widget::Id, KeyboardRegion)>,
+    containers: Vec<(KeyboardRegion, Rectangle)>,
 }
 impl Operation for KeyboardFocus {
     fn container(&mut self, id: Option<&cosmic::iced::widget::Id>, bounds: Rectangle) {
@@ -179,36 +229,21 @@ impl Operation for KeyboardFocus {
     }
 }
 impl KeyboardFocus {
-    fn region(&self, regions: &[(cosmic::iced::widget::Id, FocusedPane)]) -> FocusedPane {
-        let Some((id, bounds)) = &self.focused else {
-            return FocusedPane::Other;
-        };
-        if let Some((_, region)) = regions
-            .iter()
-            .find(|(candidate, _)| Some(candidate) == id.as_ref())
-        {
-            return *region;
-        }
-        if self
-            .inputs
-            .iter()
-            .any(|(candidate, rectangle)| candidate == id && rectangle == bounds)
-        {
-            FocusedPane::TextInput
-        } else {
-            self.containers
-                .iter()
-                .rev()
-                .find(|(_, container)| container.contains(bounds.center()))
-                .map_or(FocusedPane::OutsideWorkspace, |(region, _)| *region)
-        }
+    fn region(&self, regions: &[(cosmic::iced::widget::Id, KeyboardRegion)]) -> KeyboardRegion {
+        let Some((id, bounds)) = &self.focused else { return FocusedPane::Other.into(); };
+        if let Some((_, region)) = regions.iter().find(|(candidate, _)| Some(candidate) == id.as_ref()) { return *region; }
+        let container = self.containers.iter().rev().find(|(_, container)| container.contains(bounds.center())).map_or_else(|| KeyboardRegion::from(FocusedPane::OutsideWorkspace), |(region, _)| *region);
+        if self.inputs.iter().any(|(candidate, rectangle)| candidate == id && rectangle == bounds) {
+            KeyboardRegion { pane: FocusedPane::TextInput, ..container }
+        } else { container }
     }
 }
 
 struct Observed<'a, Message> {
     content: Element<'a, Message>,
     trace: InputTrace,
-    focus_regions: Option<Vec<(cosmic::iced::widget::Id, FocusedPane)>>,
+    focus_regions: Option<Vec<(cosmic::iced::widget::Id, KeyboardRegion)>>,
+    keyboard_callback: Option<KeyboardCallback<Message>>,
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
@@ -279,7 +314,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                 &mut focus,
             );
             self.trace.1.set(Some(focus.region(regions)));
+        } else if matches!(event, Event::Keyboard(_)) && self.focus_regions.is_some() {
+            // An ordinary key or modifier update must not reuse a previous
+            // chord's pane after the user moves focus with the pointer.
+            self.trace.1.set(None);
         }
+        let region = self.trace.1.get().unwrap_or_else(|| FocusedPane::Other.into());
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -290,6 +330,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             shell,
             viewport,
         );
+        if let Event::Keyboard(event) = event && let Some(callback) = &self.keyboard_callback {
+            shell.publish(callback(event.clone(), shell.is_event_captured(), region));
+        }
     }
 
     fn mouse_interaction(
@@ -347,7 +390,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                 viewport,
                 translation,
             )
-            .map(|content| ObservedOverlay::wrap(content, &self.trace, self.focus_regions.clone()))
+            .map(|content| ObservedOverlay::wrap(content, &self.trace, self.focus_regions.clone(), self.keyboard_callback))
     }
 
     fn a11y_nodes(
@@ -383,19 +426,22 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
 struct ObservedOverlay<'a, Message> {
     content: overlay::Element<'a, Message, Theme, Renderer>,
     trace: InputTrace,
-    focus_regions: Option<Vec<(cosmic::iced::widget::Id, FocusedPane)>>,
+    focus_regions: Option<Vec<(cosmic::iced::widget::Id, KeyboardRegion)>>,
+    keyboard_callback: Option<KeyboardCallback<Message>>,
 }
 
 impl<'a, Message: 'a> ObservedOverlay<'a, Message> {
     fn wrap(
         content: overlay::Element<'a, Message, Theme, Renderer>,
         trace: &InputTrace,
-        focus_regions: Option<Vec<(cosmic::iced::widget::Id, FocusedPane)>>,
+        focus_regions: Option<Vec<(cosmic::iced::widget::Id, KeyboardRegion)>>,
+        keyboard_callback: Option<KeyboardCallback<Message>>,
     ) -> overlay::Element<'a, Message, Theme, Renderer> {
         overlay::Element::new(Box::new(Self {
             content,
             trace: trace.clone(),
             focus_regions,
+            keyboard_callback,
         }))
     }
 }
@@ -425,30 +471,27 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
     }
 
     fn update(
-        &mut self,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
+        &mut self, event: &Event, layout: Layout<'_>, cursor: mouse::Cursor,
+        renderer: &Renderer, clipboard: &mut dyn Clipboard, shell: &mut Shell<'_, Message>,
     ) {
         self.trace.record(event);
-        if keyboard_event_needs_focus(event)
-            && let Some(regions) = &self.focus_regions
-        {
-            let mut focus = KeyboardFocus {
-                known_regions: regions.clone(),
-                ..KeyboardFocus::default()
-            };
-            self.content
-                .as_overlay_mut()
-                .operate(layout, renderer, &mut focus);
+        let mut owns_keyboard = false;
+        if matches!(event, Event::Keyboard(_)) && let Some(regions) = &self.focus_regions {
+            let mut focus = KeyboardFocus { known_regions: regions.clone(), ..KeyboardFocus::default() };
+            self.content.as_overlay_mut().operate(layout, renderer, &mut focus);
+            owns_keyboard = focus.focused.is_some();
             self.trace.1.set(Some(focus.region(regions)));
         }
-        self.content
-            .as_overlay_mut()
-            .update(event, layout, cursor, renderer, clipboard, shell);
+        let region = self.trace.1.get().unwrap_or_else(|| FocusedPane::OutsideWorkspace.into());
+        self.content.as_overlay_mut().update(event, layout, cursor, renderer, clipboard, shell);
+        if let Event::Keyboard(event) = event && let Some(callback) = &self.keyboard_callback {
+            // A focused overlay owns ignored editing chords too. Capturing
+            // those prevents both background input and duplicate root routing.
+            if owns_keyboard { shell.capture_event(); }
+            if shell.is_event_captured() {
+                shell.publish(callback(event.clone(), true, region));
+            }
+        }
     }
 
     fn mouse_interaction(
@@ -469,10 +512,11 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let trace = self.trace.clone();
         let regions = self.focus_regions.clone();
+        let keyboard_callback = self.keyboard_callback;
         self.content
             .as_overlay_mut()
             .overlay(layout, renderer)
-            .map(|nested| ObservedOverlay::wrap(nested, &trace, regions))
+            .map(|nested| ObservedOverlay::wrap(nested, &trace, regions, keyboard_callback))
     }
 
     fn index(&self) -> f32 {
@@ -512,13 +556,13 @@ mod tests {
         query.focusable(Some(&sidebar), bounds, &mut Focus(true));
         query.custom(Some(&sidebar), bounds, &mut TextEditing);
         assert_eq!(
-            query.region(&[(editor.clone(), FocusedPane::Editor)]),
+            query.region(&[(editor.clone(), FocusedPane::Editor.into())]).pane,
             FocusedPane::TextInput
         );
         let mut query = KeyboardFocus::default();
         query.focusable(Some(&editor), bounds, &mut Focus(true));
         assert_eq!(
-            query.region(&[(editor, FocusedPane::Editor)]),
+            query.region(&[(editor, FocusedPane::Editor.into())]).pane,
             FocusedPane::Editor
         );
     }
