@@ -1,4 +1,6 @@
 use super::Relocation;
+mod files;
+use files::{Directory,Edit};
 use std::path::{Path,PathBuf};
 
 // A Locate choice must not attach unrelated linked checkouts to this repo.
@@ -35,108 +37,119 @@ pub(crate) fn belongs_to_relocated_worktree(path: &Path, relocation: &Relocation
 // `git worktree repair` does not update an external Git directory's
 // core.worktree. Change only the exact previous checkout chosen by Locate.
 pub(crate) fn repair_checkout_config(relocation: &Relocation) -> Result<(), String> {
-    use crate::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
-    let (admin, common) = crate::project_location::checkout_identity(&relocation.new_root)
-        .ok_or("The selected checkout no longer has readable Git metadata")?;
-    if common != relocation.destination {
-        return Err("The selected checkout changed repositories while locating it".into());
-    }
-    if admin != common {
-        return Ok(());
-    }
-    let command = || {
-        CommandSpec::new("git")
-            .arg("--git-dir")
-            .arg(&relocation.destination)
-            .cwd(&relocation.new_root)
-            .env_remove("GIT_DIR")
-            .env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_WORK_TREE")
-            .env_remove("GIT_COMMON_DIR")
-            .timeout(std::time::Duration::from_secs(15))
-            .output_limits(64 * 1024, 64 * 1024)
-    };
-    let read = command().args(["config", "--local", "--null", "--get", "core.worktree"]);
-    let output = SystemProcessExecutor
-        .execute(&read, &crate::repository::CancellationToken::default())
-        .map_err(|error| error.to_string())?;
-    if output.exit_code == Some(1) {
-        return Ok(());
-    }
-    let output = output
-        .require_success(&read.program)
-        .map_err(|error| error.to_string())?;
-    let bytes = output
-        .stdout
-        .strip_suffix(&[0])
-        .ok_or("Git returned an invalid checkout setting")?;
-    let configured = PathBuf::from(
-        String::from_utf8(bytes.to_vec()).map_err(|_| "Git checkout setting is not valid UTF-8")?,
-    );
-    let absolute = if configured.is_absolute() {
-        configured
-    } else {
-        relocation.destination.join(configured)
-    };
-    let mut normalized = PathBuf::new();
-    for component in absolute.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                normalized.pop();
-            }
-            component => normalized.push(component.as_os_str()),
-        }
-    }
-    if normalized == relocation.new_root {
-        return Ok(());
-    }
-    if normalized != relocation.old_root {
-        return Err(format!(
-            "This Git directory names another checkout: {}. Its setting was preserved.",
-            normalized.display()
-        ));
-    }
-    let write = command()
-        .args(["config", "--local", "core.worktree"])
-        .arg(&relocation.new_root);
-    SystemProcessExecutor
-        .execute(&write, &crate::repository::CancellationToken::default())
-        .and_then(|output| output.require_success(&write.program))
-        .map_err(|error| error.to_string())?;
-    Ok(())
+    repair_config_with(relocation,||{})
 }
 
+fn repair_config_with(relocation:&Relocation,before_write:impl FnOnce())->Result<(),String> {
+    let root=Directory::open(&relocation.new_root)?;
+    let common=Directory::open(&relocation.destination)?;
+    repair_config_pinned(relocation,&root,&common,before_write)
+}
+
+fn repair_config_pinned(relocation:&Relocation,root:&Directory,common:&Directory,before_write:impl FnOnce())->Result<(),String> {
+    use crate::repository::{CommandSpec,ProcessExecutor,SystemProcessExecutor};
+    root.require_current()?;common.require_current()?;
+    let (admin,discovered)=crate::project_location::checkout_identity(&root.anchor()).ok_or("The selected checkout no longer has readable Git metadata")?;
+    if discovered!=relocation.destination {return Err("The selected checkout changed repositories while locating it".into());}
+    root.require_current()?;common.require_current()?;
+    if admin!=common.path() {return Ok(());}
+    let original=common.read("config",8*1024*1024)?;
+    // Let Git parse and preserve its config syntax in a private working copy.
+    // It never receives a mutable repository pathname. The final replace is
+    // performed by us relative to the retained common-directory FD.
+    let temporary=tempfile::tempdir().map_err(|error|error.to_string())?;
+    let config=temporary.path().join("config");
+    std::fs::write(&config,&original).map_err(|error|error.to_string())?;
+    let command=||CommandSpec::new("git").args(["config","--no-includes","--file"]).arg(&config)
+        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_COMMON_DIR").env_remove("GIT_INDEX_FILE")
+        .timeout(std::time::Duration::from_secs(15)).output_limits(64*1024,64*1024);
+    let read=command().args(["--null","--get","core.worktree"]);
+    let output=SystemProcessExecutor.execute(&read,&crate::repository::CancellationToken::default()).map_err(|error|error.to_string())?;
+    if output.exit_code==Some(1) {return Ok(());}
+    let output=output.require_success(&read.program).map_err(|error|error.to_string())?;
+    let bytes=output.stdout.strip_suffix(&[0]).ok_or("Git returned an invalid checkout setting")?;
+    let configured=PathBuf::from(String::from_utf8(bytes.to_vec()).map_err(|_|"Git checkout setting is not valid UTF-8")?);
+    let absolute=if configured.is_absolute(){configured}else{relocation.destination.join(configured)};
+    let mut normalized=PathBuf::new();
+    for component in absolute.components(){match component {std::path::Component::CurDir=>{},std::path::Component::ParentDir=>{normalized.pop();},component=>normalized.push(component.as_os_str())}}
+    if normalized==relocation.new_root {return Ok(());}
+    if normalized!=relocation.old_root {return Err(format!("This Git directory names another checkout: {}. Its setting was preserved.",normalized.display()));}
+    let write=command().arg("core.worktree").arg(&relocation.new_root);
+    SystemProcessExecutor.execute(&write,&crate::repository::CancellationToken::default()).and_then(|output|output.require_success(&write.program)).map_err(|error|error.to_string())?;
+    let after=std::fs::read(&config).map_err(|error|error.to_string())?;
+    before_write();
+    root.require_current()?;common.require_current()?;
+    Edit::new(common.clone(),"config",original,after).apply()?;
+    root.require_current()
+}
 
 /// The caller holds the exact project's scoped location reservation. Perform
 /// repairs only after registry instance validation, never in a stale chooser.
-pub fn repair(relocation: &Relocation, worktrees: &[PathBuf]) -> Result<(), String> {
-    repair_checkout_config(relocation)?;
-    use crate::repository::{CommandSpec, ProcessExecutor, SystemProcessExecutor};
-    let mut command = CommandSpec::new("git").cwd(&relocation.new_root)
-        .args(["worktree", "repair"])
-        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR").env_remove("GIT_INDEX_FILE")
-        .timeout(std::time::Duration::from_secs(15)).output_limits(64*1024,64*1024);
+pub(crate) fn repair(relocation: &Relocation, worktrees: &[PathBuf]) -> Result<(), String> {
+    let root=Directory::open(&relocation.new_root)?;
+    let common=Directory::open(&relocation.destination)?;
+    repair_config_pinned(relocation,&root,&common,||{})?;
     let mut known=worktrees.to_vec();
-    // The UI's loaded tree may omit closed linked checkouts. Git's own
-    // bounded admin records supply candidates; the exact backlink check below
-    // still gates each explicit repair argument.
-    if let Ok(entries)=std::fs::read_dir(relocation.destination.join("worktrees")) {
+    if let Ok(entries)=std::fs::read_dir(common.anchor().join("worktrees")) {
         for entry in entries.take(4096).flatten() {
             if let Some(marker)=read_marker(&entry.path().join("gitdir")) {
-                if let Some(path)=Path::new(marker.trim()).parent() { known.push(path.to_owned()); }
+                if let Some(path)=Path::new(marker.trim()).parent(){known.push(path.to_owned());}
             }
         }
     }
     known.sort();known.dedup();
-    for path in &known {
-        let path = relocation.mapped(path);
-        if path != relocation.new_root && belongs_to_relocated_worktree(&path,relocation) { command=command.arg(path); }
+    for path in known {
+        let path=relocation.mapped(&path);
+        if path==relocation.new_root || !belongs_to_relocated_worktree(&path,relocation){continue;}
+        let checkout=Directory::open(&path)?;
+        let before=checkout.read(".git",4096)?;
+        let marker=std::str::from_utf8(&before).map_err(|error|error.to_string())?;
+        let admin=Path::new(marker.trim().strip_prefix("gitdir: ").ok_or("Invalid linked checkout marker")?);
+        let admin=if admin.is_absolute(){admin.to_owned()}else{path.join(admin)};
+        if !admin.starts_with(&relocation.repository){return Err("Linked checkout changed Git ownership during Locate".into());}
+        let admin_path=relocation.mapped(&admin);
+        // Only an exact child admin directory is repaired; no inferred name
+        // or arbitrary replacement-clone .git marker grants write authority.
+        if admin_path.parent()!=Some(relocation.destination.join("worktrees").as_path()){return Err("Linked checkout admin directory changed during Locate".into());}
+        let admin=Directory::open(&admin_path)?;
+        let backlink=admin.read("gitdir",4096)?;
+        let old=std::str::from_utf8(&backlink).map_err(|error|error.to_string())?;
+        if relocation.mapped(Path::new(old.trim()))!=path.join(".git"){return Err("Linked checkout backlink changed during Locate".into());}
+        root.require_current()?;common.require_current()?;checkout.require_current()?;admin.require_current()?;
+        // Git worktree repair canonicalizes paths internally before writes;
+        // retained argument FDs alone cannot fence those later opens. Repair
+        // these already verified linking records with directory-relative edits.
+        Edit::new(checkout.clone(),".git",before,format!("gitdir: {}\n",admin_path.display()).into_bytes()).apply()?;
+        root.require_current()?;common.require_current()?;checkout.require_current()?;
+        Edit::new(admin,"gitdir",backlink,format!("{}\n",path.join(".git").display()).into_bytes()).apply()?;
+        checkout.require_current()?;
     }
-    if let Err(error)=SystemProcessExecutor.execute(&command,&crate::repository::CancellationToken::default()).and_then(|output|output.require_success(&command.program)) {
-        // Separately missing linked checkouts remain actionable after primary repair.
-        tracing::warn!(%error,"some linked worktrees could not be repaired after locating project");
+    root.require_current()?;common.require_current()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn config_repair_refuses_replaced_checkout_or_admin_after_read_without_touching_replacement() {
+        for replace_admin in [false,true] {
+            let fixture=tempfile::tempdir().unwrap();
+            let old=fixture.path().join("old");let selected=fixture.path().join("selected");let common=fixture.path().join("repo.git");
+            std::fs::create_dir(&selected).unwrap();std::fs::create_dir(&common).unwrap();
+            std::fs::write(selected.join(".git"),format!("gitdir: {}\n",common.display())).unwrap();
+            std::fs::write(common.join("config"),format!("[core]\nworktree = {}\n",old.display())).unwrap();
+            let relocation=Relocation{repository:common.clone(),destination:common.clone(),old_root:old,new_root:selected.clone()};
+            let replaced=if replace_admin {common.clone()}else{selected.clone()};
+            let retained=fixture.path().join("original-inode");
+            let result=repair_config_with(&relocation,|| {
+                std::fs::rename(&replaced,&retained).unwrap();std::fs::create_dir(&replaced).unwrap();
+                std::fs::write(replaced.join("config"),b"replacement must remain exact").unwrap();
+            });
+            assert!(result.unwrap_err().contains("replaced"));
+            assert_eq!(std::fs::read(replaced.join("config")).unwrap(),b"replacement must remain exact");
+            let original_config=if replace_admin {retained.join("config")}else{common.join("config")};
+            assert!(String::from_utf8(std::fs::read(original_config).unwrap()).unwrap().contains("/old"));
+            assert!(!common.join("config.lock").exists());
+        }
     }
-    Ok(())
 }
