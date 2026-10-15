@@ -208,13 +208,7 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(
-            theme,
-            limit.map(|height| (height, true)),
-            target,
-            find,
-            None,
-        )
+        self.surface(theme, limit.map(|height| (height, true)), target, find, None, None)
     }
 
     /// Patches and read results open at their first line.
@@ -225,7 +219,7 @@ impl ToolText {
         target: Target,
         find: Option<&str>,
     ) -> Element<'static, Message> {
-        self.surface(theme, Some((height, false)), target, find, None)
+        self.surface(theme, Some((height, false)), target, find, None, None)
     }
 
     pub(super) fn view_logical(
