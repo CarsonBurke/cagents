@@ -143,14 +143,20 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-/// Version 78 carries terminal provider outcomes and readable exit diagnostics.
-pub const PROTOCOL_VERSION: u16 = 78;
+/// Version 90 joins retained actor ownership, terminal provider outcomes and
+/// source-bound cleanup/close consent in a matched CLI, daemon and UI set.
+/// Intermediate development forks 78–89 are not compatible wire contracts.
+pub const PROTOCOL_VERSION: u16 = 90;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
 /// Client requests carry at most a one-MiB byte vector plus small scalars.
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
+/// Full immutable receipts are persisted as JSON as well as sent as postcard.
+/// The host preflights both representations before handoff effects; UI ledger
+/// reservations must use this independent escaped-JSON promise.
+pub const MAX_HANDOFF_RECEIPT_JSON_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_RESUME_TERMINALS: usize = 1024;
 /// Production full and browserless builds retain the runtime namespace; a
@@ -376,6 +382,7 @@ pub enum ClientRequest {
     /// Replace an attached native actor using its host-retained execution context.
     ChatReturnTerminal {
         chat_id: TerminalId,
+        expected: ChatSourceBinding,
     },
     /// GUI acknowledgement after the replacement terminal is durably saved.
     ChatCommitTerminal {
@@ -494,6 +501,15 @@ pub enum ClientRequest {
     CloseProjectGuarded {
         project: crate::project_recovery::ProjectInstance,
         sessions: Vec<crate::project_recovery::SessionClose>,
+    },
+    /// Close an exact existing conversation without attaching or restarting it.
+    ChatCloseSession {
+        session: crate::chat::Session,
+    },
+    /// Retire only this exact host-issued handoff after its full durable save.
+    /// Future matched protocol allocation; never use the legacy ID-only ACK.
+    ChatCommitTerminalReceipt {
+        receipt: TerminalHandoffReceipt,
     },
 }
 
@@ -735,10 +751,14 @@ pub enum ServerResponse {
     ShutdownOutcome(ShutdownOutcome),
     ChatAttached {
         session: crate::chat::Session,
+        execution_instance: uuid::Uuid,
+        binding: Option<ChatSourceBinding>,
         snapshot: crate::chat::Snapshot,
     },
     ChatSnapshot {
         chat_id: TerminalId,
+        execution_instance: uuid::Uuid,
+        binding: Option<ChatSourceBinding>,
         snapshot: Option<crate::chat::Snapshot>,
     },
     ChatListed {
@@ -772,6 +792,7 @@ pub enum ServerResponse {
     ChatTerminal {
         chat_id: TerminalId,
         session: TerminalSession,
+        receipt: TerminalHandoffReceipt,
         snapshot: crate::chat::Snapshot,
     },
     WorkspaceModel {
@@ -792,6 +813,8 @@ pub enum ServerResponse {
         session: crate::chat::Session,
     },
     ChatUpdate {
+        execution_instance: uuid::Uuid,
+        binding: Option<ChatSourceBinding>,
         chat_id: TerminalId,
         update: crate::chat::presentation::Presentation,
     },
@@ -819,6 +842,10 @@ pub enum ServerResponse {
     },
     ProjectCloseInventory {
         sessions: Vec<crate::project_recovery::SessionClose>,
+    },
+    ChatRestarted {
+        receipt: crate::chat::RestartReceipt,
+        snapshot: crate::chat::Snapshot,
     },
 }
 
@@ -886,6 +913,9 @@ pub enum ShutdownOutcome {
     ConfirmationRequired {
         current_count: u64,
     },
+    /// An original helper is still owned outside the resident inventory.
+    /// Confirmation cannot turn uncertain teardown into an empty daemon.
+    OwnershipUncertain,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -921,6 +951,69 @@ pub enum ProtocolErrorCode {
     PermissionDenied,
     Internal,
     ViewConflict,
+}
+
+/// Opaque authenticated authority for one concrete native backend. The host
+/// retains the process/actor witness privately; this nonce never authorizes a
+/// later backend in the same resident Handle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatSourceBinding {
+    pub source: crate::chat::Session,
+    pub execution_instance: uuid::Uuid,
+    pub backend: uuid::Uuid,
+}
+
+/// Host-issued evidence for one native chat to exact published terminal transition.
+/// Metadata only: transcript snapshots stay outside this retained receipt.
+/// This wire addition requires a future owner-allocated protocol after 90.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TerminalHandoffReceipt {
+    pub operation: uuid::Uuid,
+    pub source: crate::chat::Session,
+    pub source_execution_instance: uuid::Uuid,
+    pub source_binding: ChatSourceBinding,
+    /// Positive publication after this operation's own pairing or first
+    /// confirmed thread learning. The original captured intent stays above.
+    pub retained_binding: Option<ChatSourceBinding>,
+    /// Retained native publication boundary of the returned resource ID.
+    /// A later terminal -> native -> retired transition invalidates this stamp.
+    pub terminal_native_epoch: uuid::Uuid,
+    pub terminal: TerminalDescriptor,
+}
+
+/// Count the actual persisted representation without allocating an oversized
+/// JSON string. Serialized control characters count their escaped byte length.
+pub fn terminal_handoff_json_bytes(receipt: &TerminalHandoffReceipt) -> io::Result<usize> {
+    bounded_json_bytes(receipt, MAX_HANDOFF_RECEIPT_JSON_BYTES)
+}
+
+pub(crate) fn bounded_json_bytes(value: &impl Serialize, maximum: usize) -> io::Result<usize> {
+    struct Counter {
+        bytes: usize,
+        maximum: usize,
+    }
+    impl Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let required = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|required| *required <= self.maximum)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "terminal handoff JSON exceeds its reserved byte limit",
+                    )
+                })?;
+            self.bytes = required;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, maximum };
+    serde_json::to_writer(&mut counter, value).map_err(io::Error::other)?;
+    Ok(counter.bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2152,6 +2245,76 @@ mod tests {
         }
     }
     #[test]
+    fn native_backend_binding_and_exact_terminal_handoff_round_trip() {
+        let proof = proof("handoff", "boot", "incarnation");
+        let recipe = LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/fixture".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let source = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: recipe.clone(),
+                session_id: Some("confirmed-thread".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+        };
+        let binding = ChatSourceBinding {
+            source: source.clone(),
+            execution_instance: uuid::Uuid::new_v4(),
+            backend: uuid::Uuid::new_v4(),
+        };
+        let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
+        terminal.execution_instance = uuid::Uuid::new_v4();
+        terminal.session.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let receipt = TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(),
+            source: source.clone(),
+            source_execution_instance: binding.execution_instance,
+            source_binding: binding.clone(),
+            retained_binding: None,
+            terminal_native_epoch: uuid::Uuid::new_v4(),
+            terminal: terminal.clone(),
+        };
+        let request = ClientRequest::ChatReturnTerminal {
+            chat_id: source.id,
+            expected: binding,
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+        let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, request);
+        let ack = ClientRequest::ChatCommitTerminalReceipt {
+            receipt: receipt.clone(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &ack).unwrap();
+        let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, ack);
+        let response = ServerResponse::ChatTerminal {
+            chat_id: source.id,
+            session: terminal.session.clone(),
+            receipt,
+            snapshot: Default::default(),
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn activity_survives_full_and_unchanged_row_delta_snapshots() {
         let mut base = grid(1, &["ab"]);
         base.activity = Some(TerminalOutputActivity {
@@ -2199,6 +2362,8 @@ mod tests {
             ..Default::default()
         };
         let response = ServerResponse::ChatSnapshot {
+            execution_instance: uuid::Uuid::nil(),
+            binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };
@@ -2239,6 +2404,8 @@ mod tests {
         };
         let mut bytes = Vec::new();
         let response = ServerResponse::ChatSnapshot {
+            execution_instance: uuid::Uuid::nil(),
+            binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };
@@ -2266,6 +2433,8 @@ mod tests {
             ..Default::default()
         };
         let response = ServerResponse::ChatSnapshot {
+            execution_instance: uuid::Uuid::nil(),
+            binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };

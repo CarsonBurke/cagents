@@ -80,7 +80,9 @@ type Pending = Arc<
     Mutex<
         BTreeMap<
             u64,
-            crossbeam_channel::Sender<Result<Option<crate::model::TerminalSession>, String>>,
+            crossbeam_channel::Sender<
+                Result<Option<crate::terminal_ipc::TerminalHandoffReceipt>, String>,
+            >,
         >,
     >,
 >;
@@ -126,9 +128,79 @@ impl SourceClock {
     }
 }
 
+fn valid_source_binding(
+    binding: &crate::terminal_ipc::ChatSourceBinding,
+    source: &Session,
+    instance: uuid::Uuid,
+    proof: &HostSessionProof,
+) -> bool {
+    !instance.is_nil()
+        && !binding.backend.is_nil()
+        && binding.execution_instance == instance
+        && binding.source.id == source.id
+        && binding.source.proof.as_ref() == Some(proof)
+        && binding.source.launch.provider == source.launch.provider
+        && binding.source.launch.recipe == source.launch.recipe
+}
+
+fn valid_handoff_receipt(
+    receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+    expected: &crate::terminal_ipc::ChatSourceBinding,
+    proof: &HostSessionProof,
+) -> bool {
+    if !proof.is_complete()
+        || receipt.operation.is_nil()
+        || receipt.terminal_native_epoch.is_nil()
+        || receipt.terminal.execution_instance.is_nil()
+        || receipt.source_binding != *expected
+        || receipt.source_execution_instance != expected.execution_instance
+        || expected.source.proof.as_ref() != Some(proof)
+        || receipt
+            .terminal
+            .session
+            .continuity
+            .live_proof()
+            .as_ref()
+            .is_some_and(|issued| issued != proof)
+    {
+        return false;
+    }
+    let mut source = expected.source.clone();
+    if source.launch.session_id.is_some()
+        && source.launch.session_id != receipt.source.launch.session_id
+    {
+        return false;
+    }
+    source.launch.session_id = receipt.source.launch.session_id.clone();
+    source.native_continuity = receipt.source.native_continuity.clone();
+    if source != receipt.source {
+        return false;
+    }
+    if let Some(retained) = &receipt.retained_binding {
+        if !valid_source_binding(retained, &source, expected.execution_instance, proof)
+            || retained.source.launch.session_id != source.launch.session_id
+        {
+            return false;
+        }
+        let mut post = source.clone();
+        post.native_continuity = retained.source.native_continuity.clone();
+        if retained.source != post {
+            post.terminal = Some(receipt.terminal.session.clone());
+            if retained.source != post {
+                return false;
+            }
+        }
+    } else if source.launch.session_id != expected.source.launch.session_id {
+        return false; // First learning requires the authenticated canonical publication.
+    }
+    true
+}
+
 struct Inner {
     id: TerminalId,
     session: Session,
+    execution_instance: uuid::Uuid,
+    source_binding: Arc<Mutex<Option<crate::terminal_ipc::ChatSourceBinding>>>,
     upgrade_recovery: Option<(Session, Session)>,
     proof: HostSessionProof,
     wire: Arc<Mutex<Wire>>,
@@ -480,6 +552,8 @@ impl ClientHandle {
             inner: Arc::new(Inner {
                 id: session.id,
                 session,
+                execution_instance: uuid::Uuid::new_v4(),
+                source_binding: Arc::new(Mutex::new(None)),
                 upgrade_recovery: None,
                 proof,
                 wire: Arc::new(Mutex::new(Wire {
@@ -506,6 +580,30 @@ impl ClientHandle {
                 visibility_worker: Mutex::new(None),
             }),
         }
+    }
+
+    /// Explicit positive authority for isolated UI fixtures. Ordinary display
+    /// fixtures stay unbound and exercise the real unknown-authority refusal.
+    /// No running backend, server acknowledgement or native test is implied.
+    #[cfg(test)]
+    pub(crate) fn fixture_with_source_binding(session: Session, snapshot: Snapshot) -> Self {
+        let handle = Self::fixture(session, snapshot);
+        let mut source = handle.inner.session.clone();
+        source.proof = Some(handle.inner.proof.clone());
+        source.launch.session_id = handle.snapshot().session_id.clone();
+        let binding = crate::terminal_ipc::ChatSourceBinding {
+            source,
+            execution_instance: handle.inner.execution_instance,
+            backend: uuid::Uuid::new_v4(),
+        };
+        assert!(valid_source_binding(
+            &binding,
+            &handle.inner.session,
+            handle.inner.execution_instance,
+            &handle.inner.proof
+        ));
+        *handle.inner.source_binding.lock().unwrap() = Some(binding);
+        handle
     }
 
     #[cfg(test)]
@@ -844,7 +942,7 @@ impl ClientHandle {
         let mut early_activity = None;
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
-        let (session, initial) = loop {
+        let (session, initial, execution_instance, initial_binding) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
             let frame = codec.read(&mut stream);
@@ -891,11 +989,28 @@ impl ClientHandle {
                     early_usage.push(report, observed_at);
                 }
                 ServerMessage::Response {
-                    response: ServerResponse::ChatAttached { session, snapshot },
+                    response:
+                        ServerResponse::ChatAttached {
+                            session,
+                            snapshot,
+                            execution_instance,
+                            binding,
+                        },
                 } if session.id == id && envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
-                    break (session, snapshot);
+                    if execution_instance.is_nil() {
+                        return Err("Native attachment has no exact actor incarnation".into());
+                    }
+                    if binding.as_ref().is_some_and(|binding| {
+                        !valid_source_binding(binding, &session, execution_instance, &proof)
+                            || session.launch.session_id.as_ref().is_some_and(|thread| {
+                                binding.source.launch.session_id.as_ref() != Some(thread)
+                            })
+                    }) {
+                        return Err("Native attachment has inconsistent backend authority".into());
+                    }
+                    break (session, snapshot, execution_instance, binding);
                 }
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
@@ -947,12 +1062,16 @@ impl ClientHandle {
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
         let visible = Arc::new(AtomicBool::new(false));
+        let source_binding = Arc::new(Mutex::new(initial_binding));
         let pending: Pending = Arc::new(Mutex::new(BTreeMap::new()));
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
+        let binding_source = session.clone();
         let inner = Arc::new(Inner {
             id,
             session,
+            execution_instance,
+            source_binding: source_binding.clone(),
             upgrade_recovery,
             proof: proof.clone(),
             wire: wire.clone(),
@@ -1027,7 +1146,10 @@ impl ClientHandle {
                 if matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::ChatClosed { .. } | ServerResponse::ChatTerminal { .. } }) {
                     let (chat_id, final_snapshot, terminal) = match envelope.message {
                         ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id, snapshot } } => (chat_id, snapshot, None),
-                        ServerMessage::Response { response: ServerResponse::ChatTerminal { chat_id, session, snapshot } } => (chat_id, snapshot, Some(session)),
+                        ServerMessage::Response { response: ServerResponse::ChatTerminal { chat_id, session, receipt, snapshot } } => {
+                            if receipt.terminal.session != session || receipt.source.id != chat_id || receipt.operation.is_nil() || receipt.source_execution_instance.is_nil() || receipt.terminal.execution_instance.is_nil() || receipt.source.proof.as_ref() != Some(&proof) || receipt.terminal.session.continuity.live_proof().as_ref() != Some(&proof) { break "Daemon returned inconsistent terminal handoff authority".into(); }
+                            (chat_id, snapshot, Some(receipt))
+                        },
                         _ => unreachable!(),
                     };
                     if chat_id!=id { break "Daemon closed a different chat".into(); }
@@ -1096,7 +1218,12 @@ impl ClientHandle {
                             .push(report, observed_at);
                         if first { wake(Wake::AccountUsage); }
                     },
-                    ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
+                    ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update, execution_instance: observed_instance, binding } } if chat_id == id => {
+                        if observed_instance != execution_instance || binding.as_ref().is_some_and(|binding|
+                            !valid_source_binding(binding, &binding_source, execution_instance, &proof)) {
+                            break "Native backend response belongs to a different actor incarnation".into();
+                        }
+                        *source_binding.lock().unwrap_or_else(|p| p.into_inner()) = binding;
                         read_pending = false;
                         if let Some(update) = update {
                             resync = false;
@@ -1107,7 +1234,12 @@ impl ClientHandle {
                             if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
                         }
                     },
-                    ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
+                    ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update, execution_instance: observed_instance, binding } } if chat_id == id => {
+                        if observed_instance != execution_instance || binding.as_ref().is_some_and(|binding|
+                            !valid_source_binding(binding, &binding_source, execution_instance, &proof)) {
+                            break "Native backend update belongs to a different actor incarnation".into();
+                        }
+                        *source_binding.lock().unwrap_or_else(|p| p.into_inner()) = binding;
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                         let sampled_at = update.metadata.sampled_at;
@@ -1270,7 +1402,7 @@ impl ClientHandle {
     fn request_response(
         &self,
         request: ClientRequest,
-    ) -> Result<Option<crate::model::TerminalSession>, String> {
+    ) -> Result<Option<crate::terminal_ipc::TerminalHandoffReceipt>, String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected; exact reattachment is required".into());
         }
@@ -1301,15 +1433,46 @@ impl ClientHandle {
         self.request_response(request).map(|_| ())
     }
 
+    /// Exercise unavailable post-return metadata on the SAME captured handle.
+    /// This withdraws authority and never constructs a replacement binding.
+    #[cfg(test)]
+    pub(crate) fn clear_source_binding_for_test(&self) {
+        *self
+            .inner
+            .source_binding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// Latest authenticated live source metadata; absence grants no new authority.
+    pub fn source_binding(&self) -> Option<crate::terminal_ipc::ChatSourceBinding> {
+        self.inner
+            .source_binding
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
     /// The daemon retains and replays the resulting terminal across lost replies.
     /// Credentials stay entirely within the host's native/PTY execution context.
-    pub fn return_terminal(&self) -> Result<crate::model::TerminalSession, String> {
+    pub fn return_terminal(
+        &self,
+        expected: crate::terminal_ipc::ChatSourceBinding,
+    ) -> Result<crate::terminal_ipc::TerminalHandoffReceipt, String> {
+        if !valid_source_binding(
+            &expected,
+            &self.inner.session,
+            self.inner.execution_instance,
+            &self.inner.proof,
+        ) {
+            return Err("Return intent has no matching authenticated native backend".into());
+        }
         let terminal = self
             .request_response(ClientRequest::ChatReturnTerminal {
                 chat_id: self.inner.id,
+                expected: expected.clone(),
             })?
             .ok_or("Daemon did not return the exact replacement terminal")?;
-        if terminal.continuity.live_proof().as_ref() != Some(&self.inner.proof) {
+        if !valid_handoff_receipt(&terminal, &expected, &self.inner.proof) {
             return Err("Replacement terminal has no matching daemon ownership proof".into());
         }
         Ok(terminal)
@@ -1483,6 +1646,51 @@ fn acknowledge_terminal_handoffs_on(
         .collect()
 }
 
+/// Retire metadata only after saving each COMPLETE host-issued receipt.
+/// Missing/replaced daemons cannot retire an unknown operation: keep the
+/// durable receipt so the caller can report or reconcile it explicitly.
+pub fn acknowledge_terminal_handoff_receipts(
+    receipts: &[crate::terminal_ipc::TerminalHandoffReceipt],
+) -> Vec<Result<(), String>> {
+    if receipts.is_empty() {
+        return Vec::new();
+    }
+    let socket = match ipc::daemon_socket_path() {
+        Ok(socket) => socket,
+        Err(error) => return vec![Err(error.to_string()); receipts.len()],
+    };
+    acknowledge_terminal_handoff_receipts_on(
+        crate::control::ControlClient::connect(&socket),
+        receipts,
+    )
+}
+
+fn acknowledge_terminal_handoff_receipts_on(
+    connection: Result<crate::control::ControlClient, crate::control::ControlError>,
+    receipts: &[crate::terminal_ipc::TerminalHandoffReceipt],
+) -> Vec<Result<(), String>> {
+    let mut client = match connection {
+        Ok(client) => client,
+        Err(error) => return vec![Err(error.to_string()); receipts.len()],
+    };
+    let mut connection_failure = None;
+    receipts.iter().map(|receipt| {
+        if receipt.source.proof.as_ref() != Some(client.proof()) {
+            return Err("The exact daemon that issued this terminal handoff is unavailable; its receipt was retained".into());
+        }
+        if let Some(error) = &connection_failure { return Err(error.clone()); }
+        match client.commit_terminal_handoff_receipt(receipt) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                if !matches!(error, crate::control::ControlError::Remote { .. }) {
+                    connection_failure = Some(error.to_string());
+                }
+                Err(error.to_string())
+            }
+        }
+    }).collect()
+}
+
 /// Running and starting daemon chats, including detached sessions. Never starts a daemon.
 pub fn inventory() -> Result<Vec<Session>, String> {
     let socket = ipc::daemon_socket_path().map_err(|e| e.to_string())?;
@@ -1532,6 +1740,164 @@ mod tests {
     use super::*;
 
     #[test]
+    fn authenticated_same_record_thread_refresh_preserves_captured_return_intents() {
+        let proof = host_proof("live-thread-binding");
+        let source = omp_card(Some("thread-a"), Some(proof.clone()));
+        let instance = uuid::Uuid::new_v4();
+        let a = crate::terminal_ipc::ChatSourceBinding {
+            source: source.clone(),
+            execution_instance: instance,
+            backend: uuid::Uuid::new_v4(),
+        };
+        let mut b = a.clone();
+        b.source.launch.session_id = Some("thread-b".into());
+        b.backend = uuid::Uuid::new_v4();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (advance, ready) = std::sync::mpsc::channel();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let sent_a = a.clone();
+        let sent_b = b.clone();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(connect.request_id),
+                &proof,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: Vec::new(),
+                    },
+                },
+            );
+            let attach: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(attach.request_id),
+                &proof,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session: sent_a.source.clone(),
+                        execution_instance: instance,
+                        binding: Some(sent_a.clone()),
+                        snapshot: Snapshot {
+                            generation: 1,
+                            session_id: Some("thread-a".into()),
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            loop {
+                let visibility: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                if matches!(
+                    visibility.request,
+                    ClientRequest::ChatVisibility { visible: true, .. }
+                ) {
+                    break;
+                }
+            }
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                None,
+                &proof,
+                ServerMessage::ChatChanged {
+                    chat_id: sent_a.source.id,
+                },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+            handoff_reply(
+                &mut server,
+                &mut codec,
+                Some(read.request_id),
+                &proof,
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id: sent_a.source.id,
+                        execution_instance: instance,
+                        binding: Some(sent_b.clone()),
+                        snapshot: Some(Snapshot {
+                            generation: 2,
+                            session_id: Some("thread-b".into()),
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            for (expected, reason) in [
+                (sent_a, "old captured intent refused"),
+                (sent_b, "new captured intent reached host"),
+            ] {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert!(
+                    matches!(request.request, ClientRequest::ChatReturnTerminal { expected: ref actual, .. } if *actual == expected)
+                );
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(request.request_id),
+                    &proof,
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::InvalidRequest,
+                        reason,
+                        false,
+                    )),
+                );
+            }
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle = ClientHandle::connect_on(
+            client,
+            source,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(handle.source_binding(), Some(a.clone()));
+        handle.set_visible(true).unwrap();
+        advance.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.source_binding() != Some(b.clone())
+            || handle.session().launch.session_id.as_deref() != Some("thread-b")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "same Record refresh did not publish B"
+            );
+            thread::yield_now();
+        }
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        assert_eq!(
+            handle.return_terminal(a).unwrap_err(),
+            "old captured intent refused"
+        );
+        assert_eq!(
+            handle.return_terminal(b).unwrap_err(),
+            "new captured intent reached host"
+        );
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        assert!(handle.snapshot().error.is_none());
+        finish.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn handled_command_refusals_do_not_become_shared_snapshot_errors() {
         for initial_error in [None, Some("previous unsolicited error".to_owned())] {
             let (client, mut server) = UnixStream::pair().unwrap();
@@ -1571,6 +1937,8 @@ mod tests {
                     &proof,
                     ServerMessage::Response {
                         response: ServerResponse::ChatAttached {
+                            execution_instance: uuid::Uuid::from_u128(1),
+                            binding: None,
                             session,
                             snapshot: Snapshot {
                                 generation: 1,
@@ -1739,6 +2107,159 @@ mod tests {
                     resumed: Vec::new(),
                 },
             },
+        );
+    }
+
+    #[test]
+    fn completed_handoff_retains_exact_operation_proof_without_a_live_continuity_claim() {
+        let terminal = handoff_terminal();
+        let source = Session {
+            id: TerminalId::new(),
+            proof: Some(handoff_proof()),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: terminal.launch.clone(),
+                session_id: Some("original".into()),
+            },
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+        };
+        let binding = crate::terminal_ipc::ChatSourceBinding {
+            source: source.clone(),
+            execution_instance: uuid::Uuid::new_v4(),
+            backend: uuid::Uuid::new_v4(),
+        };
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            terminal.id,
+            terminal.launch,
+            None,
+        );
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let mut receipt = crate::terminal_ipc::TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(),
+            source,
+            source_execution_instance: binding.execution_instance,
+            source_binding: binding.clone(),
+            retained_binding: None,
+            terminal_native_epoch: uuid::Uuid::new_v4(),
+            terminal: descriptor,
+        };
+        assert!(receipt.terminal.session.continuity.live_proof().is_none());
+        assert!(valid_handoff_receipt(&receipt, &binding, &handoff_proof()));
+        receipt.terminal.execution_instance = uuid::Uuid::nil();
+        assert!(!valid_handoff_receipt(&receipt, &binding, &handoff_proof()));
+        receipt.terminal.execution_instance = uuid::Uuid::new_v4();
+        receipt.source.launch.session_id = Some("another".into());
+        assert!(!valid_handoff_receipt(&receipt, &binding, &handoff_proof()));
+    }
+
+    #[test]
+    fn typed_handoff_ack_transmits_the_complete_operation_and_preserves_refusals() {
+        let terminal = handoff_terminal();
+        let source = Session {
+            id: TerminalId::new(),
+            proof: Some(handoff_proof()),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: terminal.launch.clone(),
+                session_id: Some("original".into()),
+            },
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+        };
+        let binding = crate::terminal_ipc::ChatSourceBinding {
+            source: source.clone(),
+            execution_instance: uuid::Uuid::new_v4(),
+            backend: uuid::Uuid::new_v4(),
+        };
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            terminal.id,
+            terminal.launch,
+            None,
+        );
+        descriptor.execution_instance = uuid::Uuid::new_v4();
+        let a = crate::terminal_ipc::TerminalHandoffReceipt {
+            operation: uuid::Uuid::new_v4(),
+            source,
+            source_execution_instance: binding.execution_instance,
+            source_binding: binding,
+            retained_binding: None,
+            terminal_native_epoch: uuid::Uuid::new_v4(),
+            terminal: descriptor,
+        };
+        let mut b = a.clone();
+        b.operation = uuid::Uuid::new_v4();
+        b.terminal.execution_instance = uuid::Uuid::new_v4();
+        let receipts = vec![a, b];
+        let expected = receipts.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        struct Completed(std::sync::mpsc::Sender<()>);
+        impl Drop for Completed {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let _completed = Completed(done_tx);
+            let mut server = server;
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            handoff_handshake(&mut server, &mut codec);
+            for (index, expected) in expected.into_iter().enumerate() {
+                let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                assert_eq!(
+                    request.request,
+                    ClientRequest::ChatCommitTerminalReceipt { receipt: expected }
+                );
+                let message = if index == 0 {
+                    ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+                        "exact receipt refused",
+                        false,
+                    ))
+                } else {
+                    ServerMessage::Response {
+                        response: ServerResponse::Accepted,
+                    }
+                };
+                handoff_reply(
+                    &mut server,
+                    &mut codec,
+                    Some(request.request_id),
+                    &handoff_proof(),
+                    message,
+                );
+            }
+        });
+        let result = acknowledge_terminal_handoff_receipts_on(
+            crate::control::ControlClient::from_stream(client),
+            &receipts,
+        );
+        let completed = done_rx.recv_timeout(Duration::from_secs(6));
+        drop(worker);
+        assert!(completed.is_ok(), "finite framed peer did not finish");
+        assert!(
+            result[0]
+                .as_ref()
+                .unwrap_err()
+                .contains("exact receipt refused")
+        );
+        assert!(result[1].is_ok());
+        assert!(
+            acknowledge_terminal_handoff_receipts_on(
+                Err(crate::control::ControlError::ConnectionClosed),
+                &receipts
+            )
+            .iter()
+            .all(Result::is_err)
         );
     }
 
@@ -2751,7 +3272,12 @@ mod tests {
                         _ => {}
                     }
                     ServerMessage::Response {
-                        response: ServerResponse::ChatAttached { session, snapshot },
+                        response: ServerResponse::ChatAttached {
+                            execution_instance: uuid::Uuid::from_u128(1),
+                            binding: None,
+                            session,
+                            snapshot,
+                        },
                     }
                 });
             if mismatch == 0 {
@@ -2807,6 +3333,8 @@ mod tests {
                 };
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached {
+                        execution_instance: uuid::Uuid::from_u128(1),
+                        binding: None,
                         session,
                         snapshot: Snapshot::default(),
                     },
@@ -2913,6 +3441,8 @@ mod tests {
                 Some(start.request_id),
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached {
+                        execution_instance: uuid::Uuid::from_u128(1),
+                        binding: None,
                         session,
                         snapshot: initial,
                     },
@@ -2928,7 +3458,12 @@ mod tests {
                 &mut server,
                 None,
                 ServerMessage::Response {
-                    response: ServerResponse::ChatUpdate { chat_id, update },
+                    response: ServerResponse::ChatUpdate {
+                        execution_instance: uuid::Uuid::from_u128(1),
+                        binding: None,
+                        chat_id,
+                        update,
+                    },
                 },
             );
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2966,6 +3501,8 @@ mod tests {
                 None,
                 ServerMessage::Response {
                     response: ServerResponse::ChatUpdate {
+                        execution_instance: uuid::Uuid::from_u128(1),
+                        binding: None,
                         chat_id,
                         update: malformed,
                     },
@@ -2990,6 +3527,8 @@ mod tests {
                 Some(resync.request_id),
                 ServerMessage::Response {
                     response: ServerResponse::ChatSnapshot {
+                        execution_instance: uuid::Uuid::from_u128(1),
+                        binding: None,
                         chat_id,
                         snapshot: Some(full),
                     },
@@ -3103,6 +3642,8 @@ mod tests {
                     &mut server,
                     Some(start.request_id),
                     ServerResponse::ChatAttached {
+                        execution_instance: uuid::Uuid::from_u128(1),
+                        binding: None,
                         session,
                         snapshot: Snapshot {
                             generation: 1,
@@ -3124,6 +3665,8 @@ mod tests {
                         &mut server,
                         None,
                         ServerResponse::ChatSnapshot {
+                            execution_instance: uuid::Uuid::from_u128(1),
+                            binding: None,
                             chat_id,
                             snapshot: Some(Snapshot {
                                 generation,

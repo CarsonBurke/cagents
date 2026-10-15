@@ -50,6 +50,16 @@ fn model_unavailable(error: String) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::Internal, error, false)
 }
 
+// Only deliberately constructed diagnostic hosts may omit managed storage.
+// A real daemon records its opening attempt before it can adopt any owner.
+#[derive(Clone, Copy)]
+enum ModelAdmission {
+    Unmanaged,
+    Opening,
+    Ready,
+    Unavailable,
+}
+
 pub(crate) type ClientId = u64;
 /// The lock every host user serializes on; see [`super::lock`].
 pub(crate) type HostLock = super::lock::HostMutex<HostState>;
@@ -258,6 +268,7 @@ pub(crate) struct HostState {
     /// would invite every window to re-seed on every connection. A failure is
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
+    model_admission: ModelAdmission,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
@@ -282,6 +293,10 @@ pub(crate) struct HostState {
     model_watchers: BTreeSet<ClientId>,
     client_pids: BTreeMap<ClientId, u32>,
     pub(super) notifications: Option<super::notifications::Handle>,
+    pub(super) native_actor_restarts:
+        BTreeMap<TerminalId, super::chat::retained_actor::PreparedRestart>,
+    pub(super) native_actor_outcomes: Option<super::chat::retained_actor::Broker>,
+    pub(super) native_actor_startups: BTreeMap<TerminalId, super::chat::retained_actor::Startup>,
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
     notification_activation:
@@ -292,13 +307,20 @@ pub(crate) struct HostState {
     pub(super) inventory_generation: u64,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
     pub(super) chats: BTreeMap<TerminalId, super::chat::Record>,
+    pub(super) chat_transition_gates: BTreeMap<TerminalId, std::sync::Weak<Mutex<()>>>,
+    pub(super) chat_restarts: BTreeMap<TerminalId, super::chat::restart::Restart>,
     /// A daemon proof plus native UUID must identify at most one fresh actor.
     /// Retain successful/explicitly closed IDs after removing their records.
     pub(super) issued_chat_ids: BTreeSet<TerminalId>,
     /// Retry a failed private metadata write at most once per second, while
     /// continuing to publish actor output. Directory authority stays unchanged.
     pub(super) directory_thread_retry: Option<Instant>,
+    pub(super) chat_observer_stamps: BTreeMap<TerminalId, (uuid::Uuid, uuid::Uuid)>,
+    pub(super) directory_thread_observers: BTreeMap<TerminalId, std::sync::Weak<Mutex<()>>>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
+    pub(super) native_sources: super::chat::source_binding::History,
+    handoff_receipts: BTreeMap<uuid::Uuid, crate::terminal_ipc::TerminalHandoffReceipt>,
+    handoff_receipt_order: VecDeque<uuid::Uuid>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
@@ -331,6 +353,106 @@ struct PreparedUpgrade {
 }
 
 impl HostState {
+    #[cfg(test)]
+    pub(super) fn has_pending_terminal_spawn_for_test(&self) -> bool {
+        !self.spawning.is_empty()
+    }
+    #[cfg(test)]
+    pub(super) fn observe_terminal_worker_for_test(
+        &mut self,
+        id: TerminalId,
+        instance: uuid::Uuid,
+    ) {
+        self.published_terminal_workers.observe(id, instance);
+    }
+    #[cfg(test)]
+    pub(super) fn latest_terminal_worker_for_test(&self, id: TerminalId) -> Option<uuid::Uuid> {
+        self.published_terminal_workers.latest(id)
+    }
+    /// Keep a bounded history after workers/actors retire. Live and pending
+    /// owners retain their one exact receipt independently of history eviction.
+    pub(super) fn remember_terminal_handoff(
+        &mut self,
+        receipt: crate::terminal_ipc::TerminalHandoffReceipt,
+    ) {
+        const HISTORY: usize = 1024;
+        if self.handoff_receipts.contains_key(&receipt.operation) {
+            return;
+        }
+        while self.handoff_receipt_order.len() >= HISTORY {
+            if let Some(old) = self.handoff_receipt_order.pop_front() {
+                self.handoff_receipts.remove(&old);
+            }
+        }
+        self.handoff_receipt_order.push_back(receipt.operation);
+        self.handoff_receipts.insert(receipt.operation, receipt);
+    }
+
+    /// Called under the same HostLock as a conditional source/membership edit.
+    /// Neither public IDs nor a caller's descriptor can mint transition authority.
+    pub(super) fn validate_terminal_handoff_receipt(
+        &self,
+        receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+    ) -> Result<(), ProtocolError> {
+        super::chat::source_binding::validate_receipt(self, receipt)?;
+        let id = receipt.terminal.session.id;
+        let instance = receipt.terminal.execution_instance;
+        if instance.is_nil()
+            || self.published_terminal_workers.latest(id) != Some(instance)
+            || self.spawning.contains(&id)
+            || self.chat_spawning.contains_key(&id)
+            || self.chats.get(&id).is_some_and(|record| {
+                id != receipt.source.id
+                    || record.execution_instance != receipt.source_execution_instance
+            })
+            || self
+                .terminals
+                .get(&id)
+                .is_some_and(|record| record.handle.execution_instance() != instance)
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "The returned terminal was replaced or its exact publication history is unavailable",
+                false,
+            ));
+        }
+
+        self.validate_issued_terminal_handoff(receipt)
+    }
+
+    /// Metadata-only ACK authenticates the immutable issued operation without
+    /// requiring execution to remain live. It never grants teardown authority.
+    pub(super) fn validate_issued_terminal_handoff(
+        &self,
+        receipt: &crate::terminal_ipc::TerminalHandoffReceipt,
+    ) -> Result<(), ProtocolError> {
+        crate::terminal_ipc::validate_proof(receipt.source.proof.as_ref(), self.proof())?;
+        let issued = self
+            .handoff_receipts
+            .get(&receipt.operation)
+            .or_else(|| {
+                self.chat_handoffs
+                    .values()
+                    .filter_map(|pending| pending.issued())
+                    .find(|old| old.operation == receipt.operation)
+            })
+            .or_else(|| {
+                self.chats
+                    .values()
+                    .filter_map(|chat| chat.handoff_receipt.as_ref())
+                    .find(|old| old.operation == receipt.operation)
+            });
+        if issued == Some(receipt) {
+            Ok(())
+        } else {
+            Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "The exact host-issued terminal handoff is no longer retained; refresh the source without guessing a successor",
+                false,
+            ))
+        }
+    }
+
     pub(super) fn enable_holder_recovery(&mut self) {
         self.recover_holders = true;
     }
@@ -346,6 +468,7 @@ impl HostState {
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
+            model_admission: ModelAdmission::Unmanaged,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             automations: None,
@@ -356,6 +479,9 @@ impl HostState {
             model_watchers: BTreeSet::new(),
             client_pids: BTreeMap::new(),
             notifications: None,
+            native_actor_restarts: BTreeMap::new(),
+            native_actor_outcomes: None,
+            native_actor_startups: BTreeMap::new(),
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
@@ -365,9 +491,16 @@ impl HostState {
             inventory_generation: 0,
             shutdown_capabilities: VecDeque::new(),
             chats: BTreeMap::new(),
+            chat_transition_gates: BTreeMap::new(),
+            chat_restarts: BTreeMap::new(),
             issued_chat_ids: BTreeSet::new(),
             directory_thread_retry: None,
+            chat_observer_stamps: BTreeMap::new(),
+            directory_thread_observers: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
+            native_sources: Default::default(),
+            handoff_receipts: BTreeMap::new(),
+            handoff_receipt_order: VecDeque::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
@@ -447,6 +580,40 @@ impl HostState {
             }
         };
         self.model = Some(registry);
+        self.model_admission = if self.execution_registry.is_some() {
+            ModelAdmission::Ready
+        } else {
+            ModelAdmission::Unavailable
+        };
+    }
+
+    pub(super) fn expect_model(&mut self) {
+        self.model_admission = ModelAdmission::Opening;
+    }
+    pub(super) fn model_open_failed(&mut self) {
+        self.model_admission = ModelAdmission::Unavailable;
+    }
+
+    /// Resident admission state only; this never opens or probes a store.
+    pub(super) fn managed_registry_unavailable(&self) -> bool {
+        match self.model_admission {
+            ModelAdmission::Unmanaged => false,
+            ModelAdmission::Opening | ModelAdmission::Unavailable => true,
+            ModelAdmission::Ready => self.model.is_none() || self.execution_registry.is_none(),
+        }
+    }
+
+    /// In-memory publication of the exact durable observer registration. The
+    /// caller installs this under the same HostLock as the matching Record.
+    pub(super) fn publish_chat_observer(
+        &mut self,
+        id: TerminalId,
+        instance: uuid::Uuid,
+        stamp: uuid::Uuid,
+    ) {
+        self.chat_observer_stamps
+            .retain(|id, _| self.chats.contains_key(id));
+        self.chat_observer_stamps.insert(id, (instance, stamp));
     }
 
     /// Called under HostLock with the callback's private actor incarnation.
@@ -1390,6 +1557,32 @@ impl HostState {
         self.detach(0, source.id)
     }
 
+    /// Typed native recovery may inspect this authenticated current worker
+    /// before its durable native-console association has been installed.
+    pub(super) fn native_terminal_projection(
+        &self,
+        id: TerminalId,
+    ) -> Result<TerminalSession, String> {
+        let terminal = self
+            .terminals
+            .get(&id)
+            .ok_or("The native console worker is unavailable")?;
+        if terminal.handle.is_completed() || !self.proof().is_complete() {
+            return Err(
+                "The native console worker completed or its current ownership is unavailable"
+                    .into(),
+            );
+        }
+        let proof = self.proof();
+        let mut current = terminal.session.clone();
+        current.continuity = TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        Ok(current)
+    }
+
     pub(crate) fn finish_spawn(
         &mut self,
         client_id: ClientId,
@@ -1411,7 +1604,8 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_generation += 1;
         self.notification_closed.remove(&terminal_id);
-        self.published_terminal_workers.observe(terminal_id,execution_instance);
+        self.published_terminal_workers
+            .observe(terminal_id, handle.execution_instance());
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
@@ -1687,6 +1881,9 @@ impl HostState {
         client: ClientId,
         windows: &[crate::instance::VerifiedWindow],
     ) -> Result<(), String> {
+        if !self.native_actor_startups.is_empty() {
+            return Err("Unconfirmed native helper startup ownership has not settled".into());
+        }
         let verified = |id: &ClientId| {
             self.client_pids
                 .get(id)
@@ -1704,6 +1901,7 @@ impl HostState {
             || !self.chat_handoffs.is_empty()
             || !self.native_closing.is_empty()
             || !self.native_adoption_failures.is_empty()
+            || crate::daemon::child_reaper::has_outstanding_ownership()
         {
             return Err("Hosted process ownership has not settled".into());
         }
@@ -1785,6 +1983,11 @@ impl HostState {
         if self.shutting_down {
             return Err(ShutdownOutcome::AlreadyShuttingDown);
         }
+        if !self.native_actor_startups.is_empty()
+            || crate::daemon::child_reaper::has_retained_ownership()
+        {
+            return Err(ShutdownOutcome::OwnershipUncertain);
+        }
         if self.shutdown_capabilities.len() == MAX_SHUTDOWN_CAPABILITIES {
             self.shutdown_capabilities.pop_front();
         }
@@ -1840,10 +2043,15 @@ impl HostState {
         capability: &ShutdownCapability,
         now: Instant,
     ) -> Result<(), String> {
-        let count = self.inventory_count();
         if self.shutting_down {
             return Err("Daemon is already shutting down".into());
         }
+        if !self.native_actor_startups.is_empty()
+            || crate::daemon::child_reaper::has_retained_ownership()
+        {
+            return Err("Original helper cleanup is still owned outside the session inventory; wait for exact cleanup or resolve retained ownership before upgrading".into());
+        }
+        let count = self.inventory_count();
         if capability.proof != *self.proof {
             return Err("Daemon changed; obtain a new upgrade preflight".into());
         }
@@ -1880,6 +2088,16 @@ impl HostState {
         operation: ShutdownOperation,
         now: Instant,
     ) -> ShutdownOutcome {
+        // Caller-held spawn credits are represented by the host's spawning
+        // inventory and its indivisible shutdown admission fence. Only service
+        // entries and quarantined cleanup credits are extra owners: a failed
+        // startup publishes that fence before releasing its host reservation.
+        if !self.shutting_down
+            && (!self.native_actor_startups.is_empty()
+                || crate::daemon::child_reaper::has_retained_ownership())
+        {
+            return ShutdownOutcome::OwnershipUncertain;
+        }
         let count = self.inventory_count();
         if let ShutdownOperation::Stop { require_empty, .. } = operation
             && (!self.chat_spawning.is_empty()
@@ -2184,12 +2402,11 @@ fn prepare_upgrade_with_carry_policy(
         // A durable native holder also keeps its paired terminal alive. Its
         // exact environment remains only in the two holders' private memory.
         let carries = |id: &TerminalId, record: &TerminalRecord| {
-            (state.chats.get(id).is_some_and(|chat| {
-                matches!(
-                    chat.handle.native_continuity(),
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
-            }) || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
+            (state
+                .chats
+                .get(id)
+                .is_some_and(|chat| chat.handle.native_continuity().retains_provider())
+                || (!state.chats.contains_key(id) && record.execution_environment.is_none()))
                 && holders.is_some()
         };
         let carried = state
@@ -2244,13 +2461,10 @@ fn prepare_upgrade_with_carry_policy(
             }
             let mut source = record.session.clone();
             source.native_continuity = record.handle.native_continuity();
-            if matches!(
-                source.native_continuity,
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+            if source.native_continuity.retains_provider() {
                 source.launch.session_id = record.handle.confirmed_session_id();
-                crate::chat::protocol::align_resume_identity(&mut source.launch)
-                    .map_err(upgrade_error)?;
+                // The issued recipe is immutable. Only the separate effective
+                // launch below may adopt the provider-confirmed resume identity.
             }
             let mut launch = source.launch.clone();
             launch.session_id = record.handle.confirmed_session_id();
@@ -2261,7 +2475,12 @@ fn prepare_upgrade_with_carry_policy(
             // final conversation.
             super::super::chat::protocol::align_resume_identity(&mut launch)
                 .map_err(upgrade_error)?;
-            if launch.terminal_recipe().is_none() {
+            if launch.terminal_recipe().is_none()
+                && !matches!(
+                    source.native_continuity,
+                    crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+                )
+            {
                 return Err(upgrade_error(format!(
                     "Native chat {} has no exact resumable conversation; wait for provider initialization or close it explicitly",
                     source.id
@@ -2280,10 +2499,7 @@ fn prepare_upgrade_with_carry_policy(
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
                 && state.terminals.contains_key(&source.id)
-                && !matches!(
-                    source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && !source.native_continuity.retains_provider()
             {
                 if source.proof.as_ref() != Some(state.proof())
                     || source
@@ -2609,10 +2825,7 @@ pub(super) fn finish_upgrade(host: &SharedHost) -> Result<(), String> {
                 .collect::<Result<Vec<_>, _>>()?
         };
         for (chat, handle) in checkpoint.chats.iter_mut().zip(chats) {
-            let durable = matches!(
-                handle.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            );
+            let durable = handle.native_continuity().retains_provider();
             if durable {
                 handle.preserve_for_restart()?;
             } else {
@@ -2986,12 +3199,11 @@ fn restore_upgrade_from(
         return Ok(Vec::new());
     };
     checkpoint.validate()?;
-    if checkpoint.chats.iter().any(|chat| {
-        !matches!(
-            chat.source.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        )
-    }) {
+    if checkpoint
+        .chats
+        .iter()
+        .any(|chat| !chat.source.native_continuity.retains_provider())
+    {
         checkpoint.require_ready().map_err(|error| format!(
             "{error}. Evidence: {}. After inspecting the exact provider conversations, `cagents daemon abandon-upgrade --yes` archives this checkpoint and permits an empty daemon start; native sessions then require explicit manual recovery",
             store.path.display()
@@ -3003,10 +3215,7 @@ fn restore_upgrade_from(
     for chat in &checkpoint.chats {
         // A private holder authenticates the exact still-running server. Its
         // presence is the purpose of adoption, not permission to relaunch it.
-        if matches!(
-            chat.source.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        ) {
+        if chat.source.native_continuity.retains_provider() {
             continue;
         }
         let terminal = TerminalSession {
@@ -3045,10 +3254,7 @@ fn restore_upgrade_from(
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if super::chat::owns_codex_listener(&chat.source)
-                && !matches!(
-                    chat.source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && !chat.source.native_continuity.retains_provider()
             {
                 super::chat::restore_upgrade(host, chat)?;
             }
@@ -3078,11 +3284,7 @@ fn restore_upgrade_from(
         // checkpoint, but their authenticated holders retain the final screen.
         // Restore those receipts before requiring a native pair to match.
         if checkpoint.chats.iter().any(|chat| {
-            chat.source.terminal.is_some()
-                && matches!(
-                    chat.source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+            chat.source.terminal.is_some() && chat.source.native_continuity.retains_provider()
         }) {
             restore_orphaned_holders(host)?;
         }
@@ -3092,10 +3294,7 @@ fn restore_upgrade_from(
         // thread's rollout, is that conversation's problem to report, not a
         // reason to keep every other session and the daemon itself down.
         for chat in &checkpoint.chats {
-            if !matches!(
-                chat.source.native_continuity,
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+            if !chat.source.native_continuity.retains_provider() {
                 continue;
             }
             if crate::daemon::termination_requested() {
@@ -3522,10 +3721,7 @@ fn close_failed_restore(
         )
     };
     for chat in chats {
-        if matches!(
-            chat.native_continuity(),
-            crate::chat::NativeContinuity::Durable { .. }
-        ) {
+        if chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()?;
         } else {
             chat.close()?;
@@ -7131,6 +7327,286 @@ for line in sys.stdin:
         }
     }
 
+    fn run_child_shutdown_fixture(name: &str, marker: &str) -> bool {
+        if std::env::var_os(marker).is_some() {
+            return false;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        for entry in ["data", "config", "cache", "runtime"] {
+            std::fs::create_dir(directory.path().join(entry)).unwrap();
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture", "--test-threads=1"])
+            .env_clear()
+            .env(marker, "1")
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", directory.path())
+            .env("XDG_DATA_HOME", directory.path().join("data"))
+            .env("XDG_CONFIG_HOME", directory.path().join("config"))
+            .env("XDG_CACHE_HOME", directory.path().join("cache"))
+            .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("isolated original-child shutdown fixture exceeded its deadline");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let result = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            result.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        true
+    }
+
+    #[test]
+    fn retained_original_child_fences_empty_stop_and_upgrade_after_preflight() {
+        const CHILD: &str = "CAGENTS_CHILD_SHUTDOWN_FIXTURE";
+        const NAME: &str = "host::state::tests::retained_original_child_fences_empty_stop_and_upgrade_after_preflight";
+        if run_child_shutdown_fixture(NAME, CHILD) {
+            return;
+        }
+        use crate::daemon::child_reaper;
+        use std::os::fd::FromRawFd;
+        fn original_child() -> (std::process::Child, std::fs::File, std::process::ChildStdin) {
+            let mut child = std::process::Command::new("/bin/cat")
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let descriptor = unsafe {
+                libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) as libc::c_int
+            };
+            if descriptor < 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixture pidfd: {error}");
+            }
+            let stdin = child.stdin.take().unwrap();
+            // SAFETY: pidfd_open returned a new owned descriptor above.
+            (
+                child,
+                unsafe { std::fs::File::from_raw_fd(descriptor) },
+                stdin,
+            )
+        }
+        fn wait_reaped() {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while child_reaper::has_retained_ownership() {
+                assert!(Instant::now() < deadline, "original child was not reaped");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let reservation = child_reaper::reserve().unwrap();
+        assert!(!child_reaper::has_retained_ownership());
+        // A normal caller-held credit does not prevent counted confirmation.
+        // The host's spawn reservation represents the not-yet-installed actor.
+        let mut spawning = test_host();
+        spawning.reserve_spawn(TerminalId::new()).unwrap();
+        let capability = spawning
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        assert!(matches!(
+            spawning.shutdown(ShutdownOperation::Confirm { capability }, Instant::now()),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 1,
+                ..
+            }
+        ));
+        let mut state = test_host();
+        let before_transfer = state.shutdown_preflight(Instant::now()).unwrap().capability;
+        let (child, pidfd, stdin) = original_child();
+        reservation
+            .retain(child, pidfd)
+            .unwrap_or_else(|(error, mut child, _, _)| {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fixture transfer: {error}");
+            });
+        assert_eq!(state.inventory_count(), 0);
+        assert_eq!(
+            state.shutdown_preflight(Instant::now()),
+            Err(ShutdownOutcome::OwnershipUncertain)
+        );
+        assert_eq!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::OwnershipUncertain
+        );
+        assert_eq!(
+            state.shutdown(
+                ShutdownOperation::Confirm {
+                    capability: before_transfer.clone()
+                },
+                Instant::now()
+            ),
+            ShutdownOutcome::OwnershipUncertain
+        );
+        assert!(
+            state
+                .validate_upgrade_capability(&before_transfer, Instant::now())
+                .unwrap_err()
+                .contains("Original helper cleanup")
+        );
+        assert!(
+            !state.shutting_down,
+            "no uncertain stop may commit the shutdown fence"
+        );
+        drop(stdin);
+        wait_reaped();
+        state.shutdown_preflight(Instant::now()).unwrap();
+        // Suspended valid-FD ownership also fences shutdown after the child
+        // exits, until explicit original-owner retry actually reaps it.
+        let reservation = child_reaper::reserve().unwrap();
+        let (child, pidfd, stdin) = original_child();
+        reservation.preserve_suspended(child, Some(pidfd), "injected transfer failure");
+        drop(stdin);
+        assert_eq!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::OwnershipUncertain
+        );
+        assert_eq!(child_reaper::retry_preserved().unwrap().retained, 0);
+        wait_reaped();
+        assert!(matches!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 0,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn failed_startup_holder_queued_for_cleanup_is_not_an_empty_daemon() {
+        const CHILD: &str = "CAGENTS_QUEUED_HOLDER_SHUTDOWN_FIXTURE";
+        const NAME: &str =
+            "host::state::tests::failed_startup_holder_queued_for_cleanup_is_not_an_empty_daemon";
+        if run_child_shutdown_fixture(NAME, CHILD) {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let invalid_transcript = directory.path().join("transcript-directory");
+        std::fs::create_dir(&invalid_transcript).unwrap();
+        let mut state = test_host();
+        state.register_client(1);
+        let capability = state.shutdown_preflight(Instant::now()).unwrap().capability;
+        let host = Arc::new(HostLock::new(state));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "printf '%s' \"$PPID\" > \"$1/holder\"; printf '%s' \"$$\" > \"$1/root\"; exec /bin/cat".into(), "fixture".into(), directory.path().to_string_lossy().into_owned()],
+            working_directory: directory.path().into(), environment: Default::default(), unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: Some(invalid_transcript),
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+        };
+        TerminalHandle::with_blocked_holder_cleanup_for_test(|| {
+            assert!(
+                !crate::daemon::child_reaper::has_retained_ownership(),
+                "bounded latch jobs own no process"
+            );
+            let error = spawn_terminal(&host, 1, session.clone(), Default::default()).unwrap_err();
+            assert!(
+                error.message.contains("open transcript"),
+                "failure must occur after creating the actual holder: {error:?}"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let markers = loop {
+                let markers = ["holder", "root"]
+                    .into_iter()
+                    .map(|name| {
+                        std::fs::read_to_string(directory.path().join(name))
+                            .ok()?
+                            .parse::<i32>()
+                            .ok()
+                    })
+                    .collect::<Option<Vec<_>>>();
+                if let Some(markers) = markers {
+                    break markers;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture child never wrote its owned process markers"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            };
+            for pid in markers {
+                assert!(
+                    crate::daemon::holder_registry::Process::read(pid)
+                        .unwrap()
+                        .is_current(),
+                    "the queued holder still owns its actual live child"
+                );
+            }
+            let mut state = host.lock().unwrap();
+            assert!(state.spawning.is_empty());
+            assert!(state.terminals.is_empty());
+            assert_eq!(state.inventory_count(), 0);
+            assert_eq!(
+                state.shutdown_preflight(Instant::now()),
+                Err(ShutdownOutcome::OwnershipUncertain)
+            );
+            assert_eq!(
+                state.shutdown(empty_stop(), Instant::now()),
+                ShutdownOutcome::OwnershipUncertain
+            );
+            assert_eq!(
+                state.shutdown(
+                    ShutdownOperation::Confirm {
+                        capability: capability.clone()
+                    },
+                    Instant::now()
+                ),
+                ShutdownOutcome::OwnershipUncertain
+            );
+            assert!(
+                state
+                    .validate_upgrade_capability(&capability, Instant::now())
+                    .is_err()
+            );
+        });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::daemon::child_reaper::has_retained_ownership() {
+            assert!(
+                Instant::now() < deadline,
+                "queued original child cleanup never completed"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut state = host.lock().unwrap();
+        state.shutdown_preflight(Instant::now()).unwrap();
+        assert!(matches!(
+            state.shutdown(empty_stop(), Instant::now()),
+            ShutdownOutcome::Accepted {
+                live_terminals_before: 0,
+                ..
+            }
+        ));
+    }
+
     #[test]
     fn shutdown_reservations_and_spawn_fence_are_atomic() {
         let now = Instant::now();
@@ -7306,6 +7782,8 @@ for line in sys.stdin:
                 execution_instance: uuid::Uuid::new_v4(),
                 console_recipe: None,
                 paired_terminal: None,
+                handoff_receipt: None,
+                source_binding: None,
                 session,
                 handle: handle.clone(),
                 source_process: None,

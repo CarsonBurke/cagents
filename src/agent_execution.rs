@@ -439,6 +439,88 @@ pub struct Accepted {
     pub created: bool,
 }
 
+/// A currently observed presentation, not proof of its historical execution
+/// generation. Confirming this target only removes the shown ended pane.
+/// Clients must display that distinction and obtain explicit owner consent.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentationRepairTarget {
+    pub registry: uuid::Uuid,
+    pub agent: Agent,
+    pub scope: Placement,
+    pub view_revision: u64,
+    pub pane: crate::workspace_model::views::Pane,
+}
+
+impl std::fmt::Debug for PresentationRepairTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PresentationRepairTarget")
+            .field("agent", &self.agent.id).field("pane", &self.pane.id)
+            .field("view_revision", &self.view_revision).finish_non_exhaustive()
+    }
+}
+
+/// Current-presentation consent for an OPEN agent. This observation grants
+/// no teardown authority: the host must additionally bind its exact live or
+/// retained native owner and confirm normal provider/paired cleanup.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentationCloseObservation {
+    pub registry: uuid::Uuid,
+    pub agent: Agent,
+    pub scope: Placement,
+    pub view_revision: u64,
+    pub pane: crate::workspace_model::views::Pane,
+    pub source: HostedSession,
+}
+
+impl std::fmt::Debug for PresentationCloseObservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PresentationCloseObservation")
+            .field("agent", &self.agent.id).field("pane", &self.pane.id)
+            .field("view_revision", &self.view_revision).finish_non_exhaustive()
+    }
+}
+
+/// Exact process identities observed through the authenticated native holder.
+/// This identifies the current cleanup owner; it makes no claim about the
+/// unverifiable historical terminal pane generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresentationCloseOwner {
+    pub version: u32,
+    pub native: bool,
+    pub terminal: TerminalId,
+    pub application: String,
+    pub boot: crate::model::BootId,
+    pub holder_pid: i32,
+    pub holder_start: u64,
+    pub provider_pid: i32,
+    pub provider_start: u64,
+}
+
+/// A live/completed backend's exact observed incarnation, or a distinct
+/// authenticated receipt proving the entire original native owner retired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PresentationCloseBackend {
+    Process {pid: i32, start: u64},
+    RetiredOwner,
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentationCloseTarget {
+    pub observation: PresentationCloseObservation,
+    pub host: crate::model::HostSessionProof,
+    pub owner: PresentationCloseOwner,
+    pub actor_instance: Option<uuid::Uuid>,
+    pub backend: PresentationCloseBackend,
+    pub paired_owner: Option<PresentationCloseOwner>,
+}
+impl std::fmt::Debug for PresentationCloseTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PresentationCloseTarget")
+            .field("agent", &self.observation.agent.id)
+            .field("pane", &self.observation.pane.id).finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Submit(Submit),
@@ -469,6 +551,14 @@ pub enum Operation {
     PeekInbox(mailbox::Inbox),
     /// Settle exact received IDs in the authenticated recipient's mailbox.
     AcknowledgeInbox(mailbox::Receipt),
+    /// Observe an ended managed pane whose historical generation is unknown.
+    InspectPresentationRepair(AgentId),
+    /// Explicit presentation-only consent, fenced by the exact observation.
+    ConfirmPresentationRepair { observed: PresentationRepairTarget },
+    /// Observe exact current provider cleanup authority and unknown-history pane.
+    InspectPresentationClose(AgentId),
+    /// Explicitly stop the observed current provider and remove only this pane.
+    ConfirmPresentationClose { observed: PresentationCloseTarget },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -533,11 +623,14 @@ pub enum Reply {
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
+    PresentationRepair(Option<PresentationRepairTarget>),
+    PresentationRemoved { agent: AgentId, removed: bool },
+    PresentationClose(Option<PresentationCloseTarget>),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
 /// outcome must never be assigned to the agent's currently active run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Update {
     Started { provider_key: String },
     Waiting,

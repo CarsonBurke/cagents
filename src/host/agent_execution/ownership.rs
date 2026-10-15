@@ -68,9 +68,10 @@ fn interactive_inner(
         | ClientRequest::ChatAttach { session } => (session.id, false),
         ClientRequest::ChatPrepareResume { source }
         | ClientRequest::ChatRecoverAccount { source, .. } => (source.id, false),
-        ClientRequest::ChatReturnTerminal { chat_id } => (*chat_id, true),
+        ClientRequest::ChatReturnTerminal { chat_id, .. } => (*chat_id, true),
         ClientRequest::ChatCommitTerminal { terminal_id } => (*terminal_id, false),
         ClientRequest::ChatClose { chat_id } => (*chat_id, false),
+        ClientRequest::ChatCloseSession { session } => (session.id, false),
         _ => return apply(request),
     };
     let registry = host
@@ -257,7 +258,7 @@ fn reconcile_agent_run_with_archive(
         let HostedSession::Chat(source) = source else {
             return Err("This agent has no native cleanup contract".into());
         };
-        let handle = {
+        let (handle, execution_instance) = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             let record = state
                 .chats
@@ -267,7 +268,7 @@ fn reconcile_agent_run_with_archive(
                         .same_process(&HostedSession::Chat(record.session.clone()))
                 })
                 .ok_or("The exact provider ownership is unavailable for reconciliation")?;
-            record.handle.clone()
+            (record.handle.clone(), record.execution_instance)
         };
         let completed = handle.is_completed();
         let snapshot = (!completed || retire)
@@ -309,10 +310,12 @@ fn reconcile_agent_run_with_archive(
         if let Some(generation) = idle_generation {
             handle.close_if_idle(generation)?;
         }
-        super::super::chat::process(
+        super::super::chat::close_captured(
             host,
             EXECUTION_CLIENT,
-            ClientRequest::ChatClose { chat_id: source.id },
+            source,
+            &handle,
+            execution_instance,
         )
         .map_err(|error| error.message)?;
     } else if !retire {

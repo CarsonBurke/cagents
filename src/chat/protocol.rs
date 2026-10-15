@@ -286,6 +286,25 @@ impl ExecutionContext {
             .as_deref()
             == Some(path)
     }
+
+    /// Preserve an existing provider scope across a verified same-inode
+    /// relocation. A newly pinned legacy process never gains scope here.
+    pub(crate) fn relocate_observed_provider_directory(
+        &self,
+        previous: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        let mut observed = self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if observed.as_deref() != Some(previous) {
+            return Ok(false);
+        }
+        self.verify_directory(path)?;
+        *observed = Some(path.to_owned());
+        Ok(true)
+    }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         let Some(expected) = self.directory_identity()? else {
             return Ok(());
@@ -322,6 +341,10 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Deterministically exercise provider work after the last local input poll.
+    #[cfg(test)]
+    fn after_close_input_drained(&mut self) {}
+
     /// Refresh cached operational paths after the caller verified the same
     /// approved directory inode. This never changes provider launch provenance.
     fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
@@ -403,6 +426,36 @@ mod launch_tests {
         fn cleanup(&self) -> Result<LaunchOutcome, String> {
             Ok(*self.0.lock().unwrap())
         }
+    }
+
+    #[test]
+    fn verified_provider_scope_moves_without_granting_legacy_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let observed = ExecutionContext::capture(&original).unwrap();
+        let legacy = ExecutionContext::capture(&original).unwrap();
+        observed.observe_provider_directory(&original).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert!(
+            observed
+                .relocate_observed_provider_directory(&original, &moved)
+                .unwrap()
+        );
+        assert!(observed.provider_directory_observed(&moved).unwrap());
+        assert!(
+            !legacy
+                .relocate_observed_provider_directory(&original, &moved)
+                .unwrap()
+        );
+        assert!(!legacy.provider_directory_observed(&moved).unwrap());
+        assert!(
+            observed
+                .relocate_observed_provider_directory(&moved, &original)
+                .is_err()
+        );
     }
 
     #[test]

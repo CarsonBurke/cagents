@@ -89,6 +89,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatVisibility { .. }
         | R::ChatRead { .. }
         | R::ChatClose { .. }
+        | R::ChatCloseSession { .. }
         | R::ChatCloseRetained { .. }
         | R::ChatList
         | R::ChatAcknowledge { .. }
@@ -97,6 +98,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatStartSelected { .. }
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
+        | R::ChatCommitTerminalReceipt { .. }
         | R::ChatPrepareResume { .. } => Access::Refused,
     }
 }

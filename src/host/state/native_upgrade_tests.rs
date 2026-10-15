@@ -427,6 +427,8 @@ fn committed_upgrade_shutdown_preserves_real_native_owner_even_if_final_save_fai
                     execution_instance: uuid::Uuid::new_v4(),
                     console_recipe: None,
                     paired_terminal: None,
+                    handoff_receipt: None,
+                    source_binding: None,
                     session: stale_source,
                     handle: local,
                     source_process: None,

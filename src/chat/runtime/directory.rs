@@ -24,25 +24,33 @@ impl DirectoryProof {
     }
 }
 
-impl Handle {
-    /// A completed actor cannot prove a live cwd, but its still-open original
-    /// directory descriptor can authorize an explicit replacement session.
+impl LocalHandle {
+    /// The retained descriptor authorizes an explicit completed-provider
+    /// replacement even when there is no live cwd left to inspect.
     pub(crate) fn pinned_execution_directory(
         &self,
         candidate: &Path,
     ) -> Result<Arc<super::super::protocol::ExecutionContext>, String> {
-        let original = self.0.pinned_directory.lock().unwrap_or_else(|p| p.into_inner()).clone()
-            .ok_or("The completed provider has no retained approved directory descriptor; recover its original context or create a new session explicitly")?;
-        let identity = DirectoryIdentity::from_metadata(
-            &original.metadata().map_err(|error| error.to_string())?,
-        );
-        let candidate = Arc::new(super::super::protocol::ExecutionContext::capture(
+        let identity = self.pinned_directory_identity()?;
+        let context = Arc::new(super::super::protocol::ExecutionContext::capture(
             candidate,
         )?);
-        if candidate.directory_identity()? != Some(identity) {
+        if context.directory_identity()? != Some(identity) {
             return Err("The completed provider's original directory was replaced; its approval cannot transfer to this folder".into());
         }
-        Ok(candidate)
+        Ok(context)
+    }
+    pub(super) fn pinned_directory_identity(&self) -> Result<DirectoryIdentity, String> {
+        let directory = self
+            .0
+            .pinned_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or("The provider has no retained approved directory descriptor")?;
+        Ok(DirectoryIdentity::from_metadata(
+            &directory.metadata().map_err(|error| error.to_string())?,
+        ))
     }
     /// Call outside HostState: this is serialized with the owning actor and
     /// may wait behind provider work. An unavailable proof never authorizes a

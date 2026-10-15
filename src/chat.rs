@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 pub mod coordination;
 pub mod presentation;
 pub mod pricing;
+mod restart;
+pub use restart::RestartReceipt;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
@@ -525,6 +527,21 @@ pub enum NativeContinuity {
     Durable {
         provider_version: String,
     },
+    /// The exact Claude stream reducer, Store and pipes belong to a retained
+    /// actor. Its provider may not have published a session ID yet. This shape
+    /// never grants adoption authority; the host authenticates the helper.
+    RetainedClaudeActor {
+        protocol: u32,
+    },
+}
+
+impl NativeContinuity {
+    pub fn retains_provider(&self) -> bool {
+        matches!(
+            self,
+            Self::Durable { .. } | Self::RetainedClaudeActor { .. }
+        )
+    }
 }
 
 /// Versions verified with an isolated Responses API fixture while disconnecting
@@ -624,6 +641,48 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
             let mut normalized = new.clone();
             normalized.continuity = old.continuity.clone();
             &normalized == old
+        }
+        _ => false,
+    }
+}
+
+/// The proof-only transition of an exact retained Claude actor before it has
+/// named a conversation. This shape check grants no ownership: callers must
+/// resolve authenticated helper lineage and verify the attached snapshot.
+/// Keep ordinary thread-bearing upgrade and save predicates strict.
+pub fn is_unnamed_retained_claude_recovery(source: &Session, replacement: &Session) -> bool {
+    let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
+        return false;
+    };
+    if !matches!(
+        source.native_continuity,
+        NativeContinuity::RetainedClaudeActor { protocol: 1 }
+    ) || source.native_continuity != replacement.native_continuity
+        || !source.has_valid_native_continuity()
+        || !replacement.has_valid_native_continuity()
+        || !old.is_complete()
+        || !new.is_complete()
+        || old == new
+        || old.boot_id != new.boot_id
+        || source.id != replacement.id
+        || source.launch != replacement.launch
+        || source.launch.session_id.is_some()
+        || replacement.launch.session_id.is_some()
+        || source.owned_codex_listener != replacement.owned_codex_listener
+    {
+        return false;
+    }
+    match (&source.terminal, &replacement.terminal) {
+        (None, None) => true,
+        (Some(previous), Some(next))
+            if previous.id == source.id
+                && next.id == source.id
+                && previous.continuity.live_proof().as_ref() == Some(old)
+                && next.continuity.live_proof().as_ref() == Some(new) =>
+        {
+            let mut normalized = next.clone();
+            normalized.continuity = previous.continuity.clone();
+            normalized == *previous
         }
         _ => false,
     }
@@ -729,6 +788,20 @@ impl Session {
     pub fn has_valid_native_continuity(&self) -> bool {
         match &self.native_continuity {
             NativeContinuity::ReconnectOnly => true,
+            NativeContinuity::RetainedClaudeActor { protocol } => {
+                *protocol == 1
+                    && self.launch.provider == Provider::Claude
+                    && self.owned_codex_listener.is_none()
+                    && self
+                        .proof
+                        .as_ref()
+                        .is_some_and(crate::model::HostSessionProof::is_complete)
+                    && self
+                        .launch
+                        .session_id
+                        .as_ref()
+                        .is_none_or(|id| uuid::Uuid::parse_str(id).is_ok())
+            }
             NativeContinuity::Durable { provider_version } => {
                 self.owns_codex_listener()
                     && self
@@ -758,7 +831,7 @@ impl Session {
         let (Some(old), Some(new)) = (&previous.terminal, &self.terminal) else {
             return false;
         };
-        matches!(previous.native_continuity, NativeContinuity::Durable { .. })
+        previous.native_continuity.retains_provider()
             && self.native_continuity == previous.native_continuity
             && self.has_valid_native_continuity()
             && previous
@@ -2169,10 +2242,116 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// An explicit maintenance boundary, separate from prompt completion.
+    /// A generic idle status cannot release accepted prompt admission.
+    Compaction {
+        active: bool,
+    },
+    /// Delayed results notify their original turn without settling current work.
+    PastTurnFinished {
+        key: Option<String>,
+        outcome: crate::notifications::Kind,
+    },
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn retained_claude_shape_is_typed_and_never_relaxes_codex_durability() {
+        use super::*;
+        let mut session = Session {
+            id: crate::model::TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/fixture".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            terminal: None,
+            owned_codex_listener: None,
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "host".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "actor-owner".into(),
+            }),
+            native_continuity: NativeContinuity::RetainedClaudeActor { protocol: 1 },
+        };
+        assert!(
+            session.has_valid_native_continuity(),
+            "an unnamed issued actor can persist before its first provider result"
+        );
+        assert!(
+            !session.is_unstarted(),
+            "an installed actor is never an empty draft"
+        );
+        let mut next = session.clone();
+        next.proof.as_mut().unwrap().host_incarnation = "successor".into();
+        assert!(is_unnamed_retained_claude_recovery(&session, &next));
+        assert!(
+            !is_upgrade_recovery(&session, &next),
+            "ordinary named-thread predicate remains strict"
+        );
+        for field in 0..8 {
+            let mut wrong = next.clone();
+            match field {
+                0 => wrong.proof.as_mut().unwrap().boot_id = "other-boot".into(),
+                1 => wrong.proof = session.proof.clone(),
+                2 => {
+                    wrong
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("CLAUDE_CONFIG_DIR".into(), "/other".into());
+                }
+                3 => wrong.launch.recipe.arguments.push("--other-option".into()),
+                4 => wrong.launch.recipe.working_directory = "/other".into(),
+                5 => wrong.launch.session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into()),
+                6 => wrong.native_continuity = NativeContinuity::ReconnectOnly,
+                _ => wrong.id = crate::model::TerminalId::new(),
+            }
+            assert!(
+                !is_unnamed_retained_claude_recovery(&session, &wrong),
+                "unnamed proof transition changed field {field}"
+            );
+        }
+
+        assert_eq!(
+            postcard::from_bytes::<Session>(&postcard::to_stdvec(&session).unwrap()).unwrap(),
+            session
+        );
+        session.launch.session_id = Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        assert!(session.has_valid_native_continuity());
+        for field in 0..5 {
+            let mut changed = session.clone();
+            match field {
+                0 => changed.proof = None,
+                1 => changed.proof.as_mut().unwrap().host_incarnation = "".into(),
+                2 => changed.launch.provider = Provider::Codex,
+                3 => {
+                    changed.native_continuity =
+                        NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                }
+                _ => changed.launch.session_id = Some("not-an-exact-claude-uuid".into()),
+            }
+            assert!(
+                !changed.has_valid_native_continuity(),
+                "changed retained actor shape field {field}"
+            );
+        }
+        session.native_continuity = NativeContinuity::Durable {
+            provider_version: "claude-stream-json/actor-v1".into(),
+        };
+        assert!(
+            !session.has_valid_native_continuity(),
+            "Codex numeric listener contract remains separate"
+        );
+    }
+
     #[test]
     fn terminal_provider_outcomes_and_diagnostics_round_trip_without_losing_reason() {
         use crate::agent::ActivityOutcome;

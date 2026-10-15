@@ -6,12 +6,7 @@ use crate::chat::{Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::{
-    fs,
-    io::Write,
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
-    path::PathBuf,
-};
+use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 
 const PART_BYTES: usize = 128 * 1024;
 const WINDOW_BYTES: usize = 3 * 1024 * 1024;
@@ -59,6 +54,7 @@ pub(crate) struct Store {
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
+    _lease: fs::File,
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
@@ -80,6 +76,9 @@ pub(crate) struct Store {
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
 impl Store {
+    pub(super) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
     /// of base64, and identical payloads share the same private file.
     fn image_file(&self, url: &str) -> Result<String, String> {
@@ -126,11 +125,8 @@ impl Store {
         Self::at(root)
     }
     fn at(root: PathBuf) -> Result<Self, String> {
-        let directory = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|e| format!("Cannot create private transcript cache: {e}"))?;
+        let (directory, lease) = crate::transcript_cache::create(&root)
+            .map_err(|error| format!("Cannot create private transcript cache: {error}"))?;
         let path = directory.join("transcript.sqlite");
         let result = (|| {
             fs::OpenOptions::new()
@@ -157,6 +153,7 @@ impl Store {
                 presented_file_changes: None,
                 db,
                 directory: directory.clone(),
+                _lease: lease,
                 end: None,
                 first: None,
                 newest: None,
@@ -1477,8 +1474,7 @@ impl Store {
 }
 impl Drop for Store {
     fn drop(&mut self) {
-        // This UUID directory was created exclusively by this store, never discovered by a scan.
-        let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        // The original lease remains locked until our private cache is gone.
         let _ = fs::remove_dir_all(&self.directory);
     }
 }
@@ -1629,6 +1625,112 @@ mod tests {
     use super::*;
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn transcript_cache_reclaims_a_killed_store_and_the_other_store_keeps_working() {
+        const CHILD: &str = "CAGENTS_KILLED_STORE_FIXTURE";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let root = PathBuf::from(root);
+            let store = Store::at(root.clone()).unwrap();
+            fs::write(
+                root.join("ready.tmp"),
+                store.directory.to_string_lossy().as_bytes(),
+            )
+            .unwrap();
+            fs::rename(root.join("ready.tmp"), root.join("ready")).unwrap();
+            std::mem::forget(store); // Still live until this process loses its descriptors.
+            loop {
+                std::thread::park();
+            }
+        }
+        let root = tempfile::tempdir().unwrap();
+        let mut live = Store::at(root.path().to_owned()).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "chat::runtime::store::tests::transcript_cache_reclaims_a_killed_store_and_the_other_store_keeps_working", "--nocapture"])
+            .env(CHILD, root.path()).stdout(std::process::Stdio::null()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !root.path().join("ready").exists() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("second store never became ready");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let abandoned = PathBuf::from(fs::read_to_string(root.path().join("ready")).unwrap());
+        let protected = crate::transcript_cache::sweep(root.path());
+        let killed = child.kill();
+        child.wait().unwrap();
+        killed.unwrap();
+        assert_eq!(protected.unwrap().count, 0);
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            1
+        );
+        assert!(!abandoned.exists());
+        live.apply(Event::Item(Item {
+            id: "still-live".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: "still operational".into(),
+                thinking: false,
+                phase: Phase::default(),
+            },
+        }))
+        .unwrap();
+        assert!(live.directory.exists());
+    }
+
+    #[test]
+    fn transcript_cache_journal_is_removed_after_more_than_fifty_mebibytes_of_rewrites() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::at(root.path().to_owned()).unwrap();
+        let mut live = Store::at(root.path().to_owned()).unwrap();
+        for rewrite in 0..64 {
+            let item = Item {
+                id: "rewritten".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Text {
+                    text: format!("{rewrite}{}", "x".repeat(1024 * 1024)),
+                    thinking: false,
+                    phase: Phase::default(),
+                },
+            };
+            store.apply(Event::Item(item)).unwrap();
+            for suffix in ["-wal", "-journal"] {
+                assert!(
+                    !store
+                        .directory
+                        .join(format!("transcript.sqlite{suffix}"))
+                        .exists()
+                );
+            }
+        }
+        assert_eq!(
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
+            0
+        );
+        live.apply(Event::Item(Item {
+            id: "still-live".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: "live".into(),
+                thinking: false,
+                phase: Phase::default(),
+            },
+        }))
+        .unwrap();
+        assert_eq!(
+            crate::transcript_cache::usage(root.path()).unwrap().count,
+            2
+        );
+    }
+
     #[test]
     fn one_megabyte_input_deltas_write_linear_bytes_and_hydrate_exactly() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();

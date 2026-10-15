@@ -198,6 +198,11 @@ pub(crate) struct Holder {
 }
 
 impl Holder {
+    /// Exact discovery metadata; observing it grants no release authority.
+    pub(crate) fn record(&self) -> &Record {
+        &self.identity.record
+    }
+
     pub fn diagnostic(&mut self) -> Result<ExitDiagnostic, String> {
         if !self.identity.record.build.as_ref().is_some_and(|build| {
             build
@@ -367,6 +372,12 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     }
     let retained_source = source.clone();
     let recovery = Recovery {
+        launch_account_scope: crate::account::scope::LaunchAccountScope::resolve(
+            source.launch.provider,
+            &spec.working_directory,
+            |name| spec.environment.get(name).map(std::ffi::OsString::from),
+        )
+        .ok(),
         source,
         execution_console: None,
         paired_holder: None,
@@ -387,7 +398,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
     let execution = spec.execution.clone();
     let directory = execution
         .as_ref()
-        .and_then(|context| context.directory.clone());
+        .and_then(|context| context.directory_descriptor());
     let directory_fd = directory.as_ref().map(|file| file.as_raw_fd());
     let request = Spawn {
         directory_fd,

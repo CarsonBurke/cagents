@@ -62,6 +62,36 @@ pub(super) fn publish(
     save(&path, &receipt)
 }
 
+pub(crate) fn publish_actor_close(
+    record: &Record,
+    proof: &HostSessionProof,
+    source: &crate::chat::Session,
+    lineage: &[crate::chat::Session],
+    paired_holder: Option<&Record>,
+) -> Result<(), String> {
+    let receipt = Receipt {
+        record: record.clone(),
+        proof: proof.clone(),
+        sources: lineage
+            .iter()
+            .chain(std::iter::once(source))
+            .map(source_digest)
+            .collect::<Result<_, _>>()?,
+        paired_closed: paired_holder.is_none(),
+        paired_holder: paired_holder.cloned(),
+    };
+    save(&path(record.terminal, &record.holder)?, &receipt)
+}
+
+pub(crate) fn actor_close_proved(
+    record: &Record,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
+    consume(record.terminal, &record.holder, true, |receipt| {
+        receipt.record == *record && receipt.proof == *proof
+    })
+}
+
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
     let parent = path
         .parent()
@@ -149,7 +179,7 @@ impl Startup {
                 && receipt.record.terminal == self.terminal
                 && receipt.record.holder == self.holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && crate::daemon::holder_registry::record_application_matches(&receipt.record)
                 && receipt.record.boot == self.proof.boot_id
                 && receipt.proof == self.proof
         })
@@ -163,7 +193,11 @@ fn consume(
     matches: impl FnOnce(&Receipt) -> bool,
 ) -> Result<bool, String> {
     let path = path(terminal, holder)?;
-    let file = match crate::secure_file::open_existing_private_file(&path) {
+    let file = match if retain {
+        crate::secure_file::open_existing_private_file_readonly(&path)
+    } else {
+        crate::secure_file::open_existing_private_file(&path)
+    } {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
@@ -188,6 +222,7 @@ fn consume(
     if retain {
         return Ok(true);
     }
+    crate::chat::runtime::remove_actor_final_snapshot(&receipt.record)?;
     match fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -203,6 +238,15 @@ pub(crate) fn closed_source(
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
     Ok(find_source(source, proof)?.map(|receipt| (receipt.record, receipt.paired_closed)))
+}
+
+/// Return the exact historical receipt proof after authenticating the current
+/// daemon lease and the complete issued source digest. Never rotate/backfill it.
+pub(crate) fn closed_source_proof(
+    source: &crate::chat::Session,
+    current_proof: &HostSessionProof,
+) -> Result<Option<HostSessionProof>, String> {
+    Ok(find_source(source, current_proof)?.map(|receipt| receipt.proof))
 }
 
 pub(crate) fn closed_pair_holder(
@@ -267,7 +311,7 @@ fn find_source(
                 && receipt.record.terminal == source.id
                 && receipt.record.holder == holder
                 && receipt.record.kind == Kind::Native
-                && receipt.record.application == crate::instance::APPLICATION_ID
+                && crate::daemon::holder_registry::record_application_matches(&receipt.record)
                 && receipt.record.boot == proof.boot_id
                 && receipt.proof.boot_id == proof.boot_id
                 && receipt.proof.is_complete()

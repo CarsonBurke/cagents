@@ -1,17 +1,17 @@
 //! A fixed, bounded owner for retained-provider cleanup. Caller deadlines do
 //! not abandon holders or allocate another thread for each close attempt.
-use super::Handle;
+use super::LocalHandle;
 use std::sync::{OnceLock, atomic::Ordering};
 
 const CAPACITY: usize = 64;
 const WORKERS: usize = 2;
 enum Task {
-    Retained(Handle),
+    Retained(LocalHandle),
     FinalHolder(crate::chat::native_holder::Holder),
 }
 static SERVICE: OnceLock<Result<crossbeam_channel::Sender<Task>, String>> = OnceLock::new();
 
-pub(super) fn request(handle: &Handle) -> Result<(), String> {
+pub(super) fn request(handle: &LocalHandle) -> Result<(), String> {
     if handle
         .0
         .native_reconciling
@@ -54,7 +54,7 @@ fn service() -> &'static Result<crossbeam_channel::Sender<Task>, String> {
                             continue;
                         }
                     };
-                    // The exact Handle owns all teardown resources. No host or
+                    // The exact LocalHandle owns all teardown resources. No host or
                     // control guard enters this queue, including on panic.
                     let result=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||handle.close()))
                         .unwrap_or_else(|_|Err("Native cleanup panicked; its owner remains unconfirmed".into()));
@@ -68,7 +68,7 @@ fn service() -> &'static Result<crossbeam_channel::Sender<Task>, String> {
     })
 }
 
-/// Final Handle destruction has no caller that can retain/retry it. Transfer
+/// Final LocalHandle destruction has no caller that can retain/retry it. Transfer
 /// its exact holder without waiting; if capacity is unavailable, keep its
 /// durable registry identity and let the helper's orphan policy own shutdown.
 pub(super) fn retire_final(holder: crate::chat::native_holder::Holder) {

@@ -1,10 +1,10 @@
 //! OS thread exit can follow is_finished (notably TLS destructors). Keep
 //! actual joins off callers with deadlines and retain the exact actor owner.
-use super::Handle;
+use super::LocalHandle;
 use std::sync::{OnceLock, atomic::Ordering};
 
 struct Task {
-    owner: Handle,
+    owner: LocalHandle,
     worker: std::thread::JoinHandle<()>,
 }
 static SERVICE: OnceLock<Result<crossbeam_channel::Sender<Task>, String>> = OnceLock::new();
@@ -12,7 +12,7 @@ const CAPACITY: usize = 64;
 const WORKERS: usize = 2;
 
 pub(super) fn request(
-    owner: &Handle,
+    owner: &LocalHandle,
     slot: &mut Option<std::thread::JoinHandle<()>>,
 ) -> Result<(), String> {
     let service = SERVICE

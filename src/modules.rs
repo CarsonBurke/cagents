@@ -97,6 +97,7 @@ pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
 pub mod lsp;
+pub mod layout_metrics;
 pub mod model;
 pub mod notifications;
 pub mod performance;
@@ -156,3 +157,6 @@ pub mod workspace;
 pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
+
+#[cfg(feature = "host")]
+pub mod transcript_cache;

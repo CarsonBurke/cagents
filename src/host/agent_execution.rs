@@ -21,6 +21,8 @@ mod account_info;
 mod directory;
 pub(super) mod mailbox;
 mod ownership;
+mod restart;
+pub(super) use restart::{PairPlan, prepare_restart_pair, restore_restart_pair};
 pub(super) mod terminals;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run, cancel_agent_run_under_control, interactive,
@@ -39,6 +41,17 @@ pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
         .execution_registry
         .clone()
         .ok_or_else(|| "The agent execution registry is unavailable".into())
+}
+
+/// Unmanaged diagnostic sessions may exist without a model. Once a model is
+/// installed, a failed execution-store connection never grants permission to
+/// skip its retirement preflight or claim a managed provider was retired.
+pub(super) fn retirement_registry(host: &SharedHost) -> Result<Option<SharedRegistry>, String> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.managed_registry_unavailable() {
+        return Err("The managed execution registry is unavailable; recover its store before closing the original provider".into());
+    }
+    Ok(state.execution_registry.clone())
 }
 
 pub(super) fn origin(host: &SharedHost, authority: &Authority) -> Result<Origin, String> {
@@ -149,6 +162,18 @@ pub(super) fn submit(
         .previous_agent_acceptance(&origin, &request)?
     {
         return Ok(previous);
+    }
+    if let Destination::Existing(id) = &request.destination {
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent(*id)?;
+        if agent.origin != origin || agent.closed {
+            return Err("This caller does not own an open agent with that ID".into());
+        }
+        if let Some(HostedSession::Chat(session)) = &agent.session {
+            super::chat::check_restart_available(host, session)?;
+        }
     }
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
@@ -379,6 +404,13 @@ fn dispatch(
         .agent_request(accepted.run.id)
         .map_err(before)?;
     let (session, handle) = if let Some(HostedSession::Chat(session)) = &accepted.agent.session {
+        super::chat::restart_completed_with_execution(
+            host,
+            EXECUTION_CLIENT,
+            session,
+            Some(context.clone()),
+        )
+        .map_err(|error| before(error.message))?;
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
@@ -453,20 +485,14 @@ fn dispatch(
                 "Provider start returned an unexpected response".into(),
             ));
         };
-        let handle = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .chats
-            .get(&session.id)
-            .ok_or_else(|| {
-                (
-                    State::Interrupted,
-                    "The new agent disappeared before attachment; its launch intent is retained"
-                        .into(),
-                )
-            })?
-            .handle
-            .clone();
+        let (handle, execution_instance) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state.chats.get(&session.id).filter(|record|
+                HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(session.clone()))
+            ).ok_or_else(|| (State::Interrupted,
+                "The new agent changed before attachment; its exact launch intent was retained".to_owned()))?;
+            (record.handle.clone(), record.execution_instance)
+        };
         let binding = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -475,33 +501,38 @@ fn dispatch(
                 None,
                 HostedSession::Chat(session.clone()),
             );
-        if let Err(error) = binding {
-            // Teardown is synchronous and uses the same exact actor retirement
-            // path as UI close. A failed teardown retains the private launch
-            // identity and interrupted capacity instead of losing ownership.
-            match super::chat::process(
-                host,
-                EXECUTION_CLIENT,
-                ClientRequest::ChatClose {
-                    chat_id: session.id,
-                },
-            ) {
-                Ok(_) => {
-                    return Err(before(format!(
-                        "Cannot bind provider: {error}; provider teardown confirmed"
-                    )));
-                }
-                Err(close) => {
-                    return Err((
-                        State::Interrupted,
-                        format!(
-                            "Cannot bind provider: {error}; teardown is unconfirmed: {}",
-                            close.message
-                        ),
-                    ));
+        let bound = match binding {
+            Ok(bound) => bound,
+            Err(error) => {
+                // Teardown is synchronous and uses the same exact actor retirement
+                // path as UI close. A failed teardown retains the private launch
+                // identity and interrupted capacity instead of losing ownership.
+                match super::chat::close_captured(
+                    host,
+                    EXECUTION_CLIENT,
+                    &session,
+                    &handle,
+                    execution_instance,
+                ) {
+                    Ok(_) => {
+                        return Err(before(format!(
+                            "Cannot bind provider: {error}; provider teardown confirmed"
+                        )));
+                    }
+                    Err(close) => {
+                        return Err((
+                            State::Interrupted,
+                            format!(
+                                "Cannot bind provider: {error}; teardown is unconfirmed: {}",
+                                close.message
+                            ),
+                        ));
+                    }
                 }
             }
-        }
+        };
+        let session = reconcile_bound_chat(host, &registry, &bound, &handle, execution_instance)
+            .map_err(|error| (State::Interrupted, format!("Cannot publish the confirmed agent binding: {error}. The exact provider was retained; no prompt was sent.")))?;
         announce(host, &registry);
         (session, handle)
     };
@@ -587,6 +618,83 @@ fn dispatch(
     Ok(())
 }
 
+/// The private launch may have learned a provider thread after ChatAttached
+/// was captured. Reconcile through the exact stamped actor, then use the actual
+/// canonical Agent row rather than the pre-reconciliation return value.
+pub(super) fn reconcile_bound_chat(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    bound: &Agent,
+    handle: &chat::runtime::Handle,
+    execution_instance: uuid::Uuid,
+) -> Result<chat::Session, String> {
+    let Some(HostedSession::Chat(source)) = &bound.session else {
+        return Err("The bound agent has no native provider source".into());
+    };
+    if execution_instance.is_nil()
+        || source
+            .proof
+            .as_ref()
+            .is_none_or(|proof| !proof.is_complete())
+    {
+        return Err("The bound provider has no authenticated actor incarnation".into());
+    }
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.chats.get(&source.id).is_some_and(|record| {
+            record.execution_instance == execution_instance
+                && record.handle.same_actor(handle)
+                && HostedSession::Chat(record.session.clone())
+                    .same_process(&HostedSession::Chat(source.clone()))
+        }) {
+            return Err("The exact provider changed before binding reconciliation".into());
+        }
+    }
+    super::session_locations::observe_chat_directory_thread(
+        host,
+        source.id,
+        execution_instance,
+        true,
+    )?;
+    let current = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent(bound.id)?;
+    if current.closed || current.origin != bound.origin || current.spec != bound.spec {
+        return Err("The accepted agent changed while its binding was reconciled".into());
+    }
+    let Some(HostedSession::Chat(canonical)) = current.session else {
+        return Err("The canonical agent lost its native provider binding".into());
+    };
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if !state.chats.get(&source.id).is_some_and(|record| {
+        record.execution_instance == execution_instance
+            && record.handle.same_actor(handle)
+            && HostedSession::Chat(record.session.clone())
+                .same_process(&HostedSession::Chat(canonical.clone()))
+            && record.session.launch.session_id == canonical.launch.session_id
+    }) {
+        return Err("The exact provider or confirmed binding changed during reconciliation".into());
+    }
+    Ok(canonical)
+}
+
+/// Save provider-confirmed identity even when no window has opened the chat.
+/// Presentation descriptors may be issued before the first init frame arrives.
+pub(super) fn retain_chat_identity(host: &SharedHost, id: TerminalId) {
+    let instance = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.chats.get(&id).map(|record| record.execution_instance)
+    };
+    if let Some(instance) = instance {
+        if let Err(error) =
+            super::session_locations::observe_chat_directory_thread(host, id, instance, false)
+        {
+            tracing::warn!(%error, %id, "cannot retain confirmed agent conversation identity");
+        }
+    }
+}
+
 pub(super) fn observed(
     host: &SharedHost,
     session: TerminalId,
@@ -594,6 +702,7 @@ pub(super) fn observed(
     run: RunId,
     update: Update,
 ) {
+    retain_chat_identity(host, session);
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
@@ -715,8 +824,8 @@ pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
-    // Normal interactive sessions still work without the optional registry.
-    let Ok(registry) = registry(host) else {
+    // Only a genuinely unmanaged/no-model session has optional retirement.
+    let Some(registry) = retirement_registry(host)? else {
         return Ok(());
     };
     let changed = registry
@@ -727,6 +836,22 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
         announce(host, &registry);
     }
     Ok(())
+}
+
+/// Read only the managed presentation. A missing installed store is a retryable
+/// refusal; only sessions without any model have an optional subsystem.
+pub(super) fn preflight_retirement(
+    host: &SharedHost,
+    session: &chat::Session,
+) -> Result<(), String> {
+    let Some(registry) = retirement_registry(host)? else {
+        return Ok(());
+    };
+    let result = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .preflight_agent_retirement(&HostedSession::Chat(session.clone()));
+    result
 }
 
 fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
@@ -756,11 +881,16 @@ pub(super) fn close_owned_agent_under_control(
     let agent = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .agent(id)?;
-    if agent.origin != origin {
-        return Err("This caller does not own the agent".into());
-    }
+        .preflight_agent_close(&origin, id)?;
     if agent.closed {
+        // Older daemons closed the worker without retiring its shared pane.
+        // Repeating close repairs only that retained presentation; it does not
+        // start or contact a provider, and keeps the completed run history.
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .close_agent(&origin, id)?;
+        announce(host, &registry);
         return Ok(agent);
     }
     let pending = registry
@@ -772,23 +902,26 @@ pub(super) fn close_owned_agent_under_control(
             HostedSession::Chat(session) => {
                 let hosted = {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                    state
-                        .chats
-                        .get(&session.id)
-                        .map(|record| record.session.clone())
+                    state.chats.get(&session.id).map(|record| {
+                        (
+                            record.session.clone(),
+                            record.handle.clone(),
+                            record.execution_instance,
+                        )
+                    })
                 };
-                if let Some(current) = hosted {
+                if let Some((current, handle, instance)) = hosted {
                     if current.proof != session.proof
                         || current.launch.recipe != session.launch.recipe
                     {
                         return Err("The agent ownership changed before close; its successor was not stopped".into());
                     }
-                    super::chat::process(
+                    super::chat::close_captured(
                         host,
                         EXECUTION_CLIENT,
-                        ClientRequest::ChatClose {
-                            chat_id: session.id,
-                        },
+                        &current,
+                        &handle,
+                        instance,
                     )
                     .map_err(|error| error.message)?;
                 } else {
@@ -818,10 +951,7 @@ pub(super) fn close_owned_agent_under_control(
                             }
                         }
                     } else if session.owned_codex_listener.is_some()
-                        || matches!(
-                            session.native_continuity,
-                            chat::NativeContinuity::Durable { .. }
-                        )
+                        || session.native_continuity.retains_provider()
                     {
                         // Missing history can prevent actor restoration while
                         // its authenticated provider holder is still alive.
@@ -921,6 +1051,84 @@ pub(super) fn process(
             Ok(Reply::Listed(summaries))
         }
         Operation::Close(id) => close(host, &authority, id).map(Reply::Closed),
+        Operation::InspectPresentationRepair(id) => {
+            let origin = origin(host, &authority)?;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            let target = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .inspect_presentation_repair(&origin, id)?;
+            Ok(Reply::PresentationRepair(target))
+        }
+        Operation::ConfirmPresentationRepair { observed } => {
+            let origin = origin(host, &authority)?;
+            let id = observed.agent.id;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            let removed = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .confirm_presentation_repair(&origin, &observed)?;
+            if removed {
+                announce(host, &registry);
+            }
+            Ok(Reply::PresentationRemoved { agent: id, removed })
+        }
+        Operation::InspectPresentationClose(id) => {
+            let origin = origin(host, &authority)?;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let source = registry(host)?
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent(id)?
+                .session
+                .ok_or("The agent has no exact provider source")?;
+            let transition = super::chat::presentation_close::transition_gate(host, source.id());
+            let _transition = transition.try_lock().map_err(
+                |_| "The provider is changing incarnation; retry inspection after it settles",
+            )?;
+            let registry = registry(host)?;
+            let observation = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .inspect_presentation_close(&origin, id)?;
+            let target = observation
+                .map(|observed| super::chat::presentation_close::capture(host, observed))
+                .transpose()?;
+            Ok(Reply::PresentationClose(target))
+        }
+        Operation::ConfirmPresentationClose { observed } => {
+            let origin = origin(host, &authority)?;
+            let id = observed.observation.agent.id;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let transition = super::chat::presentation_close::transition_gate(
+                host,
+                observed.observation.source.id(),
+            );
+            let _transition = transition.try_lock().map_err(
+                |_| "The provider is changing incarnation; no close consent was applied",
+            )?;
+            let registry = registry(host)?;
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .preflight_presentation_close(&origin, &observed.observation)?;
+            super::chat::close_with_presentation(host, &origin, &observed)?;
+            let agent = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent(id)?;
+            if !agent.closed {
+                return Err("The exact provider cleanup did not commit agent retirement".into());
+            }
+            announce(host, &registry);
+            Ok(Reply::Closed(agent))
+        }
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }
@@ -1103,6 +1311,17 @@ fn create_console(
     session: &chat::Session,
     handle: &chat::runtime::Handle,
 ) -> Result<(), ConsoleError> {
+    create_console_with_restart(host, registry, agent, session, handle, None).map(|_| ())
+}
+
+fn create_console_with_restart(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: AgentId,
+    session: &chat::Session,
+    handle: &chat::runtime::Handle,
+    restart: Option<(&Agent, &chat::Session)>,
+) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
     let program = crate::companion::Product::Cli
         .beside_current()
         .map_err(|e| e.to_string())?;
@@ -1123,6 +1342,21 @@ fn create_console(
         environment: Default::default(),
         unset_environment: Default::default(),
     };
+    create_console_from_recipe(host, registry, agent, session, handle, restart, recipe)
+}
+
+// The production caller validates the matched CLI and resolves its directory
+// above. Keeping pairing publication in one function also lets owning tests
+// exercise its actual source/holder/Registry order with a private PTY command.
+fn create_console_from_recipe(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: AgentId,
+    session: &chat::Session,
+    handle: &chat::runtime::Handle,
+    restart: Option<(&Agent, &chat::Session)>,
+    recipe: crate::model::LaunchRecipe,
+) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
@@ -1134,7 +1368,8 @@ fn create_console(
     }
     let mut retained_before = session.clone();
     retained_before.launch.session_id = handle.confirmed_session_id();
-    chat::protocol::align_resume_identity(&mut retained_before.launch)?;
+    // Published source argv is immutable; the thin console has its own exact
+    // launch. Retained helper aliases must never be rewritten into resume argv.
     retained_before.native_continuity = handle.native_continuity();
     let terminal = crate::model::TerminalSession {
         id: session.id,
@@ -1180,6 +1415,7 @@ fn create_console(
             let record = state.chats.get_mut(&session.id).expect("checked actor");
             record.session.terminal = Some(descriptor.session.clone());
             record.paired_terminal = Some(console_handle.clone());
+            super::chat::source_binding::pair_changed(&mut state, session.id);
         }
         let mut retained = retained_before.clone();
         retained.terminal = Some(descriptor.session.clone());
@@ -1204,16 +1440,42 @@ fn create_console(
                 .ok_or("The provider closed while publishing its console")?;
             record.session.terminal = Some(descriptor.session.clone());
             record.paired_terminal = Some(console_handle.clone());
+            super::chat::source_binding::pair_changed(&mut state, session.id);
         }
+        let receipt = if let Some((_, source)) = restart {
+            let current = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let record = state
+                    .chats
+                    .get(&session.id)
+                    .filter(|record| record.handle.same_actor(handle))
+                    .ok_or("The restarted provider changed before its pair was saved")?;
+                let mut current = record.session.clone();
+                current.launch.session_id = handle.confirmed_session_id();
+                current.native_continuity = handle.native_continuity();
+                current
+            };
+            Some(chat::RestartReceipt::confirm(source.clone(), current)?)
+        } else {
+            None
+        };
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let expected = registry
-            .agent(agent)?
-            .session
-            .ok_or("Provider binding disappeared")?;
-        registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
-        Ok::<_, String>(())
+        if let Some((previous, _)) = restart {
+            registry.rebind_restarted_agent(
+                previous,
+                receipt.as_ref().ok_or("The restart receipt disappeared")?,
+            )?;
+        } else {
+            let expected = registry
+                .agent(agent)?
+                .session
+                .ok_or("Provider binding disappeared")?;
+            registry.bind_agent_console(agent, &expected, descriptor.session.clone())?;
+        }
+        Ok::<_, String>(receipt)
     })();
-    if let Err(error) = publish {
+    if let Err(error) = &publish {
+        let error = error.clone();
         // The holder must retain its exact pair until terminal teardown is
         // proved. Clearing the pair first loses the cleanup owner if the daemon
         // crashes between that acknowledgment and terminal shutdown.
@@ -1252,6 +1514,7 @@ fn create_console(
                 record.session.terminal = None;
                 record.console_recipe = None;
                 record.paired_terminal = None;
+                super::chat::source_binding::pair_changed(&mut state, session.id);
             }
             if state.terminals.get(&session.id).is_some_and(|record| {
                 super::chat::matches_paired_terminal(
@@ -1265,8 +1528,9 @@ fn create_console(
         }
         return Err(ConsoleError::Known(error));
     }
+    let receipt = publish.map_err(ConsoleError::Known)?;
     announce(host, registry);
-    Ok(())
+    Ok(receipt)
 }
 
 fn console(

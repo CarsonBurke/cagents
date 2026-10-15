@@ -13,6 +13,8 @@ pub(crate) use model::inspect_archive_report_in;
 pub(crate) const WORKSPACE_REGISTRY_SCHEMA_VERSION: u32 = model::SCHEMA_VERSION;
 mod notifications;
 mod project_removal;
+#[cfg(test)]
+mod provider_shutdown_tests;
 mod service;
 mod session_locations;
 mod state;
@@ -203,6 +205,26 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     Ok(DaemonAdmission { _guard: admission })
 }
 
+// This same admission path is used by the constructor-failure contract test.
+// No clients, provider restoration or helper adoption runs before it returns.
+fn initialize_model(host: &SharedHost, open: impl FnOnce() -> Result<model::Registry, String>) {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .expect_model();
+    match open() {
+        Ok(registry) => host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .install_model(registry),
+        Err(error) => {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .model_open_failed();
+            tracing::error!(%error, "the shared workspace model is unavailable; managed native owners were retained");
+        }
+    }
+}
+
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
@@ -224,16 +246,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     // The model is reported unavailable to the clients that ask for it, which is
     // what keeps a window from mistaking a broken store for an empty registry
     // and donating its state over and over.
-    match model::Registry::open() {
-        Ok(registry) => host
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .install_model(registry),
-        Err(error) => {
-            tracing::error!(%error, "the shared workspace model is unavailable; channels will \
-                                    not be shared between windows")
-        }
-    }
+    initialize_model(&host, model::Registry::open);
     let notification_application = crate::instance::notification_daemon_application(
         &std::env::current_exe()?,
         std::env::args_os()
@@ -254,11 +267,20 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
+    if let Err(error) = chat::retained_actor::reconcile_startup_losses(&host) {
+        // The holder keeps its unacknowledged loss and refuses new input;
+        // another failed store must not dispose of unrelated live sessions.
+        tracing::warn!(%error, "retained actor loss remains pending durable reconciliation");
+    }
+    let retained_runs = chat::retained_actor::retained_runs(&host);
     if let Ok(registry) = agent_execution::registry(&host) {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs(crate::chat::now_ms().unwrap_or(0))
+            .interrupt_unproven_agent_runs_except(
+                crate::chat::now_ms().unwrap_or(0),
+                &retained_runs,
+            )
             .map_err(io::Error::other)?;
     }
     let _agent_activity = activity::Monitor::start(&host)?;
@@ -403,11 +425,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         });
         delivery.close_after_drain();
     }
-    for handle in &handles {
-        handle.request_shutdown();
-    }
-    for handle in handles {
-        if let Err(error) = handle.shutdown() {
+    for outcome in finish_terminal_shutdown(&handles) {
+        if let Err(error) = outcome {
             tracing::error!(%error, "daemon terminal shutdown left unconfirmed ownership; recovery evidence retained");
             runtime_error = Some(io::Error::other(format!(
                 "terminal shutdown left unconfirmed ownership: {error}"
@@ -435,8 +454,19 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     }
 }
 
+// Request every terminal before waiting on any one worker, and retain every
+// outcome so a failed provider/worker cannot skip another terminal's cleanup.
+fn finish_terminal_shutdown(
+    handles: &[crate::terminal::TerminalHandle],
+) -> Vec<Result<(), crate::terminal::TerminalSendError>> {
+    for handle in handles {
+        handle.request_shutdown();
+    }
+    handles.iter().map(|handle| handle.shutdown()).collect()
+}
+
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
-    let (chats, upgrading) = {
+    let (chats, upgrading, pending_native_startups) = {
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             state
@@ -445,22 +475,34 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                 .map(|record| (record.session.clone(), record.handle.clone()))
                 .collect::<Vec<_>>(),
             state.has_committed_upgrade(),
+            state.native_actor_startups.len(),
         )
     };
     let mut result = state::finish_upgrade(host);
+    if pending_native_startups != 0 && result.is_ok() {
+        // These contexts may own a real helper before a Record or discovery
+        // JSON exists. Snapshot only; explicit exact startup reconciliation
+        // owns cleanup and never runs under HostLock or a renewed loop budget.
+        result = Err(format!(
+            "{pending_native_startups} native helper startup ownership record(s) remain unconfirmed; exact startup cleanup must settle"
+        ));
+    }
     for (session, chat) in chats {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
-        let closed = if upgrading
-            && matches!(
-                chat.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+        let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
             chat.close()
         };
+        let closed = closed.and_then(|()| {
+            if upgrading {
+                Ok(())
+            } else {
+                chat::retained_actor::finish_close(host, &chat, &session)
+            }
+        });
         match closed {
             Ok(()) if !upgrading => {
                 // Ordinary shutdown proved this exact provider stopped. Retire
@@ -473,7 +515,15 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                     }
                 }
             }
-            Err(error) => tracing::warn!(%error, "provider shutdown was not confirmed"),
+            Err(error) => {
+                tracing::warn!(%error, "provider shutdown was not confirmed");
+                if result.is_ok() {
+                    result = Err(format!(
+                        "Provider {} shutdown was not confirmed: {error}",
+                        session.id
+                    ));
+                }
+            }
             Ok(()) => {}
         }
     }
@@ -537,3 +587,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) use chat::source_binding::BackendFixture;

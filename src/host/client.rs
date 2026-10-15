@@ -955,8 +955,10 @@ pub(super) fn process_admitted(
         | ClientRequest::ChatAcknowledge { .. }
         | ClientRequest::ChatRead { .. }
         | ClientRequest::ChatClose { .. }
+        | ClientRequest::ChatCloseSession { .. }
         | ClientRequest::ChatReturnTerminal { .. }
         | ClientRequest::ChatCommitTerminal { .. }
+        | ClientRequest::ChatCommitTerminalReceipt { .. }
         | ClientRequest::ChatList) => Ok((
             super::chat::process(host, client_id, request)?,
             Vec::new(),
@@ -1438,6 +1440,7 @@ pub(super) fn process_admitted(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .handle(client_id, terminal_id)?;
+            super::chat::preflight_for_terminal_close(host, terminal_id, &handle)?;
             let outcome = handle.close_checked(allow_active);
             if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
                 host.lock()
@@ -2525,6 +2528,8 @@ mod tests {
                     console_recipe: (provider != crate::agent::Provider::Codex)
                         .then(|| session.launch.clone()),
                     paired_terminal: Some(terminal),
+                    handoff_receipt: None,
+                    source_binding: None,
                     session: chat::Session {
                         archive_report: None,
                         id: session.id,
@@ -2730,6 +2735,8 @@ mod tests {
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
                     paired_terminal: terminal.as_ref().map(|(_, worker)| worker.clone()),
+                    handoff_receipt: None,
+                    source_binding: None,
                     session: chat::Session {
                         archive_report: None,
                         native_continuity: Default::default(),
@@ -3321,6 +3328,8 @@ mod tests {
                 execution_instance: uuid::Uuid::nil(),
                 console_recipe: None,
                 paired_terminal: None,
+                handoff_receipt: None,
+                source_binding: None,
                 session: chat::Session {
                     native_continuity: Default::default(),
                     owned_codex_listener: None,
