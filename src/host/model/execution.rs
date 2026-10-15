@@ -1321,7 +1321,7 @@ impl Registry {
 
 /// Moving a pane changes presentation membership, not execution authority.
 /// Compare every other field, including the exact session, launch and owner.
-fn same_dispatch_agent(current: &Agent, accepted: &Agent) -> bool {
+pub(super) fn same_dispatch_agent(current: &Agent, accepted: &Agent) -> bool {
     let mut expected = accepted.clone();
     expected.placement = current.placement.clone();
     current == &expected
