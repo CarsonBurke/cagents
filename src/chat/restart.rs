@@ -32,7 +32,9 @@ impl RestartReceipt {
     pub(crate) fn is_valid(&self) -> bool {
         let old = &self.source;
         let new = &self.replacement;
-        if old.id != new.id
+        if old.archive_report.is_some()
+            || new.archive_report.is_some()
+            || old.id != new.id
             || old.proof != new.proof
             || !new
                 .proof
@@ -189,6 +191,15 @@ mod tests {
                 "changed field {field}"
             );
         }
+        let report = super::super::ArchiveReportReference { format: 1,
+            registry: uuid::Uuid::new_v4(), agent: crate::model::AgentId::new(),
+            source_operation: uuid::Uuid::new_v4() };
+        let mut archived_source = source.clone();
+        archived_source.archive_report = Some(report.clone());
+        assert!(RestartReceipt::confirm(archived_source, replacement.clone()).is_err());
+        let mut archived_replacement = replacement.clone();
+        archived_replacement.archive_report = Some(report);
+        assert!(RestartReceipt::confirm(source.clone(), archived_replacement).is_err());
         let mut retained = source.clone();
         retained.native_continuity =
             super::super::NativeContinuity::RetainedClaudeActor { protocol: 1 };

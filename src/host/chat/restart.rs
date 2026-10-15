@@ -319,7 +319,7 @@ fn publish_with_snapshot(
 ) -> Result<ServerResponse, ProtocolError> {
     let receipt = chat::RestartReceipt::confirm(source.clone(), receipt.replacement().clone())
         .map_err(unavailable)?;
-    let completed_pair = {
+    let (execution_instance, completed_pair) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
@@ -328,6 +328,10 @@ fn publish_with_snapshot(
             .ok_or_else(|| {
                 unavailable("The restarted actor changed before its receipt was delivered")
             })?;
+        let execution_instance = record.execution_instance;
+        if execution_instance.is_nil() {
+            return Err(unavailable("The exact restarted Record has no execution identity; its owner and receipt were retained"));
+        }
         // Subscribe before fetching history so changes concurrent with a slow
         // remote snapshot cannot fall into an unobserved attachment gap.
         record.subscribers.entry(client).or_insert(false);
@@ -356,7 +360,7 @@ fn publish_with_snapshot(
         // BEFORE fallible history I/O, or retry would attempt the durable CAS
         // again against the old accepted-console binding.
         restart.receipt = Some(receipt.clone());
-        restart.plan.release_completed()
+        (execution_instance, restart.plan.release_completed())
     };
     drop(completed_pair);
     let snapshot=snapshot(actor).ok_or_else(||unavailable("The restarted provider's history is temporarily unavailable; its exact actor, console receipt and saved pane were retained. Retry this pane; no second provider was started"))?;
@@ -365,11 +369,19 @@ fn publish_with_snapshot(
             "The restarted actor has not confirmed its exact conversation identity; its actor and console receipt were retained",
         ));
     }
+    // The semantic restart/pair receipt is already positive. Resolve the exact
+    // captured actor's current backend publication after history, off HostState.
+    let binding = super::source_binding::refresh_owned(host, source.id, true, actor, execution_instance)?;
+    if binding.execution_instance != execution_instance || &binding.source != receipt.replacement() {
+        return Err(unavailable("The restarted backend binding differs from its exact receipt; no executable attachment was published"));
+    }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state
         .chats
         .get(&source.id)
-        .is_none_or(|record| !record.handle.same_actor(actor))
+        .is_none_or(|record| !record.handle.same_actor(actor)
+            || record.execution_instance != execution_instance
+            || record.source_binding.as_ref() != Some(&binding))
         || state.chat_restarts.get(&source.id).is_none_or(|restart| {
             restart.receipt.as_ref() != Some(&receipt)
                 || restart
@@ -382,7 +394,7 @@ fn publish_with_snapshot(
             "The restarted actor changed while its history was being read; no replacement was published",
         ));
     }
-    Ok(ServerResponse::ChatRestarted { receipt, snapshot })
+    Ok(ServerResponse::ChatRestarted { receipt, snapshot, execution_instance, binding: Some(binding) })
 }
 
 pub(super) fn require_not_busy(host: &SharedHost, id: TerminalId) -> Result<(), ProtocolError> {
@@ -568,7 +580,7 @@ for line in sys.stdin:
                 .is_err()
             );
             drop(held);
-            let ServerResponse::ChatRestarted { receipt, .. } = super::super::process(
+            let ServerResponse::ChatRestarted { receipt, execution_instance, binding, .. } = super::super::process(
                 &host,
                 1,
                 ClientRequest::ChatAttach {
@@ -578,6 +590,16 @@ for line in sys.stdin:
             .unwrap() else {
                 panic!("missing typed receipt")
             };
+            assert!(!execution_instance.is_nil());
+            let binding = binding.expect("typed restart requires exact current backend authority");
+            assert_eq!(binding.execution_instance, execution_instance);
+            assert_eq!(&binding.source, receipt.replacement());
+            {
+                let state = host.lock().unwrap();
+                let current = &state.chats[&source.id];
+                assert_eq!(current.execution_instance, execution_instance);
+                assert_eq!(current.source_binding.as_ref(), Some(&binding));
+            }
             assert_eq!(receipt.source(), &source);
             assert_eq!(receipt.replacement().launch, source.launch);
             let replacement = host.lock().unwrap().chats[&source.id].handle.clone();

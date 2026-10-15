@@ -854,6 +854,9 @@ pub enum ServerResponse {
     ChatRestarted {
         receipt: crate::chat::RestartReceipt,
         snapshot: crate::chat::Snapshot,
+        // Future91 field allocation: preserve this order after receipt/snapshot.
+        execution_instance: uuid::Uuid,
+        binding: Option<ChatSourceBinding>,
     },
 }
 
