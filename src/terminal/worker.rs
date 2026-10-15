@@ -1325,6 +1325,12 @@ impl TerminalHandle {
         self.release_completed_holder_until(std::time::Instant::now() + std::time::Duration::from_secs(3))
     }
 
+    /// The daemon keeps the exact listed record pending until this result
+    /// proves cleanup. Queue refusal and failure leave its holder retryable.
+    pub(crate) fn release_completed_holder_async(&self) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
+        holder::release::completed(self)
+    }
+
     pub(crate) fn release_completed_holder_until(&self, deadline: std::time::Instant) -> Result<(), String> {
         if std::time::Instant::now() >= deadline {return Err("Terminal family cleanup deadline expired; its exact owner remains retained".into());}
         let mut retained = self.inner.published.retained_holder.try_lock()
@@ -6495,6 +6501,28 @@ mod tests {
             super::super::ipc::TerminalCloseResult::Closed
         );
         assert!(handle.is_completed());
+    }
+
+    #[test]
+    fn asynchronous_completed_cleanup_preserves_owner_across_contention_and_retry() {
+        let live = TerminalHandle::spawn(shell_session("exec sleep 600"), TerminalConfig::default(), |_| {}).unwrap();
+        assert!(live.release_completed_holder_async().is_err(), "live roots are not retirement candidates");
+        live.shutdown().unwrap();
+        let handle = TerminalHandle::spawn(shell_session("exit 0"), TerminalConfig::default(), |_| {}).unwrap();
+        let deadline = std::time::Instant::now()+Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(std::time::Instant::now()<deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        let retained = handle.inner.published.retained_holder.lock().unwrap();
+        assert!(retained.is_some());
+        let result = handle.release_completed_holder_async().unwrap();
+        assert!(result.recv_timeout(Duration::from_secs(5)).unwrap().is_err());
+        assert!(retained.is_some(), "contention cannot discard exact cleanup ownership");
+        drop(retained);
+        let result = handle.release_completed_holder_async().unwrap();
+        assert_eq!(result.recv_timeout(Duration::from_secs(5)).unwrap(), Ok(()));
+        assert!(handle.inner.published.retained_holder.lock().unwrap().is_none());
     }
 
     #[test]
