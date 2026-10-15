@@ -1254,9 +1254,15 @@ impl HostState {
     /// keep masking a provisional record as Failed.
     pub(super) fn native_terminal_projection(&self, id: TerminalId) -> Result<TerminalSession, String> {
         let terminal = self.terminals.get(&id).ok_or("The native console worker is unavailable")?;
-        if terminal.handle.is_completed() || !self.proof().is_complete() {
-            return Err("The native console worker completed or its current ownership is unavailable".into());
+        if terminal.handle.is_completed() {
+            return Err("The native console worker completed".into());
         }
+        self.native_terminal_owner_projection(id)
+    }
+
+    fn native_terminal_owner_projection(&self, id: TerminalId) -> Result<TerminalSession, String> {
+        let terminal = self.terminals.get(&id).ok_or("The native console worker is unavailable")?;
+        if !self.proof().is_complete() { return Err("The native console ownership is unavailable".into()); }
         let proof = self.proof();
         let mut current = terminal.session.clone();
         current.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(),
@@ -1270,10 +1276,17 @@ impl HostState {
         let Some(terminal) = self.terminals.get(&id) else { return false; };
         let Some(chat) = self.chats.get(&id) else { return false; };
         let Some(pair) = chat.session.terminal.as_ref() else { return false; };
-        if chat.handle.is_completed() || chat.session.proof.as_ref() != Some(self.proof())
-            || !chat.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&terminal.handle))
-            || pair.continuity.live_proof().as_ref() != Some(self.proof()) { return false; }
-        let Ok(current) = self.native_terminal_projection(id) else { return false; };
+        if chat.session.proof.as_ref() != Some(self.proof())
+            || !chat.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&terminal.handle)) { return false; }
+        match pair.continuity.live_proof() {
+            Some(proof) if &proof == self.proof() => {}
+            None if matches!(pair.continuity, TerminalContinuity::Exited { .. }
+                | TerminalContinuity::RelaunchAvailable { last_exit: Some(_), .. }) => {}
+            _ => return false,
+        }
+        // Identity survives completion: a busy native actor can still require
+        // consent after its PTY ends. This does not authorize recovery/replay.
+        let Ok(current) = self.native_terminal_owner_projection(id) else { return false; };
         let mut pair = pair.clone();
         pair.continuity = current.continuity.clone();
         pair.resume_hint = current.resume_hint.clone();
@@ -1281,7 +1294,9 @@ impl HostState {
     }
 
     pub(super) fn confirm_native_terminal_binding(&mut self, id: TerminalId) -> bool {
-        if !self.native_terminal_binding_known(id) { return false; }
+        if !self.native_terminal_binding_known(id)
+            || self.terminals[&id].handle.is_completed()
+            || self.chats[&id].handle.is_completed() { return false; }
         self.terminals.get_mut(&id).expect("the validated pair remains under this host lock").authority_rebind_pending = false;
         true
     }

@@ -219,6 +219,20 @@ mod authority_regression {
         let recovered = reconcile(&host, 1, &source).unwrap();
         assert!(recovered.session.continuity.live_proof().is_some());
         assert!(host.lock().unwrap().terminals[&source.id].handle.same_worker(&handle));
+        handle.shutdown().unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            assert!(state.native_terminal_binding_known(source.id), "exact pair identity survives PTY completion");
+            assert!(state.native_terminal_projection(source.id).is_err(), "completed workers cannot become live native recovery");
+            assert!(!state.confirm_native_terminal_binding(source.id));
+        }
+        let request = |allow_active| crate::terminal_ipc::ClientRequest::ReconcileTerminalClose { session: source.clone(), allow_active };
+        assert!(matches!(super::super::super::client::process_request(&host, 1, request(false)).unwrap().0,
+            crate::terminal_ipc::ServerResponse::TerminalCloseChecked { outcome: crate::terminal_ipc::TerminalCloseResult::Active, .. }),
+            "a completed console still needs consent for its live native actor");
+        assert!(matches!(super::super::super::client::process_request(&host, 1, request(true)).unwrap().0,
+            crate::terminal_ipc::ServerResponse::TerminalCloseChecked { outcome: crate::terminal_ipc::TerminalCloseResult::Closed, .. }));
+        assert!(_actor_cleanup.0.is_completed());
     }
 
     #[test]
