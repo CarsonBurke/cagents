@@ -128,9 +128,12 @@ struct Holding {
     files: Vec<File>,
 }
 impl Holding {
-    fn create(parent: &Root) -> Result<Self, FileIoError> {
+    fn create(parent: &Root, source: &File) -> Result<Self, FileIoError> {
         let slot = RecoverySlot::reserve().map_err(FileIoError::Io)?;
         let retained_parent = parent.try_clone().map_err(io_error)?;
+        // Duplicate the authenticated source BEFORE mkdir/acquisition. Even a
+        // later verification error keeps this inode pinned in the result.
+        let retained_source = source.try_clone().map_err(io_error)?;
         let name = OsString::from(format!(".cagents-save-{}", uuid::Uuid::new_v4()));
         let mut publication = match fs_safety::create_directory_beneath(parent, Path::new(&name), 0o700)
             .map_err(resolve_error)? {
@@ -169,7 +172,7 @@ impl Holding {
                 return Err(FileIoError::Recovery { message: error.to_string(), authority });
             }
         };
-        Ok(Self { root, parent: retained_parent, publication, slot: Some(slot), files: vec![] })
+        Ok(Self { root, parent: retained_parent, publication, slot: Some(slot), files: vec![retained_source] })
     }
     fn keep_file(&mut self, file: &File) -> Result<(), FileIoError> {
         self.files.push(file.try_clone().map_err(io_error)?);
@@ -181,14 +184,17 @@ impl Holding {
     fn retain(mut self) -> RecoveryAuthority {
         let description = self.location();
         let slot = self.slot.take().expect("a holding reserves recovery capacity before creation");
-        slot.retain(description, move || {
-            self.publication.resolve_recovery().map_err(|e|e.to_string())?;
-            // Unknown/nonempty contents are preserved. A retry may clean up
-            // only an empty exact original; it never deletes an arbitrary leaf
-            // or overwrites a newer destination in pursuit of cleanup.
-            self.publication.cleanup_empty().map_err(|e|e.to_string())?;
-            fs_safety::sync_directory(&self.parent).map_err(|e|e.to_string())
-        })
+        // A method receiver deliberately captures the WHOLE owned state.
+        // Disjoint-field closure capture must not drop authenticated file FDs.
+        slot.retain(description, move || self.retry_cleanup())
+    }
+    fn retry_cleanup(&mut self) -> Result<(), String> {
+        self.publication.resolve_recovery().map_err(|e|e.to_string())?;
+        // Unknown/nonempty contents are preserved. A retry may clean up only
+        // an empty exact original; it never deletes an arbitrary leaf or
+        // overwrites a newer destination in pursuit of cleanup.
+        self.publication.cleanup_empty().map_err(|e|e.to_string())?;
+        fs_safety::sync_directory(&self.parent).map_err(|e|e.to_string())
     }
     fn location(&self) -> String {
         format!("the held private directory originally named {}", self.root.path().display())
@@ -234,7 +240,7 @@ fn publish_with_hooks(
     after_publish: impl FnOnce(&Root, &Root) -> io::Result<()>,
     sync_parent: impl FnOnce(&Root) -> io::Result<()>,
 ) -> Result<SaveDurability, FileIoError> {
-    let mut holding = Holding::create(parent)?;
+    let mut holding = Holding::create(parent, destination)?;
     let result = publish_in_holding(&mut holding, parent, name, destination, bytes,
         permissions, baseline, before_publish, after_acquire, after_publish, sync_parent);
     if holding.publication.is_removed() { return result; }
@@ -297,10 +303,10 @@ fn publish_in_holding(
         if !same_file(&written, &opened) || full_version(&written) != full_version(&opened) {
             return Err(changed());
         }
+        holding.keep_file(&readable)?;
         let mut prepared = SaveBaseline::capture(&readable, Some(blake3::hash(bytes)))?;
         prepared.hash_limit = bytes.len() as u64;
         temporary_baseline = Some(prepared);
-        holding.keep_file(&readable)?;
         readable_temporary = Some(readable);
         before_publish().map_err(io_error)?;
         // This coherency check is supplementary: the atomic acquisition below,
@@ -342,9 +348,9 @@ fn publish_in_holding(
         after_acquire(parent, &holding.root).map_err(io_error)?;
         let acquired =
             fs_safety::open_beneath(&holding.root, Path::new(previous)).map_err(resolve_error)?;
+        holding.keep_file(&acquired)?;
         baseline.verify(&acquired, true)?;
         let acquired_version = acquired.metadata().map_err(io_error)?;
-        holding.keep_file(&acquired)?;
         // Sync the acquired directory entry before the replacement is exposed.
         fs_safety::sync_directory(&holding.root).map_err(io_error)?;
         verify_temporary(
@@ -792,6 +798,28 @@ mod tests {
         assert!(matches!(result, SaveOutcome::Saved { .. }));
         assert_eq!(fs::read(moved.join("file")).unwrap(), b"mine");
         assert_eq!(fs::read(named.join("file")).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn save_acquisition_recovery_keeps_authenticated_file_descriptors_until_actual_resolution() {
+        use std::os::fd::AsRawFd;
+        let (dir, root) = fixture();
+        let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let holding = Holding::create(&root, &source).unwrap();
+        let descriptor = holding.files[0].as_raw_fd();
+        fs::write(holding.root.path().join("unresolved"), b"preserve").unwrap();
+        drop(source);
+        let private_path = holding.root.path().to_owned();
+        let authority = holding.retain();
+        assert!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0, "the returned authority must own the authenticated file descriptor");
+        assert!(authority.retry().is_err());
+        assert!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) } >= 0, "failed retry must retain all owned authority");
+        fs::remove_file(private_path.join("unresolved")).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert_eq!(unsafe { libc::fcntl(descriptor, libc::F_GETFD) }, -1, "actual resolution releases the captured file descriptor");
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(fs::read(dir.path().join("file")).unwrap(), b"base");
     }
 
     #[test]
