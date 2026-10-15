@@ -5412,7 +5412,7 @@ impl Cagents {
         &self, card: CardId, descriptor: crate::terminal_ipc::TerminalDescriptor, visible: bool,
     ) -> Task<Message> {
         let Some(proof) = descriptor.session.continuity.live_proof() else {
-            return Task::done(Message::TerminalStarted { card, terminal: descriptor.session.id,
+            return cosmic::task::message(Message::TerminalStarted { card, terminal: descriptor.session.id,
                 result: Err("Completed handoff requires its original authenticated operation proof".into()) });
         };
         self.start_terminal_from_handoff_proved(card, descriptor, proof, visible)
