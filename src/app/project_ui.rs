@@ -2474,6 +2474,7 @@ mod tests {
             command: vec!["unused-before-discovery-delivery".into()],
             root_markers: vec![],
             initialization_options: None,
+            ..Default::default()
         }];
         app.settings.language_servers = servers.clone();
         app.lsp = LspManager::new(servers);
