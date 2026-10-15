@@ -121,7 +121,8 @@ fn source_key(source: &HostedSession) -> Result<Option<[u8; 32]>, String> {
         _ => return Ok(None),
     }
     .map_err(|error| error.to_string())?;
-    Ok(Some(*blake3::hash(&value).as_bytes()))
+    use sha2::Digest;
+    Ok(Some(sha2::Sha256::digest(&value).into()))
 }
 fn retain_source(location: &mut Location) -> Result<(), String> {
     let source = location.source.clone();
@@ -187,14 +188,52 @@ fn write(db: &Connection, location: &Location) -> Result<(), String> {
 
 pub(super) fn refusals(
     db: &Connection,
+    views: &[crate::workspace_model::views::View],
+    agents: &[crate::agent_execution::Agent],
 ) -> Result<Vec<crate::workspace_model::SessionLocationRefusal>, String> {
-    db.prepare("SELECT session,blocked_directory,refusal FROM session_locations WHERE blocked_directory IS NOT NULL AND refusal IS NOT NULL ORDER BY session")
-        .map_err(|error| error.to_string())?
-        .query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?)))
-        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>).map_err(|error| error.to_string())?
-        .into_iter().map(|(session, directory, reason)| Ok(crate::workspace_model::SessionLocationRefusal {
-            session: session.parse().map_err(|_| "Invalid saved session identity".to_owned())?, directory: directory.into(), reason,
-        })).collect()
+    let mut owned = std::collections::BTreeSet::new();
+    for view in views {
+        for pane in &view.panes {
+            match &pane.kind {
+                crate::model::CardKind::Terminal(session) => {
+                    owned.insert(session.id);
+                }
+                crate::model::CardKind::Chat(session) => {
+                    owned.insert(session.id);
+                    if let Some(terminal) = &session.terminal {
+                        owned.insert(terminal.id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for agent in agents.iter().filter(|agent| !agent.closed) {
+        if let Some(source) = &agent.session {
+            owned.insert(source.id());
+        }
+        if let Some(console) = &agent.console {
+            owned.insert(console.id);
+        }
+    }
+    // Indexed lookups bound public status hydration to current ownership,
+    // regardless of how many closed historical bindings remain private.
+    let mut query = db.prepare("SELECT blocked_directory,refusal FROM session_locations WHERE session=?1 AND blocked_directory IS NOT NULL AND refusal IS NOT NULL").map_err(|error| error.to_string())?;
+    let mut statuses = Vec::new();
+    for session in owned {
+        let status: Option<(String, String)> = query
+            .query_row([session.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((directory, reason)) = status {
+            statuses.push(crate::workspace_model::SessionLocationRefusal {
+                session,
+                directory: directory.into(),
+                reason,
+            });
+        }
+    }
+    Ok(statuses)
 }
 
 /// Only server-prepared evidence enters this transaction. No process, actor or
@@ -709,6 +748,47 @@ mod tests {
         registry
             .bind_session_location(&source, None, fixture.path(), identity)
             .unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: fixture.path().into(),
+                name: "Owned".into(),
+                kind: ProjectKind::Folder,
+            })
+            .unwrap();
+        let scope = crate::workspace_model::views::Scope::Worktree {
+            repository: fixture.path().into(),
+            path: fixture.path().into(),
+        };
+        let card = crate::model::CardId::new();
+        let HostedSession::Chat(chat) = &source else {
+            unreachable!()
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![crate::workspace_model::views::Pane {
+                    id: card,
+                    title: "Owned".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 0.5,
+                    kind: crate::model::CardKind::Chat(chat.clone()),
+                    scope: Some(fixture.path().into()),
+                }],
+                closed: vec![],
+            })
+            .unwrap();
+        let hidden = self::source(fixture.path());
+        registry
+            .bind_session_location(&hidden, None, fixture.path(), identity)
+            .unwrap();
+        registry
+            .refuse_session_location(
+                &hidden,
+                &fixture.path().join("closed"),
+                "Private closed history",
+            )
+            .unwrap();
         let candidate = fixture.path().join("replacement");
         registry
             .refuse_session_location(
@@ -742,15 +822,50 @@ mod tests {
                 .retained_session_location(&[source.clone()])
                 .is_err()
         );
+        let expected_revision = registry.view_revision(&scope).unwrap();
         registry
-            .bind_session_location(&source, None, fixture.path(), identity)
+            .apply(&ModelEdit::ChangeView {
+                scope,
+                expected_revision,
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Remove { id: card },
+            })
             .unwrap();
         assert!(
             registry
                 .model()
                 .unwrap()
                 .session_location_refusals
-                .is_empty()
+                .is_empty(),
+            "closed panes and unrelated history are not published"
+        );
+        assert!(
+            registry
+                .session_location(&source)
+                .unwrap()
+                .unwrap()
+                .refusal
+                .is_some(),
+            "closing a pane preserves its private recovery binding"
+        );
+        assert!(
+            registry
+                .session_location(&hidden)
+                .unwrap()
+                .unwrap()
+                .refusal
+                .is_some()
+        );
+        registry
+            .bind_session_location(&source, None, fixture.path(), identity)
+            .unwrap();
+        assert!(
+            registry
+                .session_location(&source)
+                .unwrap()
+                .unwrap()
+                .refusal
+                .is_none()
         );
     }
 
