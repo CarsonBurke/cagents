@@ -248,6 +248,7 @@ pub fn handoff_source_matches(expected:&Pane,receipt:&crate::terminal::ipc::Term
     !receipt.operation.is_nil() && !receipt.source_execution_instance.is_nil()
         && !receipt.terminal_native_epoch.is_nil()
         && !receipt.source_binding.backend.is_nil()
+        && receipt.retained_binding.as_ref().is_none_or(|binding|binding.source.archive_report.is_none())
         && receipt.source_binding.execution_instance==receipt.source_execution_instance
         && handoff_chat_source_matches(&receipt.source_binding.source,&receipt.source)
         && !receipt.terminal.execution_instance.is_nil()

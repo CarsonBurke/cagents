@@ -634,6 +634,8 @@ impl Cagents {
         receipt:&crate::terminal::ipc::TerminalHandoffReceipt,
         shared:Option<super::shared_views::RemovalSource>,
     )->Option<QueuedCardClose> {
+        if receipt.source.archive_report.is_some() || receipt.source_binding.source.archive_report.is_some()
+            || receipt.retained_binding.as_ref().is_some_and(|binding|binding.source.archive_report.is_some()) {return None;}
         let source=&receipt.terminal.session;
         let proof=receipt.source.proof.clone().filter(HostSessionProof::is_complete)?;
         if source.continuity.live_proof().is_some_and(|issued|issued!=proof) {return None;}
@@ -1806,6 +1808,9 @@ mod tests {
         assert_eq!(Some(&captured.proof),receipt.source.proof.as_ref());
         assert_eq!(captured.execution_instance,receipt.terminal.execution_instance);
         assert!(matches!(captured.source.continuity,TerminalContinuity::Exited {..}));
+        let mut report_receipt=receipt.clone();
+        report_receipt.source.archive_report=Some(crate::chat::ArchiveReportReference {format:1,registry:uuid::Uuid::new_v4(),agent:crate::model::AgentId::new(),source_operation:uuid::Uuid::new_v4()});
+        assert!(app.capture_handoff_card_close_for(card,None,&report_receipt,None).is_none(),"read-only source cannot seed a terminal binding even for unpublished membership");
         let mut missing_epoch=receipt.clone();missing_epoch.terminal_native_epoch=uuid::Uuid::nil();
         assert!(app.capture_handoff_card_close_for(card,None,&missing_epoch,None).is_none(),"no unknown returned-resource publication fallback");
         receipt.source.proof=None;
