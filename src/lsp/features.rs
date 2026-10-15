@@ -109,7 +109,7 @@ pub(super) enum RequestArgs {
     CodeActions {range:lsp_types::Range,diagnostics:Vec<lsp_types::Diagnostic>},
     Resolve(lsp_types::CodeAction),
     Execute(LspCommand),
-    Signature(Option<String>),
+    Signature {trigger:Option<String>,is_retrigger:bool,active:Option<lsp_types::SignatureHelp>},
 }
 
 pub(super) enum RawFeatureResult {
@@ -134,7 +134,13 @@ impl LspManager {
         Some((session.server_settings.format_on_save,Duration::from_millis(session.server_settings.formatting_timeout_ms)))
     }
     pub fn signature_trigger(&self,doc:LspDocumentId,ch:char)->bool {
-        let c=self.capabilities(doc);let ch=ch.to_string();c.ready && c.signature_triggers.iter().chain(&c.signature_retriggers).any(|t|t==&ch)
+        self.signature_trigger_with_context(doc,ch,false)
+    }
+    pub fn signature_trigger_with_context(&self,doc:LspDocumentId,ch:char,visible:bool)->bool {
+        let Some(session)=self.documents.get(&doc).and_then(|document|self.sessions.get(&document.session)) else{return false;};
+        if session.retired.load(Ordering::Acquire)||session.commands.is_closed()||!session.status.lock().unwrap_or_else(|p|p.into_inner()).is_ready(){return false;}
+        let caps=session.capabilities.lock().unwrap_or_else(|p|p.into_inner());let mut encoded=[0;4];let ch=ch.encode_utf8(&mut encoded);
+        caps.signature_help && (caps.signature_triggers.iter().any(|trigger|trigger==ch)||(visible&&caps.signature_retriggers.iter().any(|trigger|trigger==ch)))
     }
     fn feature_request(&mut self,doc:LspDocumentId,at:LspPosition,kind:RequestKind,args:RequestArgs,timeout:Duration, supported:bool)->LspRequestId {
         if !supported {
@@ -180,7 +186,11 @@ impl LspManager {
         self.feature_request(doc,LspPosition::default(),RequestKind::ExecuteCommand,RequestArgs::Execute(command),Duration::from_secs(15),supported)
     }
     pub fn request_signature_help(&mut self,doc:LspDocumentId,at:LspPosition,trigger:Option<String>)->LspRequestId {
-        let c=self.capabilities(doc);self.feature_request(doc,at,RequestKind::SignatureHelp,RequestArgs::Signature(trigger),Duration::from_secs(15),c.ready&&c.signature_help)
+        self.request_signature_help_retrigger(doc,at,trigger,false,None)
+    }
+    pub fn request_signature_help_retrigger(&mut self,doc:LspDocumentId,at:LspPosition,trigger:Option<String>,is_retrigger:bool,active:Option<LspSignatureHelp>)->LspRequestId {
+        let c=self.capabilities(doc);let active=if is_retrigger {active.map(signature_to_protocol)}else{None};
+        self.feature_request(doc,at,RequestKind::SignatureHelp,RequestArgs::Signature{trigger,is_retrigger,active},Duration::from_secs(15),c.ready&&c.signature_help)
     }
     fn fail_feature(&mut self,doc:LspDocumentId,error:LspError)->LspRequestId {let id=LspRequestId(self.next_request);self.next_request+=1;self.events.emit_now(LspEvent::RequestFailed{request:id,doc,error});id}
 }
@@ -201,7 +211,7 @@ pub(super) async fn perform_feature(server:ServerSocket,kind:RequestKind,positio
         (RequestKind::CodeActions,RequestArgs::CodeActions{range,diagnostics})=>server.request::<request::CodeActionRequest>(lsp_types::CodeActionParams{text_document:position.text_document,range,context:lsp_types::CodeActionContext{diagnostics,only:None,trigger_kind:Some(lsp_types::CodeActionTriggerKind::INVOKED)},work_done_progress_params:progress,partial_result_params:Default::default()}).await.map(R::CodeActions),
         (RequestKind::ResolveCodeAction,RequestArgs::Resolve(item))=>server.request::<request::CodeActionResolveRequest>(item).await.map(R::CodeActionResolved),
         (RequestKind::ExecuteCommand,RequestArgs::Execute(command))=>server.request::<request::ExecuteCommand>(lsp_types::ExecuteCommandParams{command:command.command,arguments:command.arguments,work_done_progress_params:progress}).await.map(R::CommandExecuted),
-        (RequestKind::SignatureHelp,RequestArgs::Signature(trigger))=>server.request::<request::SignatureHelpRequest>(lsp_types::SignatureHelpParams{text_document_position_params:position,work_done_progress_params:progress,context:Some(lsp_types::SignatureHelpContext{trigger_kind:if trigger.is_some(){lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER}else{lsp_types::SignatureHelpTriggerKind::INVOKED},trigger_character:trigger,is_retrigger:false,active_signature_help:None})}).await.map(R::SignatureHelp),
+        (RequestKind::SignatureHelp,RequestArgs::Signature{trigger,is_retrigger,active})=>server.request::<request::SignatureHelpRequest>(lsp_types::SignatureHelpParams{text_document_position_params:position,work_done_progress_params:progress,context:Some(lsp_types::SignatureHelpContext{trigger_kind:if trigger.is_some(){lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER}else{lsp_types::SignatureHelpTriggerKind::INVOKED},trigger_character:trigger,is_retrigger,active_signature_help:active})}).await.map(R::SignatureHelp),
         _=>Err(async_lsp::Error::Protocol("invalid editor request arguments".into()))
     }
 }
@@ -339,6 +349,20 @@ fn convert_signature(help:lsp_types::SignatureHelp)->Result<LspSignatureHelp,Lsp
     Ok(LspSignatureHelp{signatures,active_signature,active_parameter})
 }
 
+fn signature_to_protocol(help:LspSignatureHelp)->lsp_types::SignatureHelp {
+    let signatures=help.signatures.into_iter().map(|signature| {
+        let parameters=signature.parameters.into_iter().map(|parameter| {
+            let offsets=parameter.range.and_then(|range| {
+                signature.label.get(range.clone())?;
+                Some([u32::try_from(signature.label[..range.start].encode_utf16().count()).ok()?,u32::try_from(signature.label[..range.end].encode_utf16().count()).ok()?])
+            });
+            lsp_types::ParameterInformation {label:offsets.map(lsp_types::ParameterLabel::LabelOffsets).unwrap_or(lsp_types::ParameterLabel::Simple(parameter.label)),documentation:parameter.documentation.map(lsp_types::Documentation::String)}
+        }).collect();
+        lsp_types::SignatureInformation {label:signature.label,documentation:signature.documentation.map(lsp_types::Documentation::String),parameters:Some(parameters),active_parameter:signature.active_parameter.and_then(|index|u32::try_from(index).ok())}
+    }).collect();
+    lsp_types::SignatureHelp {signatures,active_signature:u32::try_from(help.active_signature).ok(),active_parameter:help.active_parameter.and_then(|index|u32::try_from(index).ok())}
+}
+
 static NEXT_SERVER_EDIT_ID:AtomicU64=AtomicU64::new(1);
 
 #[derive(Default)]
@@ -400,7 +424,7 @@ impl RequestArgs {
         Self::CodeActions{diagnostics,..}=>serde_json::to_vec(diagnostics).map_or(MAX_CONTENT_LENGTH,|bytes|bytes.len()),
         Self::Resolve(item)=>serde_json::to_vec(item).map_or(MAX_CONTENT_LENGTH,|b|b.len()),
         Self::Execute(c)=>c.command.len()+c.arguments.iter().map(|a|serde_json::to_vec(a).map_or(MAX_CONTENT_LENGTH,|b|b.len())).sum::<usize>(),
-        Self::Signature(s)=>s.as_ref().map_or(0,String::len),
+        Self::Signature{trigger,active,..}=>trigger.as_ref().map_or(0,String::len).saturating_add(active.as_ref().map_or(0,|help|serde_json::to_vec(help).map_or(MAX_CONTENT_LENGTH,|bytes|bytes.len()))),
     }}
 }
 
