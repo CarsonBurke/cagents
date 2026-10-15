@@ -57,11 +57,11 @@ impl Lifecycle {
 
     fn maintain_retention(&mut self, host: &SharedHost) -> Option<Instant> {
         let now = Instant::now();
-        let (deadline, gate, registry, candidates) = {
+        let (deadline, gate, registry) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             state.observe_completed_terminals(now);
             (state.terminal_retention_deadline(self.retention, &BTreeSet::new()),
-                state.control_gate.clone(), state.execution_registry.clone(), state.terminals.keys().copied().collect::<BTreeSet<_>>())
+                state.control_gate.clone(), state.execution_registry.clone())
         };
         let deadline = deadline?;
         if deadline > now { return Some(deadline); }
@@ -69,6 +69,10 @@ impl Lifecycle {
         // Fence pane edits, attaches and upgrades while deciding which completed
         // descriptors can retire. Terminal output does not acquire this gate.
         let _control = gate.write().unwrap_or_else(|p| p.into_inner());
+        // A spawn/presence admitted before this exclusive acquisition may
+        // have installed another completed, pinned terminal. Census the same
+        // current population that retirement will inspect, including at 0s.
+        let candidates = host.lock().unwrap_or_else(|p| p.into_inner()).terminals.keys().copied().collect::<BTreeSet<_>>();
         let pinned = registry.ok_or_else(|| "The workspace registry is unavailable".to_owned())
             .and_then(|registry| registry.lock().unwrap_or_else(|p| p.into_inner()).pinned_terminals(&candidates));
         let pinned = match pinned {
