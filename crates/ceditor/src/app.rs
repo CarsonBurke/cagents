@@ -1523,7 +1523,10 @@ impl Editor {
             repository: opened.root.clone(),
             worktree: opened.root.clone(),
         };
-        let git = opened.snapshot.is_some();
+        // A definition/history source tab inherits the physical Git context
+        // without copying a stale snapshot. External dependency tabs stay read-only.
+        let git = external.is_none() && (opened.snapshot.is_some() || opened.authority.is_some());
+        let needs_git_snapshot = git && opened.snapshot.is_none();
         let mut runtime = if git {
             RepositoryRuntime::new(descriptor)
         } else {
@@ -1637,7 +1640,8 @@ impl Editor {
             self.active = Some(id);
         }
         let effects = self.apply_review_effects(id);
-        Task::batch([task, review_task, effects])
+        let snapshot = if needs_git_snapshot { self.refresh_snapshot(id, false) } else { Task::none() };
+        Task::batch([task, review_task, effects, snapshot])
     }
 
     // Pending canonical paths reserve ownership too: CLI/picker opens can
@@ -7213,7 +7217,7 @@ mod tests {
         app.settings.editor_auto_save = false;
         app.settings.editor_auto_close = false;
         app.settings.editor_tab_width = 8;
-        let task = app.add(Opened { root: root.into(), file: Some("empty.rs".into()), snapshot: None }, true);
+        let task = app.add(Opened { root: root.into(), file: Some("empty.rs".into()), snapshot: None, authority: None }, true);
         run_tasks(&mut app, task);
         let card = app.active.unwrap();
         assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (8, true));
@@ -7233,7 +7237,7 @@ mod tests {
         std::fs::create_dir(root.join("src")).unwrap();
         std::fs::write(root.join("src/app.rs"), "a😀ébcde\n".repeat(30_001)).unwrap();
         let mut app = configured(&directory);
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None, authority: None }, true);
         run_tasks(&mut app, task);
         let file = app.active.unwrap();
         drop(app.update(Message::QuickOpen));
@@ -7256,7 +7260,7 @@ mod tests {
 
         // Selecting the same canonical file from another folder tab focuses
         // the existing owner and forwards the location rather than losing it.
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None, authority: None }, true);
         run_tasks(&mut app, task);
         let folder = app.active.unwrap();
         assert_ne!(folder, file);
@@ -7278,7 +7282,7 @@ mod tests {
             std::fs::write(root.join("foo.rs"), "a😀bcdef\n".repeat(30_001)).unwrap();
             std::fs::write(root.join("bar.rs"), "previous buffer\n").unwrap();
             let mut app = configured(&directory);
-            let task = app.add(Opened { root: root.into(), file: old_buffer.then(|| "bar.rs".into()), snapshot: None }, true);
+            let task = app.add(Opened { root: root.into(), file: old_buffer.then(|| "bar.rs".into()), snapshot: None, authority: None }, true);
             run_tasks(&mut app, task);
             let owner = app.active.unwrap();
             app.tab_mut(owner).unwrap().files_loaded = false;
@@ -7287,7 +7291,7 @@ mod tests {
             assert_eq!(app.tab(owner).unwrap().pending_file.as_ref().unwrap().canonical.as_deref(), Some(root.join("foo.rs").as_path()));
             let request = app.tab(owner).unwrap().pending_file.as_ref().unwrap().request;
             let before = app.tab(owner).unwrap().runtime.cursor_position();
-            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None, authority: None }, true);
             run_tasks(&mut app, task);
             let folder = app.active.unwrap();
             assert_ne!(folder, owner);
@@ -7316,11 +7320,11 @@ mod tests {
             let root = directory.path();
             std::fs::write(root.join("foo.rs"), "abcdefgh\n".repeat(40)).unwrap();
             let mut app = configured(&directory);
-            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None, authority: None }, true);
             run_tasks(&mut app, task);
             let old_card = app.active.unwrap();
             let old = app.request_file_at(old_card, "foo.rs".into(), Some((9, 1)));
-            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None, authority: None }, true);
             run_tasks(&mut app, task);
             let new_card = app.active.unwrap();
             let new = app.request_file_at(new_card, "foo.rs".into(), Some((29, 4)));
@@ -7339,7 +7343,7 @@ mod tests {
         std::fs::write(root.join("a.rs"), "first\n").unwrap();
         std::fs::write(root.join("b.rs"), "second\n").unwrap();
         let mut app = configured(&directory);
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None, authority: None }, true);
         run_tasks(&mut app, task);
         let card = app.active.unwrap();
         drop(app.update(Message::QuickOpen));
@@ -7364,7 +7368,7 @@ mod tests {
         std::fs::write(root.join("b.rs"), "other file\n").unwrap();
         let mut app = configured(&directory);
         app.settings.editor_auto_save = false;
-        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None, authority: None }, true);
         run_tasks(&mut app, task);
         let card = app.active.unwrap();
         let old = app.request_file_at(card, "a.rs".into(), Some((0, 5)));

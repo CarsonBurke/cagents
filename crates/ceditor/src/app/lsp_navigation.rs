@@ -163,6 +163,7 @@ impl Editor {
     fn open_navigation_target(&mut self, origin: CardId, resolved: Resolved) -> Task<Message> {
         let Some(tab) = self.tab(origin) else { return Task::none(); };
         let root = tab.runtime.descriptor.worktree.clone();
+        let authority = tab.worktree_authority.clone();
         let origin_location = self.capture_editor_location(origin);
         let existing = self.tabs.iter().find(|tab| tab.runtime.source_tab_path().as_ref() == Some(&resolved.path)
             && tab.runtime.is_read_only_source() == resolved.external).map(|tab| tab.id);
@@ -170,7 +171,7 @@ impl Editor {
         let target = if let Some(target) = existing { target } else {
             let relative = if resolved.external { None } else { resolved.path.strip_prefix(&root).ok().map(Path::to_path_buf) };
             if !resolved.external && relative.is_none() { return Task::none(); }
-            tasks.push(self.add_with_source(Opened { root, file: relative, snapshot: None }, true,
+            tasks.push(self.add_with_source(Opened { root, file: relative, snapshot: None, authority }, true,
                 resolved.external.then(|| resolved.path.clone())));
             let Some(target) = self.active else { return Task::none(); };
             if resolved.external && let Some(tab) = self.tab_mut(target) {
@@ -234,10 +235,12 @@ impl Editor {
         })?;
         let same_source = self.tab(target.location.card).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&target.location.source) && tab.runtime.editor_navigation_anchor().is_some());
         if !same_source {
-            let root = self.tab(target.location.card)?.runtime.descriptor.worktree.clone();
+            let tab = self.tab(target.location.card)?;
+            let root = tab.runtime.descriptor.worktree.clone();
+            let authority = tab.worktree_authority.clone();
             let relative = target.location.source.strip_prefix(&root).ok().map(Path::to_path_buf);
             let external = relative.is_none().then(|| target.location.source.clone());
-            let task = self.add_with_source(Opened { root, file: relative, snapshot: None }, true, external);
+            let task = self.add_with_source(Opened { root, file: relative, snapshot: None, authority }, true, external);
             let opened = self.active?;
             if !self.tab(opened).is_some_and(|tab| tab.runtime.source_tab_path().as_ref() == Some(&target.location.source)) { return Some(task); }
             self.selection_epoch = self.selection_epoch.wrapping_add(1);
@@ -301,13 +304,35 @@ impl Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{editor, run_tasks};
+    use crate::app::tests::{editor, git_fixture, open_real_git, run_tasks};
     use cosmic::iced::futures::StreamExt;
 
     fn open_file(app: &mut Editor, root: &Path, path: &str) -> CardId {
-        let task = app.add(Opened { root: root.to_path_buf(), file: Some(path.into()), snapshot: None }, true);
+        let task = app.add(Opened { root: root.to_path_buf(), file: Some(path.into()), snapshot: None, authority: None }, true);
         run_tasks(app, task);
         app.active.unwrap()
+    }
+
+    #[test]
+    fn internal_definition_tab_retains_its_original_git_authority_and_controls() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("target.rs"), "fn target() {}\n").unwrap();
+        let mut app = editor();
+        let origin = open_real_git(&mut app, root, Some("tracked.txt"));
+        let task = app.open_navigation_target(origin, Resolved {
+            path: root.join("target.rs"), external: false,
+            at: LspPosition::new(0, 3), coordinates: LspCoordinates::Utf16,
+        });
+        run_tasks(&mut app, task);
+        let target = app.active.unwrap();
+        assert_ne!(target, origin);
+        let tab = app.tab(target).unwrap();
+        assert!(tab.git, "an internal source remains a Git tab");
+        assert_eq!(tab.worktree_authority.as_ref().unwrap().path(), root);
+        assert!(tab.sidebar.source_control.as_ref().is_some_and(|source| !source.is_reloading()));
+        assert!(tab.runtime.editor_text().is_some());
+        assert!(tab.runtime.diff_presentation_action(target, repository_widget::DiffPresentationCommand::StageFile).is_some(), "the untracked target retains Git toolbar capabilities");
     }
 
     #[test]
