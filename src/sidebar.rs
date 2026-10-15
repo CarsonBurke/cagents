@@ -18825,7 +18825,7 @@ pub(crate) mod tests {
         let captures = |model: &SidebarModel| {
             frame_enter_presses(
                 &renderer,
-                body(model, &state, false, false, &default_menu_shortcuts()),
+                body(model, &state, false, false, default_menu_shortcuts_shared()),
             )
             .into_iter()
             .filter_map(|action| match action {
@@ -18927,11 +18927,11 @@ pub(crate) mod tests {
         model.projects[0].reloading = true;
         assert_ne!(ready, cache.generation(&model, &state));
         model.projects[0].reloading = false;
-        let shortcuts = default_menu_shortcuts();
+        let shortcuts = default_menu_shortcuts_shared();
         for compact in [false, true] {
             let actions = frame_enter_presses(
                 &renderer,
-                body_with_creation_allowed(&model, &state, compact, false, &shortcuts, false),
+                body_with_creation_allowed(&model, &state, compact, false, shortcuts, false),
             );
             assert!(
                 !actions
