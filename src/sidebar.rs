@@ -8208,6 +8208,7 @@ fn change_row_view<'a>(
         selected,
         modal_open,
     );
+    let identity = crate::interaction::tooltip(identity, chrome.label.to_string());
     let commands = row_commands(source, area, row, modal_open);
     if commands.is_empty() {
         return identity;
