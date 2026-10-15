@@ -329,8 +329,8 @@ pub fn read_link_beneath(root: &Root, relative: &Path) -> Result<PathBuf, Resolv
     let reported = root.path.join(relative);
     let (directory, name) = open_parent_beneath(root, relative)?;
     let name = c_component(&name, &reported)?;
-    // A link target is bounded by PATH_MAX on every filesystem Linux exposes;
-    // a truncated read is reported rather than silently shortened.
+    // Bound the read by the platform limit. A full buffer is reported as a
+    // truncated target rather than silently shortening its path.
     let mut buffer = vec![0_u8; libc::PATH_MAX as usize];
     // SAFETY: `name` outlives the call, and the write is bounded by the
     // buffer's own length.
@@ -588,16 +588,19 @@ impl fmt::Display for AttributeNotCopied {
 /// `source` onto the `destination` that is about to take its name, so an
 /// atomic replacement does not have to be abandoned to keep them.
 ///
-/// Two of Linux's four namespaces are reproduced and two are deliberately not,
+/// Darwin uses the OS safe-save attribute policy; its mandatory extended ACL
+/// is preserved separately by [`copy_access_acl`].
+///
+/// On Linux, two namespaces are reproduced and two are deliberately not,
 /// and the two that are skipped are skipped because the replacement gets a
 /// better version of them from someone else than this function could copy:
 ///
 /// * `user.*` is the user's own metadata and nothing in the system will put it
 ///   back, so it is copied and a failure to copy it is reported.
 /// * `system.*` is where a POSIX ACL lives — `system.posix_acl_access` *is*
-///   the ACL, its named entries and its mask — so copying the namespace is
-///   what carries the ACL across, with no second ACL-specific mechanism. The
-///   caller must set the replacement's mode *before* calling this, because the
+///   the ACL, its named entries and its mask. Callers separately require
+///   [`copy_access_acl`] to succeed when access control is mandatory. The
+///   replacement's mode must be set *before* copying attributes, because the
 ///   kernel derives the mode from the ACL and a later `fchmod` would rewrite
 ///   the ACL's mask from the mode.
 /// * `security.*` belongs to the kernel and the LSM, and reproducing it would

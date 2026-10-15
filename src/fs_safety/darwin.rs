@@ -37,8 +37,8 @@ unsafe extern "C" {
 pub(super) fn is_content_attribute(name: &CStr) -> bool {
     // Access control is mandatory and copied through its native ACL API below.
     // Ask the OS's safe-save policy which other metadata survives new contents;
-    // this includes restrictive quarantine metadata without copying stale
-    // content signatures or inventing Linux namespace rules on Darwin.
+    // content-dependent attributes follow that policy instead of inheriting
+    // Linux namespace rules or assuming every security attribute is preserved.
     if name.to_bytes() == b"com.apple.system.Security" {
         return false;
     }
