@@ -6878,14 +6878,21 @@ mod tests {
         }
 
         fn isolated_large_pathspec_test(name: &str) -> bool {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             let name = name
                 .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
                 .unwrap_or(name);
             if std::env::var("CAGENTS_LARGE_PATHSPEC_CONTRACT").as_deref() == Ok(name) {
                 return false;
             }
+            // Keep the namespace on every outcome until the outer owner has
+            // established full-family settlement; a child result is not that proof.
+            let directory = tempfile::Builder::new()
+                .prefix("cagents-pathspec-contract-")
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in("/var/tmp").unwrap().keep();
             let mut command = CommandSpec::new(std::env::current_exe().unwrap())
-                .args(["--exact", name, "--test-threads=1"])
+                .args(["--exact", name, "--nocapture", "--test-threads=1", "--color=never"])
                 .timeout(Duration::from_secs(240))
                 .output_limits(1024 * 1024, 1024 * 1024);
             for (key, _) in std::env::vars_os() {
@@ -6895,6 +6902,7 @@ mod tests {
             }
             command = command
                 .env("CAGENTS_LARGE_PATHSPEC_CONTRACT", name)
+                .env("CAGENTS_LARGE_PATHSPEC_ROOT", &directory)
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -6907,18 +6915,38 @@ mod tests {
                 .env("GIT_CONFIG_VALUE_2", "false")
                 .env("GIT_CONFIG_KEY_3", "init.templateDir")
                 .env("GIT_CONFIG_VALUE_3", "");
-            let output = SystemProcessExecutor
-                .execute(&command, &CancellationToken::new())
-                .unwrap();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                output.success,
-                "{stdout}\n{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            assert!(stdout.contains(&format!("test {name} ... ok")), "{stdout}");
-            assert!(stdout.contains("1 passed; 0 failed"), "{stdout}");
+            let (success, stdout, stderr, status) = match
+                SystemProcessExecutor.execute(&command, &CancellationToken::new())
+            {
+                Ok(output) => (output.success, output.stdout, output.stderr,
+                    format!("exit {:?}, signal {:?}", output.exit_code, output.signal)),
+                Err(failure) => (false, failure.stdout, failure.stderr,
+                    format!("{:?}: {}", failure.kind, failure.message)),
+            };
+            for (name, bytes) in [("stdout", &stdout), ("stderr", &stderr)] {
+                fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+                    .open(directory.join(name)).unwrap().write_all(bytes).unwrap();
+            }
+            eprintln!("Retained pathspec contract root: {}", directory.display());
+            let stdout = String::from_utf8_lossy(&stdout);
+            let stderr = String::from_utf8_lossy(&stderr);
+            assert!(success, "{status}\n{stdout}\n{stderr}");
+            assert!(stdout.lines().any(|line| line.contains(&format!("test {name} ... ok"))), "{stdout}");
+            assert!(stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")), "{stdout}");
+            print!("{stdout}");
+            eprint!("{stderr}");
             true
+        }
+
+        fn retained_large_pathspec_directory() -> tempfile::TempDir {
+            use std::os::unix::fs::PermissionsExt;
+            let parent = std::env::var_os("CAGENTS_LARGE_PATHSPEC_ROOT")
+                .expect("owning private contract namespace");
+            let mut directory = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(parent).unwrap();
+            directory.disable_cleanup(true);
+            directory
         }
 
         #[test]
@@ -6929,7 +6957,7 @@ mod tests {
             )) {
                 return;
             }
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = retained_large_pathspec_directory();
             let root = directory.path();
             git(root, &["init", "-b", "main"]);
             fs::write(root.join("selected.txt"), "base").unwrap();
@@ -6997,7 +7025,7 @@ mod tests {
             )) {
                 return;
             }
-            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = retained_large_pathspec_directory();
             let root = directory.path();
             git(root, &["init", "-b", "main"]);
             let names = [
