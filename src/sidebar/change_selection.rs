@@ -20,14 +20,22 @@ pub(super) struct Selection {
 }
 
 impl Selection {
-    pub(super) fn clear(&mut self) { self.rows.clear(); self.first_by_area.clear(); self.anchor = None; }
+    pub(super) fn clear(&mut self) -> bool {
+        let changed = !self.rows.is_empty() || self.anchor.is_some();
+        self.rows.clear(); self.first_by_area.clear(); self.anchor = None;
+        changed
+    }
     pub(super) fn contains(&self, row: &Row) -> bool { self.rows.contains(row) }
     pub(super) fn is_empty(&self) -> bool { self.rows.is_empty() }
     pub(super) fn len(&self) -> usize { self.rows.len() }
-    pub(super) fn retain(&mut self, mut present: impl FnMut(&Row) -> bool) {
+    pub(super) fn retain(&mut self, mut present: impl FnMut(&Row) -> bool) -> bool {
+        let count = self.rows.len();
+        let anchor = self.anchor.clone();
         self.rows.retain(&mut present);
         if self.anchor.as_ref().is_some_and(|row| !present(row)) { self.anchor = None; }
-        self.update_areas();
+        let changed = count != self.rows.len() || anchor != self.anchor;
+        if changed { self.update_areas(); }
+        changed
     }
     pub(super) fn first_in_area(&self, area: ChangeArea) -> Option<&Row> { self.first_by_area.get(&area) }
     fn update_areas(&mut self) {

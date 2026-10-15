@@ -2867,6 +2867,7 @@ pub struct SidebarState {
     rows: selection::Selection,
     change_rows: change_selection::Selection,
     change_focus: Option<ChangeSelectionRow>,
+    change_selection_revision: u64,
     reveal_file: Option<RepoPath>,
     query: String,
     filter: SidebarFilter,
@@ -2928,13 +2929,17 @@ impl SidebarState {
     pub fn select_change_rows(&mut self, row: ChangeSelectionRow, intent: SelectionIntent, order: &[ChangeSelectionRow]) {
         self.change_focus = Some(row.clone());
         self.change_rows.select(row, intent, order);
+        self.change_selection_revision = self.change_selection_revision.wrapping_add(1);
     }
 
     pub fn reconcile_change_rows(&mut self, source: &SourceControlModel) {
         let present = |row: &ChangeSelectionRow| source.group(row.area).and_then(|group| group.visible_path(&row.path)).is_some();
-        self.change_rows.retain(present);
-        if self.change_focus.as_ref().is_some_and(|row| !present(row)) { self.change_focus = None; }
+        let mut changed = self.change_rows.retain(present);
+        if self.change_focus.as_ref().is_some_and(|row| !present(row)) { self.change_focus = None; changed = true; }
+        if changed { self.change_selection_revision = self.change_selection_revision.wrapping_add(1); }
     }
+
+    pub fn change_selection_revision(&self) -> u64 { self.change_selection_revision }
 
     pub fn selected_change_count(&self) -> usize { self.change_rows.len() }
 
@@ -3390,6 +3395,7 @@ impl SidebarState {
         self.collapsed_change_directories.clear();
         self.change_rows.clear();
         self.change_focus = None;
+        self.change_selection_revision = self.change_selection_revision.wrapping_add(1);
         self.reveal_file = None;
         self.change_pages.clear();
         self.files_page = 0;
@@ -3497,7 +3503,9 @@ impl SidebarState {
             SidebarAction::OpenFile { path, .. } => {
                 self.panel_selection = Some(PanelSelection::File(path.clone()));
             }
-            SidebarAction::ClearChangeSelection { .. } => self.change_rows.clear(),
+            SidebarAction::ClearChangeSelection { .. } => {
+                if self.change_rows.clear() { self.change_selection_revision = self.change_selection_revision.wrapping_add(1); }
+            }
             SidebarAction::SelectChangeRows { .. } | SidebarAction::NavigateChangeRow { .. } | SidebarAction::InvokeChangeRows { .. } | SidebarAction::RevealChangeInFiles { .. } | SidebarAction::IgnoreChangePath { .. } => {},
             SidebarAction::OpenChange { path, area, .. } => {
                 self.panel_selection = Some(PanelSelection::Change {
@@ -8902,8 +8910,15 @@ pub fn selected_change_group_anchor(source: &SourceControlModel, state: &Sidebar
 /// Capability checks do not clone a potentially large selected path vector.
 /// Actual activation resolves exact surviving paths through the same handler.
 pub fn change_command_available(source: &SourceControlModel, state: &SidebarState, command: ChangeGroupCommand) -> bool {
-    if state.active_worktree() != Some(&source.key) { return false; }
     let Some(focused) = state.focused_change_row() else { return false; };
+    change_command_available_for(source, state, focused, command)
+}
+
+/// The same capability predicate for an original captured menu/palette row.
+/// Selection membership remains activation-time state and must be fenced by
+/// change_selection_revision when the caller retains intent across focus changes.
+pub fn change_command_available_for(source: &SourceControlModel, state: &SidebarState, focused: &ChangeSelectionRow, command: ChangeGroupCommand) -> bool {
+    if state.active_worktree() != Some(&source.key) { return false; }
     let allowed = |area| match command {
         ChangeGroupCommand::Stage => area != ChangeArea::Staged,
         ChangeGroupCommand::Unstage => area == ChangeArea::Staged,
@@ -18062,4 +18077,30 @@ pub fn focus_and_reveal<T: Send + 'static>(id: Id) -> cosmic::iced::Task<T> {
         }
     }
     cosmic::iced::advanced::widget::operate(FocusRow { id, bounds: None })
+}
+
+#[cfg(test)]
+mod change_command_revision_tests {
+    use super::*;
+    #[test]
+    fn stable_reconcile_keeps_revision_while_equal_count_selection_replacement_changes_it() {
+        let model = super::tests::panel_model();
+        let mut state = super::tests::panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let rows = change_selection_order(source, &state);
+        assert!(rows.len() > 1);
+        let initial = state.change_selection_revision();
+        state.select_change_rows(rows[0].clone(), SelectionIntent::Toggle, &rows);
+        let first = state.change_selection_revision();
+        assert_ne!(initial, first);
+        state.reconcile_change_rows(source);
+        assert_eq!(state.change_selection_revision(), first);
+        state.select_change_rows(rows[0].clone(), SelectionIntent::Toggle, &rows);
+        state.select_change_rows(rows[1].clone(), SelectionIntent::Toggle, &rows);
+        assert_eq!(state.selected_change_count(), 1);
+        assert_ne!(state.change_selection_revision(), first);
+        let current = state.change_selection_revision();
+        state.apply(&SidebarAction::ClearChangeSelection { key: source.key.clone() });
+        assert_ne!(state.change_selection_revision(), current);
+    }
 }
