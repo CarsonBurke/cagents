@@ -45,6 +45,120 @@ impl DirectoryCreation {
     }
 }
 
+/// An unsuccessful creation can still own private staging. Keep this error
+/// until its recovery has been transferred to a live carrier or explicitly
+/// resolved. There is no conversion back to ResolveError that discards it.
+#[derive(Debug)]
+#[must_use = "creation failures may retain live staging authority"]
+pub struct DirectoryCreateError {
+    cause: ResolveError,
+    recovery: Option<DirectoryPreparation>,
+}
+impl DirectoryCreateError {
+    pub fn cause(&self) -> &ResolveError { &self.cause }
+    pub fn recovery(&self) -> Option<&DirectoryPreparation> { self.recovery.as_ref() }
+    pub fn take_recovery(&mut self) -> Option<DirectoryPreparation> { self.recovery.take() }
+}
+impl std::fmt::Display for DirectoryCreateError {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.cause, out)?;
+        if let Some(recovery) = &self.recovery {
+            write!(out, "; private staging retained (diagnostic spelling {}): {}",
+                recovery.diagnostic_path().display(), recovery.cleanup_error.as_deref().unwrap_or("cleanup unresolved"))?;
+        }
+        Ok(())
+    }
+}
+impl std::error::Error for DirectoryCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> { Some(&self.cause) }
+}
+impl From<ResolveError> for DirectoryCreateError {
+    fn from(cause: ResolveError) -> Self { Self { cause, recovery: None } }
+}
+
+/// Retained INTERNAL staging after a failed prepublication operation. If mkdir
+/// succeeded but descriptor acquisition failed, namespace/name acquisition is
+/// pending under the protected internal bootstrap contract stated above. This
+/// never grants creation authority over a public target. No Drop mutates disk.
+#[derive(Debug)]
+#[must_use = "retain unresolved staging until explicit worker cleanup succeeds"]
+pub struct DirectoryPreparation {
+    namespace: DirectoryNamespace,
+    name: OsString,
+    outer: Option<Root>,
+    payload: Option<Root>,
+    payload_created: bool,
+    created: bool,
+    cleanup_error: Option<String>,
+}
+impl DirectoryPreparation {
+    /// Opened spelling only, possibly stale after an ancestor rename.
+    pub fn diagnostic_path(&self) -> PathBuf { self.namespace.directory.path.join(&self.name) }
+    pub fn is_resolved(&self) -> bool { !self.created }
+    pub fn retry_cleanup(&mut self) -> Result<(), ResolveError> {
+        if !self.created { return Ok(()); }
+        namespace_protected(&self.namespace.directory)
+            .map_err(|e| ResolveError::io(&self.namespace.directory.path, &e))?;
+        let outer = match resolve_directory(&self.namespace.directory, Path::new(&self.name)) {
+            Ok(outer) => outer,
+            Err(error) if error.is_not_found() => {
+                if let Some(held) = &self.outer {
+                    if held.metadata().map_err(|e| ResolveError::io(&held.path, &e))?.nlink() != 0 {
+                        return Err(ResolveError::message(&held.path, "retained staging is no longer at its internal name; authority preserved for resolution"));
+                    }
+                }
+                self.created = false; self.cleanup_error = None; return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let metadata = outer.metadata().map_err(|e| ResolveError::io(&outer.path, &e))?;
+        if let Some(held) = &self.outer {
+            let expected = held.metadata().map_err(|e| ResolveError::io(&held.path, &e))?;
+            if (metadata.dev(), metadata.ino()) != (expected.dev(), expected.ino()) {
+                return Err(ResolveError::message(&outer.path, "internal staging identity changed; replacement preserved"));
+            }
+        } else {
+            self.outer = Some(outer.try_clone().map_err(|e| ResolveError::io(&outer.path, &e))?);
+        }
+        if self.payload_created {
+            match resolve_directory(&outer, Path::new("directory")) {
+                Ok(payload) => {
+                    let metadata = payload.metadata().map_err(|e| ResolveError::io(&payload.path, &e))?;
+                    if let Some(held) = &self.payload {
+                        let expected = held.metadata().map_err(|e| ResolveError::io(&held.path, &e))?;
+                        if (metadata.dev(), metadata.ino()) != (expected.dev(), expected.ino()) {
+                            return Err(ResolveError::message(&payload.path, "internal payload identity changed; replacement preserved"));
+                        }
+                    }
+                    remove_directory_within(&outer, OsStr::new("directory"))?;
+                }
+                Err(error) if error.is_not_found() => {
+                    if let Some(held) = &self.payload {
+                        if held.metadata().map_err(|e| ResolveError::io(&held.path, &e))?.nlink() != 0 {
+                            return Err(ResolveError::message(&held.path, "retained payload is no longer at its internal name; authority preserved for resolution"));
+                        }
+                    }
+                },
+                Err(error) => return Err(error),
+            }
+            self.payload_created = false;
+        }
+        remove_directory_within(&self.namespace.directory, &self.name)?;
+        self.created = false;
+        self.cleanup_error = None;
+        Ok(())
+    }
+    fn fail(mut self, cause: ResolveError) -> DirectoryCreateError {
+        match self.retry_cleanup() {
+            Ok(()) => cause.into(),
+            Err(error) => {
+                self.cleanup_error = Some(error.to_string());
+                DirectoryCreateError { cause, recovery: Some(self) }
+            }
+        }
+    }
+}
+
 /// Result of explicitly resolving an acquired cleanup entry. Restored does not
 /// mean the original directory was removed; callers must preserve that distinction.
 #[derive(Debug,Clone,Copy,PartialEq,Eq)]
@@ -175,7 +289,7 @@ impl DirectoryPublication {
 /// publication_error; recovery may traverse Existing/Unverified without chmod.
 /// Public payload permissions obey mkdir umask. Exact chmod, when required,
 /// is a separate caller action on the Published receipt's retained Root.
-pub fn create_directory_beneath(root: &Root, relative: &Path, mode: u32) -> Result<DirectoryCreation,ResolveError> {
+pub fn create_directory_beneath(root: &Root, relative: &Path, mode: u32) -> Result<DirectoryCreation,DirectoryCreateError> {
     if let Some(existing)=existing_directory(root,relative)? {return Ok(DirectoryCreation::Existing(existing));}
     let (parent,name)=open_parent_beneath(root,relative)?;
     match DirectoryNamespace::acquire(&parent) {
@@ -183,14 +297,14 @@ pub fn create_directory_beneath(root: &Root, relative: &Path, mode: u32) -> Resu
         Err(reason) => create_unverified(&parent,&name,mode,reason.to_string()),
     }
 }
-fn create_unverified(parent:&Root,name:&OsStr,mode:u32,reason:String)->Result<DirectoryCreation,ResolveError> {
+fn create_unverified(parent:&Root,name:&OsStr,mode:u32,reason:String)->Result<DirectoryCreation,DirectoryCreateError> {
     let leaf=c_component(name,&parent.path)?;
     // No creation authority is inferred from mkdir followed by name resolution.
     let status=unsafe {libc::mkdirat(parent.descriptor(),leaf.as_ptr(),mode)};
     if status<0 {
         let error=io::Error::last_os_error();
-        if error.kind()!=io::ErrorKind::AlreadyExists {return Err(ResolveError::io(&parent.path.join(name),&error));}
-        return resolve_directory(parent,Path::new(name)).map(DirectoryCreation::Existing);
+        if error.kind()!=io::ErrorKind::AlreadyExists {return Err(ResolveError::io(&parent.path.join(name),&error).into());}
+        return resolve_directory(parent,Path::new(name)).map(DirectoryCreation::Existing).map_err(Into::into);
     }
     let directory=resolve_directory(parent,Path::new(name))?;
     Ok(DirectoryCreation::Unverified {directory,reason})
@@ -201,11 +315,15 @@ fn create_unverified(parent:&Root,name:&OsStr,mode:u32,reason:String)->Result<Di
 /// cannot reproduce every native directory inheritance policy. Different
 /// parents create with ordinary mkdir semantics and return Unverified, never
 /// a falsely owned receipt. Callers may acquire the actual protected parent.
-pub fn create_directory_in_namespace(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mode:u32)->Result<DirectoryCreation,ResolveError> {
+pub fn create_directory_in_namespace(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mode:u32)->Result<DirectoryCreation,DirectoryCreateError> {
     create_with_hooks(namespace,root,relative,mode,|_,_|{},|_,_|{})
 }
 fn create_with_hooks(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mode:u32,
-    after_capture:impl FnOnce(&Root,&OsStr),after_publish:impl FnOnce(&Root,&OsStr))->Result<DirectoryCreation,ResolveError> {
+    after_capture:impl FnOnce(&Root,&OsStr),after_publish:impl FnOnce(&Root,&OsStr))->Result<DirectoryCreation,DirectoryCreateError> {
+    create_with_preparation_hook(namespace,root,relative,mode,|_,_|{},after_capture,after_publish)
+}
+fn create_with_preparation_hook(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mode:u32,
+    after_stage:impl FnOnce(&Root,&OsStr),after_capture:impl FnOnce(&Root,&OsStr),after_publish:impl FnOnce(&Root,&OsStr))->Result<DirectoryCreation,DirectoryCreateError> {
     // Borrowing an existing target never requires staging write permission.
     if let Some(existing)=existing_directory(root,relative)? {return Ok(DirectoryCreation::Existing(existing));}
     let (parent,name)=open_parent_beneath(root,relative)?;
@@ -216,61 +334,69 @@ fn create_with_hooks(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mod
             "owned directory publication requires the exact protected destination parent; different-parent inheritance remains unverified".into());
     }
     namespace_protected(&namespace.directory).map_err(|e|ResolveError::io(&namespace.directory.path,&e))?;
-    let retained_namespace=DirectoryNamespace {directory:namespace.directory.try_clone()
-        .map_err(|e|ResolveError::io(&namespace.directory.path,&e))?};
-    let stage=unused_name(&namespace.directory)?;
-    let leaf=c_component(&stage,&namespace.directory.path)?;
-    // Private OUTER staging never grants other-UID access. The payload inside
-    // it uses the requested mode and the actual process umask, exactly as mkdir.
+    // Retain the namespace before the first effect, including failures before
+    // a payload/publication receipt exists.
+    let mut preparation = DirectoryPreparation {
+        namespace: DirectoryNamespace {directory: namespace.directory.try_clone()
+            .map_err(|e| ResolveError::io(&namespace.directory.path, &e))?},
+        name: unused_name(&namespace.directory)?, outer: None, payload: None,
+        payload_created: false, created: false, cleanup_error: None,
+    };
+    let leaf = c_component(&preparation.name, &namespace.directory.path)?;
     if unsafe {libc::mkdirat(namespace.directory.descriptor(),leaf.as_ptr(),0o700)} !=0 {
-        return Err(ResolveError::io(&namespace.directory.path.join(&stage),&io::Error::last_os_error()));
+        return Err(ResolveError::io(&namespace.directory.path.join(&preparation.name),&io::Error::last_os_error()).into());
     }
-    let prepare=(|| {
-        let outer=resolve_directory(&namespace.directory,Path::new(&stage))?;
-        // Repair only this captured internal boundary, never public payload
-        // permissions. O_PATH/O_EVTONLY acquisition is separately qualified.
+    preparation.created = true;
+    after_stage(&namespace.directory,&preparation.name);
+    let mut identity = None;
+    let prepare = (|| -> Result<bool, ResolveError> {
+        let outer=resolve_directory(&namespace.directory,Path::new(&preparation.name))?;
+        preparation.outer=Some(outer);
+        let outer=preparation.outer.as_ref().unwrap();
         let inherited=outer.metadata().map_err(|e|ResolveError::io(&outer.path,&e))?;
-        set_directory_permissions(&outer,0o700|(inherited.mode()&0o2000)).map_err(|e|ResolveError::io(&outer.path,&e))?;
-        namespace_protected(&outer).map_err(|e|ResolveError::io(&outer.path,&e))?;
+        set_directory_permissions(outer,0o700|(inherited.mode()&0o2000)).map_err(|e|ResolveError::io(&outer.path,&e))?;
+        namespace_protected(outer).map_err(|e|ResolveError::io(&outer.path,&e))?;
         let repaired=outer.metadata().map_err(|e|ResolveError::io(&outer.path,&e))?;
         if repaired.gid()!=parent_metadata.gid() || repaired.mode()&0o2000!=parent_metadata.mode()&0o2000 {
-            return Ok((outer,None));
+            return Ok(false);
         }
         if unsafe {libc::mkdirat(outer.descriptor(),c"directory".as_ptr(),mode)}!=0 {
             return Err(ResolveError::io(&outer.path.join("directory"),&io::Error::last_os_error()));
         }
-        let payload=resolve_directory(&outer,Path::new("directory"))?;
-        let identity=payload.metadata().map_err(|e|ResolveError::io(&payload.path,&e))?;
-        Ok((outer,Some((payload,identity))))
+        preparation.payload_created=true;
+        let payload=resolve_directory(outer,Path::new("directory"))?;
+        preparation.payload=Some(payload);
+        let payload=preparation.payload.as_ref().unwrap();
+        identity=Some(payload.metadata().map_err(|e|ResolveError::io(&payload.path,&e))?);
+        Ok(true)
     })();
-    let (outer,payload)=match prepare {
-        Ok(result)=>result,
-        Err(error)=>{
-            // Only private internal entries are addressed here. The payload
-            // can exist if its descriptor acquisition failed after mkdir.
-            if let Ok(outer)=resolve_directory(&namespace.directory,Path::new(&stage)) {
-                let _=remove_directory_within(&outer,OsStr::new("directory"));
-            }
-            let cleanup=remove_directory_within(&namespace.directory,&stage);
-            return Err(match cleanup {Ok(())=>error,Err(cleanup)=>ResolveError::message(
-                &namespace.directory.path.join(&stage),&format!("{error}; private staging cleanup failed: {cleanup}"))});
+    match prepare {
+        Err(error)=>return Err(preparation.fail(error)),
+        Ok(false)=> {
+            if let Err(error)=preparation.retry_cleanup() {return Err(preparation.fail(error));}
+            return create_unverified(&parent,&name,mode,
+                "internal owner-access repair could not preserve destination gid/SGID; creation ownership is unverified".into());
         }
-    };
-    let Some((mut directory,identity))=payload else {
-        remove_directory_within(&namespace.directory,&stage)?;
-        return create_unverified(&parent,&name,mode,
-            "internal owner-access repair could not preserve destination gid/SGID; creation ownership is unverified".into());
-    };
-    after_capture(&parent,&name);
-    if let Err(error)=rename_exclusive(&outer,OsStr::new("directory"),&parent,&name) {
-        let payload_cleanup=remove_directory_within(&outer,OsStr::new("directory"));
-        let outer_cleanup=remove_directory_within(&namespace.directory,&stage);
-        if let Err(cleanup)=payload_cleanup.and(outer_cleanup) {return Err(ResolveError::message(&namespace.directory.path.join(&stage),&format!("{error}; private staging cleanup failed: {cleanup}")));}
-        if error.kind()==io::ErrorKind::AlreadyExists {
-            return resolve_directory(&parent,Path::new(&name)).map(DirectoryCreation::Existing);
-        }
-        return Err(ResolveError::io(&parent.path.join(&name),&error));
+        Ok(true)=>{},
     }
+    after_capture(&parent,&name);
+    let outer=preparation.outer.as_ref().unwrap();
+    if let Err(error)=rename_exclusive(outer,OsStr::new("directory"),&parent,&name) {
+        let exists=error.kind()==io::ErrorKind::AlreadyExists;
+        let failure=preparation.fail(ResolveError::io(&parent.path.join(&name),&error));
+        if exists && failure.recovery.is_none() {
+            return resolve_directory(&parent,Path::new(&name)).map(DirectoryCreation::Existing).map_err(Into::into);
+        }
+        return Err(failure);
+    }
+    // From here onward the published receipt must retain known identity even
+    // when private outer cleanup fails.
+    preparation.payload_created=false;
+    let mut directory=preparation.payload.take().unwrap();
+    let identity=identity.unwrap();
+    let outer=preparation.outer.take().unwrap();
+    let stage=preparation.name;
+    let retained_namespace=preparation.namespace;
     directory.path=parent.path.join(&name);
     after_publish(&parent,&name);
     // Nothing after successful publication can erase the known identity from
@@ -630,4 +756,60 @@ mod tests {
         set_directory_permissions(receipt.directory(),0o750).unwrap();
         assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0o750);
     }
+    #[test]
+    fn failed_preparation_retains_private_stage_until_explicit_retry() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let mut failure=create_with_preparation_hook(&namespace,&root,Path::new("target"),0o700,
+            |_,name|{fs::write(dir.path().join(name).join("directory"),b"do not discard").unwrap();},
+            |_,_|panic!("preparation must fail"),|_,_|panic!("must not publish")).unwrap_err();
+        assert!(failure.recovery().is_some());
+        let mut retained=failure.take_recovery().unwrap();
+        assert!(failure.recovery().is_none());
+        assert!(!retained.is_resolved());
+        assert!(retained.retry_cleanup().is_err());
+        assert_eq!(fs::read(retained.diagnostic_path().join("directory")).unwrap(),b"do not discard");
+        fs::remove_file(retained.diagnostic_path().join("directory")).unwrap();
+        retained.retry_cleanup().unwrap();
+        assert!(retained.is_resolved());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(),0);
+        assert!(!dir.path().join("target").exists());
+    }
+    #[test]
+    fn failed_publication_retains_prepared_identity_and_retries_cleanup() {
+        if unsafe {libc::geteuid()}==0 {return;}
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let mut failure=create_with_hooks(&namespace,&root,Path::new("target"),0o700,|_,_|{
+            fs::set_permissions(dir.path(),fs::Permissions::from_mode(0o555)).unwrap();
+        },|_,_|panic!("must not publish through nonwritable parent")).unwrap_err();
+        fs::set_permissions(dir.path(),fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(!dir.path().join("target").exists());
+        let mut retained=failure.take_recovery().unwrap();
+        assert!(retained.outer.is_some());
+        retained.retry_cleanup().unwrap();
+        assert!(retained.is_resolved());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(),0);
+    }
+    #[test]
+    fn retained_preparation_preserves_changed_internal_identity() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let mut failure=create_with_preparation_hook(&namespace,&root,Path::new("target"),0o700,
+            |_,name|{fs::write(dir.path().join(name).join("directory"),b"original").unwrap();},
+            |_,_|{},|_,_|{}).unwrap_err();
+        let mut retained=failure.take_recovery().unwrap();
+        let old=retained.diagnostic_path();
+        fs::rename(&old,dir.path().join("original-stage")).unwrap();
+        fs::create_dir(&old).unwrap();
+        fs::write(old.join("foreign"),b"preserve").unwrap();
+        assert!(retained.retry_cleanup().is_err());
+        assert!(!retained.is_resolved());
+        assert_eq!(fs::read(old.join("foreign")).unwrap(),b"preserve");
+        assert_eq!(fs::read(dir.path().join("original-stage/directory")).unwrap(),b"original");
+    }
+
 }
