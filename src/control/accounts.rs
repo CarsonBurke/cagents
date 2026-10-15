@@ -51,7 +51,7 @@ pub enum AccountCommand {
     },
     /// Read caller context and configured account plan allowances without probing.
     Info {
-        /// Limit account rows to this provider.
+        /// Limit account rows to claude, codex, or omp.
         #[arg(long, value_parser = crate::control::agents::parse_provider)]
         provider: Option<crate::agent::Provider>,
         /// Select a stable provider/account ID from this report.

@@ -221,6 +221,11 @@ pub trait Adapter: Send {
     ) -> Result<Step, String> {
         Err("This provider transport has no supported reset-credit redemption path; no credit was consumed".into())
     }
+    /// Whether this exact pending answer refuses work. Providers with opaque
+    /// action IDs must inspect their retained decision, never its UI label.
+    fn answer_declines(&self, _request_id: &str, action: &str) -> bool {
+        super::declines(action)
+    }
     fn command_for_run(
         &mut self,
         _run: crate::model::RunId,
