@@ -571,7 +571,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_receipt_protocol_and_known_native_build_are_discovered_but_unknown_native_is_refused() {
+    fn terminal_receipt_protocol_and_known_native_build_are_discovered_but_unknown_native_is_refused()
+     {
         let directory = tempfile::tempdir().unwrap();
         let mut terminal = record();
         terminal.version = 4;
@@ -588,8 +589,14 @@ mod tests {
         native.kind = Kind::Native;
         native.version = 4;
         native.create(directory.path()).unwrap();
-        assert_eq!(evidence(&socket(directory.path(), native.terminal), Kind::Native).unwrap(), Some(native.clone()));
-        assert_eq!(discover(directory.path(), &native.boot, Kind::Native).unwrap(), vec![native.clone()]);
+        assert_eq!(
+            evidence(&socket(directory.path(), native.terminal), Kind::Native).unwrap(),
+            Some(native.clone())
+        );
+        assert_eq!(
+            discover(directory.path(), &native.boot, Kind::Native).unwrap(),
+            vec![native.clone()]
+        );
         native.remove(directory.path());
         native.version = 5;
         native.create(directory.path()).unwrap();
