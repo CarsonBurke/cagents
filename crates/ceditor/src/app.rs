@@ -1980,6 +1980,7 @@ impl Editor {
             return Task::none();
         };
         let intents = tab.runtime.take_lsp_intents();
+        let edits = tab.runtime.take_lsp_edits();
         let autosave = repository_task(tab.runtime.auto_save_task(id));
         let working_diff = repository_task(tab.runtime.working_diff_task(id));
         for intent in intents {
@@ -2015,13 +2016,16 @@ impl Editor {
                     self.lsp_navigation.results.remove(&id);
                     self.lsp_navigation.resolving.remove(&id);
                     if let Some(doc) = self.tab(id).and_then(|tab| tab.runtime.lsp_document()) {
-                        self.lsp.change(doc, version, &[], &text);
+                        match text {
+                            cagents::repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
+                            cagents::repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
+                        }
                     }
                     if let Some(tab) = self.tab_mut(id) {
                         tab.completions.clear();
                         tab.hover = None;
-                        tab.diagnostics.clear();
-                        tab.diagnostics_version = None;
+                        cagents::lsp::shift_diagnostics(&mut tab.diagnostics,&edits);
+                        tab.diagnostics_version = Some(version);
                     }
                 }
                 LspIntent::Save { text } => {
@@ -4435,13 +4439,14 @@ impl Application for Editor {
             | LspEvent::ApplyWorkspaceEdit { doc, .. }
             | LspEvent::DocumentDesynced { doc, .. } => *doc,
                         };
+                        let current_version = self.lsp.document_version(doc);
                         if let Some(tab) = self
                             .tabs
                             .iter_mut()
                             .find(|tab| tab.runtime.lsp_document() == Some(doc))
                         {
                             match event {
-                                LspEvent::Diagnostics { items, version, .. } => {
+                                LspEvent::Diagnostics { items, version, .. } if current_version == Some(version) => {
                                     tab.diagnostics = items;
                                     tab.diagnostics_version = Some(version);
                                 }
