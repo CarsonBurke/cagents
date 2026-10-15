@@ -3431,8 +3431,8 @@ impl SidebarState {
                     self.commit_draft.amend = *amend;
                 }
             }
-            SidebarAction::ChangeViewport { key, scope, first_row } => {
-                if self.active_worktree.as_ref() == Some(key) {
+            SidebarAction::ChangeViewport { key, scope, first_row, epoch } => {
+                if self.active_worktree.as_ref() == Some(key) && self.change_scroll_epoch == *epoch {
                     self.change_first_rows.insert(*scope, *first_row);
                 }
             }
@@ -3547,6 +3547,7 @@ pub enum SidebarAction {
         key: ActiveWorktreeKey,
         scope: ChangeTreeScope,
         first_row: usize,
+        epoch: u64,
     },
     NavigateRow {
         row: SelectionRow,
@@ -7803,9 +7804,10 @@ fn virtual_changes<'a>(
         widget::Space::new().height(total.saturating_sub(range.end) as f32 * PANEL_ROW_HEIGHT).into(),
     ]);
     let key = key.clone();
+    let epoch = state.change_scroll_epoch;
     widget::scrollable(content)
         .id(stable_id(format!("changes.scroll.{}.{scope:?}.{}", key.worktree_id, state.change_scroll_epoch)))
-        .on_scroll(move |viewport| SidebarAction::ChangeViewport { key: key.clone(), scope,
+        .on_scroll(move |viewport| SidebarAction::ChangeViewport { key: key.clone(), scope, epoch,
             first_row: (viewport.absolute_offset().y / PANEL_ROW_HEIGHT).max(0.0) as usize })
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()))
         .height(Length::Fixed((total.min(crate::change_list::VIEW_ROWS) as f32 * PANEL_ROW_HEIGHT).max(PANEL_ROW_HEIGHT)))
@@ -16023,16 +16025,20 @@ pub(crate) mod tests {
         assert!(!ids.contains(&last));
         assert!(ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8, "mounted {} controls", ids.len());
         state.apply(&SidebarAction::ChangeViewport {
-            key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984,
+            key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984, epoch:state.change_scroll_epoch,
         });
         let ids = control_ids(&change_group_view(&state, &source, group, false));
         assert!(!ids.contains(&first));
         assert!(ids.contains(&last));
         assert!(ids.len() <= MAX_VISIBLE_CHANGE_ROWS * 8 + 8, "mounted {} controls", ids.len());
         assert_eq!(group.rows.len(), 40_000, "virtualization retains the complete command model");
+        let old_epoch=state.change_scroll_epoch;
+        state.apply(&SidebarAction::SetChangeListMode { key:source.key.clone(), mode:FileListMode::Flat });
+        state.apply(&SidebarAction::ChangeViewport { key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984, epoch:old_epoch });
+        assert!(state.change_first_rows.is_empty(), "old layout callbacks cannot undo a list-mode scroll reset");
         assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
         state.apply(&SidebarAction::ChangeViewport {
-            key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984,
+            key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984, epoch:state.change_scroll_epoch,
         });
         assert!(state.change_first_rows.is_empty(), "old worktree scroll callbacks cannot move the newly bound pane");
     }
