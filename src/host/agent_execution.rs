@@ -29,7 +29,7 @@ pub(super) use ownership::{
 
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.
-const EXECUTION_CLIENT: u64 = 0;
+pub(super) const EXECUTION_CLIENT: u64 = 0;
 pub(super) type SharedRegistry = Arc<Mutex<Registry>>;
 
 pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {

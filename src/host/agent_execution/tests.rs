@@ -3032,7 +3032,7 @@ fn archived_automation_reservation_refuses_stale_executable_controls_before_and_
         ];
         for request in requests {
             let refused = crate::host::chat::process(&host, 17, request).unwrap_err();
-            assert!(refused.message.contains("saved read-only"), "{refused:?}");
+            assert!(refused.message.contains("saved read-only") || (!closed && refused.message.contains("pending archive actor")), "{refused:?}");
         }
         assert_eq!(std::fs::read_to_string(&spawn_path).unwrap(), before);
         assert_eq!(
@@ -3111,4 +3111,78 @@ fn automation_does_not_reserve_or_close_a_successful_parent_with_running_native_
     assert_eq!(std::fs::read_to_string(path.parent().unwrap().join("spawns")).unwrap(),"spawn\n");
     // Explicit fixture cleanup is separate from automatic reconciliation.
     crate::host::chat::process(&host,EXECUTION_CLIENT,ClientRequest::ChatClose { chat_id: session.id }).unwrap();
+}
+
+#[test]
+fn a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart() {
+    const NAME: &str = "a_pending_archive_keeps_exact_live_attachment_and_decisions_without_restart";
+    if isolated(NAME).is_some() { return; }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let script = root.join("bin/claude");
+    let source = std::fs::read_to_string(&script).unwrap();
+    let marker = r#"      printf '{"type":"result","uuid":"result-%s","subtype":"success","is_error":false,"session_id":"%s","usage":{"input_tokens":7,"output_tokens":3}}\n' "$n" "$session""#;
+    // Only the ordinary user-prompt result pauses. The next frame is a real
+    // background permission AFTER the completed report has been reserved.
+    let occurrence = source.rfind(marker).expect("ordinary fixture result");
+    let mut source = source.clone();
+    let extra = r#"
+      while [ ! -e "$HOME/../release-background" ]; do /bin/sleep 0.01; done
+      printf '{"type":"control_request","request_id":"late-background","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"late-tool","input":{"command":"true"}}}\n'
+"#;
+    source.insert_str(occurrence + marker.len(),extra);
+    std::fs::write(&script,source).unwrap();
+    let mut definition = automation_fixture(&host,&request).definition;
+    definition.session_mode = crate::automations::SessionMode::Fresh;
+    let automation = crate::host::automations::service::create(&host,definition).unwrap();
+    let accepted = claim_fixture(&host,&automation);
+    dispatch_accepted(&host,accepted.clone()).unwrap();
+    let done = settled(&host,accepted.run.id);
+    assert_eq!(done.state,State::Succeeded);
+    let store = registry(&host).unwrap();
+    let agent = store.lock().unwrap().agent(accepted.agent.id).unwrap();
+    let Some(HostedSession::Chat(session)) = agent.session.clone() else { panic!("hosted provider") };
+    let handle = host.lock().unwrap().chats.get(&session.id).unwrap().handle.clone();
+    let firing = store.lock().unwrap().reconcile_automation_run(done.id,now()).unwrap().unwrap();
+    {
+        let gate = agent_gate(&host,agent.id);
+        let _guard = gate.lock().unwrap();
+        let snapshot = handle.snapshot(None).unwrap();
+        store.lock().unwrap().archive_automation_conversation(firing.id,&agent,snapshot).unwrap();
+    }
+    std::fs::write(root.join("release-background"),b"continue").unwrap();
+    assert_eq!(pending_requests(&host,agent.id)[0].id,"late-background");
+    let current = store.lock().unwrap().agent(agent.id).unwrap();
+    assert!(store.lock().unwrap().is_archived_automation_session(session.id).unwrap());
+    for (index,mut changed) in [session.clone(),session.clone()].into_iter().enumerate() {
+        if index == 0 {
+            changed.launch.session_id = Some("wrong-native-thread".into());
+        } else {
+            changed.launch.recipe.environment.insert("INVALID_ARCHIVE_SOURCE".into(),"different".into());
+        }
+        assert!(crate::host::chat::process(&host,17,ClientRequest::ChatAttach { session:changed }).is_err());
+    }
+    let record = host.lock().unwrap().chats.remove(&session.id).unwrap();
+    assert!(crate::host::chat::process(&host,17,ClientRequest::ChatAttach { session: session.clone() }).is_err(), "an absent reserved actor must never enter start/restart fallback");
+    assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap(),"spawn\n");
+    host.lock().unwrap().chats.insert(session.id,record);
+    let attached = crate::host::chat::process(&host,17,ClientRequest::ChatAttach { session: session.clone() }).unwrap();
+    let ServerResponse::ChatAttached { snapshot, .. } = attached else { panic!("exact live attachment") };
+    assert_eq!(snapshot.requests[0].id,"late-background");
+    assert!(!store.lock().unwrap().agent_is_interactive(agent.id).unwrap(), "viewing must not take ownership");
+    let snapshot = handle.snapshot(None).unwrap();
+    assert!(reconcile_agent_run(&host,&done,true).is_err(), "the changed native state must prevent automatic close");
+    assert!(!handle.is_completed() && !current.closed);
+    crate::host::chat::process(&host,17,ClientRequest::ChatCommand { chat_id:session.id, command:Command::Answer { request_id:"late-background".into(),action:"deny".into(),answers:vec![] } }).unwrap();
+    assert!(store.lock().unwrap().agent_is_interactive(agent.id).unwrap(), "an explicit live decision takes interactive ownership before teardown can race");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(root.join("decisions")).unwrap_or_default() != "deny\n" {
+        assert!(Instant::now()<deadline,"the exact provider never received the denial");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap(),"spawn\n");
+    assert_eq!(snapshot.requests.len(),1);
+    crate::host::chat::process(&host,17,ClientRequest::ChatClose { chat_id:session.id }).unwrap();
+    assert!(crate::host::chat::process(&host,17,ClientRequest::ChatAttach { session }).is_err(), "a completed reserved report must never enter a restart fallback");
+    assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap(),"spawn\n");
 }

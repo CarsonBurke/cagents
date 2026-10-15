@@ -1947,12 +1947,79 @@ fn confirm_account_conversation(
     }
 }
 
+/// The caller holds this agent's owner gate and has proved an OPEN pending
+/// archive reservation. Resolve only its exact existing actor, never a launcher.
+pub(in crate::host) fn reserved_automation_actor(
+    host: &SharedHost,
+    client: ClientId,
+    agent: &crate::agent_execution::Agent,
+    require_attached: bool,
+) -> Result<chat::runtime::Handle, ProtocolError> {
+    if agent.closed || !matches!(agent.origin, crate::agent_execution::Origin::Automation { .. }) {
+        return Err(error("Completed scheduled conversations are saved read-only"));
+    }
+    let Some(crate::agent_execution::HostedSession::Chat(issued)) = &agent.session else {
+        return Err(unavailable("The exact pending archive provider is unavailable"));
+    };
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(issued.proof.as_ref(), state.proof())?;
+    let record = state.chats.get(&issued.id)
+        .filter(|record| !record.handle.is_completed())
+        .filter(|record| crate::automations::archive::native_descriptor_matches(agent, &record.session))
+        .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id)
+        .filter(|record| !require_attached || record.subscribers.contains_key(&client))
+        .ok_or_else(|| unavailable("The exact pending archive actor is no longer live and attached; no replacement was started"))?;
+    Ok(record.handle.clone())
+}
+
+/// Attach an OPEN reserved conversation directly to its issued live actor.
+/// Snapshot hydration runs outside HostState, including retained native RPCs.
+pub(in crate::host) fn attach_reserved_automation_actor(
+    host: &SharedHost,
+    client: ClientId,
+    agent: &crate::agent_execution::Agent,
+    requested: &chat::Session,
+) -> Result<ServerResponse, ProtocolError> {
+    let handle = reserved_automation_actor(host, client, agent, false)?;
+    let mut issued = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state.chats.get(&requested.id)
+            .filter(|record| record.handle.same_actor(&handle))
+            .ok_or_else(|| unavailable("The pending archive actor changed before attachment"))?;
+        record.session.clone()
+    };
+    issued.launch.session_id = handle.confirmed_session_id();
+    issued.native_continuity = handle.native_continuity();
+    let mut current_owner = agent.clone();
+    current_owner.session = Some(crate::agent_execution::HostedSession::Chat(issued.clone()));
+    if !crate::automations::archive::native_descriptor_matches(&current_owner, requested) {
+        return Err(error("The pending archive attachment changed its exact native descriptor"));
+    }
+    let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The pending archive snapshot is unavailable"))?;
+    if snapshot.session_id != issued.launch.session_id || snapshot.native_continuity != issued.native_continuity {
+        return Err(unavailable("The pending archive conversation changed during hydration"));
+    }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    validate_proof(requested.proof.as_ref(), state.proof())?;
+    let record = state.chats.get_mut(&requested.id)
+        .filter(|record| record.handle.same_actor(&handle) && !record.handle.is_completed())
+        .filter(|record| crate::automations::archive::native_descriptor_matches(agent, &record.session))
+        .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id && record.handle.native_continuity() == issued.native_continuity)
+        .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
+    if let std::collections::btree_map::Entry::Vacant(entry) = record.subscribers.entry(client) {
+        entry.insert(false);
+        record.observations.insert(client, Observation { after_generation: record.handle.observe_next_update(), ..Default::default() });
+    }
+    Ok(ServerResponse::ChatAttached { session: issued, snapshot })
+}
+
 pub(in crate::host) fn executable_automation_sessions(
     request: &ClientRequest,
 ) -> Vec<crate::model::TerminalId> {
     match request {
         ClientRequest::ChatStart { session, .. }
-        | ClientRequest::ChatStartSelected { session, .. } => vec![session.id],
+        | ClientRequest::ChatStartSelected { session, .. }
+        | ClientRequest::ChatAttach { session } => vec![session.id],
         ClientRequest::ChatPrepareResume { source } => vec![source.id],
         ClientRequest::ChatRecoverAccount {
             source,
@@ -1990,6 +2057,13 @@ pub(super) fn process(
                     .is_archived_automation_session(id)
                     .map_err(unavailable)?
                 {
+                    // An external exact attach or command is re-admitted under
+                    // the owner gate below. Its reserved live path cannot enter
+                    // a start/restart fallback; completed archives still refuse.
+                    if client != super::agent_execution::EXECUTION_CLIENT && matches!(&request,
+                        ClientRequest::ChatAttach { .. } | ClientRequest::ChatCommand { .. }) {
+                        continue;
+                    }
                     return Err(error(
                         "Completed scheduled conversations are saved read-only. Open their saved view or create a distinct new conversation.",
                     ));

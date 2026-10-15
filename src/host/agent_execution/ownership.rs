@@ -25,7 +25,8 @@ pub(in crate::host) fn interactive(
             !matches!(command, Command::Refresh | Command::LoadEarlier),
         ),
         ClientRequest::ChatStart { session, .. }
-        | ClientRequest::ChatStartSelected { session, .. } => (session.id, false),
+        | ClientRequest::ChatStartSelected { session, .. }
+        | ClientRequest::ChatAttach { session } => (session.id, false),
         ClientRequest::ChatPrepareResume { source }
         | ClientRequest::ChatRecoverAccount { source, .. } => (source.id, false),
         ClientRequest::ChatReturnTerminal { chat_id } => (*chat_id, true),
@@ -71,21 +72,39 @@ pub(in crate::host) fn interactive(
         .iter()
         .map(|gate| gate.lock().unwrap_or_else(|p| p.into_inner()))
         .collect::<Vec<_>>();
-    {
+    let reserved = {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        let mut reserved = Vec::new();
         for session in executable {
-            if registry
-                .is_archived_automation_session(session)
-                .map_err(unavailable)?
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::InvalidRequest,
-                    "Completed scheduled conversations are saved read-only. Open their saved view or create a distinct new conversation.",
-                    false,
-                ));
+            if registry.is_archived_automation_session(session).map_err(unavailable)? {
+                reserved.push(registry.agent_for_session(session).map_err(unavailable)?
+                    .ok_or_else(|| unavailable("The pending archive owner is unavailable".into()))?);
             }
         }
+        reserved
+    };
+    for owner in reserved {
+        if !owner.closed {
+            match &request {
+                ClientRequest::ChatAttach { session } if owner.session.as_ref().is_some_and(|issued| issued.id() == session.id) => {
+                    return super::super::chat::attach_reserved_automation_actor(host,client,&owner,session);
+                }
+                ClientRequest::ChatCommand { chat_id, .. } if owner.session.as_ref().is_some_and(|issued| issued.id() == *chat_id) => {
+                    super::super::chat::reserved_automation_actor(host,client,&owner,true)?;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            "Completed scheduled conversations are saved read-only. Open their saved view or create a distinct new conversation.",
+            false,
+        ));
     }
+    // The pre-gate lookup selected locks, not mutable control authority.
+    let agent = registry.lock().unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(id).map_err(unavailable)?;
     if claims {
         let Some(agent) = agent else {
             return apply(request);
