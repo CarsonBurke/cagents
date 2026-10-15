@@ -1484,7 +1484,7 @@ impl Cagents {
                         for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
                         if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.clone())); }
                         self.feature_failure(publication.operation.card, error);
-                        return Task::batch([self.save_after_feature(&publication.operation), self.finish_editor_publication_saves(), self.resume_waiting_editor_closes(), self.modal_restore_focus(self.modal_restore_fallback())]);
+                        return Task::batch([self.save_after_feature(&publication.operation), self.finish_editor_publication_saves(), self.resume_waiting_editor_closes(), self.complete_closed_projects(), self.modal_restore_focus(self.modal_restore_fallback())]);
                     }
                     Ok(report) => report,
                 };
@@ -1514,6 +1514,7 @@ impl Cagents {
                 }
                 tasks.push(self.finish_editor_publication_saves());
                 tasks.push(self.resume_waiting_editor_closes());
+                tasks.push(self.complete_closed_projects());
                 tasks.push(self.modal_restore_focus(self.modal_restore_fallback()));
                 Task::batch(tasks)
             }
