@@ -3,6 +3,7 @@
 //! The daemon owns delivery and the durable journal. Windows report focus and
 //! acknowledge attention; they do not each send a desktop notification.
 
+pub mod presentation;
 pub mod review;
 #[cfg(feature = "ui")]
 pub mod ui;
