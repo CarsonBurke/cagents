@@ -206,6 +206,14 @@ The `settings_general`, `settings_appearance`, `settings_terminal`,
 `settings_accounts`, `settings_notifications`, and `settings_about` commands
 open the corresponding Settings section. These commands also start unbound.
 
+Native code-buffer actions are separately configurable as
+`keyboard_shortcuts.editor_undo` (`Ctrl+Z`), `editor_redo` (`Ctrl+Shift+Z`,
+`Ctrl+Y`), `editor_cut` (`Ctrl+X`), `editor_copy` (`Ctrl+C`), `editor_paste`
+(`Ctrl+V`) and `editor_select_all` (`Ctrl+A`). These bindings apply only to the
+editable code buffer. Other text fields and terminal programs retain their own
+editing keys. Rebinding or clearing an editor action also replaces its original
+code-buffer chord; menu hints follow the current binding.
+
 
 Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.
@@ -216,7 +224,9 @@ modifiers, joined by `+`. Names are case-insensitive.
 - Keys: `A`-`Z`, `0`-`9`, `Left`, `Right`, `Up`, `Down`, `Tab`, `PageUp`, or
   `PageDown`, punctuation, or `F1`–`F12`. Use `Comma` and `Plus` for separator
   keys, for example `Ctrl+Comma`.
-- No chord can appear twice, even under different actions.
+- Actions that can run in the same context cannot share a chord. Native editor
+  editing actions can share an editing chord with an action that only runs
+  outside text controls; Redo and Reopen pane share `Ctrl+Shift+Z` this way.
 - Terminal interception follows the action's **Send to terminal** policy in
   Keyboard settings. `terminal_passthrough_actions` stores serialized action
   names whose chords reach the focused terminal. Its defaults include
@@ -436,11 +446,3 @@ The command registry also exposes `keyboard_shortcuts.mark_all_read` and
 `keyboard_shortcuts.search_in_project` (`Ctrl+Alt+F`). `focus_last_pane`
 uses `Alt+0`; `next_attention` and `previous_attention` follow the configured
 attention navigation bindings. All of these appear in Keyboard settings.
-
-Native code-buffer actions are separately configurable as
-`keyboard_shortcuts.editor_undo` (`Ctrl+Z`), `editor_redo` (`Ctrl+Shift+Z`,
-`Ctrl+Y`), `editor_cut` (`Ctrl+X`), `editor_copy` (`Ctrl+C`), `editor_paste`
-(`Ctrl+V`) and `editor_select_all` (`Ctrl+A`). These bindings apply only to the
-editable code buffer. Other text fields and terminal programs retain their own
-editing keys. Rebinding or clearing an editor action also replaces its original
-code-buffer chord; menu hints follow the current binding.
