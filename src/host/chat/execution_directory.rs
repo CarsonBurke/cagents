@@ -21,15 +21,37 @@ pub(super) fn prepare(
     issued: &Launch,
     supplied: Option<Arc<ExecutionContext>>,
 ) -> Result<Prepared, ProtocolError> {
+    prepare_at(issued, supplied, None)
+}
+
+/// An approved handoff may execute in a relocated inode while preserving the
+/// entire issued recipe. The caller retains this same pin before teardown;
+/// supplying a path by itself never authorizes reopening another directory.
+pub(super) fn prepare_at(
+    issued: &Launch,
+    supplied: Option<Arc<ExecutionContext>>,
+    operational_directory: Option<&std::path::Path>,
+) -> Result<Prepared, ProtocolError> {
     let mut launch = issued.clone();
+    if operational_directory.is_some() && supplied.is_none() {
+        return Err(unavailable(
+            "A relocated provider launch requires its original approved directory descriptor",
+        ));
+    }
     if launch.needs_read_only_history() {
+        if operational_directory.is_some() {
+            return Err(error("Read-only history cannot consume an execution-directory handoff"));
+        }
         return Ok(Prepared {
             launch,
             context: supplied,
             preparation_error: None,
         });
     }
-    let physical = match launch.recipe.working_directory.canonicalize() {
+    let physical = match operational_directory
+        .unwrap_or(&launch.recipe.working_directory)
+        .canonicalize()
+    {
         Ok(path) => path,
         Err(error) => {
             return Ok(Prepared {
@@ -216,5 +238,31 @@ mod tests {
         std::fs::rename(&path, root.path().join("old")).unwrap();
         std::fs::create_dir(&path).unwrap();
         assert!(context.provider_directory_observed(&path).is_err());
+    }
+
+    #[test]
+    fn relocated_preparation_reuses_the_pre_teardown_pin_without_reopening_issued_path() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let issued_path = root.path().join("issued");
+        let moved = root.path().join("located");
+        let other = root.path().join("unrelated");
+        std::fs::create_dir(&issued_path).unwrap();
+        std::fs::create_dir(&other).unwrap();
+        let mut issued = launch(issued_path.clone());
+        issued.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let before = issued.clone();
+        let context = Arc::new(ExecutionContext::capture(&issued_path).unwrap());
+        std::fs::rename(&issued_path, &moved).unwrap();
+        let prepared = prepare_at(&issued, Some(context.clone()), Some(&moved)).unwrap();
+        assert_eq!(issued, before, "private execution does not rewrite the issued identity");
+        assert_eq!(prepared.launch.recipe.working_directory, moved);
+        assert!(Arc::ptr_eq(prepared.context.as_ref().unwrap(), &context));
+        assert!(!issued_path.exists());
+        assert!(!context.provider_directory_observed(&moved).unwrap(), "a physical pin alone does not claim resumed-tool scope");
+        assert!(prepare_at(&issued, Some(context.clone()), Some(&other)).is_err());
+        assert!(prepare_at(&issued, None, Some(&moved)).is_err());
+        std::fs::rename(&moved, root.path().join("moved-again")).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        assert!(prepare_at(&issued, Some(context), Some(&moved)).is_err(), "a replacement clone must not consume the captured handoff");
     }
 }
