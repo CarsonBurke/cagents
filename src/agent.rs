@@ -47,6 +47,15 @@ pub enum ActivityOutcome {
 }
 
 impl ActivityOutcome {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Succeeded => "Succeeded",
+            Self::Cancelled => "Cancelled",
+            Self::Failed { .. } => "Failed",
+            Self::Interrupted { .. } => "Interrupted",
+        }
+    }
+
     pub fn reason(&self) -> Option<&str> {
         match self {
             Self::Failed { reason } | Self::Interrupted { reason } => Some(reason),
