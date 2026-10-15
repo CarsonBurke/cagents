@@ -4,7 +4,10 @@
 //! Only a completed drop reaches the application; pointer motion never mutates
 //! its order or clones its editor/terminal state.
 
-use crate::{design, model::{CardId, ChannelId}};
+use crate::{
+    design,
+    model::{CardId, ChannelId},
+};
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
@@ -70,28 +73,48 @@ pub fn strip<'a, Message: 'a>(
 
 /// A sidebar channel can receive an existing pane without becoming a drag source.
 pub fn channel_target<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>, channel: ChannelId, enabled: bool,
+    content: impl Into<Element<'a, Message>>,
+    channel: ChannelId,
+    enabled: bool,
 ) -> Element<'a, Message> {
-    Element::new(Reorder { content: content.into(), kind: Kind::ChannelTarget { channel, enabled } })
+    Element::new(Reorder {
+        content: content.into(),
+        kind: Kind::ChannelTarget { channel, enabled },
+    })
 }
 
 /// Observe tab drags across the entire native surface, keeping ordinary strip
 /// reordering local until a valid channel actually receives the release.
 pub fn channel_scope<'a, Message: 'a>(
-    content: impl Into<Element<'a, Message>>, source_strip: Id, generation: u64, enabled: bool,
+    content: impl Into<Element<'a, Message>>,
+    source_strip: Id,
+    generation: u64,
+    enabled: bool,
     allowed: impl Fn(CardId, ChannelId) -> bool + 'a,
     dropped: impl Fn(CardId, ChannelId) -> Message + 'a,
 ) -> Element<'a, Message> {
-    Element::new(Reorder { content: content.into(), kind: Kind::ChannelScope {
-        source_strip, generation, enabled, allowed: Box::new(allowed), dropped: Box::new(dropped),
-    } })
+    Element::new(Reorder {
+        content: content.into(),
+        kind: Kind::ChannelScope {
+            source_strip,
+            generation,
+            enabled,
+            allowed: Box::new(allowed),
+            dropped: Box::new(dropped),
+        },
+    })
 }
 
 enum Kind<'a, Message> {
     Handle(CardId),
-    ChannelTarget { channel: ChannelId, enabled: bool },
+    ChannelTarget {
+        channel: ChannelId,
+        enabled: bool,
+    },
     ChannelScope {
-        source_strip: Id, generation: u64, enabled: bool,
+        source_strip: Id,
+        generation: u64,
+        enabled: bool,
         allowed: Box<dyn Fn(CardId, ChannelId) -> bool + 'a>,
         dropped: Box<dyn Fn(CardId, ChannelId) -> Message + 'a>,
     },
@@ -116,8 +139,17 @@ struct State {
     channel_drag: Option<ChannelDrag>,
     channel_targeted: bool,
 }
-struct ChannelDrag { source: CardId, origin: Point, generation: u64, moved: bool }
-struct ChannelTarget { channel: ChannelId, enabled: bool, highlighted: bool }
+struct ChannelDrag {
+    source: CardId,
+    origin: Point,
+    generation: u64,
+    moved: bool,
+}
+struct ChannelTarget {
+    channel: ChannelId,
+    enabled: bool,
+    highlighted: bool,
+}
 struct WindowHandle(CardId);
 struct ChannelDropBlocker;
 
@@ -127,29 +159,56 @@ pub(crate) fn block_channel_drop(operation: &mut dyn Operation, bounds: Rectangl
 }
 
 struct ChannelHit {
-    point: Point, source_strip: Id, strip_bounds: Option<Rectangle>,
-    source: Option<CardId>, target: Option<ChannelId>,
-    target_viewport: Option<Rectangle>, blocked: bool,
+    point: Point,
+    source_strip: Id,
+    strip_bounds: Option<Rectangle>,
+    source: Option<CardId>,
+    target: Option<ChannelId>,
+    target_viewport: Option<Rectangle>,
+    blocked: bool,
 }
 impl Operation for ChannelHit {
-    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-    fn scrollable(&mut self, id: Option<&Id>, bounds: Rectangle, _: Rectangle, _: Vector,
-        _: &mut dyn cosmic::iced::advanced::widget::operation::Scrollable) {
-        if id == Some(&self.source_strip) { self.strip_bounds = Some(bounds); }
-        if id == Some(&Id::new("sidebar.projects.scroll")) { self.target_viewport = Some(bounds); }
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
+    fn scrollable(
+        &mut self,
+        id: Option<&Id>,
+        bounds: Rectangle,
+        _: Rectangle,
+        _: Vector,
+        _: &mut dyn cosmic::iced::advanced::widget::operation::Scrollable,
+    ) {
+        if id == Some(&self.source_strip) {
+            self.strip_bounds = Some(bounds);
+        }
+        if id == Some(&Id::new("sidebar.projects.scroll")) {
+            self.target_viewport = Some(bounds);
+        }
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if !bounds.contains(self.point) { return; }
-        if let Some(handle) = state.downcast_ref::<WindowHandle>() { self.source = Some(handle.0); }
-        if state.is::<ChannelDropBlocker>() { self.blocked = true; }
-        if let Some(target) = state.downcast_ref::<ChannelTarget>().filter(|target| target.enabled) {
+        if !bounds.contains(self.point) {
+            return;
+        }
+        if let Some(handle) = state.downcast_ref::<WindowHandle>() {
+            self.source = Some(handle.0);
+        }
+        if state.is::<ChannelDropBlocker>() {
+            self.blocked = true;
+        }
+        if let Some(target) = state
+            .downcast_ref::<ChannelTarget>()
+            .filter(|target| target.enabled)
+        {
             self.target = Some(target.channel);
         }
     }
 }
 struct HighlightChannel(Option<ChannelId>);
 impl Operation for HighlightChannel {
-    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+    fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+        visit(self);
+    }
     fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
         if let Some(target) = state.downcast_mut::<ChannelTarget>() {
             target.highlighted = target.enabled && self.0 == Some(target.channel);
@@ -236,11 +295,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
     ) {
         if let Kind::Handle(id) = self.kind {
             operation.custom(None, layout.bounds(), &mut Handle(id));
-            operation.custom(None, layout.bounds() - layout.virtual_offset(), &mut WindowHandle(id));
+            operation.custom(
+                None,
+                layout.bounds() - layout.virtual_offset(),
+                &mut WindowHandle(id),
+            );
         }
         if let Kind::ChannelTarget { channel, enabled } = self.kind {
             let state = tree.state.downcast_mut::<State>();
-            let mut target = ChannelTarget { channel, enabled, highlighted: state.channel_targeted };
+            let mut target = ChannelTarget {
+                channel,
+                enabled,
+                highlighted: state.channel_targeted,
+            };
             operation.custom(None, layout.bounds() - layout.virtual_offset(), &mut target);
             state.channel_targeted = target.highlighted;
         }
@@ -259,50 +326,118 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Kind::ChannelScope { source_strip, generation, enabled, allowed, dropped } = &self.kind {
+        if let Kind::ChannelScope {
+            source_strip,
+            generation,
+            enabled,
+            allowed,
+            dropped,
+        } = &self.kind
+        {
             let mut drag = tree.state.downcast_mut::<State>().channel_drag.take();
             let was_dragging = drag.is_some();
-            let cancel = !enabled || drag.as_ref().is_some_and(|drag| drag.generation != *generation)
+            let cancel = !enabled
+                || drag
+                    .as_ref()
+                    .is_some_and(|drag| drag.generation != *generation)
                 || matches!(event, Event::Window(window::Event::Unfocused))
-                || matches!(event, Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Escape), .. }));
-            if cancel { drag = None; }
-            let observe = drag.is_some() || (*enabled && matches!(event,
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))));
-            let mut hit = observe.then(|| cursor.position()).flatten().map(|point| ChannelHit {
-                point, source_strip: source_strip.clone(), strip_bounds: None, source: None, target: None,
-                target_viewport: None, blocked: false,
-            });
-            if let Some(hit) = hit.as_mut() {
-                self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer, hit);
+                || matches!(
+                    event,
+                    Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                        ..
+                    })
+                );
+            if cancel {
+                drag = None;
             }
-            if *enabled && !shell.is_event_captured()
-                && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)))
+            let observe = drag.is_some()
+                || (*enabled
+                    && matches!(
+                        event,
+                        Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                    ));
+            let mut hit = observe
+                .then(|| cursor.position())
+                .flatten()
+                .map(|point| ChannelHit {
+                    point,
+                    source_strip: source_strip.clone(),
+                    strip_bounds: None,
+                    source: None,
+                    target: None,
+                    target_viewport: None,
+                    blocked: false,
+                });
+            if let Some(hit) = hit.as_mut() {
+                self.content
+                    .as_widget_mut()
+                    .operate(&mut tree.children[0], layout, renderer, hit);
+            }
+            if *enabled
+                && !shell.is_event_captured()
+                && matches!(
+                    event,
+                    Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                )
                 && let Some(hit) = hit.as_ref()
-                && hit.strip_bounds.is_some_and(|bounds| bounds.contains(hit.point))
+                && hit
+                    .strip_bounds
+                    .is_some_and(|bounds| bounds.contains(hit.point))
                 && let Some(source) = hit.source
             {
-                drag = Some(ChannelDrag { source, origin: hit.point, generation: *generation, moved: false });
+                drag = Some(ChannelDrag {
+                    source,
+                    origin: hit.point,
+                    generation: *generation,
+                    moved: false,
+                });
             }
             if let (Some(drag), Some(hit)) = (drag.as_mut(), hit.as_ref()) {
                 drag.moved |= drag.origin.distance(hit.point) >= THRESHOLD;
             }
             let destination = drag.as_ref().filter(|drag| drag.moved).and_then(|drag| {
-                hit.as_ref().filter(|hit| !hit.blocked && hit.target_viewport.is_none_or(|bounds| bounds.contains(hit.point)))
-                    .and_then(|hit| hit.target).filter(|channel| allowed(drag.source, *channel))
+                hit.as_ref()
+                    .filter(|hit| {
+                        !hit.blocked
+                            && hit
+                                .target_viewport
+                                .is_none_or(|bounds| bounds.contains(hit.point))
+                    })
+                    .and_then(|hit| hit.target)
+                    .filter(|channel| allowed(drag.source, *channel))
             });
             if drag.is_some() || was_dragging {
-                self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer,
-                    &mut HighlightChannel(destination));
+                self.content.as_widget_mut().operate(
+                    &mut tree.children[0],
+                    layout,
+                    renderer,
+                    &mut HighlightChannel(destination),
+                );
             }
-            if matches!(event, Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))) {
+            if matches!(
+                event,
+                Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
+            ) {
                 if let Some((drag, channel)) = drag.take().zip(destination) {
                     // Cancel the source strip's held press before dispatching
                     // the transfer; no adjacent tab or close button may fire.
-                    self.content.as_widget_mut().update(&mut tree.children[0], event, layout,
-                        mouse::Cursor::Unavailable, renderer, clipboard, shell, viewport);
-                    self.content.as_widget_mut().operate(&mut tree.children[0], layout, renderer,
-                        &mut HighlightChannel(None));
+                    self.content.as_widget_mut().update(
+                        &mut tree.children[0],
+                        event,
+                        layout,
+                        mouse::Cursor::Unavailable,
+                        renderer,
+                        clipboard,
+                        shell,
+                        viewport,
+                    );
+                    self.content.as_widget_mut().operate(
+                        &mut tree.children[0],
+                        layout,
+                        renderer,
+                        &mut HighlightChannel(None),
+                    );
                     shell.publish(dropped(drag.source, channel));
                     shell.capture_event();
                     shell.request_redraw();
@@ -310,9 +445,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
                 }
                 drag = None;
             }
-            if ((drag.is_some() || was_dragging) && matches!(event, Event::Mouse(
-                mouse::Event::CursorMoved { .. } | mouse::Event::ButtonPressed(_) | mouse::Event::ButtonReleased(_))))
-                || (cancel && was_dragging) { shell.request_redraw(); }
+            if ((drag.is_some() || was_dragging)
+                && matches!(
+                    event,
+                    Event::Mouse(
+                        mouse::Event::CursorMoved { .. }
+                            | mouse::Event::ButtonPressed(_)
+                            | mouse::Event::ButtonReleased(_)
+                    )
+                ))
+                || (cancel && was_dragging)
+            {
+                shell.request_redraw();
+            }
             tree.state.downcast_mut::<State>().channel_drag = drag;
         }
         if let Kind::Strip {
@@ -471,7 +616,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        if tree.state.downcast_ref::<State>().channel_drag.as_ref().is_some_and(|drag| drag.moved) {
+        if tree
+            .state
+            .downcast_ref::<State>()
+            .channel_drag
+            .as_ref()
+            .is_some_and(|drag| drag.moved)
+        {
             return mouse::Interaction::Grabbing;
         }
         if tree
@@ -514,9 +665,18 @@ impl<Message> Widget<Message, Theme, Renderer> for Reorder<'_, Message> {
             && tree.state.downcast_ref::<State>().channel_targeted
             && let Some(bounds) = layout.bounds().intersection(viewport)
         {
-            renderer.fill_quad(renderer::Quad { bounds, border: cosmic::iced::Border {
-                color: design::accent_color(theme), width: 1.0, radius: 4.0.into(),
-            }, ..Default::default() }, design::accent_color(theme).scale_alpha(0.12));
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds,
+                    border: cosmic::iced::Border {
+                        color: design::accent_color(theme),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                },
+                design::accent_color(theme).scale_alpha(0.12),
+            );
         }
         if let Kind::Strip { items, .. } = &self.kind
             && let Some(drag) = tree
@@ -770,19 +930,44 @@ mod tests {
             let ids = [CardId::new(), CardId::new(), CardId::new(), CardId::new()];
             let channel = ChannelId::new();
             let mut surface = Surface::new(&ids, false);
-            let target = channel_target(widget::button::custom(widget::Space::new())
-                .width(120).height(30).on_press(Action::Select(ids[1])), channel, true);
-            surface.element = channel_scope(widget::row::with_children(vec![target, tabs(&ids, false)]),
-                widget::Id::new("reorder.test"), 1, true, move |_, _| allowed, Action::Move);
+            let target = channel_target(
+                widget::button::custom(widget::Space::new())
+                    .width(120)
+                    .height(30)
+                    .on_press(Action::Select(ids[1])),
+                channel,
+                true,
+            );
+            surface.element = channel_scope(
+                widget::row::with_children(vec![target, tabs(&ids, false)]),
+                widget::Id::new("reorder.test"),
+                1,
+                true,
+                move |_, _| allowed,
+                Action::Move,
+            );
             surface.tree = Tree::new(surface.element.as_widget());
-            surface.node = surface.element.as_widget_mut().layout(&mut surface.tree, &surface.renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)));
+            surface.node = surface.element.as_widget_mut().layout(
+                &mut surface.tree,
+                &surface.renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)),
+            );
             surface.scroll(scroll);
             assert!(surface.press(130.0).is_empty());
             assert!(surface.moved(20.0).is_empty());
             let moved = if scroll > 0.0 { ids[1] } else { ids[0] };
-            assert_eq!(surface.release(20.0), if allowed { vec![Action::Move(moved, channel)] } else { vec![] });
-            assert!(surface.release(130.0).is_empty(), "the original held tab press was cancelled");
+            assert_eq!(
+                surface.release(20.0),
+                if allowed {
+                    vec![Action::Move(moved, channel)]
+                } else {
+                    vec![]
+                }
+            );
+            assert!(
+                surface.release(130.0).is_empty(),
+                "the original held tab press was cancelled"
+            );
         }
     }
 
@@ -791,23 +976,44 @@ mod tests {
         let ids = [CardId::new(), CardId::new()];
         let channel = ChannelId::new();
         let make = |generation| {
-            let target = channel_target(widget::button::custom(widget::Space::new())
-                .width(120).height(30).on_press(Action::Select(ids[1])), channel, true);
-            channel_scope(widget::row::with_children(vec![target, tabs(&ids, false)]),
-                widget::Id::new("reorder.test"), generation, true, |_, _| true, Action::Move)
+            let target = channel_target(
+                widget::button::custom(widget::Space::new())
+                    .width(120)
+                    .height(30)
+                    .on_press(Action::Select(ids[1])),
+                channel,
+                true,
+            );
+            channel_scope(
+                widget::row::with_children(vec![target, tabs(&ids, false)]),
+                widget::Id::new("reorder.test"),
+                generation,
+                true,
+                |_, _| true,
+                Action::Move,
+            )
         };
         let mut surface = Surface::new(&ids, false);
         surface.element = make(1);
         surface.tree = Tree::new(surface.element.as_widget());
-        surface.node = surface.element.as_widget_mut().layout(&mut surface.tree, &surface.renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)));
+        surface.node = surface.element.as_widget_mut().layout(
+            &mut surface.tree,
+            &surface.renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)),
+        );
         assert!(surface.press(130.0).is_empty());
         assert!(surface.moved(20.0).is_empty());
         surface.element = make(2);
         surface.tree.diff(surface.element.as_widget_mut());
-        surface.node = surface.element.as_widget_mut().layout(&mut surface.tree, &surface.renderer,
-            &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)));
-        assert!(surface.release(20.0).is_empty(), "a stale drag must never move the prior workspace's pane");
+        surface.node = surface.element.as_widget_mut().layout(
+            &mut surface.tree,
+            &surface.renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(280.0, 30.0)),
+        );
+        assert!(
+            surface.release(20.0).is_empty(),
+            "a stale drag must never move the prior workspace's pane"
+        );
     }
 
     #[test]

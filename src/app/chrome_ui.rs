@@ -754,10 +754,18 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
-            PaneMenuCommand::MoveTo(channel) => return Message::MovePaneToChannel { card: id, channel },
-            PaneMenuCommand::MoveToChannel => return Message::Palette(palette_ui::Action::MovePane(id)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
+            PaneMenuCommand::MoveTo(channel) => {
+                return Message::MovePaneToChannel { card: id, channel };
+            }
+            PaneMenuCommand::MoveToChannel => {
+                return Message::Palette(palette_ui::Action::MovePane(id));
+            }
         })
     }
 }

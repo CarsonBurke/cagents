@@ -5658,19 +5658,23 @@ fn channel_view(
         channel.delete_id.clone(),
         compact,
     );
-    crate::reorder::channel_target(grid.mount(with_deletion_retry(
-        channel_context_controls(action, channel.id, inert, selection_count),
-        deletion,
-        compact,
-        &channel.title,
-        gated(
-            SidebarAction::RetryChannelDeletion {
-                channel_id: channel.id,
-            },
-            modal_open,
-        ),
-        entity_id("channel.retry-delete", channel.id),
-    )), channel.id, !inert)
+    crate::reorder::channel_target(
+        grid.mount(with_deletion_retry(
+            channel_context_controls(action, channel.id, inert, selection_count),
+            deletion,
+            compact,
+            &channel.title,
+            gated(
+                SidebarAction::RetryChannelDeletion {
+                    channel_id: channel.id,
+                },
+                modal_open,
+            ),
+            entity_id("channel.retry-delete", channel.id),
+        )),
+        channel.id,
+        !inert,
+    )
 }
 
 /// Keep the row's primary button and its destructive quick action separate.
@@ -10414,9 +10418,13 @@ mod row_interaction {
                     .set(layout.bounds().y + layout.virtual_offset().y);
             }
             if matches!(self.kind, Kind::Group { .. })
-                && let Some(header) = child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout).next()
+                && let Some(header) =
+                    child_layouts(&self.kind, tree.state.downcast_ref::<State>(), layout).next()
             {
-                crate::reorder::block_channel_drop(operation, header.bounds() - header.virtual_offset());
+                crate::reorder::block_channel_drop(
+                    operation,
+                    header.bounds() - header.virtual_offset(),
+                );
             }
             operation.container(None, layout.bounds());
             operation.traverse(&mut |operation| {

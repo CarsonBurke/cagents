@@ -274,14 +274,28 @@ impl Cagents {
     }
 
     fn pane_move_palette_entries(&self, card: CardId) -> Vec<(String, String, Message)> {
-        self.pane_move_destinations(card).into_iter().map(|channel| (
-            format!("Move pane to channel: {}", self.pane_move_destination_label(channel)),
-            String::new(),
-            Message::MovePaneToChannel { card, channel: channel.id },
-        )).collect()
+        self.pane_move_destinations(card)
+            .into_iter()
+            .map(|channel| {
+                (
+                    format!(
+                        "Move pane to channel: {}",
+                        self.pane_move_destination_label(channel)
+                    ),
+                    String::new(),
+                    Message::MovePaneToChannel {
+                        card,
+                        channel: channel.id,
+                    },
+                )
+            })
+            .collect()
     }
 
-    fn filter_palette_entries(&self, mut entries: Vec<(String, String, Message)>) -> Vec<(String, String, Message)> {
+    fn filter_palette_entries(
+        &self,
+        mut entries: Vec<(String, String, Message)>,
+    ) -> Vec<(String, String, Message)> {
         let query = self
             .palette
             .query
@@ -311,12 +325,16 @@ impl Cagents {
             );
         }
         let query = self.palette.query.as_ref()?;
-        let input =
-            crate::ui_controls::field::search(if self.palette.move_pane.is_some() {
+        let input = crate::ui_controls::field::search(
+            if self.palette.move_pane.is_some() {
                 "Move pane to channel…"
-            } else { "Search commands, panes and workspaces" }, query)
-                .id(widget::Id::new("palette.query"))
-                .on_input(|query| Message::Palette(Action::Query(query)));
+            } else {
+                "Search commands, panes and workspaces"
+            },
+            query,
+        )
+        .id(widget::Id::new("palette.query"))
+        .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
@@ -341,9 +359,14 @@ impl Cagents {
             })
             .collect();
         let rows = if rows.is_empty() {
-            widget::column::with_children(vec![design::caption(if self.palette.move_pane.is_some() {
-                "No matching channels"
-            } else { "No matching commands" }).into()])
+            widget::column::with_children(vec![
+                design::caption(if self.palette.move_pane.is_some() {
+                    "No matching channels"
+                } else {
+                    "No matching commands"
+                })
+                .into(),
+            ])
         } else {
             widget::column::with_children(rows)
         };
