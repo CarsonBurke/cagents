@@ -813,6 +813,7 @@ mod tests {
             .try_iter()
             .filter_map(|command| match command {
                 super::super::handle::Command::Input(input) => Some(input),
+                super::super::handle::Command::OwnedKey(super::super::handle::OwnedKeyInput { input, .. }) => Some(input),
                 _ => None,
             })
             .collect()

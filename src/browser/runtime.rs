@@ -21,7 +21,7 @@ use super::{
     BrowserRestoreState, DelegateRequest, DelegateRequestId, InputMethodState, PhysicalViewport,
     SurfacePlacement,
     fallback::{FallbackSurface, WaylandSubsurfaceFactory},
-    handle::{CoalescedCommands, Command, CommandMailbox, EventBus},
+    handle::{CoalescedCommands, Command, CommandMailbox, EventBus, OwnedKeyInput},
     input,
     lifecycle::LifecycleMachine,
 };
@@ -607,6 +607,7 @@ impl Card {
             Command::Hibernate => self.hibernate(),
             Command::Restore => return self.restore_resources(),
             Command::Input(event) => self.forward_input(event),
+            Command::OwnedKey(key) => self.forward_owned_key(key),
             Command::ClipboardText { id, result } => {
                 if let Some(request) = self
                     .session
@@ -729,6 +730,23 @@ impl Card {
         if !self.visible || self.session.is_none() {
             return;
         }
+        self.deliver_input(event);
+    }
+
+    fn forward_owned_key(&mut self, key: OwnedKeyInput) {
+        if self.session.is_none() {
+            return;
+        }
+        let Some(input) = self.mailbox.take_current_key_input(key) else {
+            return;
+        };
+        // Native focus admitted this down/up before blur. Coalesced visibility
+        // may overtake the FIFO, but both keys still belong to this live
+        // session. A destroyed/recreated session has a different generation.
+        self.deliver_input(input);
+    }
+
+    fn deliver_input(&mut self, event: BrowserInput) {
         let session = self.session.as_ref().expect("session checked");
         let id = session
             .webview
@@ -821,6 +839,7 @@ impl Card {
             return;
         }
         self.session = Some(session);
+        self.mailbox.begin_key_session();
         let _ = self.lifecycle.resources_created(self.visible);
         self.events.semantic(BrowserEvent::Ready {
             backend: BackendSelection {
@@ -857,6 +876,7 @@ impl Card {
     }
 
     fn destroy_session(&mut self) {
+        self.mailbox.end_key_session();
         if let Some(session) = self.session.take() {
             session.store_navigation(&mut self.restore);
             session.shutdown();
@@ -1476,6 +1496,48 @@ mod tests {
             closed: false,
         };
         (card, teardown_done)
+    }
+
+    #[test]
+    fn coalesced_hide_keeps_same_session_fifo_keys_and_retirement_rejects_them() {
+        use super::super::{ButtonState, input::iced_key};
+        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        // No compositor/Servo is involved: exercise the exact generation
+        // selector used by forward_owned_key after a session-presence check.
+        let mut card = sessionless_card(true);
+        card.mailbox.begin_key_session();
+        let physical = Physical::Code(Code::KeyA);
+        let key = keyboard::Key::Character("a".into());
+        let input = |state| iced_key(state, &key, physical,
+            keyboard::Location::Standard, keyboard::Modifiers::empty(), false, false);
+        // Metadata may already have a wake before down was admitted. Hiding
+        // can then overtake down/up without retiring their original session.
+        card.mailbox.update_coalesced(|state| state.presented = Some(false)).unwrap();
+        card.mailbox.press_key(physical, input(ButtonState::Pressed),
+            input(ButtonState::Released)).unwrap();
+        card.mailbox.release_pressed_keys();
+        let mut observed = Vec::new();
+        while let Ok(command) = card.mailbox.receiver().try_recv() {
+            card.mailbox.refill_after_receive();
+            match command {
+                Command::WakeCoalesced => { card.apply_coalesced(card.mailbox.drain_coalesced()); }
+                Command::OwnedKey(key) => {
+                    assert!(!card.visible);
+                    if let Some(input) = card.mailbox.take_current_key_input(key) { observed.push(input); }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(observed, vec![input(ButtonState::Pressed), input(ButtonState::Released)]);
+        // destroy_session retires even if there is no compositor fixture, so
+        // queued old key events cannot become input to a future adoption.
+        card.mailbox.release_key(physical, input(ButtonState::Released)).unwrap();
+        card.mailbox.press_key(physical, input(ButtonState::Pressed),
+            input(ButtonState::Released)).unwrap();
+        let Command::OwnedKey(old_down) = card.mailbox.receiver().try_recv().unwrap() else { panic!() };
+        card.destroy_session();
+        card.mailbox.begin_key_session();
+        assert!(card.mailbox.take_current_key_input(old_down).is_none());
     }
 
     #[test]
