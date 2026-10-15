@@ -120,6 +120,7 @@ pub mod tray;
 pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
+#[cfg(any(feature = "ui", feature = "host"))]
 pub mod worktree_basis;
 pub mod worktree_branch;
 pub mod worktree_cleanup;
