@@ -172,7 +172,7 @@ impl RemoteActor {
         if source.launch.provider!=crate::agent::Provider::Claude || !matches!(spec.transport,TransportSpec::JsonLines) {return Err("Retained actors require the Claude stream-json transport".into());}
         spec.remove_unset_environment();
         let proof=source.proof.clone().ok_or("Retained actor launch lacks daemon ownership proof")?;
-        let directory=spec.execution.as_ref().and_then(|context|context.directory.clone());
+        let directory=spec.execution.as_ref().and_then(|context|context.directory_descriptor());
         let directory_fd=directory.as_ref().map(|file|file.as_raw_fd());
         let request=Startup {protocol:PROTOCOL,source:source.clone(),program:spec.program,arguments:spec.arguments,environment:spec.environment,working_directory:spec.working_directory,directory_fd,directory_identity:spec.execution.as_ref().map(|context|context.directory_identity()).transpose()?.flatten(),mailbox_key:spec.messages.as_ref().map(|seal|seal.export_private_key()),recovery_environment};
         let (control,remote)=UnixStream::pair().map_err(|error|error.to_string())?;

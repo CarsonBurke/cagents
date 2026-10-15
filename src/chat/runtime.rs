@@ -1523,7 +1523,7 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     if let Some(directory) = spec
         .execution
         .as_ref()
-        .and_then(|context| context.directory.clone())
+        .and_then(|context| context.directory_descriptor())
     {
         // SAFETY: fchdir is async-signal-safe; the captured File remains open
         // across fork until the provider execs.
@@ -2227,6 +2227,10 @@ impl Actor {
                         context.verify_directory(&directory)?;
                         if self.working_directory == directory { return Ok(()); }
                         self.adapter.relocate_directory(&directory)?;
+                        if let Err(error) = self.store.lock().unwrap_or_else(|p| p.into_inner()).relocate_file_directory(&directory) {
+                            let _ = self.adapter.relocate_directory(&self.working_directory);
+                            return Err(error);
+                        }
                         self.record_execution_directory(&directory);
                         self.working_directory = directory;
                         Ok(())
