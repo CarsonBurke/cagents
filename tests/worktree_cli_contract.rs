@@ -612,37 +612,82 @@ fn optional_agent_uses_new_worktree_and_waits_for_setup() {
 
 #[test]
 fn project_selector_refuses_distinct_path_and_name_but_preserves_explicit_paths() {
-    let fixture=Fixture::new();
-    let project=fixture.root.path().join("project");
-    let collision=project.join("collision");
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    let collision = project.join("collision");
     fs::create_dir(&collision).unwrap();
-    fixture.git(&collision,&["init","-q","-b","main"]);
-    fs::write(collision.join("selected"),"selected repository\n").unwrap();
-    fixture.git(&collision,&["add","selected"]);
-    fixture.git(&collision,&["commit","-qm","selected"]);
+    fixture.git(&collision, &["init", "-q", "-b", "main"]);
+    fs::write(collision.join("selected"), "selected repository\n").unwrap();
+    fixture.git(&collision, &["add", "selected"]);
+    fixture.git(&collision, &["commit", "-qm", "selected"]);
     fixture.project_name(Some("collision"));
-    let refused=fixture.output(&["worktree","create","ambiguous-project","--project","collision","--no-setup"]);
+    let refused = fixture.output(&[
+        "worktree",
+        "create",
+        "ambiguous-project",
+        "--project",
+        "collision",
+        "--no-setup",
+    ]);
     assert!(!refused.status.success());
-    let error:Value=serde_json::from_slice(&refused.stdout).unwrap();
-    let message=error["error"]["message"].as_str().unwrap();
-    assert!(message.contains("ambiguous"),"{error}");
-    assert!(message.contains(project.join(".git").to_str().unwrap()),"{error}");
-    assert!(message.contains(collision.join(".git").to_str().unwrap()),"{error}");
-    for repository in [&project,&collision] {
-        assert!(fixture.git(repository,&["branch","--list","ambiguous-project"]).trim().is_empty());
+    let error: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    let message = error["error"]["message"].as_str().unwrap();
+    assert!(message.contains("ambiguous"), "{error}");
+    assert!(
+        message.contains(project.join(".git").to_str().unwrap()),
+        "{error}"
+    );
+    assert!(
+        message.contains(collision.join(".git").to_str().unwrap()),
+        "{error}"
+    );
+    for repository in [&project, &collision] {
+        assert!(
+            fixture
+                .git(repository, &["branch", "--list", "ambiguous-project"])
+                .trim()
+                .is_empty()
+        );
     }
-    let selected=fixture.cli(&["worktree","create","path-choice","--project","./collision","--no-setup"]);
-    let selected_path=Path::new(selected["worktree"]["path"].as_str().unwrap());
-    assert_eq!(selected_path,collision.join("managed/path-choice"));
+    let selected = fixture.cli(&[
+        "worktree",
+        "create",
+        "path-choice",
+        "--project",
+        "./collision",
+        "--no-setup",
+    ]);
+    let selected_path = Path::new(selected["worktree"]["path"].as_str().unwrap());
+    assert_eq!(selected_path, collision.join("managed/path-choice"));
     assert!(selected_path.join("selected").is_file());
     assert!(!selected_path.join("tracked").exists());
-    let named=fixture.cli(&["worktree","create","name-choice","--project",project.to_str().unwrap(),"--no-setup"]);
-    assert_eq!(Path::new(named["worktree"]["path"].as_str().unwrap()),project.join("managed/name-choice"));
+    let named = fixture.cli(&[
+        "worktree",
+        "create",
+        "name-choice",
+        "--project",
+        project.to_str().unwrap(),
+        "--no-setup",
+    ]);
+    assert_eq!(
+        Path::new(named["worktree"]["path"].as_str().unwrap()),
+        project.join("managed/name-choice")
+    );
     // A relative directory inside the named repository is the same authority.
     fs::create_dir(project.join("same-project")).unwrap();
     fixture.project_name(Some("same-project"));
-    let same=fixture.cli(&["worktree","create","same-choice","--project","same-project","--no-setup"]);
-    assert_eq!(Path::new(same["worktree"]["path"].as_str().unwrap()),project.join("managed/same-choice"));
+    let same = fixture.cli(&[
+        "worktree",
+        "create",
+        "same-choice",
+        "--project",
+        "same-project",
+        "--no-setup",
+    ]);
+    assert_eq!(
+        Path::new(same["worktree"]["path"].as_str().unwrap()),
+        project.join("managed/same-choice")
+    );
 }
 
 #[test]

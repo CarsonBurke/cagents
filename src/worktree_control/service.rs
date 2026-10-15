@@ -383,16 +383,18 @@ pub(crate) fn execute(
                     },
                 })
             } else {
-                Ok(match delete_branch_checked_at(
-                    &repository,
-                    &branch,
-                    force,
-                    expected_oid.as_deref(),
-                    &cancellation,
-                ) {
-                    Ok(()) => Reply::BranchDeleted { branch },
-                    Err(failure) => Reply::BranchDeleteRefused { failure },
-                })
+                Ok(
+                    match delete_branch_checked_at(
+                        &repository,
+                        &branch,
+                        force,
+                        expected_oid.as_deref(),
+                        &cancellation,
+                    ) {
+                        Ok(()) => Reply::BranchDeleted { branch },
+                        Err(failure) => Reply::BranchDeleteRefused { failure },
+                    },
+                )
             }
         }
         Operation::Inspect { repository, path } => {

@@ -260,7 +260,6 @@ mod tests {
         assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
     }
 
-
     #[test]
     fn plain_folders_have_canonical_folder_identity() {
         let root = tempfile::tempdir().unwrap();

@@ -677,7 +677,10 @@ pub(super) fn process_request(
                     match started {
                         Ok(session) => setup.terminal = Some(session),
                         Err(error) => {
-                            warnings.push(format!("Worktree was created, but its setup terminal could not start: {}", error.message));
+                            warnings.push(format!(
+                                "Worktree was created, but its setup terminal could not start: {}",
+                                error.message
+                            ));
                             setup.error = Some(error.message);
                         }
                     }
