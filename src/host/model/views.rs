@@ -282,7 +282,7 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         let rows = statement.query_map([], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?;
-        let mut pinned = std::collections::BTreeSet::new();
+        let mut pinned = self.retention_pins()?;
         for row in rows {
             let panes: Vec<crate::workspace_model::views::Pane> = serde_json::from_str(
                 &row.map_err(|error| error.to_string())?).map_err(|error| error.to_string())?;

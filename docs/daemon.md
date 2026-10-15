@@ -493,7 +493,10 @@ A terminal is eligible for automatic retirement only after its worker confirms
 that all owned process work has completed. Once it has no attached client and
 no saved pane referencing it, the daemon retains its final result for ten
 minutes, then removes the inventory entry and releases its holder. Saved pane
-membership pins the result across closed windows; paired native conversations
+membership and the window's complete durable-card presence pin results across
+closed windows, including local panes outside shared projects. Those narrow
+pins survive daemon restart and are removed on explicit terminal close;
+paired native conversations
 and pending handoffs also preserve their terminal ownership. Explicitly closing
 a completed terminal removes it immediately, including finished sign-in panes.
 

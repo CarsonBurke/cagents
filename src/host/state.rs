@@ -1025,6 +1025,7 @@ impl HostState {
     pub(super) fn terminal_retention_deadline(
         &self, retention: Duration, pinned: &BTreeSet<TerminalId>,
     ) -> Option<Instant> {
+        if self.shutting_down || self.upgrade.is_some() { return None; }
         self.terminals.iter().filter(|(id, record)| {
             record.handle.is_completed()
                 && self.subscriptions.clients(**id).is_empty()
@@ -6815,6 +6816,18 @@ for line in sys.stdin:
         assert_eq!(state.terminal_retention_deadline(retention, &BTreeSet::new()), Some(now + retention));
         assert!(state.retire_expired_terminals(now + retention - Duration::from_nanos(1), retention, &BTreeSet::new()).is_empty());
         assert_eq!(state.retire_expired_terminals(now + retention, retention, &BTreeSet::new()).len(), 1);
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_suppresses_an_overdue_retention_deadline() {
+        let (mut state, _, handle) = completed_retention_fixture();
+        state.unregister_client(1);
+        let retention = Duration::from_secs(1);
+        assert!(state.terminal_retention_deadline(retention, &BTreeSet::new()).is_some());
+        state.shutting_down = true;
+        assert!(state.terminal_retention_deadline(retention, &BTreeSet::new()).is_none());
+        assert!(state.retire_expired_terminals(Instant::now(), retention, &BTreeSet::new()).is_empty());
         handle.shutdown().unwrap();
     }
 

@@ -341,6 +341,12 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     }
 }
 
+fn forget_retention_pin(host: &SharedHost, terminal: crate::model::TerminalId) {
+    let result = super::agent_execution::registry(host).and_then(|registry|
+        registry.lock().unwrap_or_else(|p| p.into_inner()).forget_retention_pin(terminal));
+    if let Err(error) = result { tracing::warn!(%error, %terminal, "Could not compact a closed terminal retention pin"); }
+}
+
 type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
 
 pub(super) fn process_request(
@@ -523,6 +529,17 @@ pub(super) fn process_request(
                     "Invalid notification window ownership",
                     false,
                 ));
+            }
+            if presence.application == crate::notifications::Application::Cagents && !presence.sessions.is_empty() {
+                // This includes saved local panes absent from shared_views. A
+                // disconnect is not a card close, so pins remain durable.
+                if let Ok(registry) = super::agent_execution::registry(host) {
+                    registry.lock().unwrap_or_else(|p| p.into_inner())
+                        .pin_window_terminals(&presence.sessions).map_err(|message|
+                            ProtocolError::new(ProtocolErrorCode::Internal, message, true))?;
+                }
+                // Without a model registry retention already fails closed;
+                // notification delivery can remain usable in that condition.
             }
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             // Watch and subsequent focus reports share the same live window
@@ -1077,6 +1094,7 @@ pub(super) fn process_request(
             let retired = host.lock().unwrap_or_else(|p| p.into_inner())
                 .retire_terminal_if_current(terminal_id, &handle);
             drop(retired);
+            forget_retention_pin(host, terminal_id);
             crate::daemon::wake();
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
@@ -1153,6 +1171,7 @@ pub(super) fn process_request(
                 handle.as_ref().and_then(|handle| state.retire_terminal_if_current(session.id, handle))
             };
             drop(retired); // Drop holder ownership outside the global host lock.
+            forget_retention_pin(host, session.id);
             crate::daemon::wake();
             Ok((
                 ServerResponse::TerminalCloseChecked {
@@ -1177,6 +1196,7 @@ pub(super) fn process_request(
                 let retired = host.lock().unwrap_or_else(|p| p.into_inner())
                     .retire_terminal_if_current(terminal_id, &handle);
                 drop(retired);
+                forget_retention_pin(host, terminal_id);
                 crate::daemon::wake();
             }
             Ok((
