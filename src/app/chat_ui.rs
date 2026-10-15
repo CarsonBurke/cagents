@@ -13654,10 +13654,16 @@ mod tests {
         // New Window uses this same read-only snapshot operation, so the
         // private choices travel with the backup without entering pane IPC.
         let backup = directory.path().join("new-window.sqlite3");
-        StateStore::copy_snapshot(&database, &backup).unwrap();
+        StateStore::copy_window_snapshot(&database, &backup, boot.clone()).unwrap();
         let new_window = StateStore::open(&backup, boot).unwrap();
         let restored = new_window.load_workspace(saved.id, None).unwrap().unwrap();
-        assert_eq!(restored.configured_chat_drafts[&card], expected);
+        assert!(!restored.configured_chat_drafts.contains_key(&card));
+        assert_eq!(reopened.load_workspace(saved.id, None).unwrap().unwrap().configured_chat_drafts[&card], expected);
+        let (&card, copied) = restored.configured_chat_drafts.iter().next().unwrap();
+        assert_ne!(copied.id, expected.id);
+        let mut normalized = copied.clone(); normalized.id = expected.id;
+        assert_eq!(normalized, expected);
+        let expected = copied.clone();
         let CardKind::Chat(session) = restored
             .cards
             .iter()
@@ -13723,6 +13729,86 @@ mod tests {
                 .configured_chat_drafts
                 .contains_key(&card)
         );
+    }
+
+    #[test]
+    fn settings_two_copied_windows_issue_distinct_configured_panes_without_replacing_either_actor() {
+        use crate::{persistence::{StateStore, SnapshotBase}, workspace_model::{ModelEdit, views::{View, Scope}}};
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("source.sqlite3");
+        let boot = crate::model::BootId::new("configured-two-windows");
+        let store = StateStore::open(&source, boot.clone()).unwrap();
+        let mut original = crate::app::tests::context_inspector_test_app(false);
+        let channel = crate::model::ChannelId::new();
+        Arc::make_mut(&mut original.durable).channels.push(crate::model::ProjectChannel {
+            id: channel, project_id: crate::model::ProjectId::new(), title: "configured".into(), title_source: Default::default(),
+            ordinal: 0, shared: true, cards: vec![], focused: None,
+        });
+        Arc::make_mut(&mut original.durable).active_channel = Some(channel);
+        drop(original.new_native_chat(Provider::Claude, Some(directory.path().into())));
+        let saved = original.persistent_workspace();
+        let original_card = original.workspace.focused().unwrap();
+        store.save_workspace(&saved, SnapshotBase { workspace: 0, cards: &std::collections::BTreeMap::new() }).unwrap();
+        let identity = uuid::Uuid::new_v4();
+        let mut windows = Vec::new();
+        for name in ["one.sqlite3", "two.sqlite3"] {
+            let path = directory.path().join(name);
+            StateStore::copy_window_snapshot(&source, &path, boot.clone()).unwrap();
+            let copied = StateStore::open(&path, boot.clone()).unwrap();
+            let restored = copied.load_workspace(saved.id, None).unwrap().unwrap();
+            let card = *restored.configured_chat_drafts.keys().next().unwrap();
+            assert_ne!(card, original_card);
+            let CardKind::Chat(session) = restored.cards.iter().find(|state| state.id == card).unwrap().kind.clone() else { panic!("draft") };
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.workspace = Cagents::rebuild_workspace(&restored);
+            app.shared_views = shared_views::State::for_workspace(&restored);
+            app.chat_ui = State::with_drafts(restored.chat_drafts.clone());
+            app.durable = Arc::new(restored);
+            app.workspace_model.identity = identity;
+            app.workspace_model.views = vec![View::empty(channel)];
+            app.acknowledge_view_edit(Scope::Channel(channel), None);
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.open_chat_draft(card, session));
+            windows.push((app, card, rx));
+        }
+        assert_ne!(windows[0].1, windows[1].1);
+        let mut canonical = View::empty(channel);
+        let mut issued_ids = Vec::new();
+        for (index, (app, card, rx)) in windows.iter_mut().enumerate() {
+            app.workspace_model.views = vec![canonical.clone()];
+            drop(app.reconcile_shared_views());
+            assert!(app.configured_chat_is_local(*card));
+            write(app, *card, "issue this window's configured conversation");
+            submit(app, *card);
+            let attempt = app.chat_ui.attempt(*card).unwrap();
+            let target = attempt.target;
+            let mut issued = attempt.session.clone();
+            issued.launch.recipe.program = format!("/owning-daemon/fixture-{index}");
+            let handle = Arc::new(ClientHandle::fixture(issued, Snapshot::default()));
+            let mut exact = handle.session();
+            exact.proof = handle.proof();
+            answer_start(app, target, Ok(handle));
+            assert!(!app.configured_chat_is_local(*card));
+            for edit in std::iter::from_fn(|| rx.try_recv().ok()) {
+                if let ModelEdit::ChangeView { scope, change, .. } = edit {
+                    assert_eq!(scope, Scope::Channel(channel));
+                    canonical.apply(&change).unwrap();
+                }
+            }
+            assert!(canonical.panes.iter().any(|pane| pane.id == *card && pane.kind == CardKind::Chat(exact.clone())));
+            issued_ids.push((*card, exact));
+        }
+        assert_eq!(canonical.panes.len(), 2);
+        assert_ne!(issued_ids[0].1.id, issued_ids[1].1.id);
+        for (app, _, _) in &mut windows {
+            app.workspace_model.views = vec![canonical.clone()];
+            drop(app.reconcile_shared_views());
+            for (card, exact) in &issued_ids {
+                assert_eq!(app.card_state(*card).unwrap().kind, CardKind::Chat(exact.clone()));
+            }
+        }
+        assert!(store.load_workspace(saved.id, None).unwrap().unwrap().configured_chat_drafts.contains_key(&original_card));
     }
 
     #[test]

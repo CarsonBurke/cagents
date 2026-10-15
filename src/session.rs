@@ -459,7 +459,8 @@ impl SessionRuntime {
     }
 
     /// Initializes a named window from a consistent SQLite snapshot, never a
-    /// byte copy of a live WAL database. IDs and exact migration links survive.
+    /// byte copy of a live WAL database. Issued/shared IDs and migration links
+    /// survive; private configured drafts receive this window's own identities.
     pub fn initialize_window(source: &str) -> Result<(), SessionError> {
         let destination = Self::default_database_path()?;
         let source = instance::window_database_path(source)
@@ -467,7 +468,7 @@ impl SessionRuntime {
         if destination == source || destination.exists() || !source.exists() {
             return Ok(());
         }
-        StateStore::copy_snapshot(&source, &destination)?;
+        StateStore::copy_window_snapshot(&source, &destination, current_boot_id()?)?;
         Ok(())
     }
     pub fn open_default() -> Result<(Self, Option<WorkspaceState>), SessionError> {

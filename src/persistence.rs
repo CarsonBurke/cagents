@@ -29,6 +29,7 @@ use crate::{
     },
 };
 
+mod configured_window_copy;
 #[cfg(feature = "ui")]
 mod review_cache;
 
@@ -541,6 +542,14 @@ impl StateStore {
     /// Copies a live store through SQLite's transactionally consistent VACUUM
     /// snapshot. The source is never startup-reconciled or checkpointed here.
     pub fn copy_snapshot(source: &Path, destination: &Path) -> Result<()> {
+        Self::copy_snapshot_prepared(source, destination, |_| Ok(()))
+    }
+
+    fn copy_snapshot_prepared(
+        source: &Path,
+        destination: &Path,
+        prepare: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
         enforce_private_database(source)?;
         let parent = destination
             .parent()
@@ -559,6 +568,7 @@ impl StateStore {
             "VACUUM INTO ?1",
             [temporary.path().to_string_lossy().as_ref()],
         )?;
+        prepare(temporary.path())?;
         temporary.as_file().sync_all()?;
         temporary
             .persist_noclobber(destination)
