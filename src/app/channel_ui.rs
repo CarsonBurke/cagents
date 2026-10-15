@@ -1497,13 +1497,18 @@ mod tests {
         let CardKind::Chat(session) = &mut other.kind else { unreachable!() };
         session.id = crate::model::TerminalId::new();
         session.launch.recipe.working_directory = "/located/worktree/other".into();
-        durable.channels.iter_mut().find(|row| row.id == channel).unwrap().cards.push(other.id);
+        let other_id = other.id;
+        let other_pane = Pane::from_card(&other, None).unwrap();
+        durable.channels.iter_mut().find(|row| row.id == channel).unwrap().cards.push(other_id);
         durable.cards.push(other);
+        app.workspace_model.views[0].panes.push(other_pane);
         let mut incoming = app.workspace_model.clone();
         incoming.sequence += 1;
         incoming.agent_locations[0].blocked_directory = Some("/located/candidate".into());
         drop(app.update(Message::WorkspaceModelObserved(super::super::workspace_model_sync::ModelUpdate::Read(incoming))));
         assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none());
+        assert!(app.durable.channels.iter().find(|row| row.id == channel).unwrap().cards.contains(&other_id),
+            "valid other-card control survives actual shared-model reconciliation");
         assert!(app.agent_worktree(card).is_none());
         assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
         Arc::make_mut(&mut app.durable).card_scopes.insert(card, "/located/worktree".into());
