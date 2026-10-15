@@ -201,7 +201,14 @@ widget layout, pointer update and headless draw CPU time. The event median must
 be at most 2 ms and at most twice the small workload. These are explicit test
 budgets, not claims of achieved results. The test excludes GPU submission and
 compositor presentation. Run the neighboring long-streaming workloads separately
-for a busy parent and a selected running child whose parent is idle.
+for a busy parent and a selected running child whose parent is idle. Streaming
+fixtures apply validated `Presentation` deltas and record append lineage. They
+complete and verify each current rendered publication before sampling its steady
+frame, and separately report synchronous fixture wall time for refresh, the owned
+parser engine, installation and geometry settling. This phase is diagnostic work
+attribution, not native worker scheduling/input latency. An unconsumed new source
+or a Loading placeholder cannot count as the rendered streaming workload. Native
+80-delta/second input and completion timing must be measured separately.
 
 A native comparison must use the same scripted provider, workload text, pane
 geometry and build profile on both revisions. Record the exact commit and dirty

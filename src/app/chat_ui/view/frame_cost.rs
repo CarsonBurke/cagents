@@ -168,6 +168,7 @@ struct Stages {
     view: Stage,
     layout: Stage,
     draw: Stage,
+    preparation: Stage,
 }
 
 impl Stages {
@@ -180,6 +181,9 @@ impl Stages {
     }
 
     fn report(&mut self) {
+        if !self.preparation.0.is_empty() {
+            self.preparation.report("refresh + owned preparation + install + geometry settle (fixture wall)");
+        }
         let total = self.update.report("update")
             + self.view.report("view")
             + self.layout.report("layout")
@@ -189,6 +193,9 @@ impl Stages {
 
     /// One line of medians, for a workload that reports several cases.
     fn row(&mut self, name: &str) {
+        if !self.preparation.0.is_empty() {
+            println!("{name:>28}: fixture refresh+preparation+install+geometry median {:>8.3} ms (outside steady event stages)", self.preparation.median().as_secs_f64() * 1e3);
+        }
         let stages = [
             self.update.median(),
             self.view.median(),
@@ -401,7 +408,28 @@ impl Pane {
         {
             child.items = vec![snapshot.items.pop().expect("streamed child item")];
         }
-        self.handle.publish_snapshot_for_test(snapshot);
+        use chat::presentation::{ChildUpdate, ItemChange, Presentation};
+        let previous = self.handle.snapshot();
+        let changes = |old: &[Arc<chat::Item>], next: &[Arc<chat::Item>]| {
+            let previous: HashMap<_, _> = old.iter().map(|item| (item.id.as_str(), item.as_ref())).collect();
+            next.iter().filter_map(|item| {
+                let old = previous.get(item.id.as_str()).copied();
+                (old != Some(item.as_ref())).then(|| ItemChange::between(old, item))
+            }).collect()
+        };
+        let order = snapshot.items.iter().map(|item| item.id.clone()).collect();
+        let parent_changes = changes(&previous.items, &snapshot.items);
+        snapshot.items.clear();
+        let children = snapshot.subagents.iter_mut().map(|child| {
+            let old = previous.subagents.iter().find(|old| old.id == child.id)
+                .map_or(&[][..], |old| old.items.as_slice());
+            let update = ChildUpdate { id: child.id.clone(),
+                order: child.items.iter().map(|item| item.id.clone()).collect(),
+                changes: changes(old, &child.items) };
+            child.items.clear(); update
+        }).collect();
+        self.handle.publish_presentation_for_test(Presentation { base_generation: previous.generation,
+            file_changes_unchanged: false, metadata: snapshot, order, changes: parent_changes, children });
     }
 
     /// Opens `id` the way pressing its header does.
@@ -496,8 +524,22 @@ impl Pane {
         [refreshed, viewed, laid_out, drawn]
     }
 
+    /// Complete the same owned preparation engine before a sampled new body.
+    /// This synchronous fixture wall phase includes install and geometry settling;
+    /// it is reported separately and is not native worker scheduling latency.
+    fn prepare_publication(&mut self) -> Duration {
+        let start = Instant::now();
+        self.settle_geometry();
+        let expected = self.items.last().expect("streamed item");
+        let cached = self.runtime.cache.get(&expected.id).expect("active streamed cache");
+        assert!(!cached.preparing && !cached.placeholder, "new publication must finish preparation");
+        assert_eq!(cached.item.as_deref(), Some(expected), "cannot time a stale rendered prefix as the new body");
+        start.elapsed()
+    }
+
     /// Streams prose into the newest item for `FRAMES` frames.
     fn stream_prose(&mut self) -> Stages {
+        self.metadata.busy = true;
         let mut stages = Stages::default();
         for frame in 0..FRAMES {
             let text = self.tail();
@@ -507,8 +549,10 @@ impl Pane {
                 text.push_str("\n\n");
             }
             self.publish();
+            let prepared = self.prepare_publication();
             let stage = self.frame();
             if frame >= WARMUP {
+                stages.preparation.0.push(prepared);
                 stages.record(stage);
             }
         }
@@ -608,7 +652,7 @@ fn long_streaming_block(background: bool) {
     println!(
         "one fenced block streamed {DELTA} bytes a frame, {SAMPLES} frames ending at each length:"
     );
-    let (mut lines, mut refreshing) = (0, Duration::ZERO);
+    let (mut lines, mut refreshing, mut preparing) = (0, Duration::ZERO, Duration::ZERO);
     let mut checkpoints = CHECKPOINTS.iter().copied().peekable();
     let mut window: Vec<[Duration; 4]> = Vec::new();
     for delta in source.as_bytes().chunks(DELTA) {
@@ -616,6 +660,7 @@ fn long_streaming_block(background: bool) {
         pane.tail().push_str(delta);
         lines += delta.matches('\n').count();
         pane.publish();
+        preparing += pane.prepare_publication();
         let Some(checkpoint) = checkpoints.peek().copied() else {
             break;
         };
@@ -640,6 +685,7 @@ fn long_streaming_block(background: bool) {
             checkpoints.next();
         }
     }
+    println!("    all fixture refresh/preparation/install/geometry settling: {:>8.1} ms (not native scheduling)", preparing.as_secs_f64() * 1e3);
     println!(
         "    every refresh of the stream together: {:>8.1} ms",
         refreshing.as_secs_f64() * 1e3
@@ -1088,5 +1134,23 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
             median <= small * 2,
             "{name} exceeded2x fixed-viewport scaling budget"
         );
+    }
+}
+
+
+#[test]
+fn streaming_fixture_applies_validated_deltas_and_prepares_each_visible_revision() {
+    let mut pane = Pane::new(vec![item("answer".into(), chat::Role::Assistant,
+        prose("Answer **bold** ordinary tail".into(), false, chat::Phase::Final))]);
+    pane.metadata.busy = true;
+    for suffix in [" more words", " and still more"] {
+        let previous = pane.handle.snapshot().items[0].clone();
+        pane.tail().push_str(suffix);
+        pane.publish();
+        let current = pane.handle.snapshot().items[0].clone();
+        assert!(pane.handle.known_append(&previous, &current), "fixture must exercise accepted append lineage");
+        pane.prepare_publication();
+        assert!(pane.runtime.snapshot.busy, "streaming fixture must be a running parent");
+        assert!(Arc::ptr_eq(pane.runtime.cache["answer"].item.as_ref().unwrap(), &current));
     }
 }
