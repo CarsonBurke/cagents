@@ -226,7 +226,11 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
-        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        // Acquire the WAL writer before any model reads. A Deferred read
+        // transaction's later promotion cannot use busy_timeout to wait for
+        // another connection's writer, and would spuriously fail pane edits.
+        let transaction = self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
