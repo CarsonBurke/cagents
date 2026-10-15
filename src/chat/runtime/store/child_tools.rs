@@ -45,6 +45,7 @@ impl Store {
     }
 
     fn child_tool_revoked(&self,agent:&str,id:&str)->Result<bool,String> {
+        if !self.child_tools_have_revocations {return Ok(false);}
         self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tool_revoked WHERE agent=?1 AND id=?2)",params![agent,id],|row|row.get(0)).map_err(|e|e.to_string())
     }
 
@@ -68,7 +69,9 @@ impl Store {
             // not re-create a body the provider explicitly removed.
             tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1+?2,chunks=chunks-?3 WHERE singleton=1",params![cost,agent.len()+id.len()+64,chunks]).map_err(|e|e.to_string())?;
         }
-        tx.commit().map_err(|e|e.to_string())
+        tx.commit().map_err(|e|e.to_string())?;
+        self.child_tools_have_revocations |= cost.is_some();
+        Ok(())
     }
 
     pub(super) fn cache_child_tool(&mut self, event: &Event) -> Result<Option<String>, String> {
@@ -77,8 +80,11 @@ impl Store {
         match event {
             Event::Reset { .. } => {
                 self.pending_child_tool = None;
+                let tx=self.db.transaction().map_err(|e|e.to_string())?;
+                tx.execute_batch("DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|e| e.to_string())?;
+                tx.commit().map_err(|e|e.to_string())?;
                 self.child_tools_unavailable = None;
-                self.db.execute_batch("DELETE FROM child_tools; DELETE FROM child_tool_revoked; UPDATE child_tool_budget SET bytes=0,items=0,chunks=0 WHERE singleton=1;").map_err(|e| e.to_string())?;
+                self.child_tools_have_revocations = false;
                 return Ok(None);
             }
             Event::SubagentItemsRemoved { id, ids } => {
@@ -474,6 +480,23 @@ mod tests {
         store.apply(Event::SubagentInputDelta{id:"child".into(),item_id:"tool".into(),offset:99,delta:"lost prefix".into()}).unwrap();
         assert!(store.child_adapter_item(&CanonicalItemKey::new(Some("child"),"tool")).is_err());
         assert!(store.child_tools_unavailable.is_some());
+    }
+
+    #[test]
+    fn failed_reset_keeps_revocation_and_the_other_exact_source_atomic() {
+        let mut store=Store::new().unwrap();
+        put(&mut store,"child",tool("removed","private",""));
+        store.apply(Event::SubagentItemsRemoved{id:"child".into(),ids:vec!["removed".into()]}).unwrap();
+        put(&mut store,"child",tool("other","retained",""));
+        store.db.execute_batch("CREATE TRIGGER reject_source_reset BEFORE DELETE ON child_tool_revoked BEGIN SELECT RAISE(ABORT,'injected reset refusal'); END;").unwrap();
+        assert!(store.apply(Event::Reset{reason:"failed reset".into()}).is_err());
+        assert!(store.child_tools_have_revocations);
+        assert!(store.child_adapter_item(&CanonicalItemKey::new(Some("child"),"removed")).is_err());
+        assert!(read(&mut store,"child","other").is_some());
+        store.db.execute_batch("DROP TRIGGER reject_source_reset").unwrap();
+        store.apply(Event::Reset{reason:"successful reset".into()}).unwrap();
+        assert!(!store.child_tools_have_revocations);
+        assert!(read(&mut store,"child","removed").is_none());
     }
 
     #[test]
