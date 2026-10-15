@@ -1761,10 +1761,14 @@ fn shortcut_applies(
             return false;
         }
     }
-    if matches!(
-        focused,
+    // Sidebar rows may reuse NewThread for their captured worktree. Other
+    // pane commands must not act on the background selected card. The app's
+    // current row capability mask rejects project/channel/stale NewThread.
+    let outside_pane = matches!(focused,
         FocusedPane::TextInput | FocusedPane::OutsideWorkspace
-    ) && matches!(
+            | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges)
+        || (focused == FocusedPane::SidebarRows && descriptor.action != GlobalShortcut::NewThread);
+    if outside_pane && matches!(
         descriptor.action,
         GlobalShortcut::FindInPane
             | GlobalShortcut::NewThread
@@ -4936,6 +4940,18 @@ mod tests {
             ) {
                 shell.publish(Some(self.0));
             }
+        }
+    }
+
+    #[test]
+    fn sidebar_regions_resolve_row_commands_without_background_pane_actions() {
+        let shortcuts = KeyboardShortcuts::default();
+        for focused in [FocusedPane::SidebarRows, FocusedPane::SidebarFiles, FocusedPane::SidebarChanges] {
+            for action in [GlobalShortcut::RenamePane, GlobalShortcut::CloseFocusedCard, GlobalShortcut::ClonePane, GlobalShortcut::ChatAccount, GlobalShortcut::ChatModel, GlobalShortcut::ChatPermissions, GlobalShortcut::FindInPane] {
+                assert!(!shortcut_applies(shortcut_descriptor(action), focused, &shortcuts), "{action:?} must not target a background pane from {focused:?}");
+            }
+            assert!(shortcut_applies(shortcut_descriptor(GlobalShortcut::NewTerminal), focused, &shortcuts));
+            assert_eq!(shortcut_applies(shortcut_descriptor(GlobalShortcut::NewThread), focused, &shortcuts), focused == FocusedPane::SidebarRows);
         }
     }
 
