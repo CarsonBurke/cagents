@@ -9,10 +9,13 @@ use std::{ffi::OsString, os::unix::fs::MetadataExt, sync::Arc};
 pub struct FileRestoration {
     source: File,
     permissions: Permissions,
+    /// Measured on the capture worker; cache accounting performs no file IO.
+    retained_bytes: usize,
     _permit: RestorationPermit,
 }
 
 impl FileRestoration {
+    pub(crate) fn retained_bytes(&self) -> usize { self.retained_bytes }
     pub(crate) fn git_mode(&self) -> u32 {
         use std::os::unix::fs::PermissionsExt;
         if self.permissions.mode() & 0o100 != 0 {
@@ -414,6 +417,7 @@ fn replace_or_remove_document_file_in_context(
         restoration: Arc::new(FileRestoration {
             source: template,
             permissions: original.permissions(),
+            retained_bytes: metadata_template_bytes(&attributes),
             _permit: permit.expect("a removal reserved its bounded metadata descriptor"),
         }),
         durability,
@@ -483,11 +487,13 @@ fn capture_restoration_in_context_with_hook(root: &Root, path: &Path, expected_h
             "The reloaded file changed while retaining Undo metadata.".into(),
         ));
     }
-    Ok(Arc::new(FileRestoration {
-        source: template,
-        permissions: before.permissions(),
-        _permit: permit,
-    }))
+    Ok(Arc::new(FileRestoration { source: template, permissions: before.permissions(), retained_bytes: metadata_template_bytes(&attributes), _permit: permit }))
+}
+
+fn metadata_template_bytes(attributes: &std::collections::BTreeMap<OsString, Vec<u8>>) -> usize {
+    attributes.iter().fold(std::mem::size_of::<FileRestoration>(), |bytes, (name, value)| {
+        bytes.saturating_add(name.len()).saturating_add(value.len()).saturating_add(96)
+    })
 }
 
 fn immutable_metadata_template(holding: &mut PresenceHolding, source: &File, before: &fs::Metadata, attributes: &std::collections::BTreeMap<OsString, Vec<u8>>) -> Result<File, FileIoError> {

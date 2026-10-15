@@ -148,6 +148,15 @@ pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: P
     let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(worktree).map_err(|error| crate::editor::FileIoError::Io(error.to_string()))?);
     let root = crate::editor::worktree_root(worktree)?;
     let context = capture.then(|| crate::editor::recovery_context_at(&root, protection)).transpose()?;
+    load_with_restoration_at_in_context(&root, path, before, tone, capture, context.as_ref())
+}
+
+/// Worker-only read/capture through the ORIGINAL model root. An earlier named
+/// validation never authorizes reopening that name for a different checkout.
+pub(crate) fn load_with_restoration_at_in_context(root: &crate::fs_safety::Root, path: &Path, before: &str, tone: PdfTone, capture: bool, context: Option<&crate::editor::RecoveryContext>) -> Result<Version, crate::editor::FileIoError> {
+    if capture && context.is_none() {
+        return Err(crate::editor::FileIoError::Io("The original reload recovery context is unavailable; no file metadata was acquired.".into()));
+    }
     match crate::editor::load_file_at(&root, path, tone) {
         Ok(LoadedFile {
             source,
@@ -170,6 +179,24 @@ pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: P
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn retained_reload_never_reopens_a_replacement_named_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let named = directory.path().join("source");
+        let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("file.txt"), "original").unwrap();
+        let original = crate::editor::worktree_root(&named).unwrap();
+        std::fs::rename(&named, &moved).unwrap();
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("file.txt"), "foreign").unwrap();
+        let version = load_with_restoration_at_in_context(&original, Path::new("file.txt"), "", PdfTone::Original, false, None).unwrap();
+        assert_eq!(version.text, "original");
+        assert!(load_with_restoration_at_in_context(&original, Path::new("file.txt"), "", PdfTone::Original, true, None).is_err());
+        assert_eq!(std::fs::read(named.join("file.txt")).unwrap(), b"foreign");
+        assert_eq!(std::fs::read_dir(&named).unwrap().count(), 1);
+        assert_eq!(std::fs::read_dir(&moved).unwrap().count(), 1);
+    }
     #[test]
     fn ordinary_and_cross_presence_reload_preserve_symlink_worktree_roots() {
         let directory = tempfile::tempdir().unwrap();

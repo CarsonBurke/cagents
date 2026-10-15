@@ -878,6 +878,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::ConfiguredFileLoaded { .. }
+            | RepositoryAction::EditorRootRebound { .. }
             | RepositoryAction::BinaryPageLoaded { .. }
             | RepositoryAction::DiskMetadata { .. }
             | RepositoryAction::ComparisonMetadata { .. }

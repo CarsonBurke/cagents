@@ -52,6 +52,8 @@ impl RepositoryRuntime {
                 _ => None,
             },
             RepositoryAction::DiskLoaded { result: Err(error), .. } => error.recovery_authority(),
+            RepositoryAction::EditorFilePrepared { preparation, .. } => preparation.error().and_then(FileIoError::recovery_authority),
+            RepositoryAction::EditorFileAdmitted { admission, .. } => admission.error().and_then(FileIoError::recovery_authority),
             _ => None,
         };
         if let Some(authority) = authority {

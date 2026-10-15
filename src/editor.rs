@@ -245,6 +245,11 @@ pub struct LoadedFile {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FileContent {
+    /// An unchanged absent baseline of a retained editor history. Only the
+    /// saved-history loader produces this after proving the selected path
+    /// still resolves to the same missing source; empty files stay Editable.
+    SavedAbsence,
+
     Editable {
         text: String,
         content_hash: blake3::Hash,
@@ -459,6 +464,155 @@ pub fn load_file(
     load_file_at(&root, relative_path, tone)
 }
 
+/// Filesystem identity of the root used by an asynchronous document read.
+#[derive(Debug, Clone)]
+pub struct FileRootIdentity {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+    _root: std::sync::Arc<Root>,
+    // The whole pair keeps this actual Doc/Undo/worker owner visible to the
+    // window's original custody. Diagnostic ticket clones alone are not owners.
+    admission: Option<crate::edited_root_admission::AdmittedRoot>,
+}
+impl PartialEq for FileRootIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path && self.device == other.device && self.inode == other.inode
+    }
+}
+impl Eq for FileRootIdentity {}
+impl FileRootIdentity {
+    /// Pure clone of the original worker-opened descriptor. A stale spelling
+    /// does not turn this into authority over a newly located/replaced root.
+    pub fn retained_root(&self) -> std::sync::Arc<Root> {
+        std::sync::Arc::clone(&self._root)
+    }
+    /// Cached candidate comparison only. Worker lease validation must also
+    /// prove the mount instance before an original admission can be reused.
+    pub(crate) fn same_directory_candidate(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+    /// Pure clone of an already admitted original owner. This does not enroll,
+    /// validate or authorize a different directory from its diagnostic path.
+    pub fn retained_admission(&self) -> Option<crate::edited_root_admission::AdmittedRoot> {
+        self.admission.clone()
+    }
+    pub(crate) fn has_active_admission(&self) -> bool {
+        self.admission.as_ref().is_some_and(|admission| {
+            admission.ticket().phase() == crate::edited_root_admission::AdmissionPhase::Active
+        })
+    }
+    /// Worker-only construction for an already enrolled original Source. Both
+    /// metadata capture and lease association happen before UI publication.
+    pub fn admitted(
+        root: std::sync::Arc<Root>,
+        admission: crate::edited_root_admission::AdmittedRoot,
+        deadline: std::time::Instant,
+    ) -> Result<Self, FileIoError> {
+        Self::of(root)?.with_admission(admission, deadline)
+    }
+    /// Worker-only attachment before Editable publication. A successful ticket
+    /// from another Root cannot be rebound merely by storing it in the model.
+    pub(crate) fn with_admission(
+        mut self,
+        admission: crate::edited_root_admission::AdmittedRoot,
+        deadline: std::time::Instant,
+    ) -> Result<Self, FileIoError> {
+        admission
+            .validate_for_root(&self._root, deadline)
+            .map_err(io_error)?;
+        self.admission = Some(admission);
+        Ok(self)
+    }
+    /// Called on the publication worker. A stale read receipt may still name
+    /// this held root, but its old pathname cannot authorize a new checkout.
+    pub(crate) fn validate_named(&self, worktree: &Path) -> Result<&Root, FileIoError> {
+        let named = Self::of(std::sync::Arc::new(worktree_root(worktree)?))?;
+        if &named != self {
+            return Err(FileIoError::Io(
+                "The editor worktree was moved or replaced. Reopen the file before saving.".into(),
+            ));
+        }
+        let admission = self.admission.as_ref().ok_or_else(|| {
+            FileIoError::Io(
+                "Original edited-root registration is unavailable. The buffer has been kept."
+                    .into(),
+            )
+        })?;
+        admission
+            .validate_for_root(
+                &self._root,
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            )
+            .map_err(io_error)?;
+        Ok(&self._root)
+    }
+    /// Worker-only proof for an explicit Locate/relocation. A replacement
+    /// clone is not the original editor root, even when its bytes match.
+    /// The caller must fence the result against the original document/context
+    /// and invalidate path-keyed caches before installing the new pathname.
+    pub(crate) fn rebind_same_directory(&self, worktree: &Path) -> Result<Self, FileIoError> {
+        let relocated = Self::of(std::sync::Arc::new(worktree_root(worktree)?))?;
+        if self.device != relocated.device || self.inode != relocated.inode {
+            return Err(FileIoError::Io("The located checkout is a different directory. The original buffer was kept; reopen a file in the new checkout before saving there.".into()));
+        }
+        match &self.admission {
+            Some(admission) => relocated.with_admission(
+                admission.clone(),
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            ),
+            None => Ok(relocated),
+        }
+    }
+
+    pub(crate) fn of(root: std::sync::Arc<Root>) -> Result<Self, FileIoError> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = root.metadata().map_err(io_error)?;
+        Ok(Self {
+            path: root.path().to_path_buf(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            _root: root,
+            admission: None,
+        })
+    }
+}
+
+/// Reopens a saved history without confusing a missing source with an empty
+/// present file. Follow the same bounded in-worktree link policy as normal
+/// loading and require the exact previously saved source before admitting it.
+pub(crate) fn load_file_with_saved_absence(
+    root: &Root,
+    path: &Path,
+    tone: PdfTone,
+    absent: Option<&Path>,
+) -> Result<LoadedFile, FileIoError> {
+    if let Some(expected) = absent {
+        validate_repo_path(path)?;
+        let mut source = path.to_path_buf();
+        for _ in 0..=MAX_FOLLOWED_LINKS {
+            match fs_safety::metadata_beneath(&root, &source) {
+                Err(error) if error.is_not_found() && source == expected => {
+                    return Ok(LoadedFile {
+                        source,
+                        content: FileContent::SavedAbsence,
+                    });
+                }
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    let target =
+                        fs_safety::read_link_beneath(&root, &source).map_err(resolve_error)?;
+                    let Some(Some(next)) = link_target_beneath(&root, &source, &target) else {
+                        break;
+                    };
+                    source = next;
+                }
+                _ => break,
+            }
+        }
+    }
+    load_file_at(&root, path, tone)
+}
+
 pub(crate) fn load_file_at(
     root: &Root,
     relative_path: &Path,
@@ -584,6 +738,18 @@ fn link_target_beneath(root: &Root, link: &Path, target: &Path) -> Option<Option
     Some(Some(resolved.into_iter().collect()))
 }
 
+/// The same source classification is used when restoring a saved absence.
+pub(crate) fn is_markdown_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("README"))
+        || path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
+            })
+}
+
 /// Reads and classifies the regular file at `relative_path`, whose name was
 /// just found to describe something other than a link.
 fn load_regular_file(
@@ -701,15 +867,7 @@ fn load_regular_file(
         )));
     }
     let text = String::from_utf8(bytes).expect("UTF-8 validated above");
-    let markdown = relative_path
-        .file_name()
-        .is_some_and(|name| name.eq_ignore_ascii_case("README"))
-        || relative_path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .is_some_and(|extension| {
-                matches!(extension.to_ascii_lowercase().as_str(), "md" | "markdown")
-            });
+    let markdown = is_markdown_path(relative_path);
     Ok(FileContent::Editable {
         content_hash: blake3::hash(text.as_bytes()),
         text,
@@ -1377,6 +1535,114 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn editor_root_relocation_requires_the_original_physical_directory() {
+        use crate::edited_root_admission::{EditedRootAdmissions, test_peer::{Event, ScriptedEditedRootPeer}};
+        use std::{sync::Arc, time::{Duration, Instant}};
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let root = Arc::new(worktree_root(&original).unwrap());
+        // Actual client framing/descriptor transfer with a scripted private
+        // peer, not a claim of daemon Registry19 admission acceptance.
+        let peer = ScriptedEditedRootPeer::start(&root);
+        let mut ledger = EditedRootAdmissions::default();
+        let ticket = ledger.reserve().unwrap();
+        let work = ticket.begin_preparation().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let client = crate::recovery_domain::RecoveryPlacementClient::connect_local_until(peer.endpoint(), deadline).unwrap();
+        let owner = client.prepare_edited_root_owner(root.clone()).unwrap();
+        let prepared = work.prepared(owner);
+        let admission = prepared.begin_enrollment().unwrap().run(&crate::process::CancellationToken::new(), deadline).unwrap();
+        let retained = FileRootIdentity::admitted(root, admission, deadline).unwrap();
+        drop(client);
+        std::fs::rename(&original, &moved).unwrap();
+        let rebound = retained.rebind_same_directory(&moved).unwrap();
+        assert!(rebound.validate_named(&moved).is_ok());
+        assert!(
+            retained.validate_named(&moved).is_err(),
+            "ordinary Save cannot perform an implicit relocation"
+        );
+        std::fs::create_dir(&original).unwrap();
+        assert!(
+            retained.rebind_same_directory(&original).is_err(),
+            "a replacement clone cannot acquire the old Undo root"
+        );
+        drop(rebound);
+        drop(retained);
+        ledger.request_unowned_retirements();
+        ledger.next_retirement().unwrap().expect("actual relocated owners drained").run(Instant::now() + Duration::from_secs(2)).unwrap();
+        drop(ticket);
+        drop(ledger);
+        assert!(peer.finish().contains(&Event::Released));
+    }
+
+    #[test]
+    fn a_raw_root_and_its_relocation_never_authorize_a_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let raw = FileRootIdentity::of(std::sync::Arc::new(worktree_root(&original).unwrap())).unwrap();
+        assert!(raw.validate_named(&original).is_err());
+        std::fs::rename(&original, &moved).unwrap();
+        let rebound = raw.rebind_same_directory(&moved).unwrap();
+        assert!(rebound.validate_named(&moved).is_err(), "a path/identity rebind does not mint negative-root enrollment");
+    }
+
+    #[test]
+    fn saved_absence_loader_distinguishes_empty_recreated_files_and_retargeted_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = worktree_root(directory.path()).unwrap();
+        std::os::unix::fs::symlink("missing.rs", directory.path().join("alias.rs")).unwrap();
+        assert!(matches!(
+            load_file_with_saved_absence(
+                &root,
+                Path::new("alias.rs"),
+                PdfTone::Original,
+                Some(Path::new("missing.rs"))
+            )
+            .unwrap()
+            .content,
+            FileContent::SavedAbsence
+        ));
+        std::fs::write(directory.path().join("missing.rs"), "").unwrap();
+        assert!(matches!(
+            load_file_with_saved_absence(
+                &root,
+                Path::new("alias.rs"),
+                PdfTone::Original,
+                Some(Path::new("missing.rs"))
+            )
+            .unwrap()
+            .content,
+            FileContent::Editable { .. }
+        ));
+        std::fs::remove_file(directory.path().join("missing.rs")).unwrap();
+        std::fs::remove_file(directory.path().join("alias.rs")).unwrap();
+        std::os::unix::fs::symlink("other.rs", directory.path().join("alias.rs")).unwrap();
+        assert!(!matches!(
+            load_file_with_saved_absence(
+                &root,
+                Path::new("alias.rs"),
+                PdfTone::Original,
+                Some(Path::new("missing.rs"))
+            )
+            .unwrap()
+            .content,
+            FileContent::SavedAbsence
+        ));
+        assert!(!matches!(
+            load_file_with_saved_absence(&root, Path::new("new.rs"), PdfTone::Original, None),
+            Ok(LoadedFile {
+                content: FileContent::SavedAbsence,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn external_sources_are_bounded_regular_utf8_without_binary_or_directory_reads() {
