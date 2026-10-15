@@ -3467,7 +3467,7 @@ impl Runtime {
     }
 
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        small_icon(
+        let mut controls = vec![small_icon(
             if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
                 Icon::Check
             } else {
@@ -3475,7 +3475,17 @@ impl Runtime {
             },
             "Copy this message",
             Action::Copy(self.target, item.id.clone(), CopyPart::Text),
-        )
+        )];
+        if let Some((at, stamp, full)) = self.cache.get(&item.id).and_then(|cached| cached.stamp.as_ref())
+            && item.at == Some(*at)
+        {
+            controls.push(widget::tooltip(
+                design::caption(stamp.clone()).class(cosmic::theme::Text::Custom(design::muted_text)),
+                design::caption(full.clone()),
+                widget::tooltip::Position::Top,
+            ).into());
+        }
+        widget::row::with_children(controls).spacing(step::GAP_XS).align_y(Alignment::Center).into()
     }
 
     /// A draft's first message while its conversation starts.
@@ -3929,44 +3939,12 @@ impl Runtime {
             .width(Length::Fill)
             .into();
         }
-        // An answer's hover footer dates the message and offers to copy it, and
-        // nothing else: a reader of an answer reaches for those two, and the
-        // Markdown source of a rendered answer was a developer's control on a
-        // reader's surface.
-        // The controls lead and the time follows, muted like the time: a
-        // reader reaches for copy far more often than they read the stamp,
-        // and an icon in the text color beside a muted stamp was the one
-        // thing on the row that looked like it wanted attention.
-        let mut controls: Vec<Element<'static, Message>> = vec![small_icon(
-            if self.copied.as_ref().is_some_and(|(id, _)| *id == item.id) {
-                Icon::Check
-            } else {
-                Icon::Copy
-            },
-            "Copy this message",
-            Action::Copy(target, item.id.clone(), CopyPart::Text),
-        )];
-
-        if let Some((_, stamp, full)) = &cached.stamp {
-            controls.push(
-                widget::tooltip(
-                    design::caption(stamp.clone())
-                        .class(cosmic::theme::Text::Custom(design::muted_text)),
-                    design::caption(full.clone()),
-                    widget::tooltip::Position::Top,
-                )
-                .into(),
-            );
-        }
         // The answer is bare prose on the pane's own surface. Wrapping it in
         // a panel would put a frame around the one thing the reader came for,
         // and would make it look like just another block.
         widget::container(message_actions(
             prose::view(cached, settings, self.target, self.find.as_deref()),
-            widget::row::with_children(controls)
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
-                .into(),
+            self.message_copy(item),
             Alignment::Start,
         ))
         .max_width(design::READABLE_MEASURE)
@@ -4641,6 +4619,85 @@ mod frame_cost;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recorded_message_timestamp_format_uses_message_metadata() {
+        let at = 1_700_000_000_000;
+        let local = chat::local_time((at / 1000) as i64).unwrap();
+        let same_day = chat::local_time((at / 1000 + 60) as i64).unwrap();
+        let full = format!("{:04}-{:02}-{:02} {}", local.year + 1900, local.month + 1, local.day, local.clock());
+        let stamp = recorded_message_stamp(at, Some(&same_day)).unwrap();
+        assert_eq!(stamp, (at, local.clock(), full.clone()));
+        let other_day = chat::local_time((at / 1000 + 172_800) as i64).unwrap();
+        assert_eq!(recorded_message_stamp(at, Some(&other_day)), Some((at, full.clone(), full.clone())));
+        assert_eq!(recorded_message_stamp(at, None), Some((at, full.clone(), full)));
+    }
+
+    #[test]
+    fn recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers() {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::{Operation, Tree}};
+        #[derive(Default)]
+        struct Texts(Vec<(String, iced::Rectangle)>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let at = 1_700_000_000_000;
+        let parent = chat::Item { id: "dated-prompt".into(), role: chat::Role::User, at: Some(at), started_at: None,
+            content: ItemContent::Text { text: "Recorded prompt".into(), thinking: false, phase: chat::Phase::Final } };
+        let (mut runtime, handle) = frame_cost::live_runtime(std::slice::from_ref(&parent));
+        let child = chat::Item { id: "dated-child-answer".into(), role: chat::Role::Assistant, at: Some(at + 120_000),
+            content: ItemContent::Text { text: "Recorded child answer".into(), thinking: true, phase: chat::Phase::Commentary }, ..parent.clone() };
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents.push(chat::Subagent { items: vec![Arc::new(child.clone())], ..native_child_fixture() });
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        let renderer = crate::app::tests::headless_renderer();
+        for item in [&parent, &child] {
+            let expected = runtime.cache[&item.id].stamp.clone().expect("parent and child retain recorded time");
+            assert_eq!(expected.0, item.at.unwrap());
+            // Disclosure rebuilds receive the prior cache, without a provider
+            // publication. Its fixed metadata must not disappear on hover.
+            let previous = runtime.cache.remove(&item.id);
+            let mut rebuilt = CachedItem::updated(&item.content, runtime.syntax_theme, previous, true, false, None);
+            rebuilt.item = Some(Arc::new(item.clone()));
+            assert_eq!(rebuilt.stamp.as_ref(), Some(&expected));
+            runtime.cache.insert(item.id.clone(), rebuilt);
+            let mut footer = runtime.message_copy(item);
+            let mut tree = Tree::new(footer.as_widget());
+            let node = footer.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 100.0)));
+            let mut texts = Texts::default();
+            footer.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            let (_, stamp_bounds) = texts.0.iter().find(|(text, _)| text == &expected.1).expect("real footer contains recorded label");
+            let accessible = footer.as_widget().a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+            let copy = accessible.root().iter().chain(accessible.children()).find(|node|
+                node.node().role() == iced_accessibility::accesskit::Role::Button && node.node().label() == Some("Copy this message"))
+                .expect("actual Copy action remains accessible");
+            let bounds = copy.node().bounds().unwrap();
+            assert!(stamp_bounds.x >= bounds.x1 as f32, "timestamp follows Copy in the same footer");
+            let cursor = iced::Point::new(((bounds.x0 + bounds.x1) / 2.0) as f32, ((bounds.y0 + bounds.y1) / 2.0) as f32);
+            let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 100.0));
+            let mut messages = Vec::new();
+            for button in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
+                footer.as_widget_mut().update(&mut tree, &iced::Event::Mouse(button), Layout::new(&node), iced::mouse::Cursor::Available(cursor),
+                    &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            }
+            assert_eq!(messages.len(), 1);
+            assert!(matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id));
+        }
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        Arc::make_mut(&mut snapshot.items[0]).at = None;
+        Arc::make_mut(&mut snapshot.subagents[0].items[0]).at = None;
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert!(runtime.cache[&parent.id].stamp.is_none());
+        assert!(runtime.cache[&child.id].stamp.is_none(), "missing recorded time never falls back to the current clock");
+    }
 
     fn native_child_fixture() -> chat::Subagent {
         chat::Subagent {
