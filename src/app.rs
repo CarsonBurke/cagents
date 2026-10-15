@@ -7560,6 +7560,10 @@ impl Cagents {
     }
 
     fn acknowledge_active_pane(&mut self) -> Task<Message> {
+        self.acknowledge_active_pane_with_notices(true)
+    }
+
+    fn acknowledge_active_pane_with_notices(&mut self, acknowledge_notices: bool) -> Task<Message> {
         let Some(card) = self
             .workspace
             .focused()
@@ -7587,7 +7591,9 @@ impl Cagents {
                 "Could not acknowledge terminal output: {error}"
             )));
         }
-        self.acknowledge_card_notices(card);
+        if acknowledge_notices {
+            self.acknowledge_card_notices(card);
+        }
         self.persist();
         self.acknowledge_chat_updates(card)
     }
@@ -14879,7 +14885,7 @@ impl Application for Cagents {
             }
             Message::AcknowledgeVisiblePane { card, epoch } => {
                 if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
-                    self.acknowledge_active_pane()
+                    self.acknowledge_visible_pane()
                 } else {
                     Task::none()
                 }

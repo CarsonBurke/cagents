@@ -45,6 +45,8 @@ pub(super) struct State {
     last_workspace: Weak<WorkspaceState>,
     last_focus: Option<(Option<CardId>, bool, bool)>,
     visible_focus: Option<CardId>,
+    visible_notices: BTreeSet<uuid::Uuid>,
+    visible_acknowledged: bool,
     acknowledged: BTreeSet<uuid::Uuid>,
     /// Whether a test notification is waiting on the desktop's answer.
     pub testing: bool,
@@ -67,6 +69,8 @@ impl Default for State {
             last_workspace: Weak::new(),
             last_focus: None,
             visible_focus: None,
+            visible_notices: BTreeSet::new(),
+            visible_acknowledged: false,
             acknowledged: BTreeSet::new(),
             testing: false,
             inbox_activation: None,
@@ -308,6 +312,12 @@ impl Cagents {
             return Task::none();
         }
         self.notification_ui.visible_focus = visible;
+        self.notification_ui.visible_acknowledged = false;
+        let session = visible.and_then(|card| self.card_state(card)).and_then(card_session);
+        self.notification_ui.visible_notices = self.notification_ui.snapshot.notices.iter()
+            .filter(|notice| session.is_some() && notice.event.source_session() == session
+                && !notice.acknowledged && !self.notification_ui.acknowledged.contains(&notice.id))
+            .map(|notice| notice.id).collect();
         self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
         let epoch = self.attention_focus_epoch;
         visible.map_or_else(Task::none, |card| {
@@ -316,6 +326,17 @@ impl Cagents {
                 Message::AcknowledgeVisiblePane { card, epoch }
             })
         })
+    }
+
+    pub(super) fn acknowledge_visible_pane(&mut self) -> Task<Message> {
+        // The timer owns the notices present at its visibility boundary. A
+        // newer opted-in alert must survive an older parent's pending dwell.
+        self.notification_ui.visible_acknowledged = true;
+        let ids = std::mem::take(&mut self.notification_ui.visible_notices);
+        for id in ids {
+            self.notification_ui.acknowledge(id);
+        }
+        self.acknowledge_active_pane_with_notices(false)
     }
 
     pub(super) fn sync_notification_presence(&mut self) {
@@ -372,13 +393,29 @@ impl Cagents {
             *previous = presence.clone();
             changed
         };
-        let read = crate::notifications::focused_notice_ids(
+        let mut read = crate::notifications::focused_notice_ids(
             &self.notification_ui.snapshot,
             presence.focused_target.as_ref(),
+            None,
+            focus_changed,
+            self.settings.notifications.while_focused,
+        );
+        let session_read = crate::notifications::focused_notice_ids(
+            &self.notification_ui.snapshot,
+            None,
             focused,
             focus_changed,
             self.settings.notifications.while_focused,
         );
+        // Delivery presence changes immediately, but implicit Session reads on
+        // a visibility return share the sidebar's qualified dwell. Preserve
+        // the existing policy for fresh alerts while the parent stays visible.
+        if focused_card == self.notification_ui.visible_focus {
+            read.extend(session_read.into_iter().filter(|id| {
+                self.notification_ui.visible_acknowledged
+                    || (!focus_changed && !self.notification_ui.visible_notices.contains(id))
+            }));
+        }
         self.notification_ui
             .changed(|pending| pending.presence = Some(presence));
         for id in read {
@@ -1150,6 +1187,7 @@ mod tests {
             Some(session)
         );
         let current_epoch = app.attention_focus_epoch;
+        assert!(!app.notification_ui.acknowledged_for_test(id));
         assert_eq!(app.durable.focused, app.workspace.focused());
         let resize = app.workspace.resize_viewport(1200.0);
         drop(app.apply_viewport(resize, true, false));
@@ -1167,10 +1205,11 @@ mod tests {
             epoch: current_epoch,
         }));
         assert!(!app.sidebar_state.has_card_update(card));
+        assert!(app.notification_ui.acknowledged_for_test(id));
     }
 
     #[test]
-    fn background_window_keeps_attention_until_its_agent_is_focused() {
+    fn attention_background_journal_waits_for_current_visible_dwell() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let session = card_session(&app.durable.cards[0]).unwrap();
         let id = uuid::Uuid::new_v4();
@@ -1203,16 +1242,32 @@ mod tests {
                 .acknowledged
                 .is_empty()
         );
-        app.refresh_ui.focused = true;
-        app.sync_notification_presence();
-        let pending = app.notification_ui.pending.lock().unwrap();
-        assert_eq!(pending.presence.as_ref().unwrap().focused, Some(session));
-        assert_eq!(pending.acknowledged, BTreeSet::from([id]));
+        app.context_inspector_open = false;
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let card = app.workspace.focused().unwrap();
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        let stale_epoch = app.attention_focus_epoch;
+        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, false))));
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: stale_epoch }));
+        assert!(!app.notification_ui.acknowledged_for_test(id),
+            "returning then leaving before dwell cannot read an unseen journal entry");
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        let epoch = app.attention_focus_epoch;
+        assert_ne!(epoch, stale_epoch);
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert!(app.notification_ui.acknowledged_for_test(id));
+        assert!(!app.sidebar_state.has_card_update(card));
     }
 
     #[test]
-    fn opted_in_focused_alert_survives_snapshot_and_is_read_on_return() {
+    fn attention_opted_in_fresh_alert_survives_an_older_visibility_dwell() {
         let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let card = app.workspace.focused().unwrap();
         app.settings.notifications.while_focused = true;
         app.refresh_ui.focused = true;
         app.sync_notification_presence();
@@ -1239,7 +1294,7 @@ mod tests {
             diagnostic: None,
         };
         drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
-        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
         assert!(
             app.notification_ui
                 .pending
@@ -1250,14 +1305,25 @@ mod tests {
             "notification snapshots must not withdraw an explicitly requested focused alert"
         );
 
-        app.refresh_ui.focused = false;
-        app.sync_notification_presence();
-        app.refresh_ui.focused = true;
-        app.sync_notification_presence();
-        assert_eq!(
-            app.notification_ui.pending.lock().unwrap().acknowledged,
-            BTreeSet::from([id])
-        );
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, false))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
+        let epoch = app.attention_focus_epoch;
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        let newer = uuid::Uuid::new_v4();
+        let mut next = snapshot.clone();
+        let mut notice = next.notices[0].clone();
+        notice.id = newer;
+        notice.event.evidence.key = "newer-focused-completion".into();
+        next.notices.push(notice);
+        drop(app.update(Message::NotificationUi(Action::Snapshot(next))));
+        assert!(!app.notification_ui.acknowledged_for_test(newer));
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert!(app.notification_ui.acknowledged_for_test(id));
+        assert!(!app.notification_ui.acknowledged_for_test(newer),
+            "an older dwell cannot withdraw a newer opted-in alert");
+        drop(app.mark_cards_read(vec![card]));
+        assert!(app.notification_ui.acknowledged_for_test(newer),
+            "explicit Mark Read retains its declared current scope");
     }
 
     fn scheduled_attention_fixture() -> (Cagents, crate::agent_execution::Agent) {
