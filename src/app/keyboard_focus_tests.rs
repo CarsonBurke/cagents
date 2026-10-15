@@ -191,6 +191,21 @@ fn actual_nonselected_pane_header_keeps_native_focus_through_all_ready_update_op
     let mut messages = Vec::new();
     let _ = ui.update(&[key("q", Code::KeyQ, keyboard::Modifiers::empty(), None)], mouse::Cursor::Unavailable, &mut renderer, &mut clipboard::Null, &mut messages);
     assert!(messages.iter().any(|m| matches!(m, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))), "logical reconciliation and its actual widget operations must preserve the nondefault native owner");
+    let cache = ui.into_cache();
+    let (_, messages) = native(&app, &mut renderer, cache, None, &[key("s", Code::KeyS, keyboard::Modifiers::CTRL, None)]);
+    let routed = messages.into_iter().find(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &header && region.card == Some(owner))).unwrap();
+    let task = app.update(routed);
+    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let mut save = None;
+    executor.block_on(async {
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            while let Ok(Some(action)) = tokio::time::timeout(Duration::from_millis(100), stream.next()).await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(RepositoryAction::Save { card, overwrite: false }))) = action { save = Some(card); }
+            }
+        }
+    });
+    executor.shutdown_background();
+    assert_eq!(save, Some(owner), "ordinary Save must keep targeting the exact repository that owns this nontext control");
 }
 
 

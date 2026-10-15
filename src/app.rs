@@ -15809,6 +15809,13 @@ impl Application for Cagents {
                 let native_region = self.input_trace.keyboard_focus();
                 let native_targets_pane = native_region.is_none() || self.input_trace.keyboard_card().is_some();
                 let repository_keys = native_region.is_none() || matches!(native_region, Some(workspace_widget::FocusedPane::Editor | workspace_widget::FocusedPane::Review));
+                // Ordinary Save also belongs to this repository's own
+                // nontext controls, without granting a sidebar/field access
+                // to the buffer behind it. Staging keeps its narrower scope.
+                let repository_save_keys = repository_keys
+                    || (native_region == Some(workspace_widget::FocusedPane::Other)
+                        && self.input_trace.keyboard_card().is_some_and(|card|
+                            matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))));
                 let native_widget = self.input_trace.keyboard_widget_id();
                 let chat_find_keys = native_region.is_none() || native_widget == self.workspace.focused().map(|card| card_control_id(card, "chat-find"));
                 if let Some(task) = self.automation_approval_key(&event, captured) {
@@ -16099,7 +16106,7 @@ impl Application for Cagents {
                 if native_targets_pane && !captured && let Some(task) = self.chat_scroll_key(&event) {
                     return task;
                 }
-                if repository_keys && is_save_press(&event)
+                if repository_save_keys && is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
                     && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
                 {
