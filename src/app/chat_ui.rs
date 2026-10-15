@@ -2350,18 +2350,17 @@ impl Runtime {
         // Restored and paged conversations carry their own prompt history.
         // Preserve a recalled index while the reader is walking it.
         if self.history_cursor.is_none() {
-            self.history = snapshot
-                .items
-                .iter()
-                .filter_map(|item| match (&item.role, &item.content) {
-                    (chat::Role::User, ItemContent::Text { text, .. })
-                        if !text.trim().is_empty() =>
-                    {
-                        Some(text.clone())
-                    }
-                    _ => None,
-                })
-                .collect();
+            let mut count = 0;
+            for text in snapshot.items.iter().filter_map(|item| match (&item.role, &item.content) {
+                (chat::Role::User, ItemContent::Text { text, .. }) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            }) {
+                if let Some(previous) = self.history.get_mut(count) {
+                    if previous != text { previous.clone_from(text); }
+                } else { self.history.push(text.clone()); }
+                count += 1;
+            }
+            self.history.truncate(count);
         }
         let live_ids: HashSet<&str> = snapshot
             .items
@@ -2518,26 +2517,23 @@ impl Runtime {
         // late; that costs a step its group, never the disclosure state of one.
         self.asked
             .retain(|id| snapshot.requests.iter().any(|request| &request.id == id));
+        let mut grouping_dirty = false;
         for request in &snapshot.requests {
             if self.asked.insert(request.id.clone())
                 && let Some(last) = snapshot.items.last()
             {
-                self.asked_after.insert(last.id.clone());
+                grouping_dirty |= self.asked_after.insert(last.id.clone());
             }
         }
         self.source_clock = source_clock;
         let cache = &self.cache;
-        let turns = turn::group(&snapshot.items, &self.asked_after, |item| {
-            cache.get(&item.id)?.coordination.as_deref()
+        let turns = (grouping_dirty || !turn::same_structure(&self.snapshot.items, &snapshot.items)).then(|| {
+            turn::group(&snapshot.items, &self.asked_after, |item| cache.get(&item.id)?.coordination.as_deref())
         });
-        carry_step_disclosures(
-            &mut self.opened,
-            &mut self.find_disclosure,
-            &self.turns,
-            &self.snapshot.items,
-            &turns,
-            &snapshot.items,
-        );
+        if let Some(turns) = &turns {
+            carry_step_disclosures(&mut self.opened, &mut self.find_disclosure,
+                &self.turns, &self.snapshot.items, turns, &snapshot.items);
+        }
         let current_anchor = self.turns.last().map(|turn| turn.key.as_str());
         if self
             .snapshot
@@ -2551,15 +2547,17 @@ impl Runtime {
             && !snapshot.exited
             && snapshot.turn_generation == self.snapshot.turn_generation
             && snapshot.session_id == self.snapshot.session_id
-            && current_anchor == turns.last().map(|turn| turn.key.as_str())
+            && current_anchor == turns.as_deref().unwrap_or(&self.turns).last().map(|turn| turn.key.as_str())
         {
             let provider = self.session.launch.provider;
             self.failures.retain(|(anchor, message)| {
                 anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
             });
         }
-        self.turns = turns;
-        reconcile_disclosure(&mut self.opened, &self.turns);
+        if let Some(turns) = turns {
+            self.turns = turns;
+            reconcile_disclosure(&mut self.opened, &self.turns);
+        }
         if snapshot.error != self.snapshot.error
             && let Some(error) = &snapshot.error
         {

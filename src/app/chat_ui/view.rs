@@ -6324,6 +6324,21 @@ mod tests {
     }
 
     #[test]
+    fn prose_only_refresh_keeps_prompt_strings_and_turn_group_allocations() {
+        let mut items = frame_cost::transcript(1);
+        let (mut runtime, handle) = frame_cost::live_runtime(&items);
+        let prompt = runtime.history[0].as_ptr();
+        let turns = runtime.turns.as_ptr();
+        let prose = runtime.turns.last().unwrap().prose.as_ptr();
+        let ItemContent::Text { text, .. } = &mut items.last_mut().unwrap().content else { unreachable!() };
+        text.push_str(" More streamed text.");
+        publish(&mut runtime, &handle, &items, 20);
+        assert_eq!(runtime.history[0].as_ptr(), prompt, "unchanged history strings are not cloned");
+        assert_eq!(runtime.turns.as_ptr(), turns, "unchanged placement is not regrouped");
+        assert_eq!(runtime.turns.last().unwrap().prose.as_ptr(), prose);
+    }
+
+    #[test]
     fn refresh_reparses_tail_colliding_rewrites_and_invalidates_retained_turns() {
         let body =
             |prefix: &str| format!("```text\n{}{}\n```\n", prefix.repeat(80), "z".repeat(80));
