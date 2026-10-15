@@ -1840,7 +1840,7 @@ mod tests {
         let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(terminal.id, terminal.launch, None);
         descriptor.execution_instance = uuid::Uuid::new_v4();
         let a = crate::terminal_ipc::TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source,
-            source_execution_instance: binding.execution_instance, source_binding: binding, retained_binding: None, terminal: descriptor };
+            source_execution_instance: binding.execution_instance, source_binding: binding, retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor };
         let mut b = a.clone(); b.operation = uuid::Uuid::new_v4(); b.terminal.execution_instance = uuid::Uuid::new_v4();
         let receipts = vec![a, b];
         let expected = receipts.clone();

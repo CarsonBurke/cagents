@@ -12,6 +12,7 @@ pub(in crate::host) struct History {
 }
 struct Entry {
     instance: uuid::Uuid,
+    resource_epoch: uuid::Uuid,
     unresolved: bool,
     learned_from: Option<ChatSourceBinding>,
     known: Option<(chat::runtime::BackendIdentity, ChatSourceBinding, Option<uuid::Uuid>)>,
@@ -26,12 +27,25 @@ impl History {
             }
             self.order.push_back(id);
         }
-        self.entries.insert(id, Entry { instance, unresolved: false, learned_from: None, known: None });
+        self.entries.insert(id, Entry { instance, resource_epoch: uuid::Uuid::new_v4(), unresolved: false, learned_from: None, known: None });
     }
+    /// Positively retain the native-publication boundary of a returned resource
+    /// even if it has never hosted a native actor. Issuance alone may create
+    /// this stamp; validation only looks it up and unknown/evicted refuses.
+    pub(super) fn retain_resource_epoch(&mut self, id: TerminalId) -> uuid::Uuid {
+        if !self.entries.contains_key(&id) { self.installed(id, uuid::Uuid::nil()); }
+        self.entries[&id].resource_epoch
+    }
+    pub(super) fn resource_epoch(&self, id: TerminalId) -> Option<uuid::Uuid> {
+        self.entries.get(&id).map(|entry| entry.resource_epoch)
+    }
+
     /// Fence even a start which creates a backend but loses its reply before
     /// Record installation. The previous positive publication stays invalid.
     pub(in crate::host) fn mutating(&mut self, id: TerminalId) {
+        self.retain_resource_epoch(id);
         if let Some(entry) = self.entries.get_mut(&id) {
+            entry.resource_epoch = uuid::Uuid::new_v4();
             entry.known = None;
             entry.learned_from = None;
             entry.unresolved = true;
@@ -54,6 +68,7 @@ impl History {
     fn invalidate(&mut self, id: TerminalId, instance: uuid::Uuid) -> Result<(), ProtocolError> {
         let entry = self.entries.get_mut(&id).filter(|e| e.instance == instance)
             .ok_or_else(|| unavailable("Native backend publication history is unavailable; no owner was changed"))?;
+        entry.resource_epoch = uuid::Uuid::new_v4();
         entry.known = None;
         entry.learned_from = None;
         entry.unresolved = true;
@@ -149,6 +164,7 @@ pub(in crate::host) fn pair_changed(state: &mut HostState, id: TerminalId) {
     let Some(entry) = state.native_sources.entries.get_mut(&id).filter(|entry| entry.instance == instance) else { return; };
     if entry.known.as_ref().is_some_and(|(_, binding, old_pair)|
         *old_pair != paired || binding.source.terminal != terminal) {
+        entry.resource_epoch = uuid::Uuid::new_v4();
         entry.known = None;
         entry.learned_from = None;
         state.chats.get_mut(&id).expect("same lock").source_binding = None;
@@ -244,7 +260,11 @@ pub(super) fn decorate(host: &SharedHost, response: &mut ServerResponse) {
 }
 
 pub(in crate::host) fn validate_receipt(state: &HostState, receipt: &TerminalHandoffReceipt) -> Result<(), ProtocolError> {
-    if receipt.source_execution_instance != receipt.source_binding.execution_instance
+    if receipt.terminal_native_epoch.is_nil()
+        || state.native_sources.resource_epoch(receipt.terminal.session.id) != Some(receipt.terminal_native_epoch)
+        || state.native_actor_startups.contains_key(&receipt.source.id)
+        || state.native_actor_startups.contains_key(&receipt.terminal.session.id)
+        || receipt.source_execution_instance != receipt.source_binding.execution_instance
         || !state.native_sources.validates(receipt.retained_binding.as_ref().unwrap_or(&receipt.source_binding)) {
         return Err(unavailable("The handoff's original native backend was superseded or its history is unavailable"));
     }
@@ -470,7 +490,7 @@ mod tests {
         descriptor.execution_instance = uuid::Uuid::new_v4();
         let a = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: source.clone(),
             source_execution_instance: binding.execution_instance, source_binding: binding,
-            retained_binding: None, terminal: descriptor };
+            retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor };
         let mut b = a.clone();
         b.operation = uuid::Uuid::new_v4();
         b.terminal.execution_instance = uuid::Uuid::new_v4();
@@ -516,6 +536,70 @@ mod tests {
             assert!(fixture.return_refuses(unknown).contains("captured native backend changed"));
             assert!(!owner.0.is_completed());
         }
+    }
+
+    #[test]
+    fn returned_resource_native_publication_or_ambiguous_start_survives_retirement() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let original = actor(&source);
+        let fixture = BackendFixture::new(source.clone(), original.0.clone(), uuid::Uuid::new_v4());
+        let binding = fixture.capture().unwrap();
+        // A returned worker may already have retired: only its positive,
+        // bounded publication history remains. No absence grants authority.
+        let mut terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), source.launch.recipe.clone(), None);
+        terminal.execution_instance = uuid::Uuid::new_v4();
+        let receipt = {
+            let mut state = fixture.host.lock().unwrap();
+            state.published_terminal_workers.observe(terminal.session.id, terminal.execution_instance);
+            let receipt = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: source.clone(),
+                source_execution_instance: binding.execution_instance, source_binding: binding.clone(), retained_binding: None,
+                terminal_native_epoch: state.native_sources.retain_resource_epoch(terminal.session.id), terminal: terminal.clone() };
+            state.remember_terminal_handoff(receipt.clone());
+            state.validate_terminal_handoff_receipt(&receipt).unwrap();
+            receipt
+        };
+        let mut native_source = source.clone(); native_source.id = terminal.session.id;
+        let successor = actor(&native_source); // actual independent provider process
+        {
+            let mut state = fixture.host.lock().unwrap();
+            let instance = uuid::Uuid::new_v4();
+            state.native_sources.installed(native_source.id, instance);
+            state.chats.insert(native_source.id, Record { execution_instance: instance,
+                console_recipe: None, paired_terminal: None, handoff_receipt: None, source_binding: None,
+                session: native_source.clone(), handle: successor.0.clone(), source_process: None,
+                subscribers: BTreeMap::from([(1, false)]), observations: BTreeMap::new(),
+                completion_observed: false, returning_terminal: false });
+            assert!(state.validate_terminal_handoff_receipt(&receipt).is_err());
+        }
+        successor.0.close().unwrap();
+        {
+            let mut state = fixture.host.lock().unwrap();
+            drop(state.chats.remove(&native_source.id));
+            assert!(state.chats.get(&native_source.id).is_none());
+            assert_eq!(state.published_terminal_workers.latest(native_source.id), Some(terminal.execution_instance));
+            assert!(state.native_sources.validates(&binding), "original C0 backend history is unchanged");
+            assert!(state.validate_terminal_handoff_receipt(&receipt).is_err(), "retired B cannot restore C0 -> T1 consent");
+        }
+        // A DIFFERENT returned resource is fenced before any provider creation,
+        // including failure before Record install. Clearing pending metadata
+        // cannot repair that explicitly unresolved transition.
+        let pending_id = TerminalId::new();
+        let mut pending = receipt.clone(); pending.operation = uuid::Uuid::new_v4(); pending.terminal.session.id = pending_id;
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.published_terminal_workers.observe(pending_id, pending.terminal.execution_instance);
+            pending.terminal_native_epoch = state.native_sources.retain_resource_epoch(pending_id);
+            state.remember_terminal_handoff(pending.clone());
+            state.validate_terminal_handoff_receipt(&pending).unwrap();
+            state.native_sources.mutating(pending_id); // actual production pre-creation seam
+            assert!(!state.chats.contains_key(&pending_id));
+            assert!(state.validate_terminal_handoff_receipt(&pending).is_err());
+            for _ in 0..CAPACITY { state.native_sources.retain_resource_epoch(TerminalId::new()); }
+            assert_eq!(state.native_sources.resource_epoch(pending_id), None);
+            assert!(state.validate_terminal_handoff_receipt(&pending).is_err(), "eviction never reconstructs an absence stamp");
+        }
+        assert!(!original.0.is_completed());
     }
 
 }

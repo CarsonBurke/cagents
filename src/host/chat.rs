@@ -230,8 +230,9 @@ fn issue_terminal_handoff(
     {
         return Err(unavailable("The native backend or returned worker changed before handoff publication"));
     }
+    let terminal_native_epoch = state.native_sources.retain_resource_epoch(terminal.session.id);
     let receipt = crate::terminal_ipc::TerminalHandoffReceipt {
-        operation: uuid::Uuid::new_v4(), source, source_execution_instance, source_binding, retained_binding, terminal,
+        operation: uuid::Uuid::new_v4(), source, source_execution_instance, source_binding, retained_binding, terminal_native_epoch, terminal,
     };
     state.remember_terminal_handoff(receipt.clone());
     Ok(receipt)

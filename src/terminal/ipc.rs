@@ -950,6 +950,9 @@ pub struct TerminalHandoffReceipt {
     /// Positive publication after this operation's own pairing or first
     /// confirmed thread learning. The original captured intent stays above.
     pub retained_binding: Option<ChatSourceBinding>,
+    /// Retained native publication boundary of the returned resource ID.
+    /// A later terminal -> native -> retired transition invalidates this stamp.
+    pub terminal_native_epoch: uuid::Uuid,
     pub terminal: TerminalDescriptor,
 }
 
@@ -2148,7 +2151,7 @@ mod tests {
         let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
         terminal.execution_instance = uuid::Uuid::new_v4();
         terminal.session.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
-        let receipt = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: source.clone(), source_execution_instance: binding.execution_instance, source_binding: binding.clone(), retained_binding: None, terminal: terminal.clone() };
+        let receipt = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: source.clone(), source_execution_instance: binding.execution_instance, source_binding: binding.clone(), retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: terminal.clone() };
         let request = ClientRequest::ChatReturnTerminal { chat_id: source.id, expected: binding };
         let mut bytes = Vec::new(); write_frame(&mut bytes, &request).unwrap();
         let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
