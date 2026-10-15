@@ -961,6 +961,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(feature = "ui", feature = "host"))]
     fn inherited_shared_protection_outlives_parent_guard_and_directory_replacement() {
         use std::io::{BufRead, Write};
         let runtime = tempfile::tempdir().unwrap();
