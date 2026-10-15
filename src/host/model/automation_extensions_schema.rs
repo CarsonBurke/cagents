@@ -5,7 +5,7 @@ use rusqlite::{Connection, OptionalExtension, Transaction};
 const OBJECTS: &[(&str,&str,&str)] = &[
     ("table","created_start_requirements",r###"CREATE TABLE created_start_requirements (
         session_id TEXT PRIMARY KEY, card_id TEXT NOT NULL,
-        creation_operation TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>=0),
+        intent_operation TEXT NOT NULL, generation INTEGER NOT NULL CHECK(generation>=0),
         attempt TEXT NOT NULL UNIQUE, kind TEXT NOT NULL CHECK(kind IN('terminal','native_chat')),
         phase TEXT NOT NULL CHECK(phase IN('required','started','retired')), started_receipt TEXT,
         CHECK(phase!='required' OR started_receipt IS NULL),
@@ -242,11 +242,11 @@ mod tests {
         let card=uuid::Uuid::new_v4().to_string();
         let first=uuid::Uuid::new_v4().to_string();let second=uuid::Uuid::new_v4().to_string();
         let operation=uuid::Uuid::new_v4().to_string();let attempt=uuid::Uuid::new_v4().to_string();
-        registry.db.execute("INSERT INTO created_start_requirements(session_id,card_id,creation_operation,generation,attempt,kind,phase) VALUES(?1,?2,?3,0,?4,'native_chat','required')",rusqlite::params![first,card,operation,attempt]).unwrap();
-        assert!(registry.db.execute("INSERT INTO created_start_requirements(session_id,card_id,creation_operation,generation,attempt,kind,phase) VALUES(?1,?2,?3,1,?4,'terminal','required')",rusqlite::params![second,card,operation,uuid::Uuid::new_v4().to_string()]).is_err());
+        registry.db.execute("INSERT INTO created_start_requirements(session_id,card_id,intent_operation,generation,attempt,kind,phase) VALUES(?1,?2,?3,0,?4,'native_chat','required')",rusqlite::params![first,card,operation,attempt]).unwrap();
+        assert!(registry.db.execute("INSERT INTO created_start_requirements(session_id,card_id,intent_operation,generation,attempt,kind,phase) VALUES(?1,?2,?3,1,?4,'terminal','required')",rusqlite::params![second,card,operation,uuid::Uuid::new_v4().to_string()]).is_err());
         assert!(registry.db.execute("UPDATE created_start_requirements SET phase='started' WHERE session_id=?1",[&first]).is_err(),"a successful RPC is not a start receipt");
         registry.db.execute("UPDATE created_start_requirements SET phase='retired' WHERE session_id=?1",[&first]).unwrap();
-        registry.db.execute("INSERT INTO created_start_requirements(session_id,card_id,creation_operation,generation,attempt,kind,phase) VALUES(?1,?2,?3,1,?4,'terminal','required')",rusqlite::params![second,card,operation,uuid::Uuid::new_v4().to_string()]).unwrap();
+        registry.db.execute("INSERT INTO created_start_requirements(session_id,card_id,intent_operation,generation,attempt,kind,phase) VALUES(?1,?2,?3,1,?4,'terminal','required')",rusqlite::params![second,card,operation,uuid::Uuid::new_v4().to_string()]).unwrap();
         drop(registry);
         let registry=Registry::at(&path).unwrap();
         assert_eq!(registry.db.query_row("SELECT phase,started_receipt FROM created_start_requirements WHERE session_id=?1",[&first],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?))).unwrap(),("retired".into(),None));
