@@ -207,10 +207,31 @@ impl Fixture {
             .unwrap()
             .name
     }
+    // Crash seeds retain the same canonical Value serialization as the journal's
+    // byte-exact payload CAS. SQLite json_set with a struct-serialized fragment
+    // would preserve its different field order and fabricate a stale payload.
+    fn install_setup_intent(&self, path: &Path, intent: &cagents::repository::WorktreeSetupIntent) {
+        let journal = self.root.path().join("data").join(cagents::instance::STORAGE_NAME)
+            .join("worktree-operations.sqlite3");
+        let connection = rusqlite::Connection::open(journal).unwrap();
+        let payload: String = connection.query_row(
+            "SELECT payload_json FROM pending_operations WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?1",
+            [path.to_str().unwrap()], |row| row.get(0)).unwrap();
+        let mut payload: Value = serde_json::from_str(&payload).unwrap();
+        payload["request"]["setup_intent"] = serde_json::to_value(intent).unwrap();
+        assert_eq!(connection.execute(
+            "UPDATE pending_operations SET payload_json=?1 WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?2",
+            rusqlite::params![serde_json::to_string(&payload).unwrap(), path.to_str().unwrap()]).unwrap(), 1);
+    }
+    fn error(output: &Output) -> Value {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "JSON errors belong to stderr: {output:?}");
+        serde_json::from_slice(&output.stderr).unwrap_or_else(|error| panic!("Invalid error JSON: {error}: {output:?}"))
+    }
     fn refusal(&self, target: &str, contains: &str) {
         let output = self.output(&["worktree", "remove", target]);
         assert!(!output.status.success(), "{output:?}");
-        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let value = Self::error(&output);
         assert_eq!(value["ok"], false);
         assert!(value.to_string().contains(contains), "{value}");
     }
@@ -364,7 +385,7 @@ fn removal_refuses_a_target_naming_different_branch_and_relative_path_worktrees(
     let path_target = fixture.create("path-choice");
     let output = fixture.output(&["worktree", "remove", "managed/path-choice", "--force"]);
     assert!(!output.status.success(), "{output:?}");
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let value = Fixture::error(&output);
     assert!(
         value
             .to_string()
@@ -466,7 +487,7 @@ fn setup_preparation_failure_returns_nonzero_and_reports_the_retained_checkout()
         !output.status.success(),
         "known preparation failure must not report success: {output:?}"
     );
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let value = Fixture::error(&output);
     assert_eq!(value["ok"], false);
     assert!(
         value.to_string().contains("Worktree was created"),
@@ -630,7 +651,7 @@ fn project_selector_refuses_distinct_path_and_name_but_preserves_explicit_paths(
         "--no-setup",
     ]);
     assert!(!refused.status.success());
-    let error: Value = serde_json::from_slice(&refused.stdout).unwrap();
+    let error = Fixture::error(&refused);
     let message = error["error"]["message"].as_str().unwrap();
     assert!(message.contains("ambiguous"), "{error}");
     assert!(
@@ -747,7 +768,7 @@ fn removal_refuses_a_canonical_path_that_cannot_be_encoded_exactly() {
     std::os::unix::fs::symlink(&raw, &alias).unwrap();
     let output = fixture.output(&["worktree", "remove", "raw-alias", "--force"]);
     assert!(!output.status.success(), "{output:?}");
-    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    let value = Fixture::error(&output);
     assert!(
         value
             .to_string()
@@ -860,15 +881,7 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
         run_id: Some(OperationId::new()),
         copy_done: true,
     };
-    let journal = fixture
-        .root
-        .path()
-        .join("data")
-        .join(cagents::instance::STORAGE_NAME)
-        .join("worktree-operations.sqlite3");
-    let connection = rusqlite::Connection::open(journal).unwrap();
-    assert_eq!(connection.execute("UPDATE pending_operations SET payload_json=json_set(payload_json,'$.request.setup_intent',json(?1)) WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?2",rusqlite::params![serde_json::to_string(&crash_intent).unwrap(),path.to_str().unwrap()]).unwrap(),1);
-    drop(connection);
+    fixture.install_setup_intent(&path, &crash_intent);
     let device_service::Reply::Worktree(Reply::SetupIntents { intents, warnings }) = client
         .device_operation(device_service::Operation::Worktree {
             operation: Operation::SetupIntents {
@@ -1294,9 +1307,7 @@ fn superseded_pending_setup_cannot_start_after_an_explicit_skip() {
         .join("data")
         .join(cagents::instance::STORAGE_NAME)
         .join("worktree-operations.sqlite3");
-    let connection = rusqlite::Connection::open(&journal).unwrap();
-    assert_eq!(connection.execute("UPDATE pending_operations SET payload_json=json_set(payload_json,'$.request.setup_intent',json(?1)) WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?2",rusqlite::params![serde_json::to_string(&intent).unwrap(),path.to_str().unwrap()]).unwrap(),1);
-    drop(connection);
+    fixture.install_setup_intent(&path, &intent);
     let socket = fixture
         .root
         .path()
