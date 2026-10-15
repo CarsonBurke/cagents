@@ -39,7 +39,9 @@ pub(crate) fn receive_response(stream:&UnixStream,deadline:Instant)
         if header[..4]!=MAGIC || metadata_len==0 || metadata_len>MAX_CHALLENGE_BYTES
             || row_len==0 || row_len>MAX_CREATION_ROW_BYTES {return Err(invalid("Invalid private creation response header"));}
         let mut metadata=vec![0;metadata_len];read_exact(stream,&mut metadata,deadline)?;
-        let challenge:UiJournalChallenge=postcard::from_bytes(&metadata).map_err(|e|invalid(&e.to_string()))?;
+        let (challenge,unused): (UiJournalChallenge, &[u8]) = postcard::take_from_bytes(&metadata)
+            .map_err(|e|invalid(&e.to_string()))?;
+        if !unused.is_empty() {return Err(invalid("Trailing private creation challenge metadata"));}
         challenge.validate_shape()?;
         let mut row=vec![0;row_len];read_exact(stream,&mut row,deadline)?;
         let response=UiJournalResponse::from_wire(challenge,row)?;
@@ -137,6 +139,23 @@ mod tests {
             a.write_all(&header).unwrap();assert!(receive_response(&b,Instant::now()+Duration::from_secs(1)).is_err());
             a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();assert_eq!(a.read(&mut[0u8;1]).unwrap(),0);
         }
+    }
+    #[test]
+    fn private_response_refuses_metadata_suffix_before_reading_row_or_rights() {
+        let mut metadata = postcard::to_stdvec(&challenge()).unwrap();
+        metadata.push(0);
+        let (mut a, b) = UnixStream::pair().unwrap();
+        let mut header = [0u8; 12];
+        header[..4].copy_from_slice(&MAGIC);
+        header[4..8].copy_from_slice(&(metadata.len() as u32).to_be_bytes());
+        header[8..12].copy_from_slice(&1u32.to_be_bytes());
+        a.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+        a.write_all(&header).unwrap();
+        a.write_all(&metadata).unwrap();
+        let error = receive_response(&b, Instant::now() + Duration::from_secs(1)).err().unwrap();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        a.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(a.read(&mut [0u8; 1]).unwrap(), 0);
     }
     #[test]
     fn incomplete_private_frame_uses_one_deadline_and_invalidates_stream() {
