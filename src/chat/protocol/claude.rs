@@ -1534,6 +1534,7 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.cwd = directory.to_path_buf(); Ok(()) }
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
