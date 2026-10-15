@@ -605,13 +605,20 @@ fn watch(
     }
 }
 
-/// The daemon's end of a holder: its control socket and its process.
-/// Dropping it releases the holder, unless the holder was detached.
+/// Initialize fixed cleanup services before measuring daemon readiness.
+pub(super) fn initialize_cleanup() -> Result<(),String> {
+    // Warm the fixed original-child reaper without starting any child.
+    drop(crate::daemon::child_reaper::reserve().map_err(|error|error.to_string())?);
+    release::initialize()
+}
+
 struct OwnedChild {
     child: Child,
     reservation: crate::daemon::child_reaper::Reservation,
 }
 
+/// The daemon's end of a holder: its control socket and its process.
+/// Dropping it releases the holder, unless the holder was detached.
 pub(super) struct Holder {
     control: UnixStream,
     /// A holder this daemon started is its child, which it reaps. An adopted
