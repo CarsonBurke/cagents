@@ -34,6 +34,8 @@ pub struct SourcePart {
     pub source_len: usize,
     /// A bounded resident child placeholder represents no original bytes.
     pub replacement: bool,
+    /// Changes only when the original source is replaced, never on append.
+    pub epoch: u64,
     pub metadata: SourceMetadata,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
