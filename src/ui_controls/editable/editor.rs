@@ -203,6 +203,11 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
     ) {
         self.inner
             .operate(&mut tree.children[0], layout, renderer, operation);
+        operation.custom(
+            tree.state.downcast_ref::<EditorState>().identity.id.as_ref(),
+            layout.bounds(),
+            &mut crate::input_trace::TextEditing,
+        );
     }
     fn overlay<'b>(
         &'b mut self,
