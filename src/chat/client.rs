@@ -2048,7 +2048,7 @@ fn acknowledge_terminal_handoff_receipts_on(
         Ok(client) => client,
         Err(error) => return vec![Err(error.to_string()); receipts.len()],
     };
-    let mut connection_failure = None;
+    let mut connection_failure: Option<String> = None;
     receipts.iter().map(|receipt| {
         if receipt.source.proof.as_ref() != Some(client.proof()) {
             return Err("The exact daemon that issued this terminal handoff is unavailable; its receipt was retained".into());
