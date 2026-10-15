@@ -211,7 +211,11 @@ impl Fixture {
     // byte-exact payload CAS. SQLite json_set with a struct-serialized fragment
     // would preserve its different field order and fabricate a stale payload.
     fn install_setup_intent(&self, path: &Path, intent: &cagents::repository::WorktreeSetupIntent) {
-        let journal = self.root.path().join("data").join(cagents::instance::STORAGE_NAME)
+        let journal = self
+            .root
+            .path()
+            .join("data")
+            .join(cagents::instance::STORAGE_NAME)
             .join("worktree-operations.sqlite3");
         let connection = rusqlite::Connection::open(journal).unwrap();
         let payload: String = connection.query_row(
@@ -225,8 +229,12 @@ impl Fixture {
     }
     fn error(output: &Output) -> Value {
         assert!(!output.status.success(), "{output:?}");
-        assert!(output.stdout.is_empty(), "JSON errors belong to stderr: {output:?}");
-        serde_json::from_slice(&output.stderr).unwrap_or_else(|error| panic!("Invalid error JSON: {error}: {output:?}"))
+        assert!(
+            output.stdout.is_empty(),
+            "JSON errors belong to stderr: {output:?}"
+        );
+        serde_json::from_slice(&output.stderr)
+            .unwrap_or_else(|error| panic!("Invalid error JSON: {error}: {output:?}"))
     }
     fn refusal(&self, target: &str, contains: &str) {
         let output = self.output(&["worktree", "remove", target]);
