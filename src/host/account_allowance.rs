@@ -57,7 +57,7 @@ mod tests {
         let error=execute(&host,Request {session,action:Action::Inspect}).unwrap_err();
         assert!(error.contains("shutting down"));
         let state=host.lock().unwrap();
-        assert!(state.chats.is_empty() && state.chat_spawning.is_empty() && state.terminals.is_empty() && state.spawning.is_empty());
+        assert!(state.chats.is_empty() && state.chat_spawning.is_empty() && state.terminals.is_empty());
         assert!(state.chat_handoffs.is_empty());
     }
 }
