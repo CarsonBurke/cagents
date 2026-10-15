@@ -154,7 +154,7 @@ impl State {
     }
 
     fn needs_file_page(&self) -> bool {
-        if self.pages.hydrate_all {
+        if self.pages.hydrate_all || self.only_changed_since_viewed {
             return true;
         }
         let unknown = |path: &RepoPath| {
@@ -323,6 +323,38 @@ mod tests {
             ViewedSync::Unknown,
             "absent state is not unviewed"
         );
+    }
+
+    #[test]
+    fn changed_only_filter_loads_a_dismissed_mark_beyond_the_first_hundred_files() {
+        use cosmic::iced::futures::StreamExt;
+        let (mut state, api) = state();
+        drop(state.update(Action::Open(target(1))));
+        let mut initial = loaded((0..101).map(|i| entry(&format!("file-{i:04}.rs"), ChangeKind::Modified)).collect(),
+            (0..100).map(|i| remote_file(&format!("file-{i:04}.rs"), true)).collect());
+        initial.next_file_cursor = Some("page-2".into());
+        finish_load(&mut state, initial);
+        assert!(!state.pages.loading);
+        let mut changed = remote_file("file-0100.rs", false); changed.viewer_viewed_state = FileViewedState::Dismissed;
+        let context = state.context.as_ref().unwrap();
+        *api.page.lock().unwrap() = Some(PullRequestFilePage { files: vec![changed], next_cursor: None,
+            viewer: context.viewer.clone(), pull_request_id: context.pull_request_id.clone(), head_oid: context.head_oid.clone(), base_oid: context.base_oid.clone() });
+        let task = state.update(Action::ToggleChangedSinceViewed);
+        assert!(state.pages.loading, "the filter must request unknown marks even when it displays no rows");
+        assert!(state.changed_files_empty_label().contains("incomplete"));
+        let receipt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            let mut stream = iced::runtime::task::into_stream(task).unwrap();
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(action @ Action::FilePage(PageAction::Loaded { .. })) = action { return action; }
+            }
+            panic!("file-page worker returned no receipt");
+        });
+        drop(state.update(receipt));
+        assert!(state.files[100].changed_since_viewed);
+        assert!(!state.file_marks_incomplete());
+        let displayed = state.displayed_file_rows(&directory_tallies(&state.rows, &state.files));
+        assert_eq!(displayed.len(), 1);
+        assert_eq!(state.rows[displayed[0]].file, Some(100));
     }
 
     #[test]

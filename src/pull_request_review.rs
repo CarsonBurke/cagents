@@ -2240,7 +2240,7 @@ impl State {
         let viewed = self.files.iter().filter(|file| file.viewed).count();
         let changed = self.files.iter().filter(|file| file.changed_since_viewed).count();
         let toolbar = widget::row::with_children(vec![
-            design::caption(format!("{viewed}/{} viewed · {changed} changed since viewed", self.files.len()))
+            design::caption(format!("{viewed}/{} viewed · {changed} changed since viewed{}", self.files.len(), if self.file_marks_incomplete() { " (incomplete)" } else { "" }))
                 .width(Length::Fill)
                 .into(),
             controls,
@@ -2305,6 +2305,15 @@ impl State {
             .collect()
     }
 
+    fn file_marks_incomplete(&self) -> bool {
+        self.pages.cursor.is_some() || self.files.iter().any(|file| file.sync == ViewedSync::Unknown)
+    }
+
+    fn changed_files_empty_label(&self) -> &'static str {
+        if self.file_marks_incomplete() { "Changed-file results are incomplete until all viewed states are loaded." }
+        else { "No files changed since you viewed them." }
+    }
+
     fn file_scrollable(&self, modal_open: bool, height: f32) -> Element<'_, Action> {
         let tallies = directory_tallies(&self.rows, &self.files);
         let mut rows: Vec<crate::sticky_tree::Row<'_, Action>> = Vec::new();
@@ -2353,7 +2362,7 @@ impl State {
         if rows.is_empty() {
             let message = match &self.load {
                 LoadState::Loading => "",
-                LoadState::Ready if self.only_changed_since_viewed => "No files changed since you viewed them.",
+                LoadState::Ready if self.only_changed_since_viewed => self.changed_files_empty_label(),
                 LoadState::Ready if self.hide_viewed && !self.files.is_empty() => {
                     "All files viewed."
                 }
