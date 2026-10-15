@@ -6038,17 +6038,6 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
 fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
-<<<<<<< HEAD
-    if worktree.status_error.is_some()
-        || worktree
-            .dirty
-            .as_ref()
-            .is_some_and(|dirty| dirty.conflicted > 0)
-    {
-        Icon::Warning
-    } else {
-        Icon::Changes
-=======
     if worktree.status_error.is_some() || worktree.operation_error.is_some()
         || worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) {
         return Icon::Warning;
@@ -6060,29 +6049,14 @@ fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
         Some(GitOperationKind::CherryPick) => Icon::Commit,
         Some(GitOperationKind::Revert) => Icon::RevertFile,
         None => Icon::Changes,
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
     }
 }
 
 fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
-<<<<<<< HEAD
-    if worktree.status_error.is_some() {
-        BadgeTone::Warning
-    } else if worktree
-        .dirty
-        .as_ref()
-        .is_some_and(|dirty| dirty.conflicted > 0)
-    {
-        BadgeTone::Danger
-    } else {
-        BadgeTone::Warning
-    }
-=======
     if worktree.status_error.is_some() || worktree.operation_error.is_some() { BadgeTone::Warning }
     else if worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) { BadgeTone::Danger }
     else if worktree.operation.is_some() { BadgeTone::Neutral }
     else { BadgeTone::Warning }
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
 }
 
 fn worktree_change_count(worktree: &SidebarWorktree) -> String {
@@ -6090,20 +6064,10 @@ fn worktree_change_count(worktree: &SidebarWorktree) -> String {
         return "?".to_owned();
     }
     let count = worktree.dirty.as_ref().map_or(0, dirty_count);
-<<<<<<< HEAD
-    if count > 999 {
-        "999+".to_owned()
-    } else if worktree.listing_truncated {
-        format!("{count}+")
-    } else {
-        count.to_string()
-    }
-=======
     let count = if count > 999 { "999+".to_owned() } else if worktree.listing_truncated {format!("{count}+")} else { count.to_string() };
     if worktree.operation_error.is_some() { format!("{count} · ?") }
     else if let Some(operation) = worktree.operation { format!("{} · {count}", operation.label()) }
     else { count }
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
 }
 
 fn worktree_indicator(

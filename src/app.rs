@@ -1767,11 +1767,8 @@ pub struct LoadedRepository {
     github: GitHubAvailability,
     review_repository: Option<GitHubRepoKey>,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
-<<<<<<< HEAD
     status_order: git_ui::LoadedStatusOrder,
-=======
     operations: HashMap<crate::model::WorktreeId, crate::repository::GitOperationObservation>,
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
 }
 
 type WorktreePrCacheKey = (GitHubRepoKey, GitHubRepoKey, String, String);
@@ -13808,7 +13805,6 @@ impl Application for Cagents {
                                     SidebarWorktree::from_repository(record, status.as_ref());
                                 row.head_repository =
                                     loaded.head_repositories.get(&record.id).cloned();
-<<<<<<< HEAD
                                 row.apply_status_error(
                                     loaded
                                         .status_order
@@ -13816,11 +13812,9 @@ impl Application for Cagents {
                                         .get(&record.id)
                                         .map(String::as_str),
                                 );
-=======
                                 if let Some(operation) = loaded.operations.get(&record.id) {
                                     row.apply_operation(operation);
                                 }
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
                                 row
                             })
                             .collect();
@@ -17782,11 +17776,8 @@ fn load_project(
         github: GitHubAvailability::NotAssociated,
         review_repository: None,
         head_repositories: HashMap::new(),
-<<<<<<< HEAD
         status_order: Default::default(),
-=======
         operations: HashMap::new(),
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
     })
 }
 
@@ -17880,11 +17871,8 @@ fn load_repository(
         github: github_availability,
         review_repository,
         head_repositories,
-<<<<<<< HEAD
         status_order,
-=======
         operations,
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
     })
 }
 
@@ -23782,11 +23770,8 @@ mod tests {
             github: GitHubAvailability::NotAssociated,
             review_repository: None,
             head_repositories: HashMap::new(),
-<<<<<<< HEAD
             status_order: Default::default(),
-=======
             operations: HashMap::new(),
->>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
         };
 
         // The failure lands last on purpose. A failure followed by a success
