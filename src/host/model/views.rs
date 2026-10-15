@@ -313,6 +313,16 @@ pub(super) fn apply(
                     {
                         return Err("workspace view removal source conflict".into());
                     }
+                    // This is the accepted source/consent path, after original
+                    // registry/repository/revision/unique-owner validation.
+                    // Lookup stays bound to ORIGINAL before (a proved handoff
+                    // may now have a different terminal ID); retirement checks
+                    // the separately validated CURRENT pane in this SAME TX.
+                    let current=view.panes.iter().find(|pane|pane.id==before.id).cloned()
+                        .ok_or("workspace view removal source conflict")?;
+                    if let Some(requirement)=super::created_start::retirement_requirement(transaction,before)? {
+                        super::created_start::retire(transaction,&requirement,scope,&current)?;
+                    }
                     let changed = view.apply(change)?;
                     transaction
                         .execute(
@@ -817,4 +827,56 @@ mod tests {
             "explicit CLI Remove retains its existing current-membership semantics"
         );
     }
+    // Actual cumulative Registry19 + directory-start producer1c143 + authenticated
+    // HostState/receipt source graph are mandatory. These Registry fixtures use
+    // explicit Started metadata, not a real startup/cleanup proof or fake DDL.
+    fn created_console_fixture() -> (Registry,tempfile::TempDir,ChannelId,Pane,Pane,crate::terminal::ipc::TerminalHandoffReceipt,crate::model::CreatedStartRequirement) {
+        let (mut registry,directory,a,_)=setup();
+        let (original,receipt)=crate::workspace_model::views::handoff_tests::fixture();
+        let CardKind::Chat(source)=&original.kind else {panic!()};
+        let requirement=crate::model::CreatedStartRequirement{card:original.id,session:source.id,
+            operation:crate::model::OperationId::new(),generation:7,attempt:Uuid::new_v4(),kind:crate::model::CreatedStartKind::NativeChat};
+        registry.require_created_start(&requirement).unwrap();
+        seed(&mut registry,a,vec![original.clone()]);
+        registry.db.execute("UPDATE created_start_requirements SET phase='started',started_receipt='metadata-fixture-not-execution-proof' WHERE session_id=?1",[requirement.session.to_string()]).unwrap();
+        let mut current=original.clone();current.kind=CardKind::Terminal(receipt.terminal.session.clone());
+        assert_ne!(requirement.session,receipt.terminal.session.id,"exercise real distinct-ID handoff shape");
+        let change=edit(&mut registry,a,Change::Update{before:original.clone(),pane:current.clone()});
+        registry.apply(&change).unwrap();
+        (registry,directory,a,original,current,receipt,requirement)
+    }
+    #[test]
+    fn conditional_remove_retires_original_started_target_after_validated_distinct_id_handoff() {
+        let (mut registry,_directory,a,original,current,receipt,requirement)=created_console_fixture();
+        let identity=registry.model().unwrap().identity;
+        // Current console alone cannot choose its card's historical native
+        // obligation. The actual HostState also rejects fabricated handoffs.
+        let guessed=edit(&mut registry,a,Change::RemoveSource{registry:identity,repository:"/repo".into(),before:current.clone(),execution_instance:Some(receipt.terminal.execution_instance),handoff:None});
+        let before=registry.model().unwrap();assert!(registry.apply(&guessed).is_err());assert_eq!(registry.model().unwrap(),before);
+        assert_eq!(registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap().state,super::super::created_start::CreatedStartState::Started);
+        let accepted=edit(&mut registry,a,Change::RemoveSource{registry:identity,repository:"/repo".into(),before:original,execution_instance:Some(receipt.terminal.execution_instance),handoff:Some(receipt)});
+        registry.apply(&accepted).unwrap();
+        let retired=registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap();
+        assert_eq!(retired.requirement,requirement,"never rewrite native tuple to current console kind/ID");
+        assert_eq!(retired.state,super::super::created_start::CreatedStartState::Retired);
+        assert!(read(&registry.db,&Scope::Channel(a)).unwrap().panes.is_empty());
+        let done=registry.model().unwrap();registry.apply(&accepted).unwrap();assert_eq!(registry.model().unwrap(),done);
+        assert!(registry.require_created_start(&requirement).is_err(),"accepted removal keeps permanent negative history");
+    }
+    #[test]
+    fn conditional_remove_retirement_rolls_back_with_membership_and_cli_remove_does_not_infer_consent() {
+        let (mut registry,_directory,a,original,current,receipt,requirement)=created_console_fixture();
+        let identity=registry.model().unwrap().identity;
+        registry.db.execute_batch("CREATE TRIGGER fixture_refuse_membership_delete BEFORE DELETE ON shared_view_panes BEGIN SELECT RAISE(ABORT,'fixture membership delete refused'); END;").unwrap();
+        let accepted=edit(&mut registry,a,Change::RemoveSource{registry:identity,repository:"/repo".into(),before:original,execution_instance:Some(receipt.terminal.execution_instance),handoff:Some(receipt)});
+        let before=registry.model().unwrap();assert!(registry.apply(&accepted).is_err());assert_eq!(registry.model().unwrap(),before);
+        let operation=match &accepted {ModelEdit::ChangeView{operation,..}=>*operation,_=>panic!()};
+        assert!(!registry.view_operation_seen(operation).unwrap());
+        assert_eq!(registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap().state,super::super::created_start::CreatedStartState::Started,"failed membership write rolls back retirement in same TX");
+        registry.db.execute_batch("DROP TRIGGER fixture_refuse_membership_delete;").unwrap();
+        let ordinary=edit(&mut registry,a,Change::Remove{id:current.id});registry.apply(&ordinary).unwrap();
+        assert!(read(&registry.db,&Scope::Channel(a)).unwrap().panes.is_empty());
+        assert_eq!(registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap().state,super::super::created_start::CreatedStartState::Started,"bare CLI membership removal gains no inferred owning retirement authority");
+    }
+
 }
