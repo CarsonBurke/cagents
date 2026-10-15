@@ -11900,51 +11900,84 @@ mod worktree_journal_tests {
             ) -> Result<ProcessOutput, ProcessFailure> {
                 let output = SystemProcessExecutor.execute(command, token)?;
                 if output.success
-                    && command.arguments.iter().any(|argument| argument == "--git-dir")
-                    && command.arguments.windows(2).any(|pair| {
-                        pair[0] == "-C" && pair[1] == self.destination.as_os_str()
-                    })
+                    && command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "--git-dir")
+                    && command
+                        .arguments
+                        .windows(2)
+                        .any(|pair| pair[0] == "-C" && pair[1] == self.destination.as_os_str())
                     && !self.fired.swap(true, std::sync::atomic::Ordering::SeqCst)
                 {
                     fs::write(
                         self.destination.join(".git"),
                         format!("gitdir: {}\n", self.other_admin.display()),
-                    ).unwrap();
+                    )
+                    .unwrap();
                 }
                 Ok(output)
             }
         }
         let mut fixture = Fixture::new();
         fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
-            issue_id: "ENG-123".into(), workspace: None,
+            issue_id: "ENG-123".into(),
+            workspace: None,
         });
         interrupted_linear_checkout(&fixture);
-        let original_admin = fixture.service.git_dir(
-            &fixture.request.destination, &CancellationToken::new(),
-        ).unwrap();
+        let original_admin = fixture
+            .service
+            .git_dir(&fixture.request.destination, &CancellationToken::new())
+            .unwrap();
         let original_gitfile = fs::read(fixture.request.destination.join(".git")).unwrap();
         let unrelated = Fixture::new();
-        let other_admin = unrelated.service.git_dir(
-            &unrelated.request.repository, &CancellationToken::new(),
-        ).unwrap();
+        let other_admin = unrelated
+            .service
+            .git_dir(&unrelated.request.repository, &CancellationToken::new())
+            .unwrap();
         let executor = Arc::new(RetargetAfterDiscovery {
-            destination: fixture.request.destination.clone(), other_admin: other_admin.clone(),
+            destination: fixture.request.destination.clone(),
+            other_admin: other_admin.clone(),
             fired: std::sync::atomic::AtomicBool::new(false),
         });
         let service = RepositoryService::new("git", Arc::clone(&executor));
-        let report = service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
+        let report = service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
         assert!(executor.fired.load(std::sync::atomic::Ordering::SeqCst));
-        assert_eq!(report.state, WorktreeOperationState::ReconcileRequired, "{report:?}");
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::ReconcileRequired,
+            "{report:?}"
+        );
         assert!(report.detail.contains("administrative identity changed"));
         for admin in [&original_admin, &other_admin] {
             assert!(!admin.join("cagents-linear.json").exists());
         }
-        assert_eq!(fs::read_to_string(original_admin.join("locked")).unwrap().trim(),
-            format!("cagents:{}", fixture.request.operation_id));
+        assert_eq!(
+            fs::read_to_string(original_admin.join("locked"))
+                .unwrap()
+                .trim(),
+            format!("cagents:{}", fixture.request.operation_id)
+        );
         fs::write(fixture.request.destination.join(".git"), original_gitfile).unwrap();
-        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
-        assert_eq!(recovered.state, WorktreeOperationState::Created, "{recovered:?}");
-        assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
+        let recovered = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            recovered.state,
+            WorktreeOperationState::Created,
+            "{recovered:?}"
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.destination)
+                .unwrap()
+                .issue_id,
+            "ENG-123"
+        );
         assert!(!other_admin.join("cagents-linear.json").exists());
     }
 

@@ -440,9 +440,10 @@ mod tests {
         std::fs::write(
             checkout.path().join(".git"),
             format!("gitdir: {}\n", other.path().display()),
-        ).unwrap();
-        let error = ensure_link_for_creation(checkout.path(), &expected, "ENG-123", None)
-            .unwrap_err();
+        )
+        .unwrap();
+        let error =
+            ensure_link_for_creation(checkout.path(), &expected, "ENG-123", None).unwrap_err();
         assert_eq!(error.kind, "linear_link_context_changed");
         assert!(read_stored_link(&expected).unwrap().is_none());
         assert!(read_stored_link(&other).unwrap().is_none());
