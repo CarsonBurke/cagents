@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkouts/project")));
         model.fold(3, &ModelEdit::OpenProject {
             repository: "/metadata/project.git".into(), checkout: Some("/checkouts/linked".into()), primary_checkout: None,
-            name: "project".into(), kind: ProjectKind::Git,
+            name: "renamed".into(), kind: ProjectKind::Git,
         });
         assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkouts/linked")));
         assert_eq!(model.projects[0].primary_checkout.as_deref(), Some(Path::new("/checkouts/project")));
