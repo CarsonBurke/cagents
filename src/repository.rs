@@ -4611,12 +4611,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         paths: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<Vec<RepoPath>, RepositoryError> {
-        // ls-files has no stdin pathspec support. Read the index once and
-        // filter by hashed membership; argv stays bounded for every selection.
-        let command = self.git_literal_read(worktree, ["ls-files", "-z"]);
-        let output = self.run_checked(&command, cancellation)?;
-        let parsed = parse_path_list(&output.stdout, "git ls-files");
-        let listed: HashSet<_> = invalid_output(parsed, output)?.into_iter().collect();
+        // ls-files has no stdin pathspec support. Bound both argv and stdout
+        // by querying selected literal paths in small batches; a one-file
+        // operation must not enumerate an arbitrarily large repository index.
+        let mut listed = HashSet::new();
+        for batch in bounded_pathspec_batches(paths) {
+            let mut arguments = vec![OsString::from("ls-files"), OsString::from("-z"), OsString::from("--")];
+            arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
+            let command = self.git_literal_read(worktree, arguments);
+            let output = self.run_checked(&command, cancellation)?;
+            let parsed = parse_path_list(&output.stdout, "git ls-files");
+            listed.extend(invalid_output(parsed, output)?);
+        }
         Ok(paths
             .iter()
             .filter(|path| listed.contains(path))
@@ -4635,17 +4641,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         paths: &[&RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<Vec<RepoPath>, RepositoryError> {
-        // ls-tree likewise lacks stdin pathspecs. A recursive listing plus
-        // membership filtering avoids both ARG_MAX and quadratic scans.
-        let command = self.git_literal_read(worktree, ["ls-tree", "-r", "-z", revision.as_str()]);
-        let output = self.run_checked(&command, cancellation)?;
-        let parsed = parse_tree_entries(&output.stdout);
-        let entries = invalid_output(parsed, output)?;
-        let listed: HashSet<RepoPath> = entries.into_iter().map(|entry| entry.path).collect();
+        let mut listed = HashSet::new();
+        let paths: Vec<RepoPath> = paths.iter().map(|path| (*path).clone()).collect();
+        for batch in bounded_pathspec_batches(&paths) {
+            let mut arguments = vec![OsString::from("ls-tree"), OsString::from("-r"), OsString::from("-z"), OsString::from(revision.as_str()), OsString::from("--")];
+            arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
+            let command = self.git_literal_read(worktree, arguments);
+            let output = self.run_checked(&command, cancellation)?;
+            let parsed = parse_tree_entries(&output.stdout);
+            let entries = invalid_output(parsed, output)?;
+            listed.extend(entries.into_iter().map(|entry| entry.path));
+        }
         Ok(paths
             .iter()
             .filter(|path| listed.contains(*path))
-            .map(|path| (*path).clone())
+            .cloned()
             .collect())
     }
 
@@ -6139,6 +6149,27 @@ fn read_options(command: CommandSpec) -> CommandSpec {
         .env("GIT_OPTIONAL_LOCKS", "0")
 }
 
+/// Git read commands lack stdin pathspec support. Keep each argv far below
+/// ARG_MAX including argument-pointer overhead; preserve order between batches.
+fn bounded_pathspec_batches(paths: &[RepoPath]) -> impl Iterator<Item = &[RepoPath]> {
+    use std::os::unix::ffi::OsStrExt;
+    const BUDGET: usize = 32 * 1024;
+    let mut remaining = paths;
+    std::iter::from_fn(move || {
+        if remaining.is_empty() { return None; }
+        let mut bytes = 0usize;
+        let count = remaining.iter().take_while(|path| {
+            let next = path.as_os_str().as_bytes().len() + 1 + std::mem::size_of::<usize>();
+            if bytes != 0 && bytes.saturating_add(next) > BUDGET { return false; }
+            bytes = bytes.saturating_add(next);
+            true
+        }).count();
+        let (batch, rest) = remaining.split_at(count);
+        remaining = rest;
+        Some(batch)
+    })
+}
+
 /// NUL-delimited literal paths preserve arbitrary Unix names without argv limits.
 fn pathspec_input(paths: &[RepoPath]) -> Vec<u8> {
     use std::os::unix::ffi::OsStrExt;
@@ -6787,6 +6818,32 @@ mod tests {
         }
 
         #[test]
+        fn small_membership_queries_do_not_enumerate_large_index_or_head_tree() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("selected.txt"), "base").unwrap();
+            git(root, &["add", "selected.txt"]);
+            let blob = String::from_utf8(git_output(root, &["rev-parse", ":selected.txt"])).unwrap();
+            let mut input = Vec::new();
+            // Over17MiB of index names, plus substantially larger ls-tree
+            // records, reproduced the default16MiB process-output failure.
+            for index in 0..250_000 {
+                input.extend_from_slice(format!("100644 {}\tgenerated_component_file_with_an_extraordinarily_long_name_{index:06}.txt\0", blob.trim()).as_bytes());
+            }
+            let service = service();
+            let cancel = CancellationToken::new();
+            let command = service.git_mutation(root, ["update-index", "-z", "--index-info"]).stdin(input);
+            service.run_checked(&command, &cancel).unwrap();
+            git(root, &["commit", "--quiet", "-m", "large sparse fixture"]);
+            fs::write(root.join("selected.txt"), "modified").unwrap();
+            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: vec![PathSelection {path: path("selected.txt"), old_path: None}]}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            assert!(matches!(service.unstage(&UnstageRequest {worktree: root.into(), selection: vec![PathSelection {path: path("selected.txt"), old_path: None}]}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            let head = service.resolve_head(root, &cancel).unwrap().unwrap();
+            assert_eq!(service.head_tree_paths(root, &head, &[&path("selected.txt")], &cancel).unwrap(), vec![path("selected.txt")]);
+        }
+
+        #[test]
         fn large_literal_pathspec_mutations_roundtrip_without_argv_limits() {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let root = directory.path();
@@ -6909,7 +6966,7 @@ mod tests {
                         &DiscardRequest {
                             worktree: root.into(),
                             tracked: vec![],
-                            untracked: selection.into_iter().map(|entry| entry.path).collect(),
+                            untracked: selection.iter().map(|entry| entry.path.clone()).collect(),
                             confirmed: true
                         },
                         &cancel
@@ -6922,6 +6979,16 @@ mod tests {
                     .join("generated_component_file_with_an_extraordinarily_long_name_00000.txt")
                     .exists()
             );
+            // Exercise the >ARG_MAX tracked restore path as well as unlinking
+            // untracked files: all three Git mutation operations use stdin.
+            for entry in &selection { fs::write(root.join(entry.path.as_os_str()), "generated").unwrap(); }
+            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            git(root, &["commit", "--quiet", "-m", "generated baseline"]);
+            for entry in &selection { fs::write(root.join(entry.path.as_os_str()), "modified").unwrap(); }
+            assert!(matches!(service.stage(&StageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            assert!(matches!(service.unstage(&UnstageRequest {worktree: root.into(), selection: selection.clone()}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            assert!(matches!(service.discard(&DiscardRequest {worktree: root.into(), tracked: selection.clone(), untracked: vec![], confirmed: true}, &cancel).unwrap(), MutationOutcome::Applied {..}));
+            for entry in &selection { assert_eq!(fs::read(root.join(entry.path.as_os_str())).unwrap(), b"generated"); }
         }
 
         #[test]
