@@ -680,6 +680,22 @@ mod tests {
     }
 
     #[test]
+    fn undo_context_does_not_recapture_missing_git_metadata_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(directory.path()).unwrap();
+        let metadata = root.metadata().unwrap();
+        let context = crate::filesystem_recovery_context::fixtures::fixture_context(&root).unwrap();
+        let outside = context.placement().directory().path().to_owned();
+        let recovery = DiscardRecovery { worktree: directory.path().to_owned(), worktree_identity: (metadata.dev(),metadata.ino()), live_recovery: LiveDiscardRecovery::default(), directories: BTreeMap::new(), entries: vec![DiscardRecoveryEntry { path: RepoPath::parse("nested/file").unwrap(), before: SavedEntry::Absent, after: SavedEntry::Absent, after_version: None, trash: None }], expires_unix_ms: u64::MAX };
+        let error = RepositoryService::system("git").with_recovery_context(context).undo_discard(&recovery, &CancellationToken::new()).unwrap_err();
+        assert!(error.to_string().contains("original retained Git metadata authority"));
+        assert!(fs::read_dir(directory.path()).unwrap().next().is_none());
+        // The service has dropped its context, whose test lease may remove the
+        // empty outside fixture directory; no holding/payload was created.
+        assert!(!outside.exists() || fs::read_dir(outside).unwrap().next().is_none());
+    }
+
+    #[test]
     fn undo_pending_holding_keeps_exact_cleanup_lease_until_explicit_resolution() {
         let (directory, recovery, holding) = fixture();
         holding.publication.directory().metadata().unwrap();

@@ -5879,6 +5879,40 @@ fn undo_discard_refuses_a_replaced_worktree_root() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn undo_discard_refuses_git_metadata_substitution_with_unchanged_source_inode() {
+    use std::os::unix::fs::MetadataExt;
+    if recovery_context::run_isolated_case("undo_discard_refuses_git_metadata_substitution_with_unchanged_source_inode") { return; }
+    let Some(fixture) = Fixture::new() else { return; };
+    fixture.write("tracked", b"base");
+    fixture.git_in_work(&["add", "."]);
+    fixture.commit("original base");
+    fixture.write("tracked", b"saved work");
+    let service = fixture.recovery_service();
+    let cancel = CancellationToken::new();
+    let recovery = service.discard_recoverable(&DiscardRequest { worktree: fixture.work(), tracked: vec![PathSelection::new(path("tracked"))], untracked: vec![], confirmed: true }, &cancel).unwrap().recovery;
+    let foreign = fixture.root.path().join("foreign");
+    fixture.run(fixture.root.path(), &["init", "-b", "main", "foreign"]);
+    fs::write(foreign.join("tracked"), b"foreign base").unwrap();
+    fixture.run(&foreign, &["add", "."]);
+    fixture.run(&foreign, &["commit", "-m", "foreign base"]);
+    let foreign_head = fixture.run(&foreign, &["rev-parse", "HEAD"]);
+    fs::write(foreign.join("tracked"), b"foreign work").unwrap();
+    fixture.run(&foreign, &["add", "."]);
+    let before = fs::metadata(fixture.work()).unwrap();
+    fs::rename(fixture.work().join(".git"), fixture.root.path().join("original-metadata")).unwrap();
+    fs::rename(foreign.join(".git"), fixture.work().join(".git")).unwrap();
+    let after = fs::metadata(fixture.work()).unwrap();
+    assert_eq!((before.dev(),before.ino()), (after.dev(),after.ino()));
+    assert!(service.undo_discard(&recovery, &cancel).is_err());
+    assert_eq!(fs::read(fixture.work().join("tracked")).unwrap(), b"base");
+    assert_eq!(fs::read(foreign.join("tracked")).unwrap(), b"foreign work");
+    assert_eq!(fixture.git_in_work(&["rev-parse", "HEAD"]), foreign_head);
+    assert_eq!(recovery.remaining_paths(), 1);
+    assert!(!recovery.live_recovery.needs_resolution());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn worktree_patch_recovery_handles_new_deleted_and_renamed_files() {
     if recovery_context::run_isolated_case("worktree_patch_recovery_handles_new_deleted_and_renamed_files") { return; }
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
