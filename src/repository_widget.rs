@@ -516,6 +516,11 @@ pub enum RepositoryAction {
         saved_text: String,
         result: Result<SaveOutcome, FileIoError>,
     },
+    DiskMetadata { identity: AsyncIdentity, ticket: u64, result: Result<Option<crate::editor_reload::Stamp>, String> },
+    DiskLoaded { identity: AsyncIdentity, ticket: u64, stamp: crate::editor_reload::Stamp, baseline: blake3::Hash, result: Result<crate::editor_reload::Version, String> },
+    CompareDisk { card: CardId },
+    DiskComparisonLoaded { identity: AsyncIdentity, revision: u64, disk_hash: blake3::Hash, model: Option<DiffModel> },
+    KeepMine { card: CardId },
     Reload {
         card: CardId,
     },
@@ -702,6 +707,8 @@ impl RepositoryAction {
             | Self::Clipboard { card, .. }
             | Self::Save { card, .. }
             | Self::Reload { card }
+            | Self::CompareDisk { card }
+            | Self::KeepMine { card }
             | Self::DiscardEdits { card }
             | Self::Undo { card }
             | Self::Redo { card }
@@ -749,6 +756,9 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::DiskMetadata { identity, .. }
+            | Self::DiskLoaded { identity, .. }
+            | Self::DiskComparisonLoaded { identity, .. }
             | Self::BinaryPageLoaded { identity, .. }
             | Self::DiagramsRendered { identity, .. }
             | Self::DiffLoaded { identity, .. }
@@ -813,6 +823,10 @@ struct EditorDocument {
     lsp_version: i32,
     active_save: Option<SaveTicket>,
     conflict: bool,
+    external_check_pending: bool,
+    external_version: Option<crate::editor_reload::Version>,
+    external_deleted: bool,
+    recreate_missing: bool,
     error: Option<String>,
     durability_warning: Option<String>,
     /// Undo and redo for this buffer. It lives exactly as long as the buffer:
@@ -869,6 +883,10 @@ impl EditorDocument {
             lsp_version: 1,
             active_save: None,
             conflict: false,
+            external_check_pending: false,
+            external_version: None,
+            external_deleted: false,
+            recreate_missing: false,
             error: None,
             durability_warning: None,
             history: History::default(),
@@ -1861,6 +1879,10 @@ pub struct RepositoryRuntime {
     directory_only: bool,
     standalone: bool,
     external_editors: Vec<crate::sidebar::SidebarEditor>,
+    disk_stamp: Option<Option<crate::editor_reload::Stamp>>,
+    disk_poll: Option<(u64, Instant)>,
+    next_disk_poll: u64,
+    disk_comparison: Option<DiffState>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
     /// document operation.
@@ -2082,6 +2104,10 @@ impl RepositoryRuntime {
             worktree_protection: None,
             standalone: false,
             external_editors: Vec::new(),
+            disk_stamp: None,
+            disk_poll: None,
+            next_disk_poll: 0,
+            disk_comparison: None,
             generation: 0,
             file_list_generation: 0,
             pdf_request: 0,
@@ -2848,6 +2874,64 @@ impl RepositoryRuntime {
         }
         self.background_file_refresh = true;
         self.load_files(card)
+    }
+
+    /// One descriptor metadata probe per second; unchanged files are never
+    /// serialized or re-read. The source stamp includes inode/ctime so atomic
+    /// replacement and no-op touches are distinguished by the later hash.
+    pub fn refresh_open_document(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let DocumentState::Editable(document) = &self.document else { return Task::none(); };
+        if document.active_save.is_some() || self.disk_poll.is_some_and(|(_, started)| started.elapsed() < Duration::from_secs(5)) { return Task::none(); }
+        let source = document.source.clone();
+        let identity = self.current_identity(card, document.path.clone());
+        let worktree = identity.worktree.clone(); let path = identity.path.clone();
+        self.next_disk_poll = self.next_disk_poll.wrapping_add(1);
+        let ticket = self.next_disk_poll; self.disk_poll = Some((ticket, Instant::now()));
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || crate::editor_reload::stamp(&worktree, &path, &source)).await.map_err(|error| error.to_string()).and_then(|result| result);
+            RepositoryAction::DiskMetadata { identity, ticket, result }
+        })
+    }
+
+    /// Called by the shared Git watcher after index/ref changes. Immutable
+    /// history comparisons retain their object identities and mounted model.
+    pub fn refresh_open_comparison(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if self.diff_basis.is_immutable() { return Task::none(); }
+        self.diffs.retain(|(basis, _)| basis.is_immutable());
+        self.working_diff.applied = None;
+        self.ensure_current_diff(card)
+    }
+
+    fn reload_disk_version(&mut self, card: CardId, version: crate::editor_reload::Version) -> Task<RepositoryAction> {
+        let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+        let cursor = document.content.cursor(); let scroll = document.content.scroll_position();
+        document.saved_text = version.text;
+        document.disk_hash = version.content_hash;
+        document.source = version.source; document.markdown = version.markdown;
+        let edits = document.discard_edits();
+        let map = |mut position: text_editor::Position| { position.line = version.mapping.map(position.line); position };
+        document.content.set_cursor(text_editor::Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
+        document.content.restore_scroll_position(text_editor::ScrollPosition { line: version.mapping.map(scroll.line), ..scroll });
+        document.external_version = None; document.external_deleted = false; document.external_check_pending = false; document.recreate_missing = false;
+        self.disk_comparison = None;
+        self.diffs.retain(|(basis, _)| basis.is_immutable());
+        self.working_diff.applied = None;
+        self.push_lsp_edits(edits);
+        Task::batch([self.markdown_task(card), self.ensure_current_diff(card)])
+    }
+
+    fn compare_disk(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let DocumentState::Editable(document) = &self.document else { return Task::none(); };
+        let Some(disk) = &document.external_version else { return Task::none(); };
+        let before: Arc<str> = Arc::from(disk.text.as_str()); let after = document.content.text();
+        let revision = document.revision; let disk_hash = disk.content_hash;
+        let identity = self.current_identity(card, document.path.clone()); let path = document.source.clone(); let theme = self.syntax_theme;
+        self.source_surface = SourceSurface::Diff;
+        self.disk_comparison = Some(DiffState::Loading { request: 0, cancellation: CancellationToken::new() });
+        cosmic::task::future(async move {
+            let model = tokio::task::spawn_blocking(move || crate::diff_view::build_document_diff(before, &after, &path, theme, &CancellationToken::new())).await.ok().flatten();
+            RepositoryAction::DiskComparisonLoaded { identity, revision, disk_hash, model }
+        })
     }
 
     /// Whether a file-list read is genuinely still in flight.
@@ -4053,6 +4137,7 @@ impl RepositoryRuntime {
     /// are still typing them. Without a loaded comparison there is no baseline
     /// to diff against, and loading one is the comparison surface's own job.
     fn editable_working_diff(&self) -> bool {
+        if self.disk_comparison.is_some() { return false; }
         self.diff_basis == DiffBasis::IndexToWorktree
             && self.basis_resolution.is_none()
             && matches!(self.document, DocumentState::Editable(_))
@@ -4606,6 +4691,7 @@ impl RepositoryRuntime {
                     && document.dirty
                     && document.active_save.is_none()
                     && !document.conflict
+                    && !document.external_check_pending
                     && document.error.is_none()
                     && document.durability_warning.is_none() =>
             {
@@ -4688,11 +4774,12 @@ impl RepositoryRuntime {
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
         }
+        let recreate = matches!(&self.document, DocumentState::Editable(document) if document.recreate_missing);
         let worktree = identity.worktree.clone();
         let saved_text = text.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                save_file(&worktree, &destination, &text, disk_hash, overwrite)
+                if recreate { crate::editor::save_missing_file(&worktree, &destination, &text) } else { save_file(&worktree, &destination, &text, disk_hash, overwrite) }
             })
             .await
             .map_err(|error| FileIoError::Io(format!("save worker failed: {error}")))
@@ -4728,6 +4815,80 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::DiskMetadata { identity, ticket, result } => {
+                if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
+                let DocumentState::Editable(document) = &mut self.document else { self.disk_poll = None; return Task::none(); };
+                if document.active_save.is_some() { self.disk_poll = None; return Task::none(); }
+                let stamp = match result {
+                    Ok(stamp) => stamp,
+                    Err(error) => { self.disk_poll = None; document.conflict = true; document.error = Some(format!("Could not check the file on disk: {error}")); return Task::none(); }
+                };
+                if self.disk_stamp == Some(stamp) { self.disk_poll = None; document.external_check_pending = false; return Task::none(); }
+                let Some(stamp) = stamp else {
+                    self.disk_poll = None; self.disk_stamp = Some(None);
+                    document.external_deleted = true; document.external_version = None; document.conflict = true;
+                    document.error = Some("File deleted or renamed on disk. Your buffer has been kept.".into());
+                    return Task::none();
+                };
+                document.external_check_pending = true;
+                let baseline = document.disk_hash; let before = document.saved_text.clone();
+                let worktree = identity.worktree.clone(); let path = identity.path.clone(); let tone = self.document_tone;
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || crate::editor_reload::load(&worktree, &path, &before, tone)).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    RepositoryAction::DiskLoaded { identity, ticket, stamp, baseline, result }
+                })
+            }
+            RepositoryAction::DiskLoaded { identity, ticket, stamp, baseline, result } => {
+                if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
+                self.disk_poll = None;
+                let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+                document.external_check_pending = false;
+                if document.disk_hash != baseline || document.active_save.is_some() { self.disk_stamp = None; return Task::none(); }
+                let version = match result {
+                    Ok(version) => version,
+                    Err(error) => { document.conflict = true; document.error = Some(error); self.disk_stamp = Some(Some(stamp)); return Task::none(); }
+                };
+                self.disk_stamp = Some(Some(stamp));
+                match crate::editor_reload::decide(document.disk_hash, Some(version.content_hash), document.dirty) {
+                    crate::editor_reload::Decision::Unchanged => {
+                        if document.external_version.is_some() || document.external_deleted {
+                            document.external_version = None; document.external_deleted = false; document.conflict = false; document.error = None; self.disk_comparison = None;
+                        }
+                        Task::none()
+                    },
+                    crate::editor_reload::Decision::Reload => self.reload_disk_version(identity.card, version),
+                    crate::editor_reload::Decision::Conflict => {
+                        document.external_version = Some(version); document.external_deleted = false;
+                        document.conflict = true; document.error = Some("File changed on disk".into());
+                        if self.disk_comparison.is_some() { self.compare_disk(identity.card) } else { Task::none() }
+                    }
+                    crate::editor_reload::Decision::Deleted => unreachable!(),
+                }
+            }
+            RepositoryAction::CompareDisk { card } => self.compare_disk(card),
+            RepositoryAction::DiskComparisonLoaded { identity, revision, disk_hash, model } => {
+                if self.accepts_selected(&identity) && self.disk_comparison.is_some()
+                    && matches!(&self.document, DocumentState::Editable(document) if document.revision == revision && document.external_version.as_ref().is_some_and(|disk| disk.content_hash == disk_hash)) {
+                    self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
+                    self.disk_comparison = Some(DiffState::ready(match model {
+                        Some(model) => RenderedDiff::Text { model, old_label: "Disk".into(), new_label: "Unsaved buffer".into() },
+                        None => RenderedDiff::Error("Could not compare the buffer and disk. Your edits have been kept.".into()),
+                    }));
+                }
+                Task::none()
+            }
+            RepositoryAction::KeepMine { card } => {
+                let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+                if document.active_save.is_some() { return Task::none(); }
+                if let Some(version) = document.external_version.take() {
+                    document.disk_hash = version.content_hash; document.saved_text = version.text;
+                    document.dirty = !content_matches(&document.content, &document.saved_text);
+                } else if document.external_deleted { document.recreate_missing = true; document.dirty = true; }
+                else { return self.request_save(card, true); }
+                document.conflict = false; document.error = None;
+                self.disk_comparison = None;
+                self.request_save(card, false)
+            }
             RepositoryAction::BinaryPage { card, offset } => {
                 let DocumentState::ReadOnly {
                     path,
@@ -5337,6 +5498,7 @@ impl RepositoryRuntime {
                         }) => {
                             document.saved_text = saved_text;
                             document.disk_hash = content_hash;
+                    document.external_version = None; document.external_deleted = false; document.recreate_missing = false; document.external_check_pending = false;
                             document.dirty = document.content.text() != document.saved_text;
                             document.conflict = false;
                             document.error = None;
@@ -5406,6 +5568,9 @@ impl RepositoryRuntime {
                 }
             }
             RepositoryAction::Reload { card } => {
+                if self.is_saving() { return Task::none(); }
+                if let DocumentState::Editable(document) = &mut self.document
+                    && let Some(version) = document.external_version.take() { return self.reload_disk_version(card, version); }
                 if self.is_saving() {
                     return Task::none();
                 }
@@ -5451,6 +5616,7 @@ impl RepositoryRuntime {
                 self.initial_load(card)
             }
             RepositoryAction::ApplySourceSurface { card, diff } => {
+                self.disk_comparison = None;
                 let surface = if diff {
                     SourceSurface::Diff
                 } else {
@@ -6266,6 +6432,7 @@ impl RepositoryRuntime {
         self.committed_selection = None;
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading;
+        self.disk_stamp = None; self.disk_poll = None; self.disk_comparison = None;
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(
@@ -6550,6 +6717,7 @@ impl RepositoryRuntime {
     }
 
     fn displayed_diff_state(&self) -> Option<&DiffState> {
+        if self.source_surface == SourceSurface::Diff && self.disk_comparison.is_some() { return self.disk_comparison.as_ref(); }
         let current = self.diff_state(&self.diff_basis);
         if matches!(current, Some(DiffState::Ready(..))) {
             return current;
@@ -8111,15 +8279,27 @@ fn find_strip<'a>(
     )
 }
 
-fn selected_file_view<'a>(
-    card: CardId,
-    runtime: &'a RepositoryRuntime,
-    review: Option<&'a crate::pull_request_review::State>,
-) -> Element<'a, RepositoryAction> {
-    match runtime.source_surface {
+fn selected_file_view<'a>(card: CardId, runtime: &'a RepositoryRuntime, review: Option<&'a crate::pull_request_review::State>) -> Element<'a, RepositoryAction> {
+    let content = match runtime.source_surface {
         SourceSurface::Editor => editor_surface(card, runtime),
         SourceSurface::Diff => diff_surface(card, runtime, review),
+    };
+    let DocumentState::Editable(document) = &runtime.document else { return content; };
+    if document.external_version.is_none() && !document.external_deleted { return content; }
+    let actions: Vec<Element<'a, RepositoryAction>> = vec![
+        crate::ui_controls::button::secondary("Reload").on_press_maybe((!runtime.is_saving() && document.external_version.is_some()).then_some(RepositoryAction::Reload { card })).into(),
+        crate::ui_controls::button::secondary("Compare").on_press_maybe((!runtime.is_saving() && document.external_version.is_some()).then_some(RepositoryAction::CompareDisk { card })).into(),
+        crate::ui_controls::button::secondary(if document.external_deleted { "Save again" } else { "Keep mine" }).on_press_maybe((!runtime.is_saving()).then_some(RepositoryAction::KeepMine { card })).into(),
+    ];
+    let mut rows: Vec<Element<'a, RepositoryAction>> = vec![
+        crate::design::body(if document.external_deleted { "File deleted or renamed on disk. Your buffer has been kept." } else { "File changed on disk" }).width(Length::Fill).into(),
+        widget::row::with_children(actions).spacing(space::S).align_y(Alignment::Center).into(),
+    ];
+    if runtime.disk_comparison.is_some() {
+        rows.push(crate::ui_controls::button::secondary("Back to editor").on_press(RepositoryAction::ApplySourceSurface { card, diff: false }).into());
     }
+    let bar = widget::container(widget::column::with_children(rows).spacing(space::S)).class(cosmic::theme::Container::Secondary).padding(space::M);
+    widget::column::with_children([bar.into(), content]).height(Length::Fill).into()
 }
 
 fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
@@ -8425,6 +8605,7 @@ fn editable_document_view<'a>(
     if let Some(error) = document
         .error
         .as_ref()
+        .filter(|_| document.external_version.is_none() && !document.external_deleted)
         .or(document.durability_warning.as_ref())
     {
         let mut actions: Vec<Element<'a, RepositoryAction>> =
@@ -8759,6 +8940,7 @@ fn editable_document_view<'a>(
 }
 
 fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    if runtime.disk_comparison.is_some() { return crate::design::caption("Disk → unsaved buffer").into(); }
     let selected = match &runtime.basis_resolution {
         Some(BasisResolution::Resolving(choice)) => Some(BasisChoice::Committed(*choice)),
         Some(BasisResolution::NeedsBase(_)) => {
@@ -8940,6 +9122,14 @@ fn diff_surface<'a>(
     runtime: &'a RepositoryRuntime,
     review: Option<&'a crate::pull_request_review::State>,
 ) -> Element<'a, RepositoryAction> {
+    if let Some(state) = &runtime.disk_comparison {
+        return match state {
+            DiffState::Loading { .. } => loading(),
+            DiffState::Ready(RenderedDiff::Text { model, old_label, new_label }, _) => diff_model_view(card, runtime, model, old_label, new_label, None),
+            DiffState::Ready(RenderedDiff::Error(error), _) => information_state("Could not compare buffer and disk", error),
+            _ => information_state("Comparison unavailable", "The disk file cannot be compared as text."),
+        };
+    }
     if runtime.mutation_refresh_pending
         && runtime.displayed_diff_state().is_none()
         && !runtime.diff_basis.is_immutable()
@@ -12077,6 +12267,73 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    fn disk_stamp_fixture() -> crate::editor_reload::Stamp {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("file"), "data").unwrap();
+        crate::editor_reload::stamp(root.path(), Path::new("file"), Path::new("file")).unwrap().unwrap()
+    }
+
+    fn simulate_disk_version(runtime: &mut RepositoryRuntime, card: CardId, before: &str, after: &str) {
+        let path = runtime.selected_path().unwrap().to_path_buf();
+        let identity = runtime.current_identity(card, path.clone());
+        runtime.disk_poll = Some((1, Instant::now()));
+        drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 1, stamp: disk_stamp_fixture(), baseline: blake3::hash(before.as_bytes()), result: Ok(crate::editor_reload::Version {
+            text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
+            mapping: crate::editor_reload::LineMap::between(before, after),
+        }) }));
+    }
+
+    #[test]
+    fn clean_disk_reload_maps_the_caret_and_remains_one_undo_step() {
+        let card = CardId::new();
+        let before = "one\ntwo\nthree\n"; let after = "new\none\ntwo\nthree\n";
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line: 1, column: 2 }, selection: Some(text_editor::Position { line: 2, column: 1 }) });
+        }
+        simulate_disk_version(&mut runtime, card, before, after);
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        assert_eq!(document.content.text(), after); assert!(!document.dirty); assert!(!document.conflict);
+        assert_eq!(document.content.cursor().position.line, 2); assert_eq!(document.content.cursor().selection.unwrap().line, 3);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        assert_eq!(document.content.text(), before); assert!(document.dirty);
+    }
+
+    #[test]
+    fn dirty_disk_reload_keeps_the_buffer_and_pauses_autosave_until_a_choice() {
+        let card = CardId::new(); let before = "one\ntwo\n"; let after = "disk\ntwo\n";
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
+        runtime.set_auto_save(true);
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let edited = match &runtime.document { DocumentState::Editable(document) => document.content.text(), _ => unreachable!() };
+        simulate_disk_version(&mut runtime, card, before, after);
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        assert_eq!(document.content.text(), edited); assert!(document.conflict); assert!(document.external_version.is_some());
+        assert_eq!(document.error.as_deref(), Some("File changed on disk")); assert!(runtime.auto_save_revision().is_none());
+        drop(runtime.update(RepositoryAction::Reload { card }));
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        assert_eq!(document.content.text(), after); assert!(!document.conflict); assert!(!document.dirty);
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        assert_eq!(document.content.text(), edited);
+    }
+
+    #[test]
+    fn own_save_hashes_do_not_show_a_conflict_and_deleted_files_keep_the_buffer() {
+        let card = CardId::new(); let before = "one\n";
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
+        simulate_disk_version(&mut runtime, card, before, before);
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        assert!(!document.conflict); assert!(document.error.is_none());
+        runtime.disk_poll = Some((2, Instant::now()));
+        let identity = runtime.current_identity(card, PathBuf::from("file.rs"));
+        drop(runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 2, result: Ok(None) }));
+        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        assert!(document.external_deleted); assert!(document.conflict); assert_eq!(document.content.text(), before);
+    }
+
 
     #[test]
     fn diff_scroll_range_matches_shaped_content_and_real_split_half_layout() {

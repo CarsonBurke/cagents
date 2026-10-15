@@ -167,6 +167,7 @@ impl Drop for State {
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
     Tick,
+    DocumentsTick,
     Focused(window::Id, bool),
 }
 
@@ -175,10 +176,21 @@ impl Cagents {
         if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared {
             return Subscription::none();
         }
-        cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick))
+        Subscription::batch([
+            cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick)),
+            cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshUi(Action::DocumentsTick)),
+        ])
     }
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
+        if matches!(action, Action::DocumentsTick) {
+            if !self.refresh_ui.focused || self.modal_is_open() || self.update_prepared || crate::device::is_remote() { return Task::none(); }
+            return Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| match runtime {
+                CardRuntime::Repository(runtime) => Some(repository_task(runtime.refresh_open_document(card))),
+                _ => None,
+            }).collect::<Vec<_>>());
+        }
+
         let regained_focus = match action {
             Action::Focused(window, focused) => {
                 if self.core.main_window_id() != Some(window) {
@@ -192,6 +204,7 @@ impl Cagents {
                 true
             }
             Action::Tick => false,
+            Action::DocumentsTick => unreachable!(),
         };
         // Device windows refresh their navigation catalog through the daemon.
         // Git, editor and filesystem refreshes below remain local-only.

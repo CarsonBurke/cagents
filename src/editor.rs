@@ -982,6 +982,30 @@ fn save_file_with_hooks(
     })
 }
 
+/// Recreates a document the user explicitly chose to save after deletion.
+/// Publication refuses any replacement that appeared meanwhile.
+pub fn save_missing_file(worktree: &Path, path: &Path, text: &str) -> Result<SaveOutcome, FileIoError> {
+    validate_repo_path(path)?;
+    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
+    let root = worktree_root(worktree)?;
+    let (parent, name) = fs_safety::open_parent_beneath(&root, path).map_err(resolve_error)?;
+    let (mut file, temporary) = fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
+    let result = (|| {
+        file.write_all(text.as_bytes()).map_err(io_error)?;
+        file.sync_all().map_err(io_error)?;
+        fs_safety::rename_new_within(&parent, &temporary, &name).map_err(resolve_error)
+    })();
+    if let Err(error) = result {
+        let _ = fs_safety::unlink_within(&parent, &temporary);
+        return Err(error);
+    }
+    let durability = match fs_safety::sync_directory(&parent) {
+        Ok(()) => SaveDurability::Durable,
+        Err(error) => SaveDurability::Unconfirmed { error: error.to_string() },
+    };
+    Ok(SaveOutcome::Saved { content_hash: blake3::hash(text.as_bytes()), durability })
+}
+
 /// Writes `bytes` into a temporary sibling that carries the destination's
 /// ownership, permissions, access ACL and content attributes, then renames it over the
 /// destination.
@@ -1739,6 +1763,16 @@ mod tests {
         assert_eq!(after.mode() & 0o777, before.mode() & 0o777);
         assert_eq!(fs::read(&path).unwrap(), b"after\n");
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn explicit_save_after_deletion_recreates_without_replacing_another_writer() {
+        let root = tempfile::tempdir().unwrap(); let path = Path::new("deleted.rs");
+        let outcome = save_missing_file(root.path(), path, "kept buffer").unwrap();
+        assert!(matches!(outcome, SaveOutcome::Saved { .. }));
+        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "kept buffer");
+        assert!(save_missing_file(root.path(), path, "another writer").is_err());
+        assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), "kept buffer");
     }
 
     #[test]
