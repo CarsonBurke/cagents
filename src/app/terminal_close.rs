@@ -20,7 +20,10 @@ pub(super) struct Bindings {
     local: local_presentation::State,
     batch:Option<uuid::Uuid>,
     selected:HashMap<CardId,uuid::Uuid>,
+    completed_attempts:HashMap<TerminalId,CompletedAttempt>,
 }
+
+struct CompletedAttempt { nonce:uuid::Uuid,card:CardId,batch:Option<uuid::Uuid> }
 
 #[derive(Debug, Clone)]
 pub(super) struct CloseIntent {
@@ -252,6 +255,12 @@ impl Cagents {
             && self.surface_close_binding_current(intent.card,intent.captured.as_ref())
     }
 
+    #[cfg(test)]
+    pub(super) fn completed_terminal_close_attempt(&self,card:CardId)->Option<uuid::Uuid> {
+        let mut owned=self.terminal_close_bindings.completed_attempts.values().filter(|attempt|attempt.card==card);
+        let nonce=owned.next()?.nonce;
+        owned.next().is_none().then_some(nonce)
+    }
     pub(super) fn pane_close_batch_current(&self,batch:Option<uuid::Uuid>)->bool {
         batch.is_none_or(|batch|self.project_recovery_ui.closing_panes&&self.terminal_close_bindings.batch==Some(batch))
     }
@@ -455,9 +464,14 @@ impl Cagents {
         self.capture_terminal_close_binding(card, false);
         let captured = self.terminal_close_bindings.bound.get(&card).cloned();
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
-            if !self.terminal_close_attempts.insert(session.id) {
+            if self.terminal_close_bindings.completed_attempts.contains_key(&session.id) || !self.terminal_close_attempts.insert(session.id) {
+                self.terminal_close_attempts.insert(session.id);
+                self.stop_pane_close_batch(batch);
+                self.status=Some(TransientNotice::warning(if batch.is_some(){"A previous Close request is still pending for this terminal. The other selected panes were kept; choose Close panes again after the earlier request finishes."}else{"A previous Close request is still pending for this terminal. Its pane was kept; retry after the earlier request finishes."}));
                 return Task::none();
             }
+            let attempt=uuid::Uuid::new_v4();
+            self.terminal_close_bindings.completed_attempts.insert(session.id,CompletedAttempt{nonce:attempt,card,batch});
             let presentation=self.local_terminal_dismissal_target(card);
             return cosmic::task::future(async move {
                 let source = session.clone();
@@ -481,6 +495,7 @@ impl Cagents {
                     card,
                     session,
                     batch,
+                    attempt,
                     result,
                 }
             });
@@ -549,8 +564,12 @@ impl Cagents {
         card: CardId,
         session: TerminalSession,
         batch:Option<uuid::Uuid>,
+        attempt:uuid::Uuid,
         result: Result<CompletedCloseOutcome, String>,
     ) -> Task<Message> {
+        // A stale/duplicate receipt cannot retire a newer same-ID attempt.
+        if !self.terminal_close_bindings.completed_attempts.get(&session.id).is_some_and(|owned|owned.nonce==attempt&&owned.card==card&&owned.batch==batch){return Task::none();}
+        self.terminal_close_bindings.completed_attempts.remove(&session.id);
         self.terminal_close_attempts.remove(&session.id);
         if !self.pane_close_decision_current(card,batch) {return Task::none();}
         if !self.card_state(card).is_some_and(|state| {
@@ -1384,6 +1403,7 @@ mod tests {
                 },
             };
             let ended = source.clone();
+            drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
             let outcome = match outcome {
                 CompletedCloseOutcome::ClosedWorker { .. } => CompletedCloseOutcome::ClosedWorker {
                     execution_instance: captured.execution_instance,
@@ -1394,7 +1414,7 @@ mod tests {
             let mut replacement = captured;
             replacement.execution_instance = uuid::Uuid::new_v4();
             app.terminal_close_bindings.bound.insert(card, replacement);
-            let _ = app.completed_terminal_closed(card, ended, None, Ok(outcome));
+            let _ = app.completed_terminal_closed(card, ended, None, attempt, Ok(outcome));
             assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(!app.closed_terminal_cards.contains(&card));
         }
@@ -1531,10 +1551,12 @@ mod tests {
             },
         };
         let ended = source.clone();
+        drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
         let _ = app.completed_terminal_closed(
             card,
             ended,
             None,
+            attempt,
             Ok(CompletedCloseOutcome::Absent {
                 expected_worker: Some((captured.execution_instance, captured.proof)),
                 presentation:None,
@@ -1644,6 +1666,7 @@ mod tests {
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(app.terminal_close_pending(card));
         let _ = app.update(Message::CompletedTerminalClosed {
+            attempt:app.completed_terminal_close_attempt(card).unwrap(),
             batch:None,
             card,
             session: source.clone(),
@@ -1657,6 +1680,7 @@ mod tests {
         };
         session.id = TerminalId::new();
         let _ = app.update(Message::CompletedTerminalClosed {
+            attempt:app.completed_terminal_close_attempt(card).unwrap(),
             batch:None,
             card,
             session: source,
@@ -1689,6 +1713,7 @@ mod tests {
         };
         let _ = app.begin_card_close(card);
         let _ = app.update(Message::CompletedTerminalClosed {
+            attempt:app.completed_terminal_close_attempt(card).unwrap(),
             batch:None,
             card,
             session: source.clone(),
@@ -1742,6 +1767,7 @@ mod tests {
         // holds the shell's traversal aside.
         let _ = app.begin_card_close(card);
         let _ = app.update(Message::CompletedTerminalClosed {
+            attempt:app.completed_terminal_close_attempt(card).unwrap(),
             batch:None,
             card,
             session: source,
@@ -1786,6 +1812,7 @@ mod tests {
         let source = session.clone();
         let _ = app.begin_card_close(card);
         let _ = app.update(Message::CompletedTerminalClosed {
+            attempt:app.completed_terminal_close_attempt(card).unwrap(),
             batch:None,
             card,
             session: source,

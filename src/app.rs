@@ -4129,6 +4129,7 @@ pub enum Message {
         card: CardId,
         session: TerminalSession,
         batch:Option<uuid::Uuid>,
+        attempt:uuid::Uuid,
         result: Result<terminal_close::CompletedCloseOutcome, String>,
     },
     SaveAndCloseRepository(CardId),
@@ -15107,8 +15108,9 @@ impl Application for Cagents {
                 card,
                 session,
                 batch,
+                attempt,
                 result,
-            } => self.completed_terminal_closed(card, session, batch, result),
+            } => self.completed_terminal_closed(card, session, batch, attempt, result),
             Message::SaveAndCloseRepository(id) => match self.cards.get_mut(&id) {
                 Some(CardRuntime::Repository(runtime))
                     if self

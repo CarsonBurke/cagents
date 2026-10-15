@@ -2573,8 +2573,9 @@ mod tests {
         for registry_missing in [false,true] {
             let (mut app,card,target)=local_dismissal_fixture();
             let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
+            drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
             if registry_missing {app.workspace_model.identity=crate::workspace_model::NO_REGISTRY;}else{app.workspace_model.views[0].revision+=1;}
-            drop(app.completed_terminal_closed(card,source,None,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})));
+            drop(app.completed_terminal_closed(card,source,None,attempt,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})));
             assert!(app.local_terminal_unavailable_notice(card).is_none());
             assert!(!app.status.as_ref().unwrap().message.contains("Dismiss locally"));
             assert!(app.status.as_ref().unwrap().message.contains("Reconnect"));
@@ -2590,7 +2591,8 @@ mod tests {
         drop(app.close_cards_in_order(vec![card,other]));
         assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.queued_card_closes.len(),1);
         let batch=app.pane_close_batch_for(card);
-        drop(app.completed_terminal_closed(card,source,batch,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
+        drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
+        drop(app.completed_terminal_closed(card,source,batch,attempt,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
         assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
         assert!(app.status.as_ref().unwrap().message.contains("Other selected panes were kept"));
         assert!(app.local_terminal_unavailable_notice(card).is_some());
@@ -2606,11 +2608,12 @@ mod tests {
             let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
             let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
             drop(app.close_cards_in_order(vec![card]));let old=app.pane_close_batch_for(card);
+            drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
             drop(app.close_cards_in_order(vec![card,other]));let current=app.pane_close_batch_for(card);
             let queued=app.queued_card_closes.len();let model=app.workspace_model.clone();
             assert_ne!(old,current);
             let result=if failed {Err("old failure".into())}else{Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})};
-            drop(app.update(Message::CompletedTerminalClosed{card,session:source,batch:old,result}));
+            drop(app.update(Message::CompletedTerminalClosed{card,session:source,batch:old,attempt,result}));
             assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.pane_close_batch_for(card),current);
             assert_eq!(app.queued_card_closes.len(),queued);assert!(app.local_terminal_unavailable_notice(card).is_none());
             assert!(app.workspace.card(card).is_some());assert!(app.workspace.card(other).is_some());
@@ -2619,13 +2622,45 @@ mod tests {
     }
 
     #[test]
+    fn pending_completed_attempt_stops_new_batch_and_duplicate_receipt_preserves_fresh_attempt() {
+        let (mut app,card,target)=local_dismissal_fixture();
+        let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
+        let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
+        drop(app.close_cards_in_order(vec![card]));let old=app.pane_close_batch_for(card);
+        // Construct the real UI asynchronous close task, held before IO.
+        drop(app.begin_card_close(card));let first=app.completed_terminal_close_attempt(card).unwrap();
+        assert!(app.terminal_close_attempts.contains(&source.id));
+        let held=super::super::tests::task_app_message(app.close_cards_in_order(vec![card,other]));
+        drop(app.update(held));
+        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
+        assert_eq!(app.completed_terminal_close_attempt(card),Some(first));
+        assert!(app.terminal_close_attempts.contains(&source.id));
+        assert!(app.status.as_ref().unwrap().message.contains("previous Close request"));
+        drop(app.update(Message::CompletedTerminalClosed{card,session:source.clone(),batch:old,attempt:first,result:Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})}));
+        assert!(app.completed_terminal_close_attempt(card).is_none());assert!(!app.terminal_close_attempts.contains(&source.id));
+        assert!(app.local_terminal_unavailable_notice(card).is_none());
+        drop(app.close_cards_in_order(vec![card]));let fresh_batch=app.pane_close_batch_for(card);
+        drop(app.begin_card_close(card));let fresh=app.completed_terminal_close_attempt(card).unwrap();
+        assert_ne!(fresh,first);
+        drop(app.update(Message::CompletedTerminalClosed{card,session:source.clone(),batch:old,attempt:first,result:Err("duplicate old result".into())}));
+        assert_eq!(app.completed_terminal_close_attempt(card),Some(fresh));assert!(app.terminal_close_attempts.contains(&source.id));
+        assert_eq!(app.pane_close_batch_for(card),fresh_batch);
+        drop(app.update(Message::CompletedTerminalClosed{card,session:source.clone(),batch:fresh_batch,attempt:fresh,result:Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target)})}));
+        assert!(app.completed_terminal_close_attempt(card).is_none());assert!(!app.terminal_close_attempts.contains(&source.id));
+        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
+        assert!(app.local_terminal_unavailable_notice(card).is_some());
+        assert!(app.card_state(other).unwrap().existence.is_open());assert!(app.shared_views.pending.is_empty());
+    }
+
+    #[test]
     fn old_absence_cannot_offer_or_hide_a_fresh_start_without_confirmed_worker_metadata() {
         let (mut app,card,target)=local_dismissal_fixture();
         let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
+        drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
         // A new successful startup may publish the same ended descriptor before
         // optional worker metadata arrives; its presentation generation differs.
         drop(app.terminal_local_presentation_started(card));
-        drop(app.completed_terminal_closed(card,source,None,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
+        drop(app.completed_terminal_closed(card,source,None,attempt,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
         assert!(app.local_terminal_unavailable_notice(card).is_none());
         drop(app.dismiss_terminal_locally(target));
         assert!(app.workspace.card(card).is_some());assert!(!app.locally_dismissed_terminal(card));
