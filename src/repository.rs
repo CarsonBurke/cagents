@@ -4490,8 +4490,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         hasher.update(&output.stdout);
         let digest: [u8; 32] = hasher.finalize().into();
         let mut observations_fresh = false;
-        if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some()
-            && cache.numstat_policy.as_ref().is_none_or(|policy| policy.reusable) {
+        if !cache.dirty && cache.digest == Some(digest) && cache.metadata.is_some() {
             let root = fs_safety::Root::open(worktree).ok();
             let mut unchanged = true;
             // Keep the observation pass for a changed snapshot, rather than
@@ -12576,6 +12575,27 @@ mod tests {
         assert_eq!(line_change_counts(Some(0), Some(0)), "");
         assert_eq!(line_change_counts(None, None), "");
         assert_eq!(line_change_counts(Some(7), None), "+7");
+    }
+
+    #[test]
+    fn snapshot_unsupported_attribute_variables_keep_the_unchanged_status_shortcut() {
+        let directory = tempfile::tempdir().unwrap();
+        let status = snapshot_status(b"1 M. N... 100644 100644 100644 a b tracked\0");
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![
+            exit(1, b""), success(&status),
+            exit(129, b""), exit(129, b""), // older Git does not expose attribute paths
+            exit(1, b""), success(b""),
+            success(b"1\t1\ttracked\0"), success(b""), success(b"H tracked\0"),
+            exit(1, b""), success(b""), success(b""),
+            success(&status),
+        ]));
+        let service = RepositoryService::new("git", executor.clone());
+        let cancel = CancellationToken::new(); let mut cache = SnapshotCache::default();
+        assert!(service.snapshot_cached(directory.path(), SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+        assert!(!cache.numstat_policy.as_ref().unwrap().reusable);
+        let before = executor.commands.lock().unwrap().len();
+        assert!(service.snapshot_cached(directory.path(), SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
+        assert_eq!(executor.commands.lock().unwrap().len(), before + 1);
     }
 
     #[test]
