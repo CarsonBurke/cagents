@@ -751,8 +751,16 @@ impl Cagents {
                 self.update_ui.set_aside = self.update_ui.job.as_ref().map(|job| job.id.clone());
                 self.update_ui.confirmation = None;
                 if let Some(channel) = channel {
-                    self.select_channel_then(channel,worktree_ui::selection::Intent::Focus {card,activate:false})
-                } else { cosmic::task::message(Message::FocusCard(card)) }
+                    self.select_channel_then(
+                        channel,
+                        worktree_ui::selection::Intent::Focus {
+                            card,
+                            activate: false,
+                        },
+                    )
+                } else {
+                    cosmic::task::message(Message::FocusCard(card))
+                }
             }
             Action::CopyDetails => self
                 .update_ui

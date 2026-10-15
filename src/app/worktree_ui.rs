@@ -2,8 +2,8 @@ use super::*;
 use crate::model::ChannelId;
 
 mod owner_watch;
-pub(super) mod selection;
 pub(super) mod protection_sync;
+pub(super) mod selection;
 
 /// Canonical filesystem aliases are read on the blocking pool, once per path.
 /// Runtime selection uses lexical ownership until that immutable result arrives.
@@ -26,14 +26,18 @@ impl OwnerPaths {
     fn request(&mut self, path: &Path, remote: bool) {
         self.active.insert(path.into());
         if remote {
-            self.cached.entry(path.into()).or_insert_with(|| path.into());
+            self.cached
+                .entry(path.into())
+                .or_insert_with(|| path.into());
         } else if !self.cached.contains_key(path) && !self.inflight.contains(path) {
             self.queued.insert(path.into());
         }
     }
 
     fn take_batch(&mut self) -> Option<(u64, Vec<PathBuf>)> {
-        if self.inflight_generation.is_some() || (self.queued.is_empty() && !self.watch_dirty) { return None; }
+        if self.inflight_generation.is_some() || (self.queued.is_empty() && !self.watch_dirty) {
+            return None;
+        }
         self.generation = self.generation.wrapping_add(1);
         self.inflight_epoch = Some(self.watch.epoch());
         self.inflight_generation = Some(self.generation);
@@ -44,10 +48,16 @@ impl OwnerPaths {
     }
 
     fn finish(&mut self, generation: u64, paths: Vec<(PathBuf, PathBuf)>) -> bool {
-        if self.inflight_generation != Some(generation) { return false; }
+        if self.inflight_generation != Some(generation) {
+            return false;
+        }
         if self.inflight_epoch != Some(self.watch.epoch()) {
             self.invalidate_watched();
-            self.queued.extend(self.inflight.drain().filter(|path|self.active.contains(path)));
+            self.queued.extend(
+                self.inflight
+                    .drain()
+                    .filter(|path| self.active.contains(path)),
+            );
             self.queued.extend(self.invalidated.drain());
             self.inflight_generation = None;
             self.inflight_epoch = None;
@@ -55,7 +65,11 @@ impl OwnerPaths {
             return false;
         }
         for (path, resolved) in paths {
-            if self.inflight.contains(&path) && self.active.contains(&path) && !self.invalidated.contains(&path) && !self.superseded.contains(&path) {
+            if self.inflight.contains(&path)
+                && self.active.contains(&path)
+                && !self.invalidated.contains(&path)
+                && !self.superseded.contains(&path)
+            {
                 self.cached.insert(path, resolved);
             }
         }
@@ -67,12 +81,14 @@ impl OwnerPaths {
         true
     }
 
-    fn install_prepared(&mut self, paths: Vec<(PathBuf,PathBuf)>) {
-        for (path,resolved) in paths {
+    fn install_prepared(&mut self, paths: Vec<(PathBuf, PathBuf)>) {
+        for (path, resolved) in paths {
             self.queued.remove(&path);
             self.invalidated.remove(&path);
-            if self.inflight.contains(&path) { self.superseded.insert(path.clone()); }
-            self.cached.insert(path,resolved);
+            if self.inflight.contains(&path) {
+                self.superseded.insert(path.clone());
+            }
+            self.cached.insert(path, resolved);
         }
     }
 
@@ -92,20 +108,30 @@ impl OwnerPaths {
         for _ in 0..3 {
             let before = self.watch.epoch();
             for path in self.watch.take_invalidated() {
-                if !self.active.contains(&path) { continue; }
+                if !self.active.contains(&path) {
+                    continue;
+                }
                 self.cached.remove(&path);
-                if self.inflight.contains(&path) { self.invalidated.insert(path); }
-                else { self.queued.insert(path); }
+                if self.inflight.contains(&path) {
+                    self.invalidated.insert(path);
+                } else {
+                    self.queued.insert(path);
+                }
             }
             let after = self.watch.epoch();
-            if before == after { return after; }
+            if before == after {
+                return after;
+            }
         }
         // A constantly changing filesystem must not spin on the UI thread.
         // Start uncached work instead; its receipt still fences later changes.
         self.cached.clear();
         for path in &self.active {
-            if self.inflight.contains(path) { self.invalidated.insert(path.clone()); }
-            else { self.queued.insert(path.clone()); }
+            if self.inflight.contains(path) {
+                self.invalidated.insert(path.clone());
+            } else {
+                self.queued.insert(path.clone());
+            }
         }
         self.watch.epoch()
     }
@@ -115,7 +141,10 @@ impl OwnerPaths {
     }
 
     pub(in crate::app) fn canonical(&self, path: &Path) -> PathBuf {
-        self.cached.get(path).cloned().unwrap_or_else(|| path.into())
+        self.cached
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.into())
     }
 }
 
@@ -123,10 +152,13 @@ fn canonicalize_owner_paths(
     paths: Vec<PathBuf>,
     mut resolve: impl FnMut(&Path) -> std::io::Result<PathBuf>,
 ) -> Vec<(PathBuf, PathBuf)> {
-    paths.into_iter().map(|path| {
-        let resolved = resolve(&path).unwrap_or_else(|_| path.clone());
-        (path, resolved)
-    }).collect()
+    paths
+        .into_iter()
+        .map(|path| {
+            let resolved = resolve(&path).unwrap_or_else(|_| path.clone());
+            (path, resolved)
+        })
+        .collect()
 }
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
@@ -463,61 +495,103 @@ impl Cagents {
     }
 
     fn channel_scope_path(&self, id: ChannelId) -> Option<PathBuf> {
-        let channel = self.durable.channels.iter().find(|channel|channel.id==id)?;
-        let project = self.sidebar_model.project(channel.project_id)?;
-        Some(project
-            .worktrees
+        let channel = self
+            .durable
+            .channels
             .iter()
-            .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
-            .map(|worktree| worktree.path.clone())
-            .unwrap_or_else(|| {
-                project
-                    .repository
-                    .parent()
-                    .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
-                    .unwrap_or(&project.repository)
-                    .to_path_buf()
-            }))
+            .find(|channel| channel.id == id)?;
+        let project = self.sidebar_model.project(channel.project_id)?;
+        Some(
+            project
+                .worktrees
+                .iter()
+                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+                .map(|worktree| worktree.path.clone())
+                .unwrap_or_else(|| {
+                    project
+                        .repository
+                        .parent()
+                        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                        .unwrap_or(&project.repository)
+                        .to_path_buf()
+                }),
+        )
     }
 
     fn channel_scope_is_current(&self, id: ChannelId, path: &Path) -> bool {
-        if self.durable.active_channel != Some(id) || self.active_workspace.as_deref()!=Some(path) {return false;}
-        let Some(channel) = self.durable.channels.iter().find(|channel|channel.id==id) else {return false;};
+        if self.durable.active_channel != Some(id) || self.active_workspace.as_deref() != Some(path)
+        {
+            return false;
+        }
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+        else {
+            return false;
+        };
         let members = channel.cards.iter().copied().collect::<HashSet<_>>();
-        self.workspace.order().eq(self.durable.cards.iter()
-            .filter(|card|card.existence.is_open() && members.contains(&card.id)).map(|card|card.id))
+        self.workspace.order().eq(self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && members.contains(&card.id))
+            .map(|card| card.id))
     }
 
     pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
         self.select_channel_then(id, selection::Intent::Navigate)
     }
 
-    pub(in crate::app) fn select_channel_then(&mut self, id: ChannelId, after: selection::Intent) -> Task<Message> {
+    pub(in crate::app) fn select_channel_then(
+        &mut self,
+        id: ChannelId,
+        after: selection::Intent,
+    ) -> Task<Message> {
         let Some(path) = self.channel_scope_path(id) else {
-            let cancelled=self.cancel_worktree_selection();
-            let abandoned=self.abandon_worktree_selection(after);
-            return Task::batch([cancelled,abandoned]);
+            let cancelled = self.cancel_worktree_selection();
+            let abandoned = self.abandon_worktree_selection(after);
+            return Task::batch([cancelled, abandoned]);
         };
         self.worktree_owner_paths.invalidate_watched();
-        let protected = self.worktree_owner_paths.cached.get(&path)
-            .is_some_and(|physical|self.worktree_protections.protects_exact(physical));
+        let protected = self
+            .worktree_owner_paths
+            .cached
+            .get(&path)
+            .is_some_and(|physical| self.worktree_protections.protects_exact(physical));
         // Re-selecting an already displayed, physically protected channel
         // cannot expose another directory. In particular RepositoryLoaded
         // with unchanged roots does no new filesystem work.
-        if matches!(&after,selection::Intent::Navigate) && self.channel_scope_is_current(id,&path)
-            && (!crate::instance::window_is_initialized() || crate::device::is_remote() || protected)
+        if matches!(&after, selection::Intent::Navigate)
+            && self.channel_scope_is_current(id, &path)
+            && (!crate::instance::window_is_initialized()
+                || crate::device::is_remote()
+                || protected)
         {
-            let cancelled=self.cancel_worktree_selection();
+            let cancelled = self.cancel_worktree_selection();
             let initialize = self.initialize_prepared_scope_runtimes();
             let after = self.finish_worktree_selection(after);
-            return Task::batch([cancelled,initialize,after]);
+            return Task::batch([cancelled, initialize, after]);
         }
-        self.select_worktree_then(path.clone(),false,selection::Intent::Channel { id, path, after: Box::new(after) })
+        self.select_worktree_then(
+            path.clone(),
+            false,
+            selection::Intent::Channel {
+                id,
+                path,
+                after: Box::new(after),
+            },
+        )
     }
 
     fn select_channel_inner(&mut self, id: ChannelId) -> Task<Message> {
-        let Some(path) = self.channel_scope_path(id) else { return Task::none(); };
-        if self.channel_scope_is_current(id,&path) { return Task::none(); }
+        let Some(path) = self.channel_scope_path(id) else {
+            return Task::none();
+        };
+        if self.channel_scope_is_current(id, &path) {
+            return Task::none();
+        }
         self.snapshot_workspace_scope();
         let discarded = if self.durable.active_channel != Some(id) {
             self.discard_unused_default_chats()
@@ -570,10 +644,20 @@ impl Cagents {
                     }),
             );
         let remote = crate::device::is_remote();
-        let paths = self.known_worktree_roots.iter().cloned()
-            .chain(self.durable.cards.iter().filter(|card| card.existence.is_open())
-                .filter_map(card_directory).map(Path::to_owned))
-            .chain(selected.map(Path::to_owned)).collect::<HashSet<_>>();
+        let paths = self
+            .known_worktree_roots
+            .iter()
+            .cloned()
+            .chain(
+                self.durable
+                    .cards
+                    .iter()
+                    .filter(|card| card.existence.is_open())
+                    .filter_map(card_directory)
+                    .map(Path::to_owned),
+            )
+            .chain(selected.map(Path::to_owned))
+            .collect::<HashSet<_>>();
         self.worktree_owner_paths.retain_paths(paths.clone());
         for path in paths {
             self.worktree_owner_paths.request(&path, remote);
@@ -637,29 +721,42 @@ impl Cagents {
                 // an alias retarget between read and registration cannot be
                 // lost. Register physical ancestors too, then validate the
                 // initial result across that registration gap.
-                watch.register(&paths.iter().map(|path| (path.clone(), path.clone())).collect::<Vec<_>>());
+                watch.register(
+                    &paths
+                        .iter()
+                        .map(|path| (path.clone(), path.clone()))
+                        .collect::<Vec<_>>(),
+                );
                 let mut resolver = resolver;
                 let first = canonicalize_owner_paths(paths.clone(), &mut resolver);
                 watch.register(&first);
                 let validated = canonicalize_owner_paths(paths, resolver);
                 watch.register(&validated);
                 validated
-            }).await.unwrap_or_default();
+            })
+            .await
+            .unwrap_or_default();
             Message::WorktreeOwnerPathsResolved { generation, paths }
         })
     }
 
     pub(super) fn worktree_owner_paths_resolved(
-        &mut self, generation: u64, paths: Vec<(PathBuf, PathBuf)>,
+        &mut self,
+        generation: u64,
+        paths: Vec<(PathBuf, PathBuf)>,
     ) -> Task<Message> {
-        if !self.worktree_owner_paths.finish(generation, paths) { return Task::none(); }
+        if !self.worktree_owner_paths.finish(generation, paths) {
+            return Task::none();
+        }
         // Re-evaluate current descriptors, never a stale selection captured by
         // the job. Late I/O cannot navigate back to a previously selected scope.
         let selected = self.active_workspace.clone();
         self.refresh_worktree_owners(selected.as_deref());
         if self.durable.active_channel.is_none() && !self.worktree_selection.pending {
             selected.map_or_else(Task::none, |path| self.select_worktree(path, false))
-        } else { Task::none() }
+        } else {
+            Task::none()
+        }
     }
 
     /// Refresh which worktree rows hold an open pane after state changes,
@@ -707,15 +804,24 @@ impl Cagents {
     /// The current explicit filing is authoritative for context handoffs;
     /// an executable cwd cannot override a channel or a recorded worktree.
     pub(super) fn context_card_worktree(&self, card: &CardState) -> Option<PathBuf> {
-        if let Some(channel)=self.durable.channels.iter().find(|channel|channel.cards.contains(&card.id)) {
+        if let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card.id))
+        {
             return self.channel_scope_path(channel.id);
         }
-        self.durable.card_scopes.get(&card.id).or_else(||self.worktree_owners.get(&card.id))
-            .cloned().or_else(||self.unchanneled_card_worktree(card).map(Path::to_owned))
+        self.durable
+            .card_scopes
+            .get(&card.id)
+            .or_else(|| self.worktree_owners.get(&card.id))
+            .cloned()
+            .or_else(|| self.unchanneled_card_worktree(card).map(Path::to_owned))
     }
 
     pub(super) fn context_paths_match(&self, left: &Path, right: &Path) -> bool {
-        self.worktree_owner_paths.canonical(left)==self.worktree_owner_paths.canonical(right)
+        self.worktree_owner_paths.canonical(left) == self.worktree_owner_paths.canonical(right)
     }
 
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
@@ -820,11 +926,7 @@ impl Cagents {
         self.select_worktree_then(path, create_if_empty, selection::Intent::Navigate)
     }
 
-    fn select_worktree_inner(
-        &mut self,
-        path: PathBuf,
-        create_if_empty: bool,
-    ) -> Task<Message> {
+    fn select_worktree_inner(&mut self, path: PathBuf, create_if_empty: bool) -> Task<Message> {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
@@ -2179,15 +2281,21 @@ mod tests {
     #[test]
     fn indexed_worktree_projection_marks_many_cards_without_prefix_collisions() {
         let mut app = super::super::tests::context_inspector_test_app(false);
-        let paths = (0..200).map(|index| format!("/repo/wt-{index}")).collect::<Vec<_>>();
-        register_worktrees(&mut app, &paths.iter().map(String::as_str).collect::<Vec<_>>());
+        let paths = (0..200)
+            .map(|index| format!("/repo/wt-{index}"))
+            .collect::<Vec<_>>();
+        register_worktrees(
+            &mut app,
+            &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
         let template = super::super::tests::terminal_card_state();
         for (index, root) in paths.iter().enumerate().filter(|(index, _)| index % 2 == 0) {
             for nested in 0..10 {
                 let mut card = template.clone();
                 card.id = CardId::new();
                 if let CardKind::Terminal(session) = &mut card.kind {
-                    session.launch.working_directory = PathBuf::from(root).join(format!("src/{nested}"));
+                    session.launch.working_directory =
+                        PathBuf::from(root).join(format!("src/{nested}"));
                 }
                 Arc::make_mut(&mut app.durable).cards.push(card);
             }
@@ -2196,7 +2304,11 @@ mod tests {
         app.refresh_sidebar_worktree_panes();
         let project = &app.sidebar_model.projects[0];
         for (index, worktree) in project.worktrees.iter().enumerate() {
-            assert_eq!(app.sidebar_state.worktree_has_panes(project.id, worktree.id), index % 2 == 0);
+            assert_eq!(
+                app.sidebar_state
+                    .worktree_has_panes(project.id, worktree.id),
+                index % 2 == 0
+            );
         }
     }
 
@@ -2685,7 +2797,8 @@ mod owner_path_cache_tests {
             }
             if let Some((generation, batch)) = cache.take_batch() {
                 let paths = canonicalize_owner_paths(batch, |path| {
-                    calls += 1; Ok(path.into())
+                    calls += 1;
+                    Ok(path.into())
                 });
                 assert!(cache.finish(generation, paths));
                 assert_eq!(pass, 0);
@@ -2698,55 +2811,102 @@ mod owner_path_cache_tests {
     fn older_owner_batch_cannot_overwrite_a_prepared_selection() {
         let mut cache = OwnerPaths::default();
         let alias = PathBuf::from("/alias");
-        cache.request(&alias,false);
-        let (generation,_) = cache.take_batch().unwrap();
-        cache.install_prepared(vec![(alias.clone(),"/new-target".into())]);
-        assert!(cache.finish(generation,vec![(alias.clone(),"/old-target".into())]));
-        assert_eq!(cache.canonical(&alias),PathBuf::from("/new-target"));
+        cache.request(&alias, false);
+        let (generation, _) = cache.take_batch().unwrap();
+        cache.install_prepared(vec![(alias.clone(), "/new-target".into())]);
+        assert!(cache.finish(generation, vec![(alias.clone(), "/old-target".into())]));
+        assert_eq!(cache.canonical(&alias), PathBuf::from("/new-target"));
         assert!(cache.take_batch().is_none());
     }
 
     #[test]
     fn repository_loaded_with_unchanged_roots_schedules_no_canonicalization() {
         use cosmic::Application as _;
-        use std::sync::atomic::{AtomicUsize,Ordering};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().to_owned();
         let project = ProjectId::new();
         let repository_id = RepositoryId::new();
-        let records = (0..12).map(|index| {
-            let path = root.join(format!("worktree-{index}"));
-            std::fs::create_dir(&path).unwrap();
-            WorktreeRecord {id:crate::model::WorktreeId::new(),path,created_at_unix_ms:None,
-                head_oid:None,branch:None,detached:false,bare:false,lock:Default::default(),prunable_reason:None}
-        }).collect::<Vec<_>>();
+        let records = (0..12)
+            .map(|index| {
+                let path = root.join(format!("worktree-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                WorktreeRecord {
+                    id: crate::model::WorktreeId::new(),
+                    path,
+                    created_at_unix_ms: None,
+                    head_oid: None,
+                    branch: None,
+                    detached: false,
+                    bare: false,
+                    lock: Default::default(),
+                    prunable_reason: None,
+                }
+            })
+            .collect::<Vec<_>>();
         let mut app = super::super::tests::context_inspector_test_app(false);
-        app.sidebar_model.projects = vec![SidebarProject::new(project,repository_id,"fixture".into(),root.clone(),
-            records.iter().map(|record|SidebarWorktree::from_repository(record,None)).collect(),Vec::new())];
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project,
+            repository_id,
+            "fixture".into(),
+            root.clone(),
+            records
+                .iter()
+                .map(|record| SidebarWorktree::from_repository(record, None))
+                .collect(),
+            Vec::new(),
+        )];
         app.refresh_worktree_owners(None);
         let calls = Arc::new(AtomicUsize::new(0));
         let counted = calls.clone();
         let task = app.resolve_worktree_owner_paths_with(move |path| {
-            counted.fetch_add(1,Ordering::Relaxed); path.canonicalize()
+            counted.fetch_add(1, Ordering::Relaxed);
+            path.canonicalize()
         });
-        let Message::WorktreeOwnerPathsResolved {generation,paths} = super::super::tests::task_app_message(task) else {panic!("unexpected owner result")};
-        assert!(app.worktree_owner_paths.finish(generation,paths));
+        let Message::WorktreeOwnerPathsResolved { generation, paths } =
+            super::super::tests::task_app_message(task)
+        else {
+            panic!("unexpected owner result")
+        };
+        assert!(app.worktree_owner_paths.finish(generation, paths));
         let initial = calls.load(Ordering::Relaxed);
         assert!(initial >= 12);
         let loaded = LoadedRepository {
-            project: ProjectState {id:project,generation:0,name:"fixture".into(),repository:root.clone(),
-                kind:crate::model::ProjectKind::Git,existence:Existence::Open},
-            repository:Some(RepositoryInfo {id:repository_id,selected_path:root.clone(),common_dir:root.join(".git"),
-                git_dir:root.join(".git"),worktree_root:Some(root),is_bare:false}),
-            worktrees:records.into_iter().map(|record|(record,None)).collect(),github:GitHubAvailability::NotAssociated,
-            review_repository:None,head_repositories:HashMap::new(),
+            project: ProjectState {
+                id: project,
+                generation: 0,
+                name: "fixture".into(),
+                repository: root.clone(),
+                kind: crate::model::ProjectKind::Git,
+                existence: Existence::Open,
+            },
+            repository: Some(RepositoryInfo {
+                id: repository_id,
+                selected_path: root.clone(),
+                common_dir: root.join(".git"),
+                git_dir: root.join(".git"),
+                worktree_root: Some(root),
+                is_bare: false,
+            }),
+            worktrees: records.into_iter().map(|record| (record, None)).collect(),
+            github: GitHubAvailability::NotAssociated,
+            review_repository: None,
+            head_repositories: HashMap::new(),
         };
         for generation in 1..=3 {
-            app.repository_generations.insert(project,generation);
-            drop(app.update(Message::RepositoryLoaded {open_cards:false,project_id:project,generation,result:Ok(Box::new(loaded.clone()))}));
-            assert!(app.worktree_owner_paths.inflight_generation.is_none(),"unchanged reload scheduled owner I/O");
+            app.repository_generations.insert(project, generation);
+            drop(app.update(Message::RepositoryLoaded {
+                open_cards: false,
+                project_id: project,
+                generation,
+                result: Ok(Box::new(loaded.clone())),
+            }));
+            assert!(
+                app.worktree_owner_paths.inflight_generation.is_none(),
+                "unchanged reload scheduled owner I/O"
+            );
             assert!(app.worktree_owner_paths.take_batch().is_none());
-            assert_eq!(calls.load(Ordering::Relaxed),initial);
+            assert_eq!(calls.load(Ordering::Relaxed), initial);
         }
     }
 
@@ -2755,7 +2915,8 @@ mod owner_path_cache_tests {
         use cosmic::Application as _;
         let mut app = super::super::tests::context_inspector_test_app(false);
         for index in 0..12 {
-            app.worktree_owner_paths.request(Path::new(&format!("/slow/worktree-{index}")), false);
+            app.worktree_owner_paths
+                .request(Path::new(&format!("/slow/worktree-{index}")), false);
         }
         let (entered, entered_rx) = crossbeam_channel::bounded(1);
         let (release, release_rx) = crossbeam_channel::bounded(1);
@@ -2771,11 +2932,17 @@ mod owner_path_cache_tests {
         let worker = std::thread::spawn(move || super::super::tests::task_app_message(task));
         entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         let input_started = Instant::now();
-        drop(app.update(Message::SettingsSearchChanged("responsive during slow ownership".into())));
-        eprintln!("blocked_twelve_owner_paths_input_elapsed_us={}", input_started.elapsed().as_micros());
+        drop(app.update(Message::SettingsSearchChanged(
+            "responsive during slow ownership".into(),
+        )));
+        eprintln!(
+            "blocked_twelve_owner_paths_input_elapsed_us={}",
+            input_started.elapsed().as_micros()
+        );
         assert_eq!(app.settings_search, "responsive during slow ownership");
         release.send(()).unwrap();
-        let Message::WorktreeOwnerPathsResolved { generation, paths } = worker.join().unwrap() else {
+        let Message::WorktreeOwnerPathsResolved { generation, paths } = worker.join().unwrap()
+        else {
             panic!("owner task returned another message");
         };
         assert_eq!(paths.len(), 12);
@@ -2806,7 +2973,9 @@ mod owner_path_cache_tests {
             }
             result
         });
-        let Message::WorktreeOwnerPathsResolved { paths, .. } = super::super::tests::task_app_message(task) else {
+        let Message::WorktreeOwnerPathsResolved { paths, .. } =
+            super::super::tests::task_app_message(task)
+        else {
             panic!("owner task returned another message");
         };
         assert_eq!(paths, vec![(alias, second)]);
@@ -2830,7 +2999,10 @@ mod owner_path_cache_tests {
             cache.request(Path::new(path), false);
         }
         let (generation, batch) = cache.take_batch().unwrap();
-        assert!(cache.finish(generation, batch.into_iter().map(|path| (path.clone(), path)).collect()));
+        assert!(cache.finish(
+            generation,
+            batch.into_iter().map(|path| (path.clone(), path)).collect()
+        ));
         cache.retain_paths([PathBuf::from("/root"), PathBuf::from("/new/card")].into());
         assert_eq!(cache.cached.len(), 2);
         assert!(!cache.cached.contains_key(Path::new("/old/card")));

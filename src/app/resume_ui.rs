@@ -753,16 +753,27 @@ impl Cagents {
                 .find(|channel| channel.cards.contains(&card))
                 .map(|channel| channel.id)
             {
-                return self.select_channel_then(channel,
-                    worktree_ui::selection::Intent::Focus {card, activate: false});
+                return self.select_channel_then(
+                    channel,
+                    worktree_ui::selection::Intent::Focus {
+                        card,
+                        activate: false,
+                    },
+                );
             } else {
                 let owner = self
                     .card_state(card)
                     .and_then(|card| self.card_worktree(card))
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
-                return self.select_worktree_then(owner, false,
-                    worktree_ui::selection::Intent::Focus {card, activate: false});
+                return self.select_worktree_then(
+                    owner,
+                    false,
+                    worktree_ui::selection::Intent::Focus {
+                        card,
+                        activate: false,
+                    },
+                );
             }
         }
         if entry.open {
@@ -814,12 +825,20 @@ impl Cagents {
         let replace = self.resume_ui.replace;
         self.close_resume();
         let entry = SavedConversation { session, ..entry };
-        self.select_worktree_then(entry.session.launch.recipe.working_directory.clone(), false,
-            worktree_ui::selection::Intent::Resume {entry, replace})
+        self.select_worktree_then(
+            entry.session.launch.recipe.working_directory.clone(),
+            false,
+            worktree_ui::selection::Intent::Resume { entry, replace },
+        )
     }
 
-    pub(super) fn commit_resumed_conversation(&mut self, entry: SavedConversation, replace: Option<CardId>) -> Task<Message> {
-        self.recently_closed.retain(|(card, _)| card.id != entry.card);
+    pub(super) fn commit_resumed_conversation(
+        &mut self,
+        entry: SavedConversation,
+        replace: Option<CardId>,
+    ) -> Task<Message> {
+        self.recently_closed
+            .retain(|(card, _)| card.id != entry.card);
         let session = entry.session;
         // The draft `/resume` was asked from gives its place to the
         // conversation, where both belong to the same strip.

@@ -42,8 +42,8 @@ mod terminal_close;
 mod terminal_end_ui;
 mod terminal_failure;
 mod terminal_ui;
-mod update_ui;
 mod update_tail;
+mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_operations;
@@ -4015,11 +4015,21 @@ pub enum Message {
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
     HostedTerminalsObserved(Vec<crate::terminal::ipc::TerminalDescriptor>),
-    WorktreeProtectionsPrepared { generation: u64, receipt: worktree_ui::protection_sync::Receipt },
+    WorktreeProtectionsPrepared {
+        generation: u64,
+        receipt: worktree_ui::protection_sync::Receipt,
+    },
     RetryWorktreeProtections,
-    WorktreeSelectionPrepared { generation: u64, create: bool, receipt: worktree_ui::selection::Receipt },
+    WorktreeSelectionPrepared {
+        generation: u64,
+        create: bool,
+        receipt: worktree_ui::selection::Receipt,
+    },
     WorktreeOwnerPathsInvalidated,
-    WorktreeOwnerPathsResolved { generation: u64, paths: Vec<(PathBuf, PathBuf)> },
+    WorktreeOwnerPathsResolved {
+        generation: u64,
+        paths: Vec<(PathBuf, PathBuf)>,
+    },
     PersistStableTitles,
     TerminalWake {
         card: CardId,
@@ -5795,8 +5805,11 @@ impl Cagents {
         if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(session.launch.working_directory.as_path())
         {
-            return self.select_worktree_then(session.launch.working_directory.clone(), false,
-                worktree_ui::selection::Intent::Terminal(session));
+            return self.select_worktree_then(
+                session.launch.working_directory.clone(),
+                false,
+                worktree_ui::selection::Intent::Terminal(session),
+            );
         }
         self.insert_terminal_card(session, None)
     }
@@ -7391,7 +7404,11 @@ impl Cagents {
         let is_agent = self.sidebar_state.card_activity(id).is_some()
             || self.card_state(id).is_some_and(|card| matches!(&card.kind,
                 CardKind::Terminal(session) if crate::agent::Provider::recognize_launch(&session.launch).is_some()));
-        let title = if is_agent { crate::agent::codex_title_without_status(&title) } else { &title };
+        let title = if is_agent {
+            crate::agent::codex_title_without_status(&title)
+        } else {
+            &title
+        };
         let Some(title) = normalize_card_name(title) else {
             return false;
         };
@@ -7404,16 +7421,27 @@ impl Cagents {
             &title
         };
         let _ = self.workspace.rename_card(id, presentation.to_owned());
-        if self.card_state(id).is_some_and(|card| matches!(card.kind, CardKind::Terminal(_))) {
+        if self
+            .card_state(id)
+            .is_some_and(|card| matches!(card.kind, CardKind::Terminal(_)))
+        {
             // OSC titles are presentation state while a provider animates or
             // replaces them. Only a stable title enters the durable snapshot.
-            let current = self.chrome_ui.reported_titles.get(&id)
+            let current = self
+                .chrome_ui
+                .reported_titles
+                .get(&id)
                 .map(|reported| reported.value.as_str())
                 .or_else(|| self.card_state(id).map(|state| state.title.as_str()));
             if current != Some(title.as_str()) {
-                self.chrome_ui.reported_titles.insert(id, chrome_ui::ReportedTitle {
-                    value: title, changed_at: Instant::now(), pending: true,
-                });
+                self.chrome_ui.reported_titles.insert(
+                    id,
+                    chrome_ui::ReportedTitle {
+                        value: title,
+                        changed_at: Instant::now(),
+                        pending: true,
+                    },
+                );
                 self.card_chrome.remove(&id);
             }
             return false;
@@ -7430,27 +7458,43 @@ impl Cagents {
     }
 
     fn persist_stable_titles(&mut self, now: Instant) -> Task<Message> {
-        let stable = self.chrome_ui.reported_titles.iter()
-            .filter(|(_, title)| title.pending && now.saturating_duration_since(title.changed_at) >= chrome_ui::TITLE_STABILITY)
-            .map(|(&card, title)| (card, title.value.clone())).collect::<Vec<_>>();
+        let stable = self
+            .chrome_ui
+            .reported_titles
+            .iter()
+            .filter(|(_, title)| {
+                title.pending
+                    && now.saturating_duration_since(title.changed_at) >= chrome_ui::TITLE_STABILITY
+            })
+            .map(|(&card, title)| (card, title.value.clone()))
+            .collect::<Vec<_>>();
         let mut changed = false;
         for (card, title) in stable {
             if !self.chrome_ui.user_titles.contains_key(&card)
-                && self.card_state(card).is_some_and(|state| state.title != title)
+                && self
+                    .card_state(card)
+                    .is_some_and(|state| state.title != title)
                 && let Some(state) = self.card_state_mut(card)
-            { state.title = title; changed = true; }
+            {
+                state.title = title;
+                changed = true;
+            }
             if let Some(reported) = self.chrome_ui.reported_titles.get_mut(&card) {
                 reported.pending = false;
             }
         }
-        if changed { self.persist(); }
+        if changed {
+            self.persist();
+        }
         Task::none()
     }
 
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
-        self.chrome_ui.reported_titles.retain(|card, _| self.cards.contains_key(card));
+        self.chrome_ui
+            .reported_titles
+            .retain(|card, _| self.cards.contains_key(card));
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
@@ -8571,19 +8615,26 @@ impl Cagents {
                 TerminalEvent::AgentActivityChanged(activity) => {
                     if ended_terminal(self.card_state(card)).is_none() {
                         if self.sidebar_state.card_activity(card) != activity {
-                semantic_changed = true;
-                self.update_tail.mark(update_tail::Step::Channels);
-                self.observe_agent_activity_for_card(card, activity);
-            }
+                            semantic_changed = true;
+                            self.update_tail.mark(update_tail::Step::Channels);
+                            self.observe_agent_activity_for_card(card, activity);
+                        }
                     }
                 }
                 TerminalEvent::TitleChanged(title) => {
-                    let previous = self.chrome_ui.reported_titles.get(&card)
+                    let previous = self
+                        .chrome_ui
+                        .reported_titles
+                        .get(&card)
                         .map(|title| title.value.clone())
                         .or_else(|| self.card_state(card).map(|state| state.title.clone()));
                     durable_changed |= self.apply_reported_title(card, title);
-                    if self.chrome_ui.reported_titles.get(&card)
-                        .is_some_and(|title| Some(title.value.as_str()) != previous.as_deref()) {
+                    if self
+                        .chrome_ui
+                        .reported_titles
+                        .get(&card)
+                        .is_some_and(|title| Some(title.value.as_str()) != previous.as_deref())
+                    {
                         self.update_tail.mark(update_tail::Step::Chrome);
                     }
                 }
@@ -8766,8 +8817,10 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::Loading);
             return (self.start_terminal(card, session, visible, false), true);
         }
-        (Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
-            semantic_changed || durable_changed)
+        (
+            Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
+            semantic_changed || durable_changed,
+        )
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -13296,9 +13349,13 @@ impl Application for Cagents {
         {
             return Task::none();
         }
-        let prepared_navigation=match &message {
-            Message::WorktreeSelectionPrepared {generation,receipt,..}=>self.prepared_selection_navigates(*generation,receipt),
-            _=>false,
+        let prepared_navigation = match &message {
+            Message::WorktreeSelectionPrepared {
+                generation,
+                receipt,
+                ..
+            } => self.prepared_selection_navigates(*generation, receipt),
+            _ => false,
         };
         if (self.focused_repository_is_saving() || self.modal_is_open())
             && (completion_navigates(&message) || prepared_navigation)
@@ -13426,9 +13483,16 @@ impl Application for Cagents {
                     }
                 }
             }
-            Message::WorktreeProtectionsPrepared {generation,receipt} => self.window_protections_prepared(generation,receipt),
+            Message::WorktreeProtectionsPrepared {
+                generation,
+                receipt,
+            } => self.window_protections_prepared(generation, receipt),
             Message::RetryWorktreeProtections => self.sync_worktree_protections(),
-            Message::WorktreeSelectionPrepared { generation, create, receipt } => self.worktree_selection_prepared(generation, create, receipt),
+            Message::WorktreeSelectionPrepared {
+                generation,
+                create,
+                receipt,
+            } => self.worktree_selection_prepared(generation, create, receipt),
             Message::WorktreeOwnerPathsInvalidated => {
                 self.worktree_protection_sync.invalidate();
                 self.worktree_owner_paths.invalidate_watched();
@@ -16560,7 +16624,9 @@ impl Application for Cagents {
             // paint ticks still render; neither walks the workspace projection.
             return task;
         }
-        if !terminal_wake && !camera_only { self.update_tail.changed(); }
+        if !terminal_wake && !camera_only {
+            self.update_tail.changed();
+        }
         // `status` is the shell's write channel: ninety-odd call sites raise a
         // notice by assigning it. Draining it here is what makes those notices
         // survive the next assignment instead of silently replacing each other,
@@ -16572,7 +16638,9 @@ impl Application for Cagents {
         self.sync_notification_presence();
         let protections = if self.update_tail.run(update_tail::Step::Protections) {
             self.sync_worktree_protections()
-        } else {Task::none()};
+        } else {
+            Task::none()
+        };
         self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
@@ -16624,13 +16692,17 @@ impl Application for Cagents {
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = if self.update_tail.run(update_tail::Step::Chrome) {
             self.sync_chrome()
-        } else { Task::none() };
+        } else {
+            Task::none()
+        };
         let deferred = self.release_deferred_navigation_if_unblocked();
         self.refresh_draft_permission_previews();
         let owner_paths = self.resolve_worktree_owner_paths();
         let terminal_probes = if self.update_tail.run(update_tail::Step::TranscriptProbes) {
             self.terminal_transcript_probes()
-        } else { Task::none() };
+        } else {
+            Task::none()
+        };
         Task::batch([
             task,
             binding,
@@ -16646,12 +16718,20 @@ impl Application for Cagents {
 
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
-        let title_subscription = if self.chrome_ui.reported_titles.values().any(|title| title.pending) {
+        let title_subscription = if self
+            .chrome_ui
+            .reported_titles
+            .values()
+            .any(|title| title.pending)
+        {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::PersistStableTitles)
-        } else { Subscription::none() };
+        } else {
+            Subscription::none()
+        };
         let mut subscriptions = vec![
             self.chat_subscription(),
-            self.worktree_owner_paths.subscription(self.refresh_ui.focused),
+            self.worktree_owner_paths
+                .subscription(self.refresh_ui.focused),
             self.protection_retry_subscription(),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),

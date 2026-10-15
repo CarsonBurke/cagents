@@ -288,11 +288,16 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         let started = std::time::Instant::now();
         tracing::debug!(target: "cagents::startup", stage = "lease_acquire_started");
         let lease = cagents::instance::WindowLease::acquire(new_window, slot).map_err(|error| {
-            let category = if matches!(error.get_ref().and_then(|inner|
-                inner.downcast_ref::<cagents::instance::ApplicationLeaseError>()),
-                Some(cagents::instance::ApplicationLeaseError::AlreadyRunning)) {
+            let category = if matches!(
+                error.get_ref().and_then(
+                    |inner| inner.downcast_ref::<cagents::instance::ApplicationLeaseError>()
+                ),
+                Some(cagents::instance::ApplicationLeaseError::AlreadyRunning)
+            ) {
                 "lease_held"
-            } else { "lease_io" };
+            } else {
+                "lease_io"
+            };
             tracing::debug!(target: "cagents::startup", stage = "lease_failed", category,
                 elapsed_ms = started.elapsed().as_millis() as u64);
             error
@@ -310,16 +315,18 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
             device_source
                 .as_deref()
                 .unwrap_or(cagents::instance::PRIMARY_WINDOW),
-        ).inspect_err(|_| {
+        )
+        .inspect_err(|_| {
             tracing::debug!(target: "cagents::startup", stage = "persistence_initialize_failed");
         })?;
         tracing::debug!(target: "cagents::startup", stage = "persistence_initialized",
             elapsed_ms = stage.elapsed().as_millis() as u64);
         let (activation_tx, activation_rx) = async_channel::unbounded();
         tracing::debug!(target: "cagents::startup", stage = "activation_listener_started");
-        let listener = cagents::instance::UiActivationListener::bind(activation_tx).inspect_err(|_| {
-            tracing::debug!(target: "cagents::startup", stage = "activation_listener_failed");
-        })?;
+        let listener =
+            cagents::instance::UiActivationListener::bind(activation_tx).inspect_err(|_| {
+                tracing::debug!(target: "cagents::startup", stage = "activation_listener_failed");
+            })?;
         tracing::debug!(target: "cagents::startup", stage = "activation_listener_ready");
         let stage = std::time::Instant::now();
         tracing::debug!(target: "cagents::startup", stage = "daemon_wait_started");

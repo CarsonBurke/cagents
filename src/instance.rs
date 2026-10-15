@@ -606,7 +606,9 @@ pub(crate) fn window_is_initialized() -> bool {
 }
 
 pub(crate) fn prepare_window_protection_ready() -> io::Result<PreparedLock> {
-    prepare_owned_lock(&runtime_directory()?.join(format!("{}.worktrees-ready", slot_lock_name(window_slot()))))
+    prepare_owned_lock(
+        &runtime_directory()?.join(format!("{}.worktrees-ready", slot_lock_name(window_slot()))),
+    )
 }
 
 pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
@@ -1923,13 +1925,13 @@ mod tests {
         let path = directory.path().join("readiness");
         let prepared = prepare_owned_lock(&path).unwrap();
         // Opening and verifying the descriptor does not advertise readiness.
-        let competing = owned_lock(&path,libc::LOCK_EX|libc::LOCK_NB).unwrap();
+        let competing = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         drop(competing);
-        let committed = prepared.lock(libc::LOCK_EX|libc::LOCK_NB).unwrap();
+        let committed = prepared.lock(libc::LOCK_EX | libc::LOCK_NB).unwrap();
         assert!(matches!(owned_lock(&path,libc::LOCK_EX|libc::LOCK_NB),
             Err(error) if error.kind()==io::ErrorKind::WouldBlock));
         drop(committed);
-        owned_lock(&path,libc::LOCK_EX|libc::LOCK_NB).unwrap();
+        owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
     }
 
     #[test]
