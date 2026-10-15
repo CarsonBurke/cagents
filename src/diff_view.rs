@@ -544,9 +544,16 @@ struct BaselineFlight {
 struct BaselineBuilder(Arc<BaselineFlight>);
 impl Drop for BaselineBuilder {
     fn drop(&mut self) {
-        BASELINES.lock().unwrap_or_else(|error| error.into_inner()).pending
+        BASELINES
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .pending
             .retain(|entry| !Arc::ptr_eq(entry, &self.0));
-        *self.0.finished.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        *self
+            .0
+            .finished
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = true;
         self.0.ready.notify_all();
     }
 }
@@ -563,31 +570,59 @@ const BASELINE_CACHE_ENTRIES: usize = 8;
 static BASELINES: LazyLock<Mutex<BaselineCache>> =
     LazyLock::new(|| Mutex::new(BaselineCache::default()));
 
-fn baseline_syntax(before: &Arc<str>, token: &str,
-    theme: crate::settings::EditorSyntaxTheme, cancellation: &CancellationToken,
+fn baseline_syntax(
+    before: &Arc<str>,
+    token: &str,
+    theme: crate::settings::EditorSyntaxTheme,
+    cancellation: &CancellationToken,
 ) -> Result<Arc<BaselineSyntax>, Cancelled> {
     let hash = blake3::hash(before.as_bytes());
     let builder = loop {
         check_cancelled(cancellation)?;
         let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
-        if let Some(index) = cache.entries.iter().position(|entry| entry.hash == hash
-            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()) {
+        if let Some(index) = cache.entries.iter().position(|entry| {
+            entry.hash == hash
+                && entry.token == token
+                && entry.theme == theme
+                && entry.text.as_ref() == before.as_ref()
+        }) {
             let entry = cache.entries.remove(index).expect("matched baseline");
             cache.entries.push_back(Arc::clone(&entry));
             return Ok(entry);
         }
-        if let Some(flight) = cache.pending.iter().find(|entry| entry.hash == hash
-            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()).cloned() {
+        if let Some(flight) = cache
+            .pending
+            .iter()
+            .find(|entry| {
+                entry.hash == hash
+                    && entry.token == token
+                    && entry.theme == theme
+                    && entry.text.as_ref() == before.as_ref()
+            })
+            .cloned()
+        {
             drop(cache);
-            let mut finished = flight.finished.lock().unwrap_or_else(|error| error.into_inner());
+            let mut finished = flight
+                .finished
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
             while !*finished {
                 check_cancelled(cancellation)?;
-                finished = flight.ready.wait_timeout(finished, std::time::Duration::from_millis(25))
-                    .unwrap_or_else(|error| error.into_inner()).0;
+                finished = flight
+                    .ready
+                    .wait_timeout(finished, std::time::Duration::from_millis(25))
+                    .unwrap_or_else(|error| error.into_inner())
+                    .0;
             }
         } else {
-            let flight = Arc::new(BaselineFlight { text: Arc::clone(before), hash, token: token.to_owned(), theme,
-                finished: Mutex::new(false), ready: Condvar::new() });
+            let flight = Arc::new(BaselineFlight {
+                text: Arc::clone(before),
+                hash,
+                token: token.to_owned(),
+                theme,
+                finished: Mutex::new(false),
+                ready: Condvar::new(),
+            });
             cache.pending.push(Arc::clone(&flight));
             break BaselineBuilder(flight);
         }
@@ -595,22 +630,46 @@ fn baseline_syntax(before: &Arc<str>, token: &str,
     let mut parser = HighlightParser::new(token, theme);
     let mut syntax: SyntaxLines = Default::default();
     for text in before.split_inclusive('\n') {
-        for (lines, spans) in syntax.iter_mut().zip(parser.line(text, cancellation)?) { lines.push(spans.into()); }
+        for (lines, spans) in syntax.iter_mut().zip(parser.line(text, cancellation)?) {
+            lines.push(spans.into());
+        }
     }
     // This is a payload bound, including Arc headers/vector capacities. The
     // allocator's metadata/fragmentation and in-flight requests are measured
     // separately; no opaque parser heap is retained inside this cache.
-    let retained_bytes = std::mem::size_of::<BaselineSyntax>() + before.len()
-        + 6 * std::mem::size_of::<usize>() + token.len()
-        + syntax.iter().map(|lines| lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
-            + lines.iter().map(|spans| std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()).sum::<usize>()).sum::<usize>();
-    let baseline = Arc::new(BaselineSyntax { text: Arc::clone(before), hash,
-        token: token.to_owned(), theme, syntax: Arc::new(syntax), retained_bytes });
+    let retained_bytes = std::mem::size_of::<BaselineSyntax>()
+        + before.len()
+        + 6 * std::mem::size_of::<usize>()
+        + token.len()
+        + syntax
+            .iter()
+            .map(|lines| {
+                lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
+                    + lines
+                        .iter()
+                        .map(|spans| {
+                            std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()
+                        })
+                        .sum::<usize>()
+            })
+            .sum::<usize>();
+    let baseline = Arc::new(BaselineSyntax {
+        text: Arc::clone(before),
+        hash,
+        token: token.to_owned(),
+        theme,
+        syntax: Arc::new(syntax),
+        retained_bytes,
+    });
     {
         let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
         if retained_bytes <= BASELINE_CACHE_BYTES {
-            while cache.entries.len() >= BASELINE_CACHE_ENTRIES || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES {
-                let Some(oldest) = cache.entries.pop_front() else { break; };
+            while cache.entries.len() >= BASELINE_CACHE_ENTRIES
+                || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES
+            {
+                let Some(oldest) = cache.entries.pop_front() else {
+                    break;
+                };
                 cache.bytes -= oldest.retained_bytes;
             }
             cache.bytes += retained_bytes;
@@ -623,13 +682,25 @@ fn baseline_syntax(before: &Arc<str>, token: &str,
 
 /// State-only forward parsing is linear in the baseline, with at most one
 /// live old-side stack. Sharing a colored run never stores deep checkpoints.
-fn advance_lexical(parser: &mut HighlightParser, lines: &[&str], cursor: &mut usize,
-    end: usize, cancellation: &CancellationToken) -> Result<(), Cancelled> {
+fn advance_lexical(
+    parser: &mut HighlightParser,
+    lines: &[&str],
+    cursor: &mut usize,
+    end: usize,
+    cancellation: &CancellationToken,
+) -> Result<(), Cancelled> {
     debug_assert!(*cursor <= end);
     for text in &lines[*cursor..end] {
         check_cancelled(cancellation)?;
-        let text = text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(text);
-        for (_, op) in parser.parser.parse_line(text, parser.syntaxes).unwrap_or_default() {
+        let text = text
+            .strip_suffix("\r\n")
+            .or_else(|| text.strip_suffix('\n'))
+            .unwrap_or(text);
+        for (_, op) in parser
+            .parser
+            .parse_line(text, parser.syntaxes)
+            .unwrap_or_default()
+        {
             let _ = parser.stack.apply(&op);
         }
     }
@@ -694,7 +765,13 @@ fn highlight_comparison_model(
             let starts_run =
                 index == 0 || corresponding[index - 1].is_none_or(|previous| previous + 1 != old);
             if starts_run || index >= probe {
-                advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old, cancellation)?;
+                advance_lexical(
+                    &mut old_parser,
+                    &old_lines,
+                    &mut old_cursor,
+                    old,
+                    cancellation,
+                )?;
                 if parser.parser == old_parser.parser && parser.stack == old_parser.stack {
                     let mut end = index + 1;
                     while end < corresponding.len() && corresponding[end] == Some(old + end - index)
@@ -707,7 +784,13 @@ fn highlight_comparison_model(
                             lines.push(Arc::clone(spans));
                         }
                     }
-                    advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old + end - index, cancellation)?;
+                    advance_lexical(
+                        &mut old_parser,
+                        &old_lines,
+                        &mut old_cursor,
+                        old + end - index,
+                        cancellation,
+                    )?;
                     parser.parser = old_parser.parser.clone();
                     parser.stack = old_parser.stack.clone();
                     index = end;
@@ -3721,43 +3804,83 @@ mod memory_contracts {
     fn nested_grammar_cache_retains_only_exact_source_and_colored_spans() {
         let text: Arc<str> = ("/*\n".repeat(512) + &"*/\n".repeat(512)).into();
         let baseline = baseline_syntax(&text, "rs", AUTO, &CancellationToken::new()).unwrap();
-        let spans: usize = baseline.syntax.iter().flat_map(|lines| lines.iter()).map(|line| line.len()).sum();
-        let payload = std::mem::size_of::<BaselineSyntax>() + text.len() + 6 * std::mem::size_of::<usize>() + baseline.token.len()
-            + baseline.syntax.iter().map(|lines| lines.capacity()*std::mem::size_of::<Arc<[SyntaxSpan]>>()
-                + lines.len()*2*std::mem::size_of::<usize>()).sum::<usize>() + spans*std::mem::size_of::<SyntaxSpan>();
+        let spans: usize = baseline
+            .syntax
+            .iter()
+            .flat_map(|lines| lines.iter())
+            .map(|line| line.len())
+            .sum();
+        let payload = std::mem::size_of::<BaselineSyntax>()
+            + text.len()
+            + 6 * std::mem::size_of::<usize>()
+            + baseline.token.len()
+            + baseline
+                .syntax
+                .iter()
+                .map(|lines| {
+                    lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
+                        + lines.len() * 2 * std::mem::size_of::<usize>()
+                })
+                .sum::<usize>()
+            + spans * std::mem::size_of::<SyntaxSpan>();
         assert_eq!(baseline.retained_bytes, payload);
-        assert!(baseline.retained_bytes < text.len()*100, "no retained quadratic parser checkpoint heap");
+        assert!(
+            baseline.retained_bytes < text.len() * 100,
+            "no retained quadratic parser checkpoint heap"
+        );
     }
 
     #[test]
     fn same_blob_baseline_builds_once_under_concurrent_requests() {
-        let text: Arc<str> = (0..64).map(|line| format!("fn concurrent_cache_{line}() {{}}\n")).collect::<String>().into();
+        let text: Arc<str> = (0..64)
+            .map(|line| format!("fn concurrent_cache_{line}() {{}}\n"))
+            .collect::<String>()
+            .into();
         let barrier = Arc::new(std::sync::Barrier::new(8));
-        let workers: Vec<_> = (0..8).map(|_| {
-            let text = Arc::clone(&text); let barrier = Arc::clone(&barrier);
-            std::thread::spawn(move || {
-                WORK_COUNTS.with(|counts| counts.set((0,0))); barrier.wait();
-                let baseline = baseline_syntax(&text,"rs",AUTO,&CancellationToken::new()).unwrap();
-                (baseline,WORK_COUNTS.with(std::cell::Cell::get).0)
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let text = Arc::clone(&text);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    WORK_COUNTS.with(|counts| counts.set((0, 0)));
+                    barrier.wait();
+                    let baseline =
+                        baseline_syntax(&text, "rs", AUTO, &CancellationToken::new()).unwrap();
+                    (baseline, WORK_COUNTS.with(std::cell::Cell::get).0)
+                })
             })
-        }).collect();
-        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
-        assert_eq!(results.iter().map(|(_,count)| count).sum::<usize>(),64);
-        assert!(results.iter().all(|(baseline,_)| Arc::ptr_eq(baseline,&results[0].0)));
+            .collect();
+        let results: Vec<_> = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect();
+        assert_eq!(results.iter().map(|(_, count)| count).sum::<usize>(), 64);
+        assert!(
+            results
+                .iter()
+                .all(|(baseline, _)| Arc::ptr_eq(baseline, &results[0].0))
+        );
     }
 
     #[test]
     fn waiting_baseline_can_cancel_while_unrelated_blob_completes() {
         let text: Arc<str> = Arc::from("fn held_cache_miss() {}\n");
-        let flight = Arc::new(BaselineFlight { text: Arc::clone(&text), hash: blake3::hash(text.as_bytes()), token:"rs".into(),
-            theme:AUTO,finished:Mutex::new(false),ready:Condvar::new() });
+        let flight = Arc::new(BaselineFlight {
+            text: Arc::clone(&text),
+            hash: blake3::hash(text.as_bytes()),
+            token: "rs".into(),
+            theme: AUTO,
+            finished: Mutex::new(false),
+            ready: Condvar::new(),
+        });
         BASELINES.lock().unwrap().pending.push(Arc::clone(&flight));
         let builder = BaselineBuilder(flight);
         let cancellation = CancellationToken::new();
         let worker_cancel = cancellation.clone();
-        let worker = std::thread::spawn(move || baseline_syntax(&text,"rs",AUTO,&worker_cancel).is_err());
+        let worker =
+            std::thread::spawn(move || baseline_syntax(&text, "rs", AUTO, &worker_cancel).is_err());
         let other: Arc<str> = Arc::from("fn unrelated_cache_miss() {}\n");
-        assert!(baseline_syntax(&other,"rs",AUTO,&CancellationToken::new()).is_ok());
+        assert!(baseline_syntax(&other, "rs", AUTO, &CancellationToken::new()).is_ok());
         cancellation.cancel();
         assert!(worker.join().unwrap());
         drop(builder);

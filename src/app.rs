@@ -10236,8 +10236,10 @@ impl Cagents {
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
-        let visible = self.workspace_surfaces_visible() && self.durable.cards.iter()
-            .any(|state| state.id == card && state.existence.is_open() && state.exposure == Exposure::Visible);
+        let visible = self.workspace_surfaces_visible()
+            && self.durable.cards.iter().any(|state| {
+                state.id == card && state.existence.is_open() && state.exposure == Exposure::Visible
+            });
         let (intents, edits, auto_save) = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => {
                 runtime.set_diff_surface_visible(visible);
@@ -11121,8 +11123,14 @@ impl Cagents {
                 }
                 .map_err(|error| error.to_string()),
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
-                CardRuntime::Repository(runtime) => { runtime.set_diff_surface_visible(visible); Ok(()) }
-                CardRuntime::PullRequests(pane) => { pane.runtime.set_diff_surface_visible(visible); Ok(()) }
+                CardRuntime::Repository(runtime) => {
+                    runtime.set_diff_surface_visible(visible);
+                    Ok(())
+                }
+                CardRuntime::PullRequests(pane) => {
+                    pane.runtime.set_diff_surface_visible(visible);
+                    Ok(())
+                }
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -11277,8 +11285,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13859,11 +13870,27 @@ impl Application for Cagents {
                 path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
             }
             Message::Repository(RepositoryAction::RevertFile { card }) => {
-                if self.modal_is_open() { return Task::none(); }
-                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return Task::none(); };
-                let Some(source) = self.sidebar_model.source_control.as_ref().filter(|source| source.key.canonical_path == runtime.descriptor.worktree) else { return Task::none(); };
-                let Some(request) = runtime.selected_discard_request() else { return Task::none(); };
-                self.update(Message::Sidebar(SidebarAction::RequestDiscard { key: source.key.clone(), request }))
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+                else {
+                    return Task::none();
+                };
+                let Some(request) = runtime.selected_discard_request() else {
+                    return Task::none();
+                };
+                self.update(Message::Sidebar(SidebarAction::RequestDiscard {
+                    key: source.key.clone(),
+                    request,
+                }))
             }
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
@@ -15987,16 +16014,26 @@ impl Application for Cagents {
                     return task;
                 }
                 if !captured
-                    && let keyboard::Event::KeyPressed { key, physical_key, modifiers, .. } = &event
+                    && let keyboard::Event::KeyPressed {
+                        key,
+                        physical_key,
+                        modifiers,
+                        ..
+                    } = &event
                     && let Some(card) = self.workspace.focused()
                     && match self.cards.get(&card) {
                         Some(CardRuntime::Repository(runtime)) => runtime.shows_diff(),
                         Some(CardRuntime::PullRequests(pane)) => pane.runtime.shows_diff(),
                         _ => false,
                     }
-                    && let Some(delta) = crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
+                    && let Some(delta) =
+                        crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
                 {
-                    return self.update(Message::ZoomFont { card, delta, editor: true });
+                    return self.update(Message::ZoomFont {
+                        card,
+                        delta,
+                        editor: true,
+                    });
                 }
                 if is_save_press(&event)
                     && let Some(card) = self.workspace.focused()
