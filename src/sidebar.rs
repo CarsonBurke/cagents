@@ -2813,6 +2813,12 @@ impl SourceControlModel {
     /// A retained snapshot cannot accept new host commands until its read finishes.
     pub fn is_reloading(&self) -> bool { self.reloading }
 
+    /// Only errors carrying captured command output expose the output toggle.
+    pub fn git_output(&self) -> Option<&str> {
+        self.error.as_deref()?.split_once("\n\nGit output:\n")
+            .map(|(_, output)| output).filter(|output| !output.is_empty())
+    }
+
     /// Commit needs a message, something staged, and no mutation in flight.
     pub fn can_commit(&self, message: &str) -> bool {
         !message.trim().is_empty()
@@ -8143,10 +8149,10 @@ fn source_control_notices<'a>(
 ) -> cosmic::iced::widget::Column<'a, SidebarAction, cosmic::Theme, cosmic::Renderer> {
     let mut notices = widget::column::with_capacity(3).spacing(space::XS);
     if let Some(error) = source.error.as_deref() {
-        let (summary, output) = error.split_once("\n\nGit output:\n").unwrap_or((error, ""));
+        let summary = error.split_once("\n\nGit output:\n").map_or(error, |(summary, _)| summary);
         notices = notices
             .push(design::caption(summary).wrapping(cosmic::iced::widget::text::Wrapping::Word));
-        if !output.is_empty() {
+        if let Some(output) = source.git_output() {
             notices = notices.push(
                 widget::button::text(if source.output_expanded {
                     "Hide Git output"

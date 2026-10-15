@@ -41,7 +41,7 @@ impl GitTarget {
         let key = self.key.clone();
         if command == Command::GitRefresh { return Some(SidebarAction::RefreshWorktree { key }); }
         if command == Command::GitStashes { return Some(SidebarAction::ToggleStashes { key }); }
-        if command == Command::GitOutput && source.error.is_some() { return Some(SidebarAction::ToggleGitOutput { key }); }
+        if command == Command::GitOutput && source.git_output().is_some() { return Some(SidebarAction::ToggleGitOutput { key }); }
         if source.busy() { return None; }
         let operation = match command {
             Command::GitFetch => GitOperation::Fetch { remote: source.upstream.as_ref().map(|upstream| upstream.remote()).or_else(|| source.remotes.first().map(String::as_str))?.to_owned(), prune: true },
@@ -106,6 +106,18 @@ mod tests {
         model.source_control.as_mut().unwrap().set_mutation(None);
         model.source_control.as_mut().unwrap().branch = Some(ValidatedBranchName::parse("replacement").unwrap());
         assert!(!target.available(&model, &state, Command::GitFetch), "a branch change cannot retarget an open palette");
+    }
+
+    #[test]
+    fn output_command_only_applies_when_the_notices_have_captured_output_to_show() {
+        let mut model = super::super::tests::panel_model();
+        let state = super::super::tests::panel_state(&model);
+        let target = GitTarget::capture(&model, &state).unwrap();
+        for (message, expected) in [("Reconciliation failed", false), ("Fetch failed\n\nGit output:\n", false), ("Fetch failed\n\nGit output:\nremote rejected", true)] {
+            model.source_control.as_mut().unwrap().error = Some(message.into());
+            assert_eq!(target.available(&model, &state, Command::GitOutput), expected);
+            assert_eq!(model.source_control.as_ref().unwrap().git_output().is_some(), expected);
+        }
     }
 
     #[test]
