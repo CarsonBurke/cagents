@@ -85,6 +85,32 @@ impl SearchSnapshot {
         )
     }
 
+    pub(crate) fn find_matches_with(&self, query: &str, options: crate::editor_search::FindOptions,
+        cancelled: impl Fn() -> bool) -> Result<Option<Vec<(Position, Position)>>, String> {
+        crate::editor_search::find_in_lines(self.lines.iter().map(|range| &self.text[range.clone()]), query, options, cancelled)
+    }
+
+    pub(crate) fn replace_matches_with(&self, matches: &[(Position, Position)], query: &str,
+        replacement: &str, options: crate::editor_search::FindOptions, preserve: bool) -> Result<String, String> {
+        let replacement = crate::editor_search::Replacement::new(query, replacement, options, preserve)?;
+        let mut result = String::with_capacity(self.text.len());
+        let mut copied = 0;
+        for &(start, end) in matches {
+            if start.line != end.line { return Err("A search match crosses a line boundary.".into()); }
+            let line = self.lines.get(start.line).ok_or("The selected match is outside the document.")?;
+            let text = &self.text[line.clone()];
+            let inserted = replacement.expand(text, start.column, end.column)?;
+            let start = line.start + start.column;
+            let end = line.start + end.column;
+            if end < start || start < copied { return Err("Search matches overlap.".into()); }
+            result.push_str(self.text.get(copied..start).ok_or("Invalid search position.")?);
+            result.push_str(&inserted);
+            copied = end;
+        }
+        result.push_str(self.text.get(copied..).ok_or("Invalid search position.")?);
+        Ok(result)
+    }
+
     /// Build a replacement in source order: each match and source byte is
     /// visited once, irrespective of the number of lines or length changes.
     pub(crate) fn replace_matches(
@@ -114,7 +140,7 @@ impl SearchSnapshot {
     }
 }
 
-fn find_in_lines<T: AsRef<str>>(
+pub(crate) fn find_in_lines<T: AsRef<str>>(
     lines: impl Iterator<Item = T>,
     query: &str,
     cancelled: impl Fn() -> bool,
@@ -1262,6 +1288,14 @@ where
         let lines =
             (0..internal.editor.line_count()).filter_map(|index| internal.editor.line(index));
         find_in_lines(lines.map(|line| line.text), query, || false).unwrap_or_default()
+    }
+
+    pub fn find_matches_with(&self, query: &str, options: crate::editor_search::FindOptions)
+        -> Result<Vec<(Position, Position)>, String> {
+        let internal = self.0.borrow();
+        let lines = (0..internal.editor.line_count()).filter_map(|index| internal.editor.line(index));
+        crate::editor_search::find_in_lines(lines.map(|line| line.text), query, options, || false)
+            .map(Option::unwrap_or_default)
     }
 
     pub(crate) fn search_snapshot(&self) -> SearchSnapshot {
