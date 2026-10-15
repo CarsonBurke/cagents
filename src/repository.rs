@@ -4820,8 +4820,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         const BATCH_BYTES: usize = 16 * 1024;
         let mut next = BTreeMap::new();
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
-            let reusable = cache.numstats_ready && status.entries.iter().filter(|entry| entry.area == area)
-                .all(|entry| entry.kind == ChangeKind::Modified && entry.conflict.is_none() && !entry.submodule);
+            let (simple, added, deleted) = status.entries.iter().filter(|entry| entry.area == area)
+                .fold((true, false, false), |(simple, added, deleted), entry| (
+                    simple && matches!(entry.kind, ChangeKind::Modified | ChangeKind::Added | ChangeKind::Deleted)
+                        && entry.conflict.is_none() && !entry.submodule,
+                    added || entry.kind == ChangeKind::Added,
+                    deleted || entry.kind == ChangeKind::Deleted,
+                ));
+            // Without an addition/deletion pair, rename detection cannot
+            // change another row's count. A capped prefix cannot prove the
+            // opposite half is absent, so keep its non-modification reads full.
+            let reusable = cache.numstats_ready && simple && !(added && deleted)
+                && (!status.listing_truncated || !(added || deleted));
             let mut paths = BTreeSet::new();
             let mut pending = 0usize;
             for entry in status.entries.iter_mut().filter(|entry| entry.area == area) {
@@ -9057,7 +9067,11 @@ mod tests {
             fs::remove_file(root.join("file-00")).unwrap();
             let deleted = git.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
             assert_eq!(measured(&deleted, "file-00", ChangeArea::Unstaged), (Some(0), Some(1)));
-            assert_eq!(executor.commands.lock().unwrap().len(), 2);
+            let commands = executor.commands.lock().unwrap().clone();
+            assert_eq!(commands.len(), 2);
+            let counts = commands.iter().find(|command| command.arguments.iter().any(|arg| arg == "--numstat")).unwrap();
+            let separator = counts.arguments.iter().position(|arg| arg == "--").unwrap();
+            assert_eq!(&counts.arguments[separator + 1..], &[OsString::from("file-00")]);
         }
 
         #[test]
@@ -9156,6 +9170,32 @@ mod tests {
             let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
             assert_eq!(counts.len(), 2, "semantic attribute changes still invalidate every measured basis");
             assert!(counts.iter().all(|command| !command.arguments.iter().any(|arg| arg == "--")));
+        }
+
+        #[test]
+        fn cached_numstat_keeps_full_reads_when_status_hides_rename_pairs() {
+            let directory = tempfile::tempdir().unwrap(); let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            for name in ["original", "other"] { fs::write(root.join(name), "base\n").unwrap(); }
+            git(root, &["add", "-A"]); git(root, &["commit", "-m", "initial"]);
+            git(root, &["config", "status.renames", "false"]);
+            git(root, &["mv", "original", "renamed"]);
+            fs::write(root.join("other"), "first\n").unwrap();
+            let executor = Arc::new(RecordingExecutor::default());
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new(); let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
+            let initial = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert!(initial.status.entries.iter().any(|entry| entry.kind == ChangeKind::Added));
+            assert!(initial.status.entries.iter().any(|entry| entry.kind == ChangeKind::Deleted));
+            executor.commands.lock().unwrap().clear();
+            fs::write(root.join("other"), "one\ntwo\n").unwrap();
+            let changed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&changed, "renamed", ChangeArea::Staged), (Some(0), Some(0)));
+            assert_eq!(measured(&changed, "other", ChangeArea::Unstaged), (Some(2), Some(1)));
+            let commands = executor.commands.lock().unwrap().clone();
+            let staged = commands.iter().find(|command| command.arguments.iter().any(|arg| arg == "--cached")).unwrap();
+            assert!(!staged.arguments.iter().any(|arg| arg == "--"), "hidden rename candidates need complete detection");
         }
 
         #[test]
