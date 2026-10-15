@@ -730,6 +730,7 @@ mod tests {
 
     #[test]
     fn new_pr_checkout_retains_original_owner_through_resolution_worker_and_publication() {
+        use crate::model::WorktreeId;
         use crate::repository::{
             BaseRevision, PrWorktreeCreationConsent, ValidatedBranchName, WorktreeLock,
             WorktreeRecord,
