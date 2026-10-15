@@ -42,7 +42,8 @@ impl Store {
         let visible:Vec<_>=state.subagents.iter().flat_map(|agent|agent.items.iter().filter_map(move |item|{
             if let ItemContent::Text{text,..}=&item.content {Some((SourceKey{agent_id:Some(agent.id.clone()),source_id:item.id.clone()},text.len()))} else {None}
         })).collect();
-        let changed=self.source_revision!=state.source_revision;
+        let changed=self.source_revision!=state.source_revision
+            || cached.values().any(|part|part.epoch.incarnation!=self.source_incarnation);
         let wanted:Vec<_>=visible.iter().filter(|(key,_)|changed || !cached.contains_key(key)).map(|(key,_)|key).collect();
         if !wanted.is_empty(){self.flush_child_source()?;}
         let mut lengths=std::collections::HashMap::new();
@@ -258,6 +259,27 @@ mod tests {
         assert_eq!(page.metadata,part.metadata);assert_eq!(page.text,text);
         let before=state.source_parts.clone();
         store.publish_source_parts(&mut state).unwrap();assert_eq!(state.source_parts,before);
+    }
+
+    #[test]
+    fn replaced_store_cannot_reuse_child_aliases_from_an_older_publication() {
+        let mut old=Store::new().unwrap();
+        let mut replacement=Store::new().unwrap();
+        let original=item("root","full original");
+        for store in [&mut old,&mut replacement] {
+            store.apply(Event::SubagentItem{id:"child".into(),item:original.clone()}).unwrap();
+        }
+        let mut state=crate::chat::Snapshot::default();
+        state.subagents.push(crate::chat::Subagent{id:"child".into(),items:vec![std::sync::Arc::new(original)],kind:String::new(),description:String::new(),status:crate::chat::ToolStatus::Running,background:false,model:None,waiting:false,detail:String::new()});
+        old.publish_source_parts(&mut state).unwrap();
+        let prior=state.source_parts[0].epoch;
+        // A replacement can retain the same client Snapshot and restart its
+        // local publication counter. It must still refresh cached aliases.
+        replacement.source_revision=state.source_revision;
+        replacement.publish_source_parts(&mut state).unwrap();
+        assert_eq!(state.source_parts[0].epoch.incarnation,replacement.source_incarnation);
+        assert_ne!(state.source_parts[0].epoch.incarnation,prior.incarnation);
+        assert_eq!(replacement.source_page(query(Some("child"),"root")).unwrap().epoch,state.source_parts[0].epoch);
     }
 
     #[test]
