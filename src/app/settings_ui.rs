@@ -512,17 +512,6 @@ fn settings_category_controls<'a>(
                         },
                     ),
                 ),
-                setting_stepper(
-                    "Chat content width",
-                    "Fraction of the whole workspace used by messages and the composer; fits inside narrower panes.",
-                    &draft.chat_content_fraction,
-                    SettingsField::ChatContentFraction,
-                    0.25,
-                    1.0,
-                    0.05,
-                    0.5,
-                    "",
-                ),
             ],
         )],
         SettingsCategory::Editor => vec![

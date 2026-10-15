@@ -25,7 +25,9 @@ can still be removed on older glibc systems.
 
 The `.deb` declares `git (>= 2.36)`, `libc6 (>= 2.35)`, Fontconfig, FreeType,
 GCC/libstdc++, Wayland client, xkbcommon, and zlib runtime dependencies. The
-portable archive needs equivalent libraries. Git 2.36 or newer is required for
+full package also requires `libegl1` for the integrated browser; the browserless
+package does not add this dependency. The portable archive needs equivalent
+libraries. Git 2.36 or newer is required for
 NUL-delimited worktree discovery, so Ubuntu 22.04's default Git 2.34 must be
 upgraded separately. Hosted terminals need a shell, PTY support, and Linux
 `/proc`.
