@@ -25,6 +25,8 @@ const BURST: u32 = 10;
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
+    /// A resumed visible shell should not wait for its healthy cache deadline.
+    FocusGained,
     Loaded {
         repository: GitHubRepoKey,
         generation: u64,
@@ -149,6 +151,12 @@ impl Monitor {
                         failures: 0,
                     },
                 );
+            }
+        }
+        if matches!(&action, Action::FocusGained) {
+            let now = Instant::now();
+            for entry in state.entries.values_mut().filter(|entry| entry.failures == 0) {
+                entry.due = entry.due.min(now);
             }
         }
         let failing = state.failing;
@@ -360,6 +368,37 @@ mod tests {
         load(&mut monitor, reply("new-viewer", None));
         assert!(!Arc::ptr_eq(&original, &monitor.entries[&repository].snapshot));
         assert_eq!(monitor.entries[&repository].snapshot.viewer.as_ref().unwrap().id, "new-viewer");
+    }
+
+    #[test]
+    fn focus_refreshes_healthy_cache_without_bypassing_backoff_or_pace() {
+        let mut monitor = Monitor::default();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        let (_, generation) = monitor.busy.clone().expect("initial read admitted");
+        drop(monitor.update(Action::Loaded {
+            repository: repository.clone(), generation,
+            work: Work::Page { cursor: None }, result: Ok(reply("viewer", None)),
+        }, [repository.clone()]));
+        let later = monitor.entries[&repository].due;
+        assert!(later > Instant::now(), "completed healthy read sets a future cache deadline");
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        assert!(monitor.busy.is_none(), "ordinary tick preserves a healthy cache deadline");
+        drop(monitor.update(Action::FocusGained, [repository.clone()]));
+        assert!(monitor.busy.is_some(), "real focus gain admits a fresh healthy read");
+        let busy = monitor.busy.clone();
+        drop(monitor.update(Action::FocusGained, [repository.clone()]));
+        assert_eq!(monitor.busy, busy, "another focus does not replace an in-flight read");
+        monitor.busy = None;
+        monitor.entries.get_mut(&repository).unwrap().due = later;
+        monitor.entries.get_mut(&repository).unwrap().failures = 1;
+        drop(monitor.update(Action::FocusGained, [repository.clone()]));
+        assert!(monitor.busy.is_none(), "focus cannot bypass an API failure cooldown");
+        assert_eq!(monitor.entries[&repository].due, later);
+        monitor.entries.get_mut(&repository).unwrap().failures = 0;
+        monitor.paced = Some(Instant::now() + PACE * BURST);
+        drop(monitor.update(Action::FocusGained, [repository]));
+        assert!(monitor.busy.is_none(), "focus cannot bypass the global request budget");
     }
 
     #[test]
