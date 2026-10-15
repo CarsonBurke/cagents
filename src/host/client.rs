@@ -352,75 +352,67 @@ fn ensure_account_homes_unused(
     for account in accounts {
         let variable = crate::account::home_variable(account.provider).unwrap();
         let home = account.resolved_home().unwrap();
-        let uses_environment = |environment: &std::collections::BTreeMap<String, String>,
-                                cwd: &std::path::Path| {
-            environment
-                .get(variable)
-                .filter(|path| !path.is_empty())
+        let selected_home = |environment: &std::collections::BTreeMap<String, String>,
+                             cwd: &std::path::Path| {
+            environment.get(variable).filter(|path| !path.is_empty())
                 .map(|path| cwd.join(path))
-                .or_else(|| {
-                    environment
-                        .get("HOME")
-                        .filter(|path| !path.is_empty())
-                        .map(|path| {
-                            cwd.join(path).join(
-                                if account.provider == crate::agent::Provider::Claude {
-                                    ".claude"
-                                } else {
-                                    ".codex"
-                                },
-                            )
-                        })
-                })
-                .is_some_and(|path| path == home)
+                .or_else(|| environment.get("HOME").filter(|path| !path.is_empty())
+                    .map(|path| cwd.join(path).join(if account.provider == crate::agent::Provider::Claude {
+                        ".claude"
+                    } else { ".codex" })))
         };
-        let uses = |recipe: &crate::model::LaunchRecipe| {
+        let selected_recipe = |recipe: &crate::model::LaunchRecipe| {
             let mut environment = recipe.environment.clone();
-            for name in &recipe.unset_environment {
-                environment.remove(name);
-            }
-            uses_environment(&environment, &recipe.working_directory)
+            for name in &recipe.unset_environment { environment.remove(name); }
+            selected_home(&environment, &recipe.working_directory)
         };
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.terminals.values().any(|record| {
-            !record.handle.is_completed()
-                && (uses(&record.session.launch)
-                    || record
-                        .execution_environment
-                        .as_ref()
-                        .is_some_and(|environment| {
-                            uses_environment(
-                                &environment.0,
-                                &record.session.launch.working_directory,
-                            )
-                        }))
-        }) || state.chats.values().any(|record| {
-            record.handle.owns_work()
-                && (uses(&record.session.launch.recipe)
-                    || uses_environment(
-                        &record.handle.execution_environment().0,
-                        &record.session.launch.recipe.working_directory,
-                    ))
-        }) || state
-            .chat_spawning
-            .values()
-            .any(|session| uses(&session.launch.recipe))
-            || state.chat_handoffs.values().any(|pending| {
-                uses(&pending.source().launch.recipe) || uses(&pending.replacement().launch)
-            })
-            || state
-                .native_closing
-                .values()
-                .any(|pending| pending.may_own_provider(account.provider))
-        {
+        // Copy small ownership metadata under HostState. Resolving aliases and
+        // reading retained checkpoints happens after releasing that mutex.
+        let (paths, scopes, closing, upgrade) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let mut paths = Vec::new();
+            let mut scopes = Vec::new();
+            for record in state.terminals.values().filter(|record| !record.handle.is_completed()) {
+                paths.extend(selected_recipe(&record.session.launch));
+                if let Some(environment) = &record.execution_environment {
+                    paths.extend(selected_home(&environment.0, &record.session.launch.working_directory));
+                }
+            }
+            for record in state.chats.values().filter(|record| record.handle.owns_work()) {
+                paths.extend(selected_recipe(&record.session.launch.recipe));
+                paths.extend(selected_home(&record.handle.execution_environment().0,
+                    &record.session.launch.recipe.working_directory));
+                if let Ok(scope) = record.handle.launch_account_scope() {
+                    scopes.push(scope.clone());
+                }
+            }
+            for session in state.chat_spawning.values() {
+                paths.extend(selected_recipe(&session.launch.recipe));
+            }
+            for pending in state.chat_handoffs.values() {
+                paths.extend(selected_recipe(&pending.source().launch.recipe));
+                paths.extend(selected_recipe(&pending.replacement().launch));
+            }
+            (paths, scopes, state.native_closing.values()
+                .any(|pending| pending.may_own_provider(account.provider)), state.account_cleanup_evidence())
+        };
+        use std::os::unix::fs::MetadataExt;
+        let identity = std::fs::metadata(&home).ok().filter(|metadata| metadata.is_dir())
+            .map(|metadata| (metadata.dev(), metadata.ino()));
+        let uses_path = |path: &std::path::Path| {
+            path == home || identity.is_some_and(|identity| std::fs::metadata(path).ok()
+                .is_some_and(|metadata| metadata.is_dir() && (metadata.dev(), metadata.ino()) == identity))
+        };
+        if closing || paths.iter().any(|path| uses_path(path)) || scopes.iter().any(|scope| {
+            scope.provider == account.provider &&
+                (scope.canonical_home == home || identity == Some((scope.device, scope.inode)))
+        }) {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::InvalidRequest,
                 "This device account still has a live terminal, sign-in or conversation. Close it before changing its account home.",
                 false,
             ));
         }
-        let upgrade = state.account_cleanup_evidence();
-        drop(state);
         // Unattached holders keep their effective environment private. Their
         // provider is enough to identify uncertainty, not enough to authorize
         // changing a home. Inspect durable summaries outside HostState.
@@ -1506,7 +1498,12 @@ mod tests {
             )]),
             unset_environment: Default::default(),
         };
-        let spec = ProcessSpec::from(&recipe);
+        let selected = account.resolved_home().unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        let alias = directory.path().join("selected-home-alias");
+        std::os::unix::fs::symlink(&selected, &alias).unwrap();
+        let mut spec = ProcessSpec::from(&recipe);
+        spec.environment.insert("CLAUDE_CONFIG_DIR".into(), alias.display().to_string());
         let mut initial = Step::default();
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let handle =
@@ -1569,7 +1566,7 @@ mod tests {
             );
         assert!(
             ensure_account_homes_unused(&host, [account.clone()]).is_err(),
-            "effective startup home, not a later saved descriptor, owns the live account"
+            "effective startup home through an alias still owns the physical account, even when the saved descriptor differs"
         );
         host.lock().unwrap().chats.remove(&id);
         host.lock()
