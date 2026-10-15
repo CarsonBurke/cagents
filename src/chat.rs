@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
+pub mod cache;
 pub mod pricing;
 
 /// Grace periods shared with clients that must wait for confirmed teardown.
@@ -944,6 +945,11 @@ pub struct Snapshot {
     /// Provider-reported edits in the owned cache, independent of transcript paging.
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
+    /// Original prose mutation boundary, independent of status/presentation updates.
+    #[serde(default)]
+    pub source_revision: u64,
+    #[serde(default)]
+    pub source_parts: Vec<cache::SourcePart>,
 }
 
 /// When a provider takes a message it is holding.
@@ -1211,6 +1217,8 @@ pub enum Command {
         cursor: Option<FilePatchCursor>,
         revision: u64,
     },
+    /// Read original prose without hydrating or changing the presentation window.
+    LoadSource { query: cache::SourceQuery },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
