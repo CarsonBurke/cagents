@@ -5,9 +5,23 @@ use crate::daemon::holder_registry::{self as registry, Kind};
 #[derive(Clone)]
 pub(in crate::host) struct NativeClose {
     source: Session,
-    owner: chat::native_holder::Detached,
+    owner: NativeOwner,
     closed: bool,
     paired: Option<RetainedPair>,
+}
+
+#[derive(Clone)]
+enum NativeOwner {
+    Server(chat::native_holder::Detached),
+    Actor { record: registry::Record, handle: Handle },
+}
+impl NativeOwner {
+    fn record(&self) -> &registry::Record {
+        match self { Self::Server(owner) => &owner.record, Self::Actor { record, .. } => record }
+    }
+    fn close_retaining_receipt(&self) -> Result<(), String> {
+        match self { Self::Server(owner) => owner.close_retaining_receipt(), Self::Actor { handle, .. } => handle.close() }
+    }
 }
 
 #[derive(Clone)]
@@ -85,11 +99,11 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                 let (record, _) = receipt.unwrap();
                 let pending = NativeClose {
                     source: source.clone(),
-                    owner: chat::native_holder::Detached {
+                    owner: NativeOwner::Server(chat::native_holder::Detached {
                         record,
                         source: source.clone(),
                         proof: proof.clone(),
-                    },
+                    }),
                     closed: true,
                     paired: retained_pair(
                         host,
@@ -107,6 +121,18 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
             None => {
                 let record = registry::evidence(&socket, Kind::Native)?
                     .ok_or("No exact native holder or confirmed close receipt is available")?;
+                if Handle::is_remote_record(&record) {
+                    let inspection = Handle::inspect_remote(&record, proof.clone())?;
+                    let paired = retained_pair(host, inspection.source.terminal.as_ref(), inspection.paired_holder.as_ref(), &proof)?;
+                    // The helper independently recognizes the entire issued
+                    // descriptor before changing attachment epoch or closing.
+                    let handle = Handle::adopt_remote(&record, source.clone(), proof.clone(), |_| {})?;
+                    let pending = NativeClose {
+                        source: source.clone(), owner: NativeOwner::Actor { record, handle }, closed: false, paired,
+                    };
+                    host.lock().unwrap_or_else(|p| p.into_inner()).native_closing.insert(source.id, pending.clone());
+                    pending
+                } else {
                 let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
                 if &recovery.source != source && !recovery.previous_sources.contains(source) {
                     return Err(
@@ -122,7 +148,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                 let (holder, _) = chat::native_holder::adopt(&record, source, &proof)?;
                 let pending = NativeClose {
                     source: source.clone(),
-                    owner: holder.preserve(),
+                    owner: NativeOwner::Server(holder.preserve()),
                     closed: false,
                     paired,
                 };
@@ -131,6 +157,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                     .native_closing
                     .insert(source.id, pending.clone());
                 pending
+                }
             }
         };
         if let Some(pair) = &pending.paired {
@@ -188,7 +215,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         chat::native_holder::confirm_pair_closed(source, &proof)?;
         // Keep the proved owner while durable retirement is retryable. An SQL
         // failure cannot force a second Release or lose its cleanup evidence.
-        retire_closed_execution(host, source, &pending.owner.record, &proof)?;
+        retire_closed_execution(host, source, pending.owner.record(), &proof)?;
         Ok(())
     })();
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
