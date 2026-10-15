@@ -1050,8 +1050,7 @@ fn start_with_execution(
         .clone();
     // Capture before a proven source may be frozen/stopped. The same Arc
     // retains uncertain startup cleanup; issued launch recipes stay unchanged.
-    let execution = if execution.is_none() && session.launch.provider == Provider::Claude
-        && matches!(spec.transport, chat::protocol::TransportSpec::JsonLines)
+    let execution = if execution.is_none() && retained_actor::enabled(session.launch.provider, &spec.transport)
     {
         Some(Arc::new(chat::protocol::ExecutionContext::capture(&spec.working_directory).map_err(unavailable)?))
     } else { execution };
@@ -1168,8 +1167,7 @@ fn start_with_execution(
             retired = state.chats.remove(&session.id);
         }
         session.proof = Some(state.proof().clone());
-        if session.launch.provider == Provider::Claude
-            && matches!(spec.transport, chat::protocol::TransportSpec::JsonLines)
+        if retained_actor::enabled(session.launch.provider, &spec.transport)
         {
             if state.native_actor_startups.contains_key(&session.id) || state.native_actor_startups.len() >= 128 {
                 return Err(unavailable("Retained startup cleanup or capacity prevents another launch; no source was stopped"));
@@ -1330,8 +1328,7 @@ fn start_with_execution(
                 }
             } else { changed(&weak, id, update); }
         };
-        let remote = session.launch.provider == Provider::Claude
-            && matches!(spec.transport, chat::protocol::TransportSpec::JsonLines);
+        let remote = retained_actor::enabled(session.launch.provider, &spec.transport);
         let startup_source = session.clone();
         let handle = if remote {
             // The holder creates and retains the sole reducer/Store. Host

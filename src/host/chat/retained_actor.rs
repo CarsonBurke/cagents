@@ -5,6 +5,17 @@ use super::*;
 use crate::host::model::NativeActorEvent;
 use std::{collections::BTreeSet, sync::{Condvar, Mutex}};
 
+/// Unit-only HostState fixtures intentionally exercise local transports without
+/// a daemon lease. The retained-actor integration fixture opts into the genuine
+/// exec/socket/lease boundary. Production has no fallback or environment knob.
+pub(super) fn enabled(provider: Provider, transport: &chat::protocol::TransportSpec) -> bool {
+    #[cfg(test)]
+    let enabled = std::env::var_os("CAGENTS_RETAINED_ACTOR_FIXTURE").is_some();
+    #[cfg(not(test))]
+    let enabled = true;
+    enabled && provider == Provider::Claude && matches!(transport, chat::protocol::TransportSpec::JsonLines)
+}
+
 #[derive(Clone)]
 pub(in crate::host) struct Broker(Arc<Inbox>);
 struct Inbox {
