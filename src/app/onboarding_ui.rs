@@ -818,6 +818,39 @@ mod tests {
     }
 
     #[test]
+    fn queued_home_commands_respect_update_freeze_without_a_confirmation_modal() {
+        use workspace_widget::GlobalShortcut as Command;
+        for command in [Command::NewThread, Command::CloneRepository, Command::ResumeConversation] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            assert!(!app.modal_is_open());
+            assert!(!app.workspace_inputs_blocked());
+            app.update_prepared = true;
+            let message = Message::Onboarding(Action::Command(command));
+            assert!(super::super::user_workspace_message_blocked_while_modal(&message));
+            assert!(super::super::user_message_blocked_during_update(&message));
+            let cards = app.durable.cards.len();
+            let focused = app.workspace.focused();
+            drop(app.update(message));
+            assert_eq!(app.durable.cards.len(), cards);
+            assert_eq!(app.workspace.focused(), focused);
+            assert!(app.chrome_ui.clone_repository.is_none());
+            assert!(!app.modal_is_open(), "a frozen command must not open a form");
+        }
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update_onboarding(Action::Clone));
+        let form = app.chrome_ui.clone_repository.as_mut().unwrap();
+        form.running = true;
+        let id = form.id;
+        app.update_prepared = true;
+        let completed = Message::Onboarding(Action::Finished { id, result: Err("fixture failure".into()) });
+        assert!(!super::super::user_message_blocked_during_update(&completed));
+        drop(app.update(completed));
+        let form = app.chrome_ui.clone_repository.as_ref().unwrap();
+        assert!(!form.running, "background completion must settle during the freeze");
+        assert!(form.error.as_ref().unwrap().contains("fixture failure"));
+    }
+
+    #[test]
     fn no_selection_lists_live_workspaces_in_recent_order() {
         use crate::sidebar::{SidebarProject, SidebarWorktree};
         let mut app = super::super::tests::context_inspector_test_app(false);

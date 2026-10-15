@@ -2599,7 +2599,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
         Message::ChatClose(chat_ui::closing::Action::End(_)) => true,
-        Message::Onboarding(onboarding_ui::Action::Clone | onboarding_ui::Action::HomeChat)
+        Message::Onboarding(onboarding_ui::Action::Command(_) | onboarding_ui::Action::Clone | onboarding_ui::Action::HomeChat)
         | Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
