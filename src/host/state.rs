@@ -3235,6 +3235,7 @@ fn restore_upgrade_from(
     let mut adopted = Vec::new();
     let mut unattached = Vec::new();
     let mut reattached = Vec::new();
+    let mut restored_chats = std::collections::BTreeSet::new();
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
@@ -3243,6 +3244,7 @@ fn restore_upgrade_from(
                 && !chat.source.native_continuity.retains_provider()
             {
                 super::chat::restore_upgrade(host, chat)?;
+                restored_chats.insert(chat.source.id);
             }
         }
         // Carried terminals are adopted before anything is relaunched: their
@@ -3298,6 +3300,7 @@ fn restore_upgrade_from(
                     .remember_upgrade(chat, &reason);
                 unattached.push(UnattachedChat::new(chat.clone(), reason));
             } else {
+                restored_chats.insert(chat.source.id);
                 reattached.push(chat.source.id);
             }
         }
@@ -3349,7 +3352,12 @@ fn restore_upgrade_from(
                 .map_err(|error| error.message)?;
         }
         for chat in &checkpoint.chats {
-            if super::chat::owns_codex_listener(&chat.source) {
+            // Consume actual earlier restoration outcomes, including Claude
+            // actors without a Codex listener. A separately retained refusal
+            // stays unattached rather than being retried as a global failure.
+            if restored_chats.remove(&chat.source.id)
+                || unattached.iter().any(|saved| saved.summary.id == chat.source.id)
+            {
                 continue;
             }
             if crate::daemon::termination_requested() {

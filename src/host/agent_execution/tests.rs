@@ -4766,3 +4766,6 @@ include!("presentation_acceptance_tests.rs");
 // Actual retained backend lifecycle/receipt scheduling contracts.
 include!("retained_close_race_tests.rs");
 include!("terminal_pair_close_tests.rs");
+
+// Real retained-provider checkpoint restoration and isolated refusal.
+include!("retained_upgrade_tests.rs");
