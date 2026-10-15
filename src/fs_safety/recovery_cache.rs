@@ -651,19 +651,32 @@ mod tests {
         assert!(recovery.is_resolved());
         assert!(names(parent).is_empty());
     }
+    struct UnknownCreationGuard(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for UnknownCreationGuard {
+        fn drop(&mut self) {
+            assert!(self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0);
+        }
+    }
     struct UnknownEnrollment {
+        creation_count: Arc<std::sync::atomic::AtomicUsize>,
+        sealed: std::sync::atomic::AtomicBool,
         attempts: std::sync::atomic::AtomicUsize,
         payload: std::sync::Mutex<Option<Root>>,
         _outside: tempfile::TempDir,
         _runtime: tempfile::TempDir,
     }
     impl RecoveryRegistrationLease for UnknownEnrollment {
-        fn validate(&self) -> io::Result<()> {
-            Ok(())
+        fn validate(&self) -> io::Result<()> { Ok(()) }
+        fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
+            // This complete isolated test topology grants only counted owned
+            // creation admission. Sealing blocks new work, never old cleanup.
+            if self.sealed.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(io::Error::other("Fixture creation admission sealed"));
+            }
+            self.creation_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Arc::new(UnknownCreationGuard(self.creation_count.clone())))
         }
-        fn descriptor_budget(&self) -> usize {
-            1
-        }
+        fn descriptor_budget(&self) -> usize { 1 }
         fn register_payload(&self, root: &Root) -> io::Result<()> {
             let mut held = self.payload.lock().unwrap();
             if let Some(original) = held.as_ref() {
@@ -699,19 +712,11 @@ mod tests {
         let parent = Arc::new(Root::open(outside.path()).unwrap());
         // Complete isolated topology; the owned lease deliberately records the
         // real original Root BEFORE returning unknown, as a daemon handoff can.
-        let registry = Arc::new(UnknownEnrollment {
-            attempts: std::sync::atomic::AtomicUsize::new(0),
-            payload: std::sync::Mutex::new(None),
-            _outside: outside,
-            _runtime: runtime,
-        });
-        let placement = RecoveryPlacement::acquire(
-            parent.clone(),
-            source.clone(),
-            Arc::from([source.clone()]),
-            RecoveryRegistryCheck::from_lease(registry.clone()),
-        )
-        .unwrap();
+        let registry = Arc::new(UnknownEnrollment { creation_count: Arc::default(),
+            sealed: std::sync::atomic::AtomicBool::new(false), attempts: std::sync::atomic::AtomicUsize::new(0),
+            payload: std::sync::Mutex::new(None), _outside: outside, _runtime: runtime });
+        let placement = RecoveryPlacement::acquire(parent.clone(), source.clone(), Arc::from([source.clone()]),
+            RecoveryRegistryCheck::from_lease(registry.clone())).unwrap();
         let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
         let error = prepare_recovery_directory(
             context.reserve_directory().unwrap(),
@@ -720,26 +725,17 @@ mod tests {
         )
         .unwrap_err();
         let recovery = error.recovery().unwrap();
-        assert_eq!(
-            registry.attempts.load(std::sync::atomic::Ordering::SeqCst),
-            1
-        );
-        assert!(recovery.retry().is_err());
-        assert!(!recovery.is_resolved());
-        assert_eq!(
-            registry.attempts.load(std::sync::atomic::Ordering::SeqCst),
-            2
-        );
-        assert!(
-            parent.path().join("holding").is_dir(),
-            "unknown enrollment must not remove H"
-        );
-        recovery.retry().unwrap();
-        assert!(recovery.is_resolved());
-        assert_eq!(
-            registry.attempts.load(std::sync::atomic::Ordering::SeqCst),
-            3
-        );
+        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(registry.creation_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        registry.sealed.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(context.reserve_directory().is_err(), "retirement refuses new mkdir admission");
+        assert!(recovery.retry().is_err()); assert!(!recovery.is_resolved());
+        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(parent.path().join("holding").is_dir(), "unknown enrollment must not remove H");
+        assert_eq!(registry.creation_count.load(std::sync::atomic::Ordering::SeqCst), 1, "same-slot uncertain recovery retains creation admission");
+        recovery.retry().unwrap(); assert!(recovery.is_resolved());
+        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert_eq!(registry.creation_count.load(std::sync::atomic::Ordering::SeqCst), 0, "positive retry cleanup releases the final original slot guard");
         assert!(names(&parent).is_empty());
     }
 
