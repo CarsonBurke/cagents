@@ -41,6 +41,9 @@ pub(super) fn edit(host: &SharedHost, origin: ClientId, edit: ModelEdit) -> Resu
         }
     }
     let applied = registry.apply(&edit).map_err(|error| {
+        if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
+            return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
+        }
         // The independent execution connection can close a destination after
         // preflight. The failed transaction rolled back; reclassify its exact
         // current refusal under this same workspace writer guard.
