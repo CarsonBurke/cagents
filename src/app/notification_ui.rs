@@ -818,13 +818,17 @@ impl Cagents {
             return BTreeSet::new();
         }
         let cards = self.notification_attention_cards();
-        snapshot.notices.iter().filter_map(|notice| {
-            if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
-                return None;
-            }
-            let session = notice.event.source_session()?;
-            cards.get(&session).copied().flatten()
-        }).collect()
+        snapshot
+            .notices
+            .iter()
+            .filter_map(|notice| {
+                if notice.acknowledged || self.notification_ui.acknowledged.contains(&notice.id) {
+                    return None;
+                }
+                let session = notice.event.source_session()?;
+                cards.get(&session).copied().flatten()
+            })
+            .collect()
     }
 
     /// Journal and workspace-model watches are independent. Reconsider retained
@@ -2595,8 +2599,8 @@ mod tests {
 
     #[test]
     fn notification_snapshot_before_model_reprojects_canonical_unread_without_another_snapshot() {
-        use crate::workspace_model::views::{Pane, View};
         use super::super::workspace_model_sync::ModelUpdate;
+        use crate::workspace_model::views::{Pane, View};
         for connected in [false, true] {
             for control in ["valid", "locally-acknowledged", "replaced-proof"] {
                 let (mut app, agent) = scheduled_attention_fixture();
@@ -2608,7 +2612,9 @@ mod tests {
                 app.workspace_model.views = vec![View {
                     scope: agent.placement.clone(),
                     revision: 1,
-                    panes: vec![Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap()],
+                    panes: vec![
+                        Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap(),
+                    ],
                     retired: vec![],
                 }];
                 let mut alias = card.clone();
@@ -2626,7 +2632,8 @@ mod tests {
                 assert!(app.shared_views.blocked.contains(&agent.placement));
                 app.refresh_ui.focused = false;
                 let focus = app.workspace.focused();
-                Arc::make_mut(&mut app.durable).workspace_model_identity = Some(app.workspace_model.identity);
+                Arc::make_mut(&mut app.durable).workspace_model_identity =
+                    Some(app.workspace_model.identity);
                 let mut model = std::mem::take(&mut app.workspace_model);
                 let mut snapshot = attention_snapshot(session);
                 // A cold, already-completed source need not emit another runtime
@@ -2646,19 +2653,38 @@ mod tests {
                     replaced.continuity = TerminalContinuity::Live {
                         host_session_id: crate::model::HostSessionId::new("replacement-host"),
                         boot_id: crate::model::BootId::new("replacement-boot"),
-                        host_incarnation: crate::model::HostIncarnation::new("replacement-incarnation"),
+                        host_incarnation: crate::model::HostIncarnation::new(
+                            "replacement-incarnation",
+                        ),
                     };
                 }
-                let update = if connected { ModelUpdate::Connected(model) } else { ModelUpdate::Read(model) };
+                let update = if connected {
+                    ModelUpdate::Connected(model)
+                } else {
+                    ModelUpdate::Read(model)
+                };
                 drop(app.update(Message::WorkspaceModelObserved(update)));
-                assert_eq!(app.sidebar_state.has_card_update(canonical), control == "valid");
+                assert_eq!(
+                    app.sidebar_state.has_card_update(canonical),
+                    control == "valid"
+                );
                 assert!(!app.sidebar_state.has_card_update(alias_id));
                 assert!(app.shared_views.blocked.contains(&agent.placement));
                 assert!(app.card_state(alias_id).unwrap().existence.is_open());
                 assert_eq!(app.card_state(canonical).unwrap().kind, card.kind);
-                assert_eq!(app.workspace.focused(), focus, "unread projection cannot focus or activate");
-                assert_eq!(app.notification_ui.snapshot, snapshot, "no second Snapshot was delivered");
-                assert_eq!(app.notification_ui.acknowledged_for_test(notice), control == "locally-acknowledged");
+                assert_eq!(
+                    app.workspace.focused(),
+                    focus,
+                    "unread projection cannot focus or activate"
+                );
+                assert_eq!(
+                    app.notification_ui.snapshot, snapshot,
+                    "no second Snapshot was delivered"
+                );
+                assert_eq!(
+                    app.notification_ui.acknowledged_for_test(notice),
+                    control == "locally-acknowledged"
+                );
                 assert!(app.notification_ui.session_activation.is_none());
                 assert!(!app.chat_start_pending(canonical));
                 // The exact local ACK must also survive a later model replay.
