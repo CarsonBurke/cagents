@@ -35,6 +35,25 @@ impl Authority {
         for (attachment,capture) in attachments.iter_mut().zip(prepared.attachments){attachment.path=capture.path;}
         Ok(Some(id))
     }
+    pub(super) fn prepare_retry(&mut self,session:&str,original:&annotations::OriginalPrompt)->Result<(String,crate::chat::Command),OriginalError>{
+        if self.session.as_deref()!=Some(session) || self.latest_proven.as_deref()!=Some(original.user_id.as_str()){return Err(OriginalError::Changed);}
+        let mut text=String::with_capacity(original.text_bytes.min(annotations::ORIGINAL_TEXT_BYTES));
+        loop{
+            let page=self.original(Some(&original.user_id),text.len(),annotations::ORIGINAL_PAGE_BYTES)?;
+            if page.session_id!=session || &page.original!=original{return Err(OriginalError::Changed);}
+            if page.offset!=text.len() || page.next_offset!=text.len().saturating_add(page.text.len()) || (!page.complete && page.text.is_empty()){return Err(OriginalError::Changed);}
+            text.push_str(&page.text);if page.complete{break;}
+        }
+        let mut pending=self.pending_store().map_err(OriginalError::Unavailable)?;
+        let mut captured_text=pending.capture_text(&text)?;
+        let mut captures=original.attachments.iter().map(|attachment|pending.retain_attachment(&attachment.path)).collect::<Result<Vec<_>,_>>()?;
+        // Verify the COPIED provider-visible bytes, closing the race between
+        // checking an old pathname and capturing it for a new dispatch.
+        if captures.iter().zip(&original.attachments).any(|(capture,expected)|capture.attachment.bytes!=expected.bytes || capture.attachment.sha256!=expected.sha256){return Err(OriginalError::Changed);}
+        let id=uuid::Uuid::new_v4().to_string();let prepared=pending.prepare_command(&id,Some(session),&mut captured_text,&mut captures)?;
+        let command=crate::chat::Command::Prompt{text,attachments:prepared.attachments.into_iter().map(|attachment|crate::chat::Attachment{path:attachment.path}).collect(),mode:crate::chat::PromptMode::Send};
+        Ok((id,command))
+    }
     pub(super) fn abandon(&mut self,id:&str)->Result<(),String>{
         self.pending_store()?.abandon_command(id).map_err(|error|format!("{error:?}"))?;
         self.unconfirmed_commands.retain(|command|command!=id);Ok(())
@@ -312,6 +331,17 @@ mod tests {
             let mut step=adapter.receive(frame).unwrap();let confirmed=step.events.iter().find_map(|event|if let Event::Session{id,..}=event{Some(Some(id.clone()))}else{None});assert!(authority.apply(confirmed.as_ref(),adapter.take_approval_updates(),&mut step.events).is_none());assert!(authority.originals(adapter.take_original_updates()).is_none());
         }
         let original=authority.original(None,0,1024).unwrap();assert_eq!(original.text,"original /slash-command");assert_eq!(original.session_id,session);assert_eq!(original.original.user_id,id);assert_eq!(authority.original(Some("actual-root:0"),0,1024).ok().map(|page|page.text),Some("original /slash-command".into()));
+    }
+
+    #[test]
+    fn retry_reloads_exact_stored_input_and_checks_copied_attachment_hash_and_current_identity(){
+        use annotations::{OriginalSettings,OriginalUpdate,Setting};
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();let mut authority=Authority::new(Ok(scope));authority.root=Some(root.path().join("annotations"));authority.apply(Some(&Some("session".into())),vec![],&mut vec![]);
+        let image=root.path().join("picker.png");std::fs::write(&image,b"original immutable image").unwrap();let mut command=Command::Prompt{text:"original /command 🐙".into(),attachments:vec![crate::chat::Attachment{path:image}],mode:crate::chat::PromptMode::Send};let id=authority.prepare(&mut command,root.path()).unwrap().unwrap();let settings=OriginalSettings{model:Setting::Value("reported".into()),reasoning:Setting::Value("low".into()),fast:Setting::Unsupported,permission:Setting::Value("ask".into())};authority.originals(vec![OriginalUpdate::Settings{command_id:id.clone(),settings},OriginalUpdate::Accepted{command_id:id,session_id:"session".into(),user_id:"user".into(),turn_id:"turn".into(),aliases:vec![]},OriginalUpdate::Latest{session_id:"session".into(),user_id:"user".into()}]);let original=authority.original(None,0,1024).unwrap().original;
+        let (id,retry)=authority.prepare_retry("session",&original).unwrap();let Command::Prompt{text,attachments,..}=retry else{panic!("ordinary guarded dispatch expected")};assert_eq!(text,"original /command 🐙");assert_ne!(attachments[0].path,original.attachments[0].path);assert_eq!(std::fs::read(&attachments[0].path).unwrap(),b"original immutable image");authority.abandon(&id).unwrap();
+        let mut forged=original.clone();forged.settings.model=Setting::Value("forged-model".into());assert!(matches!(authority.prepare_retry("session",&forged),Err(OriginalError::Changed)));assert!(matches!(authority.prepare_retry("other-session",&original),Err(OriginalError::Changed)));
+        std::fs::write(&original.attachments[0].path,b"tampered private image").unwrap();assert!(matches!(authority.prepare_retry("session",&original),Err(OriginalError::Changed)));
+        authority.latest_user("newer-native-user").unwrap();assert!(matches!(authority.prepare_retry("session",&original),Err(OriginalError::Changed)));
     }
 
 }

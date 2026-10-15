@@ -1240,6 +1240,13 @@ pub enum Command {
         offset: usize,
         limit: usize,
     },
+    /// Retry only the exact current original. The actor reloads private input
+    /// and verifies its identity; caller-provided text is never dispatched.
+    PromptOriginal {
+        session_id:String,
+        original:annotations::OriginalPrompt,
+        turn_generation:u64,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -1846,6 +1853,9 @@ pub struct Capabilities {
     /// background, rather than only the turn and the work inside it.
     #[serde(default)]
     pub interrupt_stops_background: bool,
+    /// Backend can restore exact original settings as part of guarded Retry.
+    #[serde(default)]
+    pub original_retry:bool,
 }
 /// Provider-confirmed speed setting, independent of model reasoning effort.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
