@@ -2064,7 +2064,8 @@ where
         }
     };
 
-    let no_start = cli.no_start || std::env::var("CAGENTS_NO_START")
+    let stopping_daemon=matches!(&cli.command,TopCommand::Daemon{command:DaemonCommand::Stop{..}});
+    let no_start = stopping_daemon || cli.no_start || std::env::var("CAGENTS_NO_START")
         .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
@@ -2151,6 +2152,10 @@ where
     ) {
         return match crate::device::serve_stdio() {
             Ok(()) => ExitCode::SUCCESS,
+            Err(error) if crate::device::daemon_absent(&error)=>{
+                crate::device::report_absent_bridge();
+                ExitCode::from(crate::device::BRIDGE_ABSENT_EXIT)
+            }
             Err(error) => {
                 eprintln!("cagents daemon bridge: {error}");
                 ExitCode::FAILURE
@@ -2159,6 +2164,11 @@ where
     }
     if crate::device::is_remote() && !matches!(cli.command, TopCommand::Ui { .. }) {
         if let Err(error) = crate::device::prepare() {
+            if crate::device::daemon_absent(&error) {
+                if stopping_daemon {emit_success(cli.json,already_stopped());return ExitCode::SUCCESS;}
+                emit_error(cli.json,&AppError::new("daemon_not_running",error));
+                return ExitCode::FAILURE;
+            }
             emit_error(cli.json, &AppError::new("device", error));
             return ExitCode::FAILURE;
         }
