@@ -2387,15 +2387,13 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
         "the decision outlives the turn"
     );
 
-    for refused in [
-        answer(&asked.id, "allow"),
-        Control::Interrupt {
-            including_subagents: true,
-        },
-    ] {
-        let error = control(refused).unwrap_err();
-        assert!(error.contains("no active run"), "{error}");
-    }
+    let error = control(answer(&asked.id, "allow")).unwrap_err();
+    assert!(error.contains("only decline"), "{error}");
+    let error = control(Control::Interrupt {
+        including_subagents: true,
+    })
+    .unwrap_err();
+    assert!(error.contains("no active run"), "{error}");
     let root = path.parent().unwrap();
     assert!(!root.join("decisions").exists(), "nothing was approved");
 
