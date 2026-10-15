@@ -2983,10 +2983,18 @@ impl Adapter for Codex {
                 account::codex::parse_login_update(params),
             ))),
             "thread/compacted" => {
-                if self.compaction_pending {
-                    self.compaction_pending = false;
-                    self.compaction_acknowledged = false;
-                    step.events.push(Event::Compaction { active: false });
+                // This notification has no compact request identity. Even its
+                // turnId cannot associate it with our newer local request: a
+                // prior compact may already have completed through metadata.
+                // Only a current-revision idle read after our own ACK proves
+                // completion. Older/legacy notifications are refresh hints.
+                if self.compaction_pending
+                    && self.compaction_acknowledged
+                    && params["threadId"].as_str().is_some_and(|id| {
+                        self.thread.as_deref() == Some(id)
+                    })
+                {
+                    self.reread(&mut step)?;
                 }
             }
             "item/reasoning/summaryPartAdded" => {}
@@ -6523,23 +6531,79 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::TurnFinished { .. }))
         );
-        adapter.command(Command::Compact).unwrap();
-        let wrong_thread = adapter
-            .receive(json!({"method":"thread/compacted","params":{"threadId":"unrelated"}}))
-            .unwrap();
-        assert!(
-            !wrong_thread
-                .events
-                .contains(&Event::Compaction { active: false })
-        );
-        let completed = adapter
-            .receive(json!({"method":"thread/compacted","params":{"threadId":"thread-exact"}}))
-            .unwrap();
-        assert!(
-            completed
-                .events
-                .contains(&Event::Compaction { active: false })
-        );
+        let history = acknowledged.writes.iter()
+            .find(|frame| frame["method"] == "thread/turns/list").unwrap();
+        adapter.receive(json!({"id":history["id"],"result":{"data":[],"nextCursor":null}})).unwrap();
+        let requested = adapter.command(Command::Compact).unwrap();
+        for params in [
+            json!({"threadId":"unrelated", "turnId":"old"}),
+            json!({"threadId":"thread-exact", "turnId":"old"}),
+            json!({"threadId":"thread-exact"}),
+            json!({}),
+        ] {
+            let unconfirmed = adapter.receive(json!({"method":"thread/compacted","params":params})).unwrap();
+            assert!(!unconfirmed.events.contains(&Event::Compaction { active:false }));
+            assert!(unconfirmed.writes.is_empty(), "no current compact ACK has been received");
+            assert!(adapter.compaction_pending);
+        }
+        let acknowledged = adapter.receive(json!({"id":requested.writes[0]["id"],"result":{}})).unwrap();
+        let history = acknowledged.writes.iter()
+            .find(|frame| frame["method"] == "thread/turns/list").unwrap();
+        adapter.receive(json!({"id":history["id"],"result":{"data":[],"nextCursor":null}})).unwrap();
+        // A legacy event without turnId still refreshes after the exact ACK;
+        // it never supplies a fabricated per-operation completion identity.
+        let notification = adapter.receive(json!({"method":"thread/compacted","params":{"threadId":"thread-exact"}})).unwrap();
+        assert!(!notification.events.contains(&Event::Compaction { active:false }));
+        let probe = notification.writes.iter()
+            .find(|frame| frame["method"] == "thread/read").unwrap();
+        let completed = adapter.receive(json!({"id":probe["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"idle"},"canAcceptDirectInput":true}}})).unwrap();
+        assert!(completed.events.contains(&Event::Compaction { active:false }));
+    }
+
+    #[test]
+    fn compaction_old_boundary_and_probe_cannot_finish_a_new_request() {
+        let mut adapter = adapter();
+        let a = adapter.command(Command::Compact).unwrap();
+        let a_ack = adapter.receive(json!({"id":a.writes[0]["id"],"result":{}})).unwrap();
+        let a_probe = a_ack.writes.iter().find(|frame| frame["method"] == "thread/read").unwrap();
+        let a_history = a_ack.writes.iter().find(|frame| frame["method"] == "thread/turns/list").unwrap();
+        adapter.receive(json!({"id":a_history["id"],"result":{"data":[],"nextCursor":null}})).unwrap();
+        let a_refresh = adapter.command(Command::Refresh).unwrap();
+        let late_a_probe = a_refresh.writes.iter().find(|frame| frame["method"] == "thread/read").unwrap();
+        let a_history = a_refresh.writes.iter().find(|frame| frame["method"] == "thread/turns/list").unwrap();
+        let idle = |id: &Value| json!({"id":id,"result":{"thread":{"id":"thread-exact","status":{"type":"idle"},"canAcceptDirectInput":true}}});
+        let a_done = adapter.receive(idle(&a_probe["id"])).unwrap();
+        assert!(a_done.events.contains(&Event::Compaction { active:false }));
+        adapter.receive(json!({"id":a_history["id"],"result":{"data":[],"nextCursor":null}})).unwrap();
+        let b = adapter.command(Command::Compact).unwrap();
+        let boundary = || json!({"method":"thread/compacted","params":{"threadId":"thread-exact","turnId":"A"}});
+        let before_ack = adapter.receive(boundary()).unwrap();
+        assert!(before_ack.events.is_empty());
+        assert!(before_ack.writes.is_empty());
+        assert!(adapter.compaction_pending);
+        assert!(adapter.command(Command::Compact).is_err());
+        let stale_probe = adapter.receive(idle(&late_a_probe["id"])).unwrap();
+        assert!(stale_probe.events.is_empty(), "an old own-probe reply cannot finish B either");
+        assert!(adapter.compaction_pending);
+        let b_ack = adapter.receive(json!({"id":b.writes[0]["id"],"result":{}})).unwrap();
+        let b_history = b_ack.writes.iter().find(|frame| frame["method"] == "thread/turns/list").unwrap();
+        adapter.receive(json!({"id":b_history["id"],"result":{"data":[],"nextCursor":null}})).unwrap();
+        let after_ack = adapter.receive(boundary()).unwrap();
+        assert!(!after_ack.events.contains(&Event::Compaction { active:false }));
+        let b_probe = after_ack.writes.iter().find(|frame| frame["method"] == "thread/read").unwrap();
+        let active = adapter.receive(json!({"id":b_probe["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"active"},"canAcceptDirectInput":true}}})).unwrap();
+        assert!(!active.events.contains(&Event::Compaction { active:false }));
+        assert!(adapter.compaction_pending);
+        assert!(adapter.command(Command::Compact).is_err());
+        let b_history = after_ack.writes.iter().find(|frame| frame["method"] == "thread/turns/list").unwrap();
+        adapter.receive(json!({"id":b_history["id"],"result":{"data":[],"nextCursor":null}})).unwrap();
+        let current = adapter.receive(json!({"method":"thread/compacted","params":{"threadId":"thread-exact","turnId":"B"}})).unwrap();
+        assert!(!current.events.contains(&Event::Compaction { active:false }));
+        let current_probe = current.writes.iter().find(|frame| frame["method"] == "thread/read").unwrap();
+        let done = adapter.receive(idle(&current_probe["id"])).unwrap();
+        assert!(done.events.contains(&Event::Compaction { active:false }));
+        assert!(!adapter.compaction_pending);
+        assert!(!done.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
     }
 
     /// A plan reaches the surface as the steps it is made of. It used to
