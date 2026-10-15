@@ -194,6 +194,9 @@ pub(super) fn try_defer(
         }
     };
     super::client::ensure_control_open(host)?;
+    // Keep the shared admission gate through reservation check and actor
+    // enqueue: deferred controls bypass synchronous process_request.
+    super::project_removal::admit(host, &request)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     // This preserves the exact interactive ownership/agent gate used by the
     // synchronous ChatCommand path; only waiting for its reply is deferred.
