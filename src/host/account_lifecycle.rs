@@ -792,4 +792,17 @@ pub(crate) mod tests {
         assert!(host.lock().unwrap().chats.is_empty());assert!(host.lock().unwrap().chat_spawning.is_empty());assert!(std::fs::read_dir(selected).unwrap().next().is_none());
     }
 
+    #[test]
+    fn automatic_worktree_cleanup_refuses_while_account_operands_are_reserved() {
+        let root=tempfile::tempdir().unwrap();let homes=Homes::at(root.path().join("homes"));let store=Store::at(root.path().join("registry"));let host=host();
+        let account=Account::linked(Provider::Claude,uuid::Uuid::new_v4(),root.path().join("linked-account"));
+        let reservation=Reservation::test_install(&host,&[account],store,&homes).unwrap();
+        let gate=host.lock().unwrap().control_gate.clone();let _writer=super::super::client::try_scoped_control_write(&gate).unwrap();
+        assert!(ensure_idle(&host).is_err());
+        let error=host.lock().unwrap().allow_automatic_worktree_cleanup(1,&[]).unwrap_err();
+        assert!(error.contains("account operation"));drop(reservation);
+        assert!(ensure_idle(&host).is_ok());
+        assert_eq!(host.lock().unwrap().allow_automatic_worktree_cleanup(1,&[]).unwrap_err(),"A window has not established directory protection");
+    }
+
 }

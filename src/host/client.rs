@@ -373,6 +373,7 @@ pub(super) fn process_request(
             Ok(prepared) => {
                 let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
                 ensure_control_open(host)?;
+                super::account_lifecycle::ensure_idle(host)?;
                 prepared
                     .remove(|windows| {
                         host.lock()

@@ -1384,6 +1384,11 @@ impl HostState {
         client: ClientId,
         windows: &[crate::instance::VerifiedWindow],
     ) -> Result<(), String> {
+        // Account probes/creation now retain a physical reservation instead
+        // of the global writer. They can still own operands inside this tree.
+        if !self.account_lifecycle.lock().unwrap_or_else(|p|p.into_inner()).is_empty() {
+            return Err("An account operation is still using its credential directories".into());
+        }
         let verified = |id: &ClientId| {
             self.client_pids
                 .get(id)
