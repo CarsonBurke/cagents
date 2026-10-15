@@ -895,7 +895,7 @@ impl Cagents {
                         continue;
                     };
                     has_panes = true;
-                    if let Some(directory) = card_directory(card) { directories.push(directory); }
+                    if let Some(directory) = super::worktree_ui::card_directory(card) { directories.push(directory); }
                     if let Some(next) = state.card_outcome(*id)
                         && outcome.as_ref().is_none_or(|previous| sidebar::outcome_priority(next) > sidebar::outcome_priority(previous))
                     { outcome = Some(next.clone()); }
