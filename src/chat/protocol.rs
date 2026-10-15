@@ -223,6 +223,7 @@ pub trait Adapter: Send {
     fn supports_original_commands(&self, _command:&Command) -> bool { false }
     fn retry_original(&mut self,_settings:&crate::chat::annotations::OriginalSettings,_command:Command)->Result<Step,String>{Err("This provider cannot restore exact original settings atomically".into())}
     fn original_command(&mut self, _command_id: Option<String>) {}
+    fn discard_undispatched(&mut self)->Result<Option<Step>,String>{Ok(None)}
     fn maintenance(&mut self)->Result<Step,String>{Ok(Step::default())}
     fn maintenance_deadline(&self)->Option<std::time::Instant>{None}
     fn take_original_updates(&mut self) -> Vec<crate::chat::annotations::OriginalUpdate> { Vec::new() }

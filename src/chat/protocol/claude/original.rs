@@ -12,6 +12,8 @@ pub(super) struct Waiting {
     request:String,
     command:String,
     revision:u64,
+    attention_generation:u64,
+    provider_revision:u64,
     frames:Vec<Value>,
     bytes:usize,
 }
@@ -19,6 +21,9 @@ pub(super) struct Waiting {
 pub(super) struct Originals {
     pub staged:Option<String>,
     pub revision:u64,
+    provider_revision:u64,
+    #[cfg(test)]
+    pub wait_timeout:Option<Duration>,
     pub updates:Vec<OriginalUpdate>,
     pub waiting:Option<Waiting>,
     proofs:ClaudeProofs,
@@ -52,11 +57,31 @@ impl Claude {
         // cannot prevent dispatch of the user's already validated prompt.
         let read=match self.control(json!({"subtype":"get_settings"})) {Ok(read)=>read,Err(_)=>return Ok(vec![frame])};
         let request=read.writes[0]["request_id"].as_str().ok_or("Claude settings request has no ID")?.to_owned();
-        self.originals.waiting=Some(Waiting{deadline:Instant::now()+Duration::from_secs(1),request,command,revision:self.originals.revision,bytes:encoded_len(&frame)?,frames:vec![frame]});
+        #[cfg(test)]
+        let timeout=self.originals.wait_timeout.unwrap_or(Duration::from_secs(1));
+        #[cfg(not(test))]
+        let timeout=Duration::from_secs(1);
+        self.originals.waiting=Some(Waiting{deadline:Instant::now()+timeout,request,command,revision:self.originals.revision,attention_generation:self.attention_generation,provider_revision:self.originals.provider_revision,bytes:encoded_len(&frame)?,frames:vec![frame]});
         Ok(read.writes)
     }
     pub(super) fn original_flush(&mut self)->Vec<Value>{
         if let Some(waiting)=self.originals.waiting.take(){self.controls.remove(&waiting.request);waiting.frames}else{vec![]}
+    }
+    pub(super) fn original_abort(&mut self,closing:bool)->Result<Option<Step>,String>{
+        let Some(waiting)=self.originals.waiting.take() else{return Ok(None);};
+        self.controls.remove(&waiting.request);self.originals.proofs.cancel(&waiting.command);self.originals.applied.remove(&waiting.command);self.originals.started.remove(&waiting.command);self.originals.owned.remove(&waiting.command);
+        self.originals.updates.push(OriginalUpdate::Rejected{command_id:waiting.command.clone()});
+        let ids=if closing{waiting.frames.iter().filter_map(|frame|frame["uuid"].as_str().map(str::to_owned)).collect::<Vec<_>>()}else{vec![waiting.command.clone()]};
+        let mut step=Step::default();self.retract(&json!(ids),&mut step)?;
+        for id in &ids{self.submissions.remove(id);self.queued.retain(|queued|queued.id!=*id);}
+        step.events.push(Event::QueueChanged(self.queued.clone()));
+        // Reset only the optimistic turn this held input introduced. An
+        // actual newer provider turn remains busy and follows normal interrupt.
+        if self.attention_generation==waiting.attention_generation && self.originals.provider_revision==waiting.provider_revision{
+            self.status(false,"Pending input cancelled before dispatch",&mut step);step.events.push(Event::TurnSettled);step.events.push(Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled});self.attention_generation=self.attention_generation.wrapping_add(1);self.started_generation=None;
+        }
+        if !closing{step.writes.extend(waiting.frames.into_iter().skip(1));}
+        Ok(Some(step))
     }
     pub(super) fn original_maintenance(&mut self)->Step{
         if self.originals.waiting.as_ref().is_some_and(|waiting|Instant::now()>=waiting.deadline){
@@ -121,6 +146,7 @@ impl Claude {
         if frame["type"]=="command_lifecycle" && let Some(command)=frame["command_uuid"].as_str(){
             match frame["state"].as_str(){
                 Some("started"|"completed")=>{
+                    if frame["state"]=="started"{self.originals.provider_revision=self.originals.provider_revision.wrapping_add(1);}
                     if self.originals.owned.contains(command){self.originals.started.insert(command.to_owned());}
                     if frame["state"]=="started"{self.originals.latest_started=Some(command.to_owned());}
                 },
@@ -215,6 +241,24 @@ mod tests {
             adapter.receive(started(&id)).unwrap();adapter.receive(user(&id)).unwrap();adapter.receive(json!({"type":"result","subtype":"success","session_id":"00000000-0000-4000-8000-000000000001","is_error":false,"result":"done"})).unwrap();adapter.take_original_updates();
         }
         adapter.original_command(Some("qualified".into()));let read=adapter.command(prompt("eligible",PromptMode::Send)).unwrap();adapter.receive(settings_reply(&read.writes[0])).unwrap();adapter.receive(started("qualified")).unwrap();adapter.receive(user("qualified")).unwrap();assert!(adapter.take_original_updates().iter().any(|update|matches!(update,OriginalUpdate::Accepted{command_id,..} if command_id=="qualified")));
+    }
+
+    #[test]
+    fn interruption_and_close_never_dispatch_held_direct_input_or_late_getter_receipts(){
+        for closing in [false,true]{
+            let mut adapter=adapter();adapter.original_command(Some("never-dispatched".into()));let read=adapter.command(prompt("direct",PromptMode::Send)).unwrap();adapter.command(prompt("separate queued input",PromptMode::Queue)).unwrap();
+            let aborted=if closing{adapter.discard_undispatched().unwrap().unwrap()}else{adapter.command(Command::Interrupt).unwrap()};
+            assert!(!adapter.busy);assert!(aborted.writes.iter().all(|frame|frame["uuid"]!="never-dispatched"));assert_eq!(aborted.writes.len(),usize::from(!closing));if !closing{assert_eq!(aborted.writes[0]["message"]["content"][0]["text"],"separate queued input");}
+            assert!(adapter.receive(settings_reply(&read.writes[0])).unwrap().writes.is_empty());assert!(adapter.maintenance().unwrap().writes.is_empty());
+            let updates=adapter.take_original_updates();assert!(updates.iter().any(|update|matches!(update,OriginalUpdate::Rejected{command_id} if command_id=="never-dispatched")));assert!(updates.iter().all(|update|!matches!(update,OriginalUpdate::Latest{..}|OriginalUpdate::Accepted{..})));
+        }
+    }
+
+    #[test]
+    fn aborting_unsent_input_does_not_settle_a_newer_actual_provider_turn(){
+        let mut adapter=adapter();adapter.original_command(Some("held".into()));adapter.command(prompt("direct",PromptMode::Send)).unwrap();
+        adapter.receive(json!({"type":"command_lifecycle","command_uuid":"newer-native-turn","session_id":"00000000-0000-4000-8000-000000000001","state":"started"})).unwrap();let generation=adapter.attention_generation;
+        let interrupted=adapter.command(Command::Interrupt).unwrap();assert!(adapter.busy);assert_eq!(adapter.attention_generation,generation);assert!(interrupted.events.iter().all(|event|!matches!(event,Event::TurnSettled|Event::TurnFinished{..})));assert!(interrupted.writes.iter().any(|frame|frame["request"]["subtype"]=="interrupt"));assert!(interrupted.writes.iter().all(|frame|frame["type"]!="user"));
     }
 
 }

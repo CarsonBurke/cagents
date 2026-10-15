@@ -350,4 +350,39 @@ mod tests {
         authority.latest_user("newer-native-user").unwrap();assert!(matches!(authority.prepare_retry("session",&original),Err(OriginalError::Changed)));
     }
 
+    #[test]
+    fn actual_actor_interrupt_and_close_cancel_unsent_input_and_fence_late_settings_reply(){
+        use super::super::Handle;
+        fn wait(mut condition:impl FnMut()->bool){let deadline=std::time::Instant::now()+std::time::Duration::from_secs(5);while !condition(){assert!(std::time::Instant::now()<deadline,"scripted transport did not reach its fence");std::thread::sleep(std::time::Duration::from_millis(5));}}
+        for closing in [false,true]{
+            let root=annotations::storage::test_directory();let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Claude,root.path(),|key|(key=="CLAUDE_CONFIG_DIR").then(||home.as_os_str().to_owned())).unwrap();
+            let script=root.path().join("provider.py");std::fs::write(&script,r#"import sys,os,json,select,pathlib
+root=pathlib.Path(sys.argv[1]); pending=None; late=False; data=b''
+def emit(frame): print(json.dumps(frame),flush=True)
+def record(text):
+ with (root/'writes').open('a') as out: out.write(text+'\n')
+while True:
+ if pending and (root/'release').exists() and not late:
+  emit({'type':'control_response','response':{'subtype':'success','request_id':pending,'response':{'applied':{'model':'reported-model','effort':'low'}}}});late=True;(root/'late-sent').touch()
+ if not select.select([0],[],[],0.01)[0]: continue
+ block=os.read(0,65536)
+ if not block: break
+ data+=block
+ while b'\n' in data:
+  line,data=data.split(b'\n',1); frame=json.loads(line)
+  if frame.get('type')=='control_request':
+   subtype=frame['request']['subtype'];record(subtype)
+   if subtype=='initialize': emit({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{'current_permission_mode':'default','fast_mode_state':'off'}}})
+   elif subtype=='get_settings': pending=frame['request_id'];(root/'getter-seen').touch()
+   else: emit({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
+  elif frame.get('type')=='user': record('user:'+frame['message']['content'][0]['text'])
+"#).unwrap();
+            let spec=protocol::ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:protocol::TransportSpec::JsonLines,program:"python3".into(),arguments:vec![script.to_string_lossy().into_owned(),root.path().to_string_lossy().into_owned()],working_directory:root.path().to_owned(),environment:Default::default()};
+            let mut adapter=protocol::claude::annotation_test_async_adapter();let mut initial=adapter.initialize().unwrap();let cache=super::super::preflight(&spec,&mut initial).unwrap();let handle=Handle::start_inner(spec,adapter,initial,cache,None,None,Ok(scope),|_|{}).unwrap();handle.0.annotations.lock().unwrap().root=Some(root.path().join("annotations"));wait(||handle.snapshot(None).unwrap().ready);
+            handle.command(Command::Prompt{text:"never-dispatched".into(),attachments:vec![],mode:crate::chat::PromptMode::Send}).unwrap();wait(||root.path().join("getter-seen").exists());handle.command(Command::Prompt{text:"queued-separately".into(),attachments:vec![],mode:crate::chat::PromptMode::Queue}).unwrap();
+            if closing{handle.close().unwrap();}else{handle.command(Command::Interrupt).unwrap();std::fs::write(root.path().join("release"),b"go").unwrap();wait(||root.path().join("late-sent").exists());wait(||std::fs::read_to_string(root.path().join("writes")).unwrap_or_default().contains("user:queued-separately"));handle.close().unwrap();}
+            let writes=std::fs::read_to_string(root.path().join("writes")).unwrap();assert!(!writes.contains("user:never-dispatched"));assert_eq!(writes.contains("user:queued-separately"),!closing);assert!(!writes.contains("interrupt"),"No actual provider turn existed to interrupt");
+        }
+    }
+
 }

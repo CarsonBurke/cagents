@@ -1723,6 +1723,7 @@ impl Actor {
             if self.stop.load(Ordering::Acquire) {
                 if closing.is_none() {
                     closing = Some(Instant::now());
+                    if let Some(discarded)=self.adapter.discard_undispatched()?{self.step(discarded)?;}
                 }
                 let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
                 if busy && !interrupt_sent && self.pending.is_empty() {

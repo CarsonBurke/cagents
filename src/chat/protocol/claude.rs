@@ -1609,9 +1609,10 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn supports_original_commands(&self,command:&Command)->bool{self.ready&&!self.busy&&matches!(command,Command::Prompt{mode:PromptMode::Send,..})}
+    fn supports_original_commands(&self,command:&Command)->bool{self.ready&&!self.busy&&self.queued.is_empty()&&self.submissions.is_empty()&&matches!(command,Command::Prompt{mode:PromptMode::Send,..})}
     fn original_command(&mut self,id:Option<String>){self.originals.staged=id;}
     fn take_original_updates(&mut self)->Vec<chat::annotations::OriginalUpdate>{std::mem::take(&mut self.originals.updates)}
+    fn discard_undispatched(&mut self)->Result<Option<Step>,String>{self.original_abort(true)}
     fn maintenance(&mut self)->Result<Step,String>{Ok(self.original_maintenance())}
     fn maintenance_deadline(&self)->Option<std::time::Instant>{self.originals.waiting.as_ref().map(|pending|pending.deadline)}
     fn take_approval_updates(&mut self) -> Vec<chat::annotations::ApprovalUpdate> {
@@ -1819,6 +1820,12 @@ impl Adapter for Claude {
                 self.control(json!({"subtype":"stop_task", "task_id":task}))
             }
             Command::Interrupt => {
+                if let Some(mut aborted)=self.original_abort(false)?{
+                    if self.busy{
+                        let interrupt=self.control(json!({"subtype":"interrupt","_cagents_turn":self.attention_generation}))?;aborted.writes.extend(interrupt.writes);self.interruption=Some(false);
+                    }
+                    return Ok(aborted);
+                }
                 if self.interruption.is_some() {
                     return Err("Claude interruption is already pending for this turn".into());
                 }
@@ -5117,6 +5124,9 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 
 #[cfg(test)]
 pub(crate) fn annotation_test_adapter()->Box<dyn Adapter>{Box::new(Claude{ready:true,cwd:std::env::temp_dir(),..Claude::default()})}
+#[cfg(test)]
+pub(crate) fn annotation_test_async_adapter()->Box<dyn Adapter>{let mut adapter=Claude{ready:true,async_input:true,cwd:std::env::temp_dir(),..Claude::default()};adapter.originals.wait_timeout=Some(std::time::Duration::from_secs(10));Box::new(adapter)}
+
 #[cfg(test)]
 mod tests {
     use super::*;
