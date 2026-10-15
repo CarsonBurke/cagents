@@ -16,6 +16,18 @@ struct Project {
     scope: PathBuf,
 }
 
+impl Project {
+    fn ownership_root(&self) -> &Path {
+        // Some project descriptors use /repo/.git while the primary working
+        // tree is /repo. Match the known working-tree scope, not its admin dir.
+        if sidebar::is_primary_worktree(&self.repository, &self.scope) {
+            &self.scope
+        } else {
+            &self.repository
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::app) struct Snapshot {
     original: Option<(crate::model::ChannelId, Option<PathBuf>)>,
@@ -137,14 +149,14 @@ pub(in crate::app) fn resolve(
     if let Some(root) = snapshot.worktrees.iter().filter(|root| matches(root)).max_by_key(|root| rank(root)) {
         return choose(Destination::Worktree(root.clone()), Some(root));
     }
-    if let Some(project) = snapshot.projects.iter().filter(|project| recorded.starts_with(&project.repository))
-        .max_by_key(|project| project.repository.components().count())
-        && physical(&project.repository).is_none()
+    if let Some(project) = snapshot.projects.iter().filter(|project| recorded.starts_with(project.ownership_root()))
+        .max_by_key(|project| project.ownership_root().components().count())
+        && physical(project.ownership_root()).is_none()
     {
         return Err("The recorded project cannot be resolved. Restore its folder before resuming.".into());
     }
-    if let Some(project) = snapshot.projects.iter().filter(|project| matches(&project.repository))
-        .max_by_key(|project| rank(&project.repository))
+    if let Some(project) = snapshot.projects.iter().filter(|project| matches(project.ownership_root()))
+        .max_by_key(|project| rank(project.ownership_root()))
     {
         return choose(Destination::NewChannel { project: project.id, root: project.scope.clone() }, Some(&project.scope));
     }
@@ -204,6 +216,32 @@ mod tests {
         let canonical = vec![("/current".into(), "/physical/current".into())];
         assert!(resolve(&alias.join("history"), true, &scope, &canonical, false).is_err());
     }
+    #[test]
+    fn git_admin_project_spelling_matches_its_real_primary_working_tree() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
+        let admin = root.join(".git");
+        let recorded = root.join("src");
+        std::fs::create_dir_all(&admin).unwrap();
+        std::fs::create_dir_all(&recorded).unwrap();
+        let current = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(sidebar::SidebarProject::new(
+            project, crate::repository::RepositoryId::new(), "Recorded project".into(),
+            admin, Vec::new(), Vec::new()));
+        app.known_worktree_roots.clear();
+        app.active_workspace = Some(current.path().to_owned());
+        let session = chat::fresh_session_deferred_policy(crate::agent::Provider::Claude,
+            TerminalId::new(), recorded.clone(),
+            &crate::account::Account::system(crate::agent::Provider::Claude)).unwrap();
+        let scope = Snapshot::capture(&app, CardId::new(), &session);
+        let resolved = classify(&recorded, &scope);
+        assert_eq!(resolved.destination, Destination::NewChannel { project, root: root.clone() });
+        assert_eq!(resolved.root, root);
+        assert_eq!(resolved.physical_root, root.canonicalize().unwrap());
+    }
+
     #[test]
     fn project_matching_creates_only_an_intent_for_its_exact_channel_scope() {
         let project = ProjectId::new();
