@@ -4,7 +4,7 @@
 //! consumed host-issued transaction can authenticate its bytes; repository
 //! validation must still check the complete durable row and original six roles.
 //! The owning host reader must close the connection on every phase failure.
-use crate::model::{HostSessionProof, OperationId};
+use crate::model::{DirectoryStartRequirement, HostSessionProof, OperationId};
 use serde::{Deserialize, Serialize};
 use std::{io, time::Instant};
 
@@ -17,8 +17,7 @@ pub(crate) struct UiJournalChallenge {
     pub request_id: u64,
     pub nonce: OperationId,
     pub proof: HostSessionProof,
-    pub operation: OperationId,
-    pub generation: u64,
+    pub requirement: DirectoryStartRequirement,
     pub window: String,
     pub database: [u64; 2],
     pub roles: RoleIdentities,
@@ -26,6 +25,7 @@ pub(crate) struct UiJournalChallenge {
 impl UiJournalChallenge {
     pub(crate) fn validate_shape(&self) -> io::Result<()> {
         crate::instance::validate_window_slot(&self.window)?;
+        self.requirement.validate().map_err(refused)?;
         if !self.proof.is_complete()
             || [
                 self.proof.host_session_id.as_str(),
@@ -85,8 +85,7 @@ mod host {
             stream: &UnixStream,
             request_id: u64,
             proof: HostSessionProof,
-            operation: OperationId,
-            generation: u64,
+            requirement: DirectoryStartRequirement,
             roles: RoleIdentities,
             deadline: Instant,
             cancellation: CancellationToken,
@@ -98,8 +97,7 @@ mod host {
                 request_id,
                 nonce: OperationId::new(),
                 proof,
-                operation,
-                generation,
+                requirement,
                 window: audience.slot().to_owned(),
                 database: [device, inode],
                 roles,
@@ -126,6 +124,7 @@ mod host {
             roots: &[Root; 6],
             current_request: u64,
             current_proof: &HostSessionProof,
+            current_requirement: &DirectoryStartRequirement,
         ) -> io::Result<AuthenticatedCreationOperation> {
             active(self.deadline, &self.cancellation)?;
             validate_echo(
@@ -133,6 +132,7 @@ mod host {
                 &response.challenge,
                 current_request,
                 current_proof,
+                current_requirement,
             )?;
             let actual = role_identities(roots)?;
             if actual != self.challenge.roles {
@@ -167,15 +167,16 @@ mod host {
             &self.row
         }
         pub(crate) fn operation(&self) -> OperationId {
-            self.challenge.operation
+            self.challenge.requirement.operation
         }
         pub(crate) fn generation(&self) -> u64 {
-            self.challenge.generation
+            self.challenge.requirement.generation
         }
         pub(crate) fn validate_current(
             &self,
             current_request: u64,
             current_proof: &HostSessionProof,
+            current_requirement: &DirectoryStartRequirement,
             roots: &[Root; 6],
         ) -> io::Result<()> {
             active(self.deadline, &self.cancellation)?;
@@ -184,6 +185,7 @@ mod host {
                 &self.challenge,
                 current_request,
                 current_proof,
+                current_requirement,
             )?;
             if role_identities(roots)? != self.challenge.roles {
                 return Err(refused(
@@ -221,10 +223,12 @@ fn validate_echo(
     actual: &UiJournalChallenge,
     current_request: u64,
     current_proof: &HostSessionProof,
+    current_requirement: &DirectoryStartRequirement,
 ) -> io::Result<()> {
     if actual != expected
         || current_request != expected.request_id
         || current_proof != &expected.proof
+        || current_requirement != &expected.requirement
     {
         return Err(refused(
             "The creation journal response is stale or belongs to another host request",
@@ -248,8 +252,8 @@ mod tests {
                 boot_id: "boot".into(),
                 host_incarnation: "incarnation".into(),
             },
-            operation: OperationId::new(),
-            generation: 3,
+            requirement: DirectoryStartRequirement {card:crate::model::CardId::new(),session:crate::model::TerminalId::new(),
+                operation:OperationId::new(),generation:3,attempt:uuid::Uuid::new_v4(),kind:crate::model::DirectoryStartKind::Terminal},
             window: "primary".into(),
             database: [4, 5],
             roles: [[6, 7]; 6],
@@ -258,17 +262,21 @@ mod tests {
     #[test]
     fn response_cannot_cross_nonce_request_host_or_role_identity() {
         let expected = challenge();
-        validate_echo(&expected, &expected, 7, &expected.proof).unwrap();
+        validate_echo(&expected, &expected, 7, &expected.proof, &expected.requirement).unwrap();
         let mut changed = expected.clone();
         changed.nonce = OperationId::new();
-        assert!(validate_echo(&expected, &changed, 7, &expected.proof).is_err());
-        assert!(validate_echo(&expected, &expected, 8, &expected.proof).is_err());
+        assert!(validate_echo(&expected, &changed, 7, &expected.proof, &expected.requirement).is_err());
+        assert!(validate_echo(&expected, &expected, 8, &expected.proof, &expected.requirement).is_err());
         let mut host = expected.proof.clone();
         host.host_incarnation = "restarted".into();
-        assert!(validate_echo(&expected, &expected, 7, &host).is_err());
+        assert!(validate_echo(&expected, &expected, 7, &host, &expected.requirement).is_err());
+        let mut recipient=expected.requirement.clone(); recipient.card=crate::model::CardId::new();
+        assert!(validate_echo(&expected,&expected,7,&expected.proof,&recipient).is_err());
+        let mut recipient=expected.requirement.clone(); recipient.attempt=uuid::Uuid::new_v4();
+        assert!(validate_echo(&expected,&expected,7,&expected.proof,&recipient).is_err());
         let mut changed = expected.clone();
         changed.roles[5][1] += 1;
-        assert!(validate_echo(&expected, &changed, 7, &expected.proof).is_err());
+        assert!(validate_echo(&expected, &changed, 7, &expected.proof, &expected.requirement).is_err());
     }
     #[test]
     fn response_and_host_proof_have_strict_bounds() {
