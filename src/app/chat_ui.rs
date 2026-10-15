@@ -2073,7 +2073,7 @@ impl Runtime {
             finished_stamp: None,
             connection,
             draft_account: None,
-            draft_permission_choice: permission_mode,
+            draft_permission_choice: None,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -13395,6 +13395,9 @@ mod tests {
 
     #[test]
     fn settings_remote_draft_uses_window_choices_without_local_execution_policy() {
+        let empty = chat::fresh_session_draft(Provider::Claude, TerminalId::new(), PathBuf::from(FIXTURE_DIRECTORY), &Account::system(Provider::Claude), &Default::default()).unwrap();
+        let generic = Runtime::new(Target { card: CardId::new(), generation: 0 }, empty, Connection::Draft, true, Default::default());
+        assert!(generic.draft_permission_choice.is_none(), "an inferred preview must never become an explicit launch choice");
         let configuration = settings::AgentLaunchSettings {
             model: Some("chosen-model".into()), effort: Some("low".into()), permission_mode: Some("plan".into()),
             executable: Some("relative-local-only".into()), arguments: vec!["invalid\0argument".into()],
