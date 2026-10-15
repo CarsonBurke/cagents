@@ -376,13 +376,11 @@ impl RepositoryRuntime {
             .as_ref()
             .is_none_or(|(source, _)| source != &key.source)
         {
-            let Some(model) = self.diff_model() else {
+            let Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) = self.displayed_diff_state() else {
                 return Task::none();
             };
-            self.diff_interaction.snapshot = Some((
-                key.source.clone(),
-                Arc::new(interaction::SearchSnapshot::new(model, self.diff_mode)),
-            ));
+            let snapshot = Arc::new(interaction::SearchSnapshot::new(Arc::clone(model), self.diff_mode));
+            self.diff_interaction.snapshot = Some((key.source.clone(), snapshot));
         }
         let snapshot = Arc::clone(&self.diff_interaction.snapshot.as_ref().unwrap().1);
         let ticket = uuid::Uuid::new_v4();
