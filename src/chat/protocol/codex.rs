@@ -3911,7 +3911,7 @@ pub(crate) fn annotation_test_adapter(with_child: bool) -> Box<dyn Adapter> {
         let mut child = tests::adapter();
         child.thread = Some("child-exact".into());
         child.is_child = true;
-        adapter.children.insert("child-exact".into(), child);
+        adapter.children.insert("child-exact".into(), Box::new(child));
     }
     Box::new(adapter)
 }
