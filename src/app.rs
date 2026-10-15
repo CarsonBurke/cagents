@@ -14978,6 +14978,11 @@ impl Application for Cagents {
                     SidebarAction::Unstage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Unstage(selection)),
                     SidebarAction::ConfirmDiscard { key, request } => self.enqueue_git_mutation(key, QueuedGitMutation::Discard(request)),
                     SidebarAction::Commit { key, message, amend } => {
+                        if amend && let Some(source) = self.sidebar_model.source_control.as_mut()
+                            .filter(|source| source.key == key && source.operation.is_some()) {
+                            source.set_error(Some("Finish or abort the current Git operation before amending a commit.".into()));
+                            return Task::none();
+                        }
                         let commit_revision = self.sidebar_state.submitted_commit_revision(&key, &message, amend);
                         let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, commit_revision) else {
                             return Task::none();
@@ -28310,6 +28315,50 @@ mod tests {
         );
         let _ = project;
     }
+    #[test]
+    fn git_mutation_queue_rejects_stale_amend_during_an_operation_and_allows_turning_it_off() {
+        for kind in [
+            crate::repository::GitOperationKind::Merge,
+            crate::repository::GitOperationKind::Rebase,
+            crate::repository::GitOperationKind::CherryPick,
+            crate::repository::GitOperationKind::Revert,
+        ] {
+            let mut app = context_inspector_test_app(false);
+            app.sidebar_model = sidebar::tests::panel_model();
+            app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+            let key = app.sidebar_state.active_worktree().unwrap().clone();
+            app.active_workspace = Some(key.canonical_path.clone());
+            app.sidebar_state.apply(&SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Kept draft".into(),
+            });
+            app.sidebar_state.apply(&SidebarAction::AmendChanged {
+                key: key.clone(),
+                amend: true,
+            });
+            app.sidebar_model.source_control.as_mut().unwrap().operation =
+                Some(crate::repository::GitOperationState {
+                    kind,
+                    incoming_ref: None,
+                    message: None,
+                });
+            drop(app.update(Message::Sidebar(SidebarAction::Commit {
+                key: key.clone(),
+                message: "Kept draft".into(),
+                amend: true,
+            })));
+            assert!(!app.source_control_mutations.contains_key(&key.canonical_path));
+            assert!(app.sidebar_model.source_control.as_ref().unwrap().error
+                .as_deref().unwrap().contains("Finish or abort"));
+            assert_eq!(app.sidebar_state.commit_message(), "Kept draft");
+            drop(app.update(Message::Sidebar(SidebarAction::AmendChanged {
+                key: key.clone(),
+                amend: false,
+            })));
+            assert!(app.sidebar_state.submitted_commit_revision(&key, "Kept draft", false).is_some());
+        }
+    }
+
     #[test]
     fn git_mutation_queue_keeps_ten_clicks_and_refreshes_once_at_drain() {
         let mut app = context_inspector_test_app(false);
