@@ -89,10 +89,12 @@ impl State {
         let mut positions=std::collections::BTreeMap::new();
         for path in suspended {positions.insert(order(path),(path.as_slice(),None));}
         for leaf in leaves {positions.insert(order(&leaf.path),(leaf.path.as_slice(),Some(leaf)));}
-        for (path,leaf) in positions.values() {
-            if let Some(leaf)=leaf {builder.indexed(item,path,leaf.text.clone(),leaf.prefixes.clone());}
-            else {builder.pending(item,path);}
-        }
+        builder.stamped(disclosure_intent::source_stamp(epoch),|builder| {
+            for (path,leaf) in positions.values() {
+                if let Some(leaf)=leaf {builder.indexed(item,path,leaf.text.clone(),leaf.prefixes.clone());}
+                else {builder.pending(item,path);}
+            }
+        });
     }
     fn map(&self)->HashMap<String,Arc<find::External>> {
         self.ready.iter().map(|(item,document)|(item.clone(),document.external.clone())).collect()
@@ -377,6 +379,25 @@ mod tests {
         let runtime=app.chat_runtime_mut(target).unwrap();assert!(runtime.find.is_none());assert!(runtime.find_external.is_empty());
         complete(runtime,id,ready);assert!(runtime.find_external.is_empty(),"late old Find output cannot refill a closed search map");
         runtime.changes_find.clear();flush();assert!(body.upgrade().is_none());
+    }
+
+    #[test]
+    fn actual_changes_ready_and_pending_catalogs_carry_exact_source_epoch_even_for_identical_bytes() {
+        let request=fixture();let source=sources(&request)[0].clone();let item=source.source.source_id.clone();
+        let mut state=State {scope:Some(request.scope.clone()),ready:build(&request).unwrap(),query:None,complete:true,error:None};
+        let mut ready=selection::Catalog::builder();state.selection(&item,source.epoch,&mut ready);let ready=ready.finish();
+        let id=selection::logical_identity(&item,&[6,0]);let expected=disclosure_intent::source_stamp(source.epoch);
+        assert_eq!(ready.source_stamp(id),Some(expected));let old=ready.text(id).unwrap();
+        state.ready.clear();let mut pending=selection::Catalog::builder();state.selection_with_pending(&item,source.epoch,&[vec![6,0]],&mut pending);let pending=pending.finish();
+        assert!(pending.is_pending(id));assert_eq!(pending.source_stamp(id),Some(expected));assert_eq!(pending.retained_plain_bytes(),0);
+        edit(&request,|payload| {
+            payload.sources[0].epoch.revision+=1;
+            for page in &mut payload.sources[0].manifests {Arc::make_mut(page).epoch=payload.sources[0].epoch;}
+        });
+        let changed=sources(&request)[0].clone();state.ready=build(&request).unwrap();
+        let mut current=selection::Catalog::builder();state.selection(&item,changed.epoch,&mut current);let current=current.finish();
+        assert!(Arc::ptr_eq(&old,&current.text(id).unwrap()),"same immutable body cannot stand in for source provenance");
+        assert_ne!(current.source_stamp(id),ready.source_stamp(id));
     }
 
 }
