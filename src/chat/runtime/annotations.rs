@@ -472,11 +472,9 @@ pub(super) fn normalize(
 ) -> Result<(), String> {
     match event {
         Event::Item(item) => normalize_item(store, None, item)?,
-        Event::History { items, .. } | Event::LatestHistory { items, .. } => {
-            for item in items {
-                normalize_item(store, None, item)?;
-            }
-        }
+        // Historical IDs never inherit the current live session. The
+        // source-qualified pre-ingestion reader handles these separately.
+        Event::History { .. } | Event::LatestHistory { .. } => {}
         Event::SubagentItem { id, item } => normalize_item(store, Some(id), item)?,
         _ => {}
     }

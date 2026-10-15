@@ -136,12 +136,39 @@ mod tests {
         let mut events = history(&scope, "session-A", &["known"], &["known"]);
         let update = |request: &str| ApprovalUpdate { session_id: Some("session-A".into()), key: ApprovalKey { agent_id: None, item_id: "known".into() }, request_id: request.into(), decision: ApprovalDecision::Awaiting };
         assert!(authority.apply(None, vec![update("request-1")], &mut events).is_none());
+        assert_eq!(authority.normalize_history_events(&mut events).unwrap(), 1);
         assert_eq!(status(&events, "known"), ToolStatus::Denied, "replayed request cannot reset denial");
         let mut events = history(&scope, "session-A", &["known"], &["known"]);
         assert!(authority.apply(None, vec![update("request-2")], &mut events).is_none());
         assert_eq!(authority.normalize_history_events(&mut events).unwrap(), 0);
         assert_eq!(status(&events, "known"), ToolStatus::Failed, "real new decision must not inherit the old denial");
     }
+    #[test]
+    fn live_apply_cannot_lend_its_session_to_unknown_or_conflicting_history() {
+        let root = annotations::storage::test_directory();
+        let source = scope(root.path(), "source");
+        let other = scope(root.path(), "other");
+        let path = root.path().join("annotations");
+        let mut durable = annotations::storage::Store::for_test(&path, &source, "session-A").unwrap();
+        deny(&mut durable, "same-native-id");
+        let mut authority = Authority::for_turn_outcomes_test(source.clone(), path, "session-A");
+        let mut cases = vec![
+            (history(&source, "session-A", &["same-native-id"], &["same-native-id"]), ToolStatus::Denied),
+            (history(&source, "session-B", &["same-native-id"], &["same-native-id"]), ToolStatus::Failed),
+            (history(&other, "session-A", &["same-native-id"], &["same-native-id"]), ToolStatus::Failed),
+            (vec![Event::History { items: vec![item("same-native-id")], has_earlier: false }], ToolStatus::Failed),
+        ];
+        let mut conflicting = history(&source, "session-A", &["same-native-id"], &["same-native-id"]);
+        conflicting.push(Event::HistoryOrigins { account: account_origin(&source), session_id: "session-B".into(), item_ids: vec!["same-native-id".into()] });
+        cases.push((conflicting, ToolStatus::Failed));
+        for (mut events, expected) in cases {
+            assert!(authority.apply(None, vec![], &mut events).is_none());
+            assert_eq!(status(&events, "same-native-id"), ToolStatus::Failed, "live first pass must leave history untouched");
+            authority.normalize_history_events(&mut events).unwrap();
+            assert_eq!(status(&events, "same-native-id"), expected);
+        }
+    }
+
     #[test]
     fn actual_readonly_claude_history_normalizes_before_preflight_cache_ingestion() {
         use crate::chat::{Launch, protocol::claude};
