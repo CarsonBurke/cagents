@@ -8680,8 +8680,8 @@ impl<'a> IconCommand<'a> {
 ///
 /// Which commands exist is a fact about the area: conflicts are staged to mark
 /// them resolved, there is no unstage for an unmerged path, and untracked paths
-/// have nothing to unstage from. An in-flight Git command disables the actions
-/// in place, because a second mutation against the same index would race the first.
+/// have nothing to unstage from. Stage and unstage remain available for the
+/// serialized queue; destructive actions wait for the current mutation.
 fn group_commands<'a>(
     source: &'a SourceControlModel,
     group: &'a ChangeGroup,
@@ -17114,22 +17114,37 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_running_mutation_withholds_every_further_command_against_the_same_index() {
+    fn a_running_mutation_keeps_stage_and_unstage_available_but_withholds_discard() {
         let mut source = source_control();
         source.set_mutation(Some(MutationKind::Stage));
-        let group = source
-            .group(ChangeArea::Unstaged)
-            .expect("an unstaged group exists");
-        assert!(
-            group_commands(&source, group, false)
-                .iter()
-                .all(|command| command.action.is_none())
-                && row_commands(&source, ChangeArea::Unstaged, &group.rows()[0], false)
-                    .iter()
-                    .all(|command| command.action.is_none()),
-            "two `git add` runs against one index corrupt each other's lock, so the second is not \
-             enabled"
-        );
+        for area in [ChangeArea::Staged, ChangeArea::Unstaged] {
+            let group = source.group(area).expect("the fixture has both areas");
+            let group_actions = group_commands(&source, group, false)
+                .into_iter()
+                .filter_map(|command| command.action)
+                .filter_map(|action| resolve_group_command(&source, &action))
+                .collect::<Vec<_>>();
+            let row_actions = row_commands(&source, area, &group.rows()[0], false)
+                .into_iter()
+                .filter_map(|command| command.action)
+                .collect::<Vec<_>>();
+            for actions in [&group_actions, &row_actions] {
+                assert!(actions.iter().any(|action| match area {
+                    ChangeArea::Staged => matches!(action, SidebarAction::Unstage { .. }),
+                    _ => matches!(action, SidebarAction::Stage { .. }),
+                }), "stage and unstage intentions must reach the serialized queue");
+                assert!(!actions.iter().any(|action| matches!(
+                    action, SidebarAction::RequestDiscard { .. }
+                )), "discard remains unavailable while a mutation runs");
+            }
+            for commands in [
+                group_commands(&source, group, true),
+                row_commands(&source, area, &group.rows()[0], true),
+            ] {
+                assert!(commands.iter().all(|command| command.action.is_none()),
+                    "an open dialog still withholds every command");
+            }
+        }
     }
 
     #[test]
