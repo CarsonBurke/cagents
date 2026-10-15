@@ -3075,6 +3075,10 @@ impl Worker {
             if !is_pty_input(&command) { self.retained_commands.push_back(command); }
         }
         if pending {
+            // Cancel bytes already accepted by the master as well as those
+            // still queued here. Otherwise the next shell prompt inherits
+            // the beginning of the canceled paste after the busy job exits.
+            let _ = unsafe { libc::tcflush(self.writer.as_raw_fd(), libc::TCOFLUSH) };
             // TIOCSIG is authorized by this exact PTY master, targets its
             // foreground group and bypasses a full slave input buffer.
             let result = unsafe { libc::ioctl(self.writer.as_raw_fd(), libc::TIOCSIG, libc::SIGINT) };
@@ -5654,6 +5658,38 @@ mod tests {
     }
 
     #[test]
+    fn interrupt_discards_kernel_buffered_paste_before_the_next_prompt() {
+        let handle = TerminalHandle::spawn(
+            shell_session("stty -echo -icanon; trap 'echo interrupted' INT; echo ready; sleep 600; echo prompt; read line; printf 'received:%s\\n' \"$line\""),
+            TerminalConfig::default(), |_| {},
+        ).unwrap();
+        wait_for_text(&handle, "ready");
+        handle.paste("x".repeat(1024 * 1024), PasteOrigin::Clipboard).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        handle.input(vec![3]).unwrap();
+        wait_for_text(&handle, "prompt");
+        handle.input(b"after\n".to_vec()).unwrap();
+        wait_for_text(&handle, "received:after");
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn shutdown_deadline_releases_a_wedged_worker_without_claiming_completion() {
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let (commands, _receiver) = command_channel(1);
+        let (_events, event_receiver) = crossbeam_channel::unbounded();
+        let (release, blocked) = crossbeam_channel::bounded::<()>(1);
+        let worker = thread::spawn(move || { let _ = blocked.recv(); });
+        let handle = TerminalHandle { inner: Arc::new(HandleInner {
+            commands, events: event_receiver, published, worker: Mutex::new(Some(worker)),
+        }) };
+        let started = std::time::Instant::now();
+        assert_eq!(handle.shutdown(), Err(TerminalSendError::Closed));
+        assert!(started.elapsed() < WORKER_JOIN_TIMEOUT + Duration::from_secs(1));
+        release.send(()).unwrap();
+    }
+
+    #[test]
     fn default_scrollback_byte_budget_retains_over_ten_thousand_rows() {
         let config = TerminalConfig::default();
         let mut terminal = Terminal::new(TerminalOptions {
@@ -5661,9 +5697,7 @@ mod tests {
             rows: config.rows,
             max_scrollback: config.max_scrollback_bytes,
         }).unwrap();
-        for _ in 0..20_000 {
-            terminal.vt_write(b"output\r\n");
-        }
+        terminal.vt_write(&b"output\r\n".repeat(20_000));
         assert!(terminal.scrollbar().unwrap().total > 10_000);
     }
 
@@ -5673,7 +5707,7 @@ mod tests {
             let mut terminal = Terminal::new(TerminalOptions {
                 cols: 80, rows: 24, max_scrollback: budget,
             }).unwrap();
-            for _ in 0..40_000 { terminal.vt_write(b"output\r\n"); }
+            terminal.vt_write(&b"output\r\n".repeat(20_000));
             terminal.scrollbar().unwrap().total
         };
         let low = retained(2 * 1024 * 1024);
