@@ -21,6 +21,7 @@ struct AutomaticAttempt {
 #[derive(Debug, Clone)]
 struct AutomaticCleanup {
     request: crate::model::OperationId,
+    repository_generation: Option<u64>,
     target: Target,
     owners: Vec<AutomaticCardOwner>,
 }
@@ -654,13 +655,18 @@ impl Cagents {
                 scope: self.durable.card_scopes.get(&card.id).cloned(),
                 user_title: self.chrome_ui.user_titles.get(&card.id).cloned()})
             .collect();
-        AutomaticCleanup {request: crate::model::OperationId::new(), target, owners}
+        AutomaticCleanup {request: crate::model::OperationId::new(),
+            repository_generation: self.repository_generations.get(&target.project).copied(), target, owners}
     }
 
     fn complete_automatic_cleanup(&mut self, completed: AutomaticCleanup) -> Task<Message> {
         let target = completed.target;
+        // A Repository descriptor can retain its card/path through checkout
+        // replacement. Any newer inventory intake invalidates old UI custody.
+        let same_inventory = self.repository_generations.get(&target.project).copied()
+            == completed.repository_generation;
         let current = completed.owners.into_iter().filter(|owner| {
-            self.card_state(owner.card.id) == Some(&owner.card)
+            same_inventory && self.card_state(owner.card.id) == Some(&owner.card)
                 && self.durable.card_scopes.get(&owner.card.id) == owner.scope.as_ref()
                 && self.chrome_ui.user_titles.get(&owner.card.id) == owner.user_title.as_ref()
                 && !matches!(self.cards.get(&owner.card.id), Some(CardRuntime::Repository(runtime))
@@ -5832,9 +5838,11 @@ mod tests {
         drop(app.update(Message::RepositoryLoaded { project_id: project, generation: first_generation, open_cards: false, result: Ok(Box::new(first)) }));
         let id = app.sidebar_model.project(project).unwrap().worktrees.iter().find(|row| row.path == linked).unwrap().id;
         let target = app.project_target(project, Some(id)).unwrap();
+        drop(app.add_repository_card(project, target.repository.clone(), linked.clone()));
+        let original_repository = app.durable.cards.last().unwrap().id;
         let custody = app.capture_automatic_cleanup(target.clone());
         let request = custody.request;
-        assert!(custody.owners.is_empty());
+        assert_eq!(custody.owners.len(), 1);
         app.project_ui.automatic_in_flight.insert(id, custody);
         // Actual Git changes and the actual completed repository-read reducer
         // put a successor row at the same path before the old reply arrives.
@@ -5859,6 +5867,8 @@ mod tests {
         drop(app.handle_project_action(Action::AutomaticallyDeleted {target: target.clone(), request, result: Ok(receipt.clone())}));
         assert_eq!(app.card_state(fresh.id).unwrap().kind, fresh.kind);
         assert!(app.card_state(fresh.id).unwrap().existence.is_open());
+        assert!(app.card_state(original_repository).unwrap().existence.is_open(),
+            "new inventory supersedes old path-only repository projection custody");
         assert_eq!(app.durable.card_scopes.get(&fresh.id), Some(&linked));
         assert_eq!(app.active_workspace, active);
         assert_eq!(app.workspace.focused(), focused);
