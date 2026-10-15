@@ -334,22 +334,42 @@ mod tests {
 
     #[test]
     fn creation_guard_destruction_cannot_outlive_its_charged_context() {
-        struct BlockingDrop { entered: Arc<std::sync::Barrier>, release: Arc<std::sync::Barrier> }
+        struct BlockingDrop {
+            entered: Arc<std::sync::Barrier>,
+            release: Arc<std::sync::Barrier>,
+        }
         impl Drop for BlockingDrop {
-            fn drop(&mut self) { self.entered.wait(); self.release.wait(); }
+            fn drop(&mut self) {
+                self.entered.wait();
+                self.release.wait();
+            }
         }
         let used = Arc::new(Mutex::new(ContextUsage::default()));
-        let context = RecoveryContext::from_budget((), MAX_RECOVERY_CONTEXT_DESCRIPTORS, used.clone()).unwrap();
-        let entered = Arc::new(std::sync::Barrier::new(2)); let release = Arc::new(std::sync::Barrier::new(2));
-        let mut slot = RecoverySlot::from_budget(Arc::new(Budget { used: AtomicUsize::new(0), limit: 1 })).unwrap();
+        let context =
+            RecoveryContext::from_budget((), MAX_RECOVERY_CONTEXT_DESCRIPTORS, used.clone())
+                .unwrap();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let mut slot = RecoverySlot::from_budget(Arc::new(Budget {
+            used: AtomicUsize::new(0),
+            limit: 1,
+        }))
+        .unwrap();
         slot.context = Some(context);
-        let slot = slot.with_creation_guard(Arc::new(BlockingDrop { entered: entered.clone(), release: release.clone() }));
+        let slot = slot.with_creation_guard(Arc::new(BlockingDrop {
+            entered: entered.clone(),
+            release: release.clone(),
+        }));
         let worker = std::thread::spawn(move || drop(slot));
         entered.wait();
         let refused_while_guard_drops = RecoveryContext::from_budget((), 1, used.clone()).is_err();
         // Always unblock/join before asserting, including the failing ordering.
-        release.wait(); worker.join().unwrap();
-        assert!(refused_while_guard_drops, "guard-held native owners remain charged until destruction completes");
+        release.wait();
+        worker.join().unwrap();
+        assert!(
+            refused_while_guard_drops,
+            "guard-held native owners remain charged until destruction completes"
+        );
         assert!(RecoveryContext::from_budget((), 1, used).is_ok());
     }
 
