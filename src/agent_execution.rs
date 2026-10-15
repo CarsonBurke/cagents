@@ -532,7 +532,7 @@ pub enum Reply {
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
 /// outcome must never be assigned to the agent's currently active run.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Update {
     Started { provider_key: String },
     Waiting,

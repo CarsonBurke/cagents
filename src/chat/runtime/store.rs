@@ -59,6 +59,7 @@ pub(crate) struct Store {
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
+    _lease: fs::File,
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
@@ -80,6 +81,7 @@ pub(crate) struct Store {
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
 }
 impl Store {
+    pub(super) fn directory(&self)->&std::path::Path {&self.directory}
     /// Decode once at ingestion. Snapshots carry a small path, never megabytes
     /// of base64, and identical payloads share the same private file.
     fn image_file(&self, url: &str) -> Result<String, String> {
@@ -126,11 +128,7 @@ impl Store {
         Self::at(root)
     }
     fn at(root: PathBuf) -> Result<Self, String> {
-        let directory = root.join(format!("chat-{}", uuid::Uuid::new_v4()));
-        fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&directory)
-            .map_err(|e| format!("Cannot create private transcript cache: {e}"))?;
+        let (directory, lease) = crate::transcript_cache::create(&root).map_err(|error|format!("Cannot create private transcript cache: {error}"))?;
         let path = directory.join("transcript.sqlite");
         let result = (|| {
             fs::OpenOptions::new()
@@ -157,6 +155,7 @@ impl Store {
                 presented_file_changes: None,
                 db,
                 directory: directory.clone(),
+                _lease:lease,
                 end: None,
                 first: None,
                 newest: None,

@@ -62,6 +62,11 @@ pub(super) fn publish(
     save(&path, &receipt)
 }
 
+pub(crate) fn publish_actor_close(record:&Record,proof:&HostSessionProof,source:&crate::chat::Session,lineage:&[crate::chat::Session])->Result<(),String> {
+    let receipt=Receipt {record:record.clone(),proof:proof.clone(),sources:lineage.iter().chain(std::iter::once(source)).map(source_digest).collect::<Result<_,_>>()?,paired_closed:true,paired_holder:None};
+    save(&path(record.terminal,&record.holder)?,&receipt)
+}
+
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
     let parent = path
         .parent()

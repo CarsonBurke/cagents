@@ -1,0 +1,76 @@
+//! A daemon handle refers either to its local actor or the exact actor retained
+//! by a native helper. Remote handles never instantiate another reducer/store.
+use super::{LocalHandle,Rejection,Update,UpdateReadiness,Store};
+use super::remote_actor::{RemoteActor,ActorIdentity,OutboxEntry,InputIdentity,InputReceipt};
+use crate::chat::{self,Command,Snapshot,protocol::{Adapter,ProcessSpec,Step}};
+use std::collections::BTreeMap;
+
+#[derive(Clone)]
+pub struct Handle(Owner);
+#[derive(Clone)]
+enum Owner { Local(LocalHandle), Remote(RemoteActor) }
+impl Handle {
+    #[cfg(test)]
+    pub(crate) fn start(spec:ProcessSpec,adapter:Box<dyn Adapter>,initial:Step,store:Store,session_id:Option<String>,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
+        LocalHandle::start(spec,adapter,initial,store,session_id,notify).map(|local|Self(Owner::Local(local)))
+    }
+    pub(crate) fn start_owned(spec:ProcessSpec,adapter:Box<dyn Adapter>,initial:Step,store:Store,source:chat::Session,recovery_environment:BTreeMap<String,String>,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
+        LocalHandle::start_owned(spec,adapter,initial,store,source,recovery_environment,notify).map(|local|Self(Owner::Local(local)))
+    }
+    pub(crate) fn start_adopted(spec:ProcessSpec,adapter:Box<dyn Adapter>,initial:Step,store:Store,recovery:chat::native_holder::Recovery,holder:chat::native_holder::Holder,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
+        LocalHandle::start_adopted(spec,adapter,initial,store,recovery,holder,notify).map(|local|Self(Owner::Local(local)))
+    }
+    /// The host selects this after preparing the exact authorized launch. It
+    /// must drain/commit/ACK the outbox; ordinary notification is only a wakeup.
+    pub(crate) fn start_remote_owned(spec:ProcessSpec,source:chat::Session,recovery_environment:BTreeMap<String,String>,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
+        RemoteActor::spawn(spec,source,recovery_environment,notify).map(|remote|Self(Owner::Remote(remote)))
+    }
+    pub(crate) fn adopt_remote(record:&crate::daemon::holder_registry::Record,source:chat::Session,proof:crate::model::HostSessionProof,notify:impl Fn(Update)+Send+Sync+'static)->Result<Self,String> {
+        RemoteActor::adopt(record,source,proof,notify).map(|remote|Self(Owner::Remote(remote)))
+    }
+    pub(crate) fn inspect_remote(record:&crate::daemon::holder_registry::Record,proof:crate::model::HostSessionProof)->Result<super::remote_actor::ActorInspection,String> {RemoteActor::inspect(record,proof)}
+    pub(crate) fn actor_identity(&self)->Option<ActorIdentity> {match &self.0 {Owner::Remote(remote)=>Some(remote.identity()),_=>None}}
+    pub(crate) fn retained_outcomes(&self,after:u64)->Result<Vec<OutboxEntry>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("outbox",serde_json::json!([after])),_=>Err("This actor has no remote outbox".into())}}
+    pub(crate) fn commit_retained_outcomes(&self,through:u64)->Result<(),String> {match &self.0 {Owner::Remote(remote)=>remote.call("ack_outbox",serde_json::json!([through])),_=>Err("This actor has no remote outbox".into())}}
+    pub(crate) fn retained_input(&self,identity:InputIdentity)->Result<Option<InputReceipt>,String> {match &self.0 {Owner::Remote(remote)=>remote.call("input_receipt",serde_json::json!([identity])),_=>Err("This actor has no remote input journal".into())}}
+    pub(crate) fn commit_retained_inputs(&self,through:u64)->Result<(),String> {match &self.0 {Owner::Remote(remote)=>remote.call("ack_inputs",serde_json::json!([through])),_=>Err("This actor has no remote input journal".into())}}
+    pub(crate) fn same_actor(&self,other:&Self)->bool {match (&self.0,&other.0) {(Owner::Local(a),Owner::Local(b))=>a.same_actor(b),(Owner::Remote(a),Owner::Remote(b))=>a.identity()==b.identity(),_=>false}}
+    pub(crate) fn enqueue_command(&self,command:Command)->Result<crossbeam_channel::Receiver<Result<(),String>>,String> {match &self.0 {Owner::Local(local)=>local.enqueue_command(command),Owner::Remote(remote)=>remote.enqueue(None,command)}}
+    pub fn command(&self,command:Command)->Result<(),String> {self.try_command(command).map_err(String::from)}
+    pub(crate) fn try_command(&self,command:Command)->Result<(),Rejection> {match &self.0 {Owner::Local(local)=>local.try_command(command),Owner::Remote(remote)=>remote.submit(None,command)}}
+    pub(crate) fn command_for_run(&self,run:crate::model::RunId,command:Command)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.command_for_run(run,command),Owner::Remote(remote)=>remote.submit(Some(run),command).map_err(String::from)}}
+    pub(crate) fn close_if_idle(&self,generation:u64)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close_if_idle(generation),Owner::Remote(remote)=>remote.call("close_if_idle",serde_json::json!([generation]))}}
+    pub(crate) fn close_if_idle_for_resume(&self,generation:u64)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close_if_idle_for_resume(generation),Owner::Remote(remote)=>remote.call("close_if_idle",serde_json::json!([generation]))}}
+    pub(crate) fn check_update_readiness(&self)->Result<UpdateReadiness,String> {match &self.0 {Owner::Local(local)=>local.check_update_readiness(),Owner::Remote(remote)=>remote.call("readiness",serde_json::Value::Null)}}
+    pub(crate) fn interrupt_run(&self,run:crate::model::RunId)->Result<(),String> {self.interrupt_owned(Some(run),false)}
+    pub(crate) fn interrupt_owned(&self,run:Option<crate::model::RunId>,including_subagents:bool)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.interrupt_owned(run,including_subagents),Owner::Remote(remote)=>remote.interrupt(run,including_subagents)}}
+    pub(crate) fn update_native_source(&self,source:chat::Session,execution_console:Option<crate::model::LaunchRecipe>,paired_holder:Option<crate::terminal::holder::Record>)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.update_native_source(source,execution_console,paired_holder),Owner::Remote(remote)=>remote.call("update_source",serde_json::json!([source,execution_console,paired_holder]))}}
+    pub fn set_visible(&self,visible:bool) {match &self.0 {Owner::Local(local)=>local.set_visible(visible),Owner::Remote(remote)=>{let _=remote.call::<()>("visible",serde_json::json!([visible]));}}}
+    pub(crate) fn observe_next_update(&self)->u64 {match &self.0 {Owner::Local(local)=>local.observe_next_update(),Owner::Remote(remote)=>{let _=remote.call::<()>("observe",serde_json::Value::Null);remote.state().snapshot.generation}}}
+    pub(crate) fn file_query(&self,command:&Command)->Result<Option<chat::FileChangeReply>,String> {match &self.0 {Owner::Local(local)=>local.file_query(command),Owner::Remote(remote)=>remote.call("file_query",serde_json::json!([command]))}}
+    pub(crate) fn provider_exit_output(&self,log_id:&str,offset:u64)->Result<(Vec<u8>,Option<u64>,u64),String> {match &self.0 {Owner::Local(local)=>local.provider_exit_output(log_id,offset),Owner::Remote(remote)=>remote.call("exit_output",serde_json::json!([log_id,offset]))}}
+    pub(crate) fn usage(&self)->chat::Usage {match &self.0 {Owner::Local(local)=>local.usage(),Owner::Remote(remote)=>remote.state().snapshot.usage}}
+    pub fn snapshot(&self,after:Option<u64>)->Option<Snapshot> {match &self.0 {Owner::Local(local)=>local.snapshot(after),Owner::Remote(remote)=>remote.call("snapshot",serde_json::json!([after])).ok().flatten()}}
+    pub(crate) fn presentation(&self,chat_id:crate::model::TerminalId,after:Option<u64>)->Option<crate::terminal_ipc::ServerResponse> {match &self.0 {Owner::Local(local)=>local.presentation(chat_id,after),Owner::Remote(remote)=>remote.call("presentation",serde_json::json!([chat_id,after])).ok().flatten()}}
+    pub fn session_id(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.session_id(),Owner::Remote(remote)=>remote.state().snapshot.session_id}}
+    pub(crate) fn confirmed_session_id(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.confirmed_session_id(),Owner::Remote(remote)=>remote.state().confirmed_session}}
+    pub(crate) fn execution_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {match &self.0 {Owner::Local(local)=>local.execution_environment(),Owner::Remote(remote)=>remote.execution_environment()}}
+    pub(crate) fn recovery_environment_matches(&self,environment:&BTreeMap<String,String>)->bool {match &self.0 {Owner::Local(local)=>local.recovery_environment_matches(environment),Owner::Remote(remote)=>remote.recovery_environment_matches(environment)}}
+    pub fn is_completed(&self)->bool {match &self.0 {Owner::Local(local)=>local.is_completed(),Owner::Remote(remote)=>remote.state().completed}}
+    pub fn failure(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.failure(),Owner::Remote(remote)=>remote.state().failure}}
+    pub fn owns_work(&self)->bool {match &self.0 {Owner::Local(local)=>local.owns_work(),Owner::Remote(remote)=>!remote.state().completed}}
+    pub(crate) fn activity(&self)->crate::agent::ActivityState {match &self.0 {Owner::Local(local)=>local.activity(),Owner::Remote(remote)=>remote.state().snapshot.activity()}}
+    pub(crate) fn update_activity(&self)->(bool,bool) {match &self.0 {Owner::Local(local)=>local.update_activity(),Owner::Remote(remote)=>{let state=remote.state();(state.snapshot.is_working()||state.snapshot.waiting||!state.snapshot.requests.is_empty(),state.snapshot.ready)}}}
+    pub(crate) fn is_idle(&self)->bool {match &self.0 {Owner::Local(local)=>local.is_idle(),Owner::Remote(remote)=>remote.state().idle}}
+    pub(crate) fn requests(&self)->Vec<chat::Request> {match &self.0 {Owner::Local(local)=>local.requests(),Owner::Remote(remote)=>remote.state().snapshot.requests}}
+    pub(crate) fn background_subagents(&self)->Vec<String> {match &self.0 {Owner::Local(local)=>local.background_subagents(),Owner::Remote(remote)=>remote.state().background_subagents}}
+    pub(crate) fn interrupt_subagents(&self)->Vec<String> {match &self.0 {Owner::Local(local)=>local.interrupt_subagents(),Owner::Remote(remote)=>remote.state().interrupt_subagents}}
+    pub(crate) fn title(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.title(),Owner::Remote(remote)=>remote.state().snapshot.title}}
+    #[cfg(test)]
+    pub(crate) fn resource_lifetime(&self)->Box<dyn Fn()->bool> {match &self.0 {Owner::Local(local)=>Box::new(local.resource_lifetime()),Owner::Remote(remote)=>remote.resource_lifetime()}}
+    pub(crate) fn commit_native_installation(&self) {match &self.0 {Owner::Local(local)=>local.commit_native_installation(),Owner::Remote(remote)=>remote.commit_installation()}}
+    pub(crate) fn native_continuity(&self)->chat::NativeContinuity {match &self.0 {Owner::Local(local)=>local.native_continuity(),Owner::Remote(remote)=>remote.state().snapshot.native_continuity}}
+    pub(crate) fn preserve_for_restart(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.preserve_for_restart(),Owner::Remote(remote)=>remote.preserve()}}
+    pub(crate) fn close_for_resume(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close_for_resume(),Owner::Remote(remote)=>remote.close()}}
+    pub fn close(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.close(),Owner::Remote(remote)=>remote.close()}}
+}
