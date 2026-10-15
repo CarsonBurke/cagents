@@ -27,7 +27,8 @@ impl Indentation {
         let mut space_lines = 0;
         let mut widths = [0usize; 17];
         let mut previous = 0;
-        for line in text.lines().filter(|line| !line.trim().is_empty()).take(2000) {
+        use cosmic::iced::advanced::graphics::text::cosmic_text::LineIter;
+        for line in LineIter::new(text).map(|(range, _)| &text[range]).filter(|line| !line.trim().is_empty()).take(2000) {
             if line.starts_with('\t') { tab_lines += 1; }
             let spaces = line.bytes().take_while(|byte| *byte == b' ').count();
             if spaces > 0 { space_lines += 1; }
@@ -176,6 +177,18 @@ mod tests {
         parse("[*.{rs,py}]\nindent_style=space\nindent_size=2\ntab_width=8\n", "a.rs", &mut config);
         assert_eq!(Indentation::detect("\tfoo()", 4, config), Indentation { tabs: false, size: 2, tab_width: 8 });
     }
+    #[test]
+    fn indentation_detection_matches_native_cr_and_paired_line_endings() {
+        for ending in ["\r", "\n\r", "\r\n", "\n"] {
+            let text = format!("root{ending}\tchild{ending}\tchild2");
+            assert!(Indentation::detect(&text, 4, Overrides::default()).tabs, "{ending:?}");
+            let text = format!("root{ending}  child{ending}    child2");
+            let indentation = Indentation::detect(&text, 4, Overrides::default());
+            assert!(!indentation.tabs);
+            assert_eq!(indentation.size, 2, "{ending:?}");
+        }
+    }
+
     #[test]
     fn editorconfig_globs_handle_directories_classes_and_alternatives() {
         for path in ["src/a.rs", "src/deep/b.rs"] { assert!(glob("src/**/[ab].{rs,py}", path)); }

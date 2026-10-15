@@ -16210,6 +16210,29 @@ mod tests {
     }
 
     #[test]
+    fn configured_cr_files_keep_tab_style_when_the_runtime_indents() {
+        for ending in ["\r", "\n\r", "\r\n", "\n"] {
+            let text = format!("root{ending}\tchild{ending}\tchild2");
+            let card = CardId::new();
+            let (mut runtime, identity) = RepositoryRuntime::selection_fixture(card, "file.txt");
+            drop(runtime.update(RepositoryAction::ConfiguredFileLoaded {
+                identity: identity.clone(),
+                result: Ok(LoadedFile { source: identity.path, content: FileContent::Editable { content_hash: blake3::hash(text.as_bytes()), text: text.clone(), markdown: false } }),
+                indentation: crate::editor_indent::Overrides::default(),
+            }));
+            assert_eq!(runtime.editor_formatting_options(), (4, false));
+            let DocumentState::Editable(document) = &mut runtime.document else { panic!("editor"); };
+            assert_eq!(document.content.line_count(), 3);
+            document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line: 1, column: 0 }, selection: None });
+            drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Indent) }));
+            let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+            assert_eq!(document.content.with_line(1, |line, _| line.to_owned()).as_deref(), Some("\t\tchild"));
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().as_deref(), Some(text.as_str()));
+        }
+    }
+
+    #[test]
     fn external_editor_caret_translates_native_utf8_to_selected_column_units() {
         let card = CardId::new();
         let text = format!("{}a😀ébcdeX\n", "\n".repeat(119));
