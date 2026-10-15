@@ -222,6 +222,9 @@ mod tests {
         drop(app.update(Message::CloseCard(card)));
         let target = app.chat_ui.close_dialog.as_ref().expect("draft close confirmation").target();
         let task = app.update(Message::ChatClose(closing::Action::Hide(target)));
+        finish_hide(app, card, task);
+    }
+    fn finish_hide(app: &mut Cagents, card: CardId, task: Task<Message>) {
         use iced::futures::StreamExt;
         let mut stream = iced::runtime::task::into_stream(task).expect("captured Hide receipt");
         let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
@@ -264,6 +267,63 @@ mod tests {
         assert_eq!(runtime.unsent_text(), "retain this draft");
         assert!(runtime.snapshot.busy);
         assert!(!app.workspace.order().any(|id| id == card));
+    }
+
+    #[test]
+    fn sidebar_end_qualified_archived_report_hides_then_removes_only_original_membership() {
+        for changed_scope in [false, true] {
+            // This fixture drives the actual Archived completion and private
+            // readiness qualifier. No hand-made readiness flag or live Handle
+            // grants authority to the saved console projection.
+            let (mut app, card, owner, report) = chat_ui::qualified_closed_console_archive_for_test();
+            let original_pane = app.canonical_automation_archive_pane(card).unwrap();
+            let original_scope = app.workspace_model.views[0].scope.clone();
+            let Scope::Worktree { path, .. } = &original_scope else { panic!("saved worktree"); };
+            app.sidebar_model.projects[0].worktrees.push(sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(), path.clone(), Some("saved-run".into())));
+            let original_report = serde_json::to_value(&*report).unwrap();
+            let original_owner = serde_json::to_value(&app.workspace_model.archived_automation_agents).unwrap();
+            assert_eq!(app.archived_pane_readiness(card), Ok(Some(true)));
+            assert!(app.pending_shared_view_changes_for_test().is_empty());
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("saved report"); };
+            assert!(runtime.handle().is_none());
+            assert!(runtime.snapshot.read_only_reason.is_some());
+
+            // Use the production tab-close intake and its captured Hide
+            // completion. The retained sidebar row exists without reopening.
+            let task = app.request_chat_tab_close(card);
+            assert!(app.chat_ui.close_dialog.is_none());
+            finish_hide(&mut app, card, task);
+            app.refresh_sidebar_channels();
+            let target = Arc::clone(&app.sidebar_model.projects[0].worktrees[0]
+                .conversation_ends.entries().iter().find(|entry| entry.target.card() == card)
+                .expect("hidden qualified archive remains reachable from its saved worktree").target);
+            if changed_scope {
+                let Scope::Worktree { path, .. } = &mut app.workspace_model.views[0].scope else { panic!("original filing"); };
+                *path = path.join("moved-after-menu-opened");
+            }
+            activate(&mut app, target);
+            assert!(!app.workspace.order().any(|id| id == card), "End never temporarily reopens the hidden view");
+            assert_eq!(app.card_state(card).unwrap().existence.is_open(), changed_scope);
+            assert_eq!(serde_json::to_value(&*report).unwrap(), original_report);
+            assert_eq!(report.agent.id, owner);
+            assert_eq!(serde_json::to_value(&app.workspace_model.archived_automation_agents).unwrap(), original_owner);
+            assert!(!app.chat_start_pending(card), "membership End does not begin provider cleanup or restart");
+            assert!(app.terminal_starts.lock().unwrap().is_empty());
+            let changes = app.pending_shared_view_changes_for_test();
+            if changed_scope {
+                assert!(changes.is_empty(), "the captured menu cannot follow newer filing");
+                assert_eq!(app.durable.automation_archives.get(&card), Some(&owner));
+            } else {
+                assert!(!app.durable.automation_archives.contains_key(&card), "only the closed local projection index is pruned");
+                assert!(changes.iter().any(|(scope, change)| scope == &original_scope && matches!(change,
+                    crate::workspace_model::views::Change::RemoveArchivedAutomationSource { registry, before, .. }
+                        if *registry == app.workspace_model.identity && before == &original_pane)));
+                assert!(!changes.iter().any(|(_, change)| matches!(change,
+                    crate::workspace_model::views::Change::Remove { .. }
+                        | crate::workspace_model::views::Change::RemoveSource { .. })));
+            }
+        }
     }
 
     #[test]
