@@ -154,7 +154,7 @@ impl State {
     pub(super) fn pending_paths(&self,item:&str)->Vec<[u32;2]> {
         [RawSourceField::ToolInput,RawSourceField::CommandCall].into_iter().filter_map(|field| {
             let key=self.key(item,field)?;let entry=self.entries.get(&key)?;
-            (entry.rehydrating && entry.opened && entry.loaded.is_none() && entry.attempt.is_some()).then_some([10,field_index(field)])
+            (entry.rehydrating && entry.opened && entry.loaded.is_none()).then_some([10,field_index(field)])
         }).collect()
     }
     pub(super) fn complete_for_find(&self,item:&str)->bool {
@@ -610,6 +610,24 @@ mod tests {
         let _=runtime.set_visible(true);sync(&mut runtime);
         assert!(!runtime.raw_original.entries[&Key::of(&part)].opened,"new source cannot inherit old disclosure intent");
         runtime.raw_original.clear();assert!(runtime.raw_original.entries.is_empty(),"reset/revoke fully forget intent");
+    }
+    #[tokio::test]
+    async fn prior_raw_selection_intent_survives_same_source_retryable_read_error() {
+        let text="{ \"same\": \"source\" }";let(mut runtime,part)=runtime_fixture(text);
+        toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        runtime.raw_original.evict();sync(&mut runtime);
+        let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,Reply(Arc::new(ReplySlot(Mutex::new(Some(Err("fixture timeout".into())))))));
+        assert!(runtime.raw_original.entries[&Key::of(&part)].error.is_some());
+        assert_eq!(runtime.raw_original.pending_paths(&part.item_id),vec![[10,0]]);
+        sync(&mut runtime);assert!(runtime.raw_original.entries[&Key::of(&part)].attempt.is_none(),"no automatic error retry loop");
+        toggle(&mut runtime,&part.item_id,part.field,true);let context=runtime.raw_original.context;
+        let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        assert_eq!(runtime.raw_original.pending_paths(&part.item_id),vec![[10,0]]);
+        complete(&mut runtime,part.source.clone(),part.field,context,attempt,reply(part.clone(),text).await);
+        assert!(runtime.raw_original.pending_paths(&part.item_id).is_empty());assert_eq!(runtime.raw_original.loaded_leaves(&part.item_id)[0].text.as_ref(),text);
     }
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
