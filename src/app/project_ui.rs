@@ -1548,8 +1548,9 @@ impl Cagents {
                 if dialog.stale_lock {
                     let request = dialog.request;
                     let store = self.session.as_ref().unwrap().operation_store();
+                    let allow_local = crate::device::selected().is_none();
                     return cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || unlock_stale_worktree_for_window(&store, &target.repository, &target.path))
+                        let result = tokio::task::spawn_blocking(move || unlock_stale_worktree_for_window(&store, &target.repository, &target.path, allow_local))
                             .await.map_err(|error| error.to_string()).and_then(|result| result);
                         Message::ProjectUi(Action::StaleUnlocked { request, result })
                     });
@@ -1896,6 +1897,7 @@ impl Cagents {
     }
 
     fn remove_worktree_after_sessions(&mut self, target: Target) -> Task<Message> {
+        let allow_local = crate::device::selected().is_none();
         let authorization = target.worktree.and_then(|id| self.project_ui.deletion_authorizations.get(&id)).cloned();
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
@@ -1904,7 +1906,7 @@ impl Cagents {
                 let authorization =
                     authorization.ok_or("Deletion safety must be checked and confirmed again.")?;
                 let service = RepositoryService::system("git"); let token = CancellationToken::new();
-                let removed = service.common_dir(&request.repository, &token).ok().zip(service.git_dir(&request.path, &token).ok())
+                let removed = allow_local.then(|| service.common_dir(&request.repository, &token).ok().zip(service.git_dir(&request.path, &token).ok())).flatten()
                     .map(|(common_dir, admin_dir)| RemovedWorktree { common_dir, admin_dir, path: request.path.clone(), branch: authorization.branch.as_ref().map(|branch| format!("refs/heads/{branch}")) });
                 let crate::worktree_control::Reply::Removed { path, mut warnings, branch_error, .. } = worktree_control_request(confirmed_removal_operation(&request, &authorization)?)? else { return Err("Unexpected worktree removal response".into()); };
                 if path != request.path { return Err("The daemon removed a different worktree identity; refresh the repository".into()); }
@@ -2903,8 +2905,10 @@ fn worktree_control_request(operation: crate::worktree_control::Operation) -> Re
     }
 }
 
-fn unlock_stale_worktree_for_window(store: &crate::persistence::StateStore, repository: &Path, path: &Path) -> Result<(), String> {
-    RepositoryService::system("git").unlock_stale_worktree(store, repository, path, &CancellationToken::new()).or_else(|local_error| {
+fn unlock_stale_worktree_for_window(store: &crate::persistence::StateStore, repository: &Path, path: &Path, allow_local: bool) -> Result<(), String> {
+    let local = if allow_local { RepositoryService::system("git").unlock_stale_worktree(store, repository, path, &CancellationToken::new()) }
+        else { Err("This worktree belongs to the selected device".into()) };
+    local.or_else(|local_error| {
         match worktree_control_request(crate::worktree_control::Operation::StaleLock { repository: repository.to_path_buf(), path: path.to_path_buf(), unlock: true }) {
             Ok(crate::worktree_control::Reply::StaleLock { unlocked: true }) => Ok(()),
             Ok(_) => Err("Unexpected stale-lock unlock response".into()),
@@ -2917,9 +2921,10 @@ fn branch_deletion_task(request: BranchDeletion, force: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let worker = request.clone();
         let result = tokio::task::spawn_blocking(move || {
+            let expected_branch = worker.branch.clone();
             let other = |detail| crate::worktree_branch::BranchDeleteFailure { kind: crate::worktree_branch::BranchDeleteFailureKind::Other, detail };
             match worktree_control_request(crate::worktree_control::Operation::DeleteBranch { repository: worker.repository, branch: worker.branch, force, expected_oid: Some(worker.expected_oid) }).map_err(other)? {
-                crate::worktree_control::Reply::BranchDeleted { .. } => Ok(()),
+                crate::worktree_control::Reply::BranchDeleted { branch } if branch == expected_branch => Ok(()),
                 crate::worktree_control::Reply::BranchDeleteRefused { failure } => Err(failure),
                 _ => Err(other("Unexpected branch deletion response".into())),
             }
@@ -2929,13 +2934,16 @@ fn branch_deletion_task(request: BranchDeletion, force: bool) -> Task<Message> {
 }
 
 fn delete_options_task(target: Target, request: u64, store: crate::persistence::StateStore) -> Task<Message> {
+    let allow_local = crate::device::selected().is_none();
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let crate::worktree_control::Reply::Listed { worktrees: records } = worktree_control_request(crate::worktree_control::Operation::List { repository: target.repository.clone() })? else { return Err("Unexpected worktree listing response".into()); };
             let record = records.iter().find(|record| record.path == target.path).ok_or("Worktree no longer registered")?;
             let branch_elsewhere = record.branch.as_ref().is_some_and(|branch| records.iter().any(|other| other.path != record.path && other.branch.as_ref() == Some(branch)));
             let lock = record.locked.then(|| {
-                RepositoryService::system("git").stale_worktree_lock(&store, &target.repository, &target.path, &CancellationToken::new()).or_else(|local_error| {
+                let local = if allow_local { RepositoryService::system("git").stale_worktree_lock(&store, &target.repository, &target.path, &CancellationToken::new()) }
+                    else { Err("This worktree belongs to the selected device".into()) };
+                local.or_else(|local_error| {
                     match worktree_control_request(crate::worktree_control::Operation::StaleLock { repository: target.repository.clone(), path: target.path.clone(), unlock: false }) {
                         Ok(crate::worktree_control::Reply::StaleLock { unlocked: false }) => Ok(()),
                         Ok(_) => Err("Unexpected stale-lock inspection response".into()),
