@@ -219,6 +219,24 @@ pub(super) struct DeletionHead {
     /// Exact local branch name, without adding/removing a refs prefix.
     pub branch: String,
     pub head_oid: String,
+    /// A verified post-merge offer carries its actual merged PR metadata, so
+    /// the branch default does not depend on the sidebar cache refreshing.
+    /// An expected head alone grants no merged-state authority.
+    pub merged_pull_request: Option<Arc<crate::github::PullRequest>>,
+}
+
+impl DeletionHead {
+    fn merged_receipt_matches(&self, snapshot: &WorktreeSafetySnapshot) -> bool {
+        self.merged_pull_request.as_ref().is_some_and(|pr| {
+            pr.state.0 == "MERGED"
+                && pr.head_ref_name == self.branch
+                && pr.head_ref_oid == self.head_oid
+                && pr.belongs_to_head(&self.head_repository)
+                && snapshot.branch.as_deref() == Some(self.branch.as_str())
+                && snapshot.head_oid.as_deref() == Some(self.head_oid.as_str())
+                && snapshot.head_repository.as_ref() == Some(&self.head_repository)
+        })
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1992,6 +2010,8 @@ impl Cagents {
                     .and_then(|dialog| {
                         result.as_ref().ok().map(|(snapshot, _)| {
                             self.delete_branch_default(&dialog.target, snapshot)
+                                || dialog.expected_head.as_ref().is_some_and(|expected|
+                                    expected.merged_receipt_matches(snapshot))
                         })
                     })
                     .unwrap_or(false);
@@ -2697,6 +2717,9 @@ impl Cagents {
         else {
             return false;
         };
+        if snapshot.head_repository.as_ref() != Some(source) {
+            return false;
+        }
         let Some(branch) = snapshot.branch.as_deref() else {
             return false;
         };
@@ -4181,7 +4204,8 @@ mod tests {
         );
         pr.state = Some(crate::sidebar::WorktreePullRequestState::Merged);
         pr.head_oid = snapshot.head_oid.clone();
-        pr.head_repository = Some(source);
+        pr.head_repository = Some(source.clone());
+        snapshot.head_repository = Some(source);
         app.sidebar_model.projects[0].pull_requests.push(pr);
         assert!(app.delete_branch_default(&target, &snapshot));
         // The safety snapshot already contains a local name, including a
@@ -4200,8 +4224,53 @@ mod tests {
         assert!(!app.delete_branch_default(&target, &snapshot));
         app.sidebar_model.projects[0].pull_requests[0].state =
             Some(crate::sidebar::WorktreePullRequestState::Merged);
+        snapshot.head_repository = Some(GitHubRepoKey::new("github.com", None, "different", "repo").unwrap());
+        assert!(!app.delete_branch_default(&target, &snapshot));
+        snapshot.head_repository = None;
+        assert!(!app.delete_branch_default(&target, &snapshot));
         app.sidebar_model.projects[0].pull_requests[0].head_repository = None;
         assert!(!app.delete_branch_default(&target, &snapshot));
+    }
+
+    #[test]
+    fn post_merge_receipt_defaults_branch_without_waiting_for_sidebar_cache() {
+        for changed in 0..8 {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+            let source = GitHubRepoKey::new("github.com", None, "example", "repo").unwrap();
+            let mut linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+            linked.head_repository = Some(source.clone());
+            let (mut app, _state, project) = deletable_app(&repository, &linked, &primary);
+            assert!(app.sidebar_model.projects[0].pull_requests.is_empty());
+            let mut pr: crate::github::PullRequest = serde_json::from_value(serde_json::json!({
+                "number": 7, "title": "Merged feature", "state": "MERGED",
+                "headRefName": "feature", "headRefOid": "a".repeat(40),
+                "headRepository": {"name": "repo"}, "headRepositoryOwner": {"login": "example"},
+                "baseRefName": "main", "updatedAt": "now", "url": "https://github.com/example/repo/pull/7"
+            })).unwrap();
+            match changed {
+                1 => pr.state.0 = "OPEN".into(),
+                2 => pr.head_ref_name = "other".into(),
+                3 => pr.head_ref_oid = "b".repeat(40),
+                4 => pr.head_repository_owner.as_mut().unwrap().login = "fork".into(),
+                _ => {},
+            }
+            drop(app.open_worktree_delete_dialog_for_head(project, linked.id, DeletionHead {
+                head_repository: source.clone(), branch: "feature".into(), head_oid: "a".repeat(40),
+                merged_pull_request: (changed != 5).then(|| Arc::new(pr)),
+            }));
+            let request = app.project_ui.dialog.as_ref().unwrap().request;
+            drop(app.handle_project_action(Action::DeleteOptionsRead {request, result: Ok(DeleteOptions {
+                branch_elsewhere: changed == 6, stale_lock: false, lock_error: None,
+            })}));
+            let mut snapshot = clean_snapshot();
+            snapshot.head_oid = Some("a".repeat(40)); snapshot.head_repository = Some(source);
+            if changed == 7 { snapshot.head_repository = None; }
+            drop(app.handle_project_action(Action::SafetyRead {request, confirming: false,
+                result: Ok((snapshot, AgentCensus::default()))}));
+            assert_eq!(app.project_ui.dialog.as_ref().unwrap().delete_branch, changed == 0,
+                "only the actual merged receipt, current source/head and available branch allow the default");
+        }
     }
 
     #[test]
@@ -4398,6 +4467,7 @@ mod tests {
             let oid = "a".repeat(40);
             drop(app.open_worktree_delete_dialog_for_head(project, linked.id, DeletionHead {
                 head_repository: source.clone(), branch: "feature".into(), head_oid: oid.clone(),
+                merged_pull_request: None,
             }));
             let request = app.project_ui.dialog.as_ref().unwrap().request;
             drop(app.handle_project_action(Action::DeleteOptionsRead {request, result: Ok(DeleteOptions {
