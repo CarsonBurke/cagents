@@ -5507,7 +5507,9 @@ fn sync_reports_the_completed_pull_when_the_push_is_rejected() {
     fixture.git_in_work(&["add", "."]);
     let before = fixture.commit("local work");
     let remote_before = fixture.run(&fixture.origin(), &["rev-parse", "refs/heads/main"]);
-    let hook = fixture.origin().join("hooks/pre-receive");
+    let hooks = fixture.origin().join("hooks");
+    fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("pre-receive");
     fs::write(
         &hook,
         b"#!/bin/sh\nprintf 'policy: push refused\\n' >&2\nexit 1\n",
