@@ -242,13 +242,16 @@ pub(super) fn live_runtime(items: &[chat::Item]) -> (Runtime, Arc<ClientHandle>)
         card: CardId::new(),
         generation: 1,
     };
-    let runtime = Runtime::new(
+    let mut runtime = Runtime::new(
         target,
         session,
         Connection::Live(handle.clone()),
         true,
         crate::settings::EditorSyntaxTheme::default(),
     );
+    // This helper supplies ready rendered content to focused widget tests.
+    // Native/cold preparation timing must drive the actual async subscription.
+    preparation::drain_fixture(&mut runtime);
     (runtime, handle)
 }
 

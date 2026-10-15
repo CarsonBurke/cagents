@@ -30,6 +30,7 @@ mod reader_source;
 mod monospace;
 mod permissions;
 mod prose;
+mod preparation;
 mod retained;
 mod scroll;
 mod selectable_prose;
@@ -222,6 +223,8 @@ pub enum Action {
     SessionLinkWindowBackend(String, TerminalId, bool),
     SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, String, CopyPart),
+    MarkdownPrepared(Target, String, u64, preparation::Ready),
+    RetryMarkdown(Target),
     OpenUrl(String),
     OpenDocument(Target, String),
     OpenChangedFile(Target, PathBuf),
@@ -337,6 +340,7 @@ impl Action {
                 | Self::PasteRefused(..)
                 | Self::ImageSaved(..)
                 | Self::ImageLoaded(..)
+                | Self::MarkdownPrepared(..)
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
@@ -975,6 +979,7 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
 /// Retain the immutable item without copying its body. Tail tokens are cheap
 /// hints; exact content comparisons authorize parser and presentation reuse.
 struct CachedItem {
+    preparing: bool,
     stamp: Option<(u64, String, String)>,
     preview: tool_text::Preview,
     tool_input: Option<tool_text::ToolText>,
@@ -1015,6 +1020,13 @@ struct CachedItem {
     coordination: Option<Box<coordination::Coordinated>>,
 }
 impl CachedItem {
+    fn preparing(content: &ItemContent, theme: crate::settings::EditorSyntaxTheme) -> Self {
+        let placeholder = ItemContent::Text { text: "Loading message…".into(), thinking: false, phase: chat::Phase::Final };
+        let mut cached = Self::updated(&placeholder, theme, None, false, false, None);
+        cached.preparing = true;
+        cached.token = ChangeToken::of(content);
+        cached
+    }
     /// Approximate exposed presentation storage. Opaque Markdown/parser
     /// allocations and widget/shaping trees are intentionally not estimated.
     fn retained_bytes(&self) -> usize {
@@ -1136,6 +1148,7 @@ impl CachedItem {
             _ => (None, None),
         };
         let mut cached = Self {
+            preparing: false,
             preview: tool_text::Preview::update(preview, content, theme),
             tool_input,
             tool_output,
@@ -1526,6 +1539,7 @@ enum QueuedStep {
 }
 
 pub(super) struct Runtime {
+    preparation: preparation::State,
     find: Option<String>,
     find_focused: bool,
     find_matches: Arc<Vec<find::Match>>,
@@ -2158,6 +2172,7 @@ impl Runtime {
         let permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
         let mut runtime = Self {
+            preparation: preparation::State::default(),
             target,
             session,
             snapshot: Arc::new(Snapshot {
@@ -2262,6 +2277,7 @@ impl Runtime {
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
+        self.preparation.clear();
         self.cache.clear();
         self.presentation_evicted = false;
         self.last_presented_tail = None;
@@ -2430,9 +2446,41 @@ impl Runtime {
         let selected = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy),
             |agent| (agent.items.as_slice(), agent.status == chat::ToolStatus::Running));
+        if self.preparation.context(self.target, snapshot.session_id.as_deref(), self.selected_subagent.as_deref(), items) {
+            // The same opaque item ID may exist in two different transcripts.
+            // Never display another actor/child's old prose while loading it.
+            self.cache.retain(|_,cached|cached.reader_context==self.selected_subagent && cached.item.as_ref()
+                .is_some_and(|item|items.iter().any(|current|Arc::ptr_eq(current,item))));
+            presentation_changed=true;
+        }
+        let handle = self.handle().cloned();
         let newest = items.len().wrapping_sub(1);
         for (index, item) in items.iter().enumerate() {
             let growing = busy && index == newest;
+            let coordinated = chat::coordination::recognize(item, self.session.launch.provider);
+            if CachedItem::prose(&item.content).is_some() && coordinated.is_none() {
+                let current = self.cache.get(&item.id);
+                let exact = current.and_then(|cached| cached.item.as_ref()).is_some_and(|previous| Arc::ptr_eq(previous,item));
+                let pending = current.is_some_and(|cached| cached.preparing) || self.preparation.contains(&item.id);
+                let proven_from_cache=current.and_then(|cached|cached.item.as_ref()).is_some_and(|previous|
+                    previous.role==item.role && ChangeToken::of(&previous.content).shape==ChangeToken::of(&item.content).shape
+                    && handle.as_ref().is_some_and(|handle|handle.known_append(previous,item)));
+                let small_append = proven_from_cache && current.is_some_and(|cached| !cached.preparing)
+                    && CachedItem::prose(&item.content).is_some_and(|body|body.len()<=64*1024);
+                if pending || (!exact && !small_append) {
+                    let replaced=self.preparation.stage(item,growing,|old,new|handle.as_ref().is_some_and(|handle|handle.known_append(old,new)));
+                    if replaced && !proven_from_cache {
+                        self.cache.insert(item.id.clone(),CachedItem::preparing(&item.content,self.syntax_theme));
+                        presentation_changed=true;
+                    }
+                    if !self.cache.contains_key(&item.id) { presentation_changed=true; }
+                    let theme=self.syntax_theme;
+                    let cached=self.cache.entry(item.id.clone()).or_insert_with(||CachedItem::preparing(&item.content,theme));
+                    cached.preparing=true;
+                    cached.reader_memory=self.scroll_memory.clone();cached.reader_context.clone_from(&self.selected_subagent);
+                    continue;
+                }
+            }
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
             let append_proven = self.cache.get(&item.id).and_then(|cached| cached.item.as_ref())
@@ -2498,6 +2546,23 @@ impl Runtime {
         if presentation_changed {
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
         }
+    }
+
+    pub(super) fn preparation_metrics(&self) -> (usize,usize) {
+        (self.preparation.queued_bytes(),preparation::State::global_queued_bytes())
+    }
+
+    fn markdown_prepared(&mut self, target:Target, id:&str, run:u64, ready:preparation::Ready) {
+        if !self.visible.load(Ordering::Relaxed) { return; }
+        // Observe any replacement already published by the client before
+        // validating the worker lineage; provider and UI events may interleave.
+        self.refresh();
+        let Some(prepared)=self.preparation.accept(target,id,run,ready) else { return; };
+        let managed=self.preparation.contains(id);
+        let Some(cached)=self.cache.get_mut(id) else { return; };
+        prepared.install(cached,self.syntax_theme,managed);
+        self.presentation_revision=self.presentation_revision.wrapping_add(1);
+        self.refresh_find();
     }
 
     fn refresh(&mut self) {
@@ -2966,6 +3031,7 @@ impl Runtime {
         result
     }
     fn release_transcript_caches(&mut self) {
+        self.preparation.clear();
         self.cache = HashMap::new();
         self.selection_document.get_mut().take();
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
@@ -4953,6 +5019,7 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card {
                 subscriptions.extend(images::subscriptions(runtime));
                 if runtime.visible.load(Ordering::Relaxed) {
+                    subscriptions.extend(runtime.preparation.subscriptions(runtime.target));
                     subscriptions.extend(runtime.thumbnails.subscriptions(runtime.target));
                 }
             }
@@ -6252,6 +6319,17 @@ impl Cagents {
                     }
                 }
             }
+            Action::MarkdownPrepared(target,id,run,ready) => {
+                if let Some(runtime)=self.chat_runtime_mut(target) { runtime.markdown_prepared(target,&id,run,ready); }
+            }
+            Action::RetryMarkdown(target) => {
+                if let Some(runtime)=self.chat_runtime_mut(target)
+                    && runtime.visible.load(Ordering::Relaxed) {
+                    runtime.refresh();runtime.preparation.retry();
+                    let snapshot=runtime.snapshot.clone();runtime.prepare_transcript_cache(&snapshot);
+                    runtime.refresh_find();
+                }
+            }
             Action::DraftModel(target, provider, model) => {
                 return self.choose_draft_model(target, provider, model);
             }
@@ -6673,6 +6751,7 @@ impl Cagents {
                             == Some(VisibilityClass::Visible)
                             && self.workspace_surfaces_visible();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
+                            runtime.preparation.clear();
                             runtime.target = target;
                             runtime.connection = Connection::Live(handle);
                             runtime.model_picker = None;
@@ -9099,6 +9178,7 @@ pub(super) fn show_chat_snapshot_for_test(
         .expect("a chat snapshot is shown on a live conversation")
         .replace_snapshot_for_test(snapshot);
     runtime.show(true);
+    preparation::drain_fixture(runtime);
     assert_eq!(
         runtime.snapshot.requests.len(),
         requests,
@@ -13460,6 +13540,9 @@ mod tests {
         answer_start(app, target, Ok(handle));
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Chat(_))));
         settle(app, card, Ok(()));
+        if let Some(CardRuntime::Chat(runtime))=app.cards.get_mut(&card) {
+            preparation::drain_fixture(runtime);
+        }
         assert!(chat_runtime(app, card).queued.is_none());
         card
     }
