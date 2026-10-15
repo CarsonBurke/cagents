@@ -1561,7 +1561,9 @@ impl Server {
         operational.recipe.working_directory = startup.working_directory.clone();
         operational.recipe.environment = startup.environment.clone();
         operational.recipe.unset_environment.clear();
-        let mut spec_and_adapter = chat::protocol::create(&operational)?;
+        let mut spec_and_adapter = chat::protocol::claude::create_from_prepared_arguments(
+            &operational, &startup.arguments,
+        )?;
         if !matches!(spec_and_adapter.0.transport, TransportSpec::JsonLines) {
             return Err("Retained actor requires stream-json transport".into());
         }
