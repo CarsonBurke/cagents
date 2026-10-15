@@ -1203,6 +1203,7 @@ mod tests {
             drop(app.update_project_recovery(Action::OperationFinished(id,operation,Ok(crate::project_recovery::ProjectOperationOutcome::Aborted{operation,reason:"late old abort".into()}))));
             assert_eq!(app.project_recovery_ui.operations[&id].request,fresh);
             assert_eq!(app.sidebar_model.project(id).unwrap().pending_operation,notice);
+            std::thread::spawn(move||authority.retry()).join().unwrap().unwrap();
         }
     }
     #[tokio::test]
