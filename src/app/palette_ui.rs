@@ -20,6 +20,7 @@ pub enum Action {
     Query(String),
     Run(MessageBox),
     Submit,
+    FocusPane(CardId),
 }
 // Box breaks the recursive Message/Action representation.
 #[derive(Debug, Clone)]
@@ -27,6 +28,163 @@ pub struct MessageBox(pub Box<Message>);
 
 const ROW_HEIGHT: f32 = 40.0;
 const ROW_SPACING: f32 = space::XXS;
+
+fn palette_query(query: &str) -> (Option<char>, &str) {
+    let query = query.trim();
+    match query.chars().next() {
+        Some(prefix @ ('>' | '@' | '#')) => (Some(prefix), query[1..].trim_start()),
+        _ => (None, query),
+    }
+}
+
+fn search_label(label: &str) -> &str {
+    ["Focus pane: ", "Open workspace: ", "Open channel: "].into_iter()
+        .find_map(|prefix| label.strip_prefix(prefix)).unwrap_or(label)
+}
+
+fn entry_category(message: &Message) -> char {
+    match message {
+        Message::Palette(Action::FocusPane(_)) => '@',
+        Message::Sidebar(SidebarAction::OpenWorktree { .. } | SidebarAction::OpenChannel { .. }
+            | SidebarAction::OpenRepository { .. }) => '#',
+        _ => '>',
+    }
+}
+
+fn entry_key(message: &Message) -> Option<String> {
+    match message {
+        Message::RunCommand(command) => SettingsField::SHORTCUTS.iter()
+            .position(|field| field.shortcut_action() == Some(*command))
+            .and_then(|index| KeyboardShortcuts::action_names().get(index))
+            .map(|name| format!("command:{name}")),
+        Message::Palette(Action::FocusPane(id)) => Some(format!("pane:{id}")),
+        Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, .. }) => Some(format!("worktree:{worktree_id}")),
+        Message::Sidebar(SidebarAction::OpenChannel { channel_id }) => Some(format!("channel:{channel_id}")),
+        Message::Sidebar(SidebarAction::OpenRepository { project_id, .. }) => Some(format!("folder:{project_id}")),
+        Message::ResumeConversation(resume_ui::Action::Open) => Some("command:resume_conversation".into()),
+        _ => None,
+    }
+}
+
+fn match_score(label: &str, query: &str) -> Option<usize> {
+    crate::search_match::score(&label.to_lowercase(), &query.to_lowercase())
+}
+
+fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
+    use iced::widget::text::Span;
+    if query.is_empty() {
+        return design::body(label.to_owned())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into();
+    }
+    let accent = design::accent_color(&cosmic::theme::active());
+    let font = cosmic::font::default();
+    let searchable = search_label(label);
+    let offset = label.len() - searchable.len();
+    let folded: Vec<_> = searchable
+        .char_indices()
+        .flat_map(|(index, ch)| {
+            ch.to_lowercase()
+                .map(move |folded| (folded, offset + index..offset + index + ch.len_utf8()))
+        })
+        .collect();
+    let needle = query.to_lowercase().chars().collect::<Vec<_>>();
+    let mut matches = Vec::new();
+    if !needle.is_empty() {
+        let contiguous = folded
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, window)| window.iter().map(|(ch, _)| *ch).eq(needle.iter().copied()))
+            .min_by_key(|(index, _)| {
+                if *index == 0 {
+                    0
+                } else if !folded[index - 1].0.is_alphanumeric() {
+                    1
+                } else {
+                    2
+                }
+            });
+        if let Some((_, window)) = contiguous {
+            matches.extend(window.iter().map(|(_, range)| range.clone()));
+        } else {
+            let mut cursor = 0;
+            for needle in needle {
+                if let Some(index) = folded[cursor..].iter().position(|(ch, _)| *ch == needle) {
+                    cursor += index;
+                    matches.push(folded[cursor].1.clone());
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    let mut spans: Vec<Span<'static, ()>> = Vec::new();
+    let mut start = 0;
+    let mut highlighted = false;
+    for (index, _) in label.char_indices() {
+        let next = matches.iter().any(|range| range.contains(&index));
+        if next != highlighted {
+            if start < index {
+                let span = Span::new(label[start..index].to_owned());
+                spans.push(if highlighted {
+                    span.color(accent).font(iced::Font {
+                        weight: iced::font::Weight::Bold,
+                        ..font
+                    })
+                } else {
+                    span
+                });
+            }
+            start = index;
+            highlighted = next;
+        }
+    }
+    let span = Span::new(label[start..].to_owned());
+    spans.push(if highlighted {
+        span.color(accent).font(iced::Font {
+            weight: iced::font::Weight::Bold,
+            ..font
+        })
+    } else {
+        span
+    });
+    widget::container(
+        iced::widget::rich_text(spans)
+            .size(design::TEXT_BODY)
+            .font(font)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .clip(true)
+    .class(design::transparent())
+    .into()
+}
+
+fn palette_row_style(selected: bool) -> cosmic::theme::Button {
+    fn appearance(selected: bool, hover: bool, theme: &cosmic::Theme) -> widget::button::Style {
+        let mut accent = design::accent_color(theme);
+        accent.a = if selected { 0.18 } else { 0.08 };
+        widget::button::Style {
+            background: (selected || hover).then_some(iced::Background::Color(accent)),
+            border_radius: design::RADIUS_S.into(),
+            ..design::button_style()
+        }
+    }
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |_, theme| appearance(selected, false, theme)),
+        disabled: Box::new(move |theme| appearance(selected, false, theme)),
+        hovered: Box::new(move |_, theme| appearance(selected, true, theme)),
+        pressed: Box::new(move |_, theme| appearance(true, true, theme)),
+    }
+}
+
 
 impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
@@ -60,6 +218,19 @@ impl Cagents {
                 self.reveal_palette_selection()
             }
             Action::Run(MessageBox(message)) => self.run_palette_command(*message),
+            Action::FocusPane(id) => {
+                if self.modal_is_open() || self.focused_repository_is_saving() {
+                    return Task::none();
+                }
+                let Some(card) = self.card_state(id).filter(|card| card.existence.is_open()) else { return Task::none(); };
+                let channel = self.durable.channels.iter().find(|channel| channel.cards.contains(&id)).map(|channel| channel.id);
+                let path = self.card_worktree(card).map(Path::to_path_buf).or_else(|| self.active_workspace.clone());
+                let navigation = if self.workspace.order().any(|candidate| candidate == id) { Task::none() }
+                    else if let Some(channel) = channel { self.select_channel(channel) }
+                    else if let Some(path) = path { self.select_worktree(path, false) }
+                    else { Task::none() };
+                navigation.chain(self.update(Message::FocusCard(id)))
+            }
             Action::Submit => {
                 let entry = self
                     .palette_entries()
@@ -74,8 +245,15 @@ impl Cagents {
     }
 
     fn run_palette_command(&mut self, message: Message) -> Task<Message> {
+        if let Some(key) = entry_key(&message) {
+            self.settings.palette_recents.retain(|recent| recent != &key);
+            self.settings.palette_recents.insert(0, key);
+            self.settings.palette_recents.truncate(24);
+        }
         self.palette.query = None;
         let command = self.update(message);
+        let save = if self.settings_path.is_some() { self.save_settings_task(false) } else { Task::none() };
+        let command = Task::batch([command, save]);
         // A command can move focus to another pane synchronously. Restore
         // that current pane before running the command's explicit focus
         // effects, which may instead land in a dialog or another control.
@@ -199,73 +377,72 @@ impl Cagents {
         )
     }
 
+    fn palette_pane_label(&self, card: &CardState) -> String {
+        let title = self.card_display_title(card);
+        let place = self.durable.channels.iter().find(|channel| channel.cards.contains(&card.id))
+            .map(|channel| self.sidebar_model.project(channel.project_id)
+                .map_or_else(|| channel.title.clone(), |project| format!("{} · {}", channel.title, project.name)))
+            .or_else(|| self.card_worktree(card).map(|path| {
+                self.sidebar_model.worktree_at(path).and_then(|key| self.sidebar_model.project(key.project_id)
+                    .map(|project| project.worktrees.iter().find(|worktree| worktree.id == key.worktree_id)
+                        .map(|worktree| format!("{} · {}", worktree.label(), project.name))))
+                    .flatten().unwrap_or_else(|| path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned())
+            })).unwrap_or_else(|| "Global".into());
+        format!("Focus pane: {title} · {place}")
+    }
+
+    fn palette_pane_status(&self, card: CardId) -> &'static str {
+        let unread = self.sidebar_state.has_card_update(card);
+        match self.sidebar_state.card_activity(card).map(|activity| activity.state) {
+            Some(crate::agent::ActivityState::Working) if unread => "● Working · Unread",
+            Some(crate::agent::ActivityState::Working) => "● Working",
+            Some(crate::agent::ActivityState::Waiting) if unread => "◌ Waiting · Unread",
+            Some(crate::agent::ActivityState::Waiting) => "◌ Waiting",
+            _ if unread => "• Unread",
+            _ => "Idle",
+        }
+    }
+
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
-        let mut entries: Vec<_> = workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
-            .iter()
+        let (category, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
+        let mut entries: Vec<_> = workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter()
             .filter(|descriptor| descriptor.action != Command::CommandPalette)
             .filter(|descriptor| descriptor.scope.applies_to(self.focused_pane()))
-            .map(|descriptor| {
-                (
-                    descriptor.label.to_owned(),
-                    workspace_widget::shortcut_chords(
-                        descriptor.action,
-                        &self.settings.keyboard_shortcuts,
-                    ),
-                    Message::RunCommand(descriptor.action),
-                )
-            })
-            .collect();
-        entries.push((
-            "Resume conversation".into(),
-            "Search saved native chats".into(),
-            Message::ResumeConversation(resume_ui::Action::Open),
-        ));
-        for id in self.workspace.order() {
-            if let Some(card) = self.card_state(id) {
-                entries.push((
-                    format!("Focus pane: {}", self.card_display_title(card)),
-                    String::new(),
-                    Message::FocusCard(id),
-                ));
-            }
+            .map(|descriptor| (descriptor.label.to_owned(),
+                workspace_widget::shortcut_chords(descriptor.action, &self.settings.keyboard_shortcuts),
+                Message::RunCommand(descriptor.action))).collect();
+        entries.push(("Resume conversation".into(), "Search saved native chats".into(),
+            Message::ResumeConversation(resume_ui::Action::Open)));
+        for card in self.durable.cards.iter().filter(|card| card.existence.is_open()) {
+            entries.push((self.palette_pane_label(card), self.palette_pane_status(card.id).into(),
+                Message::Palette(Action::FocusPane(card.id))));
         }
         for project in &self.sidebar_model.projects {
+            if project.kind == ProjectKind::Folder {
+                entries.push((format!("Open workspace: {}", project.name), String::new(),
+                    Message::Sidebar(SidebarAction::OpenRepository { project_id: project.id, repository: project.repository.clone() })));
+            }
             for channel in &project.channels {
-                entries.push((
-                    format!("Open channel: {} · {}", channel.title, project.name),
-                    String::new(),
-                    Message::Sidebar(SidebarAction::OpenChannel {
-                        channel_id: channel.id,
-                    }),
-                ));
+                entries.push((format!("Open channel: {} · {}", channel.title, project.name), String::new(),
+                    Message::Sidebar(SidebarAction::OpenChannel { channel_id: channel.id })));
             }
             for worktree in &project.worktrees {
-                entries.push((
-                    format!("Open workspace: {} · {}", worktree.label(), project.name),
-                    String::new(),
-                    Message::Sidebar(SidebarAction::OpenWorktree {
-                        project_id: project.id,
-                        worktree_id: worktree.id,
-                        path: worktree.path.clone(),
-                    }),
-                ));
+                entries.push((format!("Open workspace: {} · {}", worktree.label(), project.name), String::new(),
+                    Message::Sidebar(SidebarAction::OpenWorktree { project_id: project.id, worktree_id: worktree.id, path: worktree.path.clone() })));
             }
         }
-        let query = self
-            .palette
-            .query
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
-        if !query.is_empty() {
-            entries.retain(|(label, _, _)| {
-                let mut chars = label.chars().flat_map(char::to_lowercase);
-                query
-                    .chars()
-                    .all(|needle| chars.by_ref().any(|ch| ch == needle))
-            });
-        }
+        entries.retain(|(label, _, message)| category.is_none_or(|category| entry_category(message) == category)
+            && match_score(search_label(label), query).is_some());
+        entries.sort_by_cached_key(|(label, _, message)| {
+            let recent = entry_key(message).and_then(|key| self.settings.palette_recents.iter().position(|recent| *recent == key)).unwrap_or(usize::MAX);
+            let common = match message {
+                Message::RunCommand(Command::NewTerminal) => 0,
+                Message::RunCommand(Command::NewThread) => 1,
+                Message::RunCommand(Command::OpenSettings) => 2,
+                _ => 3,
+            };
+            (match_score(search_label(label), query).unwrap_or(usize::MAX), recent, common)
+        });
         entries
     }
 
@@ -281,7 +458,7 @@ impl Cagents {
         }
         let query = self.palette.query.as_ref()?;
         let input =
-            crate::ui_controls::field::search("Search commands, panes and workspaces", query)
+            crate::ui_controls::field::search("Search commands, @ panes, # workspaces, > commands", query)
                 .id(widget::Id::new("palette.query"))
                 .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
@@ -289,22 +466,15 @@ impl Cagents {
             .into_iter()
             .enumerate()
             .map(|(index, (label, chord, message))| {
+                let (_, needle) = palette_query(query);
                 let row = widget::row::with_children(vec![
-                    design::body(label).width(Length::Fill).into(),
-                    design::caption(chord).into(),
-                ])
-                .spacing(space::M)
-                .align_y(Alignment::Center);
-                let button = if index == self.palette.selected {
-                    widget::button::custom(row).class(cosmic::theme::Button::Suggested)
-                } else {
-                    widget::button::custom(row)
-                };
-                button
-                    .width(Length::Fill)
-                    .height(ROW_HEIGHT)
-                    .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
-                    .into()
+                    highlighted_label(&label, needle),
+                    design::caption(chord).wrapping(iced::widget::text::Wrapping::None).into(),
+                ]).spacing(space::M).align_y(Alignment::Center);
+                widget::button::custom(widget::container(row).height(Length::Fill).align_y(Alignment::Center))
+                    .class(palette_row_style(index == self.palette.selected))
+                    .padding([0, 12]).width(Length::Fill).height(ROW_HEIGHT)
+                    .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message))))).into()
             })
             .collect();
         let rows = if rows.is_empty() {
@@ -317,7 +487,7 @@ impl Cagents {
                 widget::column::with_children(vec![
                     input.into(),
                     widget::container(
-                        widget::scrollable(rows.spacing(ROW_SPACING))
+                        widget::scrollable(widget::container(rows.spacing(ROW_SPACING)).padding([0, 16]))
                             .id(widget::Id::new("palette.commands"))
                             .height(Length::Shrink),
                     )
@@ -1100,6 +1270,71 @@ mod tests {
         let _ = app.update_palette(Action::Close);
         assert!(!app.palette.is_open());
     }
+    #[test]
+    fn palette_ranks_useful_matches_and_restores_bounded_recent_commands() {
+        assert!(match_score("feature login", "feat") < match_score("alpha-wt-feat", "feat"));
+        assert!(match_score("alpha-wt-feat", "feat") < match_score("defeated", "feat"));
+        let mut labels = ["Investigate task in alpha-wt-refactor-ui", "refactor ui · alpha", "prepare follow-on refactoring"];
+        labels.sort_by_cached_key(|label| match_score(label, "refactor"));
+        assert_eq!(labels[0], "refactor ui · alpha");
+        let mut app = settings_focus_fixture();
+        app.settings.palette_recents = (0..30).map(|i| format!("retired:{i}")).collect();
+        for command in [Command::NewTerminal, Command::OpenSettings, Command::OpenSettings] {
+            drop(app.run_palette_command(Message::RunCommand(command)));
+        }
+        let selected = entry_key(&Message::RunCommand(Command::OpenSettings)).unwrap();
+        assert_eq!(app.settings.palette_recents.len(), 24);
+        assert_eq!(app.settings.palette_recents.iter().filter(|key| **key == selected).count(), 1);
+        drop(app.update_palette(Action::Open));
+        let entries = app.palette_entries();
+        assert!(matches!(entries[0].2, Message::RunCommand(Command::OpenSettings)));
+        assert!(matches!(entries[1].2, Message::RunCommand(Command::NewTerminal)));
+        for prefix in ['>', '@', '#'] {
+            app.palette.query = Some(prefix.to_string());
+            assert!(app.palette_entries().iter().all(|entry| entry_category(&entry.2) == prefix));
+        }
+    }
+
+    #[test]
+    fn palette_finds_inactive_panes_with_workspace_and_unread_status_then_navigates() {
+        let mut app = settings_focus_fixture();
+        let original = app.workspace.focused().unwrap();
+        let mut other = app.card_state(original).unwrap().clone();
+        other.id = CardId::new();
+        other.title = "Migration agent".into();
+        let path = PathBuf::from("/palette-inactive-worktree");
+        app.worktree_owners.insert(other.id, path.clone());
+        Arc::make_mut(&mut app.durable).card_scopes.insert(other.id, path.clone());
+        Arc::make_mut(&mut app.durable).cards.push(other.clone());
+        app.sidebar_state.observe_agent_update(other.id, ProjectId::new(), crate::model::WorktreeId::new());
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@migration".into())));
+        let mut entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        let (label, status, message) = entries.pop().unwrap();
+        assert!(label.contains("palette-inactive-worktree"));
+        assert_eq!(status, "• Unread");
+        drop(app.run_palette_command(message));
+        assert_eq!(app.active_workspace, Some(path));
+        assert_eq!(app.workspace.focused(), Some(other.id));
+    }
+
+    #[test]
+    fn captured_pane_focus_refuses_a_closed_target_and_a_modal() {
+        let mut app = settings_focus_fixture();
+        let focused = app.workspace.focused();
+        let mut other = app.card_state(focused.unwrap()).unwrap().clone();
+        other.id = CardId::new();
+        Arc::make_mut(&mut app.durable).cards.push(other.clone());
+        app.resume_ui.open = true;
+        drop(app.update_palette(Action::FocusPane(other.id)));
+        assert_eq!(app.workspace.focused(), focused);
+        app.resume_ui.open = false;
+        app.card_state_mut(other.id).unwrap().existence = project_ui::removed_existence("closed");
+        drop(app.update_palette(Action::FocusPane(other.id)));
+        assert_eq!(app.workspace.focused(), focused);
+    }
+
     #[test]
     fn pane_rename_survives_runtime_title_updates() {
         let mut app = super::super::tests::context_inspector_test_app(true);
