@@ -6492,6 +6492,10 @@ impl Cagents {
                     Ok(Some(generation)) => generation,
                     Ok(None) => return Task::none(),
                     Err(error) => {
+                        // No handoff was admitted by this read-only query. Stop
+                        // the misleading queued wait and expose the retained
+                        // explicit continuation, without retrying the transport.
+                        runtime.pending_account_switch = None;
                         runtime.error = Some(error);
                         return Task::none();
                     }
@@ -12335,6 +12339,66 @@ mod tests {
         }
     }
 
+    fn account_continuation_from_widget(app: &Cagents, target: Target, alternate: &AccountId) -> Action {
+        use iced::advanced::{Layout,Shell,clipboard,layout,widget::Tree};
+        let renderer=crate::app::tests::headless_renderer();
+        let mut element=chat_runtime(app,target.card).account_switch_controls(false).unwrap();
+        let mut tree=Tree::new(element.as_widget());
+        let viewport=iced::Rectangle::with_size(iced::Size::new(1000.0,200.0));
+        let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(iced::Size::ZERO,viewport.size()));
+        let point=Layout::new(&node).bounds().center();
+        let mut messages=Vec::new();
+        for event in [
+            iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
+        ] {
+            element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),
+                iced::mouse::Cursor::Available(point),&renderer,&mut clipboard::Null,
+                &mut Shell::new(&mut messages),&viewport);
+        }
+        messages.into_iter().find_map(|message|match message {
+            Message::ChatUi(Action::ContinueOnAccount(actual,id)) if actual==target && &id==alternate =>Some(Action::ContinueOnAccount(actual,id)),
+            _=>None,
+        }).expect("the rendered fallback must emit an actionable continuation even while source work is pending")
+    }
+
+    #[test]
+    fn failed_queued_account_readiness_exposes_an_actionable_fallback_without_retiring_or_retrying_source() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let alternate=app.account_ui.add_managed_fixture(Provider::Codex,448);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));
+        let target=chat_runtime(&app,card).target;
+        let source=chat_runtime(&app,card).session.clone();
+        let handle=chat_runtime(&app,card).handle().unwrap().clone();
+        let mut current=handle.snapshot().as_ref().clone();
+        current.busy=true;
+        handle.publish_snapshot_for_test(current);
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy=true;
+        runtime.replace_draft(text_editor::Content::with_text("Keep the source request"));
+        drop(app.choose_chat_account(target,alternate.clone()));
+        assert!(chat_runtime(&app,card).pending_account_switch.is_some());
+        drop(app.probe_queued_account_switch(target));
+        assert!(chat_runtime(&app,card).account_switch_checking);
+        drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target,alternate.clone(),Err("Readiness transport failed".into()))));
+        let runtime=chat_runtime(&app,card);
+        assert!(runtime.pending_account_switch.is_none());
+        assert!(!runtime.account_switch_checking);
+        assert_eq!(runtime.error.as_deref(),Some("Readiness transport failed"));
+        assert!(runtime.connected());
+        assert_eq!(runtime.session,source);
+        assert_eq!(runtime.composer.text(),"Keep the source request");
+        assert!(!app.chat_start_pending(card));
+        assert!(app.chat_ui.retiring.is_empty());
+        let continuation=account_continuation_from_widget(&app,target,&alternate);
+        drop(app.handle_chat_ui(continuation));
+        let new_card=app.workspace.focused().unwrap();
+        assert_ne!(new_card,card);
+        assert_ne!(chat_runtime(&app,new_card).session.id,source.id);
+        assert_eq!(chat_runtime(&app,card).session,source);
+        assert!(Arc::ptr_eq(chat_runtime(&app,card).handle().unwrap(),&handle));
+    }
+
     #[test]
     fn unsupported_live_account_handoff_preserves_original_attachment_and_offers_separate_continuation() {
         for busy in [false,true] {
@@ -12380,31 +12444,7 @@ mod tests {
                     first_prompt:None,model:None,sent:None,page:None,queued:None,
                 });
             }
-            // Click the actual enabled control, then dispatch its normal app
-            // action while the original may have started another turn/control.
-            let messages={
-                use iced::advanced::{Layout,Shell,clipboard,layout,widget::Tree};
-                let renderer=crate::app::tests::headless_renderer();
-                let mut element=chat_runtime(&app,card).account_switch_controls(false).unwrap();
-                let mut tree=Tree::new(element.as_widget());
-                let viewport=iced::Rectangle::with_size(iced::Size::new(1000.0,200.0));
-                let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(iced::Size::ZERO,viewport.size()));
-                let point=Layout::new(&node).bounds().center();
-                let mut messages=Vec::new();
-                for event in [
-                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
-                ] {
-                    element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),
-                        iced::mouse::Cursor::Available(point),&renderer,&mut clipboard::Null,
-                        &mut Shell::new(&mut messages),&viewport);
-                }
-                messages
-            };
-            let continuation=messages.into_iter().find_map(|message|match message {
-                Message::ChatUi(Action::ContinueOnAccount(actual,id)) if actual==target && id==alternate =>Some(Action::ContinueOnAccount(actual,id)),
-                _=>None,
-            }).expect("the rendered fallback must emit an actionable continuation even while source work is pending");
+            let continuation=account_continuation_from_widget(&app,target,&alternate);
             drop(app.handle_chat_ui(continuation));
             let new_card=app.workspace.focused().unwrap();
             assert_ne!(new_card,card);
