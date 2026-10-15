@@ -102,6 +102,10 @@ pub enum TerminalEvent {
     },
     ConversationTitleChanged(String),
     WorkingDirectoryChanged(std::path::PathBuf),
+    ClipboardWrite {
+        primary: bool,
+        text: String,
+    },
     ClipboardText {
         request: uuid::Uuid,
         text: String,
@@ -151,6 +155,116 @@ pub enum TerminalKey {
     ArrowLeft,
     ArrowRight,
     Function(u8),
+    Numpad0,
+    Numpad1,
+    Numpad2,
+    Numpad3,
+    Numpad4,
+    Numpad5,
+    Numpad6,
+    Numpad7,
+    Numpad8,
+    Numpad9,
+    NumpadAdd,
+    NumpadBackspace,
+    NumpadClear,
+    NumpadClearEntry,
+    NumpadComma,
+    NumpadDecimal,
+    NumpadDivide,
+    NumpadEnter,
+    NumpadEqual,
+    NumpadMemoryAdd,
+    NumpadMemoryClear,
+    NumpadMemoryRecall,
+    NumpadMemoryStore,
+    NumpadMemorySubtract,
+    NumpadMultiply,
+    NumpadParenLeft,
+    NumpadParenRight,
+    NumpadSubtract,
+    NumpadSeparator,
+    NumpadUp,
+    NumpadDown,
+    NumpadRight,
+    NumpadLeft,
+    NumpadBegin,
+    NumpadHome,
+    NumpadEnd,
+    NumpadInsert,
+    NumpadDelete,
+    NumpadPageUp,
+    NumpadPageDown,
+
+    AltLeft,
+    AltRight,
+    ControlLeft,
+    ControlRight,
+    SuperLeft,
+    SuperRight,
+    ShiftLeft,
+    ShiftRight,
+    CapsLock,
+    NumLock,
+    IntlBackslash,
+    IntlRo,
+    IntlYen,
+    ContextMenu,
+    Convert,
+    KanaMode,
+    NonConvert,
+    Help,
+    Fn,
+    FnLock,
+    PrintScreen,
+    ScrollLock,
+    Pause,
+    BrowserBack,
+    BrowserFavorites,
+    BrowserForward,
+    BrowserHome,
+    BrowserRefresh,
+    BrowserSearch,
+    BrowserStop,
+    Eject,
+    LaunchApp1,
+    LaunchApp2,
+    LaunchMail,
+    MediaPlayPause,
+    MediaSelect,
+    MediaStop,
+    MediaTrackNext,
+    MediaTrackPrevious,
+    Power,
+    Sleep,
+    AudioVolumeDown,
+    AudioVolumeMute,
+    AudioVolumeUp,
+    WakeUp,
+    Copy,
+    Cut,
+    Paste,
+}
+
+impl TerminalKey {
+    pub fn is_modifier(self) -> bool {
+        matches!(
+            self,
+            Self::AltLeft
+                | Self::AltRight
+                | Self::ControlLeft
+                | Self::ControlRight
+                | Self::SuperLeft
+                | Self::SuperRight
+                | Self::ShiftLeft
+                | Self::ShiftRight
+                | Self::CapsLock
+                | Self::NumLock
+                | Self::Fn
+                | Self::FnLock
+                | Self::ScrollLock
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,6 +276,13 @@ pub struct KeyInput {
     /// makes of it, which the encoder derives from the key and modifiers.
     pub text: Option<String>,
     pub unshifted_codepoint: Option<char>,
+    /// Return to the live prompt after an input-producing press or repeat.
+    #[serde(default = "default_scroll_to_bottom_on_input")]
+    pub scroll_to_bottom_on_input: bool,
+}
+
+pub const fn default_scroll_to_bottom_on_input() -> bool {
+    true
 }
 
 /// Where pasted text came from, which decides how much of it may act as keys.

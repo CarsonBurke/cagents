@@ -4129,7 +4129,9 @@ fn record_event_from(
         }
         if !matches!(
             wire_event,
-            WireTerminalEvent::ClipboardText { .. } | WireTerminalEvent::SearchResults { .. }
+            WireTerminalEvent::ClipboardWrite { .. }
+                | WireTerminalEvent::ClipboardText { .. }
+                | WireTerminalEvent::SearchResults { .. }
         ) {
             record.events.push_back((sequence, wire_event.clone()));
         }
@@ -7046,5 +7048,76 @@ for line in sys.stdin:
             subscriptions.visibility(terminal_id),
             TerminalVisibility::Hidden
         );
+    }
+    #[test]
+    fn osc52_writes_are_delivered_live_but_never_replayed_after_attachment() {
+        let shared = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            recovery_origin: None,
+            predecessor: None,
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let id = session.id;
+        let handle =
+            TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let first = {
+            let mut state = shared.lock().unwrap();
+            let delivery = state.register_client(1);
+            state
+                .finish_spawn(1, session, handle.clone(), false)
+                .unwrap();
+            delivery
+        };
+        record_event(
+            &Arc::downgrade(&shared),
+            id,
+            TerminalEvent::ClipboardWrite {
+                primary: false,
+                text: "private clipboard text".into(),
+            },
+        );
+        let late = {
+            let mut state = shared.lock().unwrap();
+            let late = state.register_client(2);
+            state.attach(2, id).unwrap();
+            assert!(state.replay_events(id, 0).unwrap().is_empty());
+            late
+        };
+        record_event(&Arc::downgrade(&shared), id, TerminalEvent::Bell);
+        let replay = shared.lock().unwrap().replay_events(id, 0).unwrap();
+        assert_eq!(replay.len(), 1);
+        assert!(matches!(replay[0].1, WireTerminalEvent::Bell));
+        for (delivery, expected) in [(first, 1), (late, 0)] {
+            delivery.close_after_drain();
+            let mut seen = 0;
+            while let Some(envelope) = delivery.pop() {
+                if matches!(
+                    envelope.message,
+                    ServerMessage::Event {
+                        event: WireTerminalEvent::ClipboardWrite { .. },
+                        ..
+                    }
+                ) {
+                    seen += 1;
+                }
+            }
+            assert_eq!(seen, expected);
+        }
+        handle.shutdown().unwrap();
     }
 }

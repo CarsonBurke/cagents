@@ -149,7 +149,8 @@ use crate::{
 /// outcomes and retained diagnostic output. Use matched executables.
 /// Version 81 attaches stable history anchors to selection, find and viewport.
 /// Version 82 appends exact resident worker UUIDs for pinned terminal attachments.
-pub const PROTOCOL_VERSION: u16 = 82;
+/// Version 83 also carries complete key identities, input-follow policy and bounded clipboard writes.
+pub const PROTOCOL_VERSION: u16 = 83;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -1459,12 +1460,19 @@ pub enum WireTerminalEvent {
         matches: Vec<crate::terminal::SearchMatch>,
         truncated: bool,
     },
+    ClipboardWrite {
+        primary: bool,
+        text: String,
+    },
 }
 
 impl From<TerminalEvent> for WireTerminalEvent {
     fn from(value: TerminalEvent) -> Self {
         match value {
             TerminalEvent::TitleChanged(title) => Self::TitleChanged { title },
+            TerminalEvent::ClipboardWrite { primary, text } => {
+                Self::ClipboardWrite { primary, text }
+            }
             TerminalEvent::ClipboardText { request, text } => Self::ClipboardText { request, text },
             TerminalEvent::SearchResults {
                 request,
@@ -1517,6 +1525,9 @@ impl From<WireTerminalEvent> for TerminalEvent {
     fn from(value: WireTerminalEvent) -> Self {
         match value {
             WireTerminalEvent::TitleChanged { title } => Self::TitleChanged(title),
+            WireTerminalEvent::ClipboardWrite { primary, text } => {
+                Self::ClipboardWrite { primary, text }
+            }
             WireTerminalEvent::ClipboardText { request, text } => {
                 Self::ClipboardText { request, text }
             }
@@ -2530,6 +2541,146 @@ mod tests {
             let error = validate_proof(supplied.as_ref(), &current).unwrap_err();
             assert_eq!(error.code, ProtocolErrorCode::ProofMismatch);
             assert!(!error.retryable);
+        }
+    }
+    #[test]
+    fn keypad_modifier_and_scroll_policy_round_trip_over_terminal_ipc() {
+        use super::super::{KeyAction, KeyInput, KeyModifiers, TerminalKey};
+        for key in [
+            TerminalKey::Unidentified,
+            TerminalKey::Backspace,
+            TerminalKey::Enter,
+            TerminalKey::Tab,
+            TerminalKey::Escape,
+            TerminalKey::Delete,
+            TerminalKey::Insert,
+            TerminalKey::Home,
+            TerminalKey::End,
+            TerminalKey::PageUp,
+            TerminalKey::PageDown,
+            TerminalKey::ArrowUp,
+            TerminalKey::ArrowDown,
+            TerminalKey::ArrowLeft,
+            TerminalKey::ArrowRight,
+            TerminalKey::Numpad0,
+            TerminalKey::Numpad1,
+            TerminalKey::Numpad2,
+            TerminalKey::Numpad3,
+            TerminalKey::Numpad4,
+            TerminalKey::Numpad5,
+            TerminalKey::Numpad6,
+            TerminalKey::Numpad7,
+            TerminalKey::Numpad8,
+            TerminalKey::Numpad9,
+            TerminalKey::NumpadAdd,
+            TerminalKey::NumpadBackspace,
+            TerminalKey::NumpadClear,
+            TerminalKey::NumpadClearEntry,
+            TerminalKey::NumpadComma,
+            TerminalKey::NumpadDecimal,
+            TerminalKey::NumpadDivide,
+            TerminalKey::NumpadEnter,
+            TerminalKey::NumpadEqual,
+            TerminalKey::NumpadMemoryAdd,
+            TerminalKey::NumpadMemoryClear,
+            TerminalKey::NumpadMemoryRecall,
+            TerminalKey::NumpadMemoryStore,
+            TerminalKey::NumpadMemorySubtract,
+            TerminalKey::NumpadMultiply,
+            TerminalKey::NumpadParenLeft,
+            TerminalKey::NumpadParenRight,
+            TerminalKey::NumpadSubtract,
+            TerminalKey::NumpadSeparator,
+            TerminalKey::NumpadUp,
+            TerminalKey::NumpadDown,
+            TerminalKey::NumpadRight,
+            TerminalKey::NumpadLeft,
+            TerminalKey::NumpadBegin,
+            TerminalKey::NumpadHome,
+            TerminalKey::NumpadEnd,
+            TerminalKey::NumpadInsert,
+            TerminalKey::NumpadDelete,
+            TerminalKey::NumpadPageUp,
+            TerminalKey::NumpadPageDown,
+            TerminalKey::AltLeft,
+            TerminalKey::AltRight,
+            TerminalKey::ControlLeft,
+            TerminalKey::ControlRight,
+            TerminalKey::SuperLeft,
+            TerminalKey::SuperRight,
+            TerminalKey::ShiftLeft,
+            TerminalKey::ShiftRight,
+            TerminalKey::CapsLock,
+            TerminalKey::NumLock,
+            TerminalKey::IntlBackslash,
+            TerminalKey::IntlRo,
+            TerminalKey::IntlYen,
+            TerminalKey::ContextMenu,
+            TerminalKey::Convert,
+            TerminalKey::KanaMode,
+            TerminalKey::NonConvert,
+            TerminalKey::Help,
+            TerminalKey::Fn,
+            TerminalKey::FnLock,
+            TerminalKey::PrintScreen,
+            TerminalKey::ScrollLock,
+            TerminalKey::Pause,
+            TerminalKey::BrowserBack,
+            TerminalKey::BrowserFavorites,
+            TerminalKey::BrowserForward,
+            TerminalKey::BrowserHome,
+            TerminalKey::BrowserRefresh,
+            TerminalKey::BrowserSearch,
+            TerminalKey::BrowserStop,
+            TerminalKey::Eject,
+            TerminalKey::LaunchApp1,
+            TerminalKey::LaunchApp2,
+            TerminalKey::LaunchMail,
+            TerminalKey::MediaPlayPause,
+            TerminalKey::MediaSelect,
+            TerminalKey::MediaStop,
+            TerminalKey::MediaTrackNext,
+            TerminalKey::MediaTrackPrevious,
+            TerminalKey::Power,
+            TerminalKey::Sleep,
+            TerminalKey::AudioVolumeDown,
+            TerminalKey::AudioVolumeMute,
+            TerminalKey::AudioVolumeUp,
+            TerminalKey::WakeUp,
+            TerminalKey::Copy,
+            TerminalKey::Cut,
+            TerminalKey::Paste,
+        ] {
+            let input = KeyInput {
+                action: KeyAction::Release,
+                key,
+                modifiers: KeyModifiers::default(),
+                text: None,
+                unshifted_codepoint: None,
+                scroll_to_bottom_on_input: false,
+            };
+            let encoded = postcard::to_allocvec(&input).unwrap();
+            assert_eq!(postcard::from_bytes::<KeyInput>(&encoded).unwrap(), input);
+        }
+    }
+
+    #[test]
+    fn decoded_clipboard_destinations_and_text_round_trip_over_terminal_ipc() {
+        for primary in [false, true] {
+            for text in ["", "hello", "界 é\n\0"] {
+                let event = WireTerminalEvent::ClipboardWrite {
+                    primary,
+                    text: text.to_owned(),
+                };
+                let bytes = postcard::to_allocvec(&event).unwrap();
+                assert_eq!(
+                    postcard::from_bytes::<WireTerminalEvent>(&bytes).unwrap(),
+                    event
+                );
+                assert!(
+                    matches!(TerminalEvent::from(event), TerminalEvent::ClipboardWrite { primary: actual, text: actual_text } if actual == primary && actual_text == text)
+                );
+            }
         }
     }
 }
