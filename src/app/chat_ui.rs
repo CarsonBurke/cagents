@@ -993,6 +993,8 @@ fn contains_text(content: &ItemContent, query: &str) -> bool {
 /// Retain the immutable item without copying its body. Tail tokens are cheap
 /// hints; exact content comparisons authorize parser and presentation reuse.
 struct CachedItem {
+    // Revoke before any source/container field destructor can run.
+    copy_authority: selection::CopyAuthority,
     preparing: bool,
     /// A nonselectable loading caption, never conversation content.
     placeholder: bool,
@@ -1003,6 +1005,9 @@ struct CachedItem {
     patches: Vec<tool_text::ToolText>,
     token: ChangeToken,
     item: Option<Arc<chat::Item>>,
+    /// Exact admitted-source copy permission, supplied by the current receiver binding.
+    copy_guard: Option<selection::CopyGuard>,
+    copy_receipt: Option<selection::CopyGuard>,
     /// Unique presentation identity for retained turns, including tail collisions.
     revision: u64,
     /// The body as the Markdown parser is given it, resumed on each append.
@@ -1067,6 +1072,25 @@ impl CachedItem {
                 .chain(self.patches.iter())
                 .map(tool_text::ToolText::retained_bytes)
                 .sum::<usize>()
+    }
+
+    /// Bind only after actual admitted Item/provenance/scope changes. Cloning
+    /// the same guard preserves retained rows; a new receipt replaces buttons.
+    /// This is not permission to retag a previously displayed body.
+    fn bind_copy_guard(&mut self, guard: Option<selection::CopyGuard>) {
+        let unchanged=match (&self.copy_receipt,&guard) {
+            (Some(old),Some(new))=>old.same_receipt(new),
+            (None,None)=>true,
+            _=>false,
+        };
+        if !unchanged {
+            self.copy_authority.revoke();
+            self.copy_receipt=guard;
+            self.copy_guard=self.copy_receipt.as_ref().map(|receipt| {
+                let receipt=receipt.clone();self.copy_authority.scope().guard(move||receipt.current())
+            });
+            self.revision=Self::next_revision();
+        }
     }
 
     fn next_revision() -> u64 {
@@ -1180,6 +1204,9 @@ impl CachedItem {
             patches,
             token: ChangeToken::of(content),
             item,
+            copy_guard: None,
+            copy_receipt: None,
+            copy_authority: Default::default(),
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
@@ -1276,6 +1303,7 @@ impl CachedItem {
     /// can still require full trailing-block reparsing. Large changed prose
     /// uses the background preparation engine rather than this UI helper.
     fn extend(&mut self, body: &str, growing: bool, theme: crate::settings::EditorSyntaxTheme) {
+        self.bind_copy_guard(None);
         match self.source.advance_append(body, growing) {
             markdown_source::Step::Append(text) => self.markdown.push_str(&text),
             markdown_source::Step::Restart(text) => {
@@ -1564,6 +1592,8 @@ enum QueuedStep {
 }
 
 pub(super) struct Runtime {
+    // Field drop order expires retained Catalogs before body/cache teardown.
+    copy_authority: selection::CopyAuthority,
     preparation: preparation::State,
     find: Option<String>,
     find_focused: bool,
@@ -2259,6 +2289,7 @@ impl Runtime {
             selection_bookmarks: Default::default(),
             selection_document: Default::default(),
             transcript_scope: 0,
+            copy_authority: Default::default(),
             scroll: view::Scroll::default(),
             subagent_scroll: HashMap::new(),
             page_request: None,
@@ -2273,11 +2304,23 @@ impl Runtime {
         runtime.refresh();
         runtime
     }
+    /// Only newly admitted visible Catalogs receive a live copy scope. A
+    /// retained old Tree must not become current again after hide/replacement.
+    pub(super) fn copy_scope(&self) -> selection::CopyScope {
+        if self.visible.load(Ordering::Relaxed) { self.copy_authority.scope() }
+        else { selection::CopyScope::default() }
+    }
+    fn replace_connection(&mut self, connection: Connection) {
+        self.copy_authority.revoke();
+        self.selection_document.get_mut().take();
+        self.connection = connection;
+    }
     /// Drops everything drawn from the conversation's transcript, for a card
     /// going back to a draft, which has none.
     fn forget_transcript(&mut self) {
         self.transcript_scope = self.transcript_scope.wrapping_add(1);
         self.copied = None;
+        self.copy_authority.revoke();
         self.preparation.clear();
         self.cache.clear();
         self.presentation_evicted = false;
@@ -2797,6 +2840,8 @@ impl Runtime {
             .as_ref()
             .is_some_and(|id| !snapshot.subagents.iter().any(|agent| &agent.id == id))
         {
+            self.copy_authority.revoke();
+            self.selection_document.get_mut().take();
             self.selected_subagent = None;
         }
         let selected = self
@@ -3033,6 +3078,14 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         let changed = self.visible.swap(visible, Ordering::Relaxed) != visible;
+        if !visible {
+            self.copy_authority.revoke();
+            // Also invalidate handle-less archived memos. A later visible
+            // Catalog must bind fresh guards even with identical body Arcs.
+            // Final suspension producers capture their body-free receipt
+            // before this memo is taken, not after cache release.
+            self.selection_document.get_mut().take();
+        }
         images::sync(self);
         let result = self.present();
         if visible {
@@ -3065,6 +3118,7 @@ impl Runtime {
         result
     }
     fn release_transcript_caches(&mut self) {
+        self.copy_authority.revoke();
         self.preparation.clear();
         self.cache = HashMap::new();
         self.selection_document.get_mut().take();
@@ -6765,7 +6819,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.preparation.clear();
                             runtime.target = target;
-                            runtime.connection = Connection::Live(handle);
+                            runtime.replace_connection(Connection::Live(handle));
                             runtime.model_picker = None;
                             runtime.account_picker = false;
                             runtime.reasoning_picker = false;
@@ -8151,6 +8205,7 @@ impl Cagents {
                             .any(|agent| &agent.id == id)
                     });
                     if runtime.selected_subagent != selected {
+                        runtime.copy_authority.revoke();
                         runtime.cache.clear();
                     }
                     runtime.selected_subagent = selected;
@@ -13208,6 +13263,89 @@ mod tests {
     }
 
     #[test]
+    fn transcript_copy_scope_expires_on_actual_runtime_disposal_but_not_publications() {
+        const CHILD:&str="CAGENTS_TEST_RUNTIME_COPY_SCOPE";
+        if crate::ui_test_process::isolated(
+            "app::chat_ui::tests::transcript_copy_scope_expires_on_actual_runtime_disposal_but_not_publications",CHILD) {return;}
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        app.workspace.resize_viewport(1600.0);
+        let card=live_chat(&mut app,Some("copy-scope"));let target=chat_runtime(&app,card).target;
+        let runtime=app.chat_runtime_mut(target).unwrap();runtime.show(true);
+        let first=runtime.copy_scope().guard(||true);assert!(first.current());
+        let old=runtime.handle().unwrap().clone();let mut publication=(*runtime.snapshot).clone();publication.generation+=1;
+        old.publish_snapshot_for_test(publication);runtime.refresh();
+        assert!(first.current(),"ordinary source publication does not dispose the native copy owner");
+        runtime.release_transcript_caches();assert!(!first.current());
+        let after_release=runtime.copy_scope().guard(||true);assert!(after_release.current());
+        runtime.show(false);assert!(!after_release.current());assert!(!runtime.copy_scope().guard(||true).current());
+        runtime.show(true);let after_reveal=runtime.copy_scope().guard(||true);assert!(after_reveal.current());
+        runtime.replace_draft(text_editor::Content::with_text("preserve user draft"));
+        let composer=runtime.composer.text();runtime.forget_transcript();assert!(!after_reveal.current());assert_eq!(runtime.composer.text(),composer);
+        let before_replacement=runtime.copy_scope().guard(||true);assert!(before_replacement.current());
+        let mut builder=selection::Catalog::builder();builder.guard_copy(before_replacement.clone(),|builder|
+            builder.plain("same-source",&[0],Arc::from("same bytes after reattach")));
+        let previous_catalog=builder.finish();runtime.selection_document.get_mut().replace((runtime.presentation_revision,previous_catalog.clone()));
+        let replacement=Arc::new(ClientHandle::fixture(old.session(),(*runtime.snapshot).clone()));
+        runtime.replace_connection(Connection::Live(replacement));
+        assert!(Arc::strong_count(&old)>0,"old connection deliberately survives");
+        assert!(!before_replacement.current(),"same target/session source cannot adopt the old attachment receipt");
+        assert!(runtime.selection_document.borrow().is_none(),"same body/geometry must rebuild current guards rather than reuse a retired memo");
+        let (a,b)=previous_catalog.endpoints().unwrap();assert!(previous_catalog.copy(a,b).is_none());
+        assert!(runtime.copy_scope().guard(||true).current(),"new admitted Catalog may use a fresh scope");
+        assert_eq!(runtime.target,target);
+        runtime.replace_connection(Connection::Draft);assert!(runtime.handle().is_none());
+        let archived_body:Arc<str>=Arc::from("archived source bytes");
+        let archived=runtime.copy_scope().guard(||true);assert!(archived.current());
+        let mut builder=selection::Catalog::builder();builder.guard_copy(archived.clone(),|builder|
+            builder.plain("archive",&[0],archived_body.clone()));
+        runtime.selection_document.get_mut().replace((runtime.presentation_revision,builder.finish()));
+        let before_hide=runtime.snapshot.clone();let archived_composer=runtime.composer.text();runtime.show(false);
+        assert!(!archived.current() && runtime.selection_document.borrow().is_none());
+        assert!(Arc::ptr_eq(&runtime.snapshot,&before_hide),"no handle means archive body is retained");
+        assert_eq!(runtime.composer.text(),archived_composer);
+        runtime.show(true);let fresh=runtime.copy_scope().guard(||true);assert!(fresh.current());
+        let mut builder=selection::Catalog::builder();builder.guard_copy(fresh,|builder|
+            builder.plain("archive",&[0],archived_body));
+        let rebuilt=builder.finish();let (a,b)=rebuilt.endpoints().unwrap();
+        assert_eq!(rebuilt.copy(a,b).as_deref(),Some("archived source bytes"),"identical archived bytes use the new scope");
+        runtime.selected_subagent=Some("previous-child-context".into());
+        let child_scope=runtime.copy_scope().guard(||true);assert!(child_scope.current());
+        drop(app.handle_chat_action(Action::SelectSubagent(target,None)));assert!(!child_scope.current());
+        let retired=app.chat_runtime_mut(target).unwrap().copy_scope().guard(||true);assert!(retired.current());
+        drop(app.cards.remove(&card));assert!(!retired.current(),"retained Catalog cannot keep a disposed Runtime copy receipt alive");
+    }
+
+    #[test]
+    fn automatic_child_disappearance_expires_the_native_copy_scope_only() {
+        const CHILD:&str="CAGENTS_TEST_AUTOMATIC_CHILD_COPY_SCOPE";
+        if crate::ui_test_process::isolated(
+            "app::chat_ui::tests::automatic_child_disappearance_expires_the_native_copy_scope_only",CHILD) {return;}
+        let mut app=crate::app::tests::context_inspector_test_app(false);app.workspace.resize_viewport(1600.0);
+        let card=live_chat(&mut app,Some("child-copy-scope"));let target=chat_runtime(&app,card).target;
+        let runtime=app.chat_runtime_mut(target).unwrap();runtime.show(true);
+        runtime.replace_draft(text_editor::Content::with_text("keep unsent composer"));
+        let handle=runtime.handle().unwrap().clone();let mut publication=(*runtime.snapshot).clone();publication.generation+=1;
+        publication.subagents.push(chat::Subagent {id:"selected-child".into(),kind:"task".into(),description:"Child".into(),
+            status:chat::ToolStatus::Succeeded,model:None,waiting:false,detail:String::new(),background:false,items:vec![]});
+        handle.publish_snapshot_for_test(publication);runtime.refresh();
+        let parent_scope=runtime.copy_scope().guard(||true);assert!(parent_scope.current());
+        drop(app.handle_chat_action(Action::SelectSubagent(target,Some("selected-child".into()))));
+        assert!(!parent_scope.current(),"actual explicit switch retires the previous scope");
+        let runtime=app.chat_runtime_mut(target).unwrap();assert_eq!(runtime.selected_subagent.as_deref(),Some("selected-child"));
+        let held=runtime.copy_scope().guard(||true);assert!(held.current());
+        let mut builder=selection::Catalog::builder();builder.guard_copy(held.clone(),|builder|
+            builder.plain("same-source",&[0],Arc::from("child bytes")));
+        let old_catalog=builder.finish();runtime.selection_document.get_mut().replace((runtime.presentation_revision,old_catalog.clone()));
+        let composer=runtime.composer.text();let mut removed=(*runtime.snapshot).clone();removed.generation+=1;removed.subagents.clear();
+        handle.publish_snapshot_for_test(removed);runtime.refresh();
+        assert!(runtime.selected_subagent.is_none());assert!(!held.current(),"actual install fallback cannot keep an old child receipt live");
+        assert!(runtime.selection_document.borrow().is_none(),"parent view must not reuse retired child memo");
+        let (a,b)=old_catalog.endpoints().unwrap();assert!(old_catalog.copy(a,b).is_none());
+        assert_eq!(runtime.target,target);assert_eq!(runtime.composer.text(),composer);
+        assert!(runtime.copy_scope().guard(||true).current(),"fresh parent presentation can obtain its own scope");
+    }
+
+    #[test]
     fn flow_dispatch_prepares_cached_tools_and_recreated_temporary_contexts() {
         use iced::advanced::{
             Layout, Shell, layout, mouse,
@@ -13411,6 +13549,8 @@ mod tests {
             end: Some(end),
             anchor_prefix: document.fingerprint(anchor),
             end_prefix: document.fingerprint(end),
+            anchor_source: None,
+            end_source: None,
         }));
         runtime.selection_document.get_mut().replace((99, document));
         runtime

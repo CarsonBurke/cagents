@@ -82,6 +82,8 @@ pub mod performance;
 pub mod persistence;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod process;
+#[cfg(all(test, feature = "ui"))]
+mod ui_test_process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;

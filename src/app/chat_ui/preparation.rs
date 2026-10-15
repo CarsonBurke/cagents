@@ -384,6 +384,7 @@ impl Prepared {
         });
     }
     pub(super) fn install(self, cached: &mut CachedItem, managed: bool) {
+        cached.bind_copy_guard(None); // bind the actual newly admitted source after installation
         // Move the old owned parser containers out before replacing them:
         // their destructors may visit thousands of blocks and free code.
         let retired = Retired {

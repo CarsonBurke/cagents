@@ -18,7 +18,7 @@ mod boundary;
 mod document;
 pub(super) use boundary::{Kind, wrap};
 pub(super) use document::{
-    Bookmark, Builder as DocumentBuilder, Catalog, identity as logical_identity,
+    Bookmark, Suspended, Builder as DocumentBuilder, Catalog, CopyAuthority, CopyGuard, CopyScope, SourceStamp, identity as logical_identity,
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -123,6 +123,20 @@ impl Unit {
 }
 
 impl State {
+    /// Source revocation cancels the whole old gesture and immediately clears
+    /// mounted ranges. Otherwise the next drag event can reuse old endpoints.
+    fn revoke(&mut self) {
+        self.anchor = None; self.end = None; self.dragging = false;
+        self.initial = None; self.link = None; self.origin = None;
+        self.pointer = None; self.next_scroll = None; self.click = None;
+        self.unit = Unit::Character; self.moved = false;
+        self.reset = true;
+    }
+    fn awaiting(&self, catalog: Option<&Catalog>) -> bool {
+        self.anchor.zip(self.end).is_some_and(|(anchor, end)| {
+            catalog.is_some_and(|catalog| catalog.awaiting(anchor, end))
+        })
+    }
     fn extend(&mut self, read: &Read, block: &Block) {
         let range = self.unit.range(&block.plain, block.hit);
         let low = Endpoint {
@@ -450,12 +464,15 @@ impl Read {
     }
 
     fn copy(&self, ranges: &Ranges) -> String {
+        self.copy_if_current(ranges).unwrap_or_default()
+    }
+    fn copy_if_current(&self, ranges: &Ranges) -> Option<String> {
         if let Some(catalog) = &self.catalog {
-            return ranges
-                .logical
-                .and_then(|(anchor, end)| catalog.copy(anchor, end))
-                .unwrap_or_default();
+            return ranges.logical.and_then(|(anchor, end)| catalog.copy(anchor, end));
         }
+        Some(self.copy_blocks(ranges))
+    }
+    fn copy_blocks(&self, ranges: &Ranges) -> String {
         let values = self.table_values(ranges);
         let mut result = String::new();
         let mut emitted = false;
@@ -908,7 +925,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         let bookmark = self
             .bookmark
             .as_ref()
-            .map(|bookmark| *bookmark.borrow())
+            .map(|bookmark| bookmark.borrow().clone())
             .unwrap_or_default();
         tree::State::new(State {
             anchor: bookmark.anchor,
@@ -966,8 +983,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
             .layout(&mut tree.children[0], renderer, limits);
         let state = tree.state.downcast_mut::<State>();
         if let (Some(catalog), Some(bookmark)) = (&self.catalog, &self.bookmark) {
-            let saved = *bookmark.borrow();
-            let changed = saved
+            let saved = bookmark.borrow().clone();
+            let changed = saved.source_changed(catalog) || saved
                 .anchor
                 .zip(saved.anchor_prefix)
                 .is_some_and(|(point, hash)| {
@@ -980,12 +997,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                         catalog.fingerprint(point).is_some_and(|now| now != hash)
                     });
             if changed {
-                state.anchor = None;
-                state.end = None;
+                state.revoke();
                 *bookmark.borrow_mut() = Bookmark::default();
             }
         }
-        if state.anchor.is_some() || std::mem::take(&mut state.reset) {
+        let reset = std::mem::take(&mut state.reset);
+        if state.anchor.is_some() || reset {
             let mut read = Read::with_catalog(None, self.catalog.clone());
             self.content.as_widget_mut().operate(
                 &mut tree.children[0],
@@ -997,16 +1014,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none()
-                && !self
-                    .catalog
-                    .as_ref()
-                    .is_some_and(|catalog| catalog.is_empty())
+            if ranges.is_none() && !state.awaiting(self.catalog.as_deref())
             {
-                state.anchor = None;
-                state.end = None;
-                state.dragging = false;
-                state.link = None;
+                state.revoke();
+                // This pass already applies empty ranges below.
+                state.reset = false;
+                if let Some(bookmark) = &self.bookmark {
+                    *bookmark.borrow_mut() = Bookmark::default();
+                }
             }
             let mut apply = Apply {
                 ranges: ranges.as_deref().unwrap_or(&[]),
@@ -1240,29 +1255,38 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                         byte: block.plain.len(),
                     });
                 }
-                captured = state.anchor.is_some();
+                captured = state.anchor.is_some() || self.catalog.as_ref().is_some_and(|catalog| catalog.is_incomplete());
             }
-            let ranges = state
+            let mut ranges = state
                 .anchor
                 .zip(state.end)
                 .and_then(|(anchor, end)| read.ranges(anchor, end));
-            if ranges.is_none()
-                && !self
-                    .catalog
-                    .as_ref()
-                    .is_some_and(|catalog| catalog.is_empty())
+            if ranges.is_none() && !state.awaiting(self.catalog.as_deref())
             {
-                state.anchor = None;
-                state.end = None;
-                state.dragging = false;
-                state.link = None;
+                state.revoke();
+                // This pass already applies empty ranges below.
+                state.reset = false;
             }
             if command.is_some_and(|key| key.eq_ignore_ascii_case("c")) {
-                if let Some(ranges) = &ranges {
-                    let text = read.copy(ranges);
-                    if !text.is_empty() {
-                        clipboard.write(iced::advanced::clipboard::Kind::Standard, text);
-                        captured = true;
+                let pending = state.anchor.zip(state.end).is_some_and(|(anchor, end)| {
+                    self.catalog.as_ref().is_some_and(|catalog| catalog.copy_pending(anchor, end))
+                });
+                captured |= pending;
+                if !pending && let Some(current_ranges) = &ranges {
+                    // One guarded result distinguishes a valid empty string
+                    // from refusal. Do not make a second currentness probe
+                    // after an earlier preflight observation.
+                    match read.copy_if_current(current_ranges) {
+                        Some(text) => if !text.is_empty() {
+                            clipboard.write(iced::advanced::clipboard::Kind::Standard, text);
+                            captured = true;
+                        },
+                        None => {
+                            state.revoke();
+                            state.reset = false; // guaranteed empty Apply below
+                            ranges = None;
+                            captured = true;
+                        }
                     }
                 }
             }
@@ -1332,16 +1356,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
         }
         if let Some(bookmark) = &self.bookmark {
             let state = tree.state.downcast_ref::<State>();
-            *bookmark.borrow_mut() = Bookmark {
-                anchor: state.anchor,
-                end: state.end,
-                anchor_prefix: state
-                    .anchor
-                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
-                end_prefix: state
-                    .end
-                    .and_then(|point| self.catalog.as_ref()?.fingerprint(point)),
-            };
+            bookmark.borrow_mut().record(self.catalog.as_deref(), state.anchor, state.end);
         }
         if captured {
             shell.capture_event();
@@ -3118,4 +3133,304 @@ mod tests {
         );
         tree::NAMED.with(|named| named.borrow_mut().clear());
     }
+
+    #[test]
+    fn same_tree_selection_suspends_for_pending_source_and_rejects_rewrites_or_removal() {
+        const CHILD: &str = "CAGENTS_TEST_PENDING_SELECTION";
+        if crate::ui_test_process::isolated(
+            "app::chat_ui::selection::tests::same_tree_selection_suspends_for_pending_source_and_rejects_rewrites_or_removal", CHILD) { return; }
+        fn render(target: Target, bookmark: Rc<RefCell<Bookmark>>, body: Option<&str>, pending: bool, surroundings: bool)
+            -> (Element<'static, Message>, Arc<Catalog>)
+        {
+            let leaf = |item: &str, path: &[u32], text: &str| {
+                super::super::selectable_prose::logical_text(
+                    vec![iced::widget::text::Span::new(text.to_owned())].into(),
+                    16.0.into(), iced::Font::default(), target, None,
+                    super::super::selectable_prose::Logical { identity: logical_identity(item, path), start: 0 },
+                )
+            };
+            let mut builder = Catalog::builder();
+            let mut children = Vec::new();
+            if surroundings {
+                builder.plain("before", &[2], Arc::from("Visible unrelated header"));
+                children.push(leaf("before", &[2], "Visible unrelated header"));
+            }
+            if let Some(body) = body {
+                builder.plain("selected", &[10, 0], Arc::from(body));
+                children.push(leaf("selected", &[10, 0], body));
+            } else {
+                if pending { builder.pending("selected", &[10, 0]); }
+                children.push(iced::widget::Space::with_height(24).into());
+            }
+            if surroundings {
+                builder.plain("after", &[2], Arc::from("Visible unrelated footer"));
+                children.push(leaf("after", &[2], "Visible unrelated footer"));
+            }
+            let catalog = builder.finish();
+            (transcript_virtualized(widget::column::with_children(children).spacing(8),
+                target, None, catalog.clone(), bookmark), catalog)
+        }
+        let renderer = crate::app::tests::headless_renderer();
+        let target = Target { card: CardId::new(), generation: 3 };
+        let bookmark = Rc::new(RefCell::new(Bookmark::default()));
+        let source = "α selected source";
+        let (mut element, catalog) = render(target, bookmark.clone(), Some(source), false, true);
+        let mut tree = Tree::new(&element);
+        let viewport = Rectangle::with_size(Size::new(400.0, 240.0));
+        let limits = layout::Limits::new(Size::ZERO, viewport.size());
+        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let send = |element: &mut Element<'static, Message>, tree: &mut Tree, node: &mut layout::Node,
+                    clipboard: &mut ClipboardText, event: Event, cursor: mouse::Cursor| {
+            let mut messages = Vec::new();
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(tree, &event, Layout::new(node), cursor,
+                &renderer, clipboard, &mut shell, &viewport);
+            if shell.is_layout_invalid() { *node = element.as_widget_mut().layout(tree, &renderer, &limits); }
+            shell.is_event_captured()
+        };
+        let mut read = Read::with_catalog(None, Some(catalog));
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut read);
+        let bounds = read.blocks.iter().find(|block| block.identity == logical_identity("selected", &[10, 0])).unwrap().bounds;
+        let start = Point::new(bounds.x, bounds.y + 3.0);
+        let end = Point::new(bounds.x + bounds.width + 4.0, bounds.y + 3.0);
+        let mut clipboard = ClipboardText::default();
+        for (event, point) in [
+            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), start),
+            (Event::Mouse(mouse::Event::CursorMoved { position: end }), end),
+            (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)), end),
+            (command("c"), end),
+        ] {
+            assert!(send(&mut element, &mut tree, &mut node, &mut clipboard, event, mouse::Cursor::Available(point)));
+        }
+        assert_eq!(clipboard.0, source);
+        let saved = bookmark.borrow().clone();
+        assert!(saved.anchor_prefix.is_some() && saved.end_prefix.is_some());
+        let (replacement, pending) = render(target, bookmark.clone(), None, true, true);
+        assert!(!pending.is_empty(), "other real leaves remain during rehydration");
+        assert_eq!(pending.search_blocks().len(), 2);
+        element = replacement;
+        tree.diff(&mut element);
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!((tree.state.downcast_ref::<State>().anchor, tree.state.downcast_ref::<State>().end), (saved.anchor, saved.end));
+        clipboard.0 = "unchanged clipboard while source is pending".into();
+        assert!(send(&mut element, &mut tree, &mut node, &mut clipboard, command("c"), mouse::Cursor::Unavailable));
+        assert_eq!(clipboard.0, "unchanged clipboard while source is pending");
+        send(&mut element, &mut tree, &mut node, &mut clipboard,
+            Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now())), mouse::Cursor::Unavailable);
+        let suspended = bookmark.borrow().clone();
+        assert_eq!((suspended.anchor, suspended.end, suspended.anchor_prefix, suspended.end_prefix),
+            (saved.anchor, saved.end, saved.anchor_prefix, saved.end_prefix));
+        (element, _) = render(target, bookmark.clone(), Some(source), false, true);
+        tree.diff(&mut element);
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(send(&mut element, &mut tree, &mut node, &mut clipboard, command("c"), mouse::Cursor::Unavailable));
+        assert_eq!(clipboard.0, source, "same-source return restores exact copy");
+        // A pending-only document preserves intent; a complete empty one
+        // removes it even if the very same IDs/text arrive again later.
+        (element, _) = render(target, bookmark.clone(), None, true, false);
+        tree.diff(&mut element);
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!((tree.state.downcast_ref::<State>().anchor, tree.state.downcast_ref::<State>().end), (saved.anchor, saved.end));
+        assert!(send(&mut element, &mut tree, &mut node, &mut clipboard, command("c"), mouse::Cursor::Unavailable));
+        assert_eq!((bookmark.borrow().anchor_prefix, bookmark.borrow().end_prefix), (saved.anchor_prefix, saved.end_prefix));
+        (element, _) = render(target, bookmark.clone(), Some(source), false, false);
+        tree.diff(&mut element);
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert!(send(&mut element, &mut tree, &mut node, &mut clipboard, command("c"), mouse::Cursor::Unavailable));
+        assert_eq!(clipboard.0, source);
+        (element, _) = render(target, bookmark.clone(), None, false, false);
+        tree.diff(&mut element);
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!((tree.state.downcast_ref::<State>().anchor, tree.state.downcast_ref::<State>().end), (None, None));
+        assert_eq!((bookmark.borrow().anchor, bookmark.borrow().end), (None, None));
+        (element, _) = render(target, bookmark.clone(), Some(source), false, false);
+        tree.diff(&mut element);
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!((tree.state.downcast_ref::<State>().anchor, tree.state.downcast_ref::<State>().end), (None, None),
+            "a complete removal must not resurrect selection on identical content");
+        *bookmark.borrow_mut() = saved.clone();
+        tree.state.downcast_mut::<State>().anchor = saved.anchor;
+        tree.state.downcast_mut::<State>().end = saved.end;
+        // An actual rewrite uses a real leaf, not a pending declaration. The
+        // preserved prefix proof must reject it before any new input arrives.
+        (element, _) = render(target, bookmark.clone(), None, true, true);
+        tree.diff(&mut element);
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let rewritten = "ZZ selected source";
+        assert_eq!(rewritten.len(), source.len(), "exercise prefix mismatch, not only shorter-body rejection");
+        (element, _) = render(target, bookmark.clone(), Some(rewritten), false, true);
+        tree.diff(&mut element);
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!((tree.state.downcast_ref::<State>().anchor, tree.state.downcast_ref::<State>().end), (None, None));
+        assert_eq!((bookmark.borrow().anchor, bookmark.borrow().end), (None, None));
+        // A missing leaf without exact-source rehydration intent is removal,
+        // not a reason to preserve old endpoints or old prefix fingerprints.
+        *bookmark.borrow_mut() = saved.clone();
+        tree.state.downcast_mut::<State>().anchor = saved.anchor;
+        tree.state.downcast_mut::<State>().end = saved.end;
+        (element, _) = render(target, bookmark.clone(), None, false, true);
+        tree.diff(&mut element);
+        element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!((tree.state.downcast_ref::<State>().anchor, tree.state.downcast_ref::<State>().end), (None, None));
+        assert_eq!((bookmark.borrow().anchor, bookmark.borrow().end), (None, None));
+    }
+
+    #[test]
+    fn same_tree_identical_ready_replacement_revokes_only_changed_source_selection() {
+        const CHILD:&str="CAGENTS_TEST_SELECTION_EXACT_SOURCE_STAMP";
+        if crate::ui_test_process::isolated(
+            "app::chat_ui::selection::tests::same_tree_identical_ready_replacement_revokes_only_changed_source_selection", CHILD) { return; }
+        let renderer=crate::app::tests::headless_renderer();let target=Target {card:CardId::new(),generation:1};
+        let body:Arc<str>=Arc::from("same selected source bytes");let id=logical_identity("source",&[10,0]);
+        let make_stamp=|agent,source,epoch|SourceStamp::new(agent,source,epoch).with_cache_authority(Some([3;24]));
+        let epoch=[0u8;24];let mut revision_epoch=epoch;revision_epoch[16]=1;let mut incarnation_epoch=epoch;incarnation_epoch[0]=1;
+        let a=make_stamp(None,"source",epoch);let revision=make_stamp(None,"source",revision_epoch);let incarnation=make_stamp(None,"source",incarnation_epoch);
+        for (changed, rewrite) in [(Some(a.clone().with_cache_authority(Some([4;24]))),false),(Some(revision),false),(Some(incarnation.clone()),false),(Some(make_stamp(None,"other-key",epoch)),false),(Some(make_stamp(Some("other-agent"),"source",epoch)),false),(None,false),(Some(a.clone()),true)] {
+          for mid_drag in [false,true] {
+            let bookmark=Rc::new(RefCell::new(Bookmark::default()));
+            let rewritten:Arc<str>=Arc::from("DIFF selected source bytes");
+            assert_eq!(rewritten.len(),body.len());
+            let make=|stamp:Option<SourceStamp>,other:SourceStamp,pending,replacement| {
+                let displayed=if replacement && rewrite {rewritten.clone()}else{body.clone()};
+                let mut builder=Catalog::builder();
+                let leaf=|builder:&mut DocumentBuilder|if pending {builder.pending("source",&[10,0]);}
+                    else {builder.plain("source",&[10,0],displayed.clone());};
+                if let Some(stamp)=stamp {builder.stamped(stamp,leaf);}else{leaf(&mut builder);}
+                builder.stamped(other,|builder|builder.plain("other",&[2],Arc::from("unrelated footer")));
+                let catalog=builder.finish();
+                let leaf=|identity,text:&str|super::super::selectable_prose::logical_text(
+                    vec![iced::widget::text::Span::new(text.to_owned())].into(),16.0.into(),iced::Font::default(),target,None,
+                    super::super::selectable_prose::Logical {identity,start:0});
+                let first=if pending {widget::Space::with_height(24).into()}else{leaf(id,&displayed)};
+                let content=widget::column::with_children(vec![first,leaf(logical_identity("other",&[2]),"unrelated footer")]).spacing(8);
+                (transcript_virtualized(content,target,None,catalog.clone(),bookmark.clone()),catalog)
+            };
+            let (mut element,original)=make(Some(a.clone()),a.clone(),false,false);let mut tree=Tree::new(&element);
+            let viewport=Rectangle::with_size(Size::new(400.0,180.0));let limits=layout::Limits::new(Size::ZERO,viewport.size());
+            let mut node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);let mut clipboard=ClipboardText::default();
+            for (event,cursor) in [
+                (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),mouse::Cursor::Available(Point::new(0.0,3.0))),
+                (Event::Mouse(mouse::Event::CursorMoved {position:Point::new(350.0,3.0)}),mouse::Cursor::Available(Point::new(350.0,3.0))),
+                (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),mouse::Cursor::Available(Point::new(350.0,3.0))),
+                (command("c"),mouse::Cursor::Unavailable),
+            ] {
+                if mid_drag && matches!(event,Event::Mouse(mouse::Event::ButtonReleased(_))) {continue;}
+                let mut messages=Vec::new();let mut shell=Shell::new(&mut messages);
+                element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),cursor,&renderer,&mut clipboard,&mut shell,&viewport);
+                assert!(shell.is_event_captured());if shell.is_layout_invalid(){node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);}
+            }
+            assert_eq!(clipboard.0,body.as_ref());let saved=bookmark.borrow().clone();let native=tree.state.downcast_ref::<State>().identity;
+            // Changing another source keeps the selected endpoint and exact proof.
+            (element,_)=make(Some(a.clone()),incarnation.clone(),false,false);tree.diff(&mut element);
+            node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+            assert_eq!(tree.state.downcast_ref::<State>().anchor,saved.anchor);
+            // Same-source pending still retains all endpoint proofs without text.
+            (element,_)=make(Some(a.clone()),incarnation.clone(),true,false);tree.diff(&mut element);
+            element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+            assert_eq!(bookmark.borrow().anchor_source,Some(a.clone()));assert_eq!(bookmark.borrow().anchor,saved.anchor);
+            (element,_)=make(Some(a.clone()),incarnation.clone(),false,false);tree.diff(&mut element);
+            element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+            assert_eq!(tree.state.downcast_ref::<State>().anchor,saved.anchor);
+            // Direct READY->READY: no intervening loading/removal frame may
+            // hide the requirement to clear even identical immutable bytes.
+            let (replacement,next)=make(changed.clone(),incarnation.clone(),false,true);
+            if !rewrite {
+                assert!(Arc::ptr_eq(&original.text(id).unwrap(),&next.text(id).unwrap()));
+                assert_eq!(next.fingerprint(saved.end.unwrap()),saved.end_prefix);
+            } else { assert_ne!(next.fingerprint(saved.end.unwrap()),saved.end_prefix); }
+            assert_eq!(tree.state.downcast_ref::<State>().dragging,mid_drag,"same-source pending/ready preserves gesture");
+            element=replacement;tree.diff(&mut element);node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+            let state=tree.state.downcast_ref::<State>();assert_eq!(state.identity,native,"do not pass by remounting Selection");
+            assert!(state.anchor.is_none() && state.end.is_none());assert!(bookmark.borrow().anchor.is_none());
+            assert!(!state.dragging && state.initial.is_none() && state.link.is_none() && state.origin.is_none()
+                && state.next_scroll.is_none() && state.click.is_none());
+            struct Painted { identity:u64, ranges:Vec<Range<usize>> }
+            impl Operation for Painted {
+                fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
+                fn custom(&mut self,_:Option<&Id>,_:Rectangle,value:&mut dyn Any){
+                    if let Some(prose)=value.downcast_ref::<Prose>()
+                        && prose.logical.as_ref().is_some_and(|logical|logical.identity==self.identity) {
+                        self.ranges.push(prose.anchor..prose.end);
+                    }
+                }
+            }
+            let mut painted=Painted {identity:id,ranges:vec![]};
+            element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut painted);
+            assert!(!painted.ranges.is_empty());
+            assert!(painted.ranges.iter().all(|range|range.is_empty()),"old highlight clears during layout BEFORE any next input");
+            clipboard.0="keep newer clipboard".into();
+            for (event,cursor) in [
+                (Event::Mouse(mouse::Event::CursorMoved {position:Point::new(350.0,3.0)}),mouse::Cursor::Available(Point::new(350.0,3.0))),
+                (Event::Mouse(mouse::Event::CursorMoved {position:Point::new(350.0,220.0)}),mouse::Cursor::Available(Point::new(350.0,220.0))),
+                (Event::Window(iced::window::Event::RedrawRequested(iced::time::Instant::now()+Duration::from_secs(1))),mouse::Cursor::Unavailable),
+                (Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),mouse::Cursor::Available(Point::new(350.0,3.0))),
+                (command("c"),mouse::Cursor::Unavailable),
+            ] {
+                let mut messages=Vec::new();
+                element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),cursor,&renderer,&mut clipboard,&mut Shell::new(&mut messages),&viewport);
+                let state=tree.state.downcast_ref::<State>();
+                assert!(state.anchor.is_none() && state.end.is_none() && !state.dragging && state.initial.is_none());
+                assert!(messages.iter().all(|message|!matches!(message,Message::ChatUi(Action::OpenDocument(..)))));
+            }
+            assert_eq!(clipboard.0,"keep newer clipboard");
+          }
+        }
+    }
+
+    #[test]
+    fn native_copy_rechecks_receiver_receipt_without_wake_layout_or_catalog_replacement() {
+        const CHILD:&str="CAGENTS_TEST_SELECTION_COPY_RECEIPT";
+        if crate::ui_test_process::isolated(
+            "app::chat_ui::selection::tests::native_copy_rechecks_receiver_receipt_without_wake_layout_or_catalog_replacement", CHILD) { return; }
+        let renderer=crate::app::tests::headless_renderer();
+        let target=Target {card:CardId::new(),generation:1};let identity=logical_identity("source",&[10,0]);
+        let body:Arc<str>=Arc::from("previously admitted selected source");
+        let current=Arc::new(std::sync::atomic::AtomicBool::new(true));let captured=current.clone();
+        let probes=Arc::new(std::sync::atomic::AtomicUsize::new(0));let counted=probes.clone();
+        let mut builder=Catalog::builder();
+        builder.guard_copy(CopyGuard::new(move|| {counted.fetch_add(1,Ordering::Relaxed);captured.load(Ordering::Acquire)}),|builder|
+            builder.plain("source",&[10,0],body.clone()));
+        let catalog=builder.finish();let bookmark=Rc::new(RefCell::new(Bookmark::default()));
+        let content=super::super::selectable_prose::logical_text(
+            vec![iced::widget::text::Span::new(body.to_string())].into(),16.0.into(),iced::Font::default(),target,None,
+            super::super::selectable_prose::Logical {identity,start:0});
+        let mut element=transcript_virtualized(content,target,None,catalog.clone(),bookmark.clone());
+        let mut tree=Tree::new(&element);let viewport=Rectangle::with_size(Size::new(400.0,180.0));
+        let limits=layout::Limits::new(Size::ZERO,viewport.size());
+        let mut node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);let mut clipboard=ClipboardText::default();
+        let send=|element:&mut Element<'_,Message>,tree:&mut Tree,node:&mut layout::Node,clipboard:&mut ClipboardText,event:Event,cursor| {
+            let mut messages=Vec::new();let mut shell=Shell::new(&mut messages);
+            element.as_widget_mut().update(tree,&event,Layout::new(node),cursor,&renderer,clipboard,&mut shell,&viewport);
+            assert!(shell.is_event_captured());
+            if shell.is_layout_invalid(){*node=element.as_widget_mut().layout(tree,&renderer,&limits);}
+        };
+        for (event,cursor) in [
+            (Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),mouse::Cursor::Available(Point::new(0.0,3.0))),
+            (Event::Mouse(mouse::Event::CursorMoved {position:Point::new(390.0,3.0)}),mouse::Cursor::Available(Point::new(390.0,3.0))),
+            (command("c"),mouse::Cursor::Unavailable),
+        ] {send(&mut element,&mut tree,&mut node,&mut clipboard,event,cursor);}
+        assert_eq!(clipboard.0,body.as_ref());assert!(tree.state.downcast_ref::<State>().dragging);
+        assert_eq!(probes.load(Ordering::Relaxed),1,"one accepted copy makes one receiver observation");
+        let native=tree.state.downcast_ref::<State>().identity;
+        let saved=bookmark.borrow().clone();assert!(saved.anchor.is_some() && saved.end.is_some());
+        current.store(false,Ordering::Release);
+        // Deliberately no Wake, diff, replacement Catalog or layout here.
+        clipboard.0="new clipboard is preserved".into();
+        send(&mut element,&mut tree,&mut node,&mut clipboard,command("c"),mouse::Cursor::Unavailable);
+        assert_eq!(clipboard.0,"new clipboard is preserved");
+        assert_eq!(probes.load(Ordering::Relaxed),2,"refusal is the guarded result, not a separate preflight");let state=tree.state.downcast_ref::<State>();
+        assert_eq!(state.identity,native);assert!(state.anchor.is_none() && state.end.is_none() && !state.dragging && state.initial.is_none());
+        assert!(bookmark.borrow().anchor.is_none());
+        struct Painted(Vec<Range<usize>>);
+        impl Operation for Painted {
+            fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)){visit(self);}
+            fn custom(&mut self,_:Option<&Id>,_:Rectangle,value:&mut dyn Any){
+                if let Some(prose)=value.downcast_ref::<Prose>(){self.0.push(prose.anchor..prose.end);}
+            }
+        }
+        let mut painted=Painted(vec![]);element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut painted);
+        assert!(!painted.0.is_empty() && painted.0.iter().all(|range|range.is_empty()),"revoked highlight clears in the copy update itself");
+        assert!(catalog.copy(saved.anchor.unwrap(),saved.end.unwrap()).is_none(),"direct Catalog callers share the receiver guard");
+    }
+
 }

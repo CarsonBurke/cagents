@@ -305,6 +305,7 @@ pub(super) fn view(
         blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
+        copy_guard: cached.copy_guard.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
         item: cached
@@ -337,6 +338,7 @@ pub(super) fn content_view(
         blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
+        copy_guard: cached.copy_guard.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
         item: cached
@@ -376,6 +378,7 @@ pub(super) fn items_for_test(
         blocks: palette(cached, cosmic::theme::is_dark()),
         revision: cached.revision,
         flow_cache: cached.flow_cache.clone(),
+        copy_guard: cached.copy_guard.clone(),
         reader_memory: cached.reader_memory.clone(),
         reader_context: cached.reader_context.clone(),
         item: cached
@@ -399,6 +402,7 @@ pub(super) fn items_for_test(
 #[derive(Clone)]
 struct Renderer {
     flow_cache: flow_layout::Cache,
+    copy_guard: Option<selection::CopyGuard>,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
     item: Arc<str>,
@@ -887,7 +891,7 @@ impl Renderer {
         &self,
         settings: markdown::Settings,
         language: Option<&str>,
-        code: &str,
+        code: &Arc<str>,
         source: &Arc<str>,
         reader_source: &super::reader_source::Source,
     ) -> Element<'static, Message> {
@@ -902,7 +906,7 @@ impl Renderer {
                 if code.len() > 2048 {
                     Arc::from([])
                 } else {
-                    vec![Span::new(code.to_owned())].into()
+                    vec![Span::new(code.to_string())].into()
                 }
             });
         let text = code_text(
@@ -946,9 +950,16 @@ impl Renderer {
                     .unwrap_or("Code")
                     .to_owned(),
             ),
-            Some(Action::CopyLiteral(code.to_owned())),
+            code_copy_action(self.copy_guard.as_ref(),self.target,code),
         )
     }
+}
+
+/// Every production prose renderer displays transcript or coordinated source.
+/// Missing ownership is missing permission, including a cache with item=None.
+/// Frames carry only captured permission and the immutable parser body.
+fn code_copy_action(guard:Option<&selection::CopyGuard>, target:Target, code:&Arc<str>)->Option<Action> {
+    guard.map(|guard|Action::CopySourceLiteral(target,guard.clone(),code.clone()))
 }
 
 fn heading(
@@ -1313,6 +1324,38 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cached_code_copy_receipt_expires_on_replace_and_drop_but_clone_binding_reuses_rows() {
+        let mut cached=CachedItem::new(&ItemContent::Text {text:"```\ncode\n```".into(),thinking:false,phase:chat::Phase::Final},
+            crate::settings::EditorSyntaxTheme::default());
+        let source=selection::CopyGuard::new(||true);cached.bind_copy_guard(Some(source.clone()));
+        let old=cached.copy_guard.clone().unwrap();let revision=cached.revision;assert!(old.current());
+        cached.bind_copy_guard(Some(source.clone()));assert_eq!(cached.revision,revision);
+        assert!(cached.copy_guard.as_ref().unwrap().same_receipt(&old));
+        cached.bind_copy_guard(None);assert!(!old.current());assert!(cached.copy_guard.is_none());
+        cached.bind_copy_guard(Some(source));let fresh=cached.copy_guard.clone().unwrap();assert!(fresh.current());
+        assert!(!old.current(),"binding same source later cannot rearm an old cached view");
+        drop(cached);assert!(!fresh.current(),"retained code button cannot keep cached view admission alive");
+    }
+
+    #[test]
+    fn source_code_copy_captures_guard_and_original_arc_without_view_time_probe() {
+        let target=Target {card:CardId::new(),generation:1};let code:Arc<str>=Arc::from("exact code\n");
+        let current=Arc::new(AtomicBool::new(true));let captured=current.clone();
+        let probes=Arc::new(std::sync::atomic::AtomicUsize::new(0));let count=probes.clone();
+        let guard=selection::CopyGuard::new(move|| {count.fetch_add(1,Ordering::Relaxed);captured.load(Ordering::Acquire)});
+        let action=super::code_copy_action(Some(&guard),target,&code).unwrap();
+        assert_eq!(probes.load(Ordering::Relaxed),0,"view construction does not lock receiver metadata");
+        let Action::CopySourceLiteral(actual,receipt,body)=action else {panic!("source-bound frame must not become an unguarded literal");};
+        assert_eq!(actual,target);assert!(Arc::ptr_eq(&body,&code));assert!(receipt.same_receipt(&guard));
+        assert!(receipt.current());current.store(false,Ordering::Release);assert!(!receipt.current());
+        assert!(super::code_copy_action(None,target,&code).is_none(),"missing permission always fails closed, even when a source cache has no bound Item");
+        let missing=CachedItem::new(&ItemContent::Text {text:"```\ncode\n```".into(),thinking:false,phase:chat::Phase::Final},
+            crate::settings::EditorSyntaxTheme::default());
+        assert!(missing.item.is_none());
+        assert!(super::code_copy_action(missing.copy_guard.as_ref(),target,&code).is_none());
+    }
+
     use super::*;
 
     #[test]
