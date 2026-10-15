@@ -170,7 +170,8 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         // newly authorize closing an actor admitted in another physical scope.
         if !terminal_scope(&directory, identity, path)? { continue; }
         let (revision, busy) = handle.close_observation()?;
-        let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None, session_instance: instance };
+        let working_agent=busy && handle.observed_working_agent();
+        let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None, session_instance: instance, working_agent };
         actors.insert(session.id, Actor { token, busy, terminal: Some(Terminal { instance, session, handle, revision }), native: None, starting: false });
     }
     for NativeCandidate { execution_instance, session, handle, pair_valid, paired_live, paired_directory } in candidates.natives {
@@ -196,7 +197,7 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         let hash = digest.finalize();
         let mut instance = uuid::Uuid::from_bytes(hash[..16].try_into().expect("SHA-256 prefix"));
         let actor = actors.entry(session.id).or_insert_with(|| Actor {
-            token: BusyAgent { session: session.id, instance, close_revision: None, turn_generation: None, session_instance: instance },
+            token: BusyAgent { session: session.id, instance, close_revision: None, turn_generation: None, session_instance: instance, working_agent:false },
             busy: false, terminal: None, native: None, starting: false,
         });
         let mut session_instance = instance;
@@ -211,19 +212,21 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
             let hash = digest.finalize();
             instance = uuid::Uuid::from_bytes(hash[..16].try_into().expect("SHA-256 prefix"));
         }
-        actor.token = BusyAgent { session: session.id, instance, close_revision: Some(observation.close_revision), turn_generation: Some(observation.turn_generation), session_instance };
+        let working_agent=actor.token.working_agent || observation.owns_work && !observation.completed && observation.activity==ActivityState::Working;
+        actor.token = BusyAgent { session: session.id, instance, close_revision: Some(observation.close_revision), turn_generation: Some(observation.turn_generation), session_instance, working_agent };
         actor.busy |= observation.owns_work && (!observation.ready || matches!(observation.activity, ActivityState::Working | ActivityState::Waiting | ActivityState::Unknown));
         actor.native = Some(Native { execution_instance, session, handle, observation });
     }
     for (id, instance, directory) in candidates.starting {
         if !inside(&directory, path)? { continue; }
         let actor = actors.entry(id).or_insert_with(|| Actor {
-            token: BusyAgent { session: id, instance, close_revision: None, turn_generation: None, session_instance: instance },
+            token: BusyAgent { session: id, instance, close_revision: None, turn_generation: None, session_instance: instance, working_agent:false },
             busy: true, terminal: None, native: None, starting: true,
         });
         actor.starting = true;
         actor.busy = true;
         actor.token.close_revision = None;
+        actor.token.working_agent = false;
     }
     Ok(actors.into_values().collect())
 }
@@ -402,7 +405,7 @@ impl PendingStop {
 mod tests {
     use super::*;
     fn token(session: TerminalId) -> BusyAgent {
-        BusyAgent { session, instance: uuid::Uuid::new_v4(), close_revision: Some(3), turn_generation: Some(2), session_instance: uuid::Uuid::new_v4() }
+        BusyAgent { session, instance: uuid::Uuid::new_v4(), close_revision: Some(3), turn_generation: Some(2), session_instance: uuid::Uuid::new_v4(), working_agent:false }
     }
     fn host() -> SharedHost {
         std::sync::Arc::new(super::super::state::HostLock::new(super::super::state::HostState::new(crate::model::HostSessionProof {
@@ -457,6 +460,17 @@ mod tests {
         assert!(std::process::Command::new("git").args(["init","--quiet"]).arg(root.path()).status().unwrap().success());
         root
     }
+    #[test]
+    fn native_working_count_requires_positive_owned_work_and_deduplicates_the_roster() {
+        let root=repository_fixture();let host=host();let record=live_record(root.path().into());
+        let id=record.session.id;let handle=record.handle.clone();host.lock().unwrap().chats.insert(id,record);
+        let actors=census(&host,root.path()).unwrap();
+        assert_eq!(actors.len(),1);assert!(actors[0].token.working_agent);
+        assert_eq!(tokens(&actors,true).iter().filter(|actor|actor.working_agent).count(),1);
+        handle.close_until(std::time::Instant::now()+std::time::Duration::from_secs(5)).unwrap();
+        assert!(!census(&host,root.path()).unwrap()[0].token.working_agent,"completed actors do not remain in the working-agent count");
+    }
+
     #[test]
     fn stopped_actor_cannot_retire_a_same_id_replacement_after_gate_release() {
         let root=repository_fixture();let host=host();let record=live_record(root.path().into());

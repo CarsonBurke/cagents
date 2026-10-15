@@ -1282,6 +1282,17 @@ impl TerminalHandle {
         self.inner.published.close_observation()
     }
 
+    /// Positive cached provider activity bound to this worker's discovered
+    /// agent identity. Generic output, unknown shells and completed workers
+    /// never count as a working agent. This does no process or history I/O.
+    pub(crate) fn observed_working_agent(&self)->bool {
+        if self.is_completed() {return false;}
+        let process=self.inner.published.agent_process.lock().unwrap_or_else(|p|p.into_inner());
+        let activity=self.inner.published.agent_activity.lock().unwrap_or_else(|p|p.into_inner());
+        process.as_ref().zip(activity.as_ref()).is_some_and(|(process,activity)|
+            process.provider==activity.provider && activity.state==crate::agent::ActivityState::Working)
+    }
+
     /// Atomically fence input, priority interrupts and ownership changes on
     /// this exact worker, then publish its internal stop control. No cleanup
     /// wait or process inspection occurs while the caller holds admission.

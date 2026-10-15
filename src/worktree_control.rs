@@ -80,6 +80,8 @@ pub struct BusyAgent {
     pub turn_generation: Option<u64>,
     /// Stable actor lifetime, independent of newly admitted work.
     pub session_instance: uuid::Uuid,
+    /// Positive resident provider-working evidence, never generic shell output.
+    pub working_agent: bool,
 }
 
 /// Exact actor lifetime approved for stopping all its ongoing work.
