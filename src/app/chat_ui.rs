@@ -1501,6 +1501,7 @@ pub(super) struct Runtime {
     finished_stamp: Option<(u64, String, String)>,
     turn_outcome_markers: HashMap<String, outcomes::Marker>,
     turn_outcome_source: std::sync::Weak<chat::turn_outcomes::TurnOutcomeProjection>,
+    turn_outcome_window: u64,
     cache: HashMap<String, CachedItem>,
     /// Only the latest explicitly requested preview is retained outside recency.
     preview_request: Option<String>,
@@ -2074,6 +2075,7 @@ impl Runtime {
             finished_stamp: None,
             turn_outcome_markers: HashMap::new(),
             turn_outcome_source: std::sync::Weak::new(),
+            turn_outcome_window: 0,
             connection,
             queued: None,
             followups: Vec::new(),
@@ -2150,6 +2152,7 @@ impl Runtime {
     pub(super) fn release_turn_outcome_presentation(&mut self) {
         self.turn_outcome_markers.clear();
         self.turn_outcome_source = std::sync::Weak::new();
+        self.turn_outcome_window = 0;
     }
 
     /// Drops everything drawn from the conversation's transcript, for a card
@@ -2588,14 +2591,14 @@ impl Runtime {
         if !snapshot.busy || snapshot.turn_generation != self.snapshot.turn_generation {
             self.interrupt_armed = None;
         }
+        let outcome_window = outcomes::window_signature(&snapshot);
         if self.turn_outcome_source.as_ptr() != Arc::as_ptr(&snapshot.turn_outcomes)
             || snapshot.session_id != self.snapshot.session_id
-            || snapshot.items.len() != self.snapshot.items.len()
-            || snapshot.items.first().map(|item| &item.id) != self.snapshot.items.first().map(|item| &item.id)
-            || snapshot.items.last().map(|item| &item.id) != self.snapshot.items.last().map(|item| &item.id)
+            || outcome_window != self.turn_outcome_window
         {
             self.turn_outcome_markers = outcomes::project(&snapshot);
             self.turn_outcome_source = Arc::downgrade(&snapshot.turn_outcomes);
+            self.turn_outcome_window = outcome_window;
         }
         self.snapshot = snapshot;
         images::sync(self);
