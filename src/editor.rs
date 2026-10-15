@@ -14,7 +14,7 @@ mod presence;
 pub use crate::recovery_authority::RecoveryAuthority;
 pub(crate) use crate::recovery_authority::{RecoverySlot, RecoveryContext};
 pub use presence::FileRestoration;
-pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, capture_restoration_at};
+pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, save_document_file_at_in_context, capture_restoration_at, capture_restoration_at_in_context};
 
 /// Builds a worker-side recovery context from the EXACT pre-acquired physical
 /// cleanup lease. No named-path reacquisition occurs after a failure.

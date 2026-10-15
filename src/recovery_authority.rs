@@ -42,6 +42,11 @@ impl Drop for ContextInner {
 /// occurs on failure. Callers supply the actual retained native FD count.
 #[derive(Clone)]
 pub(crate) struct RecoveryContext(Arc<ContextInner>);
+impl std::fmt::Debug for RecoveryContext {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RecoveryContext").field("shared_descriptors", &self.0.descriptors).finish_non_exhaustive()
+    }
+}
 impl RecoveryContext {
     pub(crate) fn with_guard(guard: impl Send + Sync + 'static, descriptors: usize) -> Result<Self, String> {
         Self::from_budget(guard, descriptors, context_budget())

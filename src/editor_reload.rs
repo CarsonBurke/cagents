@@ -82,11 +82,13 @@ pub fn load(worktree: &Path, path: &Path, before: &str, tone: PdfTone) -> Result
 }
 
 pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: PdfTone, capture: bool) -> Result<Version, crate::editor::FileIoError> {
+    let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(worktree).map_err(|error| crate::editor::FileIoError::Io(error.to_string()))?);
     let root = crate::editor::worktree_root(worktree)?;
+    let context = capture.then(|| crate::editor::recovery_context_at(&root, protection)).transpose()?;
     match crate::editor::load_file_at(&root, path, tone) {
         Ok(LoadedFile { source, content: FileContent::Editable { text, content_hash, markdown } }) => {
             let mapping = LineMap::between(before, &text);
-            let restoration = capture.then(|| crate::editor::capture_restoration_at(&root, &source, content_hash)).transpose()?;
+            let restoration = context.as_ref().map(|context| crate::editor::capture_restoration_at_in_context(&root, &source, content_hash, context)).transpose()?;
             Ok(Version { text, content_hash, source, markdown, mapping, restoration })
         }
         Ok(_) => Err(crate::editor::FileIoError::Io("The file on disk is no longer editable text. Your buffer has been kept.".into())),

@@ -66,16 +66,23 @@ pub(crate) fn save_document_file(
     overwrite: bool,
     presence: PresenceSave,
 ) -> Result<SaveOutcome, FileIoError> {
-    let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
+    let protection = Arc::new(crate::worktree_cleanup::protect(worktree).map_err(io_error)?);
     let root = worktree_root(worktree)?;
-    save_document_file_at(&root, path, text, expected_hash, overwrite, presence)
+    let context = recovery_context_at(&root, protection)?;
+    save_document_file_at_in_context(&root, path, text, expected_hash, overwrite, presence, &context)
 }
 
 /// Caller retains root/protection for the whole publication transaction.
 pub(crate) fn save_document_file_at(root: &Root, path: &Path, text: &str, expected_hash: blake3::Hash, overwrite: bool, presence: PresenceSave) -> Result<SaveOutcome, FileIoError> {
+    let protection = Arc::new(crate::worktree_cleanup::protect(root.path()).map_err(io_error)?);
+    let context = recovery_context_at(root, protection)?;
+    save_document_file_at_in_context(root, path, text, expected_hash, overwrite, presence, &context)
+}
+
+pub(crate) fn save_document_file_at_in_context(root: &Root, path: &Path, text: &str, expected_hash: blake3::Hash, overwrite: bool, presence: PresenceSave, context: &RecoveryContext) -> Result<SaveOutcome, FileIoError> {
     validate_repo_path(path)?;
     if presence.expected_present && presence.desired_present && presence.restoration.is_none() {
-        return save_file_at(root, path, text, expected_hash, overwrite);
+        return save_file_at_in_context(root, path, text, expected_hash, overwrite, context);
     }
     if !presence.expected_present && presence.desired_present && presence.external_missing_recreate && presence.restoration.is_none() {
         return save_missing_file_at(root, path, text);
@@ -86,15 +93,7 @@ pub(crate) fn save_document_file_at(root: &Root, path: &Path, text: &str, expect
             .restoration
             .as_deref()
             .ok_or_else(|| FileIoError::Io("The Undo metadata is unavailable.".into()))?;
-        return replace_or_remove_document_file(
-            root,
-            &parent,
-            &name,
-            expected_hash,
-            None,
-            || Ok(()),
-            Some((restoration, text)),
-        );
+        return replace_or_remove_document_file_in_context(root, &parent, &name, expected_hash, None, || Ok(()), Some((restoration, text)), context);
     }
     if !presence.desired_present {
         if !text.is_empty() {
@@ -103,14 +102,7 @@ pub(crate) fn save_document_file_at(root: &Root, path: &Path, text: &str, expect
             ));
         }
         if presence.expected_present {
-            return remove_document_file(
-                root,
-                &parent,
-                &name,
-                expected_hash,
-                presence.expected_mode,
-                || Ok(()),
-            );
+            return replace_or_remove_document_file_in_context(root, &parent, &name, expected_hash, presence.expected_mode, || Ok(()), None, context);
         }
         require_new_destination(&parent, Path::new(&name))?;
         let restoration = presence.restoration.ok_or_else(|| {
@@ -126,7 +118,7 @@ pub(crate) fn save_document_file_at(root: &Root, path: &Path, text: &str, expect
             "The removed file's restoration metadata is unavailable. Reload before saving.".into(),
         )
     })?;
-    restore_document_file(&parent, &name, text, &restoration)
+    restore_document_file(&parent, &name, text, &restoration, context)
 }
 
 fn restore_document_file(
@@ -134,9 +126,10 @@ fn restore_document_file(
     name: &std::ffi::OsStr,
     text: &str,
     restoration: &FileRestoration,
+    context: &RecoveryContext,
 ) -> Result<SaveOutcome, FileIoError> {
     require_new_destination(parent, Path::new(name))?;
-    let mut holding = PresenceHolding::create(parent, name)?;
+    let mut holding = PresenceHolding::create_in_context(parent, name, context)?;
     if let Err(error) = holding.create_temporary() { return Err(holding.finish_error(error)); }
     let result = (|| {
         let temporary = holding.temporary_mut();
@@ -264,6 +257,21 @@ fn replace_or_remove_document_file(
     before_acquire: impl FnOnce() -> io::Result<()>,
     replacement: Option<(&FileRestoration, &str)>,
 ) -> Result<SaveOutcome, FileIoError> {
+    let protection = Arc::new(crate::worktree_cleanup::protect(_namespace_root.path()).map_err(io_error)?);
+    let context = recovery_context_at(_namespace_root, protection)?;
+    replace_or_remove_document_file_in_context(_namespace_root, parent, name, expected_hash, expected_mode, before_acquire, replacement, &context)
+}
+
+fn replace_or_remove_document_file_in_context(
+    _namespace_root: &Root,
+    parent: &Root,
+    name: &std::ffi::OsStr,
+    expected_hash: blake3::Hash,
+    expected_mode: Option<u32>,
+    before_acquire: impl FnOnce() -> io::Result<()>,
+    replacement: Option<(&FileRestoration, &str)>,
+    context: &RecoveryContext,
+) -> Result<SaveOutcome, FileIoError> {
     let permit = if replacement.is_none() {
         Some(RestorationPermit::acquire()?)
     } else {
@@ -293,7 +301,7 @@ fn replace_or_remove_document_file(
             "The file changed while Revert checked its contents.".into(),
         ));
     }
-    let mut holding = PresenceHolding::create(parent, name)?;
+    let mut holding = PresenceHolding::create_in_context(parent, name, context)?;
     holding.pin_source(source);
     let acquired_name = std::ffi::OsStr::new("file");
     if let Err(error) = before_acquire().map_err(io_error).and_then(|()| {
@@ -341,7 +349,7 @@ fn replace_or_remove_document_file(
         // Keep the acquired original until the replacement is published. A
         // racing new destination is refused and the original is put back or
         // retained explicitly; no newer path is overwritten.
-        let outcome = match restore_document_file(parent, name, text, restoration) { Ok(outcome) => outcome, Err(error) => return Err(put_back_acquired_file(holding, error)) };
+        let outcome = match restore_document_file(parent, name, text, restoration, context) { Ok(outcome) => outcome, Err(error) => return Err(put_back_acquired_file(holding, error)) };
         let cleanup = holding.finish();
         return match (outcome, cleanup) {
             (
@@ -387,10 +395,22 @@ fn replace_or_remove_document_file(
 /// Captures only metadata for a cross-presence Reload. Both the returned text
 /// and this template must name the same exact regular-file contents.
 pub(crate) fn capture_restoration_at(root: &Root, path: &Path, expected_hash: blake3::Hash) -> Result<Arc<FileRestoration>, FileIoError> {
-    capture_restoration_with_hook(root, path, expected_hash, |_, _| Ok(()))
+    let protection = Arc::new(crate::worktree_cleanup::protect(root.path()).map_err(io_error)?);
+    let context = recovery_context_at(root, protection)?;
+    capture_restoration_at_in_context(root, path, expected_hash, &context)
 }
 
 fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3::Hash, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>) -> Result<Arc<FileRestoration>, FileIoError> {
+    let protection = Arc::new(crate::worktree_cleanup::protect(root.path()).map_err(io_error)?);
+    let context = recovery_context_at(root, protection)?;
+    capture_restoration_in_context_with_hook(root, path, expected_hash, before_unlink, &context)
+}
+
+pub(crate) fn capture_restoration_at_in_context(root: &Root, path: &Path, expected_hash: blake3::Hash, context: &RecoveryContext) -> Result<Arc<FileRestoration>, FileIoError> {
+    capture_restoration_in_context_with_hook(root, path, expected_hash, |_, _| Ok(()), context)
+}
+
+fn capture_restoration_in_context_with_hook(root: &Root, path: &Path, expected_hash: blake3::Hash, before_unlink: impl FnOnce(&Root, &std::ffi::OsStr) -> io::Result<()>, context: &RecoveryContext) -> Result<Arc<FileRestoration>, FileIoError> {
     validate_repo_path(path)?;
     let permit = RestorationPermit::acquire()?;
     let (parent, name) = fs_safety::open_parent_beneath(root, path).map_err(resolve_error)?;
@@ -408,7 +428,7 @@ fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3
     // The metadata can be world-readable/writable. Until its temporary name
     // is removed, it must live behind a private directory, just as removal's
     // metadata capture does. Never expose it in the ordinary worktree parent.
-    let mut holding = PresenceHolding::create(&parent, &name)?;
+    let mut holding = PresenceHolding::create_in_context(&parent, &name, context)?;
     let capture = immutable_metadata_template_with_hook(&mut holding, &source, &before, &attributes, before_unlink);
     let cleanup = holding.finish();
     let template = match (capture, cleanup) {

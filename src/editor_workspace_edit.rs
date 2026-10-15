@@ -45,7 +45,7 @@ pub struct DocumentPlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct Plan { pub worktree: PathBuf, pub root: Arc<fs_safety::Root>, pub documents: Vec<DocumentPlan>, _protection: Arc<Option<crate::worktree_cleanup::Protection>> }
+pub struct Plan { pub worktree: PathBuf, pub root: Arc<fs_safety::Root>, pub documents: Vec<DocumentPlan>, recovery_context: editor::RecoveryContext }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTargets {
@@ -110,6 +110,7 @@ pub fn prepare_resolved(resolved: ResolvedTargets, open: &HashMap<PathBuf, OpenS
 
 fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree_cleanup::Protection>>, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
     verify_root(&root)?;
+    let recovery_context = editor::recovery_context_at(&root, protection).map_err(|error| error.to_string())?;
     let worktree = root.path().to_path_buf();
     let mut canonical_open = HashMap::new();
     let mut aliases: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -167,7 +168,7 @@ fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree
     }
     result.sort_by(|left, right| left.relative.cmp(&right.relative));
     verify_root(&root)?;
-    Ok(Plan { worktree, root, documents: result, _protection: protection })
+    Ok(Plan { worktree, root, documents: result, recovery_context })
 }
 
 /// Atomically publishes each unopened file. A later refusal rolls back earlier
@@ -223,7 +224,7 @@ fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(us
     for (index, document) in plan.documents.iter().filter(|document| !document.open && document.before != document.after).enumerate() {
         before_file(index);
         let saved = verify_root(&plan.root).map_err(editor::FileIoError::Io)
-            .and_then(|()| editor::save_file_at(&plan.root, &document.relative, &document.after, document.before_hash, false));
+            .and_then(|()| editor::save_file_at_in_context(&plan.root, &document.relative, &document.after, document.before_hash, false, &plan.recovery_context));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
                 report.durability(&document.relative, durability, false);
@@ -241,7 +242,7 @@ fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(us
         };
         let mut unrestored = Vec::new();
         for previous in published.into_iter().rev() {
-            let restored = editor::save_file_at(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false);
+            let restored = editor::save_file_at_in_context(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false, &plan.recovery_context);
             match restored {
                 Ok(SaveOutcome::Saved { durability, .. }) => report.durability(&previous.relative, durability, true),
                 Err(error) => {

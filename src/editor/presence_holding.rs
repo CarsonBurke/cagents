@@ -63,7 +63,12 @@ pub(super) struct PresenceHolding {
 }
 impl PresenceHolding {
     pub(super) fn create(parent: &Root, name: &std::ffi::OsStr) -> Result<Self, FileIoError> {
-        let slot = RecoverySlot::reserve().map_err(FileIoError::Io)?;
+        let protection = Arc::new(crate::worktree_cleanup::protect(parent.path()).map_err(io_error)?);
+        let context = recovery_context_at(parent, protection)?;
+        Self::create_in_context(parent, name, &context)
+    }
+    pub(super) fn create_in_context(parent: &Root, name: &std::ffi::OsStr, context: &RecoveryContext) -> Result<Self, FileIoError> {
+        let slot = context.reserve().map_err(FileIoError::Io)?;
         let parent = parent.try_clone().map_err(io_error)?;
         // Published only covers this exact protected parent. Shared or unknown
         // parents refuse before creating or acquiring any presence artifacts.
