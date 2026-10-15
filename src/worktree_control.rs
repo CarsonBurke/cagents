@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
+    ResolveProject { id:crate::model::ProjectId },
     Create {
         repository: PathBuf,
         branch: String,
@@ -25,16 +26,17 @@ pub enum Operation {
 }
 
 impl Operation {
-    pub fn repository(&self) -> &std::path::Path {
+    pub fn repository(&self) -> Option<&std::path::Path> {
         match self {
+            Self::ResolveProject {..}=>None,
             Self::Create { repository, .. }
             | Self::List { repository }
             | Self::Remove { repository, .. }
             | Self::Inspect { repository, .. }
-            | Self::SetDisposableIgnoredDirectories { repository, .. } => repository,
+            | Self::SetDisposableIgnoredDirectories { repository, .. } => Some(repository),
         }
     }
-    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. }) }
+    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::Inspect { .. } | Self::ResolveProject { .. }) }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +56,7 @@ pub struct Entry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reply {
+    ResolvedProject {repository:PathBuf},
     Created { worktree: Entry, warnings: Vec<String>, setup: Option<Setup> },
     Listed { worktrees: Vec<Entry> },
     Removed { path: PathBuf, branch_deleted: Option<String> },

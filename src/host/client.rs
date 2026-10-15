@@ -435,18 +435,18 @@ pub(super) fn process_request(
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Worktree { operation } } => {
-            let repository=operation.repository().to_path_buf();
+            let repository=operation.repository().map(std::path::Path::to_path_buf);
             let mutates=operation.mutates();
             let result=crate::worktree_control::service::execute(operation, |path| {
                 Ok(host.lock().unwrap_or_else(|p|p.into_inner()).worktree_live_sessions(path))
             });
             // A later setup/branch failure can follow a committed Git mutation.
             // Refresh on either outcome so a retained worktree is never hidden.
-            if mutates { host.lock().unwrap_or_else(|p|p.into_inner()).announce_worktrees_changed(&repository); }
+            if mutates&&let Some(repository)=&repository { host.lock().unwrap_or_else(|p|p.into_inner()).announce_worktrees_changed(repository); }
             let mut reply=result.map_err(|message|ProtocolError::new(ProtocolErrorCode::InvalidRequest,message,false))?;
             if let crate::worktree_control::Reply::Created {worktree,setup:Some(setup),warnings}=&mut reply {
                 if setup.error.is_none() {
-                    match start_worktree_setup(host,&repository,&worktree.path,&setup.command) {
+                    match start_worktree_setup(host,repository.as_deref().ok_or_else(||ProtocolError::new(ProtocolErrorCode::Internal,"Created worktree has no repository",false))?,&worktree.path,&setup.command) {
                         Ok(session)=>setup.terminal=Some(session),
                         Err(error)=> { warnings.push(format!("Worktree was created, but its setup terminal could not start: {error}")); setup.error=Some(error.to_string()); }
                     }

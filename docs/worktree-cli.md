@@ -1,7 +1,7 @@
 # Worktree CLI
 
 `cagents worktree create/list/remove` uses the selected device's daemon. Run
-commands inside a project, or select an open project with `--project PATH` (an
+commands inside a project, or select an open project with `--project ID_OR_PATH` (an
 unambiguous open project name is also accepted).
 
 ```sh

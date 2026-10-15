@@ -8,7 +8,7 @@ pub enum WorktreeCommand {
         branch: String,
         #[arg(long)]
         base: Option<String>,
-        /// Project directory or the exact name of an open project; defaults to this checkout.
+        /// Project ID, directory or exact name of an open project; defaults to this checkout.
         #[arg(long)]
         project: Option<PathBuf>,
         /// Link this Linear issue (for example ENG-123) to the new worktree.
@@ -56,6 +56,12 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
         WorktreeCommand::Create {project,..}|WorktreeCommand::List {project}|WorktreeCommand::Remove {project,..}=>project.clone(),
     };
     let project=project.map(|given| {
+        if let Some(id)=given.to_str().and_then(|value|value.parse::<crate::model::ProjectId>().ok()) {
+            return match client.device_operation(crate::device_service::Operation::Worktree {operation:Operation::ResolveProject {id}}).map_err(protocol_error)? {
+                crate::device_service::Reply::Worktree(Reply::ResolvedProject {repository})=>Ok(repository),
+                _=>Err(AppError::new("protocol","Unexpected project-ID response")),
+            };
+        }
         let matching=model.projects.iter().filter(|project| Path::new(&project.name)==given).collect::<Vec<_>>();
         match matching.as_slice() { [project]=>Ok(project.repository.clone()), []=>Ok(given), _=>Err(AppError::new("project","This project name is ambiguous; use its path")) }
     }).transpose()?;
@@ -101,6 +107,7 @@ pub(super) fn execute(command:WorktreeCommand)->Result<CommandOutput,AppError> {
             let human=worktrees.iter().map(|entry|format!("{}\t{}\t{}\t{}\t{}\t{}",entry.path.display(),entry.branch.as_deref().unwrap_or("(detached)"),if entry.dirty {"dirty"}else{"clean"},entry.ahead.map(|count|format!("+{count}")).unwrap_or("-".into()),entry.behind.map(|count|format!("-{count}")).unwrap_or("-".into()),entry.live_sessions.len())).collect::<Vec<_>>().join("\n");
             ("worktree.list",json!({"schema_version":1,"worktrees":worktrees}),human)
         }
+        Reply::ResolvedProject {..}=>return Err(AppError::new("protocol","Unexpected project-ID response")),
         Reply::Inspected {..}=>return Err(AppError::new("protocol","Unexpected worktree inspection response")),
         Reply::Removed {path,branch_deleted}=>("worktree.remove",json!({"schema_version":1,"path":path,"branch_deleted":branch_deleted}),format!("Removed {}{}",path.display(),branch_deleted.map(|branch|format!(" and branch {branch}")).unwrap_or_default())),
     };

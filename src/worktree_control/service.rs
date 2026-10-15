@@ -33,6 +33,15 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
     }
     let _active=OPERATIONS.read().unwrap_or_else(|poison|poison.into_inner());
     match operation {
+        Operation::ResolveProject {id} => {
+            let mut matches=std::collections::BTreeSet::new();
+            for path in crate::instance::window_database_paths().map_err(|error|error.to_string())? {
+                if !path.exists() {continue;}
+                if let Some(repository)=crate::persistence::read_project_repository(&path,id).map_err(|error|error.to_string())? {matches.insert(repository);}
+            }
+            if matches.len()!=1 {return Err(format!("Project {id} is unknown, closed or ambiguous; use its checkout path"));}
+            Ok(Reply::ResolvedProject {repository:matches.into_iter().next().expect("one matching project")})
+        }
         Operation::List { repository } => {
             let records = service.list_worktrees(&repository,&cancellation).map_err(|error|error.to_string())?;
             let worktrees = records.iter().enumerate().filter(|(_,record)|!record.bare)

@@ -2212,6 +2212,17 @@ pub fn read_live_terminal_ids(path: &Path) -> Result<HashSet<String>> {
     Ok(live)
 }
 
+/// Resolve a persisted UI project ID without migrating another window's store.
+pub fn read_project_repository(path:&Path,id:ProjectId)->Result<Option<PathBuf>> {
+    let connection=Connection::open_with_flags(path,OpenFlags::SQLITE_OPEN_READ_ONLY|OpenFlags::SQLITE_OPEN_NOFOLLOW)?;
+    connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
+    let row:Option<(String,String)>=connection.query_row("SELECT repository_json,existence_json FROM projects WHERE project_id=?1",[id.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional()?;
+    row.map(|(repository,existence)| {
+        let existence:Existence=from_json("project existence",&existence)?;
+        if existence.is_open() {Ok(Some(from_json("project repository",&repository)?))} else {Ok(None)}
+    }).transpose().map(Option::flatten)
+}
+
 /// Read navigation identities without migrating or acquiring another window's
 /// writer. Closed chats remain navigable through the conversation resume path.
 pub fn read_navigable_session_ids(path: &Path) -> Result<Vec<TerminalId>> {

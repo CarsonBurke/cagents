@@ -133,3 +133,15 @@ fn untrusted_setup_refuses_before_creation_no_setup_skips_and_trusted_copy_uses_
     assert_eq!(fs::read_to_string(path.join("setup-result")).unwrap(),"ready");
     assert_eq!(created["setup"]["terminal"]["launch"]["environment"]["CAGENTS_WORKTREE_SETUP"],"1");
 }
+
+#[test]
+fn project_ids_resolve_from_window_storage_without_migrating_it() {
+    let fixture=Fixture::new();
+    let id=cagents::model::ProjectId::new();
+    let state=fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("sessions.sqlite3");
+    let store=cagents::persistence::StateStore::open(&state,cagents::model::BootId::new("worktree-contract")).unwrap();
+    store.save_project(&cagents::model::ProjectState {id,generation:0,name:"project".into(),repository:fixture.root.path().join("project/.git"),kind:cagents::model::ProjectKind::Git,existence:cagents::model::Existence::Open}).unwrap();
+    drop(store);
+    let data=fixture.cli(&["worktree","list","--project",&id.to_string()]);
+    assert_eq!(data["worktrees"].as_array().unwrap().len(),1);
+}
