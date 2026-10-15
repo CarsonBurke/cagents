@@ -80,7 +80,7 @@ pub(super) fn restore(
     source: &Session,
 ) -> Result<ServerResponse, String> {
     super::super::session_locations::observer_registry(host)?;
-    let proof = {
+    let (proof, publication) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
             || state.chat_spawning.contains_key(&source.id)
@@ -112,11 +112,12 @@ pub(super) fn restore(
         {
             return Err("Native conversation ownership or capacity prevents adoption".into());
         }
+        let publication = state.native_sources.mutating(source.id).map_err(|error| error.message)?;
         state.chat_spawning.insert(source.id, source.clone());
         state.inventory_generation += 1;
-        state.proof().clone()
+        (state.proof().clone(), publication)
     };
-    let result = restore_reserved(host, client, source, &proof);
+    let result = restore_reserved(host, client, source, &proof, &publication);
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     state.chat_spawning.remove(&source.id);
     state.inventory_generation += 1;
@@ -128,12 +129,13 @@ fn restore_reserved(
     client: ClientId,
     source: &Session,
     proof: &HostSessionProof,
+    publication: &super::source_binding::Reservation,
 ) -> Result<ServerResponse, String> {
     let directory = registry::directory(Kind::Native)?;
     let record = registry::evidence(&registry::socket(&directory, source.id), Kind::Native)?
         .ok_or("The durable native holder is unavailable; this conversation was not restarted or resent")?;
     if Handle::is_remote_record(&record) {
-        return super::retained_actor::restore(host, client, source, proof, record);
+        return super::retained_actor::restore(host, client, source, proof, record, publication);
     }
     let (recovery, exited) = chat::native_holder::inspect(&record, proof)?;
     if exited {
@@ -150,7 +152,7 @@ fn restore_reserved(
         .chain(std::iter::once(&recovery.source))
         .filter_map(AdoptionFailures::source_key)
         .collect();
-    let result = restore_authenticated(host, client, source, proof, record, recovery);
+    let result = restore_authenticated(host, client, source, proof, record, recovery, publication);
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     match &result {
         Ok(_) => state.native_adoption_failures.clear(source.id),
@@ -172,6 +174,7 @@ fn restore_authenticated(
     proof: &HostSessionProof,
     record: registry::Record,
     recovery: chat::native_holder::Recovery,
+    publication: &super::source_binding::Reservation,
 ) -> Result<ServerResponse, String> {
     super::super::session_locations::observer_registry(host)?;
     let mut retained: Vec<_> = recovery
@@ -457,7 +460,7 @@ fn restore_authenticated(
     state.publish_chat_observer(id, execution_instance, observer_registration.stamp());
     state
         .native_sources
-        .installed(id, record.execution_instance);
+        .install_reserved(publication, record.execution_instance).map_err(|error| error.message)?;
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();

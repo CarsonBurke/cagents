@@ -10,7 +10,15 @@ pub(in crate::host) struct History {
     entries: BTreeMap<TerminalId, Entry>,
     order: VecDeque<TerminalId>,
 }
+/// A bounded history slot held across an off-host operation. Dropping a caller
+/// never evicts its pending phase; the Entry itself retains that phase.
+#[derive(Clone, Debug)]
+pub(in crate::host) struct Reservation {
+    id: TerminalId,
+    pin: Arc<()>,
+}
 struct Entry {
+    pin: Arc<()>,
     instance: uuid::Uuid,
     resource_epoch: uuid::Uuid,
     unresolved: bool,
@@ -32,52 +40,77 @@ struct PendingHandoff {
     created_pair: Option<uuid::Uuid>,
 }
 impl History {
-    /// Called BEFORE publication of every new native Record, even if its
-    /// provider has not become ready or subsequently retires without attaching.
-    pub(in crate::host) fn installed(&mut self, id: TerminalId, instance: uuid::Uuid) {
-        if !self.entries.contains_key(&id) {
-            while self.entries.len() >= CAPACITY {
-                if let Some(old) = self.order.pop_front() {
-                    self.entries.remove(&old);
-                }
-            }
-            self.order.push_back(id);
+    fn ensure(&mut self, id: TerminalId) -> Result<(), ProtocolError> {
+        if self.entries.contains_key(&id) { return Ok(()); }
+        if self.entries.len() >= CAPACITY {
+            let position = self.order.iter().position(|candidate| {
+                self.entries.get(candidate).is_some_and(|entry| {
+                    entry.pending_handoff.is_none() && Arc::strong_count(&entry.pin) == 1
+                })
+            }).ok_or_else(|| unavailable("Native history capacity is reserved by exact pending operations; no provider was changed"))?;
+            let old = self.order.remove(position).expect("selected bounded history entry");
+            self.entries.remove(&old);
         }
-        self.entries.insert(
-            id,
-            Entry {
-                instance,
-                resource_epoch: uuid::Uuid::new_v4(),
-                unresolved: false,
-                pending_handoff: None,
-                learned_from: None,
-                known: None,
-            },
-        );
+        self.order.push_back(id);
+        self.entries.insert(id, Entry {
+            pin: Arc::new(()), instance: uuid::Uuid::nil(), resource_epoch: uuid::Uuid::new_v4(),
+            unresolved: false, pending_handoff: None, learned_from: None, known: None,
+        });
+        Ok(())
     }
-    /// Positively retain the native-publication boundary of a returned resource
-    /// even if it has never hosted a native actor. Issuance alone may create
-    /// this stamp; validation only looks it up and unknown/evicted refuses.
-    pub(super) fn retain_resource_epoch(&mut self, id: TerminalId) -> uuid::Uuid {
-        if !self.entries.contains_key(&id) {
-            self.installed(id, uuid::Uuid::nil());
+    fn pin_existing(&self, id: TerminalId) -> Result<Reservation, ProtocolError> {
+        let entry = self.entries.get(&id).ok_or_else(|| unavailable("Native publication history is unknown or evicted"))?;
+        Ok(Reservation { id, pin: entry.pin.clone() })
+    }
+    fn matches_reservation(&self, reservation: &Reservation) -> bool {
+        self.entries.get(&reservation.id).is_some_and(|entry| Arc::ptr_eq(&entry.pin, &reservation.pin))
+    }
+    /// Reserve before any provider mutation. A second operation cannot replace
+    /// an exact in-flight slot or its retained ambiguous handoff phase.
+    pub(in crate::host) fn mutating(&mut self, id: TerminalId) -> Result<Reservation, ProtocolError> {
+        self.ensure(id)?;
+        let entry = &self.entries[&id];
+        if entry.pending_handoff.is_some() || Arc::strong_count(&entry.pin) != 1 {
+            return Err(unavailable("An exact native operation already reserves this resource; no provider was changed"));
         }
-        self.entries[&id].resource_epoch
+        let reservation = self.pin_existing(id)?;
+        self.mutating_reserved(&reservation)?;
+        Ok(reservation)
+    }
+    pub(in crate::host) fn mutating_reserved(&mut self, reservation: &Reservation) -> Result<(), ProtocolError> {
+        if !self.matches_reservation(reservation) { return Err(unavailable("The exact native publication reservation changed")); }
+        let entry = self.entries.get_mut(&reservation.id).expect("same lock");
+        if entry.pending_handoff.is_some() { return Err(unavailable("A retained handoff still owns this native resource")); }
+        entry.resource_epoch = uuid::Uuid::new_v4();
+        entry.known = None; entry.learned_from = None; entry.unresolved = true;
+        Ok(())
+    }
+    pub(in crate::host) fn install_reserved(&mut self, reservation: &Reservation, instance: uuid::Uuid) -> Result<(), ProtocolError> {
+        if !self.matches_reservation(reservation) { return Err(unavailable("The native publication reservation changed before installation")); }
+        let entry = self.entries.get_mut(&reservation.id).expect("same lock");
+        if entry.pending_handoff.is_some() { return Err(unavailable("A pending exact handoff cannot be overwritten by native installation")); }
+        entry.instance = instance; entry.resource_epoch = uuid::Uuid::new_v4();
+        entry.unresolved = false; entry.learned_from = None; entry.known = None;
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(in crate::host) fn installed(&mut self, id: TerminalId, instance: uuid::Uuid) -> Result<(), ProtocolError> {
+        let reservation = self.mutating(id)?;
+        self.install_reserved(&reservation, instance)
+    }
+    pub(super) fn retain_resource_epoch(&mut self, id: TerminalId) -> Result<uuid::Uuid, ProtocolError> {
+        self.ensure(id)?;
+        Ok(self.entries[&id].resource_epoch)
     }
     pub(super) fn resource_epoch(&self, id: TerminalId) -> Option<uuid::Uuid> {
         self.entries.get(&id).map(|entry| entry.resource_epoch)
     }
-
-    /// Fence even a start which creates a backend but loses its reply before
-    /// Record installation. The previous positive publication stays invalid.
-    pub(in crate::host) fn mutating(&mut self, id: TerminalId) {
-        self.retain_resource_epoch(id);
-        if let Some(entry) = self.entries.get_mut(&id) {
-            entry.resource_epoch = uuid::Uuid::new_v4();
-            entry.known = None;
-            entry.learned_from = None;
-            entry.unresolved = true;
+    #[cfg(test)]
+    pub(in crate::host) fn pressure_for_test(&mut self) {
+        for _ in 0..CAPACITY * 2 {
+            self.installed(TerminalId::new(), uuid::Uuid::new_v4()).unwrap();
         }
+        assert!(self.entries.len() <= CAPACITY);
     }
     pub(super) fn observed(
         &mut self,
@@ -271,7 +304,7 @@ pub(super) fn restarting(
     host: &SharedHost,
     id: TerminalId,
     handle: &Handle,
-) -> Result<(), ProtocolError> {
+) -> Result<Reservation, ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let instance = state
         .chats
@@ -279,12 +312,10 @@ pub(super) fn restarting(
         .filter(|r| r.handle.same_actor(handle))
         .map(|r| r.execution_instance)
         .ok_or_else(|| unavailable("Native actor changed before backend restart"))?;
-    if !state.native_sources.entries.contains_key(&id) {
-        state.native_sources.installed(id, instance);
-    }
-    state.native_sources.invalidate(id, instance)?;
+    let reservation = state.native_sources.mutating(id)?;
+    state.native_sources.entries.get_mut(&id).expect("reserved").instance = instance;
     state.chats.get_mut(&id).expect("same lock").source_binding = None;
-    Ok(())
+    Ok(reservation)
 }
 
 /// Invalidate the old publication at every actual pair mutation, including
@@ -321,6 +352,7 @@ pub(in crate::host) fn pair_changed(state: &mut HostState, id: TerminalId) {
 /// Private continuation proof captured under the lifecycle claim BEFORE the
 /// handoff's own pair mutation. It is never supplied by a client.
 pub(super) struct Continuation {
+    publication: Reservation,
     instance: uuid::Uuid,
     witness: chat::runtime::BackendIdentity,
     handle: Handle,
@@ -363,6 +395,7 @@ pub(super) fn continuation(
         .handle
         .clone();
     Ok(Continuation {
+        publication: state.native_sources.pin_existing(binding.source.id)?,
         instance: binding.execution_instance,
         witness,
         handle,
@@ -528,6 +561,9 @@ pub(super) fn claim_continuation(
 ) -> Result<(), ProtocolError> {
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.native_sources.matches_reservation(&continuation.publication) {
+            return Err(unavailable("The exact source publication reservation changed before its claim"));
+        }
         let original_pair = state
             .chats
             .get(&binding.source.id)
@@ -908,7 +944,7 @@ pub(in crate::host) fn fixture_binding(host: &SharedHost, id: TerminalId) -> Cha
             "fixture must publish an actual actor incarnation"
         );
         if !state.native_sources.entries.contains_key(&id) {
-            state.native_sources.installed(id, instance);
+            state.native_sources.installed(id, instance).unwrap();
         }
     }
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -940,7 +976,7 @@ impl BackendFixture {
     pub(crate) fn new(source: Session, handle: Handle, instance: uuid::Uuid) -> Self {
         let mut state = HostState::new(source.proof.clone().expect("authenticated fixture"));
         state.register_client(1);
-        state.native_sources.installed(source.id, instance);
+        state.native_sources.installed(source.id, instance).unwrap();
         state.chats.insert(
             source.id,
             Record {
@@ -1067,6 +1103,28 @@ mod tests {
         }
     }
     #[test]
+    fn pinned_history_capacity_refuses_new_mutation_and_same_id_replacement() {
+        let mut history = History::default();
+        let mut reservations = Vec::new();
+        for _ in 0..CAPACITY {
+            reservations.push(history.mutating(TerminalId::new()).unwrap());
+        }
+        let attempted = TerminalId::new();
+        assert!(history.mutating(attempted).unwrap_err().message.contains("capacity is reserved"));
+        assert!(!history.entries.contains_key(&attempted), "refused admission cannot publish a new resource");
+        let original = reservations[0].id;
+        let epoch = history.resource_epoch(original).unwrap();
+        assert!(history.installed(original, uuid::Uuid::new_v4()).is_err(), "same-ID installation cannot overwrite an in-flight reservation");
+        assert_eq!(history.resource_epoch(original), Some(epoch));
+        assert_eq!(history.entries.len(), CAPACITY);
+        drop(reservations.remove(0));
+        let accepted = history.mutating(attempted).unwrap();
+        assert_eq!(accepted.id, attempted);
+        assert!(!history.entries.contains_key(&original), "only released completed/unknown history may be evicted");
+        assert_eq!(history.entries.len(), CAPACITY);
+    }
+
+    #[test]
     fn binding_refresh_and_require_refuse_busy_presentation_without_holding_host() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let source = source(directory.path());
@@ -1135,7 +1193,7 @@ mod tests {
         let b = uuid::Uuid::new_v4();
         {
             let mut state = fixture.host.lock().unwrap();
-            state.native_sources.installed(source.id, b);
+            state.native_sources.installed(source.id, b).unwrap();
             let record = state.chats.get_mut(&source.id).unwrap();
             record.execution_instance = b;
             record.handle = second.0.clone();
@@ -1188,7 +1246,7 @@ mod tests {
         for _ in 0..CAPACITY {
             state
                 .native_sources
-                .installed(TerminalId::new(), uuid::Uuid::new_v4());
+                .installed(TerminalId::new(), uuid::Uuid::new_v4()).unwrap();
         }
         assert!(!state.native_sources.validates(&resolved));
         assert!(state.native_sources.entries.len() <= CAPACITY);
@@ -1760,7 +1818,7 @@ mod tests {
                 retained_binding: None,
                 terminal_native_epoch: state
                     .native_sources
-                    .retain_resource_epoch(terminal.session.id),
+                    .retain_resource_epoch(terminal.session.id).unwrap(),
                 terminal: terminal.clone(),
             };
             state.remember_terminal_handoff(receipt.clone());
@@ -1773,7 +1831,7 @@ mod tests {
         {
             let mut state = fixture.host.lock().unwrap();
             let instance = uuid::Uuid::new_v4();
-            state.native_sources.installed(native_source.id, instance);
+            state.native_sources.installed(native_source.id, instance).unwrap();
             state.chats.insert(
                 native_source.id,
                 Record {
@@ -1821,16 +1879,16 @@ mod tests {
         {
             let mut state = fixture.host.lock().unwrap();
             state.observe_terminal_worker_for_test(pending_id, pending.terminal.execution_instance);
-            pending.terminal_native_epoch = state.native_sources.retain_resource_epoch(pending_id);
+            pending.terminal_native_epoch = state.native_sources.retain_resource_epoch(pending_id).unwrap();
             state.remember_terminal_handoff(pending.clone());
             state.validate_terminal_handoff_receipt(&pending).unwrap();
-            state.native_sources.mutating(pending_id); // actual production pre-creation seam
+            state.native_sources.mutating(pending_id).unwrap(); // actual production pre-creation seam
             assert!(!state.chats.contains_key(&pending_id));
             assert!(state.validate_terminal_handoff_receipt(&pending).is_err());
             for _ in 0..CAPACITY {
                 state
                     .native_sources
-                    .retain_resource_epoch(TerminalId::new());
+                    .retain_resource_epoch(TerminalId::new()).unwrap();
             }
             assert_eq!(state.native_sources.resource_epoch(pending_id), None);
             assert!(
@@ -1890,7 +1948,7 @@ mod tests {
                 retained_binding: None,
                 terminal_native_epoch: state
                     .native_sources
-                    .retain_resource_epoch(terminal.session.id),
+                    .retain_resource_epoch(terminal.session.id).unwrap(),
                 terminal,
             };
             state.remember_terminal_handoff(receipt.clone());

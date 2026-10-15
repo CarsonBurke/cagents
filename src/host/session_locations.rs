@@ -1489,6 +1489,9 @@ mod tests {
         };
         assert!(!fixture.handle.is_completed());
         assert!(!worker.is_completed());
+        // More than two full history windows cannot discard the only exact
+        // phase after the owner applied release but its reply was lost.
+        fixture.host.lock().unwrap().native_sources.pressure_for_test();
         let response = super::super::chat::process(
             &fixture.host,
             1,

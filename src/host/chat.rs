@@ -251,7 +251,7 @@ fn issue_terminal_handoff(
     }
     let terminal_native_epoch = state
         .native_sources
-        .retain_resource_epoch(terminal.session.id);
+        .retain_resource_epoch(terminal.session.id)?;
     let receipt = crate::terminal_ipc::TerminalHandoffReceipt {
         operation: uuid::Uuid::new_v4(),
         source,
@@ -1252,13 +1252,14 @@ fn start_with_execution(
     // Adapter construction/initialization can cross provider boundaries. Fence
     // prior authority before the first such call, including failure before a
     // replacement Record can be installed. Never restore a stale old nonce.
-    {
+    let publication = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.native_sources.mutating(session.id);
+        let publication = state.native_sources.mutating(session.id)?;
         if let Some(record) = state.chats.get_mut(&session.id) {
             record.source_binding = None;
         }
-    }
+        publication
+    };
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1471,7 +1472,7 @@ fn start_with_execution(
                 },
             );
         }
-        state.native_sources.mutating(session.id);
+        state.native_sources.mutating_reserved(&publication)?;
         state.chat_spawning.insert(session.id, session.clone());
         state.inventory_generation += 1;
         source_handle
@@ -1856,7 +1857,7 @@ fn start_with_execution(
         }
         state
             .native_sources
-            .installed(id, record.execution_instance);
+            .install_reserved(&publication, record.execution_instance)?;
         state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
