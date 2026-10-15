@@ -1377,6 +1377,26 @@ fn journal_event(
     result
 }
 
+#[cfg(test)]
+pub(in crate::host) fn transfer_scheduler_events_for_test(
+    registry:&super::agent_execution::SharedRegistry,
+    path:&std::path::Path,
+)->Result<(usize,Vec<Notice>),String> {
+    let (wake,_receiver)=mpsc::channel(1);
+    let shared=Arc::new(Shared {pending:Mutex::default(),presence:Mutex::default(),snapshot:Mutex::default(),automation_receipts:Mutex::default(),wake});
+    let handle=Handle(shared.clone());
+    super::automations::transfer_notifications(registry,&handle)?;
+    let pending=std::mem::take(&mut *shared.pending.lock().unwrap());
+    let mut journal=journal::Journal::open(path)?;let mut delivered=0;
+    for event in pending.automation_events {
+        if let Some(notice)=journal_event(&mut journal,&Arc::downgrade(&shared),event,false)? {
+            journal.delivered(notice.id)?;delivered+=1;
+        }
+    }
+    super::automations::transfer_notifications(registry,&handle)?;
+    Ok((delivered,journal.list()?))
+}
+
 async fn run(
     shared: Weak<Shared>,
     host: Weak<HostLock>,

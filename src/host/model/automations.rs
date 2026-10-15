@@ -433,7 +433,7 @@ impl Registry {
             // The surviving group ID is the durable notification evidence key.
             // Reordered helper retirement can publish its first receipt late;
             // journal idempotency still delivers only one semantic skip notice.
-            queue_automation_notice(&tx,&automation,crate::notifications::Kind::AutomationSkipped,skipped_reason(&firing),&format!("skip:{}",firing.id))?;
+            queue_automation_notice(&tx,&automation,crate::notifications::Kind::AutomationSkipped,skipped_reason(&firing),&format!("skip:{}",skip_notification_group(&tx,&firing)?))?;
         }
         tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0",[]).map_err(|error|error.to_string())?;
         tx.commit().map_err(|error|error.to_string())
@@ -1033,7 +1033,7 @@ impl Registry {
                 &automation,
                 crate::notifications::Kind::AutomationSkipped,
                 "Scheduled occurrences were missed while the scheduler was unavailable",
-                &format!("skip:{}", firing.id),
+                &format!("skip:{}", skip_notification_group(&tx,&firing)?),
             )?;
         }
         automation.next = Some(next);
@@ -1728,7 +1728,7 @@ impl Registry {
                 &automation,
                 crate::notifications::Kind::AutomationSkipped,
                 skipped_reason(&firing),
-                &format!("skip:{}", firing.id),
+                &format!("skip:{}", skip_notification_group(&tx,&firing)?),
             )?;
         }
         write_automation(&tx, &automation)?;
@@ -2019,6 +2019,28 @@ fn require_unretired_request(db: &Connection, automation: Uuid, key: &str) -> Re
 
 const HISTORY_ROWS: usize = 500;
 const HISTORY_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
+/// Notification identity belongs to the earliest adjacent same-reason skip,
+/// even while that row still retains an earlier helper's cleanup authority.
+/// Merely selecting its ID never retires, rewrites or deletes that owner.
+fn skip_notification_group(tx:&Transaction<'_>,firing:&Firing)->Result<Uuid,String> {
+    if firing.missed_interval.is_some() || !matches!(firing.trigger,crate::automations::Trigger::Scheduled {..}) {return Ok(firing.id);}
+    let id:Option<String>=tx.query_row(
+        "WITH prior AS (
+            SELECT rowid AS position,id,revision,record FROM automation_firings
+            WHERE automation=?1 AND rowid<=(SELECT rowid FROM automation_firings WHERE id=?2)
+        ), boundary AS (
+            SELECT coalesce(max(position),0) AS position FROM prior
+            WHERE coalesce(json_extract(record,'$.state')='skipped'
+                AND revision=?3 AND json_extract(record,'$.skip') IS json_extract(?4,'$')
+                AND json_type(record,'$.trigger.scheduled')='object'
+                AND json_extract(record,'$.agent') IS NULL AND json_extract(record,'$.run') IS NULL
+                AND coalesce(json_extract(record,'$.release_pending'),0)=0
+                AND json_extract(record,'$.missed_interval') IS NULL,0)=0
+        ) SELECT id FROM prior WHERE position>(SELECT position FROM boundary) ORDER BY position LIMIT 1",
+        params![firing.automation.to_string(),firing.id.to_string(),firing.revision,encode(&firing.skip)?],|row|row.get(0)).optional().map_err(|error|error.to_string())?;
+    id.map(|id|id.parse::<Uuid>().map_err(|error|error.to_string())).transpose().map(|id|id.unwrap_or(firing.id))
+}
 
 fn skipped_reason(firing:&Firing)->&'static str {
     use crate::automations::SkipReason;
@@ -4502,13 +4524,24 @@ mod tests {
             let claim=registry.claim_automation(created.id,enabled.execution_revision,Some(&due),Trigger::Scheduled {occurrence:due.clone()},Some(Occurrence {due_ms:due.due_ms+60_000,local:format!("next{index}")}),false,due.due_ms).unwrap();
             registry.finish_automation_precheck(claim.firing.id,Outcome::Stopped {state:FiringState::Skipped,skip:Some(SkipReason::PrecheckExit),diagnostic:"declined".into()},due.due_ms+1).unwrap();owners.push(claim.firing);
         }
-        registry.coalesce_retired_automation_precheck(owners[1].id,owners[1].revision).unwrap();
+        let shared_registry=std::sync::Arc::new(std::sync::Mutex::new(registry));
+        shared_registry.lock().unwrap().coalesce_retired_automation_precheck(owners[1].id,owners[1].revision).unwrap();
+        let journal_directory=tempfile::tempdir().unwrap();let journal=journal_directory.path().join("notifications.sqlite3");
+        let (delivered,first_notice)=crate::host::notifications::transfer_scheduler_events_for_test(&shared_registry,&journal).unwrap();
+        assert_eq!(delivered,1);assert!(first_notice[0].delivered);
+        assert!(shared_registry.lock().unwrap().automation_notifications().unwrap().is_empty());
+        let mut registry=shared_registry.lock().unwrap();
         assert_eq!(registry.automation_history(Some(created.id),None,100).unwrap().firings.len(),2);
         assert_eq!(registry.pending_automation_precheck_retirements(None).unwrap(),vec![(owners[0].id,owners[0].revision)],"retiring the later controller never grants a receipt to the earlier one");
         registry.coalesce_retired_automation_precheck(owners[0].id,owners[0].revision).unwrap();
         let history=registry.automation_history(Some(created.id),None,100).unwrap();assert_eq!(history.firings.len(),1);
         assert_eq!(history.firings[0].id,owners[0].id);assert_eq!(history.firings[0].skipped_occurrences.as_ref().unwrap().count,2);
         assert!(registry.pending_automation_precheck_retirements(None).unwrap().is_empty());
+        drop(registry);
+        let (redelivered,after)=crate::host::notifications::transfer_scheduler_events_for_test(&shared_registry,&journal).unwrap();
+        assert_eq!(redelivered,0,"out-of-order retirement never republishes the same consecutive skip group");
+        assert_eq!(after,first_notice,"the original journal UUID and delivered state survive the earlier helper's later receipt");
+        assert!(shared_registry.lock().unwrap().automation_notifications().unwrap().is_empty());
     }
 
 }
