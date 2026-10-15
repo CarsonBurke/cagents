@@ -15,7 +15,9 @@ pub(super) struct State {
     page_offset: u64,
     page_loading: bool,
     review_refresh: Option<(u64, Option<(uuid::Uuid, u64, u64)>)>,
-    reading: Option<(uuid::Uuid, u64)>,
+    reading: Option<(uuid::Uuid, u64, u64, u64)>,
+    read_generation: u64,
+    review_stale: bool,
     deciding: bool,
     generation: u64,
     focus: usize,
@@ -38,6 +40,8 @@ pub enum Action {
     Loaded {
         id: uuid::Uuid,
         revision: u64,
+        read_generation: u64,
+        watch_epoch: u64,
         result: Arc<Result<Proposal, String>>,
     },
     Open {
@@ -136,6 +140,14 @@ impl Cagents {
         state.watch_epoch = state.watch_epoch.wrapping_add(1);
         state.pushed = None;
         state.review_refresh = None;
+        state.available = None;
+        state.reading = None;
+        state.read_generation = state.read_generation.wrapping_add(1);
+        if state.proposal.is_some() {
+            state.review_stale = true;
+            state.generation = state.generation.wrapping_add(1);
+            state.deciding = false;
+        }
         state.page_generation = state.page_generation.wrapping_add(1);
         state.page_loading = false;
     }
@@ -143,6 +155,17 @@ impl Cagents {
     pub(super) fn sync_automation_proposal_page(&mut self, identity: uuid::Uuid, sequence: u64, total: u64, pending: Vec<ProposalSummary>) -> Task<Message> {
         let key = (identity, sequence, self.automation_approval.watch_epoch);
         if self.automation_approval.pushed == Some(key) { return Task::none(); }
+        if self.automation_approval.pushed.is_some_and(|previous| previous.0 != identity) {
+            let state = &mut self.automation_approval;
+            state.available = None;
+            state.reading = None;
+            state.read_generation = state.read_generation.wrapping_add(1);
+            if state.proposal.is_some() {
+                state.review_stale = true;
+                state.generation = state.generation.wrapping_add(1);
+                state.deciding = false;
+            }
+        }
         self.automation_approval.pushed = Some(key);
         self.automation_approval.total = total;
         self.automation_approval.page_generation = self.automation_approval.page_generation.wrapping_add(1);
@@ -263,7 +286,7 @@ impl Cagents {
                     self.automation_approval.available = None;
                 }
                 if !self.automation_approval.deciding
-                    && self
+                    && (self.automation_approval.review_stale || self
                         .automation_approval
                         .proposal
                         .as_ref()
@@ -271,7 +294,7 @@ impl Cagents {
                             !self.automation_approval.pending.iter().any(|summary| {
                                 summary.id == proposal.id && summary.revision == proposal.revision
                             })
-                        })
+                        }))
                 {
                     // A bounded/queued watch packet is discovery, not a private
                     // decision receipt. An exact read also fences a packet that
@@ -326,8 +349,14 @@ impl Cagents {
                     Ok(receipt) => {
                         let mut expected = expected.clone();
                         expected.state = receipt.state.clone();
-                        if &expected == receipt && receipt.state != ProposalState::Pending {
-                            return self.retire_automation_approval();
+                        if &expected == receipt {
+                            if receipt.state != ProposalState::Pending {
+                                return self.retire_automation_approval();
+                            }
+                            self.automation_approval.review_stale = false;
+                        } else {
+                            self.automation_approval.review_stale = true;
+                            self.status = Some(TransientNotice::warning("The request changed; dismiss this review and reopen it before deciding."));
                         }
                     }
                     Err(_) => self.status = Some(TransientNotice::warning("The request could not be refreshed; its decision remains unresolved.")),
@@ -337,9 +366,12 @@ impl Cagents {
             Action::Loaded {
                 id,
                 revision,
+                read_generation,
+                watch_epoch,
                 result,
             } => {
-                if self.automation_approval.reading != Some((id, revision)) {
+                if self.automation_approval.reading != Some((id, revision, read_generation, watch_epoch))
+                    || self.automation_approval.watch_epoch != watch_epoch {
                     return Task::none();
                 }
                 self.automation_approval.reading = None;
@@ -394,10 +426,10 @@ impl Cagents {
                     .filter(|proposal| proposal.id == id && proposal.revision == revision)
                     .cloned();
                 let Some(proposal) = proposal else {
-                    if self.automation_approval.reading.is_some() {
-                        return Task::none();
-                    }
-                    self.automation_approval.reading = Some((id, revision));
+                    self.automation_approval.read_generation = self.automation_approval.read_generation.wrapping_add(1);
+                    let read_generation = self.automation_approval.read_generation;
+                    let watch_epoch = self.automation_approval.watch_epoch;
+                    self.automation_approval.reading = Some((id, revision, read_generation, watch_epoch));
                     return cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             let socket = crate::terminal::ensure_daemon_ready()
@@ -420,6 +452,8 @@ impl Cagents {
                         Message::AutomationApproval(Action::Loaded {
                             id,
                             revision,
+                            read_generation,
+                            watch_epoch,
                             result: Arc::new(result),
                         })
                     });
@@ -428,6 +462,7 @@ impl Cagents {
                     self.automation_approval.generation.wrapping_add(1);
                 self.automation_approval.reading = None;
                 self.automation_approval.proposal = Some(proposal);
+                self.automation_approval.review_stale = false;
                 self.automation_approval.focus = 0;
                 self.automation_approval.error = None;
                 self.automation_approval.restore_keyboard_nav = Some(self.core.keyboard_nav());
@@ -440,7 +475,7 @@ impl Cagents {
                 generation,
                 approved,
             } => {
-                if !self.approval_user_action_matches(id, revision, generation) {
+                if self.automation_approval.review_stale || !self.approval_user_action_matches(id, revision, generation) {
                     return Task::none();
                 }
                 let state = &mut self.automation_approval;
@@ -642,6 +677,9 @@ impl Cagents {
                 precheck.timeout_seconds, precheck.command
             )));
         }
+        if state.review_stale {
+            content = content.push(notice_detail("Rechecking this request after reconnect. Dismiss and reopen to retry if it remains unavailable."));
+        }
         if let Some(error) = &state.error {
             content = content.push(notice_detail(error));
         }
@@ -667,11 +705,11 @@ impl Cagents {
                 .into(),
             crate::ui_controls::button::secondary("Decline")
                 .id(widget::Id::new("automation-approval.decline"))
-                .on_press_maybe((!state.deciding).then(|| decision(false)))
+                .on_press_maybe((!state.deciding && !state.review_stale).then(|| decision(false)))
                 .into(),
             crate::ui_controls::button::primary("Approve and enable")
                 .id(widget::Id::new("automation-approval.approve"))
-                .on_press_maybe((!state.deciding).then(|| decision(true)))
+                .on_press_maybe((!state.deciding && !state.review_stale).then(|| decision(true)))
                 .into(),
         ]);
         let surface = widget::column::with_children(vec![
@@ -846,6 +884,8 @@ mod tests {
         drop(app.update_automation_approval(Action::Loaded {
             id: absent,
             revision: 1,
+            read_generation: app.automation_approval.read_generation,
+            watch_epoch: app.automation_approval.watch_epoch,
             result: Arc::new(Err("The request no longer exists".into())),
         }));
         drop(app.update_automation_approval(Action::Open {
@@ -859,6 +899,8 @@ mod tests {
         let task = app.update_automation_approval(Action::Loaded {
             id: proposal.id,
             revision: proposal.revision,
+            read_generation: app.automation_approval.read_generation,
+            watch_epoch: app.automation_approval.watch_epoch,
             result: Arc::new(Ok(proposal.clone())),
         });
         assert!(app.modal_is_open());
@@ -879,6 +921,8 @@ mod tests {
         drop(app.update_automation_approval(Action::Loaded {
             id: proposal.id,
             revision: proposal.revision,
+            read_generation: app.automation_approval.read_generation,
+            watch_epoch: app.automation_approval.watch_epoch,
             result: Arc::new(Ok(proposal)),
         }));
         assert!(!app.automation_approval_open());
@@ -898,6 +942,8 @@ mod tests {
         drop(app.update_automation_approval(Action::Loaded {
             id: proposal.id,
             revision: proposal.revision,
+            read_generation: app.automation_approval.read_generation,
+            watch_epoch: app.automation_approval.watch_epoch,
             result: Arc::new(Ok(proposal.clone())),
         }));
         assert!(app.automation_approval_open());
@@ -913,6 +959,8 @@ mod tests {
         drop(app.update_automation_approval(Action::Loaded {
             id: proposal.id,
             revision: proposal.revision,
+            read_generation: app.automation_approval.read_generation,
+            watch_epoch: app.automation_approval.watch_epoch,
             result: Arc::new(Ok(proposal)),
         }));
         assert!(!app.automation_approval_open());
@@ -1166,9 +1214,78 @@ mod tests {
         let mut stale = proposal.clone(); stale.state=ProposalState::Declined;
         drop(app.update_automation_approval(Action::ReviewRefreshed {generation:review,pushed:old_push,result:Arc::new(Ok(stale))}));
         assert!(app.automation_approval_open(),"old daemon receipt cannot retire the current review");
-        drop(app.update_automation_approval(Action::ReviewRefreshed {generation:review,pushed:new_push,result:Arc::new(Ok(proposal))}));
+        let current_review = app.automation_approval.generation;
+        drop(app.update_automation_approval(Action::ReviewRefreshed {generation:current_review,pushed:new_push,result:Arc::new(Ok(proposal))}));
         assert!(app.automation_approval_open());
         assert!(app.automation_approval.review_refresh.is_none());
+    }
+
+    #[test]
+    fn ordinary_proposal_loads_are_fenced_across_reconnect_and_repeated_open() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        let open = Action::Open { id: proposal.id, revision: proposal.revision };
+        drop(app.update(Message::AutomationApproval(open.clone())));
+        let old_read = app.automation_approval.read_generation;
+        let old_epoch = app.automation_approval.watch_epoch;
+        app.automation_proposals_reconnected();
+        drop(app.update(Message::AutomationApproval(Action::Loaded {
+            id: proposal.id, revision: proposal.revision,
+            read_generation: old_read, watch_epoch: old_epoch,
+            result: Arc::new(Ok(proposal.clone())),
+        })));
+        assert!(!app.automation_approval_open());
+        assert!(app.automation_approval.available.is_none());
+        drop(app.update(Message::AutomationApproval(open.clone())));
+        let first_read = app.automation_approval.read_generation;
+        let epoch = app.automation_approval.watch_epoch;
+        drop(app.update(Message::AutomationApproval(open)));
+        let current_read = app.automation_approval.read_generation;
+        assert_ne!(first_read, current_read);
+        drop(app.update(Message::AutomationApproval(Action::Loaded {
+            id: proposal.id, revision: proposal.revision,
+            read_generation: first_read, watch_epoch: epoch,
+            result: Arc::new(Ok(proposal.clone())),
+        })));
+        assert!(!app.automation_approval_open());
+        assert!(app.automation_approval.reading.is_some());
+        drop(app.update(Message::AutomationApproval(Action::Loaded {
+            id: proposal.id, revision: proposal.revision,
+            read_generation: current_read, watch_epoch: epoch,
+            result: Arc::new(Ok(proposal.clone())),
+        })));
+        assert!(app.automation_approval_open());
+        drop(app.cancel_automation_approval());
+        assert!(app.automation_approval.available.is_some());
+        app.automation_proposals_reconnected();
+        assert!(app.automation_approval.available.is_none(), "cached consent cannot cross a reconnect");
+    }
+
+    #[test]
+    fn replacement_registry_requires_private_consent_even_when_summary_matches() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        let identity = uuid::Uuid::new_v4();
+        drop(app.sync_automation_proposal_page(identity, 1, 1, vec![ProposalSummary::from(&proposal)]));
+        app.automation_approval.available = Some(proposal.clone());
+        drop(app.update(Message::AutomationApproval(Action::Open { id: proposal.id, revision: proposal.revision })));
+        let previous_generation = app.automation_approval.generation;
+        drop(app.sync_automation_proposal_page(uuid::Uuid::new_v4(), 1, 1, vec![ProposalSummary::from(&proposal)]));
+        assert!(app.automation_approval.review_stale);
+        assert!(app.automation_approval.review_refresh.is_some(), "same summary cannot qualify the new registry");
+        let generation = app.automation_approval.generation;
+        assert_ne!(previous_generation, generation);
+        drop(app.update(Message::AutomationApproval(Action::Decide { id: proposal.id, revision: proposal.revision, generation, approved: true })));
+        assert!(!app.automation_approval.deciding);
+        drop(app.update(Message::AutomationApproval(Action::ReviewRefreshed { generation, pushed: app.automation_approval.pushed, result: Arc::new(Err("unavailable".into())) })));
+        assert!(app.automation_approval.review_stale);
+        drop(app.refresh_automation_approval_review());
+        drop(app.update(Message::AutomationApproval(Action::ReviewRefreshed { generation, pushed: app.automation_approval.pushed, result: Arc::new(Ok(proposal.clone())) })));
+        assert!(!app.automation_approval.review_stale);
+        drop(app.update(Message::AutomationApproval(Action::Decide { id: proposal.id, revision: proposal.revision, generation: previous_generation, approved: true })));
+        assert!(!app.automation_approval.deciding);
+        drop(app.update(Message::AutomationApproval(Action::Decide { id: proposal.id, revision: proposal.revision, generation, approved: true })));
+        assert!(app.automation_approval.deciding);
     }
 
 }
