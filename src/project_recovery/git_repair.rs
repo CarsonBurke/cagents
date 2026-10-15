@@ -102,6 +102,16 @@ fn repair_config_pinned(relocation:&Relocation,root:&Directory,common:&Directory
 /// Prepared before any metadata write. Every edit and directory pin remains
 /// owned by the exact project operation until its model commit is settled.
 /// A retry advances this plan's cursor, without discovering new admin paths.
+/// Original directory pins prepared before Git repair. Paths are immutable
+/// diagnostic/record-role hints only; the SAME File Arc is the physical object.
+/// This observer does not authorize repair, adoption, start or a current path.
+pub(crate) struct OriginalRepairDirectory {
+    pub(crate) path:PathBuf,
+    pub(crate) directory:std::sync::Arc<std::fs::File>,
+}
+impl From<(PathBuf,std::sync::Arc<std::fs::File>)> for OriginalRepairDirectory {
+    fn from((path,directory):(PathBuf,std::sync::Arc<std::fs::File>))->Self {Self{path,directory}}
+}
 pub(crate) struct RepairPlan {
     root: Directory,
     common: Directory,
@@ -156,6 +166,16 @@ impl RepairPlan {
         self.root.require_current()?;self.common.require_current()?;
         for edit in &self.edits {edit.require_current()?;}
         Ok(())
+    }
+    /// These only clone already-owned Arc handles: no FD duplication, locking,
+    /// filesystem work, opening a pathname, or fresh discovery on retry.
+    pub(crate) fn original_selected_directory(&self)->OriginalRepairDirectory {self.root.original().into()}
+    pub(crate) fn original_common_directory(&self)->OriginalRepairDirectory {self.common.original().into()}
+    /// Exact parents of prepared metadata edits, which may be linked checkout
+    /// roots OR private admin dirs. Do not infer an admin role from a basename.
+    /// Duplicates intentionally retain their same original Arc, not new pins.
+    pub(crate) fn original_edit_directories(&self)->Vec<OriginalRepairDirectory> {
+        self.edits.iter().map(|edit|edit.original_directory().into()).collect()
     }
     pub(crate) fn retained_bytes(&self)->usize {self.bytes}
     pub(crate) fn retained_directories(&self)->usize {self.edits.len()+2}
