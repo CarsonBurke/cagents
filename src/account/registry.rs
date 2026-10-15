@@ -927,8 +927,9 @@ impl Store {
                 write(&self.directory, &self.path(), &registry)
             });
         if let Err(error) = result {
-            let _ = homes.remove(provider, key);
-            return Err(error);
+            // A failed/durable-unknown registry write cannot authorize file
+            // destruction. Preserve both the original spelling and contents.
+            return Err(io::Error::new(error.kind(), format!("Account registration failed; files were retained at {} for explicit recovery: {error}", home.display())));
         }
         Ok((key, home))
     }
@@ -967,6 +968,7 @@ impl Store {
 
     /// Short ownership/registration transaction. Tree sweeping belongs outside
     /// daemon admission and does not make the parked name launchable again.
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn park_home_checked(
         &self,
         homes: &Homes,
@@ -1162,6 +1164,27 @@ mod tests {
             .environment
             .insert("CLAUDE_CONFIG_DIR".into(), home.to_str().unwrap().into());
         recipe
+    }
+
+    #[test]
+    fn pending_registration_failure_retains_the_original_created_directory() {
+        let temporary=tempfile::tempdir().unwrap();
+        let store=Store::at(temporary.path().join("config"));
+        let homes=Homes::at(temporary.path().join("accounts"));
+        let mut registry=Registry::default();registry.revision=u64::MAX;
+        fs::create_dir_all(&store.directory).unwrap();
+        write(&store.directory,&store.path(),&registry).unwrap();
+        let mut created=None;
+        let error=store.create_pending(&homes,Provider::Claude,1,|| {
+            let (key,path)=homes.create(Provider::Claude,None)?;
+            fs::write(path.join("keep"),b"created content")?;
+            created=Some(path.clone());Ok((key,path))
+        }).unwrap_err();
+        assert!(error.to_string().contains("retained"));
+        let created=created.unwrap();
+        assert_eq!(fs::read(created.join("keep")).unwrap(),b"created content");
+        assert!(Uuid::parse_str(created.file_name().unwrap().to_str().unwrap()).is_ok());
+        assert_eq!(store.load().unwrap().revision,u64::MAX);
     }
 
     #[test]

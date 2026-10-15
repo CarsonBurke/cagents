@@ -48,9 +48,11 @@ use std::{
     fs, io,
     io::{Read, Write},
     path::{Path, PathBuf},
-    os::{fd::AsRawFd, unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt}}},
     time::Duration,
 };
+
+#[cfg(any(feature = "host", test))]
+use std::os::{fd::AsRawFd, unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt}}};
 
 use uuid::Uuid;
 
@@ -59,6 +61,7 @@ use crate::agent::Provider;
 /// Where a removal parks a home while it is deleted, so a removal that is
 /// interrupted leaves the files intact; a later loader must not infer that
 /// no actor can still use that inode.
+#[cfg(any(feature = "host", test))]
 const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -93,6 +96,7 @@ pub struct Homes {
 
 /// Exact current-operation retirement, never reconstructed from a parked name.
 /// Both descriptors survive pathname replacement and are held until cleanup.
+#[cfg(any(feature = "host", test))]
 #[derive(Debug)]
 pub(crate) struct ParkedRemoval {
     #[cfg(feature = "host")]
@@ -104,6 +108,7 @@ pub(crate) struct ParkedRemoval {
     name: std::ffi::OsString,
 }
 
+#[cfg(any(feature = "host", test))]
 impl ParkedRemoval {
     #[cfg(feature = "host")]
     pub(crate) fn account(&self) -> (Provider, Uuid) { (self.provider, self.key) }
@@ -131,15 +136,18 @@ impl ParkedRemoval {
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn descriptor_path(file: &fs::File) -> PathBuf {
     PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
 }
 
+#[cfg(any(feature = "host", test))]
 fn open_directory(path: &Path) -> io::Result<fs::File> {
     fs::OpenOptions::new().read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)
 }
 
+#[cfg(any(feature = "host", test))]
 fn require_same_directory(file: &fs::File, path: &Path) -> io::Result<()> {
     let held = file.metadata()?;
     let named = fs::symlink_metadata(path)?;
@@ -149,6 +157,7 @@ fn require_same_directory(file: &fs::File, path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn unlink_entry(parent: &fs::File, name: &std::ffi::OsStr, flags: libc::c_int) -> io::Result<()> {
     let name = std::ffi::CString::new(name.as_bytes())
         .map_err(|_| io::Error::other("Account entry contains a zero byte"))?;
@@ -159,6 +168,7 @@ fn unlink_entry(parent: &fs::File, name: &std::ffi::OsStr, flags: libc::c_int) -
     Ok(())
 }
 
+#[cfg(any(feature = "host", test))]
 fn open_child_without_mounts(parent: &fs::File, name: &std::ffi::OsStr) -> io::Result<fs::File> {
     #[cfg(target_os = "linux")]
     {
@@ -185,6 +195,7 @@ fn open_child_without_mounts(parent: &fs::File, name: &std::ffi::OsStr) -> io::R
     }
 }
 
+#[cfg(any(feature = "host", test))]
 fn remove_contents(directory: &fs::File, depth: usize, remaining: &mut usize) -> io::Result<()> {
     if depth > 256 { return Err(io::Error::other("Account tree exceeds the cleanup depth bound")); }
     let anchored = descriptor_path(directory);
@@ -290,8 +301,9 @@ impl Homes {
                 _ => Ok(()),
             };
             if let Err(error) = seeded {
-                let _ = self.remove(provider, key);
-                return Err(error);
+                // A newly visible UUID directory can already have a physical
+                // alias. Failure/absence of registration is not retirement.
+                return Err(io::Error::new(error.kind(), format!("Account setup failed; files were retained at {} for explicit recovery: {error}", path.display())));
             }
             link_shared(provider, system_home, &path);
         }
@@ -300,6 +312,7 @@ impl Homes {
 
     /// Deletes the home of account `key`. A home that is already gone is not
     /// an error: removing an account twice leaves it just as removed.
+    #[cfg(test)]
     pub fn remove(&self, provider: Provider, key: Uuid) -> io::Result<()> {
         if let Some(parked) = self.park(provider, key)? {
             parked.finish()?;
@@ -309,6 +322,7 @@ impl Homes {
 
     /// Rename under the lifecycle/registry locks; delete the parked tree only
     /// after releasing them, since provider caches can be large.
+    #[cfg(any(feature = "host", test))]
     pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<ParkedRemoval>> {
         #[cfg(not(target_os = "linux"))]
         {
@@ -636,18 +650,23 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_seed_removes_the_unregistered_home() {
+    fn a_failed_seed_retains_the_new_home_and_any_completed_configuration() {
         let directory = tempfile::tempdir().unwrap();
         let system = directory.path().join("system");
-        fs::create_dir_all(system.join("settings.json")).unwrap();
+        fs::create_dir_all(&system).unwrap();
+        let settings=b"{\"theme\":\"fixture\"}";
+        fs::write(system.join("settings.json"),settings).unwrap();
+        for source in [system.join(".claude.json"),directory.path().join(".claude.json")] {
+            fs::write(source,r#"{"mcpServers":"private-fixture"}"#).unwrap();
+        }
         let homes = Homes::at(directory.path().join("accounts"));
-        assert!(homes.create(Provider::Claude, Some(&system)).is_err());
-        assert_eq!(
-            fs::read_dir(directory.path().join("accounts/claude"))
-                .unwrap()
-                .count(),
-            0
-        );
+        let error=homes.create(Provider::Claude, Some(&system)).unwrap_err();
+        assert!(error.to_string().contains("retained"));
+        assert!(!error.to_string().contains("private-fixture"));
+        let retained=fs::read_dir(directory.path().join("accounts/claude")).unwrap().collect::<Result<Vec<_>,_>>().unwrap();
+        assert_eq!(retained.len(),1);
+        assert!(Uuid::parse_str(retained[0].file_name().to_str().unwrap()).is_ok());
+        assert_eq!(fs::read(retained[0].path().join("settings.json")).unwrap(),settings);
     }
 
     #[test]
