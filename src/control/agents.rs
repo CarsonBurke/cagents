@@ -190,7 +190,7 @@ pub struct ShowArgs {
 pub(super) fn parse_provider(value: &str) -> Result<Provider, String> {
     Provider::ALL
         .into_iter()
-        .find(|provider| provider.executable() == value)
+        .find(|provider| provider.executable().eq_ignore_ascii_case(value))
         .ok_or_else(|| "Choose omp, claude, or codex".into())
 }
 
@@ -1451,6 +1451,18 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readable_provider_flags_accept_cli_and_legacy_json_casing() {
+        for (name, expected) in [("claude", Provider::Claude), ("Claude", Provider::Claude),
+            ("CLAUDE", Provider::Claude), ("CoDeX", Provider::Codex), ("Omp", Provider::Omp)] {
+            let parsed = Cli::try_parse_from(["cagents", "account", "list", "--provider", name]).unwrap();
+            assert!(matches!(parsed.command, TopCommand::Account {
+                command: crate::control::AccountCommand::List { provider: Some(provider) }
+            } if provider == expected));
+        }
+        assert!(parse_provider("unknown").is_err());
+    }
 
     #[test]
     fn wait_contract_has_one_shape_and_outcome_exit_codes() {
