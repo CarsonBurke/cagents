@@ -47,15 +47,34 @@ pub(super) fn run_isolated_case(case: &str) -> bool {
     true
 }
 
+// This subprocess owns a static test topology. It has no production issuer or
+// retirement task; real counted guards still fence its explicit sealed state.
+#[derive(Default)]
+struct CreationState { sealed: bool, in_flight: usize }
+struct CreationGuard(Arc<Mutex<CreationState>>);
+impl Drop for CreationGuard {
+    fn drop(&mut self) {
+        let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.in_flight = state.in_flight.checked_sub(1).expect("one creation admission per guard");
+    }
+}
+
 struct OwnedLease {
     _outside: tempfile::TempDir,
     payloads: Mutex<Vec<Root>>,
+    creation: Arc<Mutex<CreationState>>,
 }
 const MAX_PAYLOADS: usize = 16;
 impl RecoveryRegistrationLease for OwnedLease {
     fn validate(&self) -> io::Result<()> {
         for root in self.payloads.lock().map_err(|_| io::Error::other("fixture lease poisoned"))?.iter() { root.metadata()?; }
         Ok(())
+    }
+    fn begin_payload_creation(&self) -> io::Result<Arc<dyn Send + Sync>> {
+        let mut state = self.creation.lock().map_err(|_| io::Error::other("fixture creation state poisoned"))?;
+        if state.sealed { return Err(io::Error::other("fixture creation admission sealed")); }
+        state.in_flight = state.in_flight.checked_add(1).ok_or_else(|| io::Error::other("fixture admission count exhausted"))?;
+        Ok(Arc::new(CreationGuard(self.creation.clone())))
     }
     fn descriptor_budget(&self) -> usize { MAX_PAYLOADS }
     fn register_payload(&self, payload: &Root) -> io::Result<()> {
@@ -78,7 +97,7 @@ pub(super) fn context(path: &Path) -> FilesystemRecoveryContext {
     let protection = Arc::new(Some(cagents::worktree_cleanup::protect_operation(&source).unwrap()));
     let outside = tempfile::Builder::new().prefix("cagents-integration-payload-").tempdir_in(path.parent().unwrap()).unwrap();
     let outside_root = Arc::new(Root::open(outside.path()).unwrap());
-    let lease = Arc::new(OwnedLease { _outside: outside, payloads: Mutex::new(Vec::new()) });
+    let lease = Arc::new(OwnedLease { _outside: outside, payloads: Mutex::new(Vec::new()), creation: Arc::default() });
     // The fixture owns the entire fresh source topology. This test-only owned
     // lease does not claim daemon registration/adoption exclusion coverage.
     let placement = RecoveryPlacement::acquire(outside_root, source.clone(), Arc::from([source.clone()]), RecoveryRegistryCheck::from_lease(lease)).unwrap();
