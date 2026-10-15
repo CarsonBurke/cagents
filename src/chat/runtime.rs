@@ -88,6 +88,12 @@ pub(crate) enum Update {
         update: crate::agent_execution::Update,
     },
     Attention(crate::notifications::Evidence),
+    /// Immutable same-frame context; optional only when the frame context
+    /// budget is exhausted. Never resample a later Snapshot for this outcome.
+    AttentionContext {
+        evidence: crate::notifications::Evidence,
+        content: Option<crate::notifications::Content>,
+    },
     Presentation,
     Observed {
         generation: u64,
@@ -370,6 +376,7 @@ impl Handle {
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
+                    waiting_fingerprint: None,
                     last_present: Instant::now(),
                     first_frame: false,
                     started: Instant::now(),
@@ -425,9 +432,11 @@ impl Handle {
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
-                    let attention = (!actor.attention.settled && !preserve_holder).then(|| crate::notifications::Evidence {
+                    let attention = (!actor.attention.settled && !preserve_holder).then(|| {
+                        crate::notifications::Evidence {
                             key: actor.attention.key.clone(),
                             kind: crate::notifications::Kind::Failed,
+                        }
                     });
                     *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     let stderr =
@@ -443,7 +452,9 @@ impl Handle {
                     });
                     // Publish the bounded diagnosis before attention samples
                     // it, while keeping retained native outcomes unconfirmed.
-                    if let Some(evidence) = attention { (actor.notify)(Update::Attention(evidence)); }
+                    if let Some(evidence) = attention {
+                        actor.publish_current_attention(evidence);
+                    }
                 }
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
@@ -734,8 +745,15 @@ impl Handle {
             .clone()
     }
     /// Bounded resident metadata only; never reads or hydrates transcript pages.
-    pub(crate) fn notification_content(&self, kind: crate::notifications::Kind) -> crate::notifications::Content {
-        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).notification_content(kind)
+    pub(crate) fn notification_content(
+        &self,
+        kind: crate::notifications::Kind,
+    ) -> crate::notifications::Content {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notification_content(kind)
     }
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
         let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
@@ -1548,6 +1566,7 @@ struct Actor {
     attention: TurnAttention,
     execution: execution::Tracker,
     attention_baselined: bool,
+    waiting_fingerprint: Option<String>,
     last_present: Instant,
     first_frame: bool,
     started: Instant,
@@ -2218,6 +2237,11 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
+        let frame_context = {
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            super::notification::FrameContext::capture(&state)
+        };
+        let mut frame_contents = frame_context.project(&step.events);
         for event in step.events {
             if let Event::Execution { run, event } = event {
                 if let crate::agent_execution::ProviderEvent::Started { key } = event {
@@ -2249,7 +2273,8 @@ impl Actor {
             // their bounded live excerpt before that boundary, without ever
             // hydrating the page a window happens to be reading.
             if matches!(&event, Event::Item(_) | Event::TextDelta { .. }) {
-                self.state.lock().unwrap_or_else(|p| p.into_inner()).notification_preview.observe(&event);
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                Arc::make_mut(&mut state.notification_preview).observe(&event);
             }
             let events = self
                 .store
@@ -2260,7 +2285,10 @@ impl Actor {
                 self.touch();
             } else {
                 for event in events {
-                    self.apply(event);
+                    let content = matches!(&event, Event::TurnFinished { .. })
+                        .then(|| frame_contents.pop_front())
+                        .flatten();
+                    self.apply_with_attention(event, content);
                 }
             }
             if self.retained > STATE_LIMIT {
@@ -2306,13 +2334,31 @@ impl Actor {
         self.publish_activity();
         Ok(())
     }
+    fn publish_current_attention(&self, evidence: crate::notifications::Evidence) {
+        let content = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notification_content(evidence.kind);
+        (self.notify)(Update::AttentionContext {
+            evidence,
+            content: Some(content),
+        });
+    }
     fn apply(&mut self, event: Event) {
+        self.apply_with_attention(event, None);
+    }
+    fn apply_with_attention(
+        &mut self,
+        event: Event,
+        content: Option<crate::notifications::Content>,
+    ) {
         if matches!(
             event,
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
         ) {
             if let Some(evidence) = self.attention.apply(&event) {
-                (self.notify)(Update::Attention(evidence));
+                (self.notify)(Update::AttentionContext { evidence, content });
             }
             if !matches!(event, Event::TurnStarted) {
                 return;
@@ -2360,21 +2406,32 @@ impl Actor {
         }
         let activity = state.activity();
         let generation = state.generation;
+        let waiting_fingerprint = if activity == ActivityState::Waiting {
+            state.waiting_fingerprint()
+        } else {
+            None
+        };
+        let waiting_changed = waiting_fingerprint != self.waiting_fingerprint;
+        self.waiting_fingerprint = waiting_fingerprint;
         let became_ready = state.ready && !self.ready;
         self.ready = state.ready;
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
-        if activity != self.activity {
+        let activity_changed = activity != self.activity;
+        if activity_changed {
             self.activity = activity;
             if let Some((run, update)) = self.execution.activity(activity) {
                 (self.notify)(Update::Execution { run, update });
             }
-            if activity == ActivityState::Waiting && baselined {
-                (self.notify)(Update::Attention(crate::notifications::Evidence {
-                    key: format!("{}:waiting:{generation}", self.attention.key),
-                    kind: crate::notifications::Kind::Waiting,
-                }));
-            }
+        }
+        if activity == ActivityState::Waiting && baselined && (activity_changed || waiting_changed)
+        {
+            self.publish_current_attention(crate::notifications::Evidence {
+                key: format!("{}:waiting:{generation}", self.attention.key),
+                kind: crate::notifications::Kind::Waiting,
+            });
+        }
+        if activity_changed {
             (self.notify)(Update::Activity {
                 state: activity,
                 generation,
@@ -2505,7 +2562,7 @@ fn recover_history_error(
 }
 
 fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event) {
-    state.notification_preview.observe(&event);
+    Arc::make_mut(&mut state.notification_preview).observe(&event);
     let latest_history = matches!(&event, Event::LatestHistory { .. });
     let child_changed = matches!(
         &event,
@@ -3022,6 +3079,87 @@ fn trim_subagent(agent: &mut Subagent) {
         let removed = agent.items.remove(0);
         bytes = bytes.saturating_sub(removed.content.byte_len());
     }
+}
+
+/// Exercise a real protocol adapter through the live actor/store callback,
+/// sampling content at attention publication rather than after the command.
+#[cfg(test)]
+pub(crate) fn notification_frame_for_test(
+    adapter: Box<dyn Adapter>,
+    frame: Value,
+    fail_store: bool,
+) -> (
+    crate::notifications::Evidence,
+    crate::notifications::Content,
+) {
+    struct Frame {
+        adapter: Box<dyn Adapter>,
+        frame: Option<Value>,
+    }
+    impl Adapter for Frame {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![Event::Ready(true), Event::TurnStarted],
+                ..Default::default()
+            })
+        }
+        fn command(&mut self, _: Command) -> Result<Step, String> {
+            self.adapter
+                .receive(self.frame.take().ok_or("fixture frame consumed")?)
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let spec = ProcessSpec {
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: vec![],
+        working_directory: directory.path().into(),
+        environment: BTreeMap::new(),
+    };
+    let mut adapter: Box<dyn Adapter> = Box::new(Frame {
+        adapter,
+        frame: Some(frame),
+    });
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let (send, receive) = crossbeam_channel::bounded(4);
+    let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        if let Update::AttentionContext { evidence, content } = update {
+            let _ = send.try_send((
+                evidence,
+                content.expect("fixture fits the bounded frame context budget"),
+            ));
+        }
+    })
+    .unwrap();
+    handle.check_update_readiness().unwrap();
+    if fail_store {
+        handle.0.store.lock().unwrap().read_only_for_test().unwrap();
+    }
+    let command = handle.command(Command::Refresh);
+    let receipt = receive.recv_timeout(Duration::from_secs(2));
+    let closed = handle.close();
+    if fail_store {
+        let error = command.expect_err("readonly SQLite must reject the final item");
+        assert!(
+            error.contains("readonly") || error.contains("read-only"),
+            "unexpected injected store failure: {error}"
+        );
+    } else {
+        command.unwrap();
+    }
+    closed.unwrap();
+    assert!(
+        handle.is_completed(),
+        "real fixture process teardown must still be proved"
+    );
+    receipt.expect("real adapter must publish an outcome through the actor")
 }
 
 #[cfg(test)]
@@ -4498,33 +4636,114 @@ mod tests {
         struct NotificationFixture(usize);
         impl Adapter for NotificationFixture {
             fn initialize(&mut self) -> Result<Step, String> {
-                Ok(Step { events: vec![Event::Ready(true)], ..Default::default() })
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
             }
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 self.0 += 1;
                 let events = match self.0 {
                     1 => vec![
-                        Event::Session { id: "notification-fixture".into(), title: Some("Repair authentication".into()) },
+                        Event::Session {
+                            id: "notification-fixture".into(),
+                            title: Some("Repair authentication".into()),
+                        },
                         Event::TurnStarted,
-                        Event::Item(Item { id: "tool".into(), role: Role::Assistant, at: None, started_at: None,
-                            content: ItemContent::Tool { name: "test".into(), input: "private arguments".into(), output: "raw-tool-garbage".repeat(10000), status: ToolStatus::Succeeded } }),
-                        Event::TextDelta { id: "answer".into(), role: Role::Assistant, thinking: false,
-                            delta: format!("## Done\nRepaired authentication.\n```sh\nraw-code-garbage\n```\nAll tests passed. {}", "More result. ".repeat(10000)) },
-                        Event::TurnFinished { key: Some("one".into()), outcome: crate::notifications::Kind::Succeeded },
+                        Event::Item(Item {
+                            id: "tool".into(),
+                            role: Role::Assistant,
+                            at: None,
+                            started_at: None,
+                            content: ItemContent::Tool {
+                                name: "test".into(),
+                                input: "private arguments".into(),
+                                output: "raw-tool-garbage".repeat(10000),
+                                status: ToolStatus::Succeeded,
+                            },
+                        }),
+                        Event::TextDelta {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            thinking: false,
+                            delta: format!(
+                                "## Done\nRepaired authentication.\n```sh\nraw-code-garbage\n```\nAll tests passed. {}",
+                                "More result. ".repeat(10000)
+                            ),
+                        },
+                        Event::TurnFinished {
+                            key: Some("one".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
                     ],
-                    2 => vec![Event::History { items: vec![text("old", "Historical answer must not notify")], has_earlier: false }],
-                    3 => vec![Event::Request(super::super::Request { kind: super::super::RequestKind::Question,
-                        id: "question".into(), title: "Migration strategy".into(), description: "Choose the migration strategy?".into(),
-                        fields: vec![super::super::Field { id: "secret".into(), label: "Secret".into(), description: String::new(), choices: vec![], multiple: false, secret: true, initial: "fixture-secret".into() }], actions: vec![] })],
+                    2 => vec![Event::History {
+                        items: vec![text("old", "Historical answer must not notify")],
+                        has_earlier: false,
+                    }],
+                    3 => vec![Event::Request(super::super::Request {
+                        kind: super::super::RequestKind::Question,
+                        id: "question".into(),
+                        title: "Migration strategy".into(),
+                        description: "Choose the migration strategy?".into(),
+                        fields: vec![super::super::Field {
+                            id: "secret".into(),
+                            label: "Secret".into(),
+                            description: String::new(),
+                            choices: vec![],
+                            multiple: false,
+                            secret: true,
+                            initial: "fixture-secret".into(),
+                        }],
+                        actions: vec![],
+                    })],
+                    4 => vec![
+                        Event::RequestResolved {
+                            id: "question".into(),
+                        },
+                        Event::TurnStarted,
+                        Event::Item(Item {
+                            id: "long-command".into(),
+                            role: Role::Assistant,
+                            at: None,
+                            started_at: None,
+                            content: ItemContent::Command {
+                                label: "Long command label ".repeat(1000),
+                                command: "private arguments".into(),
+                                working_directory: String::new(),
+                                action: super::super::CommandAction::Run,
+                                status: ToolStatus::Succeeded,
+                                exit_code: Some(0),
+                                duration_ms: None,
+                                output: "raw output".into(),
+                            },
+                        }),
+                        Event::TurnFinished {
+                            key: Some("two".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                    ],
                     _ => return Err("fixture exhausted".into()),
                 };
-                Ok(Step { events, ..Default::default() })
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
             }
-            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
         let directory = tempfile::tempdir().unwrap();
-        let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines,
-            program: "/bin/cat".into(), arguments: vec![], working_directory: directory.path().into(), environment: BTreeMap::new() };
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
         let mut adapter: Box<dyn Adapter> = Box::new(NotificationFixture(0));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
@@ -4533,16 +4752,146 @@ mod tests {
         handle.command(Command::Refresh).unwrap();
         let response = handle.notification_content(crate::notifications::Kind::Succeeded);
         assert_eq!(response.conversation, "Repair authentication");
-        assert!(response.preview.starts_with("Done Repaired authentication. All tests passed."));
+        assert!(
+            response
+                .preview
+                .starts_with("Done Repaired authentication. All tests passed.")
+        );
         assert!(!response.preview.contains("garbage"));
-        assert!(response.preview.chars().count() <= crate::notifications::presentation::PREVIEW_LIMIT);
+        assert!(
+            response.preview.chars().count() <= crate::notifications::presentation::PREVIEW_LIMIT
+        );
         handle.command(Command::Refresh).unwrap();
-        assert_eq!(handle.notification_content(crate::notifications::Kind::Succeeded), response);
+        assert_eq!(
+            handle.notification_content(crate::notifications::Kind::Succeeded),
+            response
+        );
         handle.command(Command::Refresh).unwrap();
         let waiting = handle.notification_content(crate::notifications::Kind::Waiting);
-        assert_eq!(waiting.request, Some(crate::notifications::RequestType::Question));
+        assert_eq!(
+            waiting.request,
+            Some(crate::notifications::RequestType::Question)
+        );
         assert_eq!(waiting.preview, "Choose the migration strategy?");
         assert!(!waiting.preview.contains("fixture-secret"));
+        handle.command(Command::Refresh).unwrap();
+        let content = handle.notification_content(crate::notifications::Kind::Succeeded);
+        assert!(
+            content
+                .preview
+                .starts_with("Command completed: Long command label")
+        );
+        assert!(
+            content.preview.chars().count() <= crate::notifications::presentation::PREVIEW_LIMIT
+        );
+        let mut event = crate::notifications::Event::session(
+            crate::model::TerminalId::new(),
+            crate::agent::Provider::Codex,
+            directory.path().into(),
+            crate::notifications::Evidence {
+                key: "long-command".into(),
+                kind: crate::notifications::Kind::Succeeded,
+            },
+        );
+        event.content = Some(content);
+        event.validate().unwrap();
+        assert!(
+            !crate::notifications::presentation::message(&event, false)
+                .body
+                .contains("Long command")
+        );
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn notification_waiting_context_revises_without_an_activity_transition() {
+        struct Requests(usize);
+        impl Adapter for Requests {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.0 += 1;
+                let request = |id: &str, description: &str| {
+                    Event::Request(super::super::Request {
+                        kind: super::super::RequestKind::Question,
+                        id: id.into(),
+                        title: "Question".into(),
+                        description: description.into(),
+                        fields: vec![],
+                        actions: vec![],
+                    })
+                };
+                let events = match self.0 {
+                    1 => vec![
+                        Event::TurnStarted,
+                        request("a", "First question?"),
+                        request("b", "Second question?"),
+                    ],
+                    2 => vec![Event::RequestResolved { id: "a".into() }],
+                    3 => vec![request("b", "Updated second question?")],
+                    4 => vec![Event::Status {
+                        busy: false,
+                        detail: "Unrelated metadata".into(),
+                    }],
+                    _ => return Err("fixture exhausted".into()),
+                };
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: vec![],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Requests(0));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::bounded(8);
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AttentionContext { evidence, .. } = update {
+                let _ = send.try_send(evidence);
+            }
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        let mut keys = Vec::new();
+        for expected in [
+            "First question?",
+            "Second question?",
+            "Updated second question?",
+        ] {
+            handle.command(Command::Refresh).unwrap();
+            let evidence = receive.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
+            assert_eq!(handle.notification_content(evidence.kind).preview, expected);
+            assert_eq!(
+                handle.snapshot(None).unwrap().activity(),
+                ActivityState::Waiting
+            );
+            keys.push(evidence.key);
+        }
+        assert!(keys[0] != keys[1] && keys[1] != keys[2]);
+        handle.command(Command::Refresh).unwrap();
+        assert!(
+            receive.try_recv().is_err(),
+            "unrelated metadata must not repeat an actionable alert"
+        );
         handle.close().unwrap();
     }
 
@@ -5178,6 +5527,7 @@ mod tests {
                 Update::Observed { .. }
                 | Update::AccountUsage { .. }
                 | Update::Attention(_)
+                | Update::AttentionContext { .. }
                 | Update::Ready
                 | Update::Execution { .. } => None,
             })

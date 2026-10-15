@@ -3,8 +3,8 @@
 //! The daemon owns delivery and the durable journal. Windows report focus and
 //! acknowledge attention; they do not each send a desktop notification.
 
-pub mod review;
 pub mod presentation;
+pub mod review;
 #[cfg(feature = "ui")]
 pub mod ui;
 use serde::{Deserialize, Serialize};
@@ -92,10 +92,14 @@ pub struct Evidence {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum RequestType { Approval, Question, Consent }
+pub enum RequestType {
+    Approval,
+    Question,
+    Consent,
+}
 
-/// Opt-in semantic context; the broker removes this before persistence when
-/// previews are disabled. Producers bound and sanitize it before enqueue.
+/// Opt-in semantic context; the broker removes this before notification-journal
+/// persistence when previews are disabled. Producers bound and sanitize it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Content {
     pub conversation: String,
@@ -139,7 +143,11 @@ impl Event {
         if let Some(content) = &self.content {
             if content.conversation.chars().count() > presentation::TITLE_LIMIT
                 || content.preview.chars().count() > presentation::PREVIEW_LIMIT
-                || content.conversation.chars().chain(content.preview.chars()).any(char::is_control)
+                || content
+                    .conversation
+                    .chars()
+                    .chain(content.preview.chars())
+                    .any(char::is_control)
                 || (content.request.is_some() && self.evidence.kind != Kind::Waiting)
             {
                 return Err("Notification preview exceeds its text boundary".into());
@@ -157,7 +165,8 @@ impl Event {
             destination.validate()?;
         }
         if matches!(self.target, Target::SessionInbox(_)) {
-            if self.content.is_some() || self.evidence.kind != Kind::MessageReceived
+            if self.content.is_some()
+                || self.evidence.kind != Kind::MessageReceived
                 || self.source_session.is_none()
                 || self.provider.is_some()
                 || self.directory.is_some()
@@ -175,7 +184,8 @@ impl Event {
         }
         if let Target::PullRequest(request) = &self.target {
             request.validate()?;
-            if self.content.is_some() || self.evidence.kind != Kind::ReviewRequested
+            if self.content.is_some()
+                || self.evidence.kind != Kind::ReviewRequested
                 || self.evidence.key != request.request
                 || self.source_session.is_some()
                 || self.provider.is_some()
@@ -413,6 +423,29 @@ pub fn context(event: &Event) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_context_keeps_legacy_journal_records_readable() {
+        let mut event = Event::session(
+            TerminalId::new(),
+            Provider::Claude,
+            "/fixture".into(),
+            Evidence {
+                key: "accepted-turn".into(),
+                kind: Kind::Waiting,
+            },
+        );
+        let mut legacy = serde_json::to_value(&event).unwrap();
+        legacy.as_object_mut().unwrap().remove("content");
+        assert_eq!(Event::from_journal(&legacy.to_string()).unwrap(), event);
+        event.content = Some(Content {
+            conversation: "Fixture conversation".into(),
+            preview: "Question for the operator".into(),
+            request: Some(RequestType::Question),
+        });
+        let bytes = postcard::to_stdvec(&event).unwrap();
+        assert_eq!(postcard::from_bytes::<Event>(&bytes).unwrap(), event);
+    }
 
     #[test]
     fn inbox_attention_is_distinct_fixed_and_compatible_with_waiting_preferences() {

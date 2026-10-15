@@ -3885,6 +3885,42 @@ mod tests {
     }
 
     #[test]
+    fn notification_callback_sees_completed_frame_text_and_failed_frame_diagnosis() {
+        for (status, expected_kind, error, expected) in [
+            (
+                "completed",
+                crate::notifications::Kind::Succeeded,
+                serde_json::Value::Null,
+                "Updated notification_preview in config_file.rs.",
+            ),
+            (
+                "failed",
+                crate::notifications::Kind::Failed,
+                json!({"message":"The provider rejected this request"}),
+                "The provider rejected this request",
+            ),
+        ] {
+            let frame = json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"notification-turn","status":status,
+                "items":[{"id":"final-answer","type":"agentMessage","text":"Updated `notification_preview` in config_file.rs."}],"error":error}}});
+            for fail_store in [false, true] {
+                let (evidence, content) = crate::chat::runtime::notification_frame_for_test(
+                    Box::new(adapter()),
+                    frame.clone(),
+                    fail_store,
+                );
+                assert_eq!(
+                    evidence.kind, expected_kind,
+                    "storage failure cannot erase the provider's authoritative outcome"
+                );
+                assert_eq!(
+                    content.preview, expected,
+                    "immutable callback context must include validated final metadata independently of storage success"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn attention_requires_explicit_settlement_of_the_bound_thread() {
         use crate::notifications::Kind;
         for (status, expected) in [

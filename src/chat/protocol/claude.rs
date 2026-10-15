@@ -8173,6 +8173,22 @@ mod tests {
     }
 
     #[test]
+    fn notification_callback_sees_the_failed_result_diagnosis() {
+        let adapter = Claude {
+            busy: true,
+            ready: true,
+            ..Default::default()
+        };
+        let (evidence, content) = crate::chat::runtime::notification_frame_for_test(
+            Box::new(adapter),
+            json!({"type":"result","uuid":"failed-notification-result","is_error":true,"subtype":"error_during_execution","errors":["The provider rejected this request"]}),
+            false,
+        );
+        assert_eq!(evidence.kind, crate::notifications::Kind::Failed);
+        assert_eq!(content.preview, "The provider rejected this request");
+    }
+
+    #[test]
     fn interrupt_result_before_ack_cannot_cancel_the_following_turn() {
         for accepted in [false, true] {
             let mut adapter = Claude {
