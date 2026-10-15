@@ -1877,6 +1877,14 @@ fn preflight_inner(
 impl Drop for Inner {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        let retained=match self.retained_native.try_lock() {
+            Ok(mut owner)=>owner.take(),
+            Err(std::sync::TryLockError::Poisoned(poisoned))=>poisoned.into_inner().take(),
+            // A still-active actor owns the shared Arc/guard. Never wait on
+            // that exact owner's retained holder from a frontend destructor.
+            Err(std::sync::TryLockError::WouldBlock)=>None,
+        };
+        if let Some(holder)=retained {native_reconcile::retire_final(holder);}
         let _ = self
             .wake
             .get_mut()
@@ -8065,7 +8073,8 @@ mod tests {
             assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
             return;
         }
-        for broken_control in [false,true] {
+        for scenario in 0..3 {
+        let broken_control=scenario==1;
         let mut source=super::super::native_holder::fixture_source();
         let boot=crate::daemon::read_boot_id().unwrap();
         source.proof.as_mut().unwrap().boot_id=boot.clone();
@@ -8079,9 +8088,9 @@ mod tests {
         let record=crate::daemon::holder_registry::evidence(&crate::daemon::holder_registry::socket(&root,source.id),crate::daemon::holder_registry::Kind::Native).unwrap().unwrap();
         assert!(record.root.is_current());
         let receipt=root.join(format!("{}-{}-{}.closed",source.id,record.holder.pid,record.holder.start));
-        if broken_control {
+        if scenario!=0 {
             holder.confirm(uuid::Uuid::new_v4().to_string(),super::super::native_holder::fixture_identity(),record.root.clone()).unwrap();
-            holder.disconnect_control_for_test();
+            if broken_control {holder.disconnect_control_for_test();}
         } else {
             let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
             invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
@@ -8090,6 +8099,23 @@ mod tests {
         let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
         let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
         handle.close().unwrap();
+        if scenario==2 {
+            let (stalled,peer)=UnixStream::pair().unwrap();
+            let identity=holder.replace_control_for_test(stalled);
+            *handle.0.retained_native.lock().unwrap()=Some(holder);
+            let started=Instant::now();drop(handle);
+            assert!(started.elapsed()<Duration::from_secs(1),"final Inner field destruction must not perform retained Holder RPC");
+            assert!(record.root.is_current(),"returning from Drop is not a cleanup receipt");
+            drop(peer);
+            let deadline=Instant::now()+Duration::from_secs(5);
+            loop {
+                if identity.close().is_ok() {break;}
+                assert!(Instant::now()<deadline,"the exact preserved registry owner must remain cleanable");
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(!record.root.is_current());
+            continue;
+        }
         *handle.0.retained_native.lock().unwrap()=Some(holder);
         handle.0.completed.store(false,Ordering::Release);
         *handle.0.failure.lock().unwrap()=Some("Native teardown remains unconfirmed".into());
@@ -8153,8 +8179,10 @@ mod tests {
         handle.close().unwrap();
         let (worker,release,finished)=worker_blocked_in_tls_destruction();
         *handle.0.worker.lock().unwrap()=Some(worker);
+        let shared_native=handle.0.retained_native.clone();let held_native=shared_native.lock().unwrap();
         let started=Instant::now();drop(handle);
-        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join a TLS destructor even if is_finished returned true");
+        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join TLS or wait for actor-owned native metadata");
+        drop(held_native);
         assert!(finished.try_recv().is_err(),"dropping the frontend is not proof that cleanup finished");
         release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
