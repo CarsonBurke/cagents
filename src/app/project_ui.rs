@@ -2018,7 +2018,8 @@ impl Cagents {
                     Ok((snapshot, agents)) => {
                         if !expected_source_matches || dialog.expected_head.as_ref().is_some_and(|expected|
                             snapshot.branch.as_deref() != Some(expected.branch.as_str())
-                                || snapshot.head_oid.as_deref() != Some(expected.head_oid.as_str()))
+                                || snapshot.head_oid.as_deref() != Some(expected.head_oid.as_str())
+                                || snapshot.head_repository.as_ref() != Some(&expected.head_repository))
                         {
                             dialog.safety = None;
                             dialog.busy_confirmed = None;
@@ -3956,6 +3957,7 @@ mod tests {
     #[test]
     fn worktree_inspection_preserves_byte_exact_ignored_paths_and_policy_names() {
         let safety = WorktreeSafetySnapshot {
+            head_repository: None,
             fingerprint: "fresh-device-snapshot".into(),
             modified: 0,
             untracked: 1,
@@ -3983,6 +3985,7 @@ mod tests {
 
     fn clean_snapshot() -> WorktreeSafetySnapshot {
         WorktreeSafetySnapshot {
+            head_repository: None,
             fingerprint: "fixture".into(),
             modified: 0,
             untracked: 0,
@@ -4367,7 +4370,7 @@ mod tests {
 
     #[test]
     fn post_merge_cleanup_refuses_a_replaced_branch_source_or_head_before_stopping_sessions() {
-        for changed in 0..3 {
+        for changed in 0..5 {
             let repository = PathBuf::from("/repo");
             let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
             let source = GitHubRepoKey::new("github.com", None, "example", "repo").unwrap();
@@ -4376,13 +4379,13 @@ mod tests {
             let (mut app, _state, project) = deletable_app(&repository, &linked, &primary);
             let oid = "a".repeat(40);
             drop(app.open_worktree_delete_dialog_for_head(project, linked.id, DeletionHead {
-                head_repository: source, branch: "feature".into(), head_oid: oid.clone(),
+                head_repository: source.clone(), branch: "feature".into(), head_oid: oid.clone(),
             }));
             let request = app.project_ui.dialog.as_ref().unwrap().request;
             drop(app.handle_project_action(Action::DeleteOptionsRead {request, result: Ok(DeleteOptions {
                 branch_elsewhere: false, stale_lock: false, lock_error: None,
             })}));
-            let mut snapshot = clean_snapshot(); snapshot.head_oid = Some(oid);
+            let mut snapshot = clean_snapshot(); snapshot.head_oid = Some(oid); snapshot.head_repository = Some(source);
             drop(app.handle_project_action(Action::SafetyRead {request, confirming: false,
                 result: Ok((snapshot.clone(), AgentCensus::default()))}));
             assert!(app.project_ui.dialog.as_ref().unwrap().safety.is_some());
@@ -4390,8 +4393,10 @@ mod tests {
             match changed {
                 0 => snapshot.branch = Some("replacement".into()),
                 1 => snapshot.head_oid = Some("b".repeat(40)),
-                _ => app.sidebar_model.projects[0].worktrees.iter_mut().find(|row| row.id == linked.id).unwrap().head_repository =
+                2 => app.sidebar_model.projects[0].worktrees.iter_mut().find(|row| row.id == linked.id).unwrap().head_repository =
                     Some(GitHubRepoKey::new("github.com", None, "different", "repo").unwrap()),
+                3 => snapshot.head_repository = Some(GitHubRepoKey::new("github.com", None, "fresh-source", "repo").unwrap()),
+                _ => snapshot.head_repository = None,
             }
             drop(app.handle_project_action(Action::SafetyRead {request, confirming: true,
                 result: Ok((snapshot, AgentCensus::default()))}));

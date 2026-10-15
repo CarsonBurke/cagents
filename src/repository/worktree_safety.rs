@@ -48,6 +48,10 @@ pub struct WorktreeSafetySnapshot {
     pub detached_only_commits: u64,
     pub branch: Option<String>,
     pub head_oid: Option<String>,
+    /// Fresh push/head repository identity; absent evidence is not authority
+    /// for a cleanup offer originating from a particular merged pull request.
+    #[serde(default)]
+    pub head_repository: Option<crate::github::GitHubRepoKey>,
 }
 
 impl WorktreeSafetySnapshot {
@@ -172,12 +176,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 })
         };
         let notable_ignored = self.notable_ignored_files(worktree, cancellation)?;
+        let head_repository = match status.branch() {
+            Some(branch) => self.branch_remote(worktree, &ValidatedBranchName::parse(branch)?, cancellation)?
+                .and_then(|remote| remote.push_url.as_deref().or(remote.fetch_url.as_deref())
+                    .and_then(crate::github::remote_repository_key)),
+            None => None,
+        };
         let mut fingerprint = sha2::Sha256::new();
         use sha2::Digest;
         use std::os::unix::fs::MetadataExt;
         fingerprint.update(
             serde_json::to_vec(&status).map_err(|error| ValidationError::Io(error.to_string()))?,
         );
+        fingerprint.update(serde_json::to_vec(&head_repository)
+            .map_err(|error| ValidationError::Io(error.to_string()))?);
         let paths: std::collections::BTreeSet<_> = status
             .entries
             .iter()
@@ -209,6 +221,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
         }
         Ok(WorktreeSafetySnapshot {
+            head_repository,
             fingerprint: format!("{:x}", fingerprint.finalize()),
             modified,
             untracked: status
@@ -341,6 +354,38 @@ mod tests {
                 .set_disposable_ignored_directories(root, &["../secret".into()], &cancellation)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn head_source_push_url_changes_invalidate_safety_without_changing_branch_or_commit() {
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = fixture.path();
+        git(root, &["init", "-b", "main"]);
+        fs::write(root.join("tracked"), "initial").unwrap();
+        git(root, &["add", "tracked"]);
+        git(root, &["commit", "-m", "initial"]);
+        git(root, &["remote", "add", "origin", "git@github.com:upstream/project.git"]);
+        git(root, &["remote", "add", "fork", "https://github.com/developer/project.git"]);
+        git(root, &["config", "branch.main.remote", "origin"]);
+        git(root, &["config", "branch.main.pushRemote", "fork"]);
+        git(root, &["remote", "set-url", "--push", "fork", "git@github.com:shipping/project.git"]);
+        let service = RepositoryService::system("git");
+        let token = CancellationToken::new();
+        let reviewed = service.worktree_safety(root, &token).unwrap();
+        assert_eq!(reviewed.head_repository, Some(crate::github::GitHubRepoKey::new("github.com", None, "shipping", "project").unwrap()),
+            "branch pushRemote and push URL identify the head repository, not the upstream/base repo");
+        git(root, &["remote", "set-url", "--push", "fork", "git@github.com:replacement/project.git"]);
+        let changed = service.worktree_safety(root, &token).unwrap();
+        assert_eq!(reviewed.branch, changed.branch);
+        assert_eq!(reviewed.head_oid, changed.head_oid);
+        assert_eq!(reviewed.files_to_discard(), changed.files_to_discard());
+        assert_ne!(reviewed.head_repository, changed.head_repository);
+        assert_ne!(reviewed.fingerprint, changed.fingerprint,
+            "the final expected-fingerprint removal gate must reject a remapped source");
+        git(root, &["remote", "set-url", "--push", "fork", "/unverified/local-repository"]);
+        let unknown = service.worktree_safety(root, &token).unwrap();
+        assert!(unknown.head_repository.is_none());
+        assert_ne!(changed.fingerprint, unknown.fingerprint);
     }
 
     #[test]
