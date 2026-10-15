@@ -4076,8 +4076,11 @@ for line in sys.stdin:
             let root = tempfile::Builder::new().prefix("cagents-legacy-upgrade-")
                 .tempdir_in("/var/tmp").unwrap().keep();
             for name in ["home", "run", "data", "config", "cache"] {
+                use std::os::unix::fs::PermissionsExt;
                 std::fs::create_dir(root.join(name)).unwrap();
+                std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
             }
+            eprintln!("legacy upgrade owning evidence retained at {}", root.display());
             let command = CommandSpec::new(std::env::current_exe().unwrap())
                 .args(["--exact", exact.as_str(), "--nocapture", "--test-threads=1"])
                 .env(CHILD, &exact)
