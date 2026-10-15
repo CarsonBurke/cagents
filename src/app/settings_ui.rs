@@ -1388,9 +1388,9 @@ fn shortcut_input<'a>(
         design::body(format!("{label}{required}"))
             .width(Length::FillPortion(3))
             .into(),
-        widget::flex_row(controls)
+        widget::row::with_children(controls)
             .spacing(2)
-            .align_items(Alignment::Center)
+            .align_y(Alignment::Center)
             .width(Length::FillPortion(4))
             .into(),
         design::caption(source).width(64).into(),
@@ -1461,6 +1461,23 @@ mod keyboard_table_tests {
                 workspace_widget::shortcut_keys(field.shortcut_action().unwrap(), &settings),
                 values
             );
+        }
+    }
+
+    #[test]
+    fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
+        use iced::{Size, advanced::{layout, widget::Tree}};
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        let invalid = HashMap::new();
+        for field in SettingsField::SHORTCUTS {
+            let action = field.shortcut_action().unwrap();
+            let value = draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).unwrap().1;
+            let row = shortcut_input(field.label(), value, field, &draft.keyboard_shortcuts, &invalid);
+            let mut element = settings_group("Keyboard", "", vec![row]).compact().view("Keyboard", "").unwrap();
+            let mut tree = Tree::new(element.as_widget());
+            let height = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0))).size().height;
+            assert!(height <= 64.0, "{field:?} must keep its key chip, Record and Reset on one line; group height was {height}");
         }
     }
 
