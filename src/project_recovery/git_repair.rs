@@ -238,6 +238,11 @@ mod tests {
         let relocation=Relocation{repository:common.clone(),destination:common.clone(),old_root:old,new_root:moved.clone()};
         let before=std::fs::read(common.join("config")).unwrap();
         let mut plan=RepairPlan::prepare(&relocation,&[]).unwrap();
+        let primary=plan.original_primary_checkout_directory().unwrap().expect("actual private admin equals common for this moved primary checkout");
+        let selected=plan.original_selected_directory();let common_pin=plan.original_common_directory();
+        assert_eq!(primary.path,moved);assert_eq!(common_pin.path,common);
+        assert!(std::sync::Arc::ptr_eq(&primary.directory,&selected.directory));
+        assert!(RepairPlan::pin(&relocation).unwrap().original_primary_checkout_directory().unwrap().is_none(),"pin-only inspection cannot invent a primary role");
         assert_eq!(std::fs::read(common.join("config")).unwrap(),before,"preparation cannot publish a Git write");
         plan.apply_remaining().unwrap();assert!(plan.completed_edits()>0);
         let after=std::fs::read(common.join("config")).unwrap();
@@ -255,6 +260,9 @@ mod tests {
         let held=fixture.path().join("held-admin");std::fs::rename(&common,&held).unwrap();
         std::fs::create_dir(&common).unwrap();std::fs::write(common.join("config"),b"replacement").unwrap();
         assert!(plan.apply_remaining().is_err(),"retry cannot recapture a replacement admin at the same pathname");
+        let retained=plan.original_primary_checkout_directory().unwrap().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&retained.directory,&primary.directory),"role observer retains original Arc even when current naming becomes invalid");
+        assert!(std::sync::Arc::ptr_eq(&plan.original_common_directory().directory,&common_pin.directory));
         assert_eq!(std::fs::read(common.join("config")).unwrap(),b"replacement");
         assert_eq!(std::fs::read(held.join("config")).unwrap(),after);
     }
@@ -297,7 +305,10 @@ mod tests {
         let admin=crate::project_location::checkout_identity(&old).unwrap().0;
         std::fs::rename(&old,&moved).unwrap();
         let relocation=Relocation{repository:common.clone(),destination:common,old_root:old.clone(),new_root:moved.clone()};
-        repair(&relocation,&[]).unwrap();
+        let mut plan=RepairPlan::prepare(&relocation,&[]).unwrap();
+        assert!(plan.original_primary_checkout_directory().unwrap().is_none(),"same common repository does not make a linked checkout the primary");
+        assert!(plan.original_edit_directories().iter().any(|directory|directory.path==admin),"the actual linked private-admin pin is exposed without inventing its role from a basename");
+        plan.apply_remaining().unwrap();
         assert_eq!(std::fs::read_to_string(admin.join("gitdir")).unwrap().trim(),moved.join(".git").to_str().unwrap());
         let listed=git(&primary,&["worktree","list","--porcelain"]);
         let listed=String::from_utf8(listed.stdout).unwrap();
