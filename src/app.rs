@@ -10236,8 +10236,11 @@ impl Cagents {
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
+        let visible = self.workspace_surfaces_visible() && self.durable.cards.iter()
+            .any(|state| state.id == card && state.existence.is_open() && state.exposure == Exposure::Visible);
         let (intents, edits, auto_save) = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => {
+                runtime.set_diff_surface_visible(visible);
                 let intents = runtime.take_lsp_intents();
                 // Strictly after `take_lsp_intents`, which is what materialises
                 // the `Change` these edits describe.
@@ -11118,6 +11121,8 @@ impl Cagents {
                 }
                 .map_err(|error| error.to_string()),
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
+                CardRuntime::Repository(runtime) => { runtime.set_diff_surface_visible(visible); Ok(()) }
+                CardRuntime::PullRequests(pane) => { pane.runtime.set_diff_surface_visible(visible); Ok(()) }
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -11126,8 +11131,6 @@ impl Cagents {
                 CardRuntime::Loading
                 | CardRuntime::Failed(_)
                 | CardRuntime::Completed
-                | CardRuntime::Repository(_)
-                | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
                 | CardRuntime::Accounts
                 | CardRuntime::Automations => Ok(()),
