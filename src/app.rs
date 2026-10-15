@@ -12455,14 +12455,19 @@ impl Cagents {
         })
     }
 
-    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) -> Task<Message> {
-        if saved.generation < self.settings_ack_generation { return Task::none(); }
+    fn record_settings_save(&mut self, saved: &SettingsSaved) -> bool {
+        if saved.generation < self.settings_ack_generation { return false; }
         if let Some(backup) = saved.backup.clone() { self.settings_backup = Some(backup); }
         self.settings_ack_generation = saved.generation;
-        self.settings_path = Some(saved.path);
+        self.settings_path = Some(saved.path.clone());
         if self.settings_reset_generation.is_some_and(|generation| saved.generation >= generation) {
             self.settings_reset_generation = None;
         }
+        true
+    }
+
+    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) -> Task<Message> {
+        if !self.record_settings_save(&saved) { return Task::none(); }
         // The save's UI snapshot is the baseline for edits made while it ran;
         // actual merged values may include a different window's preferences.
         if saved.reload_error.is_some() && self.settings_observed_at.is_none_or(|last| saved.observed_at >= last) {
@@ -12475,8 +12480,12 @@ impl Cagents {
 
     fn save_settings_now(&mut self) -> Result<(), String> {
         let saved = self.capture_settings_save()?.run()?;
-        // Synchronous persistence is used only while exiting the application.
-        drop(self.acknowledge_settings_save(saved));
+        // Drop folds drafts without live effects. Do not start hibernation,
+        // editor saves or theme work while the application is shutting down.
+        if self.record_settings_save(&saved) && self.settings_observed_at.is_none_or(|last| saved.observed_at >= last) {
+            self.settings_base = saved.settings;
+            self.settings_observed_at = Some(saved.observed_at);
+        }
         Ok(())
     }
 
