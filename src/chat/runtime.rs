@@ -134,6 +134,7 @@ impl Handle {
     }
 }
 struct Inner {
+    pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
     state: Arc<Mutex<Snapshot>>,
@@ -308,7 +309,9 @@ impl Handle {
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
+        let pinned_directory = Arc::new(Mutex::new(spec.execution.as_ref().and_then(|context| context.directory_descriptor())));
         let inner = Arc::new(Inner {
+            pinned_directory: pinned_directory.clone(),
             commands,
             wake: Mutex::new(wake),
             state: state.clone(),
@@ -342,6 +345,7 @@ impl Handle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    pinned_directory,
                     launch_context: spec.execution.clone(),
                     working_directory: spec.working_directory.clone(),
                     child: None,
@@ -1514,6 +1518,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
     child: Option<ChildGuard>,
@@ -1943,6 +1948,7 @@ impl Actor {
                             return Err(error);
                         }
                         self.working_directory = directory;
+                        self.dirty = true;
                         Ok(())
                     })();
                     let _ = reply.send(result);
