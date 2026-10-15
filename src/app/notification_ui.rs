@@ -14,7 +14,10 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
-    SessionActivationExpired { session: TerminalId, generation: u64 },
+    SessionActivationExpired {
+        session: TerminalId,
+        generation: u64,
+    },
     InboxResolved {
         lineage: crate::agent_execution::Lineage,
         operation: uuid::Uuid,
@@ -354,7 +357,8 @@ impl Cagents {
         if matches!(&action, Action::Activated(_)) {
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
-            self.notification_ui.activation_generation = self.notification_ui.activation_generation.wrapping_add(1);
+            self.notification_ui.activation_generation =
+                self.notification_ui.activation_generation.wrapping_add(1);
         }
         match action {
             Action::Snapshot(snapshot) => {
@@ -458,14 +462,23 @@ impl Cagents {
                 let expiry = if self.notification_ui.session_activation.is_some() {
                     cosmic::task::future(async move {
                         tokio::time::sleep(Duration::from_secs(60)).await;
-                        Message::NotificationUi(Action::SessionActivationExpired { session, generation })
+                        Message::NotificationUi(Action::SessionActivationExpired {
+                            session,
+                            generation,
+                        })
                     })
-                } else { Task::none() };
+                } else {
+                    Task::none()
+                };
                 Task::batch([focus, expiry, self.activate_main_window(None)])
             }
-            Action::SessionActivationExpired { session, generation } => {
+            Action::SessionActivationExpired {
+                session,
+                generation,
+            } => {
                 if self.notification_ui.session_activation == Some(session)
                     && self.notification_ui.activation_generation == generation
+                    && !self.durable.cards.iter().any(|card| card.existence.is_open() && card_session(card) == Some(session))
                 {
                     self.notification_ui.session_activation = None;
                     self.notification_ui.activation_attempt = None;
@@ -520,17 +533,42 @@ impl Cagents {
     /// Retry after lifecycle/model updates and dialog dismissal, never by spawning
     /// a replacement provider. Explicitly closed cards remain closed.
     pub(super) fn retry_notification_activation(&mut self) -> Task<Message> {
-        let Some(session) = self.notification_ui.session_activation else { return Task::none(); };
-        let blocked = self.workspace_inputs_blocked() || self.focused_repository_is_saving() || self.update_prepared;
-        if self.notification_ui.activation_attempt.as_ref().is_some_and(|(workspace, was_blocked)|
-            workspace.as_ptr() == Arc::as_ptr(&self.durable) && *was_blocked == blocked
-        ) { return Task::none(); }
+        let Some(session) = self.notification_ui.session_activation else {
+            return Task::none();
+        };
+        let blocked = self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared;
+        if self
+            .notification_ui
+            .activation_attempt
+            .as_ref()
+            .is_some_and(|(workspace, was_blocked)| {
+                workspace.as_ptr() == Arc::as_ptr(&self.durable) && *was_blocked == blocked
+            })
+        {
+            return Task::none();
+        }
         self.notification_ui.activation_attempt = Some((Arc::downgrade(&self.durable), blocked));
-        if blocked { return Task::none(); }
-        #[cfg(test)] { self.notification_ui.activation_attempts += 1; }
-        let card = self.durable.cards.iter().find(|card| card.existence.is_open() && card_session(card) == Some(session));
+        if blocked {
+            return Task::none();
+        }
+        #[cfg(test)]
+        {
+            self.notification_ui.activation_attempts += 1;
+        }
+        let card = self
+            .durable
+            .cards
+            .iter()
+            .find(|card| card.existence.is_open() && card_session(card) == Some(session));
         let Some(id) = card.map(|card| card.id) else {
-            if self.durable.cards.iter().any(|card| card_session(card) == Some(session)) {
+            if self
+                .durable
+                .cards
+                .iter()
+                .any(|card| card_session(card) == Some(session))
+            {
                 self.notification_ui.session_activation = None;
                 self.notification_ui.activation_attempt = None;
             }
@@ -984,14 +1022,22 @@ mod tests {
         drop(app.update_notifications(Action::Activated(Target::Session(first))));
         let first_generation = app.notification_ui.activation_generation;
         assert_eq!(app.notification_ui.activation_attempts, 1);
-        for _ in 0..100 { drop(app.retry_notification_activation()); }
+        for _ in 0..100 {
+            drop(app.retry_notification_activation());
+        }
         assert_eq!(app.notification_ui.activation_attempts, 1);
         let latest = TerminalId::new();
         drop(app.update_notifications(Action::Activated(Target::Session(latest))));
-        drop(app.update_notifications(Action::SessionActivationExpired { session: first, generation: first_generation }));
+        drop(app.update_notifications(Action::SessionActivationExpired {
+            session: first,
+            generation: first_generation,
+        }));
         assert_eq!(app.notification_ui.session_activation, Some(latest));
         let generation = app.notification_ui.activation_generation;
-        drop(app.update_notifications(Action::SessionActivationExpired { session: latest, generation }));
+        drop(app.update_notifications(Action::SessionActivationExpired {
+            session: latest,
+            generation,
+        }));
         assert!(app.notification_ui.session_activation.is_none());
     }
 
@@ -1009,6 +1055,9 @@ mod tests {
         drop(app.update_notifications(Action::Activated(Target::Session(session))));
         assert_eq!(app.workspace.focused(), previous);
         assert_eq!(app.notification_ui.session_activation, Some(session));
+        let generation = app.notification_ui.activation_generation;
+        drop(app.update_notifications(Action::SessionActivationExpired { session, generation }));
+        assert_eq!(app.notification_ui.session_activation, Some(session), "a long dialog must retain an existing actor's focus request");
         app.settings_reset_confirm = false;
         drop(app.retry_notification_activation());
         assert_eq!(app.workspace.focused(), Some(id));

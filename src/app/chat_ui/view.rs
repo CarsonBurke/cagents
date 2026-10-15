@@ -4888,7 +4888,13 @@ mod tests {
             state.kind = CardKind::Chat(runtime.session.clone());
             Arc::make_mut(&mut app.durable).cards.push(state);
             app.cards.insert(card, CardRuntime::Chat(runtime));
-            app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: ActivityState::Unknown }));
+            app.observe_agent_activity_for_card(
+                card,
+                Some(crate::agent::Activity {
+                    provider: Provider::Claude,
+                    state: ActivityState::Unknown,
+                }),
+            );
             assert!(!app.sidebar_state.has_card_update(card));
             assert!(handle.observe_outcome_for_test(ActivityState::Unknown, Some(outcome.clone())));
             app.observe_agent_activity_for_card(
@@ -4901,7 +4907,13 @@ mod tests {
             assert_eq!(app.sidebar_state.card_outcome(card), Some(&outcome));
             assert!(app.sidebar_state.has_card_update(card));
             app.sidebar_state.acknowledge_agent_update(card);
-            app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: ActivityState::Unknown }));
+            app.observe_agent_activity_for_card(
+                card,
+                Some(crate::agent::Activity {
+                    provider: Provider::Claude,
+                    state: ActivityState::Unknown,
+                }),
+            );
             assert!(!app.sidebar_state.has_card_update(card));
         }
     }
@@ -4917,21 +4929,46 @@ mod tests {
         state.kind = CardKind::Chat(runtime.session.clone());
         Arc::make_mut(&mut app.durable).cards.push(state);
         app.cards.insert(card, CardRuntime::Chat(runtime));
-        handle.observe_outcome_for_test(crate::agent::ActivityState::Unknown, Some(crate::agent::ActivityOutcome::Succeeded));
-        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Unknown }));
+        handle.observe_outcome_for_test(
+            crate::agent::ActivityState::Unknown,
+            Some(crate::agent::ActivityOutcome::Succeeded),
+        );
+        app.observe_agent_activity_for_card(
+            card,
+            Some(crate::agent::Activity {
+                provider: Provider::Claude,
+                state: crate::agent::ActivityState::Unknown,
+            }),
+        );
         assert!(!app.sidebar_state.has_card_update(card));
-        assert_eq!(app.sidebar_state.card_outcome(card), Some(&crate::agent::ActivityOutcome::Succeeded));
+        assert_eq!(
+            app.sidebar_state.card_outcome(card),
+            Some(&crate::agent::ActivityOutcome::Succeeded)
+        );
     }
 
     #[test]
     fn cancelled_running_tool_turn_stops_showing_working() {
         let items = [chat::Item {
-            id: "cancelled-tool".into(), role: chat::Role::Assistant, started_at: None, at: Some(42),
-            content: ItemContent::Command { label: "Long task".into(), command: "sleep 600".into(), working_directory: "/project".into(), action: chat::CommandAction::Run, status: chat::ToolStatus::Running, exit_code: None, duration_ms: None, output: String::new() },
+            id: "cancelled-tool".into(),
+            role: chat::Role::Assistant,
+            started_at: None,
+            at: Some(42),
+            content: ItemContent::Command {
+                label: "Long task".into(),
+                command: "sleep 600".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
         }];
         let (mut runtime, handle) = frame_cost::live_runtime(&items);
         runtime.refresh();
         assert!(!runtime.turns.is_empty());
+        assert!(runtime.turns.iter().any(|turn| turn.running));
         let mut snapshot = (*runtime.snapshot).clone();
         snapshot.generation += 1;
         snapshot.busy = false;
@@ -4941,7 +4978,14 @@ mod tests {
         runtime.refresh();
         assert!(runtime.turns.iter().all(|turn| !turn.running));
         assert_eq!(runtime.conversation_status(false).1, "Cancelled");
-        assert!(runtime.finished_stamp.as_ref().unwrap().1.starts_with("Cancelled"));
+        assert!(
+            runtime
+                .finished_stamp
+                .as_ref()
+                .unwrap()
+                .1
+                .starts_with("Cancelled")
+        );
     }
 
     #[test]
