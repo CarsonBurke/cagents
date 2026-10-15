@@ -19,9 +19,9 @@ use thiserror::Error;
 
 mod accounts;
 pub use accounts::AccountCommand;
-mod format;
 mod agents;
 mod channels;
+mod format;
 pub use agents::AgentCommand;
 mod automations;
 mod completions;
@@ -3435,11 +3435,16 @@ fn channel_output(
 fn channel_list_human(channels: &[&ModelChannel]) -> String {
     format::table(
         ["CHANNEL", "REPOSITORY", "TITLE"],
-        channels.iter().map(|channel| [
-            channel.id.to_string(),
-            channel.repository.display().to_string(),
-            channel.title.clone(),
-        ]).collect(),
+        channels
+            .iter()
+            .map(|channel| {
+                [
+                    channel.id.to_string(),
+                    channel.repository.display().to_string(),
+                    channel.title.clone(),
+                ]
+            })
+            .collect(),
         "No channels",
     )
 }
@@ -3653,12 +3658,23 @@ mod tests {
     fn readable_channel_list_has_headers_and_a_plain_empty_state() {
         assert_eq!(channel_list_human(&[]), "No channels");
         let channel = ModelChannel {
-            id: ChannelId::new(), repository: "/repo/.git".into(), title: "Build\nlogs".into(),
-            title_source: Default::default(), ordinal: 1,
+            id: ChannelId::new(),
+            repository: "/repo/.git".into(),
+            title: "Build\nlogs".into(),
+            title_source: Default::default(),
+            ordinal: 1,
         };
         let human = channel_list_human(&[&channel]);
         assert_eq!(human.lines().count(), 2);
-        assert_eq!(human.lines().next().unwrap().split_whitespace().collect::<Vec<_>>(), ["CHANNEL", "REPOSITORY", "TITLE"]);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["CHANNEL", "REPOSITORY", "TITLE"]
+        );
         assert!(human.ends_with("Build logs"));
         assert!(human.contains(&channel.id.to_string()));
         // Channel repository identity is retained; it is not asserted to be a checkout path.

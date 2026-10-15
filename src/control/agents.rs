@@ -306,22 +306,28 @@ fn checkout(project: &Path) -> PathBuf {
 fn list_human(summaries: &[Summary]) -> String {
     super::format::table(
         ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"],
-        summaries.iter().map(|summary| [
-            short(summary.agent.id),
-            summary.agent.spec.provider.executable().into(),
-            match summary.state {
-                crate::agent_execution::State::Accepted => "Queued",
-                crate::agent_execution::State::Running => "Running",
-                crate::agent_execution::State::Waiting => "Waiting for input",
-                crate::agent_execution::State::Succeeded => "Succeeded",
-                crate::agent_execution::State::Failed => "Failed",
-                crate::agent_execution::State::Cancelled => "Cancelled",
-                crate::agent_execution::State::Interrupted => "Outcome uncertain",
-            }.into(),
-            short(summary.run),
-            summary.agent.spec.target.directory.display().to_string(),
-            summary.agent.name.clone().unwrap_or_default(),
-        ]).collect(),
+        summaries
+            .iter()
+            .map(|summary| {
+                [
+                    short(summary.agent.id),
+                    summary.agent.spec.provider.executable().into(),
+                    match summary.state {
+                        crate::agent_execution::State::Accepted => "Queued",
+                        crate::agent_execution::State::Running => "Running",
+                        crate::agent_execution::State::Waiting => "Waiting for input",
+                        crate::agent_execution::State::Succeeded => "Succeeded",
+                        crate::agent_execution::State::Failed => "Failed",
+                        crate::agent_execution::State::Cancelled => "Cancelled",
+                        crate::agent_execution::State::Interrupted => "Outcome uncertain",
+                    }
+                    .into(),
+                    short(summary.run),
+                    summary.agent.spec.target.directory.display().to_string(),
+                    summary.agent.name.clone().unwrap_or_default(),
+                ]
+            })
+            .collect(),
         "No open agents",
     )
 }
@@ -1454,9 +1460,15 @@ mod tests {
 
     #[test]
     fn readable_provider_flags_accept_cli_and_legacy_json_casing() {
-        for (name, expected) in [("claude", Provider::Claude), ("Claude", Provider::Claude),
-            ("CLAUDE", Provider::Claude), ("CoDeX", Provider::Codex), ("Omp", Provider::Omp)] {
-            let parsed = Cli::try_parse_from(["cagents", "account", "list", "--provider", name]).unwrap();
+        for (name, expected) in [
+            ("claude", Provider::Claude),
+            ("Claude", Provider::Claude),
+            ("CLAUDE", Provider::Claude),
+            ("CoDeX", Provider::Codex),
+            ("Omp", Provider::Omp),
+        ] {
+            let parsed =
+                Cli::try_parse_from(["cagents", "account", "list", "--provider", name]).unwrap();
             assert!(matches!(parsed.command, TopCommand::Account {
                 command: crate::control::AccountCommand::List { provider: Some(provider) }
             } if provider == expected));
@@ -2298,13 +2310,23 @@ mod tests {
     #[test]
     fn readable_agent_list_labels_waiting_and_uncertain_results_with_an_empty_state() {
         assert_eq!(list_human(&[]), "No open agents");
-        let mut entry = summary("abcdef00-0000-4000-8000-000000000001", "12345678-0000-4000-8000-000000000001");
+        let mut entry = summary(
+            "abcdef00-0000-4000-8000-000000000001",
+            "12345678-0000-4000-8000-000000000001",
+        );
         entry.agent.name = Some("reviewer\nnext".into());
         entry.state = crate::agent_execution::State::Waiting;
         let human = list_human(&[entry.clone()]);
         assert_eq!(human.lines().count(), 2);
-        assert_eq!(human.lines().next().unwrap().split_whitespace().collect::<Vec<_>>(),
-            ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"]);
+        assert_eq!(
+            human
+                .lines()
+                .next()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>(),
+            ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"]
+        );
         assert!(human.contains("abcdef00"));
         assert!(human.contains("Waiting for input"));
         assert!(human.ends_with("reviewer next"));

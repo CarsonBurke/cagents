@@ -28,8 +28,16 @@ pub enum AccountCommand {
 pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError> {
     let (query, listing) = match command {
         AccountCommand::List { provider } => (list::query(provider), true),
-        AccountCommand::Info { provider, account, refresh } => (
-            Query { provider, account, refresh },
+        AccountCommand::Info {
+            provider,
+            account,
+            refresh,
+        } => (
+            Query {
+                provider,
+                account,
+                refresh,
+            },
             false,
         ),
     };
@@ -47,8 +55,14 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
     })
 }
 
-fn read_report(client: &mut ControlClient, authority: Authority, query: Query) -> Result<Report, AppError> {
-    let deadline = query.refresh.then(|| Instant::now() + Duration::from_secs(90));
+fn read_report(
+    client: &mut ControlClient,
+    authority: Authority,
+    query: Query,
+) -> Result<Report, AppError> {
+    let deadline = query
+        .refresh
+        .then(|| Instant::now() + Duration::from_secs(90));
     let report = match client
         .agent_before(
             authority,
