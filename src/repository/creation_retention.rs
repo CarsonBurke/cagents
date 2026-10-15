@@ -171,6 +171,24 @@ impl ActiveCreated {
 }
 
 impl RetainedWorktreeCreation {
+    /// Describe a preflight refusal before any creation session or effect.
+    /// This cannot produce a Created outcome or any live creation authority.
+    pub fn not_started(
+        request: &CreateWorktreeRequest,
+        generation: u64,
+        detail: String,
+    ) -> Self {
+        Self::refused(WorktreeOperationReport {
+            operation_id: request.operation_id,
+            generation,
+            request: Some(request.clone()),
+            state: WorktreeOperationState::NotCreated,
+            outcome: None,
+            detail,
+            created_at_unix_ms: operation_timestamp(),
+        })
+    }
+
     pub fn retention(&self) -> Option<&CreationRetention> {
         self.retention.as_ref()
     }
