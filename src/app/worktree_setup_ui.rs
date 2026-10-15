@@ -222,6 +222,36 @@ fn preparation(
     .map_err(|error| error.to_string())
 }
 
+
+/// Hold the original creation lease from the last intent read through every
+/// copy and its progress update. A superseding Resume or Skip must win before
+/// preparation starts or wait until all of these effects have settled.
+fn prepare_recorded_setup(
+    store: Option<&crate::persistence::StateStore>,
+    intent: SetupIntent,
+    destination: &Path,
+    creation: OperationId,
+    token: &CancellationToken,
+) -> Result<SetupPreparation, String> {
+    if intent.skip {
+        return preparation(intent, destination, creation, token);
+    }
+    let store = store.ok_or("The setup journal is unavailable")?;
+    let service = RepositoryService::system("git");
+    let guard = service.worktree_setup_guard(store, creation, Some(&intent))
+        .map_err(|error| error.to_string())?;
+    let result = preparation(intent.clone(), destination, creation, token)?;
+    let mut complete = intent.clone();
+    complete.copy_done = true;
+    service.update_worktree_setup_intent_with_guard(
+        store, creation, Some(&intent), complete, &guard,
+    ).map_err(|error| error.to_string())?;
+    // The host obtains the same lease for its independently verified launch.
+    // Never retain it while waiting for the StartWorktreeSetup RPC.
+    drop(guard);
+    Ok(result)
+}
+
 impl Cagents {
     pub(super) fn start_worktree_setup(
         &mut self,
@@ -245,18 +275,7 @@ impl Cagents {
         cosmic::task::future(async move {
             let worktree = destination.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let result = preparation(intent.clone(), &destination, operation, &token)?;
-                // Copy completion is durable before any shell is published.
-                // Shell completion is evidenced by its exact marked terminal.
-                if !result.skipped {
-                    let store = store.ok_or("The setup journal is unavailable")?;
-                    let mut complete = intent.clone();
-                    complete.copy_done = true;
-                    RepositoryService::system("git")
-                        .update_worktree_setup_intent(&store, operation, Some(&intent), complete)
-                        .map_err(|error| error.to_string())?;
-                }
-                Ok(result)
+                prepare_recorded_setup(store.as_deref(), intent, &destination, operation, &token)
             })
             .await
             .map_err(|error| error.to_string())
@@ -788,7 +807,7 @@ impl Cagents {
                     }
                 }
                 RepositoryService::system("git")
-                    .update_worktree_setup_intent(&store, creation, Some(&expected), intent.clone())
+                    .update_worktree_setup_intent_guarded(&store, creation, Some(&expected), intent.clone())
                     .map_err(|error| error.to_string())?;
                 Ok(ReviewCompletion::Local {
                     creation,
@@ -2067,8 +2086,53 @@ mod tests {
     }
 
     #[test]
+    fn superseded_setup_skip_prevents_old_gui_preparation_from_copying() {
+        use crate::process::{ProcessExecutor, SystemProcessExecutor};
+        let root = tempfile::tempdir().unwrap();
+        let primary = root.path().join("project");
+        std::fs::create_dir(&primary).unwrap();
+        let token = CancellationToken::new();
+        let git_service = RepositoryService::system("git");
+        let git = |arguments: &[&str]| {
+            let command = git_service.git_base(&primary, false)
+                .args(arguments)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null");
+            SystemProcessExecutor.execute(&command, &token)
+                .and_then(|output| output.require_success(&command.program)).unwrap();
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(primary.join("tracked"), "initial").unwrap();
+        git(&["add", "tracked"]);
+        git(&["-c", "user.name=Setup Contract", "-c", "user.email=setup@example.invalid", "commit", "-qm", "initial"]);
+        std::fs::create_dir(primary.join(".cagents")).unwrap();
+        std::fs::write(primary.join(".cagents/worktree.toml"), "copy = [\".env\"]\n").unwrap();
+        std::fs::write(primary.join(".env"), "preserve").unwrap();
+        let service = RepositoryService::system("git");
+        let plan = crate::worktree_setup::load(&primary).unwrap().unwrap();
+        let mut request = service.resolve_worktree_request(&crate::repository::WorktreeInput {
+            repository: primary.clone(), input: "topic".into(), base: "main".into(),
+            managed_directory: ".worktrees/".into(), destination: String::new(), operation_id: OperationId::new(),
+        }, &token).unwrap();
+        let original = SetupIntent {primary: Some(primary), plan: Some(plan), skip: false,
+            run_id: Some(OperationId::new()), copy_done: false};
+        request.setup_intent = Some(original.clone());
+        let store = crate::persistence::StateStore::open(root.path().join("journal.sqlite3"), crate::model::BootId::new("gui-prepare-test")).unwrap();
+        let (progress, _) = async_channel::bounded(8);
+        let report = service.create_worktree_journaled(&store, &request, 0, &token, &progress);
+        assert_eq!(report.state, crate::repository::WorktreeOperationState::Created, "{}", report.detail);
+        let mut skipped = original.clone();
+        skipped.run_id = Some(OperationId::new()); skipped.skip = true; skipped.copy_done = true;
+        service.update_worktree_setup_intent_guarded(&store, request.operation_id, Some(&original), skipped.clone()).unwrap();
+        assert!(prepare_recorded_setup(Some(&store), original, &request.destination, request.operation_id, &token).is_err());
+        assert!(!request.destination.join(".env").exists(), "a superseded run must not copy ignored files after an explicit skip");
+        assert_eq!(service.worktree_setup_creation(&store, request.operation_id).unwrap().unwrap().request.unwrap().setup_intent, Some(skipped));
+    }
+
+    #[test]
     fn skipped_setup_needs_no_filesystem_or_project_configuration() {
-        let result = preparation(
+        let result = prepare_recorded_setup(
+            None,
             SetupIntent {
                 primary: None,
                 plan: None,
