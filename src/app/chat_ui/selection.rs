@@ -1630,7 +1630,8 @@ mod tests {
         );
         let mut element = Element::new(Selection {
             content: cosmic::widget::scrollable(rendered_markdown(&body, |_| {}))
-                .height(Length::Fixed(2000.0)).into(),
+                .height(Length::Fixed(2000.0))
+                .into(),
             catalog: Some(catalog),
             bookmark: None,
             context: None,
@@ -1645,16 +1646,27 @@ mod tests {
         let renderer = crate::app::tests::headless_renderer();
         let viewport = Rectangle::with_size(Size::new(600.0, 2000.0));
         let limits = layout::Limits::new(Size::ZERO, viewport.size());
-        let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut node = element
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
         // The real native viewport supplies geometry to the sparse columns.
         // Without this reconciliation their default tail band is deliberately
         // outside this fixture's top viewport. Mount only the visible cells.
         for pass in 0..8 {
             let mut observation = virtualized::UpdateViewport::default();
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut observation);
-            if !observation.changed { break; }
+            element.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut observation,
+            );
+            if !observation.changed {
+                break;
+            }
             assert!(pass < 7, "native viewport realization must converge");
-            node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
         }
         // Focus through actual pointer input. Setting ACTIVE alone does not
         // make a transcript focused, so it never exercises the copy command.
@@ -1662,7 +1674,10 @@ mod tests {
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
-        assert!(!visible.tables.is_empty() && visible.tables.len() < 128, "real pointer focus must preserve sparse table mounting");
+        assert!(
+            !visible.tables.is_empty() && visible.tables.len() < 128,
+            "real pointer focus must preserve sparse table mounting"
+        );
         let first = visible
             .blocks
             .iter()
@@ -1671,7 +1686,18 @@ mod tests {
                     .visible
                     .and_then(|bounds| bounds.intersection(&viewport))
             })
-            .unwrap_or_else(|| panic!("mounted={} bounds={:?} must include a cell in the real viewport", visible.blocks.len(), visible.blocks.iter().take(4).map(|block| (block.bounds, block.visible)).collect::<Vec<_>>()));
+            .unwrap_or_else(|| {
+                panic!(
+                    "mounted={} bounds={:?} must include a cell in the real viewport",
+                    visible.blocks.len(),
+                    visible
+                        .blocks
+                        .iter()
+                        .take(4)
+                        .map(|block| (block.bounds, block.visible))
+                        .collect::<Vec<_>>()
+                )
+            });
         let point = Point::new(
             first.x + first.width.min(8.0) / 2.0,
             first.y + first.height / 2.0,
