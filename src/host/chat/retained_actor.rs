@@ -646,7 +646,7 @@ pub(in crate::host) fn finish_close(
 /// Transfer the exact final proof before native cleanup consumes its temporary
 /// file. Unknown account/confirmed identity remains explicit in this actor-only
 /// proof and never creates session read/delete authority.
-fn publish_retirement(host: &SharedHost, handle: &Handle, source: &Session) -> Result<(), String> {
+pub(super) fn publish_retirement(host: &SharedHost, handle: &Handle, source: &Session) -> Result<(), String> {
     handle.finish_retained_close()?;
     let identity = handle.actor_identity().ok_or("Final retirement lost its exact retained actor identity")?;
     let registry = super::super::agent_execution::registry(host)?;
