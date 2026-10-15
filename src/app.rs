@@ -26278,7 +26278,7 @@ mod tests {
         app.sidebar_state.set_card_activity(
             card,
             crate::agent::Activity {
-                provider: Provider::Claude,
+                provider: crate::agent::Provider::Claude,
                 state: crate::agent::ActivityState::Waiting,
             },
         );
