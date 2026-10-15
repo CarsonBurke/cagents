@@ -27,6 +27,7 @@ pub(in crate::app) struct Confirmation {
 /// descriptor requires a correlated recovery receipt before consent can follow.
 #[derive(Clone)]
 struct CloseSource {
+    registry: uuid::Uuid,
     descriptor: chat::Session,
     session: chat::Session,
 }
@@ -118,6 +119,7 @@ impl Cagents {
             return None;
         };
         state.existence.is_open().then(|| CloseSource {
+            registry: self.workspace_model.identity,
             descriptor: descriptor.clone(),
             session: self
                 .chat_return_session(card)
@@ -125,7 +127,7 @@ impl Cagents {
         })
     }
     fn chat_close_source_matches(&self, dialog: &Confirmation) -> bool {
-        self.card_state(dialog.card).is_some_and(|state| {
+        dialog.source.registry == self.workspace_model.identity && self.card_state(dialog.card).is_some_and(|state| {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Chat(current) if current == &dialog.source.descriptor)
         }) && self.chat_return_session(dialog.card).as_ref() == Some(&dialog.source.session)
@@ -1075,12 +1077,12 @@ mod tests {
 
     #[test]
     fn invalid_upper_owned_escape_cannot_cancel_a_surviving_lower_dialog() {
-        for invalidate_batch in [false, true] {
+        for invalidation in 0..3 {
             let (mut app, card, _directory) = fixture();
             write(&mut app, card, "keep original prompt", true);
             app.settings_reset_confirm = true;
             drop(app.finish_modal_update(Task::none()));
-            let batch = if invalidate_batch {
+            let batch = if invalidation == 1 {
                 let _delivery = queued(app.close_cards_in_order(vec![card]));
                 app.pane_close_batch_for(card)
             } else {
@@ -1105,8 +1107,10 @@ mod tests {
                 },
                 captured: false,
             };
-            if invalidate_batch {
+            if invalidation == 1 {
                 app.stop_pane_close_batch(batch);
+            } else if invalidation == 2 {
+                app.workspace_model.identity = uuid::Uuid::new_v4();
             } else {
                 let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else { panic!("chat"); };
                 session.launch.session_id = Some("replacement-thread".into());
