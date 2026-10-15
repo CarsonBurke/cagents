@@ -510,6 +510,10 @@ impl Server {
     }
     fn revision(&self)->u64 {self.changed.load(Ordering::Acquire).wrapping_add(self.actor.close_observation().close_revision)}
     fn resident(&self)->Result<Resident,String> {
+        // Sample before copying any metadata. A concurrent actor publication
+        // may make this conservative token old, which forces the next poll;
+        // stamping the newest token after copying could hide Ready forever.
+        let changed=self.revision();
         // Clone resident metadata only. Do not hydrate the Store or serialize
         // any growing parent/child tool body to service periodic observation.
         let state=self.actor.0.state.lock().unwrap_or_else(|p|p.into_inner());
@@ -517,7 +521,7 @@ impl Server {
         drop(state);
         let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
         let failure=journal.loss()?.or_else(||self.actor.failure());
-        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,retained_runs:journal.retained_runs()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed:self.revision()})
+        Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,retained_runs:journal.retained_runs()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed})
     }
 
     fn published_sources(&self)->Vec<chat::Session> {
