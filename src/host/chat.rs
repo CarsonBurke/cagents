@@ -1396,7 +1396,6 @@ fn start_with_execution(
         // A helper commit is fallible RPC and must run outside HostState.
         // Keep its exact context in native_actor_startups on any uncertainty.
         handle.commit_native_installation().map_err(unavailable)?;
-        if remote { session.native_continuity = handle.native_continuity(); }
         let execution_instance = handle.actor_identity().map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -2570,7 +2569,12 @@ fn process_inner(
                     .chats
                     .get(&chat_id)
                     .filter(|record| record.handle.same_actor(&handle))
-                    .map(|record| record.session.clone())
+                    .map(|record| {
+                        let mut source = record.session.clone();
+                        source.launch.session_id = snapshot.session_id.clone();
+                        source.native_continuity = snapshot.native_continuity.clone();
+                        source
+                    })
                     .ok_or_else(|| {
                         unavailable("The thread changed while its previous actor was closing.")
                     })?;
