@@ -2312,6 +2312,39 @@ mod tests {
     }
 
     #[test]
+    fn attention_passive_shared_close_forgets_surface_without_acknowledging_unseen_notice() {
+        let (mut app, channel, _, _) = fixture();
+        app.refresh_ui.focused = false;
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+        let session = attention_terminal_source();
+        drop(app.insert_terminal_card(session.clone(), None));
+        let card = app.workspace.focused().unwrap();
+        let id = uuid::Uuid::new_v4();
+        let snapshot = crate::notifications::Snapshot { diagnostic: None, notices: vec![crate::notifications::Notice {
+            id, delivered: true, acknowledged: false, window: None,
+            event: crate::notifications::Event { target: crate::notifications::Target::Session(session.id), source_session: Some(session.id),
+                provider: Some(crate::agent::Provider::Codex), directory: Some(session.launch.working_directory.clone()), destination: None,
+                evidence: crate::notifications::Evidence { key: "unseen-before-passive-close".into(), kind: crate::notifications::Kind::Succeeded } },
+        }] };
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot.clone())));
+        assert!(app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+        app.shared_views.pending.clear();
+        app.workspace_model.views = vec![View::empty(channel)];
+        drop(app.reconcile_shared_views());
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id), "surface retirement is not evidence the user read its content");
+        assert!(!app.notification_ui.snapshot.notices[0].acknowledged);
+        // The durable journal may keep the unseen notice. A later broker
+        // snapshot cannot recreate a live sidebar entry for its closed pane.
+        drop(app.update_notifications(notification_ui::Action::Snapshot(snapshot)));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(!app.notification_ui.acknowledged_for_test(id));
+    }
+
+    #[test]
     fn attention_alias_adoption_preserves_unread_only_for_the_exact_complete_native_source() {
         for source in 0..5 {
             let (mut app, channel, _, _) = fixture();
