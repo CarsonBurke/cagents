@@ -7,7 +7,10 @@ pub(crate) fn owned_surface<'a, Message: 'a, Key: Copy + Eq + 'static>(
     content: impl Into<Element<'a, Message>>,
     key: Key,
 ) -> Element<'a, Message> {
-    Element::new(OwnedSurface { content: content.into(), key })
+    Element::new(OwnedSurface {
+        content: content.into(),
+        key,
+    })
 }
 struct OwnedSurface<'a, Message, Key> {
     content: Element<'a, Message>,
@@ -15,10 +18,18 @@ struct OwnedSurface<'a, Message, Key> {
 }
 struct OwnerState<Key>(Key);
 
-impl<Message, Key: Copy + Eq + 'static> Widget<Message, Theme, Renderer> for OwnedSurface<'_, Message, Key> {
-    fn tag(&self) -> tree::Tag { tree::Tag::of::<OwnerState<Key>>() }
-    fn state(&self) -> tree::State { tree::State::new(OwnerState(self.key)) }
-    fn children(&self) -> Vec<Tree> { vec![Tree::new(&self.content)] }
+impl<Message, Key: Copy + Eq + 'static> Widget<Message, Theme, Renderer>
+    for OwnedSurface<'_, Message, Key>
+{
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<OwnerState<Key>>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(OwnerState(self.key))
+    }
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
     fn diff(&mut self, tree: &mut Tree) {
         let changed = tree.state.downcast_ref::<OwnerState<Key>>().0 != self.key;
         if changed {
@@ -28,11 +39,17 @@ impl<Message, Key: Copy + Eq + 'static> Widget<Message, Theme, Renderer> for Own
             // rebuilding, or a static button ID resurrects pressed state.
             fn evict(tree: &Tree) {
                 if let Some(Id(cosmic::iced::core::id::Internal::Custom(_, name))) = &tree.id {
-                    tree::NAMED.with(|named| { named.borrow_mut().remove(name); });
+                    tree::NAMED.with(|named| {
+                        named.borrow_mut().remove(name);
+                    });
                 }
-                for child in &tree.children { evict(child); }
+                for child in &tree.children {
+                    evict(child);
+                }
             }
-            for child in &tree.children { evict(child); }
+            for child in &tree.children {
+                evict(child);
+            }
             evict(&child);
             tree.state = tree::State::new(OwnerState(self.key));
             tree.children = vec![child];
@@ -43,7 +60,9 @@ impl<Message, Key: Copy + Eq + 'static> Widget<Message, Theme, Renderer> for Own
     fn size(&self) -> Size<Length> {
         self.content.as_widget().size()
     }
-    fn size_hint(&self) -> Size<Length> { self.content.as_widget().size_hint() }
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
     fn layout(
         &mut self,
         tree: &mut Tree,
@@ -169,4 +188,3 @@ impl<Message, Key: Copy + Eq + 'static> Widget<Message, Theme, Renderer> for Own
         );
     }
 }
-

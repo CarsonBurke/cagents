@@ -789,8 +789,8 @@ fn close_focus_id(index: usize) -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use iced::mouse;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+    use iced::mouse;
 
     #[test]
     fn tab_starts_from_the_actual_checkbox_control_after_focus_or_pointer_toggle() {
@@ -891,7 +891,10 @@ mod tests {
                         Some(Message::TerminalCloseDontAskChanged(_, true))
                     )));
                     for message in messages {
-                        let toggled = matches!(app.admit_modal_surface_message(message.clone()), Some(Message::TerminalCloseDontAskChanged(..)));
+                        let toggled = matches!(
+                            app.admit_modal_surface_message(message.clone()),
+                            Some(Message::TerminalCloseDontAskChanged(..))
+                        );
                         let task = app.update(message);
                         if toggled {
                             assert_eq!(

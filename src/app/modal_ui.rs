@@ -261,10 +261,23 @@ impl Stack {
 impl Cagents {
     fn modal_instance(&self, modal: Modal) -> Option<Instance> {
         match modal {
-            Modal::Project(role) => self.project_ui.modal_target(role).map(|target| target.request),
-            Modal::Worktree => self.worktree_dialog.as_ref().map(|dialog| Instance::Operation(dialog.request())),
-            Modal::ChatClose => self.chat_ui.close_dialog.as_ref().map(|dialog| Instance::Counter(dialog.generation())),
-            Modal::TerminalClose => self.terminal_close.as_ref().map(|intent| Instance::Counter(intent.generation)),
+            Modal::Project(role) => self
+                .project_ui
+                .modal_target(role)
+                .map(|target| target.request),
+            Modal::Worktree => self
+                .worktree_dialog
+                .as_ref()
+                .map(|dialog| Instance::Operation(dialog.request())),
+            Modal::ChatClose => self
+                .chat_ui
+                .close_dialog
+                .as_ref()
+                .map(|dialog| Instance::Counter(dialog.generation())),
+            Modal::TerminalClose => self
+                .terminal_close
+                .as_ref()
+                .map(|intent| Instance::Counter(intent.generation)),
             _ => None,
         }
     }
@@ -279,14 +292,12 @@ impl Cagents {
 
     pub(super) fn admit_modal_surface_message(&self, message: Message) -> Option<Message> {
         match message {
-            Message::ModalSurface { target, message } => {
-                (!self.update_prepared
-                    && self.top_modal() == Some(target.modal)
-                    && self.modal_instance(target.modal) == target.instance
-                    && self.modal_stack.focus_revision.load(Ordering::Relaxed) == target.revision
-                    && !matches!(&*message, Message::ModalSurface { .. }))
-                .then_some(*message)
-            }
+            Message::ModalSurface { target, message } => (!self.update_prepared
+                && self.top_modal() == Some(target.modal)
+                && self.modal_instance(target.modal) == target.instance
+                && self.modal_stack.focus_revision.load(Ordering::Relaxed) == target.revision
+                && !matches!(&*message, Message::ModalSurface { .. }))
+            .then_some(*message),
             message => Some(message),
         }
     }
@@ -385,10 +396,18 @@ impl Cagents {
             .first()
             .map(|frame| frame.restore.clone());
         let fallback = self.modal_restore_fallback();
-        let instances = active.iter().map(|kind| (*kind, self.modal_instance(*kind))).collect::<Vec<_>>();
-        let changed = self.modal_stack.reconcile_instances(&active, fallback.clone(), |kind| {
-            instances.iter().find(|(modal, _)| *modal == kind).and_then(|(_, instance)| *instance)
-        });
+        let instances = active
+            .iter()
+            .map(|kind| (*kind, self.modal_instance(*kind)))
+            .collect::<Vec<_>>();
+        let changed = self
+            .modal_stack
+            .reconcile_instances(&active, fallback.clone(), |kind| {
+                instances
+                    .iter()
+                    .find(|(modal, _)| *modal == kind)
+                    .and_then(|(_, instance)| *instance)
+            });
         if let Some((kind, _, pushed)) = changed {
             let initial = self.modal_initial_focus(kind);
             let target = if pushed {
@@ -599,16 +618,25 @@ mod tests {
     }
 
     fn apply_modal_widget_task(
-        ui: &mut iced::runtime::user_interface::UserInterface<'_, cosmic::Action<Message>, cosmic::Theme, cosmic::Renderer>,
+        ui: &mut iced::runtime::user_interface::UserInterface<
+            '_,
+            cosmic::Action<Message>,
+            cosmic::Theme,
+            cosmic::Renderer,
+        >,
         renderer: &cosmic::Renderer,
         task: Task<Message>,
     ) {
         use iced::advanced::widget::operation;
         use iced::futures::StreamExt;
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-            let executor = tokio::runtime::Builder::new_current_thread().build().unwrap();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
             while let Some(action) = executor.block_on(stream.next()) {
-                let iced::runtime::Action::Widget(mut operation) = action else { continue; };
+                let iced::runtime::Action::Widget(mut operation) = action else {
+                    continue;
+                };
                 loop {
                     ui.operate(renderer, &mut operation);
                     match operation.finish() {
@@ -622,14 +650,25 @@ mod tests {
 
     #[test]
     fn pointer_press_cannot_carry_consent_into_a_replaced_named_dialog_tree() {
-        use iced::advanced::{clipboard, widget::{Operation, operation}};
+        use iced::advanced::{
+            clipboard,
+            widget::{Operation, operation},
+        };
         use iced::runtime::user_interface::{Cache, UserInterface};
         struct ButtonBounds(Option<iced::Rectangle>);
         impl Operation for ButtonBounds {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
-            fn focusable(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle,
-                _state: &mut dyn operation::Focusable) {
-                if id == Some(&widget::Id::new("dialog.reset-settings.confirm")) { self.0 = Some(bounds); }
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _state: &mut dyn operation::Focusable,
+            ) {
+                if id == Some(&widget::Id::new("dialog.reset-settings.confirm")) {
+                    self.0 = Some(bounds);
+                }
             }
         }
         for replace in [false, true] {
@@ -644,15 +683,29 @@ mod tests {
             let bounds = iced::Size::new(1280.0, 900.0);
             let mut messages = Vec::new();
             let (cache, point) = {
-                let mut ui = UserInterface::build(cosmic::ApplicationExt::view_main(&app),
-                    bounds, Cache::new(), &mut renderer);
+                let mut ui = UserInterface::build(
+                    cosmic::ApplicationExt::view_main(&app),
+                    bounds,
+                    Cache::new(),
+                    &mut renderer,
+                );
                 let mut target = ButtonBounds(None);
                 ui.operate(&renderer, &mut target);
                 let point = target.0.expect("actual destructive button bounds").center();
-                let (_, status) = ui.update(&[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left))],
-                    iced::mouse::Cursor::Available(point), &mut renderer, &mut clipboard::Null, &mut messages);
+                let (_, status) = ui.update(
+                    &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                        iced::mouse::Button::Left,
+                    ))],
+                    iced::mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
                 assert_eq!(status, vec![iced::event::Status::Captured]);
-                assert!(messages.is_empty(), "consent is emitted on release, not press");
+                assert!(
+                    messages.is_empty(),
+                    "consent is emitted on release, not press"
+                );
                 (ui.into_cache(), point)
             };
             let task = if replace {
@@ -666,21 +719,47 @@ mod tests {
             };
             let current = app.modal_surface_target(Modal::SettingsReset);
             assert_eq!(current == original, !replace);
-            let mut ui = UserInterface::build(cosmic::ApplicationExt::view_main(&app), bounds, cache, &mut renderer);
+            let mut ui = UserInterface::build(
+                cosmic::ApplicationExt::view_main(&app),
+                bounds,
+                cache,
+                &mut renderer,
+            );
             // Apply the replacement's normal initial Cancel focus; unfocusing
             // a native button by itself does not clear its pressed state.
             apply_modal_widget_task(&mut ui, &renderer, task);
-            ui.update(&[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left))],
-                iced::mouse::Cursor::Available(point), &mut renderer, &mut clipboard::Null, &mut messages);
+            ui.update(
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(point),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
             let decisions = messages.iter().filter(|message| matches!(message,
                 cosmic::Action::App(Message::ModalSurface { message, .. }) if matches!(&**message, Message::ConfirmResetSettings))).count();
-            assert_eq!(decisions, usize::from(!replace), "a replaced surface cannot inherit pointer consent");
+            assert_eq!(
+                decisions,
+                usize::from(!replace),
+                "a replaced surface cannot inherit pointer consent"
+            );
             if replace {
                 messages.clear();
-                ui.update(&[
-                    iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-                    iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
-                ], iced::mouse::Cursor::Available(point), &mut renderer, &mut clipboard::Null, &mut messages);
+                ui.update(
+                    &[
+                        iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                            iced::mouse::Button::Left,
+                        )),
+                        iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                            iced::mouse::Button::Left,
+                        )),
+                    ],
+                    iced::mouse::Cursor::Available(point),
+                    &mut renderer,
+                    &mut clipboard::Null,
+                    &mut messages,
+                );
                 assert!(messages.iter().any(|message| matches!(message,
                     cosmic::Action::App(Message::ModalSurface { target, message }) if *target == current && matches!(&**message, Message::ConfirmResetSettings))),
                     "a fresh intentional click still reaches the replacement control");
@@ -689,24 +768,44 @@ mod tests {
     }
 
     fn emitted_reset_cancel(app: &Cagents) -> Message {
-        use iced::advanced::{Layout, Shell, clipboard, layout, widget::{Tree, operation}};
+        use iced::advanced::{
+            Layout, Shell, clipboard, layout,
+            widget::{Tree, operation},
+        };
         let renderer = super::super::tests::headless_renderer();
         let mut dialog = app.dialog().expect("visible dialog");
         let mut tree = Tree::new(&dialog);
         let bounds = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
-        let node = dialog.as_widget_mut().layout(&mut tree, &renderer,
-            &layout::Limits::new(iced::Size::ZERO, bounds.size()));
-        dialog.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
-            &mut operation::focusable::focus::<()>(widget::Id::new("dialog.reset-settings.cancel")));
+        let node = dialog.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        dialog.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(widget::Id::new("dialog.reset-settings.cancel")),
+        );
         let mut messages = Vec::new();
-        dialog.as_widget_mut().update(&mut tree, &iced::Event::Keyboard(keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(keyboard::key::Named::Enter),
-            modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
-        }), Layout::new(&node), iced::mouse::Cursor::Unavailable, &renderer,
-            &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        dialog.as_widget_mut().update(
+            &mut tree,
+            &iced::Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }),
+            Layout::new(&node),
+            iced::mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
         messages.into_iter().find(|message| matches!(message,
             Message::ModalSurface { message, .. } if matches!(&**message, Message::CancelResetSettings)))
             .expect("actual Cancel widget publishes its surface-bound decision")
@@ -723,15 +822,21 @@ mod tests {
         let revision = app.modal_stack.focus_revision.load(Ordering::Relaxed);
         drop(app.update(old.clone()));
         assert!(app.settings_reset_confirm && app.resume_ui.open);
-        assert_eq!(app.modal_stack.focus_revision.load(Ordering::Relaxed), revision,
-            "rejected UI messages must not run reconciliation or focus side effects");
+        assert_eq!(
+            app.modal_stack.focus_revision.load(Ordering::Relaxed),
+            revision,
+            "rejected UI messages must not run reconciliation or focus side effects"
+        );
         escape(&mut app);
         drop(app.update(emitted_reset_cancel(&app)));
         assert!(!app.settings_reset_confirm);
         app.settings_reset_confirm = true;
         drop(app.finish_modal_update(Task::none()));
         drop(app.update(old));
-        assert!(app.settings_reset_confirm, "reopening the same kind creates a new UI owner");
+        assert!(
+            app.settings_reset_confirm,
+            "reopening the same kind creates a new UI owner"
+        );
         drop(app.update(emitted_reset_cancel(&app)));
         assert!(!app.modal_is_open());
     }
@@ -760,7 +865,10 @@ mod tests {
         let revision = app.modal_stack.focus_revision.load(Ordering::Relaxed);
         drop(app.update(decision.clone()));
         assert!(app.settings_reset_confirm);
-        assert_eq!(app.modal_stack.focus_revision.load(Ordering::Relaxed), revision);
+        assert_eq!(
+            app.modal_stack.focus_revision.load(Ordering::Relaxed),
+            revision
+        );
         app.update_prepared = false;
         drop(app.update(decision));
         assert!(!app.modal_is_open());
