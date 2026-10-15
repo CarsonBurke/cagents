@@ -1067,6 +1067,7 @@ mod tests {
         let metadata = projects
             .values()
             .flat_map(|project| project.metadata_paths().into_keys())
+            .filter(|path| path.is_dir())
             .collect::<BTreeSet<_>>();
         // Room for all metadata and a single content directory.
         let registrations = Registrations::within(&projects, metadata.len() + 1);
