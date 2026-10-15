@@ -471,7 +471,7 @@ mod tests {
         let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
         let item = app.lsp.fixture_code_action(a_doc).await;
         let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
-        operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+        operation.command = item.command.clone(); operation.command_context = Some(item.context()); operation.open_files = app.editor_open_files();
         let prepared = plan(&app, root.path(), &["a.rs"]);
         app.lsp.close(b_doc);
         app.lsp.fixture_open_format_on_save_document(b_doc, &root.path().join("b.rs"), root.path(), "fn old() {}\n").await;
@@ -490,7 +490,7 @@ mod tests {
             let (mut app, a, _b, a_doc, b_doc) = code_action_fixture(root.path()).await;
             let item = app.lsp.fixture_code_action(a_doc).await;
             let mut operation = app.editor_operation(a, LspEditKind::CodeAction).unwrap();
-            operation.command = item.command.clone(); operation.command_context = Some(item); operation.open_files = app.editor_open_files();
+            operation.command = item.command.clone(); operation.command_context = Some(item.context()); operation.open_files = app.editor_open_files();
             let prepared = plan(&app, root.path(), &["a.rs", "unopened.rs"]);
             let publishing = app.publish_editor_workspace_edit(822, operation, prepared);
             assert!(app.editor_features.publishing());
@@ -922,7 +922,7 @@ struct Operation {
     kind: LspEditKind,
     save_after: bool,
     command: Option<LspCommand>,
-    command_context: Option<LspCodeAction>,
+    command_context: Option<LspCodeActionContext>,
     server_request: Option<LspServerEditId>,
     annotations: Vec<LspChangeAnnotation>,
     open_files: Vec<(CardId, PathBuf)>,
@@ -1139,7 +1139,7 @@ impl Cagents {
     fn validate_editor_feature_command(&self, operation: &Operation) -> Result<(), LspError> {
         if operation.command.is_none() { return Ok(()); }
         if let Some(context) = &operation.command_context {
-            self.lsp.validate_code_action_context(context)?;
+            self.lsp.validate_code_action_context_token(context)?;
         }
         Ok(())
     }
@@ -1196,7 +1196,7 @@ impl Cagents {
                 let Some(mut operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
                 if !self.editor_operation_current(&operation) { return Some(Task::none()); }
                 if let Some(reason) = &item.disabled { self.feature_failure(operation.card, reason.clone()); return Some(Task::none()); }
-                operation.command_context = Some(item.clone());
+                operation.command_context = Some(item.context());
                 operation.command = item.command.clone();
                 if let Some(edit) = &item.edit { Some(self.prepare_editor_workspace_edit(operation, edit.clone())) }
                 else {
@@ -1399,7 +1399,7 @@ impl Cagents {
                     self.editor_features.requests.insert(request, operation);
                     return Task::none();
                 }
-                operation.command_context = Some(item.clone());
+                operation.command_context = Some(item.context());
                 operation.command = item.command;
                 if let Some(edit) = item.edit { self.prepare_editor_workspace_edit(operation, edit) }
                 else if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); Task::none() }
