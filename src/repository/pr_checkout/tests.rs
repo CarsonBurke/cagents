@@ -2686,3 +2686,137 @@ fn new_pr_creation_reuses_only_an_exact_matching_unmounted_read_only_branch() {
         );
     }
 }
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_preserves_tracking_and_refuses_late_read_only_upstream() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::new_pr_creation_preserves_tracking_and_refuses_late_read_only_upstream"
+    )) {
+        return;
+    }
+    for phase in ["before", "fetch", "unlock", "worktree"] {
+        let fixture = Fixture::new(false);
+        let (request, consent, store) = creation_request(&fixture, false);
+        run_git(
+            &fixture.root,
+            &["branch", "reviewed", fixture.original.as_str()],
+        );
+        if phase == "worktree" {
+            run_git(
+                &fixture.root,
+                &["config", "extensions.worktreeConfig", "true"],
+            );
+        }
+        let configure = move |root: &Path| {
+            if phase == "worktree" {
+                run_git(
+                    root,
+                    &["config", "--worktree", "branch.reviewed.remote", "origin"],
+                );
+                run_git(
+                    root,
+                    &[
+                        "config",
+                        "--worktree",
+                        "branch.reviewed.merge",
+                        "refs/heads/feature",
+                    ],
+                );
+            } else {
+                run_git(root, &["config", "branch.reviewed.remote", "origin"]);
+                run_git(
+                    root,
+                    &["config", "branch.reviewed.merge", "refs/heads/feature"],
+                );
+            }
+        };
+        if phase == "before" {
+            configure(&fixture.root);
+        }
+        let scope = if phase == "worktree" {
+            request.destination.clone()
+        } else {
+            fixture.root.clone()
+        };
+        let root = scope.clone();
+        let gate = if phase == "worktree" { "unlock" } else { phase };
+        let mut changed = false;
+        fixture.intercept(move |command| {
+            if phase == "before" {
+                assert!(!command.arguments.iter().any(|arg| arg == "fetch"));
+            } else if !changed && command.arguments.iter().any(|arg| arg == gate) {
+                changed = true;
+                configure(&root);
+            }
+        });
+        let report = create_reviewed(&fixture, &request, &consent, &store);
+        assert_eq!(
+            report.state,
+            if phase == "before" {
+                WorktreeOperationState::NotCreated
+            } else {
+                WorktreeOperationState::OutcomeUnknown
+            },
+            "{phase}: {report:?}"
+        );
+        assert!(!matches!(
+            report.outcome,
+            Some(WorktreeCreationOutcome::Created { .. })
+        ));
+        assert_eq!(
+            git_text(&scope, &["config", "branch.reviewed.remote"]),
+            "origin"
+        );
+        assert_eq!(
+            git_text(&scope, &["config", "branch.reviewed.merge"]),
+            "refs/heads/feature"
+        );
+        assert_eq!(
+            git_text(&fixture.root, &["rev-parse", "refs/heads/reviewed"]),
+            fixture.original.as_str()
+        );
+        if phase == "before" {
+            assert!(!request.managed_root.exists());
+        } else {
+            assert_eq!(
+                git_text(&request.destination, &["rev-parse", "HEAD"]),
+                fixture.original.as_str()
+            );
+            assert!(!matches!(
+                fixture
+                    .service
+                    .rehydrate_worktree_operations(&store)
+                    .unwrap()[0]
+                    .outcome,
+                Some(WorktreeCreationOutcome::Created { .. })
+            ));
+        }
+    }
+    let fixture = Fixture::new(false);
+    let (request, consent, store) = creation_request(&fixture, true);
+    run_git(
+        &fixture.root,
+        &["branch", "reviewed", fixture.original.as_str()],
+    );
+    run_git(
+        &fixture.root,
+        &["config", "branch.reviewed.remote", "origin"],
+    );
+    run_git(
+        &fixture.root,
+        &["config", "branch.reviewed.merge", "refs/heads/other"],
+    );
+    let report = create_reviewed(&fixture, &request, &consent, &store);
+    assert_eq!(
+        report.state,
+        WorktreeOperationState::NotCreated,
+        "{report:?}"
+    );
+    assert_eq!(
+        git_text(&fixture.root, &["config", "branch.reviewed.merge"]),
+        "refs/heads/other"
+    );
+    assert!(!request.managed_root.exists());
+}

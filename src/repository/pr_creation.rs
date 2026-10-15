@@ -145,17 +145,57 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(request)
     }
 
+    pub(super) fn validate_pr_creation_tracking(
+        &self,
+        request: &CreateWorktreeRequest,
+        consent: &PrWorktreeCreationConsent,
+        settled: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        let scope = if settled {
+            &request.destination
+        } else {
+            &request.repository
+        };
+        let read = |key: &str| {
+            self.pr_values(scope, key, cancellation)
+                .map_err(ValidationError::InvalidBase)
+        };
+        let remote = read(&format!("branch.{}.remote", request.branch.as_str()))?;
+        let merge = read(&format!("branch.{}.merge", request.branch.as_str()))?;
+        let absent = remote.is_empty() && merge.is_empty();
+        let correct =
+            remote == [consent.remote.clone()] && merge == [consent.head_branch.full_ref()];
+        if (!consent.track && !absent) || (consent.track && !correct && (settled || !absent)) {
+            return Err(ValidationError::InvalidBranch(
+                "The local branch tracking differs from the reviewed PR choice; existing configuration was preserved. Reconcile it explicitly before opening".into(),
+            ).into());
+        }
+        Ok(())
+    }
+
     pub(super) fn reviewed_pr_creation_endpoint(
         &self,
         request: &CreateWorktreeRequest,
         consent: &PrWorktreeCreationConsent,
         cancellation: &CancellationToken,
     ) -> Result<String, RepositoryError> {
+        self.validate_pr_creation_tracking(request, consent, false, cancellation)?;
+        self.reviewed_pr_creation_endpoint_at(request, consent, &request.repository, cancellation)
+    }
+
+    pub(super) fn reviewed_pr_creation_endpoint_at(
+        &self,
+        request: &CreateWorktreeRequest,
+        consent: &PrWorktreeCreationConsent,
+        scope: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<String, RepositoryError> {
         consent.validate_request(request)?;
-        self.checked_remote(&request.repository, &consent.remote, cancellation)?;
+        self.checked_remote(scope, &consent.remote, cancellation)?;
         let values = self
             .pr_values(
-                &request.repository,
+                scope,
                 &format!("remote.{}.url", consent.remote),
                 cancellation,
             )
@@ -168,6 +208,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 "The PR remote no longer names its reviewed head repository".into(),
             )
             .into());
+        }
+        if consent.track {
+            let push = self
+                .pr_values(
+                    scope,
+                    &format!("remote.{}.pushurl", consent.remote),
+                    cancellation,
+                )
+                .map_err(ValidationError::InvalidBase)?;
+            if push.len() > 1
+                || push.first().is_some_and(|url| {
+                    !remote_repository_key(url)
+                        .is_some_and(|source| source.same_repository(&consent.head_repository))
+                })
+            {
+                return Err(ValidationError::InvalidBase(
+                    "The PR remote push destination changed; reconcile it explicitly".into(),
+                )
+                .into());
+            }
         }
         Ok(values[0].clone())
     }
@@ -291,6 +351,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let cancellation = CancellationToken::new();
         self.reviewed_pr_creation_endpoint(&journal.request, consent, &cancellation)?;
+        self.reviewed_pr_creation_endpoint_at(
+            &journal.request,
+            consent,
+            &journal.request.destination,
+            &cancellation,
+        )?;
+        self.validate_pr_creation_tracking(&journal.request, consent, true, &cancellation)?;
         let residual = self.reconcile_worktree(&journal.request, &cancellation)?;
         let matching = residual.registered_worktree.as_ref().is_some_and(|record| {
             record.head_oid.as_deref() == Some(consent.expected_head.as_str())

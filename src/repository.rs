@@ -11534,11 +11534,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let admin_dir = self.created_admin_dir(journal);
         if residual.branch_exists && owned && admin_dir.is_some() {
             if let Some(consent) = &journal.pr_checkout {
-                if let Err(error) = self.reviewed_pr_creation_endpoint(
-                    &journal.request,
-                    consent,
-                    &CancellationToken::new(),
-                ) {
+                let token = CancellationToken::new();
+                let source = self
+                    .reviewed_pr_creation_endpoint(&journal.request, consent, &token)
+                    .and_then(|_| {
+                        self.reviewed_pr_creation_endpoint_at(
+                            &journal.request,
+                            consent,
+                            &journal.request.destination,
+                            &token,
+                        )
+                    })
+                    .and_then(|_| {
+                        self.validate_pr_creation_tracking(&journal.request, consent, true, &token)
+                    });
+                if let Err(error) = source {
                     journal.state = WorktreeOperationState::OutcomeUnknown;
                     journal.detail = format!(
                         "PR checkout source changed before settlement: {error}; inspect the retained worktree"
