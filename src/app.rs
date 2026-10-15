@@ -23385,6 +23385,7 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    use crate::agent::Provider;
     #[test]
 
     fn git_mutation_queue_coalesces_neighbors_and_keeps_destructive_order() {

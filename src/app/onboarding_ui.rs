@@ -65,7 +65,7 @@ pub(super) fn keyboard_focus_regions() -> Vec<(widget::Id, crate::input_trace::K
     ]
     .into_iter()
     .map(str::to_owned)
-    .chain(Provider::ALL.into_iter().map(|provider| {
+    .chain(crate::agent::Provider::ALL.into_iter().map(|provider| {
         format!("onboarding.provider.{}", provider.executable())
     }))
     .map(|id| (widget::Id::new(id), workspace_widget::FocusedPane::Other.into()))

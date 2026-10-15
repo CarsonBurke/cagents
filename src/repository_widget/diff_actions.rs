@@ -1159,6 +1159,8 @@ mod tests {
             history_revision: document.history.revision(),
             snapshot_source: document.content.text_snapshot(),
             snapshot: document.content.text(),
+            present: document.present,
+            presence_id: document.presence_id,
         });
         for command in [
             Unified,

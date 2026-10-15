@@ -5322,7 +5322,7 @@ impl RepositoryRuntime {
         self.source_surface = SourceSurface::Diff;
         self.diff_basis = DiffBasis::IndexToWorktree;
         self.set_diff_state(self.diff_basis.clone(), DiffState::ready(RenderedDiff::Text {
-            model, old_label: "Before".into(), new_label: "After applying".into(),
+            model: model.into(), old_label: "Before".into(), new_label: "After applying".into(),
         }));
     }
 
@@ -16119,7 +16119,7 @@ mod tests {
     }
 
     fn metadata_ready_diff() -> RenderedDiff {
-        RenderedDiff::Text { model: two_change_model(), old_label: "Before".into(), new_label: "After".into() }
+        RenderedDiff::Text { model: two_change_model().into(), old_label: "Before".into(), new_label: "After".into() }
     }
 
     fn finish_metadata_diff(runtime: &mut RepositoryRuntime, identity: &AsyncIdentity, content: RenderedDiff) {

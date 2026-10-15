@@ -8415,7 +8415,7 @@ mod tests {
     }
     #[test]
     fn terminal_review_and_browser_chrome_use_their_actual_keyboard_scopes() {
-        use iced::keyboard::key::Code;
+        use cosmic::iced::keyboard::key::Code;
         let mut shortcuts = KeyboardShortcuts::default();
         let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
         let review = key_press("r", Code::KeyR, modifiers, false);

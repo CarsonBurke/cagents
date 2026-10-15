@@ -5170,7 +5170,7 @@ mod tests {
                     .is_some_and(|notice| notice.message.contains("selected diff changed"))
         );
         let (mut app, _, _) = diff_command_fixture();
-        app.sidebar_model.source_control.as_mut().unwrap().reloading = true;
+        app.sidebar_model.source_control.as_mut().unwrap().set_reloading(true);
         assert!(!app.command_available(Command::DiffStageSelection));
         app.sidebar_model.source_control = None;
         for command in [
@@ -5762,13 +5762,13 @@ mod tests {
         let _ = app.update_palette(Action::Query("open settings".into()));
         // File-opening commands share these words. Choose the destination by
         // its command identity so this remains a pane-focus contract.
-        app.palette.selected = app
+        app.palette.selected_message = Some(app
             .palette_entries()
-            .iter()
-            .position(|(_, _, message)| {
-                matches!(message, Message::RunCommand(Command::OpenSettings))
+            .into_iter()
+            .find_map(|(_, _, message)| {
+                matches!(message, Message::RunCommand(Command::OpenSettings)).then_some(message)
             })
-            .expect("the settings-pane command is listed");
+            .expect("the settings-pane command is listed"));
         let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
         let submit = app.update_palette(Action::Submit);
         let destination = app.workspace.focused().unwrap();
@@ -6152,7 +6152,7 @@ mod settings_recorder_tests {
             (sidebar::SelectionRow::Project(project), false),
             (sidebar::SelectionRow::Channel(channel), false),
             (
-                sidebar::SelectionRow::Worktree(project, WorktreeId::new()),
+                sidebar::SelectionRow::Worktree(project, crate::model::WorktreeId::new()),
                 false,
             ),
         ] {

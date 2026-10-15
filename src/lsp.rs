@@ -6128,7 +6128,7 @@ mod tests {
             );
             let old_ticket = manager.pending_opens[&doc].ticket;
             manager.change(doc, 2, &[], "edited during discovery");
-            assert_eq!(manager.pending_opens[&doc].text, "edited during discovery");
+            assert_eq!(manager.pending_opens[&doc].text.full_text().as_ref(), "edited during discovery");
             manager.close(doc);
             let (ticket, root) = next_matching(&events, |event| match event {
                 LspEvent::RootDiscovered { ticket, root, .. } => Some((*ticket, root.clone())),

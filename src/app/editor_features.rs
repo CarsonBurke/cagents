@@ -845,7 +845,7 @@ mod tests {
         drop(app.editor_feature_event(&LspEvent::PrepareRename { request: old, doc, range: Some(LspRange::new(LspPosition::new(0, 0), LspPosition::new(0, 4))), placeholder: Some("call".into()) }));
         assert_eq!(app.editor_features.choice_requests[&card].0, new);
         assert!(!app.editor_features.renames.contains_key(&card));
-        let event = LspEvent::CodeActions { request: new, doc, items: vec![LspCodeAction::local("Fix call", None, None)] };
+        let event = LspEvent::CodeActions { request: new, doc, items: vec![LspCodeAction::local("Fix call".into(), None, None)] };
         drop(app.editor_feature_event(&event));
         assert_eq!(app.editor_features.code_actions[&card].1[0].title, "Fix call");
         let pending = LspRequestId(75);
@@ -853,7 +853,7 @@ mod tests {
         operation.kind = LspEditKind::CodeAction;
         app.track_editor_choice_request(pending, operation);
         drop(app.update_editor_features(Action::Dismiss(card)));
-        drop(app.editor_feature_event(&LspEvent::CodeActions { request: pending, doc, items: vec![LspCodeAction::local("Dismissed fix", None, None)] }));
+        drop(app.editor_feature_event(&LspEvent::CodeActions { request: pending, doc, items: vec![LspCodeAction::local("Dismissed fix".into(), None, None)] }));
         assert!(!app.editor_features.code_actions.contains_key(&card));
         assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.editor_feature_ui_open()));
     }
@@ -870,7 +870,7 @@ mod tests {
             assert_eq!(runtime.select_text_match("call(", 0), Some(1));
             assert_eq!(runtime.cursor_position(), Some(LspPosition::new(0, 5)));
         }
-        drop(app.editor_feature_event(&LspEvent::CodeActions { request, doc, items: vec![LspCodeAction::local("Fix old range", None, None)] }));
+        drop(app.editor_feature_event(&LspEvent::CodeActions { request, doc, items: vec![LspCodeAction::local("Fix old range".into(), None, None)] }));
         assert!(!app.editor_features.code_actions.contains_key(&card));
         assert!(!app.editor_features.choice_requests.contains_key(&card));
     }
