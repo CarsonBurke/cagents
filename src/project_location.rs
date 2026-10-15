@@ -299,7 +299,10 @@ mod tests {
             let project = discover(&selected).unwrap();
             assert_eq!(project.key, selected.join(".git"));
             assert_eq!(project.checkout.as_deref(), Some(selected.as_path()));
-            assert_eq!(project.primary_checkout.as_deref(), Some(selected.as_path()));
+            assert_eq!(
+                project.primary_checkout.as_deref(),
+                Some(selected.as_path())
+            );
             let plain = root.join("plain").canonicalize().unwrap();
             let folder = discover(&plain).unwrap();
             assert_eq!(folder.key, plain);
