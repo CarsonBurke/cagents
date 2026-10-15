@@ -95,6 +95,7 @@ pub(crate) enum Update {
     Activity {
         state: ActivityState,
         generation: u64,
+        outcome: Option<crate::agent::ActivityOutcome>,
     },
     /// The provider began taking prompts, which leaves activity unchanged.
     Ready,
@@ -2378,6 +2379,7 @@ impl Actor {
             self.dirty = true;
         }
         let activity = state.activity();
+        let outcome = state.outcome.clone();
         let generation = state.generation;
         let became_ready = state.ready && !self.ready;
         self.ready = state.ready;
@@ -2397,6 +2399,7 @@ impl Actor {
             (self.notify)(Update::Activity {
                 state: activity,
                 generation,
+                outcome,
             });
         }
         if became_ready {

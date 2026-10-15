@@ -451,10 +451,11 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     };
     for (&client, &visible) in &record.subscribers {
         let message = match &update {
-            &Update::Activity { state, generation } => ServerMessage::ChatActivity {
+            Update::Activity { state, generation, outcome } => ServerMessage::ChatActivity {
                 chat_id: id,
-                state,
-                generation,
+                state: *state,
+                generation: *generation,
+                outcome: outcome.clone(),
             },
             Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
             &Update::Observed { generation } if !visible => {
