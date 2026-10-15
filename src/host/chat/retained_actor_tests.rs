@@ -359,6 +359,16 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     let reopened=crate::persistence::StateStore::open(&storage_path,replacement.proof.as_ref().unwrap().boot_id.clone()).unwrap();
     assert_eq!(reopened.load_card(pane,None).unwrap().unwrap().kind,crate::model::CardKind::Chat(replacement.clone()));
     assert!(!root.join("prompts").exists(),"no accepted input may be replayed or synthesized");
+    // A later explicit first prompt names the thread without another Ready
+    // edge. Its durable hosted descriptor must learn that ID even though no
+    // UI ever hydrated a transcript or opened this conversation.
+    let notifications=super::super::notifications::Broker::start(&successor,crate::notifications::Application::Cagents).unwrap();
+    successor.lock().unwrap().notifications=Some(notifications.handle());
+    handle.command(chat::Command::Prompt {text:"One explicit prompt after unnamed adoption".into(),attachments:Vec::new(),mode:chat::PromptMode::Send}).unwrap();
+    wait_until(||root.join("provider-done").exists(),"provider never finished its explicit first prompt");
+    wait_until(||successor.lock().unwrap().chats[&id].session.launch.session_id.is_some(),"unopened hosted descriptor did not retain late confirmed identity");
+    assert_eq!(successor.lock().unwrap().chats[&id].session.launch.session_id,handle.confirmed_session_id());
+    assert_eq!(fs::read_to_string(root.join("prompts")).unwrap().lines().count(),1);
     handle.close().unwrap();retained_actor::finish_close(&successor,&handle,&replacement).unwrap();
     assert!(!identity.record.root.is_current()&&!identity.record.holder.is_current());
     drop(lease);

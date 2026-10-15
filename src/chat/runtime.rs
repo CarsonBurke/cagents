@@ -4290,6 +4290,32 @@ mod tests {
     }
 
     #[test]
+    fn confirmed_identity_after_initial_ready_emits_a_scalar_identity_wake() {
+        struct LateIdentity;
+        impl Adapter for LateIdentity {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Default::default())}
+            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step {write:vec![serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})],..Default::default()})}
+            fn receive(&mut self,value:Value)->Result<Step,String> {Ok(Step {events:vec![Event::Session {id:value["identity"].as_str().unwrap().to_owned(),title:None}],..Default::default()})}
+        }
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec::from(&crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:root.path().into(),environment:Default::default(),unset_environment:Default::default()});
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let events=Arc::new(Mutex::new(Vec::new()));let observed=events.clone();
+        let handle=LocalHandle::start(spec,Box::new(LateIdentity),initial,store,None,move |update|observed.lock().unwrap().push(update)).unwrap();
+        until(&handle,|state|state.ready);
+        assert!(handle.confirmed_session_id().is_none());
+        handle.command(Command::Refresh).unwrap();
+        until(&handle,|state|state.session_id.is_some());
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while !events.lock().unwrap().iter().any(|update|matches!(update,Update::Identity)) {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
+        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Ready)).count(),1,"the provider never reinitializes just to publish its identity");
+        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Identity)).count(),1);
+        assert_eq!(handle.confirmed_session_id().as_deref(),Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+        handle.close().unwrap();
+    }
+
+    #[test]
     fn final_provider_proof_survives_a_pending_transcript_flush_failure() {
         struct FinalFrame { run: Option<crate::model::RunId> }
         impl Adapter for FinalFrame {
