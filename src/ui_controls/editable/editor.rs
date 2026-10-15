@@ -29,12 +29,11 @@ impl EditHistory {
         }
     }
     fn observe(&mut self, text: String, cursor: text_editor::Cursor) {
-        if let Some(target) = self.restoring {
-            if text != self.entries[target].text {
-                return;
-            }
-            self.current = target;
-            self.restoring = None;
+        // Widget events are batched before application messages. Content
+        // still describes the previous view until diff reconciles the queued
+        // restoration and any typing that followed it in the same batch.
+        if self.restoring.is_some() {
+            return;
         }
         if text == self.entries[self.current].text {
             self.entries[self.current].cursor = cursor;
@@ -50,10 +49,11 @@ impl EditHistory {
         }
         self.current = self.entries.len() - 1;
     }
+    fn reconcile_restoration(&mut self, text: String, cursor: text_editor::Cursor) {
+        self.restoring = None;
+        self.observe(text, cursor);
+    }
     fn restore(&mut self, redo: bool) -> Option<&EditSnapshot> {
-        if self.restoring.is_some() {
-            return None;
-        }
         let target = if redo {
             self.current
                 .checked_add(1)
@@ -61,6 +61,7 @@ impl EditHistory {
         } else {
             self.current.checked_sub(1)?
         };
+        self.current = target;
         self.restoring = Some(target);
         self.entries.get(target)
     }
@@ -203,6 +204,8 @@ impl<Message: Clone + 'static> Widget<Message, Theme, Renderer> for TextEditor<'
         if old != state.identity.id {
             state.lines.get_mut().clear();
             state.history = EditHistory::new(self.content.text(), self.content.cursor());
+        } else if state.history.restoring.is_some() {
+            state.history.reconcile_restoration(self.content.text(), self.content.cursor());
         }
         self.inner.set_id(state.identity.id.clone());
         tree.children[0].diff(&mut self.inner as &mut dyn Widget<Message, Theme, Renderer>);
@@ -626,6 +629,67 @@ mod tests {
         }
     }
 
+    fn apply_native_editor_batch(
+        content: &mut text_editor::Content<Renderer>,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        keys: &[cosmic::iced::keyboard::Event],
+    ) {
+        let mut messages = Vec::new();
+        {
+            let mut editor: Element<Message> = TextEditor::new("Batch composer", content)
+                .id(Id::new("test.batch-composer"))
+                .on_action(Message::Edit)
+                .on_cursor(Message::Cursor)
+                .into();
+            tree.diff(editor.as_widget_mut());
+            let node = editor.as_widget_mut().layout(tree, renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(400., 180.)));
+            let layout = Layout::new(&node);
+            editor.as_widget_mut().operate(tree, layout, renderer,
+                &mut cosmic::iced::advanced::widget::operation::focusable::focus::<()>(Id::new("test.batch-composer")));
+            for key in keys {
+                editor.as_widget_mut().update(tree, &Event::Keyboard(key.clone()), layout,
+                    mouse::Cursor::Unavailable, renderer, &mut clipboard::Null,
+                    &mut Shell::new(&mut messages), &layout.bounds());
+            }
+        }
+        for message in messages {
+            match message {
+                Message::Edit(action) => content.perform(action),
+                Message::Cursor(cursor) => content.move_to(cursor),
+                Message::Keyboard(..) => unreachable!("this fixture has no root observer"),
+            }
+        }
+    }
+
+    #[test]
+    fn typing_in_the_same_native_batch_as_undo_keeps_history_usable() {
+        use cosmic::iced::keyboard::{self, key::{Code, Physical}};
+        let key = |value: &str, code, modifiers, text: Option<&str>| keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character(value.into()),
+            modified_key: keyboard::Key::Character(value.into()),
+            physical_key: Physical::Code(code), modifiers,
+            text: text.map(Into::into), repeat: false,
+            location: keyboard::Location::Standard,
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut content = text_editor::Content::new();
+        let mut tree = Tree::empty();
+        let undo = key("z", Code::KeyZ, keyboard::Modifiers::CTRL, None);
+        let redo = key("z", Code::KeyZ, keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT, None);
+        for (events, expected) in [
+            (vec![key("a", Code::KeyA, keyboard::Modifiers::empty(), Some("a"))], "a"),
+            (vec![undo.clone(), key("b", Code::KeyB, keyboard::Modifiers::empty(), Some("b"))], "b"),
+            (vec![undo.clone()], ""),
+            (vec![redo.clone()], "b"),
+            (vec![undo, redo], "b"),
+        ] {
+            apply_native_editor_batch(&mut content, &mut tree, &renderer, &events);
+            assert_eq!(content.text(), expected);
+        }
+    }
+
     #[test]
     fn editor_history_discards_redo_after_new_text_and_bounds_retention() {
         let cursor = text_editor::Cursor {
@@ -635,8 +699,7 @@ mod tests {
         let mut history = EditHistory::new(String::new(), cursor);
         history.observe("a".into(), cursor);
         assert_eq!(history.restore(false).unwrap().text, "");
-        history.observe("".into(), cursor);
-        history.observe("b".into(), cursor);
+        history.reconcile_restoration("b".into(), cursor);
         assert!(history.restore(true).is_none());
         for value in 0..200 {
             history.observe(format!("{value}{}", "x".repeat(20_000)), cursor);
