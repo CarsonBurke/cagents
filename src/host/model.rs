@@ -638,7 +638,8 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 13 {
         project_checkout::migrate(db)?;
-        db.pragma_update(None, "user_version", 13).map_err(|error| error.to_string())?;
+        db.pragma_update(None, "user_version", 13)
+            .map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -863,7 +864,8 @@ mod tests {
 
     fn open(repository: &str) -> ModelEdit {
         ModelEdit::OpenProject {
-            checkout: None, primary_checkout: None,
+            checkout: None,
+            primary_checkout: None,
             kind: Default::default(),
             repository: PathBuf::from(repository),
             name: repository.rsplit('/').next().unwrap().to_owned(),
@@ -888,7 +890,8 @@ mod tests {
         let path = directory.path().join("model.sqlite3");
         registry
             .apply(&ModelEdit::OpenProject {
-                checkout: None, primary_checkout: None,
+                checkout: None,
+                primary_checkout: None,
                 repository: "/folder".into(),
                 name: "Folder".into(),
                 kind: ProjectKind::Folder,
@@ -899,7 +902,8 @@ mod tests {
         let mut observed = registry.model().unwrap();
         assert_eq!(observed.projects[0].kind, ProjectKind::Folder);
         let repeat = ModelEdit::ReopenProject {
-            checkout: None, primary_checkout: None,
+            checkout: None,
+            primary_checkout: None,
             repository: "/folder".into(),
             name: "Renamed".into(),
             kind: ProjectKind::Git,
@@ -990,7 +994,8 @@ mod tests {
         assert_eq!(stale.model.closed_projects, [PathBuf::from("/tmp/one")]);
         let opened = registry
             .apply(&ModelEdit::ReopenProject {
-                checkout: None, primary_checkout: None,
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: PathBuf::from("/tmp/one"),
                 name: "one".into(),

@@ -3693,15 +3693,28 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Git reports its metadata directory as the primary worktree for
     /// --separate-git-dir without core.worktree. Repair it only from a
     /// discovery that actually proved this checkout owns the common gitdir.
-    pub fn list_worktrees_for_repository(&self, repository: &RepositoryInfo, cancellation: &CancellationToken) -> Result<Vec<WorktreeRecord>, RepositoryError> {
+    pub fn list_worktrees_for_repository(
+        &self,
+        repository: &RepositoryInfo,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<WorktreeRecord>, RepositoryError> {
         let mut records = self.list_worktrees(&repository.common_dir, cancellation)?;
-        let primary = repository.worktree_root.as_ref().filter(|_| repository.git_dir == repository.common_dir && !repository.is_bare);
+        let primary = repository
+            .worktree_root
+            .as_ref()
+            .filter(|_| repository.git_dir == repository.common_dir && !repository.is_bare);
         records.retain_mut(|record| {
-            if record.bare || record.path != repository.common_dir { return true; }
-            let Some(primary) = primary else { return false; };
+            if record.bare || record.path != repository.common_dir {
+                return true;
+            }
+            let Some(primary) = primary else {
+                return false;
+            };
             record.path = primary.clone();
             record.id = stable_worktree_id(primary);
-            record.created_at_unix_ms = std::fs::metadata(primary).and_then(|metadata| metadata.created()).ok()
+            record.created_at_unix_ms = std::fs::metadata(primary)
+                .and_then(|metadata| metadata.created())
+                .ok()
                 .and_then(|created| created.duration_since(std::time::UNIX_EPOCH).ok())
                 .and_then(|duration| i64::try_from(duration.as_millis()).ok());
             true

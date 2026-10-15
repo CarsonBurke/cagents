@@ -218,18 +218,39 @@ pub enum Action {
 }
 
 impl Cagents {
-    pub(super) fn known_project_checkout(&self, repository: &Path, project_id: ProjectId) -> Option<(PathBuf, PathBuf)> {
-        if let Some(checkout) = self.project_ui.checkout_roots.get(repository).or_else(|| self.project_ui.primary_checkout_roots.get(repository)) {
+    pub(super) fn known_project_checkout(
+        &self,
+        repository: &Path,
+        project_id: ProjectId,
+    ) -> Option<(PathBuf, PathBuf)> {
+        if let Some(checkout) = self
+            .project_ui
+            .checkout_roots
+            .get(repository)
+            .or_else(|| self.project_ui.primary_checkout_roots.get(repository))
+        {
             return Some((checkout.clone(), repository.to_owned()));
         }
         let project = self.sidebar_model.project(project_id)?;
         if project.kind == ProjectKind::Folder {
             return Some((project.repository.clone(), project.repository.clone()));
         }
-        let checkout = project.worktrees.iter().find(|row| {
-            project.repository.file_name().is_some_and(|name| name == ".git")
-                && project.repository.parent() == Some(row.path.as_path())
-        }).or_else(|| project.worktrees.iter().find(|row| row.path != project.repository))?;
+        let checkout = project
+            .worktrees
+            .iter()
+            .find(|row| {
+                project
+                    .repository
+                    .file_name()
+                    .is_some_and(|name| name == ".git")
+                    && project.repository.parent() == Some(row.path.as_path())
+            })
+            .or_else(|| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| row.path != project.repository)
+            })?;
         Some((checkout.path.clone(), project.repository.clone()))
     }
 
@@ -2878,14 +2899,16 @@ mod tests {
         let model = WorkspaceModel {
             projects: vec![
                 ModelProject {
-                    checkout: None, primary_checkout: None,
+                    checkout: None,
+                    primary_checkout: None,
                     repository: child.clone(),
                     name: "Child folder".into(),
                     kind: ProjectKind::Folder,
                     ordinal: 1,
                 },
                 ModelProject {
-                    checkout: None, primary_checkout: None,
+                    checkout: None,
+                    primary_checkout: None,
                     repository: git_root.join(".git"),
                     name: "Other Git".into(),
                     kind: ProjectKind::Git,
