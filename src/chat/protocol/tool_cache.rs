@@ -242,6 +242,8 @@ mod tests {
         for index in 0..8192 {
             cache.insert(None, tool(&format!("same-frame-{index}"), 0));
         }
+        cache.insert(None, tool("same-frame-0", 0));
+        assert_eq!(cache.order.len(), 8192, "replacement must refresh, not duplicate, its ordering entry");
         assert!(cache.items.capacity() > MAX_ITEMS * 2);
         assert!(cache.order.capacity() > MAX_ITEMS * 2);
         cache.trim();
@@ -250,6 +252,7 @@ mod tests {
         assert!(cache.items.capacity() <= MAX_ITEMS * 2);
         assert!(cache.order.capacity() <= MAX_ITEMS * 2);
         assert!(cache.get(None, "same-frame-8191").is_some());
+        assert!(cache.get(None, "same-frame-0").is_some(), "replacement keeps its refreshed recent position");
         for index in 0..8192 {
             cache.insert(None, tool(&format!("uncommitted-reset-{index}"), 0));
         }
