@@ -863,7 +863,8 @@ impl Store {
         loop {
             let rows={
                 let mut query=self.db.prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64").map_err(|error|error.to_string())?;
-                query.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?))).map_err(|error|error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?
+                let rows=query.query_map([],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Vec<u8>>(1)?))).map_err(|error|error.to_string())?.collect::<Result<Vec<_>,_>>().map_err(|error|error.to_string())?;
+                rows
             };
             if rows.is_empty() {break;}
             for (id,metadata) in rows {
