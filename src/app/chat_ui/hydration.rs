@@ -36,6 +36,7 @@ struct Entry {
     loaded: Option<Loaded>,
     error: Option<String>,
     complete: bool,
+    append: Option<(std::sync::Weak<chat::Item>,std::sync::Weak<chat::Item>)>,
 }
 
 /// Full text owners are active-surface data. `clear` is part of residency
@@ -66,6 +67,12 @@ impl State {
             .filter_map(|loaded|if let ItemContent::Text {text,..}=&loaded.item.content {Some(text.len())} else {None}).sum()
     }
     pub(super) fn alias_count(&self)->usize {self.entries.values().map(|entry|entry.parts.len()).sum()}
+    /// One weak lineage edge per source proves the completed-root transition
+    /// without rescanning its prefix. Actor/selection eviction drops the edge.
+    pub(super) fn append_proven(&self,previous:&Arc<chat::Item>,current:&Arc<chat::Item>)->bool {
+        self.entries.values().any(|entry|entry.append.as_ref().is_some_and(|(old,new)|
+            old.as_ptr()==Arc::as_ptr(previous) && new.as_ptr()==Arc::as_ptr(current)))
+    }
     pub(super) fn aliases(&self,agent_id:Option<&str>,root:&str)->Vec<(String,Range<usize>)> {
         self.entries.get(&Key {agent_id:agent_id.map(str::to_owned),source_id:root.into()})
             .map(|entry|entry.parts.iter().map(|part|(part.item.id.clone(),part.range.clone())).collect())
@@ -114,7 +121,7 @@ impl State {
                     // source generation advanced in the meantime.
                 },
                 None=>{self.entries.insert(key,Entry {parts,request_version:1,version:1,
-                    attempt:next_attempt(),loaded:None,error:None,complete:false});},
+                    attempt:next_attempt(),loaded:None,error:None,complete:false,append:None});},
             }
         }
         self.aliases=self.entries.iter().flat_map(|(key,entry)|entry.parts.iter()
@@ -158,7 +165,23 @@ impl State {
         let Some(entry)=self.entries.get_mut(key).filter(|entry|entry.attempt==attempt) else {return false;};
         if entry.complete {return false;}
         entry.complete=true;
-        match loaded {Ok(loaded)=>{entry.loaded=Some(loaded);entry.error=None;},Err(error)=>entry.error=Some(error)}
+        entry.append=None;
+        match loaded {
+            Ok(loaded)=>{
+                if let Some(previous)=&entry.loaded
+                    && previous.epoch==loaded.epoch
+                    && previous.item.id==key.source_id && loaded.item.id==key.source_id
+                    && previous.item.role==loaded.item.role
+                    && !Arc::ptr_eq(&previous.item,&loaded.item)
+                    && let (ItemContent::Text {text:old,thinking:a,phase:x},ItemContent::Text {text:new,thinking:b,phase:y})=
+                        (&previous.item.content,&loaded.item.content)
+                    && a==b && x==y && old.len()<=new.len() {
+                    entry.append=Some((Arc::downgrade(&previous.item),Arc::downgrade(&loaded.item)));
+                }
+                entry.loaded=Some(loaded);entry.error=None;
+            },
+            Err(error)=>entry.error=Some(error),
+        }
         if entry.version!=entry.request_version {
             entry.complete=false;entry.request_version=entry.version;entry.attempt=next_attempt();
         }
@@ -436,6 +459,36 @@ mod tests {
         state.clear();
         assert!(!state.complete(&key,attempt,Ok(Loaded {item:text("root","old"),epoch:1})));
         assert_eq!(state.retained_bytes(),0);assert_eq!(state.alias_count(),0);
+    }
+
+    #[test]
+    fn completed_root_append_proof_is_weak_scoped_and_epoch_fenced() {
+        let raw=|generation,epoch,body:&str|source_snapshot(Snapshot {
+            generation,source_revision:epoch,items:vec![text("root",body)],..Snapshot::default()});
+        let mut state=State::default();state.project(raw(1,7,"pre"),None);
+        let key=Key {agent_id:None,source_id:"root".into()};
+        let first_attempt=state.entries[&key].attempt;
+        let previous=text("root","prefix");let weak=Arc::downgrade(&previous);
+        assert!(state.complete(&key,first_attempt,Ok(Loaded {item:previous.clone(),epoch:7})));
+        state.project(raw(2,7,"prefix appended"),None);
+        let next_attempt=state.entries[&key].attempt;let current=text("root","prefix appended suffix");
+        assert!(state.complete(&key,next_attempt,Ok(Loaded {item:current.clone(),epoch:7})));
+        assert!(state.append_proven(&previous,&current));
+        assert!(!state.append_proven(&text("root","prefix"),&current),"equal text is not immutable identity proof");
+        assert!(!state.complete(&key,first_attempt,Ok(Loaded {item:text("root","stale"),epoch:7})));
+        assert!(state.append_proven(&previous,&current),"a stale completion cannot revoke current proof");
+        drop(previous);assert!(weak.upgrade().is_none(),"proof cannot keep old bodies resident");
+        state.project(raw(3,8,"rewritten root"),None);
+        let rewritten=text("root","rewritten root is longer");let attempt=state.entries[&key].attempt;
+        assert!(state.complete(&key,attempt,Ok(Loaded {item:rewritten.clone(),epoch:8})));
+        assert!(!state.append_proven(&current,&rewritten));
+        state.project(raw(4,8,"rewritten root is longer"),None);
+        let mut changed=(*rewritten).clone();
+        let ItemContent::Text {thinking,..}=&mut changed.content else {unreachable!()};*thinking=true;
+        let changed=Arc::new(changed);let attempt=state.entries[&key].attempt;
+        assert!(state.complete(&key,attempt,Ok(Loaded {item:changed.clone(),epoch:8})));
+        assert!(!state.append_proven(&rewritten,&changed),"rendering kind changes require a parse reset");
+        state.clear();assert!(!state.append_proven(&current,&rewritten));
     }
     #[test]
     fn per_source_rewrites_revalidate_without_cancelling_inflight_reads() {
