@@ -1886,7 +1886,9 @@ impl<Message> TerminalWidget<Message> {
     }
 
     fn keyboard_focused(&self, state: &WidgetState) -> bool {
-        self.model_focused && state.native_window_focused.unwrap_or(self.window_focused) && state.input_focused
+        self.model_focused
+            && state.native_window_focused.unwrap_or(self.window_focused)
+            && state.input_focused
     }
 
     fn flush_key_releases(&self, state: &mut WidgetState, shell: &mut Shell<'_, Message>) {
@@ -2876,7 +2878,11 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // later modifier change may resemble Copy/Paste/scrollback,
                 // but cannot turn that admitted press's release into a UI
                 // shortcut. Review/read-only barriers above still apply.
-                if let Some(index) = state.input_keys.iter().position(|(key, _)| key == physical_key) {
+                if let Some(index) = state
+                    .input_keys
+                    .iter()
+                    .position(|(key, _)| key == physical_key)
+                {
                     let mut input = state.input_keys[index].1.clone();
                     input.action = KeyAction::Release;
                     input.text = None;
