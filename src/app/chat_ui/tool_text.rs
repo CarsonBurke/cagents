@@ -47,6 +47,7 @@ impl Shared {
         Self { key: tail_digest(language as u64, &text), reader_source: reader_source::Source::new(&text), text, language }
     }
     pub(super) fn text(&self) -> &Arc<str> { &self.text }
+    pub(super) fn prefixes(&self)->Arc<Vec<[u8;32]>> {self.reader_source.prefixes()}
 }
 
 pub(super) struct ToolText {

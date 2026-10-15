@@ -120,11 +120,13 @@ pub(super) struct FindSource {
     pub manifests:Vec<Arc<Manifest>>,
     pub patches:Vec<(usize,Arc<str>)>,
     pub complete:bool,
+    pub prefixes:Vec<(usize,Arc<Vec<[u8;32]>>)>,
 }
 pub(super) struct LoadedPatch {
     pub text:Arc<str>,
     pub record:chat::source_owners::ResidentPatch,
     pub view:tool_text::ToolText,
+    pub prefixes:Arc<Vec<[u8;32]>>,
 }
 /// Action clones share a single completion owner; a stale result is taken and
 /// released once, including its reader permit and allocated-capacity guard.
@@ -182,6 +184,7 @@ impl State {
         if changed {self.revision=self.revision.wrapping_add(1);}
     }
     pub(super) fn revision(&self)->u64 {self.revision}
+    pub(super) fn context_token(&self)->u64 {self.context}
     pub(super) fn item_revision(&self,item:&str)->u64 {self.aliases.get(item).and_then(|key|self.entries.get(key)).map_or(0,|entry|entry.revision)}
     pub(super) fn root(&self,item:&str)->Option<&str> {self.aliases.get(item).map(|key|key.source_id.as_str())}
     pub(super) fn metadata(&self,item:&str)->Option<&chat::cache::changes::Metadata> {
@@ -258,7 +261,9 @@ impl State {
                 }
             }
         }
-        self.entries.retain(|key,_|visible.contains(key));self.aliases=aliases;
+        let previous_len=self.entries.len();self.entries.retain(|key,_|visible.contains(key));
+        if self.entries.len()!=previous_len {self.revision=self.revision.wrapping_add(1);}
+        self.aliases=aliases;
         for (key,entry) in &mut self.entries {entry.demand(expanded.contains(&key.source_id),find);}
         let unchanged=self.raw.as_ref().is_some_and(|old|Arc::ptr_eq(old,&raw));
         if unchanged && let Some(projected)=&self.projected {return projected.clone();}
@@ -331,8 +336,9 @@ impl State {
                     entry.patch_errors.insert(index,"The patch no longer holds its source lease. Retry loading it.".into());
                 } else {
                     entry.restored.remove(&index);
+                    let prefixes=patch.prepared.prefixes();
                     let view=tool_text::ToolText::from_shared(None,patch.prepared);
-                    entry.patches.insert(index,LoadedPatch {text:patch.text,record,view});
+                    entry.patches.insert(index,LoadedPatch {text:patch.text,record,view,prefixes});
                 }
             }
             Ok(_)=>{entry.copy_all=false;entry.copy_error=Some("The original patch changed. No partial copy was made.".into());entry.patch_errors.insert(index,"The patch changed before it could be displayed. Retry loading it.".into());}
@@ -364,6 +370,8 @@ impl State {
     pub(super) fn find_sources(&self)->Vec<FindSource> {
         self.entries.iter().map(|(key,entry)|FindSource {
             source:key.clone(),epoch:entry.part.epoch,revision:entry.revision,
+            prefixes:entry.pages.values().flat_map(|page|page.files.iter()).filter_map(|file|
+                entry.current(file.file_index).map(|patch|(file.file_index,patch.prefixes.clone()))).collect(),
             manifests:entry.pages.values().cloned().collect(),
             patches:entry.pages.values().flat_map(|page|page.files.iter()).filter_map(|file|
                 entry.current(file.file_index).map(|patch|(file.file_index,patch.text.clone()))).collect(),
