@@ -117,7 +117,7 @@ fn write(db: &Connection, location: &Location) -> Result<(), String> {
     Ok(())
 }
 
-pub(super) fn refusals(db: &Connection, views: &[crate::workspace_model::views::View], agents: &[Agent]) -> Result<Vec<crate::workspace_model::SessionLocationRefusal>, String> {
+pub(super) fn refusals(db: &Connection, views: &[crate::workspace_model::views::View], agents: &[crate::agent_execution::Agent]) -> Result<Vec<crate::workspace_model::SessionLocationRefusal>, String> {
     let mut owned = std::collections::BTreeSet::new();
     for view in views { for pane in &view.panes { match &pane.kind {
         crate::model::CardKind::Terminal(session) => { owned.insert(session.id); },
