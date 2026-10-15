@@ -27,6 +27,38 @@ static EVENT_SOURCE_ID: AtomicU64 = AtomicU64::new(1);
 struct KeyboardInput {
     held: Vec<(cosmic::iced::keyboard::key::Physical, BrowserInput)>,
     released: Vec<cosmic::iced::keyboard::key::Physical>,
+    modifiers: super::BrowserModifiers,
+}
+
+impl KeyboardInput {
+    fn release_modifiers(&mut self, release: &mut BrowserInput) {
+        let BrowserInput::Key { code, modifiers, .. } = release else {
+            return;
+        };
+        // The event snapshot at keydown may predate a normally delivered
+        // modifier release. Release remaining owned modifiers in order, and
+        // keep an aggregate bit until both left and right keys are released.
+        let remaining = |left: &str, right: &str| {
+            self.held.iter().any(|(_, input)| matches!(input,
+                BrowserInput::Key { code, .. } if code == left || code == right))
+        };
+        match code.as_str() {
+            "ControlLeft" | "ControlRight" => {
+                self.modifiers.control = remaining("ControlLeft", "ControlRight");
+            }
+            "ShiftLeft" | "ShiftRight" => {
+                self.modifiers.shift = remaining("ShiftLeft", "ShiftRight");
+            }
+            "AltLeft" | "AltRight" => {
+                self.modifiers.alt = remaining("AltLeft", "AltRight");
+            }
+            "SuperLeft" | "SuperRight" => {
+                self.modifiers.meta = remaining("SuperLeft", "SuperRight");
+            }
+            _ => {}
+        }
+        *modifiers = self.modifiers;
+    }
 }
 
 #[derive(Debug)]
@@ -170,6 +202,11 @@ impl CommandMailbox {
         }
     }
 
+    pub(crate) fn observe_modifiers(&self, modifiers: super::BrowserModifiers) {
+        self.keyboard.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+            .modifiers = modifiers;
+    }
+
     pub(crate) fn press_key(
         &self,
         physical: cosmic::iced::keyboard::key::Physical,
@@ -185,7 +222,14 @@ impl CommandMailbox {
         {
             return Err(BrowserError::CommandQueueFull);
         }
+        let observed = match &press {
+            BrowserInput::Key { modifiers, .. } => Some(*modifiers),
+            _ => None,
+        };
         self.send(Command::Input(press))?;
+        if let Some(modifiers) = observed {
+            keyboard.modifiers = modifiers;
+        }
         keyboard.released.retain(|key| *key != physical);
         if !keyboard.held.iter().any(|(key, _)| *key == physical) {
             keyboard.held.push((physical, release));
@@ -202,6 +246,9 @@ impl CommandMailbox {
             .keyboard
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let BrowserInput::Key { modifiers, .. } = &release {
+            keyboard.modifiers = *modifiers;
+        }
         if let Some(index) = keyboard.released.iter().position(|key| *key == physical) {
             keyboard.released.swap_remove(index);
             return Ok(true);
@@ -226,7 +273,8 @@ impl CommandMailbox {
             .deferred_releases
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        while let Some((physical, release)) = keyboard.held.pop() {
+        while let Some((physical, mut release)) = keyboard.held.pop() {
+            keyboard.release_modifiers(&mut release);
             pending.push_back(release);
             if !keyboard.released.contains(&physical) {
                 if keyboard.released.len() == ADMITTED_KEY_LIMIT {
@@ -938,6 +986,118 @@ mod tests {
             mailbox.receiver().try_recv().is_err(),
             "physical release was already paired"
         );
+    }
+
+    #[test]
+    fn blur_does_not_restore_a_modifier_released_after_keydown() {
+        use super::super::{BrowserKeyLocation, BrowserModifiers, ButtonState};
+        use cosmic::iced::keyboard::key::{Code, Physical};
+        let mailbox = CommandMailbox::new();
+        let input = |state, code: &str, control| BrowserInput::Key {
+            state,
+            key: if code == "KeyA" { "a" } else { "Control" }.into(),
+            code: code.into(),
+            location: BrowserKeyLocation::Standard,
+            modifiers: BrowserModifiers { control, ..Default::default() },
+            repeat: false,
+            composing: false,
+        };
+        for (physical, code) in [(Physical::Code(Code::ControlLeft), "ControlLeft"),
+            (Physical::Code(Code::KeyA), "KeyA")] {
+            mailbox.press_key(physical, input(ButtonState::Pressed, code, true),
+                input(ButtonState::Released, code, true)).unwrap();
+        }
+        assert!(mailbox.release_key(Physical::Code(Code::ControlLeft),
+            input(ButtonState::Released, "ControlLeft", false)).unwrap());
+        mailbox.release_pressed_keys();
+        let observed: Vec<_> = mailbox.receiver().try_iter().filter_map(|command| {
+            if let Command::Input(input) = command { Some(input) } else { None }
+        }).collect();
+        assert_eq!(observed.last(), Some(&input(ButtonState::Released, "KeyA", false)));
+    }
+
+    #[test]
+    fn blur_uses_modifier_changes_without_an_owned_modifier_press() {
+        use super::super::{BrowserKeyLocation, BrowserModifiers, ButtonState};
+        use cosmic::iced::keyboard::key::{Code, Physical};
+        for native_release in [false, true] {
+            let mailbox = CommandMailbox::new();
+            let mut input = BrowserInput::Key {
+                state: ButtonState::Pressed, key: "a".into(), code: "KeyA".into(),
+                location: BrowserKeyLocation::Standard,
+                modifiers: BrowserModifiers { control: true, ..Default::default() },
+                repeat: false, composing: false,
+            };
+            let mut release = input.clone();
+            if let BrowserInput::Key { state, .. } = &mut release {
+                *state = ButtonState::Released;
+            }
+            mailbox.press_key(Physical::Code(Code::KeyA), input.clone(), release).unwrap();
+            if native_release {
+                assert!(!mailbox.release_key(Physical::Code(Code::ControlLeft),
+                    BrowserInput::Key {
+                        state: ButtonState::Released, key: "Control".into(),
+                        code: "ControlLeft".into(), location: BrowserKeyLocation::Left,
+                        modifiers: BrowserModifiers::default(), repeat: false, composing: false,
+                    }).unwrap());
+            } else {
+                mailbox.observe_modifiers(BrowserModifiers::default());
+            }
+            mailbox.release_pressed_keys();
+            if let BrowserInput::Key { state, modifiers, .. } = &mut input {
+                *state = ButtonState::Released;
+                *modifiers = BrowserModifiers::default();
+            }
+            let observed: Vec<_> = mailbox.receiver().try_iter().filter_map(|command| {
+                if let Command::Input(input) = command { Some(input) } else { None }
+            }).collect();
+            assert_eq!(observed.last(), Some(&input));
+        }
+    }
+
+    #[test]
+    fn blur_releases_dual_modifiers_with_current_aggregate_state() {
+        use super::super::{BrowserKeyLocation, BrowserModifiers, ButtonState};
+        use cosmic::iced::keyboard::key::{Code, Physical};
+        for (left, right, name, kind) in [
+            (Code::ControlLeft, Code::ControlRight, "Control", 0),
+            (Code::ShiftLeft, Code::ShiftRight, "Shift", 1),
+            (Code::AltLeft, Code::AltRight, "Alt", 2),
+            (Code::SuperLeft, Code::SuperRight, "Super", 3),
+        ] {
+            for reverse in [false, true] {
+                let mailbox = CommandMailbox::new();
+                let input = |state, code, location| BrowserInput::Key {
+                    state, key: name.into(), code: format!("{code:?}"), location,
+                    modifiers: BrowserModifiers {
+                        control: kind == 0, shift: kind == 1,
+                        alt: kind == 2, meta: kind == 3, ..Default::default()
+                    },
+                    repeat: false, composing: false,
+                };
+                let mut keys = [(left, BrowserKeyLocation::Left),
+                    (right, BrowserKeyLocation::Right)];
+                if reverse { keys.reverse(); }
+                for (code, location) in keys {
+                    mailbox.press_key(Physical::Code(code),
+                        input(ButtonState::Pressed, code, location),
+                        input(ButtonState::Released, code, location)).unwrap();
+                }
+                mailbox.release_pressed_keys();
+                let releases: Vec<_> = mailbox.receiver().try_iter().filter_map(|command| {
+                    if let Command::Input(BrowserInput::Key {
+                        state: ButtonState::Released, code, location, modifiers, ..
+                    }) = command { Some((code, location, modifiers)) } else { None }
+                }).collect();
+                assert_eq!(releases.len(), 2);
+                assert_eq!(releases[0].0, format!("{:?}", keys[1].0));
+                assert_eq!(releases[0].1, keys[1].1);
+                assert_eq!(releases[1].0, format!("{:?}", keys[0].0));
+                assert_eq!(releases[1].1, keys[0].1);
+                assert_ne!(releases[0].2, BrowserModifiers::default());
+                assert_eq!(releases[1].2, BrowserModifiers::default());
+            }
+        }
     }
 
     #[test]

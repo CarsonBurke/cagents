@@ -621,6 +621,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for BrowserWidget<'_, Mess
                 );
                 shell.capture_event();
             }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                self.handle.mailbox.observe_modifiers(super::input::iced_modifiers(*modifiers));
+            }
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
                 physical_key,
