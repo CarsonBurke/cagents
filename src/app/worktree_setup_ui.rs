@@ -459,6 +459,13 @@ impl Cagents {
             // checkout inherited the same creation. Wait for a verified local
             // journal or daemon receipt even on this window's first inventory.
             let Some(run) = self.setup_ui.expected_runs.get(path) else {
+                // A verified legacy/no-run receipt owns its durable summary.
+                // An unrelated saved terminal cannot supply a run for it.
+                if self.setup_ui.recovered.contains_key(path)
+                    || self.setup_ui.daemon_receipts.contains_key(path)
+                {
+                    continue;
+                }
                 self.setup_ui.statuses.insert(path.clone(), WorktreeSetupStatus::Interrupted(
                     "The saved setup terminal has no verified creation receipt for this checkout. Review setup before continuing.".into(),
                 ));
@@ -588,6 +595,8 @@ impl Cagents {
         let status = restored_setup_status(&intent);
         if let Some(run) = intent.run_id {
             self.setup_ui.expected_runs.insert(path.clone(), run);
+        } else {
+            self.setup_ui.expected_runs.remove(&path);
         }
         self.setup_ui
             .recovered
@@ -1347,9 +1356,11 @@ impl Cagents {
                 self.setup_ui
                     .expected_runs
                     .insert(receipt.path.clone(), run);
-                if previous != Some(run) {
-                    self.setup_ui.terminals.remove(&receipt.path);
-                }
+            } else {
+                self.setup_ui.expected_runs.remove(&receipt.path);
+            }
+            if previous != receipt.run_id || receipt.run_id.is_none() {
+                self.setup_ui.terminals.remove(&receipt.path);
             }
             self.setup_ui.uncertain_receipts.remove(&receipt.path);
             self.setup_ui
@@ -1587,6 +1598,79 @@ mod tests {
             app.sidebar_model.projects[0].worktrees[0].setup_status,
             Some(WorktreeSetupStatus::Interrupted(_))
         ));
+    }
+
+    #[test]
+    fn verified_receipt_without_a_run_never_inherits_a_previous_terminals_status() {
+        for remote in [false, true] {
+            for summary in ["skipped", "copy-only", "unfinished"] {
+                for live in [false, true] {
+                    let mut app = crate::app::tests::context_inspector_test_app(true);
+                    let path = PathBuf::from("/repo/setup");
+                    let project = ProjectId::new();
+                    app.sidebar_model.projects.push(SidebarProject::new(
+                        project, RepositoryId::new(), "repo".into(), "/repo".into(),
+                        vec![SidebarWorktree::from_durable(crate::model::WorktreeId::new(), path.clone(), Some("setup".into()))],
+                        vec![],
+                    ));
+                    let old = OperationId::new();
+                    let mut terminal = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
+                    terminal.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+                    terminal.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), old.to_string());
+                    terminal.continuity = if live {
+                        TerminalContinuity::Live {
+                            host_session_id: crate::model::HostSessionId::new("old-host"),
+                            boot_id: crate::model::BootId::new("old-boot"),
+                            host_incarnation: crate::model::HostIncarnation::new("old-incarnation"),
+                        }
+                    } else {
+                        TerminalContinuity::Exited { last_exit: crate::model::TerminalExit {
+                            code: Some(0), signal: None, occurred_at_unix_ms: 100,
+                        } }
+                    };
+                    Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(terminal);
+                    app.setup_ui.expected_runs.insert(path.clone(), old);
+                    app.refresh_worktree_setup_rows();
+                    assert_eq!(app.setup_ui.expected_run(&path), Some(old));
+                    assert!(app.setup_ui.terminals.contains_key(&path));
+                    let creation = OperationId::new();
+                    let skip = summary == "skipped";
+                    let copy_done = summary == "copy-only";
+                    let has_commands = summary == "unfinished";
+                    if remote {
+                        app.setup_ui.daemon_receipts.insert(path.clone(), (project, OperationId::new()));
+                        let request = OperationId::new();
+                        app.setup_ui.receipt_requests.insert(project, (request, "/repo".into(), Instant::now()));
+                        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), request, Ok((
+                            vec![crate::worktree_control::SetupReceipt {
+                                path: path.clone(), creation_id: creation, run_id: None,
+                                skip, copy_done, has_commands,
+                            }], vec![],
+                        ))));
+                    } else {
+                        app.recover_worktree_setup(creation, path.clone(), SetupIntent {
+                            run_id: None, skip, copy_done,
+                            plan: Some(SetupPlan {
+                                copy: vec![], commands: if has_commands { vec!["true".into()] } else { vec![] },
+                                fingerprint: "a".repeat(64),
+                            }),
+                            ..Default::default()
+                        });
+                    }
+                    for _ in 0..2 {
+                        app.refresh_worktree_setup_rows();
+                        assert_eq!(app.setup_ui.expected_run(&path), None);
+                        assert!(!app.setup_ui.terminals.contains_key(&path));
+                        let status = app.setup_ui.statuses.get(&path).unwrap();
+                        match summary {
+                            "skipped" => assert_eq!(status, &WorktreeSetupStatus::Skipped),
+                            "copy-only" => assert_eq!(status, &WorktreeSetupStatus::Succeeded),
+                            _ => assert!(matches!(status, WorktreeSetupStatus::Interrupted(_))),
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
