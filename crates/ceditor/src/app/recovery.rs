@@ -69,14 +69,17 @@ impl Editor {
     }
 
     pub(super) fn refuse_recovery_disk_action(&mut self, action: &RepositoryAction) -> bool {
-        if !matches!(action, RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }
+        if !matches!(action, RepositoryAction::DiskMetadata { .. } | RepositoryAction::Save { .. } | RepositoryAction::AutoSaveDue { .. }
             | RepositoryAction::StageSelected { .. } | RepositoryAction::RevertFile { .. }
             | RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }) { return false; }
         let card = action.card();
         if !self.tab(card).is_some_and(|tab| self.editor_recovery_blocks(&tab.runtime.descriptor.worktree)) { return false; }
-        if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = action
-            && let Some(tab) = self.tab_mut(card) {
-            tab.runtime.retire_auto_save_due(identity, *revision, *ticket);
+        if let Some(tab) = self.tab_mut(card) {
+            match action {
+                RepositoryAction::AutoSaveDue { identity, revision, ticket } => { tab.runtime.retire_auto_save_due(identity, *revision, *ticket); },
+                RepositoryAction::DiskMetadata { identity, ticket, .. } => { tab.runtime.retire_disk_metadata(identity, *ticket); },
+                _ => {},
+            }
         }
         self.notice = Some("Resolve retained file recovery before another disk operation in this worktree.".into());
         true
