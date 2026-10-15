@@ -290,13 +290,14 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
     let resume=|run, fingerprint,trust,skip|device_service::Operation::Worktree {operation:Operation::ResumeSetup {repository:repository.clone(),path:path.clone(),expected_run_id:run,expected_plan_fingerprint:fingerprint,trust,skip}};
     assert!(client.device_operation(resume(prior.run_id,Some(plan.fingerprint.clone()),false,false)).is_err());
     assert!(client.device_operation(resume(Some(OperationId::new()),Some(plan.fingerprint.clone()),true,false)).is_err());
+    assert!(client.device_operation(resume(prior.run_id,Some("changed-after-review".into()),true,false)).is_err());
     assert_eq!(fixture.setup_intent(&path)["run_id"],serde_json::to_value(prior.run_id).unwrap());
     let device_service::Reply::Worktree(Reply::SetupPrepared {setup:Some(setup),warnings,..})=client.device_operation(resume(prior.run_id,Some(plan.fingerprint.clone()),true,false)).unwrap() else {panic!("wrong recovery result")};
     assert!(warnings.is_empty(),"{warnings:?}");assert!(setup.error.is_none(),"{setup:?}");
     let session=setup.terminal.unwrap();let run=setup.run_id.unwrap();assert_ne!(Some(run),prior.run_id);
     assert_eq!(session.launch.environment["CAGENTS_WORKTREE_SETUP_ID"],run.to_string());
     let deadline=Instant::now()+Duration::from_secs(10);
-    while !path.join("setup-runs").exists()||client.list().unwrap().iter().any(|terminal|terminal.session.id==session.id&&terminal.session.last_exit.is_none()) {
+    while !path.join("setup-runs").exists()||client.list().unwrap().iter().any(|terminal|terminal.session.id==session.id&&!matches!(terminal.session.continuity,cagents::model::TerminalContinuity::Exited {..}|cagents::model::TerminalContinuity::RelaunchAvailable {last_exit:Some(_),..})) {
         assert!(Instant::now()<deadline,"reviewed setup did not finish");thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewed");
@@ -309,7 +310,8 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
     fs::write(&configuration,"setup = [not valid TOML").unwrap();
     let device_service::Reply::Worktree(Reply::SetupIntent {plan_error,trusted,..})=client.device_operation(device_service::Operation::Worktree {operation:Operation::SetupIntent {repository:repository.clone(),path:path.clone()}}).unwrap() else {panic!("wrong recovery metadata")};
     assert!(plan_error.is_some());assert!(!trusted);
-    let device_service::Reply::Worktree(Reply::SetupPrepared {setup:None,..})=client.device_operation(resume(Some(run),None,false,true)).unwrap() else {panic!("wrong skip result")};
+    let device_service::Reply::Worktree(Reply::SetupPrepared {setup:None,run_id:skipped_run,..})=client.device_operation(resume(Some(run),None,false,true)).unwrap() else {panic!("wrong skip result")};
     let skipped=fixture.setup_intent(&path);assert_eq!(skipped["skip"],true);assert_eq!(skipped["copy_done"],true);assert!(skipped["plan"].is_null());assert_ne!(skipped["run_id"],run.to_string());
+    assert_eq!(skipped["run_id"],skipped_run.to_string());
     assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewed");
 }
