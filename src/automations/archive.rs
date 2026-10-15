@@ -314,9 +314,8 @@ pub fn inspect_completed_automation_pane(
     ArchivedPaneReadiness::qualify_kind(expected, kind, &archive).map(Some)
 }
 
-/// Qualifies a source pane without opening a service or migrating either DB.
-/// No claim is `None`; a broken claimed archive is an error, never a live-pane
-/// exemption. Both reads refuse symlinks and preserve source files unchanged.
+/// Compatibility entry point for a native Chat. Keep schema admission and
+/// exact source qualification on the same read-only path as Terminal panes.
 #[cfg(feature = "host")]
 pub fn inspect_archived_pane(
     database: &std::path::Path,
@@ -324,74 +323,7 @@ pub fn inspect_archived_pane(
     card: crate::model::CardId,
     session: &Session,
 ) -> Result<Option<ArchivedPaneReadiness>, String> {
-    use crate::model::{CardKind, Existence};
-    use rusqlite::{Connection, OpenFlags, OptionalExtension};
-    let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW;
-    let mut source = Connection::open_with_flags(database, flags)
-        .map_err(|_| "The source archive binding is unreadable")?;
-    source
-        .busy_timeout(std::time::Duration::from_millis(100))
-        .map_err(|_| "The source archive binding is unavailable")?;
-    let tx = source
-        .transaction()
-        .map_err(|_| "Cannot read the source archive binding")?;
-    let row:Option<(String,String,String,Option<String>,String)>=tx.query_row(
-        "SELECT c.workspace_id,CASE WHEN length(CAST(c.existence_json AS BLOB))<=4096 THEN c.existence_json ELSE 'null' END,c.kind_tag,CASE WHEN length(CAST(c.content_json AS BLOB))<=4194304 THEN c.content_json ELSE NULL END,CASE WHEN length(CAST(w.existence_json AS BLOB))<=4096 THEN w.existence_json ELSE 'null' END FROM cards c JOIN workspaces w ON w.workspace_id=c.workspace_id WHERE c.card_id=?1",
-        [card.to_string()],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?))).optional().map_err(|_|"The source archive pane is unreadable")?;
-    let Some((workspace, existence, kind, content, workspace_existence)) = row else {
-        return Ok(None);
-    };
-    let bindings: Option<Option<String>> = tx
-        .query_row(
-            "SELECT CASE WHEN length(CAST(value AS BLOB))<=1048576 THEN value ELSE NULL END FROM metadata WHERE key=?1",
-            [format!(
-                "workspace:{workspace}:navigation:automation_archives"
-            )],
-            |row| row.get(0),
-        )
-        .optional()
-        .map_err(|_| "The source archive binding is unreadable")?;
-    let Some(bindings) = bindings else {
-        return Ok(None);
-    };
-    let bindings = bindings.ok_or("The source archive binding exceeds its inspection limit")?;
-    let bindings: std::collections::HashMap<crate::model::CardId, AgentId> =
-        serde_json::from_str(&bindings).map_err(|_| "The source archive binding is invalid")?;
-    let Some(agent) = bindings.get(&card).copied() else {
-        return Ok(None);
-    };
-    let existence: Existence =
-        serde_json::from_str(&existence).map_err(|_| "The source archive pane is invalid")?;
-    let workspace_existence: Existence = serde_json::from_str(&workspace_existence)
-        .map_err(|_| "The source archive workspace is invalid")?;
-    if !existence.is_open()
-        || !workspace_existence.is_open()
-        || kind != "chat"
-        || agent.as_uuid() != card.as_uuid()
-    {
-        return Err("The source archive binding changed".into());
-    }
-    let current: Session = serde_json::from_str(
-        content
-            .as_deref()
-            .ok_or("The source archive descriptor is missing")?,
-    )
-    .map_err(|_| "The source archive descriptor is invalid")?;
-    if CardKind::Chat(current) != CardKind::Chat(session.clone()) {
-        return Err("The source archive descriptor changed".into());
-    }
-    let model = Connection::open_with_flags(registry, flags)
-        .map_err(|_| "The saved automation archive is unavailable")?;
-    model
-        .busy_timeout(std::time::Duration::from_millis(100))
-        .map_err(|_| "The saved automation archive is unavailable")?;
-    let (record,snapshot):(String,String)=model.query_row("SELECT g.record,s.snapshot FROM agents g JOIN automation_snapshots s ON s.agent=g.id WHERE g.id=?1 AND g.closed=1 AND length(CAST(g.record AS BLOB))<=4194304 AND length(CAST(s.snapshot AS BLOB))<=4194304",[agent.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).map_err(|_|"The claimed automation archive is missing or unreadable")?;
-    let archive = ArchivedConversation {
-        agent: serde_json::from_str(&record).map_err(|_| "The saved archive owner is invalid")?,
-        snapshot: serde_json::from_str(&snapshot)
-            .map_err(|_| "The saved archive payload is invalid")?,
-    };
-    ArchivedPaneReadiness::qualify(agent, session, &archive).map(Some)
+    inspect_completed_automation_pane(database, registry, card, &crate::model::CardKind::Chat(session.clone()))
 }
 
 #[cfg(test)]
