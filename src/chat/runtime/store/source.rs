@@ -24,6 +24,7 @@ impl Store {
             || (query.offset>0 && (query.until.is_none() || query.expected_epoch.is_none())) || (query.until.is_some() && query.expected_epoch.is_none()) {
             return Err(SourceError::InvalidRange);
         }
+        self.flush_child_source().map_err(storage)?;
         self.flush_text().map_err(storage)?;
         let (epoch,length,supported) = if let Some(agent)=&query.source.agent_id {
             self.db.query_row("SELECT epoch,len,supported FROM child_sources WHERE agent=?1 AND id=?2",params![agent,query.source.source_id],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,usize>(1)?,r.get::<_,bool>(2)?))).optional().map_err(storage)?.ok_or(SourceError::NotFound)?
@@ -59,19 +60,16 @@ impl Store {
         Ok(SourcePage{source:query.source,epoch,source_len:until,offset:query.offset,next_offset,text,complete:next_offset==until})
     }
 
-    pub(super) fn cache_child_source(&mut self,event:&Event)->Result<(),String>{
-        match event {
-            Event::SubagentItem{id,item}=>{
-                if id.len()>METADATA_LIMIT || item.id.len()>METADATA_LIMIT {return Ok(());}
-                let text=match &item.content {ItemContent::Text{text,..}=>Some(text.as_str()),_=>None};
-                let tx=self.db.transaction().map_err(|e|e.to_string())?;
-                tx.execute("INSERT INTO child_sources VALUES(?1,?2,?3,?4,?5) ON CONFLICT(agent,id) DO UPDATE SET epoch=excluded.epoch,len=excluded.len,supported=excluded.supported",params![id,item.id,epoch()?,text.map_or(0,str::len),text.is_some()]).map_err(|e|e.to_string())?;
-                tx.execute("DELETE FROM child_source_chunks WHERE agent=?1 AND id=?2",params![id,item.id]).map_err(|e|e.to_string())?;
-                if let Some(text)=text.filter(|text|text.len()<=SOURCE_BYTES){child_chunks(&tx,id,&item.id,0,text)?;}
-                tx.commit().map_err(|e|e.to_string())?;
+    fn flush_child_source(&mut self)->Result<(),String>{
+        if let Some((agent,id,delta))=self.pending_child_source.take(){
+            if let Err(error)=self.append_child_source(&agent,&id,&delta){
+                self.pending_child_source=Some((agent,id,delta));
+                return Err(error);
             }
-            Event::SubagentTextDelta{id,item_id,delta,..}=>{
-                if id.len()>METADATA_LIMIT || item_id.len()>METADATA_LIMIT {return Ok(());}
+        }
+        Ok(())
+    }
+    fn append_child_source(&mut self,id:&str,item_id:&str,delta:&str)->Result<(),String>{
                 let tx=self.db.transaction().map_err(|e|e.to_string())?;
                 let existing:Option<(usize,bool)>=tx.query_row("SELECT len,supported FROM child_sources WHERE agent=?1 AND id=?2",params![id,item_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
                 let length=match existing {
@@ -87,6 +85,29 @@ impl Store {
                     child_chunks(&tx,id,item_id,length,&delta[..keep])?;
                 }
                 tx.commit().map_err(|e|e.to_string())?;
+        Ok(())
+    }
+
+    pub(super) fn cache_child_source(&mut self,event:&Event)->Result<(),String>{
+        if !matches!(event,Event::SubagentTextDelta{..}) {self.flush_child_source()?;}
+        match event {
+            Event::SubagentItem{id,item}=>{
+                if id.len()>METADATA_LIMIT || item.id.len()>METADATA_LIMIT {return Ok(());}
+                let text=match &item.content {ItemContent::Text{text,..}=>Some(text.as_str()),_=>None};
+                let tx=self.db.transaction().map_err(|e|e.to_string())?;
+                tx.execute("INSERT INTO child_sources VALUES(?1,?2,?3,?4,?5) ON CONFLICT(agent,id) DO UPDATE SET epoch=excluded.epoch,len=excluded.len,supported=excluded.supported",params![id,item.id,epoch()?,text.map_or(0,str::len),text.is_some()]).map_err(|e|e.to_string())?;
+                tx.execute("DELETE FROM child_source_chunks WHERE agent=?1 AND id=?2",params![id,item.id]).map_err(|e|e.to_string())?;
+                if let Some(text)=text.filter(|text|text.len()<=SOURCE_BYTES){child_chunks(&tx,id,&item.id,0,text)?;}
+                tx.commit().map_err(|e|e.to_string())?;
+            }
+            Event::SubagentTextDelta{id,item_id,delta,..}=>{
+                if id.len()>METADATA_LIMIT || item_id.len()>METADATA_LIMIT {return Ok(());}
+                if self.pending_child_source.as_ref().is_some_and(|pending|pending.0!=*id || pending.1!=*item_id || pending.2.len().saturating_add(delta.len())>64*1024) {
+                    self.flush_child_source()?;
+                }
+                if delta.len()>64*1024 {self.append_child_source(id,item_id,delta)?;}
+                else if let Some(pending)=&mut self.pending_child_source {pending.2.push_str(delta);}
+                else {self.pending_child_source=Some((id.clone(),item_id.clone(),delta.clone()));}
             }
             Event::SubagentItemsRemoved{id,ids}=>{for source in ids {self.db.execute("DELETE FROM child_sources WHERE agent=?1 AND id=?2",params![id,source]).map_err(|e|e.to_string())?;}}
             Event::Reset{..}=>{self.db.execute("DELETE FROM child_sources",[]).map_err(|e|e.to_string())?;}
@@ -161,6 +182,19 @@ mod tests {
         store.apply(Event::SubagentItemsRemoved{id:"one".into(),ids:vec!["same".into()]}).unwrap();
         assert_eq!(store.source_page(next(&first)),Err(SourceError::NotFound));
     }
+    #[test]
+    fn child_token_deltas_batch_before_disk_reads() {
+        let mut store=Store::new().unwrap();
+        for _ in 0..1024 {
+            store.apply(Event::SubagentTextDelta{id:"child".into(),item_id:"text".into(),role:Role::Assistant,thinking:false,delta:"é".into()}).unwrap();
+        }
+        assert_eq!(store.db.query_row("SELECT COUNT(*) FROM child_sources",[],|row|row.get::<_,usize>(0)).unwrap(),0);
+        assert_eq!(store.pending_child_source.as_ref().unwrap().2.len(),2048);
+        let page=store.source_page(query(Some("child"),"text")).unwrap();
+        assert_eq!(page.text,"é".repeat(1024));
+        assert!(store.pending_child_source.is_none());
+    }
+
     #[test]
     fn rejects_invalid_boundaries_unsupported_types_and_oversized_sources() {
         let mut store=Store::new().unwrap();
