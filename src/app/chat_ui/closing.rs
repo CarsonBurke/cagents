@@ -1085,8 +1085,11 @@ mod tests {
         let local = local_error.map(|_| LocalReturn { session: source.clone(), launch: source.launch.recipe.clone(), resumes: true });
         app.chat_ui.phases.insert(card, Phase::Returning { target, local, close_requested: false });
         if local_error.is_none() {
-            app.chat_ui.handoff_bindings.insert(target, crate::terminal::ipc::ChatSourceBinding {
-                source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4(),
+            app.chat_ui.handoff_bindings.insert(target, CapturedHandoffBinding {
+                binding: crate::terminal::ipc::ChatSourceBinding {
+                    source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4(),
+                },
+                handle: None, // Error-only simulated outstanding return; no receipt authority.
             });
         }
         let _original_delivery = queued(app.close_cards_in_order(vec![card]));

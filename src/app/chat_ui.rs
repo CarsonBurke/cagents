@@ -466,7 +466,7 @@ pub(super) struct State {
     close_generation: u64,
     end_requests: HashMap<Target, closing::EndRequest>,
     /// Captured before Return IO; retained even if its presentation is evicted.
-    pub(super) handoff_bindings: HashMap<Target, crate::terminal::ipc::ChatSourceBinding>,
+    pub(super) handoff_bindings: HashMap<Target, CapturedHandoffBinding>,
     handoff_closes: HashMap<CardId, HandoffClose>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
@@ -504,6 +504,11 @@ pub(super) struct State {
     /// The model last chosen for each provider, and its effort, which a new
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
+}
+#[derive(Clone)]
+pub(super) struct CapturedHandoffBinding {
+    binding: crate::terminal::ipc::ChatSourceBinding,
+    handle: Option<Arc<ClientHandle>>,
 }
 struct HandoffClose {
     attachment_operation: uuid::Uuid,
@@ -6156,7 +6161,7 @@ impl Cagents {
                             self.status = Some(TransientNotice::warning("This return cannot be retained safely yet. Save or acknowledge pending returns, then retry the original conversation."));
                             return Task::none();
                         }
-                        self.chat_ui.handoff_bindings.insert(target, expected.clone());
+                        self.chat_ui.handoff_bindings.insert(target, CapturedHandoffBinding { binding: expected.clone(), handle: Some(handle.clone()) });
                         self.chat_ui.phases.insert(
                             target.card,
                             Phase::Returning {
@@ -8338,7 +8343,12 @@ impl Cagents {
                 }
             }
             Action::HandoffFinished(target, result) => {
-                let Some(expected) = self.chat_ui.handoff_bindings.remove(&target) else { return Task::none(); };
+                let Some(captured) = self.chat_ui.handoff_bindings.remove(&target) else { return Task::none(); };
+                let expected = captured.binding;
+                let same_handle = captured.handle.as_ref().is_some_and(|original| {
+                    matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime))
+                        if runtime.handle().is_some_and(|current| Arc::ptr_eq(original, current)))
+                });
                 // The exact authenticated answer remains recoverable even if
                 // a scope change retired its presentation while IO ran. It is
                 // never ACKed as a conversion until that descriptor was saved.
@@ -8360,7 +8370,7 @@ impl Cagents {
                     self.stop_pane_close_batch(batch);
                     return Task::none();
                 };
-                if !phase_current || !retained || request.as_ref().is_some_and(|request| !match &result {
+                if !phase_current || !retained || (result.is_ok() && !same_handle) || request.as_ref().is_some_and(|request| !match &result {
                     Ok(receipt) => request.source_matches_handoff(self, target.card, receipt),
                     Err(_) => request.source_current(self, target.card),
                 }) {
@@ -14834,7 +14844,7 @@ mod tests {
             boot_id: proof.boot_id.clone(),
             host_incarnation: proof.host_incarnation.clone(),
         };
-        let expected = app.chat_ui.handoff_bindings[&target].clone();
+        let expected = app.chat_ui.handoff_bindings[&target].binding.clone();
         let mut descriptor = crate::terminal::ipc::TerminalDescriptor::relaunchable(cli.id, cli.launch.clone(), cli.transcript_path.clone());
         descriptor.session = cli;
         descriptor.execution_instance = uuid::Uuid::new_v4();
