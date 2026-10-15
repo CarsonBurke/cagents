@@ -393,6 +393,7 @@ mod tests {
                 chat_id: chat,
                 state: ActivityState::Working,
                 generation: 7,
+                outcome: None,
             },
         };
         let raw = postcard::to_allocvec(&ordinary).unwrap();
