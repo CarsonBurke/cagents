@@ -35,6 +35,29 @@ fn can_retry_source_fields(before: &Pane, current: &Pane) -> bool {
         }
 }
 
+pub(super) fn blocked_managed_view_scopes(
+    model: &crate::workspace_model::WorkspaceModel,
+    views: &[View],
+) -> HashSet<Scope> {
+    let mut blocked = HashSet::new();
+    let display_index = views::ManagedDisplayIndex::new(model);
+    let managed = model
+        .agents
+        .iter()
+        .map(|agent| (CardId::from_uuid(agent.id.as_uuid()), agent))
+        .collect::<HashMap<_, _>>();
+    for view in views {
+        if view.panes.iter().any(|pane| {
+            managed
+                .get(&pane.id)
+                .is_some_and(|agent| !display_index.permits_projection(agent, pane))
+        }) {
+            blocked.insert(view.scope.clone());
+        }
+    }
+    blocked
+}
+
 #[derive(Default)]
 pub(super) struct State {
     baseline: HashMap<Scope, Vec<Pane>>,
@@ -1190,23 +1213,7 @@ impl Cagents {
     }
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
-        self.shared_views.blocked.clear();
-        let display_index = views::ManagedDisplayIndex::new(&self.workspace_model);
-        let managed = self
-            .workspace_model
-            .agents
-            .iter()
-            .map(|agent| (CardId::from_uuid(agent.id.as_uuid()), agent))
-            .collect::<HashMap<_, _>>();
-        for view in views {
-            if view.panes.iter().any(|pane| {
-                managed
-                    .get(&pane.id)
-                    .is_some_and(|agent| !display_index.permits_projection(agent, pane))
-            }) {
-                self.shared_views.blocked.insert(view.scope.clone());
-            }
-        }
+        self.shared_views.blocked = blocked_managed_view_scopes(&self.workspace_model, views);
         // Decide which whole views can project before retiring any local alias.
         // Otherwise a later blocked pane could leave an earlier adoption without
         // the canonical descriptor required by its persistence checkpoint.

@@ -798,6 +798,11 @@ impl Cagents {
         for id in republished {
             self.publish_shared_channel(id);
         }
+        // Admission uses this incoming snapshot, not a blocked flag left by a
+        // previous projection. Defer fresh actors while their scope is truly
+        // blocked, before creating a local card or attachment Task.
+        self.shared_views.blocked =
+            super::shared_views::blocked_managed_view_scopes(&model, &model.views);
         let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
         let mut new_managed_panes = Vec::new();
         for agent in &model.agents {
@@ -814,6 +819,9 @@ impl Cagents {
                 let unpublished = display.pane.is_none()
                     && !self.durable.cards.iter().any(|entry| entry.id == card);
                 let scope = display.scope.clone();
+                if unpublished && self.shared_views.blocked.contains(&scope) {
+                    continue;
+                }
                 if let Some(task) = self.adopt_execution_agent_display(agent, display) {
                     if unpublished {
                         new_managed_panes.push((scope, card));
@@ -1943,7 +1951,12 @@ mod tests {
         use crate::agent::Provider;
         use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
         use crate::workspace_model::views::{Change, Scope, View};
-        for (active_target, retired) in [(true, false), (false, false), (true, true)] {
+        for (active_target, retired, blocked_before) in [
+            (true, false, false),
+            (false, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
             let (mut app, project, repository) = app_with_project();
             let active = ChannelId::new();
             let target = if active_target {
@@ -2029,8 +2042,46 @@ mod tests {
             // completed before the daemon announces the new live Agent.
             app.acknowledge_view_edit(scope.clone(), None);
             while rx.try_recv().is_ok() {}
+            if blocked_before {
+                let mut conflict_agent = agent.clone();
+                conflict_agent.id = crate::model::AgentId::new();
+                conflict_agent.origin = Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                };
+                let mut foreign_session = session.clone();
+                foreign_session.id = TerminalId::new();
+                let conflict = crate::workspace_model::views::Pane {
+                    id: CardId::from_uuid(conflict_agent.id.as_uuid()),
+                    title: "Conflicting saved descriptor".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 0.72,
+                    kind: CardKind::Chat(foreign_session),
+                    scope: Some(agent.spec.target.directory.clone()),
+                };
+                model.views[0].panes.push(conflict);
+                model.agents.push(conflict_agent);
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+                assert!(app.shared_views.blocked.contains(&scope));
+                model.agents.push(agent.clone());
+                model.sequence += 1;
+                drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
+                assert!(
+                    app.card_state(card).is_none(),
+                    "a truly blocked scope must not create a fresh card or Starting Task"
+                );
+                assert!(!app.chat_start_pending(card));
+                assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+                    matches!(edit, ModelEdit::ChangeView { change: Change::Insert { pane, .. }, .. } if pane.id == card)));
+                // The next authoritative read removes the conflict while the
+                // previous projection's blocked flag is still set locally.
+                model.views[0].panes.clear();
+                model.agents.retain(|existing| existing.id == agent.id);
+            } else {
+                model.agents.push(agent.clone());
+            }
             model.sequence += 1;
-            model.agents.push(agent.clone());
             let focus = app.workspace.focused();
             drop(app.apply_workspace_model_update(ModelUpdate::Read(model.clone())));
             let edits = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
