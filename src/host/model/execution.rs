@@ -441,8 +441,8 @@ impl Registry {
                 |row| row.get(0),
             )
             .map_err(|error| error.to_string())?;
-        if decode::<Run>(&stored)? != accepted.run
-            || read_agent(&tx, accepted.agent.id)? != accepted.agent
+        let agent = read_agent(&tx, accepted.agent.id)?;
+        if decode::<Run>(&stored)? != accepted.run || !same_dispatch_agent(&agent, &accepted.agent)
         {
             return Err(
                 "The accepted agent run changed before dispatch; nothing was submitted".into(),
@@ -458,10 +458,11 @@ impl Registry {
         if already_claimed {
             return Ok(false);
         }
-        if !Self::automation_dispatch_allowed_in(&tx, accepted, now_ms)? {
+        if !Self::automation_dispatch_allowed_in(&tx, accepted, &agent, now_ms)? {
             tx.commit().map_err(|error| error.to_string())?;
             return Ok(false);
         }
+        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         let claimed = tx
             .execute(
                 "INSERT OR IGNORE INTO agent_dispatches(run, claimed_at) VALUES (?1, ?2)",
@@ -906,7 +907,7 @@ impl Registry {
     pub(crate) fn validate_agent_dispatch(&self, accepted: &Accepted) -> Result<(), String> {
         let agent = self.agent(accepted.agent.id)?;
         let run = self.agent_run(accepted.run.id)?;
-        if agent.closed || run != accepted.run || agent != accepted.agent {
+        if agent.closed || run != accepted.run || !same_dispatch_agent(&agent, &accepted.agent) {
             return Err("The accepted execution changed before provider dispatch".into());
         }
         require_placement(&self.db, &agent.placement, &agent.spec.target.repository)
@@ -1075,7 +1076,8 @@ impl Registry {
     }
 
     /// Retire an exact process after confirmed teardown, including closes from
-    /// the UI. The run, capacity and delegated authority change atomically.
+    /// the UI. Run state, capacity, delegated authority and the exact retained
+    /// presentation change in the same transaction.
     pub(crate) fn retire_agent_process(
         &mut self,
         source: &HostedSession,
@@ -1147,6 +1149,11 @@ impl Registry {
                     tx.execute("UPDATE agent_runs SET state = 'cancelled', revision = ?2, record = ?3 WHERE id = ?1",
                         params![run.id.to_string(), run.revision, encode(&run)?]).map_err(|e| e.to_string())?;
                 }
+                // ChatClose and daemon shutdown retire through this path before
+                // the execution service can reach close_agent. Commit the pane
+                // tombstone here too, so a crash cannot publish a closed agent
+                // while leaving its exact retained presentation behind.
+                super::views::retire_agent(&tx, &agent)?;
                 agent.closed = true;
                 tx.execute(
                     "DELETE FROM agent_launches WHERE agent = ?1",
@@ -1194,6 +1201,11 @@ impl Registry {
         if active {
             return Err("The agent still has an unfinished run".into());
         }
+        let pane_retired = super::views::retire_agent(&tx, &agent)?;
+        if agent.closed && !pane_retired {
+            tx.commit().map_err(|error| error.to_string())?;
+            return Ok(agent);
+        }
         agent.closed = true;
         tx.execute(
             "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
@@ -1207,6 +1219,54 @@ impl Registry {
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(agent)
+    }
+
+    /// Refuse known unavailable presentation authority before stopping a
+    /// provider. The commit repeats the same predicate under its write TX.
+    pub(crate) fn preflight_agent_close(
+        &mut self,
+        origin: &Origin,
+        id: AgentId,
+    ) -> Result<Agent, String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let agent = read_agent(&tx, id)?;
+        if &agent.origin != origin {
+            return Err("This caller does not own the agent".into());
+        }
+        super::views::preflight_retire_agent(&tx, &agent)?;
+        tx.commit().map_err(|error| error.to_string())?;
+        Ok(agent)
+    }
+
+    pub(crate) fn preflight_agent_retirement(
+        &mut self,
+        source: &HostedSession,
+    ) -> Result<(), String> {
+        let tx = self.db.transaction().map_err(|error| error.to_string())?;
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT a.record,p.source FROM agents a LEFT JOIN agent_launches p ON p.agent=a.id
+             WHERE (a.session_id=?1 OR p.session_id=?1) AND a.closed=0",
+                [source.id().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some((record, pending)) = row {
+            let agent: Agent = decode(&record)?;
+            let pending = pending
+                .map(|record| decode::<HostedSession>(&record))
+                .transpose()?;
+            if agent
+                .session
+                .as_ref()
+                .or(pending.as_ref())
+                .is_some_and(|expected| expected.same_process(source))
+            {
+                super::views::preflight_retire_agent(&tx, &agent)?;
+            }
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Until exact live prompt evidence can be reconciled, restart records an
@@ -1310,6 +1370,14 @@ impl Registry {
         tx.commit().map_err(|error| error.to_string())?;
         Ok(run)
     }
+}
+
+/// Moving a pane changes presentation membership, not execution authority.
+/// Compare every other field, including the exact session, launch and owner.
+pub(super) fn same_dispatch_agent(current: &Agent, accepted: &Agent) -> bool {
+    let mut expected = accepted.clone();
+    expected.placement = current.placement.clone();
+    current == &expected
 }
 
 fn state_key(state: State) -> &'static str {
@@ -1448,6 +1516,631 @@ mod tests {
             terminal: None,
             owned_codex_listener: None,
         })
+    }
+
+    #[test]
+    fn legacy_open_presentation_close_preflight_is_read_only_and_repeats_commit_predicate() {
+        let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+        let scope =
+            crate::workspace_model::views::Scope::Channel(accepted.agent.channel().unwrap());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![ended_console(&pane)],
+                closed: vec![],
+            })
+            .unwrap();
+        let agent = registry.agent(accepted.agent.id).unwrap();
+        assert!(!agent.closed);
+        let before = registry.model().unwrap();
+        let run = registry.agent_run(accepted.run.id).unwrap();
+        assert!(
+            registry
+                .preflight_agent_close(&Origin::User, agent.id)
+                .unwrap_err()
+                .contains("historical generation proof")
+        );
+        assert!(
+            registry
+                .preflight_agent_retirement(agent.session.as_ref().unwrap())
+                .unwrap_err()
+                .contains("historical generation proof")
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+        assert_eq!(registry.agent(agent.id).unwrap(), agent);
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: registry.view_revision(&scope).unwrap(),
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Remove { id: pane.id },
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .preflight_agent_close(&Origin::User, agent.id)
+                .unwrap(),
+            agent
+        );
+        registry
+            .preflight_agent_retirement(agent.session.as_ref().unwrap())
+            .unwrap();
+    }
+
+    fn closed_pane_fixture() -> (
+        Registry,
+        tempfile::TempDir,
+        Accepted,
+        crate::workspace_model::views::Pane,
+    ) {
+        let (mut registry, directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let session = source();
+        registry
+            .bind_agent(accepted.agent.id, None, session.clone())
+            .unwrap();
+        let started = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "confirmed".into(),
+                },
+                2,
+            )
+            .unwrap();
+        registry
+            .update_agent_run(
+                accepted.run.id,
+                started.revision,
+                Update::Finished {
+                    state: State::Succeeded,
+                    result: ResultSummary {
+                        text: "Preserved review report".into(),
+                        ..Default::default()
+                    },
+                },
+                3,
+            )
+            .unwrap();
+        let HostedSession::Chat(session) = session else {
+            unreachable!()
+        };
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+            title: "Review".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: crate::model::CardKind::Chat(session),
+            scope: None,
+        };
+        (registry, directory, accepted, pane)
+    }
+
+    fn console_pane_fixture() -> (
+        Registry,
+        tempfile::TempDir,
+        Accepted,
+        crate::workspace_model::views::Pane,
+    ) {
+        use crate::model::{TerminalContinuity, TerminalSession};
+        let (mut registry, directory, accepted, mut pane) = closed_pane_fixture();
+        let retained = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+        let HostedSession::Chat(chat) = &retained else {
+            unreachable!()
+        };
+        let proof = chat.proof.clone().unwrap();
+        let console = TerminalSession {
+            id: chat.id,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: chat.launch.recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
+            },
+        };
+        registry
+            .bind_agent_console(accepted.agent.id, &retained, console.clone())
+            .unwrap();
+        pane.kind = crate::model::CardKind::Terminal(console);
+        (registry, directory, accepted, pane)
+    }
+    fn publish_console(
+        registry: &mut Registry,
+        scope: &crate::workspace_model::views::Scope,
+        before: &crate::workspace_model::views::Pane,
+        pane: &crate::workspace_model::views::Pane,
+    ) -> Result<super::super::Applied, String> {
+        registry.apply(&ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: registry.view_revision(scope)?,
+            operation: uuid::Uuid::new_v4(),
+            change: crate::workspace_model::views::Change::Update {
+                before: before.clone(),
+                pane: pane.clone(),
+            },
+        })
+    }
+    fn ended_console(
+        pane: &crate::workspace_model::views::Pane,
+    ) -> crate::workspace_model::views::Pane {
+        let mut ended = pane.clone();
+        let crate::model::CardKind::Terminal(session) = &mut ended.kind else {
+            unreachable!()
+        };
+        session.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(),
+            last_exit: Some(crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 4,
+            }),
+        };
+        ended
+    }
+
+    #[test]
+    fn ended_console_provenance_survives_batched_and_late_hints_move_and_restart() {
+        use crate::workspace_model::views::{Change, Scope};
+        for process_retirement in [false, true] {
+            let (mut registry, directory, accepted, pane) = console_pane_fixture();
+            let scope = Scope::Channel(accepted.agent.channel().unwrap());
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            let target = Scope::Worktree {
+                repository: directory.path().into(),
+                path: directory.path().into(),
+            };
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: registry.view_revision(&scope).unwrap(),
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Transfer {
+                        id: pane.id,
+                        destination: target.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
+            let mut ended = ended_console(&pane);
+            let crate::model::CardKind::Terminal(session) = &mut ended.kind else {
+                unreachable!()
+            };
+            session.resume_hint = Some("batched final provider session hint".into());
+            session.transcript_path = Some(directory.path().join("console.log"));
+            publish_console(&mut registry, &target, &pane, &ended).unwrap();
+            let mut late = ended.clone();
+            let crate::model::CardKind::Terminal(session) = &mut late.kind else {
+                unreachable!()
+            };
+            session.resume_hint = Some("late final provider session hint".into());
+            late.title = "Completed console".into();
+            publish_console(&mut registry, &target, &ended, &late).unwrap();
+            let run = registry.agent_run(accepted.run.id).unwrap();
+            drop(registry);
+            let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+            if process_retirement {
+                let source = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+                assert!(registry.retire_agent_process(&source, 5).unwrap());
+            } else {
+                registry
+                    .close_agent(&Origin::User, accepted.agent.id)
+                    .unwrap();
+            }
+            let view = super::super::views::read(&registry.db, &target).unwrap();
+            assert!(view.panes.is_empty());
+            assert!(view.retired.contains(&pane.id));
+            assert!(registry.agent(accepted.agent.id).unwrap().closed);
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+            let marker_count: u64 = registry
+                .db
+                .query_row(
+                    "SELECT count(*) FROM shared_view_terminal_sources",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                marker_count, 0,
+                "pane removal cascades exact generation annotation"
+            );
+            registry
+                .close_agent(&Origin::User, accepted.agent.id)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn repeated_closed_agent_repairs_proven_console_but_refuses_unproven_historical_end() {
+        use crate::workspace_model::views::Scope;
+        for proven in [false, true] {
+            let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+            registry
+                .close_agent(&Origin::User, accepted.agent.id)
+                .unwrap();
+            let scope = Scope::Channel(accepted.agent.channel().unwrap());
+            let ended = ended_console(&pane);
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![if proven { pane.clone() } else { ended.clone() }],
+                    closed: vec![],
+                })
+                .unwrap();
+            if proven {
+                publish_console(&mut registry, &scope, &pane, &ended).unwrap();
+            }
+            if !proven {
+                // Upgrade an older store containing only the already-ended
+                // descriptor. Migration must not invent historical proof.
+                registry
+                    .db
+                    .execute_batch(
+                        "DROP TABLE shared_view_terminal_sources; PRAGMA user_version=12;",
+                    )
+                    .unwrap();
+                drop(registry);
+                registry = Registry::at(&_directory.path().join("model.sqlite3")).unwrap();
+            }
+            let before = registry.model().unwrap();
+            let run = registry.agent_run(accepted.run.id).unwrap();
+            let result = registry.close_agent(&Origin::User, accepted.agent.id);
+            if proven {
+                result.unwrap();
+                assert!(
+                    super::super::views::read(&registry.db, &scope)
+                        .unwrap()
+                        .panes
+                        .is_empty()
+                );
+            } else {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .contains("historical generation proof is unavailable")
+                );
+                assert_eq!(
+                    registry.model().unwrap(),
+                    before,
+                    "missing proof cannot report successful retirement or alter durable state"
+                );
+                assert_eq!(
+                    super::super::views::read(&registry.db, &scope)
+                        .unwrap()
+                        .panes,
+                    vec![ended]
+                );
+            }
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+        }
+    }
+
+    #[test]
+    fn ended_console_successors_survive_old_close_and_stale_updates_are_refused() {
+        use crate::workspace_model::views::Scope;
+        for stale_before in [false, true] {
+            let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+            let scope = Scope::Channel(accepted.agent.channel().unwrap());
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            let ended = ended_console(&pane);
+            publish_console(&mut registry, &scope, &pane, &ended).unwrap();
+            let mut successor = pane.clone();
+            let crate::model::CardKind::Terminal(session) = &mut successor.kind else {
+                unreachable!()
+            };
+            let crate::model::TerminalContinuity::Live {
+                host_incarnation, ..
+            } = &mut session.continuity
+            else {
+                unreachable!()
+            };
+            *host_incarnation = crate::model::HostIncarnation::new("successor-generation");
+            publish_console(&mut registry, &scope, &ended, &successor).unwrap();
+            let successor_end = ended_console(&successor);
+            let before = registry.model().unwrap();
+            let updated = publish_console(
+                &mut registry,
+                &scope,
+                if stale_before { &pane } else { &successor },
+                &successor_end,
+            );
+            let retained = if stale_before {
+                assert!(
+                    updated
+                        .unwrap_err()
+                        .contains(Registry::VIEW_SOURCE_CONFLICT)
+                );
+                assert_eq!(registry.model().unwrap(), before);
+                successor
+            } else {
+                updated.unwrap();
+                successor_end
+            };
+            // The old agent can close, but neither a proved successor nor a
+            // refused stale update grants ownership of the successor's pane.
+            assert!(
+                registry
+                    .close_agent(&Origin::User, accepted.agent.id)
+                    .unwrap()
+                    .closed
+            );
+            assert_eq!(
+                super::super::views::read(&registry.db, &scope)
+                    .unwrap()
+                    .panes,
+                vec![retained]
+            );
+        }
+    }
+
+    #[test]
+    fn ended_console_annotation_and_presentation_roll_back_in_one_transaction() {
+        use crate::workspace_model::views::Scope;
+        let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+        let scope = Scope::Channel(accepted.agent.channel().unwrap());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        let before = registry.model().unwrap();
+        registry.db.execute_batch("CREATE TRIGGER reject_ended_view BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(FAIL,'fixture ended view failure'); END;").unwrap();
+        assert!(publish_console(&mut registry, &scope, &pane, &ended_console(&pane)).is_err());
+        assert_eq!(registry.model().unwrap(), before);
+        let count: u64 = registry
+            .db
+            .query_row(
+                "SELECT count(*) FROM shared_view_terminal_sources",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "failed view publication cannot leave a provenance marker"
+        );
+    }
+
+    #[test]
+    fn close_retires_only_its_current_shared_pane_and_keeps_report_durably() {
+        use crate::workspace_model::views::{Change, Scope};
+        let (mut registry, directory, accepted, pane) = closed_pane_fixture();
+        let source = Scope::Channel(accepted.agent.channel().unwrap());
+        let target = Scope::Worktree {
+            repository: directory.path().into(),
+            path: directory.path().into(),
+        };
+        let mut other = pane.clone();
+        other.id = crate::model::CardId::new();
+        let crate::model::CardKind::Chat(session) = &mut other.kind else {
+            unreachable!()
+        };
+        session.id = crate::model::TerminalId::new();
+        for (scope, panes) in [
+            (source.clone(), vec![pane.clone()]),
+            (target.clone(), vec![other.clone()]),
+        ] {
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope,
+                    panes,
+                    closed: vec![],
+                })
+                .unwrap();
+        }
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: source.clone(),
+                expected_revision: registry.view_revision(&source).unwrap(),
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id: pane.id,
+                    destination: target.clone(),
+                    before: None,
+                },
+            })
+            .unwrap();
+        let run = registry.agent_run(accepted.run.id).unwrap();
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        let view = super::super::views::read(&registry.db, &target).unwrap();
+        assert_eq!(view.panes, vec![other]);
+        assert!(view.retired.contains(&pane.id));
+        assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+        let sequence = registry.execution_sequence().unwrap();
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert_eq!(registry.execution_sequence().unwrap(), sequence);
+        // An old window cannot republish the retired descriptor on reconnect.
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: target.clone(),
+                panes: vec![pane],
+                closed: vec![],
+            })
+            .unwrap();
+        drop(registry);
+        let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        assert_eq!(
+            super::super::views::read(&registry.db, &target).unwrap(),
+            view
+        );
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+    }
+
+    #[test]
+    fn repeated_close_repairs_old_stale_panes_but_keeps_replacement_resources() {
+        use crate::workspace_model::views::Scope;
+        let (mut registry, _directory, accepted, pane) = closed_pane_fixture();
+        let scope = Scope::Channel(accepted.agent.channel().unwrap());
+        // Simulate the older close implementation, which left no pane tombstone.
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        assert!(
+            registry
+                .close_agent(
+                    &Origin::Child {
+                        parent: Lineage(crate::model::TerminalId::new())
+                    },
+                    accepted.agent.id
+                )
+                .is_err()
+        );
+        registry
+            .close_agent(&Origin::User, accepted.agent.id)
+            .unwrap();
+        assert!(
+            super::super::views::read(&registry.db, &scope)
+                .unwrap()
+                .panes
+                .is_empty()
+        );
+
+        for replacement in 0..3 {
+            let (mut registry, _directory, accepted, mut pane) = closed_pane_fixture();
+            let scope = Scope::Channel(accepted.agent.channel().unwrap());
+            let crate::model::CardKind::Chat(session) = &mut pane.kind else {
+                unreachable!()
+            };
+            match replacement {
+                0 => session.id = crate::model::TerminalId::new(),
+                1 => {
+                    session.proof.as_mut().unwrap().host_incarnation =
+                        crate::model::HostIncarnation::new("successor")
+                }
+                2 => session
+                    .launch
+                    .recipe
+                    .arguments
+                    .push("--different-owner".into()),
+                _ => unreachable!(),
+            }
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: scope.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            registry
+                .close_agent(&Origin::User, accepted.agent.id)
+                .unwrap();
+            assert_eq!(
+                super::super::views::read(&registry.db, &scope)
+                    .unwrap()
+                    .panes,
+                vec![pane]
+            );
+        }
+    }
+
+    #[test]
+    fn pane_retirement_and_agent_close_roll_back_together() {
+        use crate::workspace_model::views::Scope;
+        let (mut registry, _directory, accepted, pane) = closed_pane_fixture();
+        let scope = Scope::Channel(accepted.agent.channel().unwrap());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope,
+                panes: vec![pane],
+                closed: vec![],
+            })
+            .unwrap();
+        let before = registry.model().unwrap();
+        registry.db.execute_batch("CREATE TRIGGER reject_agent_close BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
+        assert!(
+            registry
+                .close_agent(&Origin::User, accepted.agent.id)
+                .is_err()
+        );
+        assert_eq!(registry.model().unwrap(), before);
+    }
+
+    #[test]
+    fn process_retirement_commits_closed_agent_and_moved_pane_together() {
+        use crate::workspace_model::views::{Change, Scope};
+        for reject_close in [false, true] {
+            let (mut registry, directory, accepted, pane) = closed_pane_fixture();
+            let initial = Scope::Channel(accepted.agent.channel().unwrap());
+            let moved = Scope::Worktree {
+                repository: directory.path().into(),
+                path: directory.path().into(),
+            };
+            registry
+                .apply(&ModelEdit::SeedView {
+                    scope: initial.clone(),
+                    panes: vec![pane.clone()],
+                    closed: vec![],
+                })
+                .unwrap();
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: initial.clone(),
+                    expected_revision: registry.view_revision(&initial).unwrap(),
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Transfer {
+                        id: pane.id,
+                        destination: moved.clone(),
+                        before: None,
+                    },
+                })
+                .unwrap();
+            let before = registry.model().unwrap();
+            let run = registry.agent_run(accepted.run.id).unwrap();
+            let retained = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+            if reject_close {
+                registry.db.execute_batch("CREATE TRIGGER reject_process_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
+                assert!(registry.retire_agent_process(&retained, 4).is_err());
+                assert_eq!(registry.model().unwrap(), before);
+            } else {
+                assert!(registry.retire_agent_process(&retained, 4).unwrap());
+                let view = super::super::views::read(&registry.db, &moved).unwrap();
+                assert!(view.panes.is_empty());
+                assert!(view.retired.contains(&pane.id));
+                assert!(registry.agent(accepted.agent.id).unwrap().closed);
+                assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+                drop(registry);
+                let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+                assert_eq!(
+                    super::super::views::read(&registry.db, &moved).unwrap(),
+                    view
+                );
+                assert!(registry.agent(accepted.agent.id).unwrap().closed);
+                assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+            }
+        }
     }
 
     #[test]
