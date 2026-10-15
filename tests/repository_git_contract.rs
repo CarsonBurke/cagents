@@ -147,7 +147,7 @@ impl Fixture {
     }
 
     #[cfg(target_os = "linux")]
-    fn recovery_service(&self) -> RepositoryService<IsolatedExecutor> {
+    fn recovery_service(&self) -> RepositoryService<cagents::repository::WorktreeExecutor<IsolatedExecutor>> {
         self.service()
             .with_worktree_authority(
                 cagents::repository::WorktreeAuthority::capture(&self.work()).unwrap(),

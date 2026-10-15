@@ -57,7 +57,7 @@ impl Fixture {
     fn write(&self, path: &str, bytes: &[u8]) { fs::write(self.work().join(path), bytes).unwrap(); }
     fn service(&self) -> RepositoryService<IsolatedExecutor> { RepositoryService::new("git", Arc::new(IsolatedExecutor)) }
     fn recovery_context(&self) -> FilesystemRecoveryContext { recovery_context::context(&self.work()) }
-    fn recovery_service(&self) -> RepositoryService<IsolatedExecutor> {
+    fn recovery_service(&self) -> RepositoryService<cagents::repository::WorktreeExecutor<IsolatedExecutor>> {
         self.service().with_worktree_authority(WorktreeAuthority::capture(&self.work()).unwrap()).unwrap()
             .with_recovery_context(self.recovery_context())
     }
