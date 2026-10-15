@@ -133,12 +133,13 @@ fn directory_error(error: fs_safety::RecoveryDirectoryError) -> FileIoError {
 struct Holding {
     parent: Root,
     publication: fs_safety::DirectoryPublication,
-    context: FilesystemRecoveryContext,
-    slot: Option<RecoverySlot>,
     // Keep authenticated file identities alive with an unresolved holding.
     // This producer retains at most four file FDs plus the receipt's bounded
     // directory handles, below MAX_RECOVERY_DESCRIPTORS (16).
     files: Vec<File>,
+    context: FilesystemRecoveryContext,
+    // Native owners above close before their creation/private charge releases.
+    slot: Option<RecoverySlot>,
     // Removal and parent durability are distinct irreversible phases.
     cleanup_sync_complete: bool,
 }
@@ -153,7 +154,7 @@ impl Holding {
         let directory = fs_safety::prepare_recovery_directory_with_owner(
             admission, &name, || false, owner,
         ).map_err(directory_error)?;
-        let (publication, context, slot, (parent, source), _private_metadata) = directory.into_parts();
+        let (publication, (parent, source), _private_metadata, context, slot) = directory.into_parts();
         // The factory established actual owner-only700 on this retained inode
         // and enrolled it before returning. Use its receipt directly, without
         // another fallible descriptor clone or a fresh mode baseline.
