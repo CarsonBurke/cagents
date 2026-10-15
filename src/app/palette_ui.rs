@@ -1392,7 +1392,12 @@ mod settings_recorder_tests {
         drop(app.update_palette(Action::Record(field)));
         let numpad = event("1", keyboard::key::Code::Numpad1, modifiers);
         drop(app.palette_key_event(&numpad));
-        assert!(app.palette.recording_error.as_ref().is_some_and(|reason| reason.contains("number row")));
+        assert!(
+            app.palette
+                .recording_error
+                .as_ref()
+                .is_some_and(|reason| reason.contains("number row"))
+        );
         assert_eq!(app.settings.keyboard_shortcuts, before);
         assert_eq!(app.palette.recording, Some(field));
         let interrupt = event("с", keyboard::key::Code::KeyC, keyboard::Modifiers::CTRL);

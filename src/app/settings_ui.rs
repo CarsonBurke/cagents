@@ -1534,32 +1534,69 @@ mod keyboard_table_tests {
             text: None,
             repeat: false,
         };
-        let shifted = press("!", keyboard::key::Code::Digit1,
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT);
+        let shifted = press(
+            "!",
+            keyboard::key::Code::Digit1,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        );
         drop(app.update_palette(palette_ui::Action::FilterKey));
         drop(app.palette_key_event(&shifted));
         assert_eq!(app.settings_search, "Ctrl+Shift+1");
-        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
-            app.palette.pressed_key_filter()).into_iter()
-            .filter_map(|group| group.view("Keyboard", "")).count(), 3,
-            "filter controls and both numeric/symbol action groups are visible");
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .into_iter()
+            .filter_map(|group| group.view("Keyboard", ""))
+            .count(),
+            3,
+            "filter controls and both numeric/symbol action groups are visible"
+        );
         for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
-            assert!(shortcut_matches_pressed_key(chord, app.palette.pressed_key_filter()));
+            assert!(shortcut_matches_pressed_key(
+                chord,
+                app.palette.pressed_key_filter()
+            ));
         }
         drop(app.update_palette(palette_ui::Action::FilterKey));
-        drop(app.palette_key_event(&press("1", keyboard::key::Code::Numpad1,
-            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT)));
-        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
-            app.palette.pressed_key_filter()).len(), 1,
-            "a numpad digit matches neither the number-row nor symbol binding");
+        drop(app.palette_key_event(&press(
+            "1",
+            keyboard::key::Code::Numpad1,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        )));
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            1,
+            "a numpad digit matches neither the number-row nor symbol binding"
+        );
         drop(app.update_palette(palette_ui::Action::FilterKey));
-        drop(app.palette_key_event(&press("à", keyboard::key::Code::Digit0,
-            keyboard::Modifiers::CTRL)));
+        drop(app.palette_key_event(&press(
+            "à",
+            keyboard::key::Code::Digit0,
+            keyboard::Modifiers::CTRL,
+        )));
         assert_eq!(app.settings_search, "Ctrl+0");
-        assert!(shortcut_matches_pressed_key("Ctrl+0", app.palette.pressed_key_filter()));
-        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
-            app.palette.pressed_key_filter()).len(), 2,
-            "filter controls and fixed Reset font size remain visible");
+        assert!(shortcut_matches_pressed_key(
+            "Ctrl+0",
+            app.palette.pressed_key_filter()
+        ));
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            2,
+            "filter controls and fixed Reset font size remain visible"
+        );
         drop(app.update(Message::SettingsSearchChanged("typed query".into())));
         assert!(app.palette.pressed_key_filter().is_none());
         drop(app.update_palette(palette_ui::Action::FilterKey));
