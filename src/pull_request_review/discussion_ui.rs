@@ -63,7 +63,7 @@ enum Destination {
     Edit(String),
 }
 
-struct Composer {
+pub(super) struct Composer {
     authority: Authority,
     destination: Destination,
     content: text_editor::Content<cosmic::Renderer>,
@@ -83,11 +83,11 @@ struct FileThreads {
 
 pub(super) struct DiscussionState {
     revision: u64,
-    conversation: Option<Arc<PullRequestConversation>>,
+    pub(super) conversation: Option<Arc<PullRequestConversation>>,
     threads: HashMap<String, FileThreads>,
     markdown: HashMap<String, Vec<markdown::Item>>,
     expanded: BTreeSet<String>,
-    composer: Option<Composer>,
+    pub(super) composer: Option<Composer>,
     /// The submission surface is disclosed on demand rather than parked
     /// under every diff.
     review_open: bool,
@@ -100,12 +100,12 @@ pub(super) struct DiscussionState {
         SubmitReviewRequest,
         Vec<discussion::PendingComment>,
     )>,
-    busy: bool,
+    pub(super) busy: bool,
     submitting: bool,
     saving_composer: bool,
     suggestion_loading: bool,
     suggestion_previews: BTreeMap<(String,usize),(String,String,String)>,
-    unknown: Option<String>,
+    pub(super) unknown: Option<String>,
     loading: bool,
 }
 

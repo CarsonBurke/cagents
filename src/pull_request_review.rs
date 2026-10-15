@@ -248,6 +248,13 @@ impl Action {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanupHead {
+    pub repository: GitHubRepoKey,
+    pub branch: String,
+    pub head: Oid,
+}
+
 /// Work the shell carries out on the state's behalf.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
@@ -263,6 +270,7 @@ pub enum Effect {
     PreviousChange,
     OpenUrl(Url),
     Checkout(CheckoutTarget),
+    CleanupMergedHead(CleanupHead),
     /// Which pull request is under review changed; `None` after `Close`.
     SelectionChanged(Option<u64>),
     /// A discussion of the whole file opened above the first diff row, so
@@ -688,6 +696,8 @@ impl State {
     pub fn list(&self) -> &ListState {
         &self.list
     }
+
+    pub fn selection_generation(&self) -> u64 { self.generation }
 
     pub fn target(&self) -> Option<&ReviewTarget> {
         self.target.as_ref()

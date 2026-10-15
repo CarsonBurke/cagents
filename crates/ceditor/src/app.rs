@@ -2368,6 +2368,7 @@ impl Editor {
         };
         let mut tasks = Vec::new();
         let mut checkout_target = None;
+        let mut cleanup_requested = false;
         for effect in tab.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -2405,8 +2406,10 @@ impl Editor {
                 // selection has nothing to update here.
                 pull_request_review::Effect::SelectionChanged(_) => {}
                 pull_request_review::Effect::Checkout(target) => checkout_target = Some(target),
+                pull_request_review::Effect::CleanupMergedHead(_) => cleanup_requested = true,
             }
         }
+        if cleanup_requested { self.notice=Some("Open this worktree in Cagents and use Delete worktree to review its branch cleanup safely.".into()); }
         if let Some(target) = checkout_target {
             self.begin_checkout(target);
         }

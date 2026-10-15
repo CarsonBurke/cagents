@@ -28,6 +28,7 @@ mod notification_ui;
 mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
+mod pull_request_cleanup;
 mod refresh_ui;
 mod resume_ui;
 mod review_request_ui;
@@ -2679,7 +2680,7 @@ fn completion_navigates(message: &Message) -> bool {
         } | Message::PullRequestCreated {
             result: Ok(PullRequestCreationOutcome::Created { .. }),
             ..
-        }
+        } | Message::PullRequestCleanupReady { result: Ok(Some(_)), .. }
     )
 }
 
@@ -4314,6 +4315,13 @@ pub enum Message {
     PullRequestReview {
         card: CardId,
         action: pull_request_review::Action,
+    },
+    PullRequestCleanupReady {
+        card: CardId,
+        project: ProjectId,
+        generation: u64,
+        head: pull_request_review::CleanupHead,
+        result: Result<Option<crate::repository::WorktreeRecord>, String>,
     },
     NativeWindowAction(cosmic::app::Action),
     ChatUi(chat_ui::Action),
@@ -6497,6 +6505,7 @@ impl Cagents {
         let mut selection: Option<Option<u64>> = dismissed_pending.then_some(None);
         let mut links = Vec::new();
         let mut checkout = None;
+        let mut cleanup = None;
         for effect in pane.review.take_effects() {
             match effect {
                 pull_request_review::Effect::OpenFile {
@@ -6531,6 +6540,7 @@ impl Cagents {
                         .project(&self.sidebar_model)
                         .map(|project| (project, target));
                 }
+                pull_request_review::Effect::CleanupMergedHead(head) => { cleanup=pane.project(&self.sidebar_model).map(|project|(project,head)); }
                 pull_request_review::Effect::SelectionChanged(number) => {
                     selection = Some(number);
                 }
@@ -6547,6 +6557,7 @@ impl Cagents {
         for url in links {
             tasks.push(self.open_clicked_link(url));
         }
+        if let Some((project, head)) = cleanup { tasks.push(self.open_merged_pull_request_cleanup(card,project,head)); }
         if let Some((project_id, target)) = checkout {
             tasks.push(self.open_worktree_dialog(
                 project_id,
@@ -16086,6 +16097,7 @@ impl Application for Cagents {
             Message::PullRequestReview { card, action } => {
                 self.handle_pull_request_review(card, action)
             }
+            Message::PullRequestCleanupReady { card, project, generation, head, result } => self.merged_pull_request_cleanup_ready(card,project,generation,head,result),
             Message::ReviewFilePanelToggle { card, collapsed } => {
                 if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
                     pane.file_panel_collapsed = Some(collapsed);
