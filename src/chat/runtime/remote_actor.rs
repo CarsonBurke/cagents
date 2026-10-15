@@ -1864,7 +1864,7 @@ impl Server {
         }
         if self.attachment_preserved && matches!(request.method.as_str(),
             "restart" | "fence_session_stop" | "close" | "close_until" |
-            "close_if_revision" | "close_if_idle" | "relocate_directory"
+            "close_if_revision" | "close_if_idle" | "relocate_directory" | "update_source"
         ) {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
@@ -3073,6 +3073,38 @@ done"#;
                 assert!(invoke(server,"preserve",Value::Null).unwrap_err().contains("stopping"));
             }
         }
+    }
+
+    #[test]
+    fn preserved_attachment_cannot_rewrite_paired_ownership_metadata() {
+        let mut fixture=resident_fixture();
+        let server=&mut fixture.server;
+        let recipe=server.source.launch.recipe.clone();
+        let proof=server.proof.clone();
+        server.source.terminal=Some(crate::model::TerminalSession {
+            id:server.source.id,owned_codex_listener:None,recovery_origin:None,predecessor:None,
+            launch:recipe.clone(),transcript_path:None,resume_hint:None,
+            continuity:crate::model::TerminalContinuity::Live {
+                host_session_id:proof.host_session_id,boot_id:proof.boot_id,host_incarnation:proof.host_incarnation,
+            },
+        });
+        let mut pair=server.identity.record.clone(); pair.kind=Kind::Terminal;
+        server.execution_console=Some(recipe); server.paired_holder=Some(pair);
+        validate_pair(&server.source,server.execution_console.as_ref(),server.paired_holder.as_ref(),None).unwrap();
+        let original=(server.source.clone(),server.lineage.clone(),server.execution_console.clone(),server.paired_holder.clone());
+        let mut unpaired=server.source.clone();unpaired.terminal=None;
+        let invoke=|server:&mut Server,method:&str,args:Value| {
+            server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args})
+        };
+        invoke(server,"preserve",Value::Null).unwrap();
+        assert!(invoke(server,"update_source",json!([unpaired.clone(),null,null])).unwrap_err().contains("preserved"));
+        assert_eq!((server.source.clone(),server.lineage.clone(),server.execution_console.clone(),server.paired_holder.clone()),original);
+        let source=server.source.clone();
+        invoke(server,"attach",json!([source])).unwrap();
+        invoke(server,"update_source",json!([unpaired.clone(),null,null])).unwrap();
+        assert_eq!(server.source,unpaired);
+        assert!(server.execution_console.is_none() && server.paired_holder.is_none());
+        assert_eq!(server.lineage,vec![original.0]);
     }
 
     #[test]
