@@ -384,7 +384,7 @@ impl Cagents {
                         {
                             return self.handle_terminal_find(terminal_ui::Action::Open(card));
                         }
-                        Task::none()
+                        self.update(Message::FocusProjectSearch)
                     }
                 }
             }
@@ -899,6 +899,27 @@ mod tests {
         app.cards.insert(card, CardRuntime::Settings);
         app.card_state_mut(card).unwrap().kind = CardKind::Settings;
         app
+    }
+
+    #[test]
+    fn find_without_a_pane_target_focuses_project_search() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.cards.remove(&app.workspace.focused().unwrap());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Project".into(),
+            std::env::temp_dir(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert!(!app.sidebar_state.controls_expanded());
+        drop(app.run_workspace_command(Command::FindInPane, keyboard::Modifiers::CTRL));
+        assert!(
+            app.sidebar_state.controls_expanded(),
+            "fallback must expose and focus project search"
+        );
     }
 
     #[test]

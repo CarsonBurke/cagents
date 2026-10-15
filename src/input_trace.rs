@@ -12,6 +12,7 @@
 
 use std::{cell::Cell, rc::Rc};
 
+use crate::workspace_widget::FocusedPane;
 use cosmic::iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
     widget::{Operation, Tree},
@@ -24,7 +25,7 @@ use cosmic::{Element, Renderer, Theme};
 /// Cloning shares the record. It is cheap to hand to every widget that reads
 /// it, and costs one copy of a few words per recorded event.
 #[derive(Clone, Default)]
-pub struct InputTrace(Rc<Cell<Sample>>);
+pub struct InputTrace(Rc<Cell<Sample>>, Rc<Cell<Option<FocusedPane>>>);
 
 #[derive(Clone, Copy, Default)]
 struct Sample {
@@ -36,6 +37,11 @@ struct Sample {
 }
 
 impl InputTrace {
+    /// Actual widget focus sampled immediately before this keyboard event.
+    pub fn keyboard_focus(&self) -> Option<FocusedPane> {
+        self.1.get()
+    }
+
     /// Records one event the window delivered.
     pub(crate) fn record(&self, event: &Event) {
         let mut sample = self.0.get();
@@ -96,12 +102,113 @@ pub fn observe<'a, Message: 'a>(
     Element::new(Observed {
         content: content.into(),
         trace: trace.clone(),
+        focus_regions: None,
     })
+}
+
+/// Sample native widget focus before workspace interception. IDs identify
+/// custom editors and terminal surfaces; ordinary text controls identify
+/// themselves through the widget operation contract.
+pub fn observe_keyboard_focus<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    trace: &InputTrace,
+    regions: Vec<(cosmic::iced::widget::Id, FocusedPane)>,
+) -> Element<'a, Message> {
+    Element::new(Observed {
+        content: content.into(),
+        trace: trace.clone(),
+        focus_regions: Some(regions),
+    })
+}
+
+fn keyboard_event_needs_focus(event: &Event) -> bool {
+    matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. } | keyboard::Event::KeyReleased { key, modifiers, .. }) if modifiers.control() || modifiers.alt() || modifiers.logo() || matches!(key, keyboard::Key::Named(_)))
+}
+
+/// Marks custom multiline text controls for native keyboard-focus queries.
+/// Unlike text_input, iced's text_editor exposes only its focusable state.
+pub(crate) struct TextEditing;
+
+#[derive(Default)]
+struct KeyboardFocus {
+    focused: Option<(Option<cosmic::iced::widget::Id>, Rectangle)>,
+    inputs: Vec<(Option<cosmic::iced::widget::Id>, Rectangle)>,
+    known_regions: Vec<(cosmic::iced::widget::Id, FocusedPane)>,
+    containers: Vec<(FocusedPane, Rectangle)>,
+}
+impl Operation for KeyboardFocus {
+    fn container(&mut self, id: Option<&cosmic::iced::widget::Id>, bounds: Rectangle) {
+        if let Some((_, region)) = self
+            .known_regions
+            .iter()
+            .find(|(candidate, _)| Some(candidate) == id)
+        {
+            self.containers.push((*region, bounds));
+        }
+    }
+    fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        operate(self);
+    }
+    fn focusable(
+        &mut self,
+        id: Option<&cosmic::iced::widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+    ) {
+        if state.is_focused() {
+            self.focused = Some((id.cloned(), bounds));
+        }
+    }
+    fn custom(
+        &mut self,
+        id: Option<&cosmic::iced::widget::Id>,
+        bounds: Rectangle,
+        state: &mut dyn std::any::Any,
+    ) {
+        if state.is::<TextEditing>() {
+            self.inputs.push((id.cloned(), bounds));
+        }
+    }
+    fn text_input(
+        &mut self,
+        id: Option<&cosmic::iced::widget::Id>,
+        bounds: Rectangle,
+        _state: &mut dyn cosmic::iced::advanced::widget::operation::TextInput,
+    ) {
+        self.inputs.push((id.cloned(), bounds));
+    }
+}
+impl KeyboardFocus {
+    fn region(&self, regions: &[(cosmic::iced::widget::Id, FocusedPane)]) -> FocusedPane {
+        let Some((id, bounds)) = &self.focused else {
+            return FocusedPane::Other;
+        };
+        if let Some((_, region)) = regions
+            .iter()
+            .find(|(candidate, _)| Some(candidate) == id.as_ref())
+        {
+            return *region;
+        }
+        if self
+            .inputs
+            .iter()
+            .any(|(candidate, rectangle)| candidate == id && rectangle == bounds)
+        {
+            FocusedPane::TextInput
+        } else {
+            self.containers
+                .iter()
+                .rev()
+                .find(|(_, container)| container.contains(bounds.center()))
+                .map_or(FocusedPane::OutsideWorkspace, |(region, _)| *region)
+        }
+    }
 }
 
 struct Observed<'a, Message> {
     content: Element<'a, Message>,
     trace: InputTrace,
+    focus_regions: Option<Vec<(cosmic::iced::widget::Id, FocusedPane)>>,
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
@@ -158,6 +265,21 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
         // Before the content, so everything inside reads this event's sample
         // as the latest and the one before it as where the motion began.
         self.trace.record(event);
+        if keyboard_event_needs_focus(event)
+            && let Some(regions) = &self.focus_regions
+        {
+            let mut focus = KeyboardFocus {
+                known_regions: regions.clone(),
+                ..KeyboardFocus::default()
+            };
+            self.content.as_widget_mut().operate(
+                &mut tree.children[0],
+                layout,
+                renderer,
+                &mut focus,
+            );
+            self.trace.1.set(Some(focus.region(regions)));
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -225,7 +347,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
                 viewport,
                 translation,
             )
-            .map(|content| ObservedOverlay::wrap(content, &self.trace))
+            .map(|content| ObservedOverlay::wrap(content, &self.trace, self.focus_regions.clone()))
     }
 
     fn a11y_nodes(
@@ -261,16 +383,19 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
 struct ObservedOverlay<'a, Message> {
     content: overlay::Element<'a, Message, Theme, Renderer>,
     trace: InputTrace,
+    focus_regions: Option<Vec<(cosmic::iced::widget::Id, FocusedPane)>>,
 }
 
 impl<'a, Message: 'a> ObservedOverlay<'a, Message> {
     fn wrap(
         content: overlay::Element<'a, Message, Theme, Renderer>,
         trace: &InputTrace,
+        focus_regions: Option<Vec<(cosmic::iced::widget::Id, FocusedPane)>>,
     ) -> overlay::Element<'a, Message, Theme, Renderer> {
         overlay::Element::new(Box::new(Self {
             content,
             trace: trace.clone(),
+            focus_regions,
         }))
     }
 }
@@ -309,6 +434,18 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         shell: &mut Shell<'_, Message>,
     ) {
         self.trace.record(event);
+        if keyboard_event_needs_focus(event)
+            && let Some(regions) = &self.focus_regions
+        {
+            let mut focus = KeyboardFocus {
+                known_regions: regions.clone(),
+                ..KeyboardFocus::default()
+            };
+            self.content
+                .as_overlay_mut()
+                .operate(layout, renderer, &mut focus);
+            self.trace.1.set(Some(focus.region(regions)));
+        }
         self.content
             .as_overlay_mut()
             .update(event, layout, cursor, renderer, clipboard, shell);
@@ -331,10 +468,11 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
         renderer: &Renderer,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
         let trace = self.trace.clone();
+        let regions = self.focus_regions.clone();
         self.content
             .as_overlay_mut()
             .overlay(layout, renderer)
-            .map(|nested| ObservedOverlay::wrap(nested, &trace))
+            .map(|nested| ObservedOverlay::wrap(nested, &trace, regions))
     }
 
     fn index(&self) -> f32 {
@@ -350,6 +488,39 @@ mod tests {
         Event::Mouse(mouse::Event::CursorMoved {
             position: Point::new(x, 0.0),
         })
+    }
+
+    #[test]
+    fn native_focus_distinguishes_external_fields_and_pane_editors() {
+        use cosmic::iced::advanced::widget::operation::Focusable;
+        struct Focus(bool);
+        impl Focusable for Focus {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+        let sidebar = cosmic::iced::widget::Id::new("sidebar.search");
+        let editor = cosmic::iced::widget::Id::new("editor");
+        let bounds = Rectangle::new(Point::ORIGIN, Size::new(100., 24.));
+        let mut query = KeyboardFocus::default();
+        query.focusable(Some(&sidebar), bounds, &mut Focus(true));
+        query.custom(Some(&sidebar), bounds, &mut TextEditing);
+        assert_eq!(
+            query.region(&[(editor.clone(), FocusedPane::Editor)]),
+            FocusedPane::TextInput
+        );
+        let mut query = KeyboardFocus::default();
+        query.focusable(Some(&editor), bounds, &mut Focus(true));
+        assert_eq!(
+            query.region(&[(editor, FocusedPane::Editor)]),
+            FocusedPane::Editor
+        );
     }
 
     #[test]
