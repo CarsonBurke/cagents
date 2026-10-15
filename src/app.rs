@@ -16622,9 +16622,6 @@ impl Application for Cagents {
                         ));
                     }
                 }
-                if let Some(task) = self.palette_key_event(&event) {
-                    return task;
-                }
                 if crate::tab_history::released(&event) {
                     self.tab_history.finish(self.workspace.focused());
                 }
@@ -16636,6 +16633,11 @@ impl Application for Cagents {
                     // message later lets that cancel instead of commit.
                     self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
                     return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
+                }
+                // Modal key capture must not swallow the modifier release
+                // that commits an already active navigation cycle.
+                if let Some(task) = self.palette_key_event(&event) {
+                    return task;
                 }
                 if self.chrome_ui.workspace_preview.is_some() {
                     return self.workspace_switcher_key(&event);
