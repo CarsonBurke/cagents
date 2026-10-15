@@ -723,5 +723,34 @@ mod tests {
         assert_eq!(db.pragma_query_value::<u32,_>(None,"user_version",|row| row.get(0)).unwrap(), future);
         assert_eq!(db.query_row("SELECT pending FROM automation_proposals WHERE id=?1",[proposal.id.to_string()],|row| row.get::<_,u64>(0)).unwrap(),0);
     }
+    #[test]
+    fn failed_automation_extension_upgrade_retains_clock_schema_and_durable_intent() {
+        let (root, mut registry, proposal) = fixture();
+        let automation = registry.create_automation(proposal.definition.clone(),200,proposal.target_identity.clone()).unwrap();
+        let claim = registry.claim_automation(automation.id,automation.execution_revision,None,Trigger::Manual { request:Uuid::new_v4() },None,true,300).unwrap();
+        let firing = registry.db.query_row("SELECT record FROM automation_firings WHERE id=?1",[claim.firing.id.to_string()],|row| row.get::<_,String>(0)).unwrap();
+        let notice = registry.db.query_row("SELECT event FROM automation_notifications WHERE key=?1",[format!("proposal:{}",proposal.id)],|row| row.get::<_,String>(0)).unwrap();
+        // A malformed legacy definition fails after clock/table creation. The
+        // entire new checkpoint must roll back, including its schema number.
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;").unwrap();
+        registry.db.execute("UPDATE automation_revisions SET definition='{malformed' WHERE automation=?1",[automation.id.to_string()]).unwrap();
+        drop(registry);
+        assert!(Registry::at(&root.path().join("registry.sqlite3")).is_err());
+        let db = Connection::open(root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(db.pragma_query_value::<u32,_>(None,"user_version",|row|row.get(0)).unwrap(),12);
+        assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name='automation_proposal_sequence')",[],|row|row.get::<_,bool>(0)).unwrap());
+        assert!(!db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='automation_precheck_retirements')",[],|row|row.get::<_,bool>(0)).unwrap());
+        assert_eq!(db.query_row("SELECT record FROM automation_firings WHERE id=?1",[claim.firing.id.to_string()],|row|row.get::<_,String>(0)).unwrap(),firing);
+        assert_eq!(db.query_row("SELECT event FROM automation_notifications WHERE key=?1",[format!("proposal:{}",proposal.id)],|row|row.get::<_,String>(0)).unwrap(),notice);
+        assert_eq!(db.query_row("SELECT pending FROM automation_proposals WHERE id=?1",[proposal.id.to_string()],|row|row.get::<_,bool>(0)).unwrap(),true);
+        // Repairing the unrelated malformed input permits the same upgrade;
+        // the accepted firing and pending request still have their identities.
+        db.execute("UPDATE automation_revisions SET definition=?2 WHERE automation=?1",params![automation.id.to_string(),encode(&proposal.definition).unwrap()]).unwrap();
+        drop(db);
+        let registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(registry.automation(automation.id).unwrap().active_firing,Some(claim.firing.id));
+        assert_eq!(registry.pending_automation_proposal_count().unwrap(),1);
+        assert_eq!(registry.automation_proposal_sequence().unwrap(),0);
+    }
 
 }
