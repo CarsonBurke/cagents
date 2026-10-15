@@ -53,21 +53,30 @@ mod tests {
     use super::*;
     #[test]
     fn lookup_and_claim_cannot_be_pruned_into_two_leases_for_the_same_session() {
+        let budget=std::time::Duration::from_secs(5);
         let id=TerminalId::new();
         let (selected,selection)=std::sync::mpsc::channel();
         let (claim,claimed)=std::sync::mpsc::channel();
         let (release,released)=std::sync::mpsc::channel();
+        let (finished,completion)=std::sync::mpsc::channel();
+        struct Release {claim:std::sync::mpsc::Sender<()>,release:std::sync::mpsc::Sender<()>}
+        impl Drop for Release {fn drop(&mut self) {let _=self.claim.send(());let _=self.release.send(());}}
+        let _release=Release {claim:claim.clone(),release:release.clone()};
         let first=std::thread::spawn(move||{
-            let lease=acquire_inner(id,||{selected.send(()).unwrap();claimed.recv().unwrap();}).unwrap();
-            released.recv().unwrap();drop(lease);
+            let lease=acquire_inner(id,||{selected.send(()).unwrap();claimed.recv_timeout(budget).unwrap();}).unwrap();
+            released.recv_timeout(budget).unwrap();drop(lease);let _=finished.send(());
         });
-        selection.recv().unwrap();
+        selection.recv_timeout(budget).unwrap();
         let lookup_is_fenced=matches!(FENCES.get().unwrap().try_lock(),Err(std::sync::TryLockError::WouldBlock));
         let (attempt,attempted)=std::sync::mpsc::channel();
-        let second=std::thread::spawn(move||{attempt.send(()).unwrap();acquire(id)});
-        attempted.recv().unwrap();claim.send(()).unwrap();
-        assert!(second.join().unwrap().is_err(),"the second lookup must share the already-claimed entry");
-        release.send(()).unwrap();first.join().unwrap();
+        let (result,observed)=std::sync::mpsc::channel();
+        let second=std::thread::spawn(move||{let _=attempt.send(());let _=result.send(acquire(id).is_err());});
+        attempted.recv_timeout(budget).unwrap();claim.send(()).unwrap();
+        assert!(observed.recv_timeout(budget).unwrap(),"the second lookup must share the already-claimed entry");
+        release.send(()).unwrap();completion.recv_timeout(budget).unwrap();
+        // Completion records follow dropping the actual leases. Do not put an
+        // OS-thread/TLS join on this test's deadline path.
+        drop(first);drop(second);
         assert!(lookup_is_fenced,"even before CAS, another lookup must be unable to prune the selected false entry");
         drop(acquire(id).unwrap());
     }
