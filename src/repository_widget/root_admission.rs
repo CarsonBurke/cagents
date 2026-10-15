@@ -46,6 +46,39 @@ impl RootFilePreparation {
     }
 }
 
+/// Build an actual opaque receipt for all-state custody tests. This grants no
+/// admission and deliberately carries a fresh, unmatched load request.
+#[cfg(test)]
+pub(crate) fn fixture_root_file_error_action(
+    identity: AsyncIdentity,
+    error: FileIoError,
+    prepared: bool,
+) -> RepositoryAction {
+    let request = uuid::Uuid::new_v4();
+    if prepared {
+        RepositoryAction::EditorFilePrepared {
+            identity,
+            preparation: RootFilePreparation {
+                request,
+                result: Err(error),
+                indentation: Default::default(),
+                root: None,
+                prepared: None,
+            },
+        }
+    } else {
+        RepositoryAction::EditorFileAdmitted {
+            identity,
+            admission: RootFileAdmission {
+                request,
+                result: Err(error),
+                indentation: Default::default(),
+                root: None,
+            },
+        }
+    }
+}
+
 struct Intake {
     endpoint: crate::recovery_domain::LocalRecoveryEndpoint,
     work: PreparationWork,

@@ -25,6 +25,8 @@ mod preview;
 mod root_admission;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 pub use root_admission::{RootFileAdmission, RootFilePreparation};
+#[cfg(test)]
+pub(crate) use root_admission::fixture_root_file_error_action;
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
 
