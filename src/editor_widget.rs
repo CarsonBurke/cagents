@@ -1416,6 +1416,15 @@ where
         })
     }
 
+    /// Exact selected span, including native word/line selections.
+    pub(crate) fn selected_cursor(&self) -> Cursor {
+        let cursor = self.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let first = cursor.position.line.min(anchor.line).saturating_sub(1);
+        let last = (cursor.position.line.max(anchor.line) + 1).min(self.line_count().saturating_sub(1));
+        self.selected_span(&self.excerpt(first, last), cursor)
+    }
+
     /// The caret with the exact span it has selected.
     ///
     /// A word or line selection reports only the point it was anchored at,

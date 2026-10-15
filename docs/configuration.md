@@ -167,6 +167,10 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
+| `editor_find_options.case_sensitive` | boolean | `false` | Match case in the native editor Find strip |
+| `editor_find_options.regex` | boolean | `false` | Interpret Find queries as bounded regular expressions |
+| `editor_find_options.whole_word` | boolean | `false` | Require word boundaries outside each Find match |
+| `editor_replace_preserve_case` | boolean | `false` | Preserve upper, lower and title case in plain-text replacements |
 | `editor_syntax_theme` | string | `"auto"` | Syntax colors for editors and diffs: `"auto"` (follows the app theme), `"solarized_dark"`, `"mocha"`, `"ocean"`, `"eighties"`, or `"inspired_github"` (`"inspired_git_hub"`, written by earlier versions, is also read) |
 | `confirm_terminal_close` | boolean | `true` | Asks before closing a terminal that has a foreground program or background jobs. An idle shell closes without asking |
 | `chat_enter_sends` | boolean | `true` | When on, Enter sends a chat message and Shift+Enter starts a new line. When off, Enter starts a new line and Ctrl+Enter sends |

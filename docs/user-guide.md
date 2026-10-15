@@ -613,9 +613,17 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   logical pixels; a terminal font size you already saved is kept.
 - Editor settings can override the terminal font family and size. **Ctrl+=**,
   **Ctrl+-**, and **Ctrl+0** zoom or reset the focused editor or terminal.
-- **Ctrl+F** finds in the open file, highlighting all matches. **Enter** and
-  **Shift+Enter** move forward and backward; replacement controls offer one
-  match or all matches.
+- **Ctrl+F** opens Find and focuses its query. Click the buffer to keep editing,
+  undoing and redoing with Find open; the match count updates without moving
+  your caret. **Enter** / **Shift+Enter** in the query and **F3** / **Shift+F3**
+  in the buffer move between matches. **Escape** closes Find and focuses the buffer.
+- Find offers **Aa** (match case), **Word** (whole words), and `.*` (regular
+  expressions). Invalid expressions show an inline error. **Selection** searches
+  only the selection captured when enabled. Matching preferences persist for
+  the user; the selection scope lasts only for this open strip.
+- Replace or Replace all uses the same matching options. Regular expressions
+  expand captures such as `$1`; plain replacements can **Preserve case** for
+  upper, lower and title case matches. Replace all is one undo step.
 - With a language server running, diagnostics appear in the gutter and under
   the affected text. **Ctrl+Space** requests completion; arrow keys choose a
   result and **Tab** or **Enter** applies it. Hover over a symbol for details,
