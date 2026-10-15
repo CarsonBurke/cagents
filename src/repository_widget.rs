@@ -3145,9 +3145,11 @@ impl RepositoryRuntime {
     }
 
     pub fn set_find_preferences(&mut self, options: crate::editor_search::FindOptions, preserve_case: bool) {
-        self.find_options = options;
         self.replace_preserve_case = preserve_case;
-        self.refresh_find_matches();
+        if self.find_options != options {
+            self.find_options = options;
+            self.refresh_find_matches();
+        }
     }
 
     pub fn find_preferences(&self) -> (crate::editor_search::FindOptions, bool) {
@@ -3156,7 +3158,7 @@ impl RepositoryRuntime {
 
     fn current_selection_scope(&self) -> Option<FindScope> {
         let DocumentState::Editable(document) = &self.document else { return None; };
-        let cursor = document.content.cursor();
+        let cursor = document.content.selected_cursor();
         let anchor = cursor.selection?;
         let first = (anchor.line, anchor.column);
         let last = (cursor.position.line, cursor.position.column);
