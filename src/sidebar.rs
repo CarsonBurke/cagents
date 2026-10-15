@@ -7805,12 +7805,17 @@ fn virtual_changes<'a>(
     ]);
     let key = key.clone();
     let epoch = state.change_scroll_epoch;
-    widget::scrollable(content)
+    let scroll:Element<'a,SidebarAction> = widget::scrollable(content)
         .id(stable_id(format!("changes.scroll.{}.{scope:?}.{}", key.worktree_id, state.change_scroll_epoch)))
         .on_scroll(move |viewport| SidebarAction::ChangeViewport { key: key.clone(), scope, epoch,
             first_row: (viewport.absolute_offset().y / PANEL_ROW_HEIGHT).max(0.0) as usize })
         .direction(cosmic::iced::widget::scrollable::Direction::Vertical(crate::design::scrollbar()))
         .height(Length::Fixed((total.min(crate::change_list::VIEW_ROWS) as f32 * PANEL_ROW_HEIGHT).max(PANEL_ROW_HEIGHT)))
+        .width(Length::Fill)
+        .into();
+    // A scrollable ID only identifies operations; it does not reset State.
+    // Replace the native child Tree when layout coordinates are reset.
+    cosmic::iced::widget::keyed::Column::with_children([(epoch, scroll)])
         .width(Length::Fill)
         .into()
 }
@@ -16041,6 +16046,43 @@ pub(crate) mod tests {
             key:source.key.clone(), scope:ChangeTreeScope::Area(group.area), first_row:39_984, epoch:state.change_scroll_epoch,
         });
         assert!(state.change_first_rows.is_empty(), "old worktree scroll callbacks cannot move the newly bound pane");
+    }
+
+    #[test]
+    fn changing_change_layout_resets_the_native_scroll_state_with_its_coordinates() {
+        use cosmic::iced::{Rectangle,Vector,advanced::widget::{Operation,operation}};
+        #[derive(Default)]
+        struct Offset(Option<f32>);
+        impl Operation for Offset {
+            fn traverse(&mut self, operate:&mut dyn FnMut(&mut dyn Operation)) {operate(self);}
+            fn scrollable(&mut self,_id:Option<&Id>,_bounds:Rectangle,_content:Rectangle,translation:Vector,_state:&mut dyn operation::Scrollable) {self.0=Some(translation.y);}
+        }
+        let mut source=source_control();
+        source.groups=vec![ChangeGroup::new(source.key.worktree_id,ChangeArea::Unstaged,
+            (0..200).map(|index|ChangeRow::new(source.key.worktree_id,&changed(repo_path(&format!("file-{index:04}.rs")),ChangeArea::Unstaged,ChangeKind::Modified,None))).collect())];
+        let model=panel_model();
+        let mut state=panel_state(&model);
+        let group=&source.groups[0];
+        let scope=ChangeTreeScope::Area(group.area);
+        let renderer=headless_renderer();
+        let mut element=change_group_view(&state,&source,group,false);
+        let mut tree=Tree::new(&element);
+        let limits=layout::Limits::new(Size::ZERO,Size::new(380.0,500.0));
+        let mut node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+        let id=stable_id(format!("changes.scroll.{}.{scope:?}.{}",source.key.worktree_id,state.change_scroll_epoch));
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,
+            &mut operation::scrollable::scroll_to::<()>(id,operation::scrollable::AbsoluteOffset {x:None,y:Some(640.0)}));
+        let mut before=Offset::default();
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut before);
+        assert_eq!(before.0,Some(640.0));
+        drop(element);
+        state.apply(&SidebarAction::SetChangeListMode {key:source.key.clone(),mode:FileListMode::Flat});
+        element=change_group_view(&state,&source,group,false);
+        tree.diff(&mut element);
+        node=element.as_widget_mut().layout(&mut tree,&renderer,&limits);
+        let mut after=Offset::default();
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut after);
+        assert_eq!(after.0,Some(0.0),"native offset and mounted row coordinates must reset together");
     }
 
     #[test]
