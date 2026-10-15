@@ -50,7 +50,14 @@ def fixture_environment(root):
     if not (root / MARKER).is_file():
         raise SystemExit("prepare this private fixture first")
     env = dict(os.environ)
-    for key in ("CAGENTS_AGENT_AUTHORITY", "CODEX_SESSION_ID", "CODEX_THREAD_ID"):
+    for key in ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_ACCOUNT_HOMES", "CODEX_SESSION_ID", "CODEX_THREAD_ID",
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_REFRESH_TOKEN", "CLAUDE_CODE_OAUTH_SCOPES",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_MANTLE",
+                "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "ANTHROPIC_PROFILE",
+                "ANTHROPIC_FEDERATION_RULE_ID", "ANTHROPIC_ORGANIZATION_ID", "OPENAI_API_KEY",
+                "CODEX_API_KEY", "CODEX_ACCESS_TOKEN", "OPENAI_FEDERATION_RULE_ID",
+                "OPENAI_IDENTITY_TOKEN_FILE", "OPENAI_WORKLOAD_IDENTITY_CONTEXT", "OMP_PROFILE", "PI_PROFILE"):
         env.pop(key, None)
     # A nested compositor's relative socket lives in the caller's runtime.
     display = env.get("WAYLAND_DISPLAY")
@@ -70,7 +77,8 @@ def fixture_environment(root):
         HOME=str(root / "home"), XDG_RUNTIME_DIR=str(runtime),
         XDG_DATA_HOME=str(root / "data"), XDG_CONFIG_HOME=str(root / "config"),
         XDG_CACHE_HOME=str(root / "cache"), XDG_STATE_HOME=str(root / "state"),
-        CODEX_HOME=str(root / "home/.codex"),
+        CODEX_HOME=str(root / "home/.codex"), CLAUDE_CONFIG_DIR=str(root / "home/.claude"),
+        PI_CONFIG_DIR=str(root / "home/.pi"), PI_CODING_AGENT_DIR=str(root / "home/.omp"),
         PATH=str(root / "bin") + ":" + env["PATH"],
     )
     return env
