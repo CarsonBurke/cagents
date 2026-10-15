@@ -1327,6 +1327,12 @@ fn snapshot_channel_name(
         .and_then(crate::workspace_model::channel_title)
         .map(|title| (title, crate::model::ChannelTitleSource::Provider))
         .or_else(|| {
+            // A bounded recent window cannot establish the conversation's
+            // first task. Keep its saved name until the actual head or a
+            // supported provider title is available; never page just to name.
+            if snapshot.has_earlier {
+                return None;
+            }
             snapshot
                 .items
                 .iter()
@@ -1347,7 +1353,7 @@ fn snapshot_channel_name(
 #[derive(Default)]
 struct ChannelNameObservation {
     session: Option<String>,
-    scanned: Option<(u64, usize, Option<String>)>,
+    scanned: Option<(u64, usize, Option<String>, bool)>,
     title: Option<(String, crate::model::ChannelTitleSource)>,
     pending: bool,
     last_view: Option<(crate::model::ChannelId, u64)>,
@@ -1375,6 +1381,7 @@ impl ChannelNameObservation {
                 snapshot.turn_generation,
                 snapshot.items.len(),
                 snapshot.items.first().map(|item| item.id.clone()),
+                snapshot.has_earlier,
             );
             if self.scanned.as_ref() != Some(&stamp) {
                 self.scanned = Some(stamp);
@@ -10026,6 +10033,45 @@ mod tests {
         snapshot.items.clear();
         assert!(observation.observe(&snapshot).is_none());
         assert!(observation.title.is_none());
+    }
+
+    #[test]
+    fn tail_only_history_cannot_replace_a_channels_first_task() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel { id, project_id: ProjectId::new(),
+            title: "Review original encryption task".into(), title_source: ChannelTitleSource::Prompt,
+            ordinal: 0, shared: true, cards: vec![card], focused: Some(card) }];
+        app.workspace_model.views = vec![View { scope: Scope::Channel(id), revision: 1, retired: Vec::new(),
+            panes: vec![Pane::from_card(app.card_state(card).unwrap(), Some(FIXTURE_DIRECTORY.into())).unwrap()] }];
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1; snapshot.title = None; snapshot.has_earlier = true;
+        snapshot.items = vec![Arc::new(chat::Item { id: "visible-window-edge".into(), role: chat::Role::User,
+            content: text("Fix a later unrelated task"), started_at: None, at: None })];
+        handle.publish_snapshot_for_test(snapshot.clone());
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(app.durable.channels[0].title, "Review original encryption task");
+        assert!(app.chat_ui.channel_names[&target].title.is_none());
+        // A confirmed provider name does not require the first history page.
+        let mut provider = snapshot.clone(); provider.title = Some("Provider encryption audit".into());
+        assert_eq!(snapshot_channel_name(&provider).unwrap(), ("Provider encryption audit".into(), ChannelTitleSource::Provider));
+        // The same edge can become a complete head after a provider/history
+        // observation; neither a new turn nor another item identity is needed.
+        snapshot.has_earlier = false;
+        let observed = app.observe_channel_name(target, &snapshot).unwrap();
+        assert_eq!(observed, ("Fix a later unrelated task".into(), ChannelTitleSource::Prompt));
+        // Unavailable content is also never an instruction to erase a manual name.
+        let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+        channel.title = "My manual channel".into(); channel.title_source = ChannelTitleSource::Manual;
+        snapshot.has_earlier = true; snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(app.durable.channels[0].title, "My manual channel");
     }
 
     fn text(body: &str) -> ItemContent {
