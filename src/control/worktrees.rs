@@ -67,6 +67,12 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
     };
     let project = project
         .map(|given| {
+            // An explicitly written path cannot be reinterpreted as a label.
+            if given.is_absolute()
+                || matches!(given.components().next(), Some(std::path::Component::CurDir | std::path::Component::ParentDir))
+            {
+                return Ok(given);
+            }
             if let Some(id) = given
                 .to_str()
                 .and_then(|value| value.parse::<crate::model::ProjectId>().ok())
@@ -89,7 +95,20 @@ pub(super) fn execute(command: WorktreeCommand) -> Result<CommandOutput, AppErro
                 .filter(|project| Path::new(&project.name) == given)
                 .collect::<Vec<_>>();
             match matching.as_slice() {
-                [project] => Ok(project.repository.clone()),
+                [project] => {
+                    // Remote relative paths are unsupported by project_directory;
+                    // only the owning device may interpret its absolute paths.
+                    if !crate::device::is_remote()
+                        && given.try_exists().map_err(|error| AppError::new("project", format!("Could not inspect project path {}: {error}", given.display())))?
+                    {
+                        let path_repository=resolve_repository(Some(given.clone()),Some(&model))?;
+                        let named_repository=resolve_repository(Some(project.repository.clone()),Some(&model))?;
+                        if path_repository != named_repository {
+                            return Err(AppError::new("project",format!("Project selector {} is ambiguous: the directory resolves to {}, while the open project named {} resolves to {}. Use an absolute or ./ path to select the directory, or the named project's absolute repository path.",given.display(),path_repository.display(),project.name,named_repository.display())));
+                        }
+                    }
+                    Ok(project.repository.clone())
+                },
                 [] => Ok(given),
                 _ => Err(AppError::new(
                     "project",
