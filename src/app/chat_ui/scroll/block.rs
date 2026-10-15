@@ -60,7 +60,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Block<'_> {
     fn tag(&self) -> tree::Tag { tree::Tag::of::<Mounted>() }
     fn state(&self) -> tree::State { tree::State::new(Mounted(None)) }
     fn children(&self) -> Vec<Tree> { vec![Tree::new(&self.content)] }
-    fn diff(&mut self, tree: &mut Tree) { tree.diff_children(std::slice::from_mut(&mut self.content)); }
+    fn diff(&mut self, tree: &mut Tree) {
+        let mounted = tree.state.downcast_mut::<Mounted>();
+        if mounted.0.as_ref().is_some_and(|key| key != &self.key) {
+            // A reused tree belongs to another logical reader. Its default
+            // is native top-left/bottom-follow, never the preceding key's offset.
+            tree.children = vec![Tree::new(&self.content)];
+            mounted.0 = None;
+        } else { tree.diff_children(std::slice::from_mut(&mut self.content)); }
+    }
     fn size(&self) -> Size<Length> { self.content.as_widget().size() }
     fn size_hint(&self) -> Size<Length> { self.content.as_widget().size_hint() }
     fn layout(&mut self, tree: &mut Tree, renderer: &cosmic::Renderer, limits: &layout::Limits) -> layout::Node {
@@ -144,11 +152,18 @@ mod tests {
             revealed.as_widget_mut().operate(&mut fresh, Layout::new(&node), &renderer, &mut read);
             assert_eq!(read.saved.unwrap().position, expected.position);
             let mut child = make(Some("child".into()));
-            let mut child_tree = Tree::new(&child);
-            child.as_widget_mut().layout(&mut child_tree, &renderer, &limits);
+            fresh.diff(&mut child);
+            child.as_widget_mut().layout(&mut fresh, &renderer, &limits);
             assert_eq!(memory.1.borrow().entries[&(None, 7)].position, expected.position);
             assert_eq!(memory.1.borrow().entries[&(Some("child".into()), 7)].position.x, 0.0,
                 "same logical block ID in another transcript has independent scroll state");
+            let mut parent = make(None);
+            fresh.diff(&mut parent);
+            let node = parent.as_widget_mut().layout(&mut fresh, &renderer, &limits);
+            let mut read = Position { restore: None, bottom, saved: None, changed: false };
+            parent.as_widget_mut().operate(&mut fresh, Layout::new(&node), &renderer, &mut read);
+            assert_eq!(read.saved.unwrap().position, expected.position,
+                "switching back through the same tree restores the original logical reader");
         }
     }
 }
