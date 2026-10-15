@@ -494,8 +494,9 @@ impl Cagents {
 
     pub(in crate::app) fn select_channel_then(&mut self, id: ChannelId, after: selection::Intent) -> Task<Message> {
         let Some(path) = self.channel_scope_path(id) else {
-            self.worktree_selection.cancel();
-            return self.abandon_worktree_selection(after);
+            let cancelled=self.cancel_worktree_selection();
+            let abandoned=self.abandon_worktree_selection(after);
+            return Task::batch([cancelled,abandoned]);
         };
         self.worktree_owner_paths.invalidate_watched();
         let protected = self.worktree_owner_paths.cached.get(&path)
@@ -506,10 +507,10 @@ impl Cagents {
         if matches!(&after,selection::Intent::Navigate) && self.channel_scope_is_current(id,&path)
             && (!crate::instance::window_is_initialized() || crate::device::is_remote() || protected)
         {
-            self.worktree_selection.cancel();
+            let cancelled=self.cancel_worktree_selection();
             let initialize = self.initialize_prepared_scope_runtimes();
             let after = self.finish_worktree_selection(after);
-            return Task::batch([initialize,after]);
+            return Task::batch([cancelled,initialize,after]);
         }
         self.select_worktree_then(path.clone(),false,selection::Intent::Channel { id, path, after: Box::new(after) })
     }

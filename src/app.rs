@@ -13317,8 +13317,12 @@ impl Application for Cagents {
         {
             return Task::none();
         }
+        let prepared_navigation=match &message {
+            Message::WorktreeSelectionPrepared {generation,receipt,..}=>self.prepared_selection_navigates(*generation,receipt),
+            _=>false,
+        };
         if (self.focused_repository_is_saving() || self.modal_is_open())
-            && completion_navigates(&message)
+            && (completion_navigates(&message) || prepared_navigation)
         {
             self.deferred_navigation.push_back(message);
             return Task::none();
