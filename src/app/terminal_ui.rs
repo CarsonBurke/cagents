@@ -20,7 +20,7 @@ pub enum Action {
     PasteClipboard(CardId),
     Paste(CardId, String),
     ConfirmPaste(CardId, bool),
-    ConfirmClipboard(CardId, bool),
+    ConfirmClipboard(CardId, TerminalId, bool),
     SelectAll(CardId),
     Clear(CardId),
     Refresh(CardId, u64),
@@ -29,6 +29,54 @@ pub enum Action {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cosmic::iced::futures::StreamExt;
+    fn confirm_clipboard(app: &Cagents, card: CardId, allow: bool) -> Action {
+        let (_, terminal, ..) = app
+            .terminal_clipboard
+            .as_ref()
+            .expect("pending clipboard request");
+        Action::ConfirmClipboard(card, *terminal, allow)
+    }
+
+    #[test]
+    fn stale_clipboard_action_cannot_approve_or_discard_a_replacement_request() {
+        let (mut app, card, directory) =
+            super::super::tests::live_agent_app("clipboard-stale-action-fixture");
+        app.settings.terminal_clipboard_write = crate::settings::TerminalClipboardWritePolicy::Ask;
+        drop(app.handle_terminal_clipboard_write(card, false, "old".into()));
+        let old_action = confirm_clipboard(&app, card, true);
+        let replacement = TerminalId::new();
+        app.cards.insert(
+            card,
+            CardRuntime::Terminal(super::super::tests::unconnected_surface(
+                directory.path(),
+                replacement,
+            )),
+        );
+        app.terminal_clipboard = None;
+        drop(app.handle_terminal_clipboard_write(card, false, "replacement".into()));
+        let pending = app.terminal_clipboard.clone();
+        assert!(clipboard_actions(app.handle_terminal_find(old_action)).is_empty());
+        assert_eq!(app.terminal_clipboard, pending);
+        assert!(
+            clipboard_actions(app.handle_terminal_find(Action::ConfirmClipboard(
+                CardId::new(),
+                replacement,
+                true
+            )))
+            .is_empty()
+        );
+        assert_eq!(app.terminal_clipboard, pending);
+        let new_action = confirm_clipboard(&app, card, true);
+        assert_eq!(
+            clipboard_actions(app.handle_terminal_find(new_action)),
+            vec![(
+                iced::advanced::clipboard::Kind::Standard,
+                "replacement".into()
+            )]
+        );
+    }
+
     fn clipboard_actions(task: Task<Message>) -> Vec<(iced::advanced::clipboard::Kind, String)> {
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -58,7 +106,7 @@ mod tests {
             app.settings.terminal_clipboard_write =
                 crate::settings::TerminalClipboardWritePolicy::Ask;
             drop(app.handle_terminal_clipboard_write(card, false, "copy".into()));
-            let task = app.handle_terminal_find(Action::ConfirmClipboard(card, allow));
+            let task = app.handle_terminal_find(confirm_clipboard(&app, card, allow));
             assert!(app.terminal_clipboard.is_none());
             assert_eq!(
                 super::super::tests::focused_element(app.view(), task),
@@ -94,7 +142,7 @@ mod tests {
         );
         assert!(app.terminal_clipboard_dialog().is_some());
         assert_eq!(
-            clipboard_actions(app.handle_terminal_find(Action::ConfirmClipboard(card, true))),
+            clipboard_actions(app.handle_terminal_find(confirm_clipboard(&app, card, true))),
             vec![(iced::advanced::clipboard::Kind::Standard, "ask".into())]
         );
         assert!(app.terminal_clipboard_dialog().is_none());
@@ -121,7 +169,7 @@ mod tests {
         app.settings.terminal_clipboard_write = TerminalClipboardWritePolicy::Ask;
         drop(app.handle_terminal_clipboard_write(card, false, "ask".into()));
         assert!(
-            clipboard_actions(app.handle_terminal_find(Action::ConfirmClipboard(card, false)))
+            clipboard_actions(app.handle_terminal_find(confirm_clipboard(&app, card, false)))
                 .is_empty()
         );
         assert!(
@@ -147,7 +195,7 @@ mod tests {
         assert!(app.terminal_clipboard_dialog().is_some());
         app.cards.insert(card, CardRuntime::Loading);
         assert!(
-            clipboard_actions(app.handle_terminal_find(Action::ConfirmClipboard(card, true)))
+            clipboard_actions(app.handle_terminal_find(confirm_clipboard(&app, card, true)))
                 .is_empty()
         );
     }
@@ -599,7 +647,17 @@ fn clipboard_write_task(primary: bool, text: String) -> Task<Message> {
 
 impl Cagents {
     pub(super) fn handle_terminal_find(&mut self, action: Action) -> Task<Message> {
-        if let Action::ConfirmClipboard(card, allow) = &action {
+        if let Action::ConfirmClipboard(card, requested_terminal, allow) = &action {
+            // An old dialog action cannot approve or dismiss another terminal's request.
+            if !self
+                .terminal_clipboard
+                .as_ref()
+                .is_some_and(|(target, terminal, ..)| {
+                    target == card && terminal == requested_terminal
+                })
+            {
+                return Task::none();
+            }
             if let Some((target, terminal, primary, text)) = self.terminal_clipboard.take()
                 && target == *card
                 && let Some(CardRuntime::Terminal(handle)) = self.cards.get(card)
@@ -653,7 +711,7 @@ impl Cagents {
             | Action::CopySelection(card, _)
             | Action::PasteClipboard(card)
             | Action::Paste(card, _)
-            | Action::ConfirmClipboard(card, _)
+            | Action::ConfirmClipboard(card, _, _)
             | Action::ConfirmPaste(card, _)
             | Action::SelectAll(card)
             | Action::Clear(card)
@@ -1084,18 +1142,18 @@ impl Cagents {
     }
 
     pub(super) fn terminal_clipboard_dialog(&self) -> Option<Element<'_, Message>> {
-        let (card, _, primary, text) = self.terminal_clipboard.as_ref()?;
-        let card = *card;
+        let (card, terminal, primary, text) = self.terminal_clipboard.as_ref()?;
+        let (card, terminal) = (*card, *terminal);
         Some(dialog_ui::overlay(dialog_ui::surface(widget::column::with_children(vec![
             crate::design::title("Allow terminal clipboard writes?").into(),
             notice_body("A program in this terminal wants to replace your clipboard. Your choice applies to this terminal until it closes."),
             widget::text(format!("{} characters · {}", text.chars().count(), if *primary { "primary selection" } else { "system clipboard" })).into(),
             widget::row::with_children(vec![
                 crate::ui_controls::button::secondary("Deny").id(widget::Id::from("terminal-clipboard-deny"))
-                    .on_press(Message::TerminalFind(Action::ConfirmClipboard(card, false))).into(),
-                crate::ui_controls::button::primary("Allow").on_press(Message::TerminalFind(Action::ConfirmClipboard(card, true))).into(),
+                    .on_press(Message::TerminalFind(Action::ConfirmClipboard(card, terminal, false))).into(),
+                crate::ui_controls::button::primary("Allow").on_press(Message::TerminalFind(Action::ConfirmClipboard(card, terminal, true))).into(),
             ]).spacing(space::S).into(),
-        ]).spacing(space::M), 480.0), Some(Message::TerminalFind(Action::ConfirmClipboard(card, false))), 1.0))
+        ]).spacing(space::M), 480.0), Some(Message::TerminalFind(Action::ConfirmClipboard(card, terminal, false))), 1.0))
     }
 
     pub(super) fn terminal_paste_dialog(&self) -> Option<Element<'_, Message>> {
