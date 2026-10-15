@@ -1402,6 +1402,33 @@ mod tests {
     }
 
     #[test]
+    fn return_capacity_refusal_precedes_flags_claim_close_and_terminal_start() {
+        let exact = std::thread::current().name().expect("named contract").to_owned();
+        if runtime::isolated_backend_contract(&exact) { return; }
+        let fixture = fixture(0);
+        let id = fixture.source.id;
+        fixture.host.lock().unwrap().register_client(1);
+        let expected = super::super::chat::source_binding::fixture_binding(&fixture.host, id);
+        let process = fixture.handle.provider_process().expect("real owned native provider");
+        assert!(process.is_current());
+        let reservations = fixture.host.lock().unwrap().native_sources.pin_capacity_for_test();
+        let error = super::super::chat::process(&fixture.host, 1,
+            ClientRequest::ChatReturnTerminal { chat_id: id, expected }).unwrap_err();
+        assert!(error.message.contains("capacity is reserved"), "{error:?}");
+        let state = fixture.host.lock().unwrap();
+        assert!(!state.chats[&id].returning_terminal, "capacity refusal cannot mark a return in progress");
+        assert!(state.terminals.is_empty());
+        assert!(!state.has_pending_terminal_spawn_for_test());
+        assert!(state.chat_handoffs.is_empty());
+        assert!(!fixture.handle.is_completed());
+        assert_eq!(fixture.handle.provider_process().as_ref(), Some(&process));
+        assert!(process.is_current(), "all-pinned admission cannot close the original process");
+        assert!(!fixture.old.join("handoff.marker").exists(), "no return CLI was launched");
+        drop(state);
+        drop(reservations);
+    }
+
+    #[test]
     fn console_pair_claim_preserves_the_exact_operation_across_lost_disposition_reply() {
         let exact = std::thread::current()
             .name()

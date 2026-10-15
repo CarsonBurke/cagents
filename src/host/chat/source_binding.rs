@@ -38,6 +38,15 @@ struct PendingHandoff {
     token: Option<uuid::Uuid>,
     original_pair: Option<uuid::Uuid>,
     created_pair: Option<uuid::Uuid>,
+    backend_closed: bool,
+    returned: Option<ReturnTarget>,
+}
+#[derive(Clone)]
+struct ReturnTarget {
+    reservation: Reservation,
+    source: crate::model::TerminalSession,
+    attempted: bool,
+    published: Option<(crate::terminal_ipc::TerminalDescriptor, crate::terminal::TerminalHandle)>,
 }
 impl History {
     fn ensure(&mut self, id: TerminalId) -> Result<(), ProtocolError> {
@@ -104,6 +113,14 @@ impl History {
     }
     pub(super) fn resource_epoch(&self, id: TerminalId) -> Option<uuid::Uuid> {
         self.entries.get(&id).map(|entry| entry.resource_epoch)
+    }
+    #[cfg(test)]
+    pub(in crate::host) fn pin_capacity_for_test(&mut self) -> Vec<Reservation> {
+        let mut reservations = self.entries.keys().map(|id| self.pin_existing(*id).unwrap()).collect::<Vec<_>>();
+        while self.entries.len() < CAPACITY {
+            reservations.push(self.mutating(TerminalId::new()).unwrap());
+        }
+        reservations
     }
     #[cfg(test)]
     pub(in crate::host) fn pressure_for_test(&mut self) {
@@ -353,6 +370,7 @@ pub(in crate::host) fn pair_changed(state: &mut HostState, id: TerminalId) {
 /// handoff's own pair mutation. It is never supplied by a client.
 pub(super) struct Continuation {
     publication: Reservation,
+    returned: Option<ReturnTarget>,
     instance: uuid::Uuid,
     witness: chat::runtime::BackendIdentity,
     handle: Handle,
@@ -396,6 +414,7 @@ pub(super) fn continuation(
         .clone();
     Ok(Continuation {
         publication: state.native_sources.pin_existing(binding.source.id)?,
+        returned: entry.pending_handoff.as_ref().and_then(|pending| pending.returned.clone()),
         instance: binding.execution_instance,
         witness,
         handle,
@@ -605,9 +624,21 @@ pub(super) fn claim_continuation(
                     token: None,
                     original_pair,
                     created_pair: None,
+                    backend_closed: false,
+                    returned: continuation.returned.clone(),
                 });
             }
         }
+    }
+    let already_closed = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.native_sources.entries[&binding.source.id].pending_handoff.as_ref()
+            .filter(|pending| pending.intent == *intent && pending.admitted == *binding && pending.backend_closed)
+            .and_then(|pending| pending.token)
+    };
+    if let Some(token) = already_closed {
+        continuation.claim = Some(token);
+        return Ok(());
     }
     let claim = match continuation
         .handle
@@ -719,11 +750,20 @@ pub(super) fn close_continuation(
     let claim = continuation
         .claim
         .ok_or_else(|| unavailable("The exact handoff claim is unconfirmed"))?;
-    continuation
-        .handle
-        .close_backend_source(&continuation.witness, claim)
-        .map_err(unavailable)?;
-    clear_continuation(host, id, continuation, claim)
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let pending = state.native_sources.entries.get(&id).and_then(|entry| entry.pending_handoff.as_ref())
+            .filter(|pending| pending.token == Some(claim) && pending.owner.same_actor(&continuation.handle))
+            .ok_or_else(|| unavailable("The exact close operation is unavailable"))?;
+        if pending.backend_closed { return Ok(()); }
+    }
+    continuation.handle.close_backend_source(&continuation.witness, claim).map_err(unavailable)?;
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| pending.token == Some(claim) && pending.owner.same_actor(&continuation.handle))
+        .ok_or_else(|| unavailable("The positive closed owner lost its exact retained operation"))?;
+    pending.backend_closed = true;
+    Ok(())
 }
 fn clear_continuation(
     host: &SharedHost,
@@ -750,6 +790,66 @@ fn clear_continuation(
         ));
     }
     entry.pending_handoff = None;
+    Ok(())
+}
+
+/// Reserve the exact future target before returning/claim/close. An ambiguous
+/// operation keeps this same ID and slot through retry; no latest-ID discovery.
+pub(super) fn reserve_return_target(
+    host: &SharedHost, continuation: &mut Continuation, source: crate::model::TerminalSession,
+) -> Result<crate::model::TerminalSession, ProtocolError> {
+    if let Some(target) = &continuation.returned { return Ok(target.source.clone()); }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state.native_sources.ensure(source.id)?;
+    let reservation = state.native_sources.pin_existing(source.id)?;
+    continuation.returned = Some(ReturnTarget { reservation, source: source.clone(), attempted: false, published: None });
+    Ok(source)
+}
+/// Unknown after an actual spawn attempt never means no provider. HR11's exact
+/// start ticket supplies the eventual positive retry disposition; until then
+/// keep this operation and refuse another resume attempt.
+pub(super) fn prepare_return_attempt(
+    host: &SharedHost, id: TerminalId, continuation: &Continuation, source: crate::model::TerminalSession,
+) -> Result<Option<(crate::terminal_ipc::TerminalDescriptor, crate::terminal::TerminalHandle)>, ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+        .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
+    let target = pending.returned.as_mut().filter(|target| target.source.id == source.id)
+        .ok_or_else(|| unavailable("The exact attempted return target changed"))?;
+    if let Some(published) = &target.published { return Ok(Some(published.clone())); }
+    if target.attempted { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
+    target.source = source;
+    target.attempted = true;
+    Ok(None)
+}
+pub(super) fn remember_return_worker(
+    host: &SharedHost, id: TerminalId, continuation: &Continuation,
+    descriptor: crate::terminal_ipc::TerminalDescriptor, worker: crate::terminal::TerminalHandle,
+) -> Result<(), ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if state.terminals.get(&descriptor.session.id).is_none_or(|record| !record.handle.same_worker(&worker)) {
+        return Err(unavailable("The exact returned worker changed before retention"));
+    }
+    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+        .ok_or_else(|| unavailable("The exact returned operation changed"))?;
+    let target = pending.returned.as_mut().filter(|target| target.source.id == descriptor.session.id)
+        .ok_or_else(|| unavailable("The returned worker belongs to another attempted target"))?;
+    target.published = Some((descriptor, worker));
+    Ok(())
+}
+pub(super) fn finish_closed_return(
+    state: &mut HostState, id: TerminalId, continuation: &Continuation, receipt: &TerminalHandoffReceipt,
+) -> Result<(), ProtocolError> {
+    let pending = state.native_sources.entries.get(&id).and_then(|entry| entry.pending_handoff.as_ref())
+        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+        .ok_or_else(|| unavailable("The exact closed return operation changed before publication"))?;
+    let target = pending.returned.as_ref().ok_or_else(|| unavailable("The exact returned resource reservation is unavailable"))?;
+    if !state.native_sources.matches_reservation(&target.reservation)
+        || target.published.as_ref().is_none_or(|(descriptor, worker)| descriptor != &receipt.terminal || worker.execution_instance() != receipt.terminal.execution_instance)
+    { return Err(unavailable("The exact returned worker receipt does not match its reserved operation")); }
+    state.native_sources.entries.get_mut(&id).expect("same lock").pending_handoff = None;
     Ok(())
 }
 

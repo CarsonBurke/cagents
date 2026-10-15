@@ -3504,6 +3504,8 @@ fn process_inner(
                     .as_ref()
                     .and_then(|source| source.transcript_path.clone()),
             };
+            terminal = source_binding::reserve_return_target(host, &mut continuation, terminal)?;
+            let terminal_id = terminal.id;
             // Retain the actor and its execution-only environment until spawn
             // succeeds, so a failed replacement can be retried without falling
             // back to the daemon's credentials or losing the exact identity.
@@ -3577,18 +3579,18 @@ fn process_inner(
                     )
                     .map_err(unavailable)?;
             }
-            let (descriptor, _) = super::state::spawn_terminal_view_owned_at_directory(
-                host,
-                client,
-                terminal,
-                crate::terminal_ipc::TerminalSpawnOptions {
-                    initially_visible: false,
-                    ..Default::default()
-                },
-                Some(handle.execution_environment()),
-                false,
-                execution,
-            )?;
+            let (descriptor, _returned_worker) = match source_binding::prepare_return_attempt(host, chat_id, &continuation, terminal.clone())? {
+                Some(published) => published,
+                None => {
+                    let published = super::state::spawn_terminal_view_owned_at_directory(
+                        host, client, terminal,
+                        crate::terminal_ipc::TerminalSpawnOptions { initially_visible: false, ..Default::default() },
+                        Some(handle.execution_environment()), false, execution,
+                    )?;
+                    source_binding::remember_return_worker(host, chat_id, &continuation, published.0.clone(), published.1.clone())?;
+                    published
+                }
+            };
             let retired = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 // `returning_terminal` marks the record this request stamped while
@@ -3622,8 +3624,9 @@ fn process_inner(
                     expected.clone(),
                     (admitted_binding != expected).then_some(admitted_binding.clone()),
                     descriptor.clone(),
-                    None,
+                    Some(&continuation),
                 )?;
+                source_binding::finish_closed_return(&mut state, chat_id, &continuation, &receipt)?;
                 state.issued_chat_ids.insert(chat_id);
                 let mut record = state.chats.remove(&chat_id);
                 state.chat_restarts.remove(&chat_id);
