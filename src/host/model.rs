@@ -27,7 +27,7 @@ use crate::{
 mod agent_locations;
 mod session_locations;
 pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
-pub(crate) use agent_locations::Location as AgentLocation;
+pub(crate) use agent_locations::{Location as AgentLocation, AgentMove};
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -219,6 +219,15 @@ impl Registry {
     }
 
     pub(crate) fn apply_with_session_moves(&mut self, edit: &ModelEdit, moves: &[SessionMove]) -> Result<Applied, String> {
+        // Direct registry users own no HostState lock. The live host route uses
+        // apply_with_location_moves with evidence prepared outside every lock.
+        let agent_moves = if let ModelEdit::RelocateProject { relocation } = edit {
+            self.agent_relocation_inputs(relocation)?.into_iter().map(|input| input.verify()).collect::<Vec<_>>()
+        } else { Vec::new() };
+        self.apply_with_location_moves(edit, moves, &agent_moves)
+    }
+
+    pub(crate) fn apply_with_location_moves(&mut self, edit: &ModelEdit, moves: &[SessionMove], agent_moves: &[AgentMove]) -> Result<Applied, String> {
         if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
             return Err("Session directory proofs may only accompany their project relocation".into());
         }
@@ -232,7 +241,7 @@ impl Registry {
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
-            ModelEdit::RelocateProject { relocation } => relocation::apply(&transaction, relocation)?,
+            ModelEdit::RelocateProject { relocation } => relocation::apply(&transaction, relocation, agent_moves)?,
             ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }

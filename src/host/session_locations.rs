@@ -56,6 +56,8 @@ pub(super) fn relocate(host: &SharedHost, origin: ClientId, relocation: Relocati
             } else { (source, Owner::Unavailable) }
         }).collect::<Vec<_>>()
     };
+    let agent_inputs = registry.lock().unwrap_or_else(|p| p.into_inner()).agent_relocation_inputs(relocation).map_err(error)?;
+    let agent_moves = agent_inputs.into_iter().map(|input| input.verify()).collect::<Vec<_>>();
     let mut prepared = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
     for (source, owner) in sources {
@@ -93,7 +95,7 @@ pub(super) fn relocate(host: &SharedHost, origin: ClientId, relocation: Relocati
             if !unchanged { return Err(error("A hosted session changed while Locate verified its directory; retry without closing or replacing it")); }
         }
         let moves = prepared.iter().map(|item| item.movement.clone()).collect::<Vec<_>>();
-        state.apply_session_relocation(&edit, &moves)?;
+        state.apply_session_relocation(&edit, &moves, &agent_moves)?;
     }
     // The exclusive gate excludes further edits/starts while actor-local
     // operational paths catch up. Keep any failed actor move explicitly blocked.

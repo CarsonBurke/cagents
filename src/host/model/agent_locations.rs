@@ -12,6 +12,29 @@ pub(crate) struct Location {
     pub blocked_directory: Option<PathBuf>,
 }
 
+/// Snapshot under the registry lock, then verify outside HostState and the
+/// writer transaction. The exact descriptor stays pinned through commit.
+#[derive(Debug)]
+pub(crate) struct RelocationInput {
+    agent: AgentId,
+    previous: Location,
+    approved: Option<DirectoryIdentity>,
+    candidate: PathBuf,
+}
+#[derive(Debug)]
+pub(crate) struct AgentMove {
+    input: RelocationInput,
+    identity: Option<DirectoryIdentity>,
+    _directory: Option<std::sync::Arc<File>>,
+}
+impl RelocationInput {
+    pub(crate) fn verify(self) -> AgentMove {
+        let directory = open_directory(&self.candidate).ok().map(std::sync::Arc::new);
+        let identity = directory.as_ref().and_then(|directory| directory.metadata().ok()).map(|metadata| DirectoryIdentity::from_metadata(&metadata));
+        AgentMove { input: self, identity, _directory: directory }
+    }
+}
+
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS agent_locations (
@@ -59,20 +82,38 @@ pub(super) fn read(db: &Connection, agent: &Agent) -> Result<Location, String> {
     db.query_row("SELECT repository,directory,blocked_directory FROM agent_locations WHERE agent=?1", [agent.id.to_string()], |row| Ok(Location { repository: PathBuf::from(row.get::<_,String>(0)?), directory: PathBuf::from(row.get::<_,String>(1)?), blocked_directory: row.get::<_,Option<String>>(2)?.map(PathBuf::from) })).optional().map_err(|error| error.to_string()).map(|location| location.unwrap_or_else(|| Location { repository: agent.spec.target.repository.clone(), directory: agent.spec.target.directory.clone(), blocked_directory: None }))
 }
 
-pub(super) fn relocate(db: &Connection, agent: &Agent, relocation: &Relocation) -> Result<bool, String> {
+pub(super) fn relocate(db: &Connection, agent: &Agent, relocation: &Relocation, moves: &[AgentMove]) -> Result<bool, String> {
     let previous = read(db, agent)?;
     if previous.repository != relocation.repository { return Ok(false); }
     insert(db, agent)?;
     let candidate = relocation.mapped(previous.blocked_directory.as_deref().unwrap_or(&previous.directory));
     let approved: Option<String> = db.query_row("SELECT directory FROM agent_policies WHERE agent=?1", [agent.id.to_string()], |row| row.get(0)).optional().map_err(|error| error.to_string())?.flatten();
     let approved = approved.map(|value| decode::<DirectoryIdentity>(&value)).transpose()?;
-    let verified = approved.is_some_and(|approved| open_directory(&candidate).and_then(|directory| directory.metadata()).is_ok_and(|metadata| DirectoryIdentity::from_metadata(&metadata) == approved));
-    let (directory, blocked) = if verified { (candidate, None) } else { (previous.directory, Some(candidate)) };
+    let verified = moves.iter().find(|movement| movement.input.agent == agent.id).is_some_and(|movement| {
+        movement.input.previous == previous && movement.input.candidate == candidate
+            && movement.input.approved.is_none_or(|expected| approved == Some(expected))
+            && approved.is_some() && movement.identity == approved
+    });
+    // No new authority is needed when an external worktree did not move.
+    let unchanged = previous.blocked_directory.is_none() && candidate == previous.directory;
+    let (directory, blocked) = if verified || unchanged { (candidate, None) } else { (previous.directory, Some(candidate)) };
     db.execute("UPDATE agent_locations SET repository=?2,directory=?3,blocked_directory=?4 WHERE agent=?1", params![agent.id.to_string(), repository_key(&relocation.destination)?, repository_key(&directory)?, blocked.as_deref().map(repository_key).transpose()?]).map_err(|error| error.to_string())?;
     Ok(true)
 }
 
 impl Registry {
+    /// Database-only snapshot. Caller releases all host/registry locks before
+    /// invoking RelocationInput::verify for each candidate.
+    pub(crate) fn agent_relocation_inputs(&self, relocation: &Relocation) -> Result<Vec<RelocationInput>, String> {
+        let mut inputs = Vec::new();
+        for agent in self.agents(None)? {
+            let previous = read(&self.db, &agent)?;
+            if previous.repository != relocation.repository { continue; }
+            let candidate = relocation.mapped(previous.blocked_directory.as_deref().unwrap_or(&previous.directory));
+            inputs.push(RelocationInput { agent: agent.id, approved: self.agent_directory(agent.id)?, previous, candidate });
+        }
+        Ok(inputs)
+    }
     pub(crate) fn retained_agent_execution_directory(&self, retained: &[crate::agent_execution::HostedSession]) -> Result<Option<PathBuf>, String> {
         // The existing source-lineage check is required before resolving any
         // operational path for an adopted holder.
@@ -173,6 +214,23 @@ mod tests {
         let before = registry.agents(None).unwrap().len();
         assert!(registry.submit_agent_with_directory(&Origin::User, &racing, None, Some(pinned), 2).unwrap_err().contains("changed during acceptance"));
         assert_eq!(registry.agents(None).unwrap().len(), before);
+    }
+
+    #[test]
+    fn prepared_inode_evidence_cannot_authorize_a_later_path_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let old = fixture.path().join("old"); std::fs::create_dir(&old).unwrap();
+        let mut registry = Registry::at(&fixture.path().join("registry.sqlite3")).unwrap();
+        let accepted = accepted(&mut registry, &old, "original");
+        let moved = fixture.path().join("moved"); std::fs::rename(&old, &moved).unwrap();
+        let relocation = Relocation { repository: old.clone(), destination: moved.clone(), old_root: old, new_root: moved.clone() };
+        let evidence = registry.agent_relocation_inputs(&relocation).unwrap().into_iter().map(RelocationInput::verify).collect::<Vec<_>>();
+        assert!(evidence[0]._directory.is_some());
+        std::fs::rename(&moved, fixture.path().join("actual-approved-inode")).unwrap();
+        std::fs::create_dir(&moved).unwrap();
+        registry.apply_with_location_moves(&ModelEdit::RelocateProject { relocation }, &[], &evidence).unwrap();
+        assert!(registry.agent_execution_directory(accepted.agent.id).unwrap_err().contains("replaced"));
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().spec, accepted.agent.spec);
     }
 
     #[test]
