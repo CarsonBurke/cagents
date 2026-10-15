@@ -48,10 +48,12 @@ impl Inputs {
     pub(super) fn discard_undispatched(&mut self,uuid:&str){
         self.proofs.cancel(uuid);self.pending.retain(|(id,_)|id!=uuid);
     }
-    pub(super) fn observe(&mut self,frame:&Value,step:&mut Step) {
+    pub(super) fn observe(&mut self,frame:&Value,step:&mut Step,native_session:Option<&str>) {
         if frame["type"]=="conversation_reset"{*self=Self::default();return;}
-        if !frame["parent_tool_use_id"].is_null(){return;}
-        if let Some(session)=frame["session_id"].as_str(){
+        if frame["type"]=="prompt_suggestion" || !frame["parent_tool_use_id"].is_null(){return;}
+        // Only the main decoder can establish native session authority. An
+        // optional suggestion or unrelated frame cannot seed this context.
+        if let Some(session)=native_session {
             if !crate::chat::protocol::input_proof::valid_id(session){return;}
             if self.confirmed.as_deref().is_some_and(|known|known!=session){return;}
             self.confirmed=Some(session.into());
@@ -98,6 +100,29 @@ mod tests {
         }
     }
     #[test]
+    fn suggestion_before_first_session_cannot_poison_accepted_input_authority(){
+        let mut adapter=adapter();
+        adapter.receive(json!({"type":"prompt_suggestion","session_id":"wrong-prediction-session","suggestion":"optional"})).unwrap();
+        assert!(adapter.session_id.is_none());
+        assert!(adapter.turn_inputs.confirmed.is_none());
+        let sent=adapter.command(prompt(PromptMode::Send)).unwrap();let uuid=sent.writes[0]["uuid"].as_str().unwrap();
+        assert!(bindings(&adapter.receive(echo(uuid)).unwrap()).is_empty());
+        let step=adapter.receive(fate(uuid,"started")).unwrap();
+        assert_eq!(bindings(&step)[0].session_id,SESSION);
+    }
+    #[test]
+    fn suggestion_cannot_supply_missing_session_authority_to_proof_frames(){
+        let mut adapter=adapter();
+        adapter.receive(json!({"type":"prompt_suggestion","session_id":SESSION,"suggestion":"optional"})).unwrap();
+        let sent=adapter.command(prompt(PromptMode::Send)).unwrap();let uuid=sent.writes[0]["uuid"].as_str().unwrap();
+        let mut user=echo(uuid);user.as_object_mut().unwrap().remove("session_id");
+        let mut started=fate(uuid,"started");started.as_object_mut().unwrap().remove("session_id");
+        assert!(bindings(&adapter.receive(user).unwrap()).is_empty());
+        assert!(bindings(&adapter.receive(started).unwrap()).is_empty());
+        assert!(adapter.session_id.is_none());
+        assert!(adapter.turn_inputs.confirmed.is_none());
+    }
+    #[test]
     fn queued_identical_inputs_keep_distinct_accepted_identity(){
         let mut adapter=adapter();let a=adapter.command(prompt(PromptMode::Queue)).unwrap();let b=adapter.command(prompt(PromptMode::Queue)).unwrap();let a=a.writes[0]["uuid"].as_str().unwrap();let b=b.writes[0]["uuid"].as_str().unwrap();assert_ne!(a,b);
         assert!(bindings(&adapter.receive(echo(a)).unwrap()).is_empty());assert!(bindings(&adapter.receive(echo(b)).unwrap()).is_empty());
@@ -112,6 +137,6 @@ mod tests {
     }
     #[test]
     fn never_dispatched_input_and_local_settlement_cannot_bind_prior_input(){
-        let mut inputs=Inputs::default();inputs.submit("held",&[]);inputs.discard_undispatched("held");let mut step=Step{events:vec![Event::TurnSettled,Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled}],..Step::default()};inputs.observe(&fate("held","started"),&mut step);inputs.observe(&echo("held"),&mut step);assert!(bindings(&step).is_empty());
+        let mut inputs=Inputs::default();inputs.submit("held",&[]);inputs.discard_undispatched("held");let mut step=Step{events:vec![Event::TurnSettled,Event::TurnFinished{key:None,outcome:crate::notifications::Kind::Cancelled}],..Step::default()};inputs.observe(&fate("held","started"),&mut step,None);inputs.observe(&echo("held"),&mut step,None);assert!(bindings(&step).is_empty());
     }
 }

@@ -2634,7 +2634,7 @@ impl Adapter for Claude {
                 *message = super::preview(message.as_bytes(), 1024);
             }
         }
-        self.turn_inputs.observe(&frame,&mut step);
+        self.turn_inputs.observe(&frame,&mut step,self.session_id.as_deref());
         Ok(step)
     }
 }
