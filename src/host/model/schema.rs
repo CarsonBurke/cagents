@@ -105,6 +105,20 @@ fn check_readonly_for(db: &Connection, supported: u32) -> Result<(), String> {
     automation_extensions_schema::validate(db,current)
 }
 
+/// A previously opened Registry is not write admission. Every future-domain
+/// mutation rechecks the exact current checkpoint/layout under its own writer
+/// transaction, so another connection cannot move it past this binary's cap.
+/// This never migrates or repairs a predecessor, and cannot be called with an
+/// autocommit Connection in place of the transaction that owns the mutation.
+pub(super) fn require_current_write(tx:&rusqlite::Transaction<'_>)->Result<(),String> {
+    let current=version(tx)?;
+    if current!=SCHEMA_VERSION {
+        return Err(format!("Workspace registry schema {current} is not this writer's required checkpoint {SCHEMA_VERSION}; recover the matching store before retrying the original operation"));
+    }
+    validate_selected(tx,current)?;
+    automation_extensions_schema::validate(tx,current)
+}
+
 #[cfg(test)]
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     migrate_after_read(db, || Ok(()))
@@ -457,6 +471,29 @@ mod tests {
         assert!(!before.1.is_empty(), "fixture requires an actual hot rollback journal");
         assert!(Registry::at(&path).is_err());
         assert_eq!((image(&path), image(&journal)), before);
+    }
+
+    #[test]
+    fn retained_writer_refuses_future_or_partial_schema_before_mutating_original_rows() {
+        for future in [false,true] {
+            let directory=tempfile::tempdir().unwrap();let path=directory.path().join("registry.sqlite3");
+            let mut registry=Registry::at(&path).unwrap();
+            registry.db.execute("INSERT INTO projects(repository,name,ordinal,kind) VALUES('/retained','original pending operation',1,'folder')",[]).unwrap();
+            let other=Connection::open(&path).unwrap();
+            if future {other.pragma_update(None,"user_version",20).unwrap();}
+            else {other.execute_batch("DROP INDEX created_start_requirements_card_phase").unwrap();}
+            let before=stored_contents(&registry.db);
+            let tx=registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+            let guarded=(||->Result<(),String>{
+                require_current_write(&tx)?;
+                tx.execute("UPDATE projects SET name='must never be published by the old writer'",[]).map_err(|error|error.to_string())?;
+                Ok(())
+            })();
+            assert!(guarded.is_err(),"the retained handle must re-admit its actual write transaction");
+            drop(tx);
+            assert_eq!(stored_contents(&registry.db),before);
+            assert_eq!(version(&registry.db).unwrap(),if future{20}else{SCHEMA_VERSION});
+        }
     }
 
     #[test]
