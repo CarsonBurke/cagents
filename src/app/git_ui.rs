@@ -3303,35 +3303,43 @@ mod tests {
         const TEST: &str = "app::git_ui::tests::repository_reload_preserves_newer_status_failures_and_clears_older_failures";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
         for newer_failure in [false, true] {
-            for bound_first in [false, true] {
-                let directory = tempfile::tempdir().unwrap();
-                let root = directory.path().join("repository");
-                let baseline = fixture(&root);
-                let key = ActiveWorktreeKey { project_id: ProjectId::new(),
-                    worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
-                let mut app = app_with_status_snapshot(baseline, &key);
-                app.active_workspace = Some(root.clone());
-                app.sidebar_state.sync_active_worktree(&app.sidebar_model,
-                    &SidebarFocus::Repository { worktree: root.clone() });
-                let index = root.join(".git/index");
-                let original = fs::read(&index).unwrap();
-                if !newer_failure { fs::write(&index, "broken index").unwrap(); }
-                app.repository_generations.insert(key.project_id, 10);
-                let loaded = super::super::tests::task_app_message(app.repository_read_task(
-                    root.clone(), key.project_id, 10, false, Some(ProjectKind::Git)));
-                if newer_failure { fs::write(&index, "broken index").unwrap(); }
-                else { fs::write(&index, original).unwrap(); fs::write(root.join("new.txt"), "new\n").unwrap(); }
-                let bound = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
-                if newer_failure {
-                    assert!(matches!(&bound, Message::SourceControlLoaded { result: Err(failure), .. } if failure.status_read.is_some()));
-                } else { assert!(matches!(&bound, Message::SourceControlLoaded { result: Ok(_), .. })); }
-                for message in if bound_first { [bound, loaded] } else { [loaded, bound] } { drop(app.update(message)); }
-                let row = &app.sidebar_model.projects[0].worktrees[0];
-                assert_eq!(row.status_error.is_some(), newer_failure);
-                let entry = &app.refresh_ui.git.entries[&key.project_id];
-                assert_eq!(entry.snapshot.status_errors.contains_key(&key.worktree_id), newer_failure);
-                assert_eq!(entry.failed_status_attempts.contains_key(&key.worktree_id), newer_failure);
-                if !newer_failure { assert_eq!(row.dirty.as_ref().unwrap().untracked, 1); }
+            for bound_sample_first in [false, true] {
+                for bound_first in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let root = directory.path().join("repository");
+                    let baseline = fixture(&root);
+                    let key = ActiveWorktreeKey { project_id: ProjectId::new(),
+                        worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+                    let mut app = app_with_status_snapshot(baseline, &key);
+                    app.active_workspace = Some(root.clone());
+                    app.sidebar_state.sync_active_worktree(&app.sidebar_model,
+                        &SidebarFocus::Repository { worktree: root.clone() });
+                    let index = root.join(".git/index");
+                    let original = fs::read(&index).unwrap();
+                    if !newer_failure { fs::write(&index, "broken index").unwrap(); }
+                    app.repository_generations.insert(key.project_id, 10);
+                    let mut load = Some(app.repository_read_task(root.clone(), key.project_id, 10, false, Some(ProjectKind::Git)));
+                    let first = if bound_sample_first {
+                        super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
+                    } else { super::super::tests::task_app_message(load.take().unwrap()) };
+                    if newer_failure { fs::write(&index, "broken index").unwrap(); }
+                    else { fs::write(&index, original).unwrap(); fs::write(root.join("new.txt"), "new\n").unwrap(); }
+                    let second = if bound_sample_first { super::super::tests::task_app_message(load.take().unwrap()) }
+                        else { super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone())) };
+                    let (bound, loaded) = if bound_sample_first { (first, second) } else { (second, first) };
+                    let bound_failed = if bound_sample_first { !newer_failure } else { newer_failure };
+                    if bound_failed {
+                        assert!(matches!(&bound, Message::SourceControlLoaded { result: Err(failure), .. } if failure.status_read.is_some()));
+                    } else { assert!(matches!(&bound, Message::SourceControlLoaded { result: Ok(_), .. })); }
+                    for message in if bound_first { [bound, loaded] } else { [loaded, bound] } { drop(app.update(message)); }
+                    let row = &app.sidebar_model.projects[0].worktrees[0];
+                    assert_eq!(row.status_error.is_some(), newer_failure);
+                    assert!(row.dirty.is_some(), "failure retains last-known scalar counts");
+                    let entry = &app.refresh_ui.git.entries[&key.project_id];
+                    assert_eq!(entry.snapshot.status_errors.contains_key(&key.worktree_id), newer_failure);
+                    assert_eq!(entry.failed_status_attempts.contains_key(&key.worktree_id), newer_failure);
+                    if !newer_failure { assert_eq!(row.dirty.as_ref().unwrap().untracked, 1); }
+                }
             }
         }
     }
