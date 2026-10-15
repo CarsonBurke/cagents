@@ -552,10 +552,10 @@ mod tests {
         let foreign = named.join(original_holding.file_name().unwrap()); fs::create_dir(&foreign).unwrap();
         fs::write(foreign.join("foreign"), "preserve").unwrap();
         assert!(authority.retry().is_err()); assert!(!authority.is_resolved());
-        fs::remove_file(moved.join(original_holding.file_name().unwrap()).join("unknown")).unwrap();
+        fs::remove_file(original_holding.join("unknown")).unwrap();
         authority.retry().unwrap(); assert!(authority.is_resolved());
         assert_eq!(fs::read_to_string(foreign.join("foreign")).unwrap(), "preserve");
-        assert!(!moved.join(original_holding.file_name().unwrap()).exists());
+        assert!(!original_holding.exists());
     }
 
     #[test]
@@ -580,12 +580,12 @@ mod tests {
     }
 
     #[test]
-    fn presence_shared_nested_parent_refuses_before_any_acquisition() {
+    fn legacy_presence_shared_source_refuses_without_registered_placement() {
         let directory = tempfile::tempdir().unwrap(); fs::create_dir(directory.path().join("shared")).unwrap();
         fs::set_permissions(directory.path().join("shared"), Permissions::from_mode(0o777)).unwrap();
         fs::write(directory.path().join("shared/file"), "original").unwrap();
         let root = Root::open(directory.path()).unwrap();
-        assert!(save_document_file_at(&root, Path::new("shared/file"), "", blake3::hash(b"original"), false, removal()).is_err());
+        assert!(super::save_document_file_at(&root, Path::new("shared/file"), "", blake3::hash(b"original"), false, removal()).is_err());
         assert_eq!(fs::read_to_string(directory.path().join("shared/file")).unwrap(), "original");
         assert_eq!(fs::read_dir(directory.path().join("shared")).unwrap().count(), 1);
     }
@@ -617,20 +617,22 @@ mod tests {
     fn editor_file_presence_cleanup_preserves_a_replacement_holding_directory() {
         let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
         fs::write(directory.path().join("file"), "original").unwrap();
+        let context = crate::filesystem_recovery_context::fixture_context(&root).unwrap();
+        let outside = context.placement().directory();
         let mut replaced = None;
-        let result = remove_document_file(&root, &root, std::ffi::OsStr::new("file"), blake3::hash(b"original"), Some(0o100644), || {
-            let holding = fs::read_dir(directory.path())?.filter_map(Result::ok)
+        let result = replace_or_remove_document_file_in_context(&root, &root, std::ffi::OsStr::new("file"), blake3::hash(b"original"), Some(0o100644), || {
+            let holding = fs::read_dir(outside.path())?.filter_map(Result::ok)
                 .find(|entry| entry.file_name().to_string_lossy().starts_with(".cagents-editor-")).unwrap().path();
-            fs::rename(&holding, directory.path().join("original-holding"))?;
+            fs::rename(&holding, outside.path().join("original-holding"))?;
             fs::create_dir(&holding)?; fs::set_permissions(&holding, Permissions::from_mode(0o711))?;
             fs::write(holding.join("foreign"), "preserve replacement")?;
             replaced = Some(holding); Ok(())
-        }).unwrap();
+        }, None, &context).unwrap();
         assert!(matches!(result, SaveOutcome::Absent { durability: SaveDurability::Recovery { .. }, .. }));
         let replaced = replaced.unwrap();
         assert_eq!(fs::read_to_string(replaced.join("foreign")).unwrap(), "preserve replacement");
         assert_eq!(fs::metadata(&replaced).unwrap().mode() & 0o777, 0o711);
-        assert_eq!(fs::metadata(directory.path().join("original-holding")).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(outside.path().join("original-holding")).unwrap().mode() & 0o777, 0o700);
         assert!(!directory.path().join("file").exists());
     }
 
@@ -669,11 +671,11 @@ mod tests {
     }
 
     #[test]
-    fn editor_file_presence_refuses_unverified_top_level_holding_before_removal() {
+    fn legacy_presence_top_level_refuses_without_registered_placement() {
         let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
         fs::write(directory.path().join("file"), "contents").unwrap();
         fs::set_permissions(directory.path(), Permissions::from_mode(0o777)).unwrap();
-        assert!(save_document_file_at(&root, Path::new("file"), "", blake3::hash(b"contents"), false, removal()).is_err());
+        assert!(super::save_document_file_at(&root, Path::new("file"), "", blake3::hash(b"contents"), false, removal()).is_err());
         assert_eq!(fs::read_to_string(directory.path().join("file")).unwrap(), "contents");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
     }
@@ -921,14 +923,16 @@ mod tests {
         fs::write(root.join("new.txt"), "synthetic beta").unwrap();
         fs::set_permissions(root.join("new.txt"), Permissions::from_mode(0o644)).unwrap();
         let held_root = Root::open(root).unwrap();
-        let outcome = replace_or_remove_document_file(
+        let context = crate::filesystem_recovery_context::fixture_context(&held_root).unwrap();
+        let outside = context.placement().directory();
+        let outcome = replace_or_remove_document_file_in_context(
             &held_root,
             &held_root,
             std::ffi::OsStr::new("new.txt"),
             blake3::hash(b"synthetic beta"),
             None,
             || {
-                let holding = fs::read_dir(root)?
+                let holding = fs::read_dir(outside.path())?
                     .find_map(|entry| {
                         let entry = entry.ok()?;
                         entry
@@ -941,6 +945,7 @@ mod tests {
                 fs::write(holding.join("cleanup-probe"), b"retain directory")
             },
             Some((&restoration, "synthetic alpha")),
+            &context,
         )
         .unwrap();
         let SaveOutcome::Saved {
@@ -960,7 +965,7 @@ mod tests {
             fs::metadata(root.join("new.txt")).unwrap().mode() & 0o777,
             0o600
         );
-        let holding = fs::read_dir(root)
+        let holding = fs::read_dir(outside.path())
             .unwrap()
             .filter_map(Result::ok)
             .find(|entry| {
