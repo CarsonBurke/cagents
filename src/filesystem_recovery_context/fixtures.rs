@@ -53,6 +53,7 @@ pub(crate) fn fixture_context_with_guard(source: &Root, guard: impl Send + Sync 
 }
 
 #[test]
+#[cfg(target_os = "linux")]
 fn fixture_owns_real_enrollment_and_cleanup_lease() {
     let source = tempfile::tempdir().unwrap();
     let source = Root::open(source.path()).unwrap();
