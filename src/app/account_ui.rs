@@ -334,6 +334,15 @@ impl State {
         self.accounts.iter().find(|account| &account.id == id)
     }
 
+    pub(super) fn account_label(&self, id: &AccountId) -> Option<String> {
+        self.account(id).map(|state| self.display_name(state))
+    }
+
+    pub(super) fn needs_alternate(&self, id: &AccountId) -> bool {
+        self.account(id).is_some_and(|state| state.snapshot.as_ref().is_some_and(|snapshot|
+            account::routing::needs_alternate_for(&state.account, snapshot, now_ms())))
+    }
+
     fn account_mut(&mut self, id: &AccountId) -> Option<&mut AccountState> {
         self.accounts.iter_mut().find(|account| &account.id == id)
     }
@@ -1890,6 +1899,21 @@ impl Cagents {
         })
     }
 
+    /// A routing refresh can finish after a newer discovery request. Adopt
+    /// only newer usage for the current account-home keys; it has no authority
+    /// to replace installation, presence, defaults or registry observations.
+    pub(super) fn adopt_routing_accounts(&mut self, snapshot: crate::device_service::AccountSnapshot) {
+        let restored = self.account_ui.accounts.iter().filter_map(|state| {
+            let key = state.account.cache_key()?;
+            if snapshot.cache_keys.get(&state.id) != Some(&key) { return None; }
+            Some(Restored { id: state.id.clone(), present: state.present,
+                entry: snapshot.entries.get(&key).cloned() })
+        }).collect();
+        self.account_ui.restore(restored);
+        for (provider, catalog) in snapshot.catalogs { self.account_ui.take_catalog(provider, catalog); }
+        self.refresh_chat_drafts();
+    }
+
     /// Reads the registry again, for what another window changed.
     pub(super) fn reload_registry(&mut self) -> Task<Message> {
         if crate::device::is_remote() {
@@ -2683,16 +2707,17 @@ impl Cagents {
                         .map(|project| (project.id, project.repository.clone()))
                         .collect::<Vec<_>>();
                     let migrate = registry.migrate_project_ids(&projects);
-                    let before = self.account_ui.accounts.len();
+                    let before: Vec<_> = self.account_ui.accounts.iter().map(|state| state.account.clone()).collect();
                     self.account_ui.set_registry(registry);
                     for id in std::mem::take(&mut self.account_ui.login_changes_unconfirmed) {
                         self.report_login_change(&id);
                     }
-                    let probe = if self.account_ui.accounts.len() != before {
-                        self.probe_accounts(Trigger::Focus)
-                    } else {
-                        Task::none()
-                    };
+                    let changed = self.account_ui.accounts.iter().map(|state| &state.account).ne(before.iter());
+                    let probe = if changed {
+                        // A locate already in flight captured the previous set
+                        // of homes. Supersede it before asking about new IDs.
+                        Task::batch([self.locate_accounts(), self.probe_accounts(Trigger::Focus)])
+                    } else { Task::none() };
                     let save = if migrate {
                         self.save_registry(move |registry| {
                             registry.migrate_project_ids(&projects);
@@ -5595,6 +5620,61 @@ mod tests {
         ready.entries.insert("codex:remote-fixture".into(), Entry { identity: Some(Identity::default()), snapshot: UsageSnapshot::state(UsageStatus::Ok, "", now_ms()) });
         drop(app.update(Message::AccountUi(Action::RemoteLoaded(generation, Ok(ready)))));
         assert_eq!(app.account_ui.account_readiness(&id), ProviderReadiness::Ready(id));
+    }
+
+    #[test]
+    fn external_registry_home_changes_supersede_earlier_discovery() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 994);
+        drop(app.locate_accounts());
+        let earlier = app.account_ui.discovery_generation;
+        let mut registry = app.account_ui.registry.clone();
+        registry.unregister(uuid::Uuid::from_u128(994));
+        registry.register(registry::Registered { key: uuid::Uuid::from_u128(994),
+            provider: Provider::Claude, linked_home: Some("/new/external/home".into()), label: None,
+            email: Some("moved@fixture.invalid".into()), organization: None, added_at: 0 }, &[]).unwrap();
+        drop(app.update(Message::AccountUi(Action::RegistryLoaded(Ok(registry)))));
+        assert_eq!(app.account_ui.discovery_generation, earlier + 1);
+        drop(app.update(Message::AccountUi(Action::Located { generation: earlier,
+            installed: BTreeMap::from([(Provider::Claude, true)]),
+            restored: vec![Restored { id: id.clone(), present: true, entry: None }] })));
+        assert_eq!(app.account_ui.account(&id).unwrap().account.resolved_home().unwrap(), PathBuf::from("/new/external/home"));
+        assert!(app.account_ui.installed.is_empty(), "the old captured account set cannot publish detection");
+    }
+
+    #[test]
+    fn routing_snapshot_adopts_only_newer_usage_for_the_current_home() {
+        let mut app = context_inspector_test_app(false);
+        let id = app.account_ui.add_managed_fixture(Provider::Claude, 995);
+        app.account_ui.installed.insert(Provider::Claude, true);
+        app.account_ui.discovery_generation = 17;
+        let key = app.account_ui.account(&id).unwrap().account.cache_key().unwrap();
+        let now = now_ms();
+        app.account_ui.account_mut(&id).unwrap().snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "current", now));
+        let registry = app.account_ui.registry.clone();
+        let mut snapshot = crate::device_service::AccountSnapshot {
+            registry: Registry::default(), homes: None,
+            system_homes: BTreeMap::from([(Provider::Claude, "/stale/remote/home".into())]),
+            entries: BTreeMap::from([(key.clone(), Entry { identity: Some(Identity::default()),
+                snapshot: UsageSnapshot::state(UsageStatus::Limited, "fresh daemon report", now + 1) })]),
+            cache_keys: BTreeMap::from([(id.clone(), key.clone())]), catalogs: Default::default(),
+            installed: BTreeMap::from([(Provider::Claude, false)]), present: Default::default(),
+        };
+        app.adopt_routing_accounts(snapshot.clone());
+        assert_eq!(app.account_ui.registry, registry);
+        assert_eq!(app.account_ui.discovery_generation, 17);
+        assert_eq!(app.account_ui.installed.get(&Provider::Claude), Some(&true));
+        assert!(app.account_ui.account(&id).unwrap().present);
+        assert!(app.account_ui.remote_system_homes.is_empty());
+        assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status, UsageStatus::Limited);
+        snapshot.entries.get_mut(&key).unwrap().snapshot = UsageSnapshot::state(UsageStatus::Ok, "old probe", now);
+        app.adopt_routing_accounts(snapshot.clone());
+        assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status, UsageStatus::Limited);
+        snapshot.entries.get_mut(&key).unwrap().snapshot.observed_at = now + 2;
+        snapshot.cache_keys.insert(id.clone(), "claude:/different/home".into());
+        app.adopt_routing_accounts(snapshot);
+        assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status, UsageStatus::Limited,
+            "a routing result for an old selected home must not become this home's allowance");
     }
 
     #[test]

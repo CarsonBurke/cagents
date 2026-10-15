@@ -1145,7 +1145,7 @@ impl Handle {
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
     }
-    /// A completed, joined source has no command race. Retain its last
+    /// A completed source has no further actor publications. Retain its last
     /// actor-published controls when its approved directory pin can be handed on.
     pub(crate) fn completed_account_options(&self) -> Option<AccountSwitchOptions> {
         self.is_completed().then(|| AccountSwitchOptions::capture(

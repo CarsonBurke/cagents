@@ -217,7 +217,7 @@ impl Monitor {
                                     ).is_some()
                                         || record.session.launch.environment.contains_key(crate::account::SELECTION_MARKER)
                                         || record.session.launch.environment.contains_key(crate::account::routing::AUTOMATIC_MARKER)
-                                        || crate::account::is_sign_in(&record.session.launch))
+                                        || record.session.launch.environment.contains_key(crate::account::SIGN_IN_MARKER))
                             })
                     };
                     drop(host);

@@ -3768,11 +3768,7 @@ impl Cagents {
             .get(settings::agents::provider_key(account.provider))
             .cloned()
             .unwrap_or_default();
-        let account_name = self
-            .account_ui
-            .account(&id)
-            .map(|state| self.account_ui.display_name(state))
-            .unwrap_or_else(|| id.to_string());
+        let account_name = self.account_ui.account_label(&id).unwrap_or_else(|| id.to_string());
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -7282,21 +7278,17 @@ impl Cagents {
                         return Task::none();
                     }
                 };
-                let adopted =
-                    self.update_account_ui(super::account_ui::Action::RemoteLoaded(Ok(snapshot)));
+                self.adopt_routing_accounts(snapshot);
                 if self
                     .automatic_chat_account(target, PromptMode::Send)
                     .is_some()
                 {
-                    return Task::batch([
-                        adopted,
-                        self.handle_chat_ui(Action::Submit(target, PromptMode::Send)),
-                    ]);
+                    return self.handle_chat_ui(Action::Submit(target, PromptMode::Send));
                 }
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.error = Some("No alternate account has fresh signed-in allowance. Your message is still unsent; sign in or refresh Accounts and try again.".into());
                 }
-                return adopted;
+                return Task::none();
             }
             Action::Submit(target, mode) => {
                 if let Some((account, generation, revision)) =
@@ -7347,15 +7339,7 @@ impl Cagents {
                                 runtime.session.launch.provider,
                                 &runtime.session.launch.recipe,
                             )?;
-                            let current = self.account_ui.account(&id)?;
-                            current.snapshot.as_ref().filter(|snapshot| {
-                                account::routing::needs_alternate_for(
-                                    &current.account,
-                                    snapshot,
-                                    now_ms(),
-                                )
-                            })?;
-                            Some((id, runtime.revision))
+                            self.account_ui.needs_alternate(&id).then_some((id, runtime.revision))
                         }
                         _ => None,
                     })
