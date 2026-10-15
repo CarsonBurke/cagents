@@ -4708,6 +4708,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// depend on arbitrary external state, so keep their existing full reads.
     fn numstat_policy(&self, worktree: &Path, cancellation: &CancellationToken) -> Result<NumstatPolicy, RepositoryError> {
         let mut policy = NumstatPolicy { attributes: Vec::new(), reusable: true, reconcile_unchanged: false };
+        if std::env::var_os("GIT_REPLACE_REF_BASE").is_some_and(|prefix| !prefix.is_empty() && prefix != "refs/replace/") {
+            // Custom bases can be opaque namespaces or prefixes without a
+            // directory boundary. Do not depend on ordinary refs/ watches.
+            policy.reusable = false; policy.reconcile_unchanged = true;
+        }
         for variable in ["GIT_ATTR_SYSTEM", "GIT_ATTR_GLOBAL"] {
             let output = self.run(&self.git_read(worktree, ["var", variable]), cancellation)?;
             // Older Git cannot expose the installation's attribute paths.
@@ -9151,6 +9156,21 @@ mod tests {
             let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
             assert_eq!(counts.len(), 2, "semantic attribute changes still invalidate every measured basis");
             assert!(counts.iter().all(|command| !command.arguments.iter().any(|arg| arg == "--")));
+        }
+
+        #[test]
+        fn cached_numstat_custom_replacement_prefix_reconciles_in_isolated_process() {
+            const CHILD: &str = "CAGENTS_NUMSTAT_REPLACEMENT_TEST_CHILD";
+            if std::env::var_os(CHILD).is_some() {
+                cached_numstat_observes_loose_and_packed_replacement_objects();
+                return;
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "repository::tests::git_contracts::cached_numstat_custom_replacement_prefix_reconciles_in_isolated_process", "--nocapture"])
+                .env(CHILD, "1").env("GIT_REPLACE_REF_BASE", "refs/replacement-")
+                .env_remove("GIT_NO_REPLACE_OBJECTS").output().unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.status.success() && stdout.contains("1 passed"), "replacement namespace child failed: {stdout}\n{}", String::from_utf8_lossy(&output.stderr));
         }
 
         #[test]
