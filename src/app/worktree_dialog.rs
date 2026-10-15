@@ -823,6 +823,7 @@ mod tests {
 
     fn request(id: OperationId) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
+            setup_intent: None,
             repository: "/repo".into(),
             managed_root: "/".into(),
             destination: "/one".into(),
