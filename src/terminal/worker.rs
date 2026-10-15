@@ -459,7 +459,10 @@ impl PublishedState {
         let order=self.input_order.lock().unwrap_or_else(|p|p.into_inner());
         let revision=order.close_revision;
         if self.completed.load(Ordering::Acquire) { return Ok((revision,false)); }
-        if order.closing || order.handoff { return Err("Terminal ownership is changing; refresh its census after it settles".into()); }
+        if order.handoff { return Err("Terminal ownership is changing; refresh its census after it settles".into()); }
+        // An admitted stop keeps the same worker authority. Expose it as
+        // needing attention so failed cleanup can be explicitly retried.
+        if order.closing {return Ok((revision,true));}
         drop(order);
         // Unknown activity needs explicit attention, including a shell builtin
         // with no child process. This advisory sample is never an idle proof:
@@ -1283,9 +1286,10 @@ impl TerminalHandle {
     /// this exact worker, then publish its internal stop control. No cleanup
     /// wait or process inspection occurs while the caller holds admission.
     pub(crate) fn fence_session_stop(&self, instance: uuid::Uuid, deadline: std::time::Instant) -> Result<TerminalSessionStop, String> {
+        if std::time::Instant::now()>=deadline {return Err("Terminal stop admission deadline expired".into());}
         let published = &self.inner.published;
-        let phase = published.archive.lock().unwrap_or_else(|p|p.into_inner());
-        let mut order = published.input_order.lock().unwrap_or_else(|p|p.into_inner());
+        let phase = published.archive.try_lock().map_err(|_|"Terminal archive admission is busy; retain its owner and retry".to_string())?;
+        let mut order = published.input_order.try_lock().map_err(|_|"Terminal input admission is busy; retain its owner and retry".to_string())?;
         if published.execution_instance != instance {
             return Err("The terminal worker was replaced; its replacement was preserved".into());
         }
@@ -1293,14 +1297,17 @@ impl TerminalHandle {
             return Err("Terminal ownership is changing; refresh before stopping it".into());
         }
         let (reply, result) = crossbeam_channel::bounded(1);
-        if published.completed.load(Ordering::Acquire) {
+        if published.completed.load(Ordering::Acquire) || order.closing && matches!(*phase,ArchivePhase::Frozen {..}) {
+            // A previous exact stop may have reached archived ownership but
+            // failed independent holder cleanup. Finish reconciles that same
+            // retained holder; this internal reply alone never proves cleanup.
             order.closing = true;
             let _ = reply.send(super::ipc::TerminalCloseResult::Closed);
         } else {
             if !matches!(*phase, ArchivePhase::Live) {
                 return Err("Terminal ownership is not live or confirmed complete".into());
             }
-            let mut priority = published.priority_close.lock().unwrap_or_else(|p|p.into_inner());
+            let mut priority = published.priority_close.try_lock().map_err(|_|"Terminal stop publication is busy; retain its owner and retry".to_string())?;
             if priority.is_some() { return Err("A terminal close is already pending; refresh after it settles".into()); }
             order.closing = true;
             *priority = Some(Command::StopSession {instance, deadline, reply});
@@ -6603,6 +6610,15 @@ mod tests {
         assert_eq!(handle.input(vec![3]), Err(TerminalSendError::Closed));
         assert_eq!(handle.input(b"new-work".to_vec()), Err(TerminalSendError::Closed));
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn stopping_terminal_remains_visible_for_explicit_cleanup_retry() {
+        let published=PublishedState::new(false,Arc::new(|_|{}));
+        published.input_order.lock().unwrap().closing=true;
+        assert_eq!(published.close_observation().unwrap(),(0,true),"pending cleanup must remain visible as needing attention");
+        published.input_order.lock().unwrap().handoff=true;
+        assert!(published.close_observation().is_err(),"another ownership transition never inherits stop authority");
     }
 
     #[test]
