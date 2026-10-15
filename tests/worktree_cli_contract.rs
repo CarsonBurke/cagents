@@ -1330,6 +1330,60 @@ fn superseded_pending_setup_cannot_start_after_an_explicit_skip() {
 }
 
 #[test]
+fn proved_setup_family_cleanup_allows_fresh_reviewed_commands() {
+    use cagents::{device_service, model::{OperationId, TerminalContinuity, TerminalId, TerminalSession}, worktree_control::{Operation, Reply}};
+    let fixture=Fixture::new();
+    let project=fixture.root.path().join("project");
+    fs::create_dir(project.join(".cagents")).unwrap();
+    fs::write(project.join(".cagents/worktree.toml"),"setup = \"printf reviewed >> setup-runs\"\n").unwrap();
+    let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
+    cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
+    let created=fixture.cli(&["worktree","create","proved-retry"]);
+    let path=Path::new(created["worktree"]["path"].as_str().unwrap()).to_path_buf();
+    let first:TerminalSession=serde_json::from_value(created["setup"]["terminal"].clone()).unwrap();
+    let first_run:OperationId=created["setup"]["run_id"].as_str().unwrap().parse().unwrap();
+    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();
+    let wait_for_exit=|client:&mut cagents::control::ControlClient,id:TerminalId| {
+        let deadline=Instant::now()+Duration::from_secs(10);
+        loop {
+            let terminal=client.list().unwrap().into_iter().find(|terminal|terminal.session.id==id).expect("setup retains its exact terminal receipt");
+            let exit=match terminal.session.continuity {
+                TerminalContinuity::Exited{last_exit}=>Some(last_exit),
+                TerminalContinuity::RelaunchAvailable{last_exit,..}=>last_exit,
+                TerminalContinuity::Failed{typed_error,..}=>panic!("setup failed: {typed_error:?}"),
+                _=>None,
+            };
+            if let Some(exit)=exit {assert_eq!(exit.code,Some(0));assert!(exit.signal.is_none());break;}
+            assert!(Instant::now()<deadline,"setup did not complete");
+            thread::sleep(Duration::from_millis(20));
+        }
+    };
+    wait_for_exit(&mut client,first.id);
+    assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewed");
+    let resume=|expected_run_id|device_service::Operation::Worktree{operation:Operation::ResumeSetup{
+        repository:project.join(".git"),path:path.clone(),expected_run_id,
+        expected_plan_fingerprint:Some(plan.fingerprint.clone()),trust:false,skip:false,
+    }};
+    assert!(client.device_operation(resume(Some(first_run))).is_err(),"a completed screen still owns its original setup lease until explicit cleanup");
+    assert_eq!(fixture.setup_intent(&path)["run_id"],first_run.to_string());
+    assert_eq!(client.close_terminal_checked(first.id,false).unwrap(),cagents::terminal_ipc::TerminalCloseResult::Closed);
+    let device_service::Reply::Worktree(Reply::SetupPrepared{setup:Some(second),run_id:second_run,warnings,..})=client.device_operation(resume(Some(first_run))).unwrap() else {panic!("wrong reviewed retry result")};
+    assert!(warnings.is_empty(),"{warnings:?}");
+    assert!(second.error.is_none(),"{second:?}");
+    assert_eq!(second.run_id,Some(second_run));
+    assert_ne!(second_run,first_run);
+    let second=second.terminal.unwrap();
+    assert_ne!(second.id,first.id);
+    wait_for_exit(&mut client,second.id);
+    assert_eq!(fs::read_to_string(path.join("setup-runs")).unwrap(),"reviewedreviewed");
+    assert_eq!(fixture.setup_intent(&path)["run_id"],second_run.to_string());
+    assert!(client.device_operation(resume(Some(first_run))).is_err(),"old approval cannot advance the current retry");
+    assert_eq!(fixture.setup_intent(&path)["run_id"],second_run.to_string());
+    assert_eq!(client.close_terminal_checked(second.id,false).unwrap(),cagents::terminal_ipc::TerminalCloseResult::Closed);
+}
+
+#[test]
 fn killed_setup_holder_with_surviving_children_cannot_authorize_resume_after_restart() {
     use cagents::{device_service, model::OperationId, worktree_control::{Operation, Reply}};
     use std::fs::File;
