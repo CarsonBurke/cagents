@@ -4255,6 +4255,9 @@ fn sidecar_meta(path: &Path) -> Option<Value> {
 struct History {
     file: File,
     account_origin:Option<(crate::chat::turn_outcomes::HistoryAccountOrigin,u64,u64)>,
+    /// Retain the opened home inode for the history lifetime; metadata alone
+    /// cannot prevent a deleted directory inode being recycled.
+    account_root:Option<crate::fs_safety::Root>,
     chain: Vec<(u64, u64, usize)>,
     offset: usize,
     session_id: String,
@@ -4340,17 +4343,18 @@ impl History {
         let canonical_home=config.canonicalize().map_err(|error|error.to_string())?;
         let before=std::fs::metadata(&canonical_home).map_err(|error|error.to_string())?;
         let path = crate::agent::claude_transcript(&canonical_home, &cwd, id)?;
-        let (file,qualified_open)=history_origins::open_resolved(&canonical_home,(before.dev(),before.ino()),&path)?;
+        let (file,account_root)=history_origins::open_resolved(&canonical_home,(before.dev(),before.ino()),&path)?;
         let file_metadata=file.metadata().map_err(|error|error.to_string())?;
         let mut history = Self::index(file, id)?;
         let after=std::fs::metadata(&canonical_home).map_err(|error|error.to_string())?;
         // A history project symlink outside the account may remain readable
         // under the legacy history contract, but grants no account provenance.
-        if qualified_open && before.is_dir() && after.is_dir()
+        if account_root.is_some() && before.is_dir() && after.is_dir()
             && (before.dev(),before.ino())==(after.dev(),after.ino()) {
             let account=crate::chat::turn_outcomes::HistoryAccountOrigin{provider:Provider::Claude,canonical_home,device:after.dev(),inode:after.ino()};
             if account.validate().is_ok(){history.account_origin=Some((account,file_metadata.dev(),file_metadata.ino()));}
         }
+        if history.account_origin.is_some(){history.account_root=account_root;}
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
     }
@@ -4646,6 +4650,7 @@ impl History {
         Ok(Self {
             file,
             account_origin:None,
+            account_root:None,
             chain,
             offset,
             session_id: id.into(),
@@ -4822,8 +4827,10 @@ impl History {
     fn qualified_account_origin(&self)->Option<crate::chat::turn_outcomes::HistoryAccountOrigin> {
         use std::os::unix::fs::MetadataExt;
         let (account,device,inode)=self.account_origin.as_ref()?;
+        let pinned=self.account_root.as_ref()?.metadata().ok()?;
         let home=std::fs::symlink_metadata(&account.canonical_home).ok()?;
         let file=self.file.metadata().ok()?;
+        if (pinned.dev(),pinned.ino())!=(account.device,account.inode){return None;}
         (home.is_dir() && !home.file_type().is_symlink() && (home.dev(),home.ino())==(account.device,account.inode)
             && file.is_file() && (file.dev(),file.ino())==(*device,*inode)).then(||account.clone())
     }

@@ -2,18 +2,19 @@
 use super::*;
 /// Qualified opens resolve from the pinned physical home without following any
 /// intermediate symlink. A legacy readable fallback never grants provenance.
-pub(super) fn open_resolved(home:&Path,expected:(u64,u64),path:&Path)->Result<(File,bool),String>{
+pub(super) fn open_resolved(home:&Path,expected:(u64,u64),path:&Path)->Result<(File,Option<crate::fs_safety::Root>),String>{
     use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
-    let qualified=(||->Result<File,String>{
+    let qualified=(||->Result<(File,crate::fs_safety::Root),String>{
         let root=crate::fs_safety::Root::open(home).map_err(|error|error.to_string())?;
         let metadata=root.metadata().map_err(|error|error.to_string())?;
         if !metadata.is_dir() || (metadata.dev(),metadata.ino())!=expected{return Err("Claude history account home changed".into());}
         let relative=path.strip_prefix(home).map_err(|_|"Claude history source escapes its account home")?;
-        crate::fs_safety::open_beneath(&root,relative).map_err(|error|error.to_string())
+        let file=crate::fs_safety::open_beneath(&root,relative).map_err(|error|error.to_string())?;
+        Ok((file,root))
     })();
     match qualified {
-        Ok(file)=>Ok((file,true)),
-        Err(_)=>std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map(|file|(file,false)).map_err(|error|format!("Cannot open exact Claude transcript: {error}")),
+        Ok((file,root))=>Ok((file,Some(root))),
+        Err(_)=>std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map(|file|(file,None)).map_err(|error|format!("Cannot open exact Claude transcript: {error}")),
     }
 }
 
@@ -88,7 +89,7 @@ mod tests {
         std::fs::rename(directory,root.path().join("old-project")).unwrap();symlink(&outside,directory).unwrap();
         // This is the exact resolution/open cut in History::open. The legacy
         // reader still works, but a directory symlink cannot mint provenance.
-        let (file,qualified)=open_resolved(&home,(metadata.dev(),metadata.ino()),&path).unwrap();assert!(!qualified);
+        let (file,qualified)=open_resolved(&home,(metadata.dev(),metadata.ino()),&path).unwrap();assert!(qualified.is_none());
         let history=History::index(file,SESSION).unwrap();
         let mut adapter=Claude{history:Some(history),history_only:true,..Claude::default()};
         let step=adapter.initialize().unwrap();
