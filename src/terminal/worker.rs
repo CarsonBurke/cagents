@@ -1419,11 +1419,13 @@ fn is_interrupt_key(key: &KeyInput) -> bool {
         && matches!(key.key, TerminalKey::Character('c' | 'C'))
 }
 
-fn is_pty_input(command: &Command) -> bool {
+fn is_cancelable_input(command: &Command) -> bool {
     match command {
-        // A priority press must retain its paired release when the child
-        // negotiated key-event reporting. The release follows the press.
-        Command::Key(key) if key.action == KeyAction::Release && is_interrupt_key(key) => false,
+        // A press may already be consumed. Preserve key and button releases
+        // while canceling bulk input, so raw/extended apps never keep a key or
+        // button pressed merely because Ctrl+C overtook its queued release.
+        Command::Key(key) if key.action == KeyAction::Release => false,
+        Command::Mouse(mouse) if mouse.action == MouseAction::Release => false,
         Command::Input(_) | Command::Paste(..) | Command::Key(_) | Command::Mouse(_) => true,
         _ => false,
     }
@@ -1900,7 +1902,7 @@ impl Worker {
                 break;
             }
             if self.published.interrupt_requested.swap(false, Ordering::AcqRel) {
-                if carried_command.as_ref().is_some_and(is_pty_input) { carried_command = None; }
+                if carried_command.as_ref().is_some_and(is_cancelable_input) { carried_command = None; }
                 self.interrupt_input();
             }
             self.flush_pty_input();
@@ -3110,7 +3112,7 @@ impl Worker {
         };
         self.pending_input.clear();
         while let Ok(command) = self.commands.try_recv() {
-            if !is_pty_input(&command) { self.retained_commands.push_back(command); }
+            if !is_cancelable_input(&command) { self.retained_commands.push_back(command); }
         }
         let mut attributes: libc::termios = unsafe { std::mem::zeroed() };
         // The master exposes its exact slave's line discipline. POLLOUT only
@@ -5779,14 +5781,26 @@ mod tests {
             let (commands, receiver) = command_channel(4);
             worker.commands = receiver;
             commands.send(Command::Key(release)).unwrap();
+            commands.send(Command::Mouse(MouseInput {
+                action: MouseAction::Release, button: Some(MouseButton::Left), modifiers: KeyModifiers::default(),
+                x: 0.0, y: 0.0, screen_width: 80, screen_height: 24, cell_width: 1, cell_height: 1, any_button_pressed: false,
+            })).unwrap();
             commands.send(Command::Paste("canceled".into(), PasteOrigin::Clipboard)).unwrap();
             *worker.published.interrupt_key.lock().unwrap() = Some(key);
             worker.interrupt_input();
+            assert_eq!(worker.retained_commands.len(), 2, "key/button releases survive canceled paste");
+            assert!(worker.retained_commands.iter().any(|command| matches!(command, Command::Mouse(mouse) if mouse.action == MouseAction::Release)));
             while let Some(command) = worker.retained_commands.pop_front() { worker.handle_command(command); }
             close_processes::signal(&worker.child.shutdown_pidfd().unwrap(), libc::SIGCONT).unwrap();
             let mut output = String::new();
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            while let Ok(message) = worker.pty_rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+            while std::time::Instant::now() < deadline {
+                worker.flush_pty_input();
+                let message = match worker.pty_rx.recv_timeout(Duration::from_millis(10)) {
+                    Ok(message) => message,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(_) => break,
+                };
                 if let PtyMessage::Bytes(bytes) = message { output.push_str(&String::from_utf8_lossy(&bytes)); }
                 else { break; }
                 let observed: Vec<u8> = output.split_whitespace().filter_map(|word| word.parse().ok()).collect();
