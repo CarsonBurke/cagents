@@ -168,9 +168,10 @@ fn current(
         .chats
         .get(&id)
         .ok_or("The restarted provider is not available; its accepted binding was retained")?;
-    let identity = record.handle.try_close_identity()
-        .filter(|identity| !identity.completed)
-        .ok_or("The restarted provider identity is busy or no longer live; its accepted binding was retained")?;
+    let identity = record.handle.try_close_identity()?;
+    if identity.completed {
+        return Err("The restarted provider is no longer live; its accepted binding was retained".into());
+    }
     let mut session = record.session.clone();
     session.launch.session_id = identity.confirmed_session_id;
     session.native_continuity = identity.native_continuity;
