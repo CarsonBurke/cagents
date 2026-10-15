@@ -17,7 +17,10 @@ mod diff_actions;
 pub use diff_actions::DiffPresentationCommand;
 mod diff_layout;
 mod diff_mutations;
-pub use diff_mutations::{Capture as DiffMutationCapture, Prepared as PreparedDiffMutation, Request as DiffMutationRequest};
+pub use diff_mutations::{
+    Capture as DiffMutationCapture, Prepared as PreparedDiffMutation,
+    Request as DiffMutationRequest,
+};
 mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
@@ -311,14 +314,28 @@ pub struct RepositoryCommandTarget {
 
 impl std::fmt::Debug for RepositoryCommandTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RepositoryCommandTarget").field("identity", &self.identity).field("editor_revision", &self.editor_revision).field("layout_revision", &self.layout_revision).finish_non_exhaustive()
+        f.debug_struct("RepositoryCommandTarget")
+            .field("identity", &self.identity)
+            .field("editor_revision", &self.editor_revision)
+            .field("layout_revision", &self.layout_revision)
+            .finish_non_exhaustive()
     }
 }
 impl PartialEq for RepositoryCommandTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
-            (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
-        }
+        self.identity == other.identity
+            && self.editor_revision == other.editor_revision
+            && self.cursor == other.cursor
+            && self.surface == other.surface
+            && self.basis == other.basis
+            && self.mode == other.mode
+            && self.layout_revision == other.layout_revision
+            && self.selection == other.selection
+            && match (&self.model, &other.model) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 impl Eq for RepositoryCommandTarget {}
@@ -1220,10 +1237,13 @@ impl EditorDocument {
     }
 
     fn refresh_dirty(&mut self) {
-        let presence_changed = self.present != self.saved_present
-            || self.presence_id != self.saved_presence_id;
+        let presence_changed =
+            self.present != self.saved_present || self.presence_id != self.saved_presence_id;
         self.dirty = presence_changed || self.history.revision() != self.saved_history_revision;
-        if !presence_changed && self.dirty && self.content.text_snapshot().same_text(&self.saved_snapshot) {
+        if !presence_changed
+            && self.dirty
+            && self.content.text_snapshot().same_text(&self.saved_snapshot)
+        {
             // Signature inequality is constant-time on ordinary edits. Only
             // a possible return to the saved bytes pays for exact equality.
             self.history.adopt_revision(self.saved_history_revision);
@@ -1386,11 +1406,15 @@ impl EditorDocument {
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
         }
-        if !text.is_empty() { self.present = true; }
+        if !text.is_empty() {
+            self.present = true;
+        }
         self.dirty = self.present != self.saved_present
             || self.presence_id != self.saved_presence_id
             || text != self.saved_text;
-        if !self.dirty { self.history.adopt_revision(self.saved_history_revision); }
+        if !self.dirty {
+            self.history.adopt_revision(self.saved_history_revision);
+        }
         self.revision = self.revision.wrapping_add(1).max(1);
     }
 
@@ -3225,8 +3249,14 @@ impl RepositoryRuntime {
     #[cfg(test)]
     pub(crate) fn dirty_fixture_at(card: CardId, path: PathBuf) -> Self {
         let mut runtime = Self::dirty_fixture(card);
-        runtime.selected.as_mut().expect("selected fixture file").path = path.clone();
-        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        runtime
+            .selected
+            .as_mut()
+            .expect("selected fixture file")
+            .path = path.clone();
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
         document.source = path;
         runtime
     }
@@ -4438,18 +4468,38 @@ impl RepositoryRuntime {
         let (editor_revision, cursor) = match &self.document {
             DocumentState::Editable(document) => {
                 let cursor = document.content.cursor();
-                (Some(document.revision), Some((cursor.position.line, cursor.position.column, cursor.selection.map(|position| (position.line, position.column)))))
+                (
+                    Some(document.revision),
+                    Some((
+                        cursor.position.line,
+                        cursor.position.column,
+                        cursor
+                            .selection
+                            .map(|position| (position.line, position.column)),
+                    )),
+                )
             }
             _ => (None, None),
         };
         RepositoryCommandTarget {
-            identity: self.current_identity(card, self.selected_path().unwrap_or(Path::new("")).to_owned()),
-            editor_revision, cursor, surface: self.source_surface, basis: self.diff_basis.clone(), mode: self.diff_mode,
-            layout_revision: self.diff_layout_revision, selection: self.diff_interaction.selection,
-            model: if self.shows_diff() { self.current_diff_model_snapshot() } else { None },
+            identity: self.current_identity(
+                card,
+                self.selected_path().unwrap_or(Path::new("")).to_owned(),
+            ),
+            editor_revision,
+            cursor,
+            surface: self.source_surface,
+            basis: self.diff_basis.clone(),
+            mode: self.diff_mode,
+            layout_revision: self.diff_layout_revision,
+            selection: self.diff_interaction.selection,
+            model: if self.shows_diff() {
+                self.current_diff_model_snapshot()
+            } else {
+                None
+            },
         }
     }
-
 
     /// The file the open buffer really is, when the selected path is a
     /// symbolic link to it; `None` for a buffer that is its own file.
@@ -5767,7 +5817,16 @@ impl RepositoryRuntime {
                 return Task::none();
             }
         }
-        let (path, destination, text, disk_hash, revision, history_revision, snapshot_source, presence) = match &self.document {
+        let (
+            path,
+            destination,
+            text,
+            disk_hash,
+            revision,
+            history_revision,
+            snapshot_source,
+            presence,
+        ) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
                     && document.active_save.is_none() =>

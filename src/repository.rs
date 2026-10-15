@@ -20,8 +20,8 @@ use std::{
 
 mod authority;
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
-mod creation_authority;
 mod browse_reveal;
+mod creation_authority;
 mod ignore_path;
 pub use browse_reveal::include as include_revealed_path;
 mod status_limit;
@@ -3847,7 +3847,8 @@ impl RepositoryService<SystemProcessExecutor> {
 
 impl<E: ProcessExecutor> RepositoryService<E> {
     pub fn new(git: impl Into<PathBuf>, executor: Arc<E>) -> Self
-    where E: 'static
+    where
+        E: 'static,
     {
         Self {
             git: git.into(),
@@ -4422,7 +4423,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let git_dir = if let Some(authority) = &self.authority {
             authority.validate()?;
             Some(authority.private_metadata_path())
-        } else { local_git_dir(worktree) };
+        } else {
+            local_git_dir(worktree)
+        };
         if !cache.fsmonitor_checked {
             let mut command = self.git_read(
                 worktree,
@@ -5168,7 +5171,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         match &request.revision {
             HistoryRevision::Head => self.resolve_head(&request.worktree, cancellation),
             HistoryRevision::Object { oid } => Ok(Some(oid.clone())),
-            HistoryRevision::Reference { name } => self.resolve_optional_revision(&request.worktree, name.as_str(), cancellation),
+            HistoryRevision::Reference { name } => {
+                self.resolve_optional_revision(&request.worktree, name.as_str(), cancellation)
+            }
         }
     }
 
@@ -5204,10 +5209,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if !(4..=64).contains(&query.len()) || !query.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Ok(None);
         }
-        let Some(oid) = self.resolve_optional_revision(&request.worktree, query, cancellation)? else { return Ok(None); };
-        if !oid.as_str().starts_with(query) { return Ok(None); }
-        let pinned = HistoryRequest { revision: HistoryRevision::Object { oid }, page: 0, ..request.clone() };
-        Ok(self.history(&pinned, cancellation)?.into_iter().next().filter(|commit| history_matches(commit, query)))
+        let Some(oid) = self.resolve_optional_revision(&request.worktree, query, cancellation)?
+        else {
+            return Ok(None);
+        };
+        if !oid.as_str().starts_with(query) {
+            return Ok(None);
+        }
+        let pinned = HistoryRequest {
+            revision: HistoryRevision::Object { oid },
+            page: 0,
+            ..request.clone()
+        };
+        Ok(self
+            .history(&pinned, cancellation)?
+            .into_iter()
+            .next()
+            .filter(|commit| history_matches(commit, query)))
     }
 
     /// Literal, case-insensitive OR search across message, author and SHA prefix.
@@ -5221,31 +5239,54 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Vec<CommitSummary>, RepositoryError> {
         let query = query.trim().to_lowercase();
-        if query.is_empty() { return self.history(request, cancellation); }
+        if query.is_empty() {
+            return self.history(request, cancellation);
+        }
         let candidate = self.history_sha_match(request, &query, cancellation)?;
         let candidate_oid = candidate.as_ref().map(|commit| commit.oid.clone());
         let start = self.history_start(request, cancellation)?;
         let mut walk = request.clone();
-        if let Some(start) = &start { walk.revision = HistoryRevision::Object { oid: start.clone() }; }
+        if let Some(start) = &start {
+            walk.revision = HistoryRevision::Object { oid: start.clone() };
+        }
         walk.page = 0;
         let mut skip = u64::from(request.page) * u64::from(HISTORY_PAGE_SIZE);
         let mut matches = Vec::new();
         if let Some(candidate) = candidate {
-            if skip > 0 { skip -= 1; } else { matches.push(candidate); }
+            if skip > 0 {
+                skip -= 1;
+            } else {
+                matches.push(candidate);
+            }
         }
         loop {
-            let commits = if start.is_some() { self.history(&walk, cancellation)? } else { Vec::new() };
+            let commits = if start.is_some() {
+                self.history(&walk, cancellation)?
+            } else {
+                Vec::new()
+            };
             let complete = commits.len() < HISTORY_PAGE_SIZE as usize;
             for commit in commits {
-                if candidate_oid.as_ref() == Some(&commit.oid) { continue; }
+                if candidate_oid.as_ref() == Some(&commit.oid) {
+                    continue;
+                }
                 if history_matches(&commit, &query) {
-                    if skip > 0 { skip -= 1; }
-                    else { matches.push(commit); }
-                    if matches.len() == HISTORY_PAGE_SIZE as usize { return Ok(matches); }
+                    if skip > 0 {
+                        skip -= 1;
+                    } else {
+                        matches.push(commit);
+                    }
+                    if matches.len() == HISTORY_PAGE_SIZE as usize {
+                        return Ok(matches);
+                    }
                 }
             }
-            if complete { return Ok(matches); }
-            let Some(next) = walk.page.checked_add(1) else { return Ok(matches); };
+            if complete {
+                return Ok(matches);
+            }
+            let Some(next) = walk.page.checked_add(1) else {
+                return Ok(matches);
+            };
             walk.page = next;
         }
     }
@@ -6363,9 +6404,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let command = self.git_read(worktree, arguments);
         let output = self.run_checked(&command, cancellation)?;
-        for path in output.stdout.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).map(bytes_to_path) {
+        for path in output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(bytes_to_path)
+        {
             // `--git-path` is relative to Git's scoped working directory.
-            if self.captured_worktree_path(&worktree.join(path))?.exists() { return Ok(true); }
+            if self.captured_worktree_path(&worktree.join(path))?.exists() {
+                return Ok(true);
+            }
         }
         Ok(false)
     }
@@ -9219,34 +9267,104 @@ mod tests {
             git(&root, &["branch", "target"]);
             fs::write(root.join("agent-change.txt"), "selected agent change\n").unwrap();
             git(&root, &["add", "."]);
-            git(&root, &["commit", "-m", "Fix from another branch", "-m", "Multiline body for the selected change"]);
+            git(
+                &root,
+                &[
+                    "commit",
+                    "-m",
+                    "Fix from another branch",
+                    "-m",
+                    "Multiline body for the selected change",
+                ],
+            );
             let service = service();
             let cancel = CancellationToken::new();
             let source = service.resolve_head(&root, &cancel).unwrap().unwrap();
-            let source_request = HistoryRequest { worktree: root.clone(), revision: HistoryRevision::Head, page: 0, path: None };
-            assert_eq!(service.filtered_history(&source_request, source.as_str(), &cancel).unwrap().len(), 1,
-                "a direct SHA lookup must not duplicate its normal HEAD-history match");
-            git(&root, &["worktree", "add", target.to_str().unwrap(), "target"]);
+            let source_request = HistoryRequest {
+                worktree: root.clone(),
+                revision: HistoryRevision::Head,
+                page: 0,
+                path: None,
+            };
+            assert_eq!(
+                service
+                    .filtered_history(&source_request, source.as_str(), &cancel)
+                    .unwrap()
+                    .len(),
+                1,
+                "a direct SHA lookup must not duplicate its normal HEAD-history match"
+            );
+            git(
+                &root,
+                &["worktree", "add", target.to_str().unwrap(), "target"],
+            );
             fs::write(target.join("target-only.txt"), "preserve target\n").unwrap();
             git(&target, &["add", "."]);
             git(&target, &["commit", "-m", "Independent target change"]);
-            let request = HistoryRequest { worktree: target.clone(), revision: HistoryRevision::Head, page: 0, path: None };
-            assert!(!service.history(&request, &cancel).unwrap().iter().any(|commit| commit.oid == source));
+            let request = HistoryRequest {
+                worktree: target.clone(),
+                revision: HistoryRevision::Head,
+                page: 0,
+                path: None,
+            };
+            assert!(
+                !service
+                    .history(&request, &cancel)
+                    .unwrap()
+                    .iter()
+                    .any(|commit| commit.oid == source)
+            );
             for query in [source.as_str(), &source.as_str()[..8]] {
                 let found = service.filtered_history(&request, query, &cancel).unwrap();
                 assert_eq!(found.len(), 1);
                 assert_eq!(found[0].oid, source);
                 assert!(found[0].body.contains("Multiline body"));
             }
-            assert!(matches!(service.git_operation(&target, &GitOperation::CherryPick { oid: source.clone(), mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
-            assert_eq!(fs::read(target.join("agent-change.txt")).unwrap(), b"selected agent change\n");
+            assert!(matches!(
+                service
+                    .git_operation(
+                        &target,
+                        &GitOperation::CherryPick {
+                            oid: source.clone(),
+                            mainline: None
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
+            assert_eq!(
+                fs::read(target.join("agent-change.txt")).unwrap(),
+                b"selected agent change\n"
+            );
             let picked = service.resolve_head(&target, &cancel).unwrap().unwrap();
             assert_ne!(picked, source);
-            assert!(matches!(service.git_operation(&target, &GitOperation::RevertCommit { oid: picked, mainline: None }, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+            assert!(matches!(
+                service
+                    .git_operation(
+                        &target,
+                        &GitOperation::RevertCommit {
+                            oid: picked,
+                            mainline: None
+                        },
+                        &cancel
+                    )
+                    .unwrap(),
+                MutationOutcome::Applied { .. }
+            ));
             assert!(!target.join("agent-change.txt").exists());
-            assert_eq!(fs::read(target.join("target-only.txt")).unwrap(), b"preserve target\n");
+            assert_eq!(
+                fs::read(target.join("target-only.txt")).unwrap(),
+                b"preserve target\n"
+            );
             assert!(root.join("agent-change.txt").exists());
-            assert_eq!(service.filtered_history(&request, source.as_str(), &cancel).unwrap().len(), 1);
+            assert_eq!(
+                service
+                    .filtered_history(&request, source.as_str(), &cancel)
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
 
         fn git(directory: &Path, arguments: &[&str]) {
@@ -10649,14 +10767,25 @@ mod tests {
         let first = record(1, "ordinary subject", "Grace").repeat(HISTORY_PAGE_SIZE as usize);
         let second = record(2, "A needle beyond page one", "Ada");
         let service = fake_service(vec![success(&first), success(&second)]);
-        let request = HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 0, path: None };
-        let found = service.filtered_history(&request, "NEEDLE", &CancellationToken::new()).unwrap();
+        let request = HistoryRequest {
+            worktree: "/repo".into(),
+            revision: HistoryRevision::Object { oid: oid(3) },
+            page: 0,
+            path: None,
+        };
+        let found = service
+            .filtered_history(&request, "NEEDLE", &CancellationToken::new())
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].oid, oid(2));
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(commands.len(), 2);
         assert!(commands[0].arguments.contains(&OsString::from("--skip=0")));
-        assert!(commands[1].arguments.contains(&OsString::from("--skip=200")));
+        assert!(
+            commands[1]
+                .arguments
+                .contains(&OsString::from("--skip=200"))
+        );
         drop(commands);
         let commit = &found[0];
         assert!(history_matches(commit, "ada"));
@@ -10668,8 +10797,23 @@ mod tests {
     fn history_filter_resolves_head_once_for_a_consistent_search_walk() {
         let record = format!("{}\0\0Ada\0ada@example.invalid\01700000000 +0000\0Ada\0ada@example.invalid\01700000000 +0000\0ordinary\0\0", oid(1)).into_bytes();
         let first = record.repeat(HISTORY_PAGE_SIZE as usize);
-        let service = fake_service(vec![success(format!("{}\n", oid(3)).as_bytes()), success(&first), success(b"")]);
-        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Head, page: 0, path: None }, "unmatched", &CancellationToken::new()).unwrap();
+        let service = fake_service(vec![
+            success(format!("{}\n", oid(3)).as_bytes()),
+            success(&first),
+            success(b""),
+        ]);
+        let found = service
+            .filtered_history(
+                &HistoryRequest {
+                    worktree: "/repo".into(),
+                    revision: HistoryRevision::Head,
+                    page: 0,
+                    path: None,
+                },
+                "unmatched",
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert!(found.is_empty());
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(commands.len(), 3);
@@ -10681,11 +10825,24 @@ mod tests {
 
     #[test]
     fn history_filter_pages_matching_results_and_keeps_message_author_or_sha_semantics() {
-        let record = |id: u8, author: &str, subject: &str| format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0body\0", oid(id), author, subject).into_bytes();
+        let record = |id: u8, author: &str, subject: &str| {
+            format!("{}\0\0{}\0author@example.invalid\01700000000 +0000\0Committer\0committer@example.invalid\01700000000 +0000\0{}\0body\0", oid(id), author, subject).into_bytes()
+        };
         let first = record(1, "Ada", "ordinary").repeat(HISTORY_PAGE_SIZE as usize);
         let second = record(2, "Grace", "Ada in the message");
         let service = fake_service(vec![success(&first), success(&second)]);
-        let found = service.filtered_history(&HistoryRequest { worktree: "/repo".into(), revision: HistoryRevision::Object { oid: oid(3) }, page: 1, path: None }, "ada", &CancellationToken::new()).unwrap();
+        let found = service
+            .filtered_history(
+                &HistoryRequest {
+                    worktree: "/repo".into(),
+                    revision: HistoryRevision::Object { oid: oid(3) },
+                    page: 1,
+                    path: None,
+                },
+                "ada",
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].oid, oid(2));
         assert!(history_matches(&found[0], "body"));
@@ -13152,12 +13309,19 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 impl WorktreeJournal {
     fn restore_creation_authority(&mut self) -> Result<(), RepositoryError> {
         if let Some(evidence) = &self.creation_authority {
-            if self.live_creation.as_ref().is_none_or(|scope|
-                evidence.has_published_destination() && !scope.has_destination()) {
+            if self.live_creation.as_ref().is_none_or(|scope| {
+                evidence.has_published_destination() && !scope.has_destination()
+            }) {
                 self.live_creation = Some(creation_authority::CreationSession::restore(
-                    evidence, &self.request, &self.common_dir)?);
+                    evidence,
+                    &self.request,
+                    &self.common_dir,
+                )?);
             }
-            self.live_creation.as_ref().expect("authority restored").validate()?;
+            self.live_creation
+                .as_ref()
+                .expect("authority restored")
+                .validate()?;
         }
         Ok(())
     }
@@ -13166,7 +13330,9 @@ impl WorktreeJournal {
         match &self.live_creation {
             Some(scope) => scope.lease_path(self.request.operation_id),
             None if self.creation_authority.is_some() => Err(ValidationError::Io(
-                "Creation authority must be restored before lease access".into()).into()),
+                "Creation authority must be restored before lease access".into(),
+            )
+            .into()),
             None => Ok(self.lease_path.clone()),
         }
     }
@@ -13175,7 +13341,9 @@ impl WorktreeJournal {
         match &self.live_creation {
             Some(scope) => scope.common_operand(),
             None if self.creation_authority.is_some() => Err(ValidationError::Io(
-                "Creation authority must be restored before common-directory access".into()).into()),
+                "Creation authority must be restored before common-directory access".into(),
+            )
+            .into()),
             None => Ok(self.common_dir.clone()),
         }
     }
@@ -13250,7 +13418,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
         if let Some(authority) = &self.authority {
-            if authority.path() != repository { return Err(ValidationError::InvalidWorktree(repository.display().to_string()).into()); }
+            if authority.path() != repository {
+                return Err(
+                    ValidationError::InvalidWorktree(repository.display().to_string()).into(),
+                );
+            }
             authority.validate()?;
             return Ok(authority.stable_common_metadata_path().to_owned());
         }
@@ -13261,10 +13433,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             ),
             cancellation,
         )?;
-        Ok(
-            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "common_dir")?)?)
-                .map_err(|e| ValidationError::Io(e.to_string()))?,
+        Ok(fs::canonicalize(
+            self.captured_worktree_path(&parse_path_line(&output.stdout, "common_dir")?)?,
         )
+        .map_err(|e| ValidationError::Io(e.to_string()))?)
     }
 
     /// The canonical Git directory of `worktree`: for a linked worktree, the
@@ -13275,7 +13447,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
         if let Some(authority) = &self.authority {
-            if authority.path() != worktree { return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()); }
+            if authority.path() != worktree {
+                return Err(
+                    ValidationError::InvalidWorktree(worktree.display().to_string()).into(),
+                );
+            }
             authority.validate()?;
             return Ok(authority.stable_private_metadata_path().to_owned());
         }
@@ -13286,10 +13462,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             ),
             cancellation,
         )?;
-        Ok(
-            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "git_dir")?)?)
-                .map_err(|e| ValidationError::Io(e.to_string()))?,
+        Ok(fs::canonicalize(
+            self.captured_worktree_path(&parse_path_line(&output.stdout, "git_dir")?)?,
         )
+        .map_err(|e| ValidationError::Io(e.to_string()))?)
     }
 
     /// The production entrypoint. No caller may create the managed root first.
@@ -13307,33 +13483,66 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if let Some(authority) = &self.authority {
             let captured = creation_authority::CreationSession::capture(authority, request);
             match captured.and_then(|(scope, evidence)| {
-                self.journal_source_service(scope.clone()).map(|service| (service, scope, evidence))
+                self.journal_source_service(scope.clone())
+                    .map(|service| (service, scope, evidence))
             }) {
-                Ok((service, scope, evidence)) => return service.create_worktree_journaled_inner(
-                    store, request, generation, cancellation, progress, Some((scope, evidence))),
+                Ok((service, scope, evidence)) => {
+                    return service.create_worktree_journaled_inner(
+                        store,
+                        request,
+                        generation,
+                        cancellation,
+                        progress,
+                        Some((scope, evidence)),
+                    );
+                }
                 Err(error) => {
-                    for stage in [WorktreeProgressStage::Validating, WorktreeProgressStage::Finished] {
+                    for stage in [
+                        WorktreeProgressStage::Validating,
+                        WorktreeProgressStage::Finished,
+                    ] {
                         let _ = progress.try_send(WorktreeProgressEvent {
-                            operation_id: request.operation_id, generation, stage,
+                            operation_id: request.operation_id,
+                            generation,
+                            stage,
                         });
                     }
                     return WorktreeOperationReport {
-                        operation_id: request.operation_id, generation, request: Some(request.clone()),
-                        state: WorktreeOperationState::MalformedPayload, outcome: None,
-                        detail: format!("The captured creation authority is unavailable; no creation was started: {error}"),
+                        operation_id: request.operation_id,
+                        generation,
+                        request: Some(request.clone()),
+                        state: WorktreeOperationState::MalformedPayload,
+                        outcome: None,
+                        detail: format!(
+                            "The captured creation authority is unavailable; no creation was started: {error}"
+                        ),
                         created_at_unix_ms: operation_timestamp(),
                     };
                 }
             }
         }
-        self.create_worktree_journaled_inner(store, request, generation, cancellation, progress, None)
+        self.create_worktree_journaled_inner(
+            store,
+            request,
+            generation,
+            cancellation,
+            progress,
+            None,
+        )
     }
 
     #[cfg(feature = "ui")]
     fn create_worktree_journaled_inner(
-        &self, store: &StateStore, request: &CreateWorktreeRequest, generation: u64,
-        cancellation: &CancellationToken, progress: &async_channel::Sender<WorktreeProgressEvent>,
-        captured: Option<(Arc<creation_authority::CreationSession>, creation_authority::CreationEvidence)>,
+        &self,
+        store: &StateStore,
+        request: &CreateWorktreeRequest,
+        generation: u64,
+        cancellation: &CancellationToken,
+        progress: &async_channel::Sender<WorktreeProgressEvent>,
+        captured: Option<(
+            Arc<creation_authority::CreationSession>,
+            creation_authority::CreationEvidence,
+        )>,
     ) -> WorktreeOperationReport {
         let created_at = operation_timestamp();
         let emit = |stage| {
@@ -13409,7 +13618,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             Ok(path) => path,
             Err(error) => {
                 journal.state = WorktreeOperationState::OutcomeUnknown;
-                journal.detail = format!("Creation authority changed before lease acquisition: {error}");
+                journal.detail =
+                    format!("Creation authority changed before lease acquisition: {error}");
                 return finish_worktree_journal(store, &journal, &payload, created_at, &emit);
             }
         };
@@ -13632,16 +13842,24 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 self.create_worktree_command(&journal.request, &oid)?
             };
             if let Some(scope) = journal.live_creation.clone() {
-                let published = scope.publish(journal.creation_authority.as_mut()
-                    .ok_or_else(|| ValidationError::Io("Missing durable creation authority".into()))?);
+                let published =
+                    scope.publish(journal.creation_authority.as_mut().ok_or_else(|| {
+                        ValidationError::Io("Missing durable creation authority".into())
+                    })?);
                 // Even if final name validation refused after publication,
                 // retain every known directory identity before returning.
-                journal.persist(store, &payload).map(|next| payload = next).map_err(|error| {
-                    journal_write_failed = true;
-                    ValidationError::Io(format!("journal write failed: {error}"))
-                })?;
+                journal
+                    .persist(store, &payload)
+                    .map(|next| payload = next)
+                    .map_err(|error| {
+                        journal_write_failed = true;
+                        ValidationError::Io(format!("journal write failed: {error}"))
+                    })?;
                 published?;
-                let position = command.arguments.len().checked_sub(2)
+                let position = command
+                    .arguments
+                    .len()
+                    .checked_sub(2)
                     .ok_or(ValidationError::DestinationOutsideRoot)?;
                 command = scope.bind_destination_operand(command, position)?;
             }
@@ -13649,12 +13867,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             emit(WorktreeProgressStage::RunningGit);
             self.run_checked(&command, cancellation)?;
             if let Some(scope) = journal.live_creation.clone() {
-                let registered = self.list_worktrees(&journal.request.repository, cancellation)?
-                    .into_iter().find(|record| record.path == journal.request.destination)
-                    .ok_or_else(|| ValidationError::Io("Git did not register the owned destination".into()))?;
-                journal.live_created = Some(scope.bind_created(
-                    journal.creation_authority.as_mut().ok_or_else(|| ValidationError::Io("Missing creation authority".into()))?,
-                    &journal.request, &registered, &oid)?);
+                let registered = self
+                    .list_worktrees(&journal.request.repository, cancellation)?
+                    .into_iter()
+                    .find(|record| record.path == journal.request.destination)
+                    .ok_or_else(|| {
+                        ValidationError::Io("Git did not register the owned destination".into())
+                    })?;
+                journal.live_created =
+                    Some(scope.bind_created(
+                        journal.creation_authority.as_mut().ok_or_else(|| {
+                            ValidationError::Io("Missing creation authority".into())
+                        })?,
+                        &journal.request,
+                        &registered,
+                        &oid,
+                    )?);
             }
             if journal
                 .existing_branch_oid
@@ -13753,7 +13981,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 cancellation,
             )?
             .map(|oid| oid.to_string());
-        if self.authority.is_some() && existing_branch_oid.is_some()
+        if self.authority.is_some()
+            && existing_branch_oid.is_some()
             && !(matches!(&request.base, BaseRevision::LocalBranch(branch) if branch == &request.branch)
                 && !request.track)
         {
@@ -13786,14 +14015,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     fn settle_worktree_journal(&self, journal: &mut WorktreeJournal, lease_grace: Duration) {
         if journal.creation_authority.is_some() {
             let scoped = journal.restore_creation_authority().and_then(|()| {
-                self.journal_source_service(journal.live_creation.clone().expect("authority restored"))
+                self.journal_source_service(
+                    journal.live_creation.clone().expect("authority restored"),
+                )
             });
             match scoped {
                 Ok(service) => service.settle_worktree_journal_inner(journal, lease_grace),
                 Err(error) => {
                     journal.outcome = None;
                     journal.state = WorktreeOperationState::OutcomeUnknown;
-                    journal.detail = format!("The original creation authority is unavailable; no replacement was authorized: {error}");
+                    journal.detail = format!(
+                        "The original creation authority is unavailable; no replacement was authorized: {error}"
+                    );
                 }
             }
         } else {
@@ -14004,25 +14237,46 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// Supplies the original roots to generation/setup/Linear settlement too;
     /// no caller should rediscover new authority from the destination path.
-    fn created_journal_roots(&self, journal: &mut WorktreeJournal)
-        -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)>
-    {
+    fn created_journal_roots(
+        &self,
+        journal: &mut WorktreeJournal,
+    ) -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)> {
         journal.restore_creation_authority().ok()?;
         let scope = journal.live_creation.clone()?;
-        let registered = self.list_worktrees(&journal.request.repository, &CancellationToken::new()).ok()?
-            .into_iter().find(|record| record.path == journal.request.destination)?;
-        let created = scope.bind_created(journal.creation_authority.as_mut()?, &journal.request,
-            &registered, journal.base_oid.as_deref()?) .ok()?;
+        let registered = self
+            .list_worktrees(&journal.request.repository, &CancellationToken::new())
+            .ok()?
+            .into_iter()
+            .find(|record| record.path == journal.request.destination)?;
+        let created = scope
+            .bind_created(
+                journal.creation_authority.as_mut()?,
+                &journal.request,
+                &registered,
+                journal.base_oid.as_deref()?,
+            )
+            .ok()?;
         let (admin, checkout) = created.roots().ok()?;
         if !journal.checkout_completed {
-            if !fs_safety::metadata_beneath(&admin, Path::new("index")).ok()?.is_file() {
+            if !fs_safety::metadata_beneath(&admin, Path::new("index"))
+                .ok()?
+                .is_file()
+            {
                 return None;
             }
             let service = self.created_worktree_service(created.clone()).ok()?;
-            let output = service.run_checked(&service.git_read(&journal.request.destination,
-                ["status", "--porcelain=v2", "-z", "--untracked-files=all"]),
-                &CancellationToken::new()).ok()?;
-            if !output.stdout.is_empty() || output.stderr.iter().any(|byte| !byte.is_ascii_whitespace()) {
+            let output = service
+                .run_checked(
+                    &service.git_read(
+                        &journal.request.destination,
+                        ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
+                    ),
+                    &CancellationToken::new(),
+                )
+                .ok()?;
+            if !output.stdout.is_empty()
+                || output.stderr.iter().any(|byte| !byte.is_ascii_whitespace())
+            {
                 return None;
             }
         }
@@ -14070,7 +14324,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 ],
             );
             if let Some(scope) = &journal.live_creation {
-                let position = unlock.arguments.len().checked_sub(1)
+                let position = unlock
+                    .arguments
+                    .len()
+                    .checked_sub(1)
                     .ok_or(ValidationError::DestinationOutsideRoot)?;
                 unlock = scope.bind_destination_operand(unlock, position)?;
             }
@@ -14433,23 +14690,43 @@ mod worktree_journal_tests {
             let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
             let scoped = fixture.service.with_worktree_authority(authority).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
-                7, &CancellationToken::new(), &sender);
+            let report = scoped.create_worktree_journaled(
+                &fixture.store,
+                &fixture.request,
+                7,
+                &CancellationToken::new(),
+                &sender,
+            );
             assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-            assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(),
-                b"committed content\n");
+            assert_eq!(
+                fs::read(fixture.request.destination.join("tracked.txt")).unwrap(),
+                b"committed content\n"
+            );
             let journal = fixture.journal(fixture.request.operation_id);
             assert!(serde_json::to_value(journal.creation_authority.as_ref().unwrap()).unwrap()["admin"].is_object());
             let serialized = serde_json::to_string(&journal).unwrap();
-            assert!(!serialized.contains("/proc/"), "descriptor IO paths must not survive a restart");
+            assert!(
+                !serialized.contains("/proc/"),
+                "descriptor IO paths must not survive a restart"
+            );
             assert!(!serialized.contains("/dev/fd/"));
             assert_eq!(journal.common_dir, fixture.request.repository.join(".git"));
-            assert_eq!(journal.lease_path.parent(), Some(journal.common_dir.as_path()));
-            assert!(journal.live_creation.is_none(), "deserialization never invents a live scope");
+            assert_eq!(
+                journal.lease_path.parent(),
+                Some(journal.common_dir.as_path())
+            );
+            assert!(
+                journal.live_creation.is_none(),
+                "deserialization never invents a live scope"
+            );
             let recovered = RepositoryService::system("git")
-                .rehydrate_worktree_operations(&fixture.store).unwrap();
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap();
             assert_eq!(recovered[0].state, WorktreeOperationState::Created);
-            assert_eq!(fixture.git(&["rev-parse", "feature"]), fixture.git(&["rev-parse", "main"]));
+            assert_eq!(
+                fixture.git(&["rev-parse", "feature"]),
+                fixture.git(&["rev-parse", "main"])
+            );
         }
     }
 
@@ -14457,16 +14734,34 @@ mod worktree_journal_tests {
     #[test]
     fn scoped_publication_failure_preserves_known_identity_for_restart() {
         let fixture = Fixture::new();
-        let scoped = fixture.service.with_worktree_authority(
-            WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+        let scoped = fixture
+            .service
+            .with_worktree_authority(
+                WorktreeAuthority::capture(&fixture.request.repository).unwrap(),
+            )
+            .unwrap();
         let (sender, _) = async_channel::bounded(8);
         creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true));
-        let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
-            7, &CancellationToken::new(), &sender);
+        let report = scoped.create_worktree_journaled(
+            &fixture.store,
+            &fixture.request,
+            7,
+            &CancellationToken::new(),
+            &sender,
+        );
         creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(false));
-        assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::OutcomeUnknown,
+            "{report:?}"
+        );
         assert!(fixture.request.destination.is_dir());
-        assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none());
+        assert!(
+            fs::read_dir(&fixture.request.destination)
+                .unwrap()
+                .next()
+                .is_none()
+        );
         let mut journal = fixture.journal(fixture.request.operation_id);
         let payload = serde_json::to_value(&journal).unwrap();
         assert!(payload["creation_authority"]["checkout"].is_object());
@@ -14477,20 +14772,31 @@ mod worktree_journal_tests {
         journal.restore_creation_authority().unwrap();
         let scope = journal.live_creation.as_ref().unwrap();
         assert!(scope.has_destination());
-        let command = scope.bind_destination_operand(CommandSpec::new("git")
-            .arg(&fixture.request.destination), 0).unwrap();
+        let command = scope
+            .bind_destination_operand(CommandSpec::new("git").arg(&fixture.request.destination), 0)
+            .unwrap();
         let held = fs::metadata(Path::new(&command.arguments[0])).unwrap();
         let named = fs::metadata(&fixture.request.destination).unwrap();
         use std::os::unix::fs::MetadataExt;
         assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
-        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+        let recovered = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap();
         assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown);
         let mut replacement_journal = fixture.journal(fixture.request.operation_id);
-        fs::rename(&fixture.request.destination, fixture.directory.path().join("original-child")).unwrap();
+        fs::rename(
+            &fixture.request.destination,
+            fixture.directory.path().join("original-child"),
+        )
+        .unwrap();
         fs::create_dir(&fixture.request.destination).unwrap();
         fs::write(fixture.request.destination.join("keep"), b"foreign\n").unwrap();
         assert!(replacement_journal.restore_creation_authority().is_err());
-        assert_eq!(fs::read(fixture.request.destination.join("keep")).unwrap(), b"foreign\n");
+        assert_eq!(
+            fs::read(fixture.request.destination.join("keep")).unwrap(),
+            b"foreign\n"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -14502,12 +14808,31 @@ mod worktree_journal_tests {
         let scoped = fixture.service.with_worktree_authority(authority).unwrap();
         let before = fixture.git(&["rev-parse", "feature"]);
         let (sender, _) = async_channel::bounded(8);
-        let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
-            7, &CancellationToken::new(), &sender);
-        assert_eq!(report.state, WorktreeOperationState::MalformedPayload, "{report:?}");
-        assert!(report.detail.contains("cannot yet advance an existing branch"));
+        let report = scoped.create_worktree_journaled(
+            &fixture.store,
+            &fixture.request,
+            7,
+            &CancellationToken::new(),
+            &sender,
+        );
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::MalformedPayload,
+            "{report:?}"
+        );
+        assert!(
+            report
+                .detail
+                .contains("cannot yet advance an existing branch")
+        );
         assert!(!fixture.request.managed_root.exists());
-        assert!(fixture.store.journaled_worktree_operations().unwrap().is_empty());
+        assert!(
+            fixture
+                .store
+                .journaled_worktree_operations()
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(fixture.git(&["rev-parse", "feature"]), before);
     }
 
@@ -14521,10 +14846,15 @@ mod worktree_journal_tests {
 
     #[cfg(target_os = "linux")]
     impl ProcessExecutor for ReplaceAtCreation {
-        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
-            -> Result<ProcessOutput, ProcessFailure>
-        {
-            if command.arguments.windows(2).any(|pair| pair[0] == "worktree" && pair[1] == "add")
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            token: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command
+                .arguments
+                .windows(2)
+                .any(|pair| pair[0] == "worktree" && pair[1] == "add")
                 && !self.seen.swap(true, Ordering::SeqCst)
             {
                 // This is the innermost executor: all authority wrappers have
@@ -14547,20 +14877,48 @@ mod worktree_journal_tests {
                 "parent" => fixture.request.managed_root.clone(),
                 _ => fixture.request.destination.clone(),
             };
-            let parked = fixture.directory.path().join(format!("parked-{replacement}"));
-            let replacement_destination = if replacement == "source" { target.clone() }
-                else { fixture.request.destination.clone() };
-            let executor = Arc::new(ReplaceAtCreation { target, parked: parked.clone(),
-                destination: replacement_destination.clone(), seen: AtomicBool::new(false) });
+            let parked = fixture
+                .directory
+                .path()
+                .join(format!("parked-{replacement}"));
+            let replacement_destination = if replacement == "source" {
+                target.clone()
+            } else {
+                fixture.request.destination.clone()
+            };
+            let executor = Arc::new(ReplaceAtCreation {
+                target,
+                parked: parked.clone(),
+                destination: replacement_destination.clone(),
+                seen: AtomicBool::new(false),
+            });
             let service = RepositoryService::new("git", executor.clone());
-            let scoped = service.with_worktree_authority(
-                WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+            let scoped = service
+                .with_worktree_authority(
+                    WorktreeAuthority::capture(&fixture.request.repository).unwrap(),
+                )
+                .unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
-                7, &CancellationToken::new(), &sender);
-            assert!(executor.seen.load(Ordering::SeqCst), "the test must reach the delayed Git effect");
-            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{replacement}: {report:?}");
-            assert_eq!(fs::read(replacement_destination.join("foreign")).unwrap(), b"replacement work\n");
+            let report = scoped.create_worktree_journaled(
+                &fixture.store,
+                &fixture.request,
+                7,
+                &CancellationToken::new(),
+                &sender,
+            );
+            assert!(
+                executor.seen.load(Ordering::SeqCst),
+                "the test must reach the delayed Git effect"
+            );
+            assert_eq!(
+                report.state,
+                WorktreeOperationState::OutcomeUnknown,
+                "{replacement}: {report:?}"
+            );
+            assert_eq!(
+                fs::read(replacement_destination.join("foreign")).unwrap(),
+                b"replacement work\n"
+            );
             assert!(!replacement_destination.join("tracked.txt").exists());
             assert!(!replacement_destination.join(".git").exists());
             let original = match replacement {
@@ -14568,8 +14926,11 @@ mod worktree_journal_tests {
                 "destination" => parked,
                 _ => fixture.request.destination.clone(),
             };
-            assert_eq!(fs::read(original.join("tracked.txt")).unwrap(), b"committed content\n",
-                "the command must address only its retained destination");
+            assert_eq!(
+                fs::read(original.join("tracked.txt")).unwrap(),
+                b"committed content\n",
+                "the command must address only its retained destination"
+            );
         }
     }
 
@@ -14583,30 +14944,46 @@ mod worktree_journal_tests {
 
     #[cfg(target_os = "linux")]
     impl ProcessExecutor for AlterCreatedMetadata {
-        fn execute(&self, command: &CommandSpec, token: &CancellationToken)
-            -> Result<ProcessOutput, ProcessFailure>
-        {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            token: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
             let output = SystemProcessExecutor.execute(command, token)?;
-            if output.success && command.arguments.windows(2)
-                .any(|pair| pair[0] == "worktree" && pair[1] == "add")
+            if output.success
+                && command
+                    .arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == "worktree" && pair[1] == "add")
                 && !self.seen.swap(true, Ordering::SeqCst)
             {
                 let locator = fs::read(self.destination.join(".git")).unwrap();
-                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                let admin = bytes_to_path(trim_one_line_ending(
+                    locator.strip_prefix(b"gitdir: ").unwrap(),
+                ));
                 match self.alteration {
                     "locator" => {
-                        fs::write(self.destination.join(".git"),
-                            format!("gitdir: {}\n", self.foreign.display())).unwrap();
+                        fs::write(
+                            self.destination.join(".git"),
+                            format!("gitdir: {}\n", self.foreign.display()),
+                        )
+                        .unwrap();
                     }
                     "admin" => {
                         fs::rename(&admin, admin.with_extension("original")).unwrap();
                         fs::create_dir(&admin).unwrap();
                         fs::write(admin.join("foreign"), b"foreign admin\n").unwrap();
                     }
-                    "backlink" => fs::write(admin.join("gitdir"),
-                        format!("{}\n", self.foreign.join(".git").display())).unwrap(),
-                    "commondir" => fs::write(admin.join("commondir"),
-                        format!("{}\n", self.foreign.display())).unwrap(),
+                    "backlink" => fs::write(
+                        admin.join("gitdir"),
+                        format!("{}\n", self.foreign.join(".git").display()),
+                    )
+                    .unwrap(),
+                    "commondir" => fs::write(
+                        admin.join("commondir"),
+                        format!("{}\n", self.foreign.display()),
+                    )
+                    .unwrap(),
                     _ => unreachable!(),
                 }
             }
@@ -14622,26 +14999,57 @@ mod worktree_journal_tests {
             let foreign = fixture.directory.path().join("foreign-metadata");
             fs::create_dir(&foreign).unwrap();
             fs::write(foreign.join("keep"), b"unrelated metadata\n").unwrap();
-            let executor = Arc::new(AlterCreatedMetadata { destination: fixture.request.destination.clone(),
-                foreign: foreign.clone(), alteration, seen: AtomicBool::new(false) });
+            let executor = Arc::new(AlterCreatedMetadata {
+                destination: fixture.request.destination.clone(),
+                foreign: foreign.clone(),
+                alteration,
+                seen: AtomicBool::new(false),
+            });
             let scoped = RepositoryService::new("git", executor.clone())
-                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+                .with_worktree_authority(
+                    WorktreeAuthority::capture(&fixture.request.repository).unwrap(),
+                )
+                .unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
-                7, &CancellationToken::new(), &sender);
+            let report = scoped.create_worktree_journaled(
+                &fixture.store,
+                &fixture.request,
+                7,
+                &CancellationToken::new(),
+                &sender,
+            );
             assert!(executor.seen.load(Ordering::SeqCst));
-            assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{alteration}: {report:?}");
-            assert_eq!(fs::read(foreign.join("keep")).unwrap(), b"unrelated metadata\n");
-            assert_eq!(fs::read_dir(&foreign).unwrap().count(), 1,
-                "no destination command may rediscover or modify substituted metadata");
+            assert_eq!(
+                report.state,
+                WorktreeOperationState::OutcomeUnknown,
+                "{alteration}: {report:?}"
+            );
+            assert_eq!(
+                fs::read(foreign.join("keep")).unwrap(),
+                b"unrelated metadata\n"
+            );
+            assert_eq!(
+                fs::read_dir(&foreign).unwrap().count(),
+                1,
+                "no destination command may rediscover or modify substituted metadata"
+            );
             if alteration == "admin" {
                 let locator = fs::read(fixture.request.destination.join(".git")).unwrap();
-                let admin = bytes_to_path(trim_one_line_ending(locator.strip_prefix(b"gitdir: ").unwrap()));
+                let admin = bytes_to_path(trim_one_line_ending(
+                    locator.strip_prefix(b"gitdir: ").unwrap(),
+                ));
                 assert_eq!(fs::read(admin.join("foreign")).unwrap(), b"foreign admin\n");
                 assert_eq!(fs::read_dir(admin).unwrap().count(), 1);
             }
-            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
-            assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown, "{alteration}");
+            let recovered = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap();
+            assert_eq!(
+                recovered[0].state,
+                WorktreeOperationState::OutcomeUnknown,
+                "{alteration}"
+            );
         }
     }
 
@@ -14652,23 +15060,51 @@ mod worktree_journal_tests {
             let fixture = Fixture::new();
             let token = CancellationToken::new();
             let scoped = RepositoryService::new("git", Arc::new(CancelAtGit { after_exit }))
-                .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+                .with_worktree_authority(
+                    WorktreeAuthority::capture(&fixture.request.repository).unwrap(),
+                )
+                .unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
-                7, &token, &sender);
+            let report = scoped.create_worktree_journaled(
+                &fixture.store,
+                &fixture.request,
+                7,
+                &token,
+                &sender,
+            );
             assert!(token.is_cancelled());
-            let expected = if after_exit { WorktreeOperationState::Created }
-                else { WorktreeOperationState::OutcomeUnknown };
+            let expected = if after_exit {
+                WorktreeOperationState::Created
+            } else {
+                WorktreeOperationState::OutcomeUnknown
+            };
             assert_eq!(report.state, expected, "{after_exit}: {report:?}");
-            assert!(fixture.journal(fixture.request.operation_id).creation_authority
-                .as_ref().unwrap().has_published_destination());
-            let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+            assert!(
+                fixture
+                    .journal(fixture.request.operation_id)
+                    .creation_authority
+                    .as_ref()
+                    .unwrap()
+                    .has_published_destination()
+            );
+            let recovered = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap();
             assert_eq!(recovered[0].state, expected);
             if after_exit {
-                assert_eq!(fs::read(fixture.request.destination.join("tracked.txt")).unwrap(), b"committed content\n");
+                assert_eq!(
+                    fs::read(fixture.request.destination.join("tracked.txt")).unwrap(),
+                    b"committed content\n"
+                );
             } else {
-                assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none(),
-                    "a published directory is a known partial effect, never a rollback claim");
+                assert!(
+                    fs::read_dir(&fixture.request.destination)
+                        .unwrap()
+                        .next()
+                        .is_none(),
+                    "a published directory is a known partial effect, never a rollback claim"
+                );
             }
         }
     }

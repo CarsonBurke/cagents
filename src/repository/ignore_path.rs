@@ -123,14 +123,23 @@ mod tests {
     #[test]
     fn ignore_rule_updates_the_retained_directory_after_path_replacement() {
         let directory = tempfile::tempdir().unwrap();
-        let worktree = directory.path().join("worktree"); let original = directory.path().join("original");
-        fs::create_dir(&worktree).unwrap(); fs::write(worktree.join(".gitignore"), b"original-rule\n").unwrap();
+        let worktree = directory.path().join("worktree");
+        let original = directory.path().join("original");
+        fs::create_dir(&worktree).unwrap();
+        fs::write(worktree.join(".gitignore"), b"original-rule\n").unwrap();
         let root = crate::fs_safety::Root::open(&worktree).unwrap();
-        fs::rename(&worktree, &original).unwrap(); fs::create_dir(&worktree).unwrap();
+        fs::rename(&worktree, &original).unwrap();
+        fs::create_dir(&worktree).unwrap();
         fs::write(worktree.join(".gitignore"), b"replacement-rule\n").unwrap();
         add(&root, &RepoPath::parse("scratch [draft].txt").unwrap()).unwrap();
-        assert_eq!(fs::read(original.join(".gitignore")).unwrap(), b"original-rule\n/scratch\\ \\[draft\\].txt\n");
-        assert_eq!(fs::read(worktree.join(".gitignore")).unwrap(), b"replacement-rule\n");
+        assert_eq!(
+            fs::read(original.join(".gitignore")).unwrap(),
+            b"original-rule\n/scratch\\ \\[draft\\].txt\n"
+        );
+        assert_eq!(
+            fs::read(worktree.join(".gitignore")).unwrap(),
+            b"replacement-rule\n"
+        );
     }
 
     #[test]
@@ -148,7 +157,14 @@ mod tests {
                 .env("GIT_CONFIG_SYSTEM", "/dev/null")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_TERMINAL_PROMPT", "0")
-                .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "init.templateDir=",
+                ])
                 .args(args)
                 .current_dir(directory.path())
                 .output()
@@ -192,14 +208,22 @@ mod tests {
         fs::write(&ignore, b"# existing rule\nprivate/").unwrap();
         fs::set_permissions(&ignore, fs::Permissions::from_mode(0o640)).unwrap();
         let path = RepoPath::parse("new [literal].txt").unwrap();
-        add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).unwrap();
+        add(
+            &crate::fs_safety::Root::open(directory.path()).unwrap(),
+            &path,
+        )
+        .unwrap();
         assert_eq!(
             fs::read(&ignore).unwrap(),
             b"# existing rule\nprivate/\n/new\\ \\[literal\\].txt\n"
         );
         assert_eq!(fs::metadata(&ignore).unwrap().mode() & 0o777, 0o640);
         let before = fs::read(&ignore).unwrap();
-        add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).unwrap();
+        add(
+            &crate::fs_safety::Root::open(directory.path()).unwrap(),
+            &path,
+        )
+        .unwrap();
         assert_eq!(fs::read(&ignore).unwrap(), before);
     }
 
@@ -213,11 +237,21 @@ mod tests {
         let ignore = directory.path().join(".gitignore");
         let path = RepoPath::parse("new.txt").unwrap();
         symlink(&victim, &ignore).unwrap();
-        assert!(add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).is_err());
+        assert!(
+            add(
+                &crate::fs_safety::Root::open(directory.path()).unwrap(),
+                &path
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(&victim).unwrap(), b"keep\n");
         fs::remove_file(&ignore).unwrap();
         fs::hard_link(&victim, &ignore).unwrap();
-        add(&crate::fs_safety::Root::open(directory.path()).unwrap(), &path).unwrap();
+        add(
+            &crate::fs_safety::Root::open(directory.path()).unwrap(),
+            &path,
+        )
+        .unwrap();
         assert_eq!(fs::read(&victim).unwrap(), b"keep\n");
         assert_eq!(fs::read(&ignore).unwrap(), b"keep\n/new.txt\n");
     }

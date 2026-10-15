@@ -15,7 +15,12 @@ pub fn create(
     request: &CreateWorktreeRequest,
     cancellation: &CancellationToken,
 ) -> WorktreeOperationReport {
-    create_with_service(&RepositoryService::system("git"), store, request, cancellation)
+    create_with_service(
+        &RepositoryService::system("git"),
+        store,
+        request,
+        cancellation,
+    )
 }
 
 /// Reuses the durable journal with a caller's retained repository authority.
@@ -27,11 +32,5 @@ pub fn create_with_service<E: crate::process::ProcessExecutor>(
     cancellation: &CancellationToken,
 ) -> WorktreeOperationReport {
     let (progress, _receiver) = async_channel::bounded(8);
-    service.create_worktree_journaled(
-        store,
-        request,
-        1,
-        cancellation,
-        &progress,
-    )
+    service.create_worktree_journaled(store, request, 1, cancellation, &progress)
 }

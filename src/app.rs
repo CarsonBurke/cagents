@@ -4071,7 +4071,9 @@ impl ShortcutDraft {
             git_stage_all_conflicts: settings::format_chords(&shortcuts.git_stage_all_conflicts),
             git_unstage_all_staged: settings::format_chords(&shortcuts.git_unstage_all_staged),
             git_discard_all_unstaged: settings::format_chords(&shortcuts.git_discard_all_unstaged),
-            git_discard_all_untracked: settings::format_chords(&shortcuts.git_discard_all_untracked),
+            git_discard_all_untracked: settings::format_chords(
+                &shortcuts.git_discard_all_untracked,
+            ),
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -4592,12 +4594,24 @@ impl SettingsDraft {
             SettingsField::ShortcutChatToggleFastMode => {
                 self.keyboard_shortcuts.chat_toggle_fast_mode = value
             }
-            SettingsField::ShortcutGitStageAllUnstaged => { self.keyboard_shortcuts.git_stage_all_unstaged = value }
-            SettingsField::ShortcutGitStageAllUntracked => { self.keyboard_shortcuts.git_stage_all_untracked = value }
-            SettingsField::ShortcutGitStageAllConflicts => { self.keyboard_shortcuts.git_stage_all_conflicts = value }
-            SettingsField::ShortcutGitUnstageAllStaged => { self.keyboard_shortcuts.git_unstage_all_staged = value }
-            SettingsField::ShortcutGitDiscardAllUnstaged => { self.keyboard_shortcuts.git_discard_all_unstaged = value }
-            SettingsField::ShortcutGitDiscardAllUntracked => { self.keyboard_shortcuts.git_discard_all_untracked = value }
+            SettingsField::ShortcutGitStageAllUnstaged => {
+                self.keyboard_shortcuts.git_stage_all_unstaged = value
+            }
+            SettingsField::ShortcutGitStageAllUntracked => {
+                self.keyboard_shortcuts.git_stage_all_untracked = value
+            }
+            SettingsField::ShortcutGitStageAllConflicts => {
+                self.keyboard_shortcuts.git_stage_all_conflicts = value
+            }
+            SettingsField::ShortcutGitUnstageAllStaged => {
+                self.keyboard_shortcuts.git_unstage_all_staged = value
+            }
+            SettingsField::ShortcutGitDiscardAllUnstaged => {
+                self.keyboard_shortcuts.git_discard_all_unstaged = value
+            }
+            SettingsField::ShortcutGitDiscardAllUntracked => {
+                self.keyboard_shortcuts.git_discard_all_untracked = value
+            }
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5310,12 +5324,30 @@ fn settings_update(
             next.keyboard_shortcuts.chat_toggle_fast_mode = settings::parse_chords(value);
             Ok(())
         }
-        SettingsField::ShortcutGitStageAllUnstaged => { next.keyboard_shortcuts.git_stage_all_unstaged = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitStageAllUntracked => { next.keyboard_shortcuts.git_stage_all_untracked = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitStageAllConflicts => { next.keyboard_shortcuts.git_stage_all_conflicts = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitUnstageAllStaged => { next.keyboard_shortcuts.git_unstage_all_staged = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitDiscardAllUnstaged => { next.keyboard_shortcuts.git_discard_all_unstaged = settings::parse_chords(value); Ok(()) }
-        SettingsField::ShortcutGitDiscardAllUntracked => { next.keyboard_shortcuts.git_discard_all_untracked = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutGitStageAllUnstaged => {
+            next.keyboard_shortcuts.git_stage_all_unstaged = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitStageAllUntracked => {
+            next.keyboard_shortcuts.git_stage_all_untracked = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitStageAllConflicts => {
+            next.keyboard_shortcuts.git_stage_all_conflicts = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitUnstageAllStaged => {
+            next.keyboard_shortcuts.git_unstage_all_staged = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitDiscardAllUnstaged => {
+            next.keyboard_shortcuts.git_discard_all_unstaged = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitDiscardAllUntracked => {
+            next.keyboard_shortcuts.git_discard_all_untracked = settings::parse_chords(value);
+            Ok(())
+        }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -13691,14 +13723,19 @@ impl Cagents {
     /// `index.lock`, and the panel's own controls stand down while one is in
     /// flight, so this is the guard for a press that raced the frame.
     fn git_mutation_unavailable(&mut self, key: &ActiveWorktreeKey) -> bool {
-        let reason = self.sidebar_model.source_control.as_ref()
+        let reason = self
+            .sidebar_model
+            .source_control
+            .as_ref()
             .filter(|source| &source.key == key)
             .and_then(|source| source.mutation_unavailable_reason())
             .map(str::to_owned);
         if let Some(reason) = reason {
             self.status = Some(TransientNotice::warning(reason));
             true
-        } else { false }
+        } else {
+            false
+        }
     }
 
     fn begin_mutation(
@@ -13707,7 +13744,9 @@ impl Cagents {
         kind: MutationKind,
         commit_revision: Option<u64>,
     ) -> Option<uuid::Uuid> {
-        if self.git_mutation_unavailable(key) { return None; }
+        if self.git_mutation_unavailable(key) {
+            return None;
+        }
         if !self.source_control_is_bound(key)
             || self.folder_scope(key)
             || self
@@ -13747,7 +13786,9 @@ impl Cagents {
         key: ActiveWorktreeKey,
         request: QueuedGitMutation,
     ) -> Task<Message> {
-        if self.git_mutation_unavailable(&key) { return Task::none(); }
+        if self.git_mutation_unavailable(&key) {
+            return Task::none();
+        }
         if !self.source_control_is_bound(&key) || self.folder_scope(&key) {
             return Task::none();
         }
@@ -17298,10 +17339,28 @@ impl Application for Cagents {
                 Task::batch(tasks)
             }
             Message::Sidebar(action) => {
-                if let SidebarAction::RunChangeGroup { key, area, command, selection_revision } = action {
-                    if self.focused_repository_is_saving() || self.workspace_inputs_blocked() { return Task::none(); }
-                    let Some(action) = sidebar::resolve_captured_change_group(&self.sidebar_model, &self.sidebar_state, &key, area, command, selection_revision, self.modal_is_open()) else {
-                        self.status = Some(TransientNotice::warning("The original change group changed; choose it again"));
+                if let SidebarAction::RunChangeGroup {
+                    key,
+                    area,
+                    command,
+                    selection_revision,
+                } = action
+                {
+                    if self.focused_repository_is_saving() || self.workspace_inputs_blocked() {
+                        return Task::none();
+                    }
+                    let Some(action) = sidebar::resolve_captured_change_group(
+                        &self.sidebar_model,
+                        &self.sidebar_state,
+                        &key,
+                        area,
+                        command,
+                        selection_revision,
+                        self.modal_is_open(),
+                    ) else {
+                        self.status = Some(TransientNotice::warning(
+                            "The original change group changed; choose it again",
+                        ));
                         return Task::none();
                     };
                     return self.update(Message::Sidebar(action));
@@ -20178,7 +20237,10 @@ impl Application for Cagents {
                 {
                     rollback.optimistic_mutation(mutation.kind, selection);
                 }
-                let mutation_refused = self.sidebar_model.source_control.as_ref()
+                let mutation_refused = self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
                     .filter(|source| source.key.canonical_path == key.canonical_path)
                     .is_some_and(|source| !source.mutations_available());
                 // Roll back Git rows, never a newer host capability. On a
@@ -31372,26 +31434,85 @@ mod tests {
         let source = app.sidebar_model.source_control.as_ref().unwrap();
         let branch = source.branch.clone().unwrap();
         let target = source.upstream.clone().unwrap();
-        let selected = source.group(crate::repository::ChangeArea::Untracked).unwrap().rows()[0].selection();
-        let reason: Arc<str> = "This host provides repository reads without strong Git mutation authority.".into();
-        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+        let selected = source
+            .group(crate::repository::ChangeArea::Untracked)
+            .unwrap()
+            .rows()[0]
+            .selection();
+        let reason: Arc<str> =
+            "This host provides repository reads without strong Git mutation authority.".into();
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(Some(reason.clone()));
         for action in [
-            SidebarAction::Stage { key: key.clone(), selection: vec![selected.clone()] },
-            SidebarAction::Commit { key: key.clone(), message: "Do not commit".into(), amend: true },
-            SidebarAction::Push { key: key.clone(), branch, target },
-            SidebarAction::GitOperation { key: key.clone(), operation: crate::repository::GitOperation::Fetch { remote: "origin".into(), prune: true } },
+            SidebarAction::Stage {
+                key: key.clone(),
+                selection: vec![selected.clone()],
+            },
+            SidebarAction::Commit {
+                key: key.clone(),
+                message: "Do not commit".into(),
+                amend: true,
+            },
+            SidebarAction::Push {
+                key: key.clone(),
+                branch,
+                target,
+            },
+            SidebarAction::GitOperation {
+                key: key.clone(),
+                operation: crate::repository::GitOperation::Fetch {
+                    remote: "origin".into(),
+                    prune: true,
+                },
+            },
         ] {
             drop(app.update(Message::Sidebar(action)));
-            assert!(app.source_control_mutations.is_empty(), "actual host dispatch must refuse, not only hide a button");
+            assert!(
+                app.source_control_mutations.is_empty(),
+                "actual host dispatch must refuse, not only hide a button"
+            );
         }
-        assert!(app.notices.recent().any(|entry| entry.notice.message == reason.as_ref()));
-        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(None);
-        assert!(app.begin_mutation(&key, MutationKind::Stage, None).is_some());
-        app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason));
-        let before = app.sidebar_model.source_control.as_ref().unwrap().groups().to_vec();
+        assert!(
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message == reason.as_ref())
+        );
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(None);
+        assert!(
+            app.begin_mutation(&key, MutationKind::Stage, None)
+                .is_some()
+        );
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(Some(reason));
+        let before = app
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .unwrap()
+            .groups()
+            .to_vec();
         drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![selected])));
-        assert!(app.source_control_mutations[&key.canonical_path].pending.is_empty(), "a capability change cannot append another queued mutation");
-        assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().groups(), before.as_slice(), "refused queue admission must not project a stage");
+        assert!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .is_empty(),
+            "a capability change cannot append another queued mutation"
+        );
+        assert_eq!(
+            app.sidebar_model.source_control.as_ref().unwrap().groups(),
+            before.as_slice(),
+            "refused queue admission must not project a stage"
+        );
     }
 
     #[test]
@@ -32157,10 +32278,11 @@ mod tests {
             app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
             let key = app.sidebar_state.active_worktree().unwrap().clone();
             app.active_workspace = Some(key.canonical_path.clone());
-            app.sidebar_state.apply(&SidebarAction::CommitMessageChanged {
-                key: key.clone(),
-                message: "Kept draft".into(),
-            });
+            app.sidebar_state
+                .apply(&SidebarAction::CommitMessageChanged {
+                    key: key.clone(),
+                    message: "Kept draft".into(),
+                });
             app.sidebar_state.apply(&SidebarAction::AmendChanged {
                 key: key.clone(),
                 amend: true,
@@ -32176,16 +32298,31 @@ mod tests {
                 message: "Kept draft".into(),
                 amend: true,
             })));
-            assert!(!app.source_control_mutations.contains_key(&key.canonical_path));
-            assert!(app.sidebar_model.source_control.as_ref().unwrap().error
-                .as_deref().unwrap().contains("Finish or abort"));
+            assert!(
+                !app.source_control_mutations
+                    .contains_key(&key.canonical_path)
+            );
+            assert!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("Finish or abort")
+            );
             assert_eq!(app.sidebar_state.commit_message(), "Kept draft");
             app.sidebar_model.source_control.as_mut().unwrap().head_oid = None;
             drop(app.update(Message::Sidebar(SidebarAction::AmendChanged {
                 key: key.clone(),
                 amend: false,
             })));
-            assert!(app.sidebar_state.submitted_commit_revision(&key, "Kept draft", false).is_some());
+            assert!(
+                app.sidebar_state
+                    .submitted_commit_revision(&key, "Kept draft", false)
+                    .is_some()
+            );
         }
     }
 
@@ -32249,30 +32386,78 @@ mod tests {
                 let key = app.sidebar_state.active_worktree().unwrap().clone();
                 app.active_workspace = Some(key.canonical_path.clone());
                 let source = app.sidebar_model.source_control.as_ref().unwrap();
-                let first = source.group(crate::repository::ChangeArea::Unstaged).unwrap().rows()[0].selection();
-                let pending = source.group(crate::repository::ChangeArea::Untracked).unwrap().rows()[0].selection();
-                drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![first.clone()])));
+                let first = source
+                    .group(crate::repository::ChangeArea::Unstaged)
+                    .unwrap()
+                    .rows()[0]
+                    .selection();
+                let pending = source
+                    .group(crate::repository::ChangeArea::Untracked)
+                    .unwrap()
+                    .rows()[0]
+                    .selection();
+                drop(app.enqueue_git_mutation(
+                    key.clone(),
+                    QueuedGitMutation::Stage(vec![first.clone()]),
+                ));
                 let operation = app.source_control_mutations[&key.canonical_path].id;
-                if queued { drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending.clone()]))); }
-                let reason: Arc<str> = "Host mutation authority is no longer available; reads remain available.".into();
-                app.sidebar_model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(reason.clone()));
+                if queued {
+                    drop(app.enqueue_git_mutation(
+                        key.clone(),
+                        QueuedGitMutation::Stage(vec![pending.clone()]),
+                    ));
+                }
+                let reason: Arc<str> =
+                    "Host mutation authority is no longer available; reads remain available."
+                        .into();
+                app.sidebar_model
+                    .source_control
+                    .as_mut()
+                    .unwrap()
+                    .set_mutation_unavailable_reason(Some(reason.clone()));
                 // This owns a real admitted turn, but no fake Git process runs:
                 // deliver the exact completion through the application handler.
                 drop(app.update(Message::SourceControlMutated {
-                    key: key.clone(), operation,
-                    report: failed.then(|| "First stage failed".to_owned()), committed: false,
+                    key: key.clone(),
+                    operation,
+                    report: failed.then(|| "First stage failed".to_owned()),
+                    committed: false,
                 }));
-                assert!(app.source_control_mutations.is_empty(), "no queued work is promoted after capability refusal");
+                assert!(
+                    app.source_control_mutations.is_empty(),
+                    "no queued work is promoted after capability refusal"
+                );
                 let source = app.sidebar_model.source_control.as_ref().unwrap();
                 assert_eq!(source.mutation_unavailable_reason(), Some(reason.as_ref()));
                 assert!(!source.busy());
                 let staged = source.group(crate::repository::ChangeArea::Staged).unwrap();
-                assert_eq!(staged.rows().iter().any(|row| row.entry.path == first.path), !failed,
-                    "a completed first stage survives success; a failed stage rolls back");
-                assert!(!staged.rows().iter().any(|row| row.entry.path == pending.path), "unsupported pending work cannot remain optimistically staged");
-                assert!(source.group(crate::repository::ChangeArea::Untracked).unwrap().rows().iter().any(|row| row.entry.path == pending.path));
-                drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending])));
-                assert!(app.source_control_mutations.is_empty(), "later admission still observes the host refusal");
+                assert_eq!(
+                    staged.rows().iter().any(|row| row.entry.path == first.path),
+                    !failed,
+                    "a completed first stage survives success; a failed stage rolls back"
+                );
+                assert!(
+                    !staged
+                        .rows()
+                        .iter()
+                        .any(|row| row.entry.path == pending.path),
+                    "unsupported pending work cannot remain optimistically staged"
+                );
+                assert!(
+                    source
+                        .group(crate::repository::ChangeArea::Untracked)
+                        .unwrap()
+                        .rows()
+                        .iter()
+                        .any(|row| row.entry.path == pending.path)
+                );
+                drop(
+                    app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Stage(vec![pending])),
+                );
+                assert!(
+                    app.source_control_mutations.is_empty(),
+                    "later admission still observes the host refusal"
+                );
             }
         }
     }

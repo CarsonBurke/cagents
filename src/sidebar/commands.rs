@@ -28,24 +28,62 @@ pub struct GroupTarget {
 impl GroupTarget {
     pub fn capture(model: &SidebarModel, state: &SidebarState) -> Option<Self> {
         let source = model.source_control.as_ref()?;
-        (state.active_worktree() == Some(&source.key) && model.contains_worktree(&source.key))
-            .then(|| Self { key: source.key.clone(), selection_revision: state.change_selection_revision() })
+        (state.active_worktree() == Some(&source.key) && model.contains_worktree(&source.key)).then(
+            || Self {
+                key: source.key.clone(),
+                selection_revision: state.change_selection_revision(),
+            },
+        )
     }
-    pub fn available(&self, model: &SidebarModel, state: &SidebarState, command: Command, modal_open: bool) -> bool {
-        let Some((area, command)) = crate::workspace_widget::git_group_command_target(command) else { return false; };
+    pub fn available(
+        &self,
+        model: &SidebarModel,
+        state: &SidebarState,
+        command: Command,
+        modal_open: bool,
+    ) -> bool {
+        let Some((area, command)) = crate::workspace_widget::git_group_command_target(command)
+        else {
+            return false;
+        };
         state.active_worktree() == Some(&self.key)
-            && model.source_control.as_ref().is_some_and(|source| source.key == self.key)
+            && model
+                .source_control
+                .as_ref()
+                .is_some_and(|source| source.key == self.key)
             && state.change_selection_revision() == self.selection_revision
             && whole_change_group_available(model, state, area, command, modal_open)
     }
-    pub fn action(&self, model: &SidebarModel, state: &SidebarState, command: Command, modal_open: bool) -> Option<SidebarAction> {
+    pub fn action(
+        &self,
+        model: &SidebarModel,
+        state: &SidebarState,
+        command: Command,
+        modal_open: bool,
+    ) -> Option<SidebarAction> {
         let (area, command) = crate::workspace_widget::git_group_command_target(command)?;
-        resolve_captured_change_group(model, state, &self.key, area, command, self.selection_revision, modal_open)?;
-        Some(SidebarAction::RunChangeGroup { key: self.key.clone(), area, command, selection_revision: self.selection_revision })
+        resolve_captured_change_group(
+            model,
+            state,
+            &self.key,
+            area,
+            command,
+            self.selection_revision,
+            modal_open,
+        )?;
+        Some(SidebarAction::RunChangeGroup {
+            key: self.key.clone(),
+            area,
+            command,
+            selection_revision: self.selection_revision,
+        })
     }
 }
 
-pub const fn whole_group_command_id(area: ChangeArea, command: ChangeGroupCommand) -> Option<Command> {
+pub const fn whole_group_command_id(
+    area: ChangeArea,
+    command: ChangeGroupCommand,
+) -> Option<Command> {
     Some(match (area, command) {
         (ChangeArea::Unstaged, ChangeGroupCommand::Stage) => Command::GitStageAllUnstaged,
         (ChangeArea::Untracked, ChangeGroupCommand::Stage) => Command::GitStageAllUntracked,
@@ -384,11 +422,19 @@ impl CommandTarget {
             return None;
         }
         let current = source.group(row.area)?.visible_path(&row.path)?;
-        if !source.mutations_available() && matches!(command,
-            Command::StageSelectedChanges | Command::UnstageSelectedChanges
-            | Command::DiscardSelectedChanges | Command::IgnoreChangePath
-            | Command::GitAcceptOurs | Command::GitAcceptTheirs)
-        { return None; }
+        if !source.mutations_available()
+            && matches!(
+                command,
+                Command::StageSelectedChanges
+                    | Command::UnstageSelectedChanges
+                    | Command::DiscardSelectedChanges
+                    | Command::IgnoreChangePath
+                    | Command::GitAcceptOurs
+                    | Command::GitAcceptTheirs
+            )
+        {
+            return None;
+        }
         match command {
             Command::CopyRelativePath => {
                 return Some(SidebarAction::FileCommand {
@@ -432,7 +478,12 @@ impl CommandTarget {
         }
         // Header Stage/Unstage already queue work behind the active mutation.
         // Preserve that behavior for the same registered selection commands.
-        if source.busy() && !matches!(command, Command::StageSelectedChanges | Command::UnstageSelectedChanges) {
+        if source.busy()
+            && !matches!(
+                command,
+                Command::StageSelectedChanges | Command::UnstageSelectedChanges
+            )
+        {
             return None;
         }
         let operation = match command {
@@ -642,27 +693,64 @@ mod change_navigation_target_tests {
         let mut model = super::super::tests::panel_model();
         let state = super::super::tests::panel_state(&model);
         let source = model.source_control.as_ref().unwrap();
-        let row = source.group(ChangeArea::Untracked).unwrap().rows()[0].entry.clone();
+        let row = source.group(ChangeArea::Untracked).unwrap().rows()[0]
+            .entry
+            .clone();
         let target = CommandTarget::Changes {
-            key: source.key.clone(), row: ChangeSelectionRow { area: row.area, path: row.path },
+            key: source.key.clone(),
+            row: ChangeSelectionRow {
+                area: row.area,
+                path: row.path,
+            },
             selection_revision: state.change_selection_revision(),
         };
         let group = GroupTarget::capture(&model, &state).unwrap();
-        for command in [Command::StageSelectedChanges, Command::DiscardSelectedChanges, Command::IgnoreChangePath] {
-            assert!(target.resolve_in(&model, &state, command).is_some(), "writable positive: {command:?}");
+        for command in [
+            Command::StageSelectedChanges,
+            Command::DiscardSelectedChanges,
+            Command::IgnoreChangePath,
+        ] {
+            assert!(
+                target.resolve_in(&model, &state, command).is_some(),
+                "writable positive: {command:?}"
+            );
         }
         for command in crate::workspace_widget::GIT_GROUP_COMMANDS {
-            assert!(group.available(&model, &state, command, false), "writable whole area: {command:?}");
+            assert!(
+                group.available(&model, &state, command, false),
+                "writable whole area: {command:?}"
+            );
         }
-        model.source_control.as_mut().unwrap().set_mutation_unavailable_reason(Some(Arc::from("Read-only Git host")));
-        for command in [Command::StageSelectedChanges, Command::DiscardSelectedChanges, Command::IgnoreChangePath] {
-            assert!(target.resolve_in(&model, &state, command).is_none(), "captured mutation must be revalidated: {command:?}");
+        model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation_unavailable_reason(Some(Arc::from("Read-only Git host")));
+        for command in [
+            Command::StageSelectedChanges,
+            Command::DiscardSelectedChanges,
+            Command::IgnoreChangePath,
+        ] {
+            assert!(
+                target.resolve_in(&model, &state, command).is_none(),
+                "captured mutation must be revalidated: {command:?}"
+            );
         }
         for command in crate::workspace_widget::GIT_GROUP_COMMANDS {
-            assert!(group.action(&model, &state, command, false).is_none(), "captured whole-area action must be revalidated: {command:?}");
+            assert!(
+                group.action(&model, &state, command, false).is_none(),
+                "captured whole-area action must be revalidated: {command:?}"
+            );
         }
-        for command in [Command::OpenFile, Command::RevealInFiles, Command::CopyRelativePath] {
-            assert!(target.resolve_in(&model, &state, command).is_some(), "read-only operation remains available: {command:?}");
+        for command in [
+            Command::OpenFile,
+            Command::RevealInFiles,
+            Command::CopyRelativePath,
+        ] {
+            assert!(
+                target.resolve_in(&model, &state, command).is_some(),
+                "read-only operation remains available: {command:?}"
+            );
         }
     }
 

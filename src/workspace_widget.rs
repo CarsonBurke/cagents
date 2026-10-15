@@ -753,11 +753,26 @@ pub struct CommandContext {
 }
 
 /// Whole-area Git templates, distinct from explicit selected-row operations.
-pub const GIT_GROUP_COMMANDS: [GlobalShortcut; 6] = [GlobalShortcut::GitStageAllUnstaged, GlobalShortcut::GitStageAllUntracked, GlobalShortcut::GitStageAllConflicts, GlobalShortcut::GitUnstageAllStaged, GlobalShortcut::GitDiscardAllUnstaged, GlobalShortcut::GitDiscardAllUntracked];
+pub const GIT_GROUP_COMMANDS: [GlobalShortcut; 6] = [
+    GlobalShortcut::GitStageAllUnstaged,
+    GlobalShortcut::GitStageAllUntracked,
+    GlobalShortcut::GitStageAllConflicts,
+    GlobalShortcut::GitUnstageAllStaged,
+    GlobalShortcut::GitDiscardAllUnstaged,
+    GlobalShortcut::GitDiscardAllUntracked,
+];
 pub fn git_group_command_bit(command: GlobalShortcut) -> Option<u8> {
-    GIT_GROUP_COMMANDS.iter().position(|candidate| *candidate == command).map(|index| 1 << index)
+    GIT_GROUP_COMMANDS
+        .iter()
+        .position(|candidate| *candidate == command)
+        .map(|index| 1 << index)
 }
-pub const fn git_group_command_target(command: GlobalShortcut) -> Option<(crate::repository::ChangeArea, crate::sidebar::ChangeGroupCommand)> {
+pub const fn git_group_command_target(
+    command: GlobalShortcut,
+) -> Option<(
+    crate::repository::ChangeArea,
+    crate::sidebar::ChangeGroupCommand,
+)> {
     use crate::repository::ChangeArea;
     use crate::sidebar::ChangeGroupCommand;
     Some(match command {
@@ -765,8 +780,12 @@ pub const fn git_group_command_target(command: GlobalShortcut) -> Option<(crate:
         GlobalShortcut::GitStageAllUntracked => (ChangeArea::Untracked, ChangeGroupCommand::Stage),
         GlobalShortcut::GitStageAllConflicts => (ChangeArea::Conflict, ChangeGroupCommand::Stage),
         GlobalShortcut::GitUnstageAllStaged => (ChangeArea::Staged, ChangeGroupCommand::Unstage),
-        GlobalShortcut::GitDiscardAllUnstaged => (ChangeArea::Unstaged, ChangeGroupCommand::Discard),
-        GlobalShortcut::GitDiscardAllUntracked => (ChangeArea::Untracked, ChangeGroupCommand::Discard),
+        GlobalShortcut::GitDiscardAllUnstaged => {
+            (ChangeArea::Unstaged, ChangeGroupCommand::Discard)
+        }
+        GlobalShortcut::GitDiscardAllUntracked => {
+            (ChangeArea::Untracked, ChangeGroupCommand::Discard)
+        }
         _ => return None,
     })
 }
@@ -859,23 +878,46 @@ impl ShortcutDescriptor {
     /// Remote row navigation remains supported through its captured mask; it
     /// must not silently substitute Device files for a different user action.
     pub fn available_on_device(self, remote: bool) -> bool {
-        if !remote { return true; }
-        if git_group_command_bit(self.action).is_some() { return false; }
-        if matches!(self.scope, ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository | ShortcutScope::Review) { return false; }
-        !matches!(self.action,
-            GlobalShortcut::ResumeConversation | GlobalShortcut::NewWorktree
-            | GlobalShortcut::NewChannel | GlobalShortcut::CloneRepository
-            | GlobalShortcut::ChatAttach | GlobalShortcut::SearchInProject
-            | GlobalShortcut::MarkAllRead | GlobalShortcut::OpenInExternalEditor
-            | GlobalShortcut::ReviewConversationChanges | GlobalShortcut::RestartDaemon)
+        if !remote {
+            return true;
+        }
+        if git_group_command_bit(self.action).is_some() {
+            return false;
+        }
+        if matches!(
+            self.scope,
+            ShortcutScope::Editor
+                | ShortcutScope::EditorHistory
+                | ShortcutScope::Repository
+                | ShortcutScope::Review
+        ) {
+            return false;
+        }
+        !matches!(
+            self.action,
+            GlobalShortcut::ResumeConversation
+                | GlobalShortcut::NewWorktree
+                | GlobalShortcut::NewChannel
+                | GlobalShortcut::CloneRepository
+                | GlobalShortcut::ChatAttach
+                | GlobalShortcut::SearchInProject
+                | GlobalShortcut::MarkAllRead
+                | GlobalShortcut::OpenInExternalEditor
+                | GlobalShortcut::ReviewConversationChanges
+                | GlobalShortcut::RestartDaemon
+        )
     }
 
     pub fn available(self, context: &CommandContext) -> bool {
-        if !self.available_on_device(context.remote_device) { return false; }
+        if !self.available_on_device(context.remote_device) {
+            return false;
+        }
         if context.save_in_flight && self.action.blocked_during_save() {
             return false;
         }
-        if let Some(bit) = git_group_command_bit(self.action) { return context.git_group_commands & bit != 0; }
+        if let Some(bit) = git_group_command_bit(self.action) {
+            return context.git_group_commands & bit != 0;
+        }
         if let Some(bit) = git_command_bit(self.action) {
             return context.git_commands & bit != 0;
         }
@@ -2161,13 +2203,42 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Chat,
     },
-    ShortcutDescriptor { action: GlobalShortcut::GitStageAllUnstaged, label: "Stage all unstaged changes", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitStageAllUntracked, label: "Stage all untracked files", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitStageAllConflicts, label: "Stage all conflicts", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitUnstageAllStaged, label: "Unstage all staged changes", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUnstaged, label: "Discard all unstaged changes…", repeatable: false, scope: ShortcutScope::Workspace },
-    ShortcutDescriptor { action: GlobalShortcut::GitDiscardAllUntracked, label: "Delete all untracked files…", repeatable: false, scope: ShortcutScope::Workspace },
-
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStageAllUnstaged,
+        label: "Stage all unstaged changes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStageAllUntracked,
+        label: "Stage all untracked files",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitStageAllConflicts,
+        label: "Stage all conflicts",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitUnstageAllStaged,
+        label: "Unstage all staged changes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitDiscardAllUnstaged,
+        label: "Discard all unstaged changes…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::GitDiscardAllUntracked,
+        label: "Delete all untracked files…",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
