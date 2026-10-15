@@ -1707,10 +1707,13 @@ pub struct Field {
 pub enum RequestKind {
     /// Authorize a tool action or additional permissions. Never submit on Enter.
     #[default]
+    #[serde(alias = "approval")]
     Approval,
     /// Answer an ordinary question, including a yes/no confirmation.
+    #[serde(alias = "question")]
     Question,
     /// Provider-managed elicitation or consent. Explicit decisions remain required.
+    #[serde(alias = "consent")]
     Consent,
 }
 

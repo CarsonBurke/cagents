@@ -985,9 +985,11 @@ pub struct TerminalSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnapshotContent {
     /// Every row, self-contained. Always valid to apply.
+    #[serde(alias = "full")]
     Full { lines: Vec<WireRowSnapshot> },
     /// Only the rows that differ from `base_generation`. The receiver must hold
     /// exactly that generation, at these dimensions, or ask for a full repaint.
+    #[serde(alias = "delta")]
     Delta {
         base_generation: u64,
         rows: Vec<WireRowDelta>,

@@ -55,9 +55,9 @@ pub(super) fn normalize(value: &mut Value) {
             Value::Object(values) => {
                 // These fields contain externally tagged application enums. A
                 // user's environment and provider arguments are opaque maps.
-                if values.len() == 1 && matches!(field, "content" | "origin" | "session" | "placement" | "view_scope" | "kind" | "scope" | "owner") {
+                if values.len() == 1 && matches!(field, "content" | "origin" | "session" | "placement" | "view_scope" | "kind" | "scope" | "owner" | "state") {
                     let key = values.keys().next().unwrap().clone();
-                    if matches!(key.as_str(), "Text" | "Command" | "Tool" | "Changes" | "Image" | "WebSearch" | "Delivery" | "Child" | "Automation" | "Chat" | "Terminal" | "Channel" | "Worktree" | "Renamed" | "Session" | "Containing" | "Project") {
+                    if matches!(key.as_str(), "Text" | "Command" | "Tool" | "Changes" | "Image" | "WebSearch" | "Delivery" | "Child" | "Automation" | "Chat" | "Terminal" | "Channel" | "Worktree" | "Renamed" | "Session" | "Containing" | "Project" | "Approved" | "Full" | "Delta") {
                         let value = values.remove(&key).unwrap();
                         values.insert(snake(&key), value);
                     }
@@ -66,8 +66,8 @@ pub(super) fn normalize(value: &mut Value) {
                     if !matches!(key.as_str(), "environment" | "unset_environment" | "arguments") { walk(value, key); }
                 }
             },
-            Value::String(text) if matches!(field, "provider" | "surface" | "state" | "run_state" | "role" | "relation" | "phase" | "status" | "origin" | "action" | "kind" | "scope" | "owner" | "source") => {
-                if matches!(text.as_str(), "Omp" | "Claude" | "Codex" | "Chat" | "Terminal" | "Unknown" | "Idle" | "Working" | "Accepted" | "Running" | "Waiting" | "Succeeded" | "Failed" | "Cancelled" | "Interrupted" | "User" | "Assistant" | "System" | "Myself" | "Parent" | "Child" | "Peer" | "Final" | "Commentary" | "Denied" | "Stopped" | "Run" | "Read" | "Search" | "List" | "Added" | "Deleted" | "Updated" | "Report" | "Message" | "Notice" | "All" | "Ok" | "Warning" | "Limited" | "NeedsLogin" | "Unavailable" | "Live" | "Probe" | "Cache" | "Recorded") { *text = snake(text); }
+            Value::String(text) if matches!(field, "provider" | "surface" | "state" | "run_state" | "role" | "relation" | "phase" | "status" | "origin" | "action" | "kind" | "scope" | "owner" | "source" | "reach" | "title_source") => {
+                if matches!(text.as_str(), "Omp" | "Claude" | "Codex" | "Chat" | "Terminal" | "Unknown" | "Idle" | "Working" | "Accepted" | "Running" | "Waiting" | "Succeeded" | "Failed" | "Cancelled" | "Interrupted" | "User" | "Assistant" | "System" | "Myself" | "Parent" | "Child" | "Peer" | "Final" | "Commentary" | "Denied" | "Stopped" | "Run" | "Read" | "Search" | "List" | "Added" | "Deleted" | "Updated" | "Report" | "Message" | "Notice" | "Pending" | "Declined" | "Git" | "Folder" | "Prompt" | "Provider" | "Manual" | "Approval" | "Question" | "Consent" | "Delivered" | "Conversation" | "Inbox" | "Offline" | "Session" | "Weekly" | "Scoped" | "Other" | "All" | "Ok" | "Warning" | "Limited" | "NeedsLogin" | "Unavailable" | "Live" | "Probe" | "Cache" | "Recorded") { *text = snake(text); }
             }
             _ => {}
         }
@@ -85,6 +85,30 @@ mod tests {
         assert_eq!(relative_at(0, 180_000), "3 min ago");
         assert_eq!(table(&["NAME", "STATE"], vec![vec!["界".into(), "idle".into()], vec!["wide".into(), "idle".into()]], "No sessions"), "NAME  STATE\n界    idle\nwide  idle");
     }
+    #[test]
+    fn exposed_domain_enums_are_snake_case_and_accept_their_normalized_input() {
+        fn check<T: Serialize + serde::de::DeserializeOwned + std::fmt::Debug + PartialEq>(field: &str, value: T) {
+            let mut data = serde_json::json!({(field): value});
+            normalize(&mut data);
+            match &data[field] {
+                Value::String(text) => assert_eq!(text, &snake(text)),
+                Value::Object(fields) => assert!(fields.keys().all(|key| *key == snake(key))),
+                other => panic!("expected enum, got {other}"),
+            }
+            assert_eq!(serde_json::from_value::<T>(data[field].clone()).unwrap(), value);
+        }
+        use crate::{agent_execution::mailbox, automations::ProposalState, chat::RequestKind, model::{ProjectKind, ChannelTitleSource}};
+        for value in [ProposalState::Pending, ProposalState::Declined, ProposalState::Approved { automation: uuid::Uuid::nil(), execution_revision: 1 }] { check("state", value); }
+        for value in [ProjectKind::Git, ProjectKind::Folder] { check("kind", value); }
+        for value in [ChannelTitleSource::Prompt, ChannelTitleSource::Provider, ChannelTitleSource::Manual] { check("title_source", value); }
+        for value in [RequestKind::Approval, RequestKind::Question, RequestKind::Consent] { check("kind", value); }
+        for value in [mailbox::State::Pending, mailbox::State::Delivered, mailbox::State::Read] { check("state", value); }
+        for value in [mailbox::Reach::Conversation, mailbox::Reach::Inbox, mailbox::Reach::Offline] { check("reach", value); }
+        for value in [crate::account::WindowKind::Session, crate::account::WindowKind::Weekly, crate::account::WindowKind::Scoped, crate::account::WindowKind::Other] { check("kind", value); }
+        check("content", crate::terminal_ipc::SnapshotContent::Full { lines: vec![] });
+        check("content", crate::terminal_ipc::SnapshotContent::Delta { base_generation: 1, rows: vec![] });
+    }
+
     #[test]
     fn cli_enum_normalization_preserves_free_form_text() {
         let mut value = serde_json::json!({"provider":"Claude", "spec":{"surface":"Chat"},"run":{"state":"Succeeded","result":{"text":"Claude"},"environment":{"provider":"Claude","state":"Running"}}});

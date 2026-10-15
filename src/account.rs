@@ -598,13 +598,17 @@ pub fn clean_label(label: &str) -> Option<String> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowKind {
     /// A short rolling window, Claude's five hours or Codex's primary limit.
+    #[serde(alias = "session")]
     Session,
     /// A weekly allowance shared by everything the account does.
+    #[serde(alias = "weekly")]
     Weekly,
     /// A weekly allowance for one model or surface.
+    #[serde(alias = "scoped")]
     Scoped,
     /// A limit the provider reported under a name cagents does not know. It
     /// is still shown, under the provider's own words, rather than dropped.
+    #[serde(alias = "other")]
     Other,
 }
 

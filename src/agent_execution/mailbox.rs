@@ -120,10 +120,13 @@ impl Party {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum State {
     /// Not yet given to the recipient.
+    #[serde(alias = "pending")]
     Pending,
     /// Given to a live conversation as a prompt.
+    #[serde(alias = "delivered")]
     Delivered,
     /// Read with `cagents inbox`, or by the asker that waited for it.
+    #[serde(alias = "read")]
     Read,
 }
 
@@ -145,10 +148,13 @@ pub struct Message {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Reach {
     /// A live conversation receives it as a prompt once it is idle.
+    #[serde(alias = "conversation")]
     Conversation,
     /// A session in a terminal reads it with `cagents inbox`.
+    #[serde(alias = "inbox")]
     Inbox,
     /// No session of the lineage runs; the next one to start receives it.
+    #[serde(alias = "offline")]
     Offline,
 }
 
