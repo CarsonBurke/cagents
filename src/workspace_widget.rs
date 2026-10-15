@@ -2471,6 +2471,7 @@ fn text_editing_conflict(
     physical: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> bool {
+    if action == GlobalShortcut::ChatLatest && modifiers.control() && !modifiers.alt() && !modifiers.shift() && !modifiers.logo() && matches!(key, keyboard::Key::Named(keyboard::key::Named::End)) { return false; }
     if modifiers.alt() && !modifiers.control() && !modifiers.shift() && !modifiers.logo()
         && matches!((action, key.as_ref()), (GlobalShortcut::BrowserBack, keyboard::Key::Named(keyboard::key::Named::ArrowLeft)) | (GlobalShortcut::BrowserForward, keyboard::Key::Named(keyboard::key::Named::ArrowRight))) {
         return false;
@@ -7239,8 +7240,16 @@ mod tests {
         let end = keyboard::Event::KeyPressed { key: keyboard::Key::Named(Named::End), modified_key: keyboard::Key::Named(Named::End), physical_key: Physical::Code(Code::End), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false };
         let mut shortcuts = KeyboardShortcuts::default();
         assert!(shortcuts.fault().is_none());
-        for focused in [FocusedPane::Chat, FocusedPane::ChatPane] { assert_eq!(global_shortcut(&end, &shortcuts, focused), Some(GlobalShortcut::ChatLatest)); }
-        for focused in [FocusedPane::TextInput, FocusedPane::Editor, FocusedPane::Terminal, FocusedPane::SidebarRows] { assert_eq!(global_shortcut(&end, &shortcuts, focused), None); }
+        for focused in [FocusedPane::Chat, FocusedPane::ChatPane] {
+            assert_eq!(global_shortcut(&end, &shortcuts, focused), Some(GlobalShortcut::ChatLatest));
+            assert!(is_global_shortcut_chord(&keyboard::Key::Named(Named::End), Physical::Code(Code::End), keyboard::Modifiers::CTRL, &shortcuts, focused));
+        }
+        for focused in [FocusedPane::TextInput, FocusedPane::Editor, FocusedPane::Terminal, FocusedPane::SidebarRows] {
+            assert_eq!(global_shortcut(&end, &shortcuts, focused), None);
+            assert!(!is_global_shortcut_chord(&keyboard::Key::Named(Named::End), Physical::Code(Code::End), keyboard::Modifiers::CTRL, &shortcuts, focused));
+        }
+        assert!(crate::settings::text_editing_shortcut_conflict_for("chat_latest", parse_shortcut("Ctrl+End").unwrap()).is_none());
+        assert!(crate::settings::text_editing_shortcut_conflict_for("chat_send", parse_shortcut("Ctrl+End").unwrap()).is_some());
         shortcuts.chat_latest.clear();
         assert_eq!(global_shortcut(&end, &shortcuts, FocusedPane::Chat), None);
         shortcuts.chat_latest = vec!["Alt+F9".into()];

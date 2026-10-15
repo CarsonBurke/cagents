@@ -1480,6 +1480,7 @@ pub fn text_editing_shortcut_conflict_for(
 ) -> Option<&'static str> {
     if is_editor_command(action)
         || (action == "find_in_pane" && parse_shortcut("Ctrl+F").ok() == Some(binding))
+        || (action == "chat_latest" && parse_shortcut("Ctrl+End").ok() == Some(binding))
         || (action == "browser_back" && parse_shortcut("Alt+Left").ok() == Some(binding))
         || (action == "browser_forward" && parse_shortcut("Alt+Right").ok() == Some(binding))
     {
