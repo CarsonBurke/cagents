@@ -131,6 +131,16 @@ pub(crate) fn primary_checkout(directory: &Path, repository: &Path) -> Option<Pa
     (admin == common && common == repository).then(|| fs::canonicalize(directory).ok()).flatten()
 }
 
+/// Choose an available checkout on the filesystem-owning worker. A retained
+/// primary may disappear independently of usable linked worktrees.
+pub(crate) fn read_checkout(repository: &Path, checkout: Option<&Path>, primary: Option<&Path>) -> Option<PathBuf> {
+    primary.and_then(|root| primary_checkout(root, repository)).or_else(|| {
+        let root = checkout?;
+        let (_, common) = checkout_identity(root)?;
+        (common == repository).then(|| fs::canonicalize(root).ok()).flatten()
+    })
+}
+
 fn exists(path: &Path) -> Result<bool, String> {
     match fs::symlink_metadata(path) {
         Ok(_) => Ok(true),

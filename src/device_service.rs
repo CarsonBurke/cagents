@@ -16,6 +16,8 @@ pub enum Operation {
         kind: crate::model::ProjectKind,
         #[serde(default)]
         checkout: Option<PathBuf>,
+        #[serde(default)]
+        primary_checkout: Option<PathBuf>,
     },
     AccountsRead,
     AccountLifecycle {
@@ -186,8 +188,8 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }
-        Operation::ProjectNavigation { repository, kind, checkout } => {
-            navigation(repository, kind, checkout).map(Reply::ProjectNavigation)
+        Operation::ProjectNavigation { repository, kind, checkout, primary_checkout } => {
+            navigation(repository, kind, checkout, primary_checkout).map(Reply::ProjectNavigation)
         }
         Operation::AccountsRead => accounts(),
         Operation::AccountLifecycle { operation } => {
@@ -372,20 +374,15 @@ fn write_with_sync(
     })
 }
 #[cfg(feature = "host")]
-fn navigation(repository: PathBuf, kind: crate::model::ProjectKind, checkout: Option<PathBuf>) -> Result<Navigation, String> {
+fn navigation(repository: PathBuf, kind: crate::model::ProjectKind, checkout: Option<PathBuf>, primary_checkout: Option<PathBuf>) -> Result<Navigation, String> {
     let repository = std::fs::canonicalize(repository).map_err(|error| error.to_string())?;
     if kind == crate::model::ProjectKind::Folder {
         if !repository.is_dir() { return Err("Project directory is unavailable".into()); }
         return Ok(Navigation { worktrees: vec![NavigationWorktree { path: repository.clone(), ..Default::default() }], repository });
     }
     use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
-    let checkout = checkout.map(std::fs::canonicalize).transpose().map_err(|error| error.to_string())?;
-    let primary = if let Some(checkout) = &checkout {
-        let (admin, common) = crate::project_location::checkout_identity(checkout)
-            .ok_or_else(|| format!("Checkout {} has no readable Git identity", checkout.display()))?;
-        if common != repository { return Err(format!("Checkout {} belongs to another repository", checkout.display())); }
-        (admin == common).then_some(checkout.clone())
-    } else { None };
+    let checkout = crate::project_location::read_checkout(&repository, checkout.as_deref(), primary_checkout.as_deref());
+    let primary = checkout.as_deref().and_then(|root| crate::project_location::primary_checkout(root, &repository));
     let mut command = CommandSpec::new("git").cwd(checkout.unwrap_or_else(|| repository.clone())).args([
         "worktree", "list", "--porcelain", "-z",
     ]);
@@ -1650,7 +1647,7 @@ mod navigation_contract_tests {
     #[test]
     fn navigation_round_trips_on_binary_wire() {
         let operation = Operation::ProjectNavigation {
-            checkout: Some("/repo".into()),
+            checkout: Some("/repo".into()), primary_checkout: None,
             repository: "/repo/.git".into(),
             kind: crate::model::ProjectKind::Git,
         };
@@ -1676,7 +1673,7 @@ mod navigation_contract_tests {
         let checkout = root.path().join("checkout");
         let metadata = root.path().join("metadata elsewhere");
         assert!(std::process::Command::new("git").args(["init", "--separate-git-dir"]).arg(&metadata).arg(&checkout).output().unwrap().status.success());
-        let result = navigation(metadata.clone(), crate::model::ProjectKind::Git, Some(checkout.clone())).unwrap();
+        let result = navigation(metadata.clone(), crate::model::ProjectKind::Git, Some(checkout.clone()), None).unwrap();
         assert_eq!(result.repository, metadata.canonicalize().unwrap());
         assert_eq!(result.worktrees.len(), 1);
         assert_eq!(result.worktrees[0].path, checkout.canonicalize().unwrap());
@@ -1697,14 +1694,14 @@ mod navigation_contract_tests {
                 .unwrap()
                 .success()
         );
-        let result = navigation(repo.join(".git"), crate::model::ProjectKind::Git, None).unwrap();
+        let result = navigation(repo.join(".git"), crate::model::ProjectKind::Git, None, None).unwrap();
         assert_eq!(result.worktrees.len(), 1);
         assert_eq!(result.worktrees[0].path, repo.canonicalize().unwrap());
         assert_eq!(
             result.worktrees[0].branch.as_deref(),
             Some("refs/heads/main")
         );
-        let result = navigation(root.path().into(), crate::model::ProjectKind::Folder, None).unwrap();
+        let result = navigation(root.path().into(), crate::model::ProjectKind::Folder, None, None).unwrap();
         assert_eq!(
             result.worktrees[0].path,
             root.path().canonicalize().unwrap()
