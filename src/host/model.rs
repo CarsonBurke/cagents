@@ -195,12 +195,15 @@ impl Registry {
                 })
             })
             .collect::<Result<Vec<_>, String>>()?;
+        let views = views::all(&self.db)?;
+        let agents = self.agents(None)?;
+        let session_location_refusals = session_locations::refusals(&self.db, &views, &agents)?;
         Ok(WorkspaceModel {
             navigation_orders,
-            views: views::all(&self.db)?,
-            agents: self.agents(None)?,
+            views,
+            agents,
             agent_locations: agent_locations::all(&self.db)?,
-            session_location_refusals: session_locations::refusals(&self.db)?,
+            session_location_refusals,
             identity,
             sequence: sequence as u64,
             projects,
