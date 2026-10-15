@@ -172,6 +172,15 @@ impl Handle {
     pub(crate) fn is_remote_record(record: &crate::daemon::holder_registry::Record) -> bool {
         RemoteActor::is_record(record)
     }
+    /// Read-only proof for an exact cold cleanup retry. This proves only the
+    /// named actor's semantic/helper retirement, never absence of a replacement
+    /// or permission to delete account/session history.
+    pub(crate) fn retained_retirement_proved(
+        record: &crate::daemon::holder_registry::Record,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<bool, String> {
+        RemoteActor::retirement_proved(record, proof)
+    }
     pub(crate) fn wake_retained_outcomes(&self) {
         if let Owner::Remote(remote) = &self.0 {
             remote.wake_outcomes();
