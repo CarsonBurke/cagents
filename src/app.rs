@@ -17540,6 +17540,12 @@ impl Application for Cagents {
                 ));
             }
         }
+        // First-run action buttons are workspace navigation even though no
+        // pane exists yet. Their form fields remain native text inputs.
+        focus_regions.extend([
+            "onboarding.open-folder", "onboarding.clone", "onboarding.home-chat",
+            "onboarding.provider.omp", "onboarding.provider.claude", "onboarding.provider.codex",
+        ].into_iter().map(|id| (widget::Id::new(id), workspace_widget::FocusedPane::Other.into())));
         let surface = crate::input_trace::observe_keyboard_events(
             surface,
             &self.input_trace,
