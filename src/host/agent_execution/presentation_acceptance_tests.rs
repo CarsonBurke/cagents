@@ -767,7 +767,7 @@ fn combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation() {
     let context = Arc::new(ExecutionContext::new(Some(Arc::new(
         std::fs::File::open(directory).unwrap(),
     ))));
-    let process = ProcessSpec {
+    let process_spec = ProcessSpec {
         execution: Some(context.clone()),
         messages: None,
         transport: TransportSpec::OwnedUnixWebSocket { socket },
@@ -777,7 +777,7 @@ fn combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation() {
         environment: Default::default(),
         unset_environment: Default::default(),
     };
-    let mut holder = chat::native_holder::spawn(process, original.clone()).unwrap();
+    let mut holder = chat::native_holder::spawn(process_spec, original.clone()).unwrap();
     context.installed();
     let owner = holders::evidence(
         &holders::socket(&holders::directory(Kind::Native).unwrap(), id),
