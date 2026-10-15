@@ -510,7 +510,15 @@ impl Worker {
         current: &AtomicU64,
         external: &HashMap<String, Arc<External>>,
     ) -> Option<Vec<Match>> {
-        self.search_composed(inputs, provider, query, generation, current, external, &HashMap::new())
+        self.search_composed(
+            inputs,
+            provider,
+            query,
+            generation,
+            current,
+            external,
+            &HashMap::new(),
+        )
     }
     /// Supplemental blocks precede the ordinary document or its authoritative
     /// replacement, matching the Original disclosure before normal tool details.
@@ -534,7 +542,11 @@ impl Worker {
             }
             let extra = external.get(&input.item.id);
             let prefix = supplemental.get(&input.item.id);
-            if extra.into_iter().chain(prefix).any(|owner| owner.item.as_ref() != input.item.id) {
+            if extra
+                .into_iter()
+                .chain(prefix)
+                .any(|owner| owner.item.as_ref() != input.item.id)
+            {
                 return None;
             }
             if self.documents.get(&input.item.id).is_none_or(|cached| {
@@ -568,7 +580,12 @@ impl Worker {
                     },
                 );
                 if let Some(prefix) = prefix {
-                    parsed.blocks = prefix.blocks.iter().chain(parsed.blocks.iter()).cloned().collect();
+                    parsed.blocks = prefix
+                        .blocks
+                        .iter()
+                        .chain(parsed.blocks.iter())
+                        .cloned()
+                        .collect();
                 }
                 parsed.revision = self.document_revision;
                 self.documents.insert(
@@ -988,7 +1005,10 @@ mod external_tests {
     fn find_supplemental_preserves_output_or_changes_in_displayed_prefix_order() {
         let mut original = input("a");
         Arc::make_mut(&mut original.item).content = ItemContent::Tool {
-            name: "tool".into(), input: "{}".into(), output: "needle output".into(), status: ToolStatus::Succeeded,
+            name: "tool".into(),
+            input: "{}".into(),
+            output: "needle output".into(),
+            status: ToolStatus::Succeeded,
         };
         let inputs = [original];
         let raw_id = crate::app::chat_ui::selection::logical_identity("a", &[10, 0]);
@@ -997,42 +1017,133 @@ mod external_tests {
         let prefix = HashMap::from([("a".into(), raw.clone())]);
         let current = AtomicU64::new(1);
         let mut worker = Worker::default();
-        let ordinary = worker.search_composed(&inputs, Provider::Claude, "needle", 1, &current, &HashMap::new(), &prefix).unwrap();
-        assert_eq!(ordinary.iter().map(|found| found.identity).collect::<Vec<_>>(), vec![raw_id, output_id]);
+        let ordinary = worker
+            .search_composed(
+                &inputs,
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+                &HashMap::new(),
+                &prefix,
+            )
+            .unwrap();
+        assert_eq!(
+            ordinary
+                .iter()
+                .map(|found| found.identity)
+                .collect::<Vec<_>>(),
+            vec![raw_id, output_id]
+        );
         let patches = HashMap::from([("a".into(), owner("a", 2, &[(60, "needle patch")]))]);
-        let composed = worker.search_composed(&inputs, Provider::Claude, "needle", 1, &current, &patches, &prefix).unwrap();
-        assert_eq!(composed.iter().map(|found| found.identity).collect::<Vec<_>>(), vec![raw_id, 60]);
-        assert!(Arc::ptr_eq(&worker.documents["a"].document.blocks[0].text, &raw.blocks[0].text));
-        assert!(Arc::ptr_eq(&worker.documents["a"].document.blocks[1].text, &patches["a"].blocks[0].text));
+        let composed = worker
+            .search_composed(
+                &inputs,
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+                &patches,
+                &prefix,
+            )
+            .unwrap();
+        assert_eq!(
+            composed
+                .iter()
+                .map(|found| found.identity)
+                .collect::<Vec<_>>(),
+            vec![raw_id, 60]
+        );
+        assert!(Arc::ptr_eq(
+            &worker.documents["a"].document.blocks[0].text,
+            &raw.blocks[0].text
+        ));
+        assert!(Arc::ptr_eq(
+            &worker.documents["a"].document.blocks[1].text,
+            &patches["a"].blocks[0].text
+        ));
         let result = Results::with_composed_revisions(composed, &inputs, 0, &patches, &prefix);
         assert!(result.sources["a"].matches_external(patches.get("a")));
         assert!(result.sources["a"].matches_supplemental(prefix.get("a")));
-        assert!(!result.sources["a"].matches_supplemental(Some(&owner("a", 3, &[(raw_id, "needle rewritten")]))));
-        assert!(!result.sources["a"].matches_external(Some(&owner("a", 4, &[(60, "needle new patch")]))));
+        assert!(!result.sources["a"].matches_supplemental(Some(&owner(
+            "a",
+            3,
+            &[(raw_id, "needle rewritten")]
+        ))));
+        assert!(!result.sources["a"].matches_external(Some(&owner(
+            "a",
+            4,
+            &[(60, "needle new patch")]
+        ))));
     }
 
     #[test]
     fn find_supplemental_negative_proof_and_base_cache_both_track_exact_sources() {
         let mut inputs = [input("a")];
         Arc::make_mut(&mut inputs[0].item).content = ItemContent::Tool {
-            name: "tool".into(), input: "{}".into(), output: "old".into(), status: ToolStatus::Succeeded,
+            name: "tool".into(),
+            input: "{}".into(),
+            output: "old".into(),
+            status: ToolStatus::Succeeded,
         };
         let prefix = HashMap::from([("a".into(), owner("a", 1, &[(10, "original")]))]);
         let current = AtomicU64::new(1);
         let mut worker = Worker::default();
-        let matches = worker.search_composed(&inputs, Provider::Claude, "needle", 1, &current, &HashMap::new(), &prefix).unwrap();
+        let matches = worker
+            .search_composed(
+                &inputs,
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+                &HashMap::new(),
+                &prefix,
+            )
+            .unwrap();
         assert!(matches.is_empty());
         let old = Results::with_composed_revisions(matches, &inputs, 0, &HashMap::new(), &prefix);
-        assert!(!old.sources["a"].matches_supplemental(None), "removing a prefix fences negative results too");
+        assert!(
+            !old.sources["a"].matches_supplemental(None),
+            "removing a prefix fences negative results too"
+        );
         let previous = worker.documents["a"].document.revision;
         Arc::make_mut(&mut inputs[0].item).content = ItemContent::Tool {
-            name: "tool".into(), input: "{}".into(), output: "needle".into(), status: ToolStatus::Succeeded,
+            name: "tool".into(),
+            input: "{}".into(),
+            output: "needle".into(),
+            status: ToolStatus::Succeeded,
         };
-        let matches = worker.search_composed(&inputs, Provider::Claude, "needle", 1, &current, &HashMap::new(), &prefix).unwrap();
-        assert_eq!(matches.len(), 1, "unchanged Original owner cannot hide a changed normal output");
+        let matches = worker
+            .search_composed(
+                &inputs,
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+                &HashMap::new(),
+                &prefix,
+            )
+            .unwrap();
+        assert_eq!(
+            matches.len(),
+            1,
+            "unchanged Original owner cannot hide a changed normal output"
+        );
         assert_ne!(worker.documents["a"].document.revision, previous);
         let wrong = HashMap::from([("a".into(), owner("foreign", 2, &[(10, "needle")]))]);
-        assert!(worker.search_composed(&inputs, Provider::Claude, "needle", 1, &current, &HashMap::new(), &wrong).is_none());
+        assert!(
+            worker
+                .search_composed(
+                    &inputs,
+                    Provider::Claude,
+                    "needle",
+                    1,
+                    &current,
+                    &HashMap::new(),
+                    &wrong
+                )
+                .is_none()
+        );
     }
 
     #[test]
@@ -1044,14 +1155,40 @@ mod external_tests {
         let prefix = HashMap::from([("a".into(), raw)]);
         let current = AtomicU64::new(1);
         let mut worker = Worker::default();
-        let matches = worker.search_composed(&inputs, Provider::Claude, "needle", 1, &current, &HashMap::new(), &prefix).unwrap();
+        let matches = worker
+            .search_composed(
+                &inputs,
+                Provider::Claude,
+                "needle",
+                1,
+                &current,
+                &HashMap::new(),
+                &prefix,
+            )
+            .unwrap();
         let proof = Results::with_composed_revisions(matches, &inputs, 0, &HashMap::new(), &prefix);
         drop(prefix);
-        assert!(header.upgrade().is_none(), "results retain no supplemental header");
-        assert!(text.upgrade().is_some(), "the worker still owns its composed text blocks");
+        assert!(
+            header.upgrade().is_none(),
+            "results retain no supplemental header"
+        );
+        assert!(
+            text.upgrade().is_some(),
+            "the worker still owns its composed text blocks"
+        );
         drop(worker);
-        assert!(text.upgrade().is_none(), "dropping idle worker releases actual body allocation");
-        assert!(proof.sources["a"].supplemental.as_ref().unwrap().upgrade().is_none());
+        assert!(
+            text.upgrade().is_none(),
+            "dropping idle worker releases actual body allocation"
+        );
+        assert!(
+            proof.sources["a"]
+                .supplemental
+                .as_ref()
+                .unwrap()
+                .upgrade()
+                .is_none()
+        );
     }
 
     #[test]

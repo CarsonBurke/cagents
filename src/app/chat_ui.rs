@@ -3205,11 +3205,21 @@ impl Runtime {
                         .lock()
                         .ok()?
                         .search_composed(
-                            &inputs, provider, &query, generation, &current, &external, &supplemental,
+                            &inputs,
+                            provider,
+                            &query,
+                            generation,
+                            &current,
+                            &external,
+                            &supplemental,
                         )
                         .map(|matches| {
                             find::Results::with_composed_revisions(
-                                matches, &inputs, scope, &external, &supplemental,
+                                matches,
+                                &inputs,
+                                scope,
+                                &external,
+                                &supplemental,
                             )
                         })
                 })
@@ -3353,7 +3363,10 @@ impl Runtime {
             .get(&item.id)
             .map(|owner| owner.revision)
             .hash(&mut hash);
-        self.find_supplemental.get(&item.id).map(|owner| owner.revision).hash(&mut hash);
+        self.find_supplemental
+            .get(&item.id)
+            .map(|owner| owner.revision)
+            .hash(&mut hash);
         if let Some(paint) = self.find_paint_for(item) {
             paint.signatures.get(item.id.as_str()).hash(&mut hash);
             paint
@@ -3414,12 +3427,19 @@ impl Runtime {
             self.find_supplemental_complete = true;
             return;
         }
-        let valid = documents.iter().all(|(id, owner)| owner.item.as_ref() == id);
+        let valid = documents
+            .iter()
+            .all(|(id, owner)| owner.item.as_ref() == id);
         let changed = self.find_supplemental.len() != documents.len()
-            || documents.iter().any(|(id, owner)| self.find_supplemental.get(id)
-                .is_none_or(|previous| !Arc::ptr_eq(previous, owner)));
+            || documents.iter().any(|(id, owner)| {
+                self.find_supplemental
+                    .get(id)
+                    .is_none_or(|previous| !Arc::ptr_eq(previous, owner))
+            });
         self.find_supplemental_complete = complete && valid;
-        if !changed && valid { return; }
+        if !changed && valid {
+            return;
+        }
         self.find_supplemental = if valid { documents } else { HashMap::new() };
         self.invalidate_find_documents();
     }
@@ -12336,25 +12356,55 @@ mod tests {
         let mut snapshot = (*chat_runtime(&app, card).snapshot).clone();
         snapshot.generation += 1;
         snapshot.items = vec![Arc::new(chat::Item {
-            id: "raw-root".into(), role: chat::Role::Assistant, at: None, started_at: None,
-            content: ItemContent::Tool { name: "tool".into(), input: "{}".into(), output: "needle output".into(), status: chat::ToolStatus::Succeeded },
+            id: "raw-root".into(),
+            role: chat::Role::Assistant,
+            at: None,
+            started_at: None,
+            content: ItemContent::Tool {
+                name: "tool".into(),
+                input: "{}".into(),
+                output: "needle output".into(),
+                status: chat::ToolStatus::Succeeded,
+            },
         })];
         show_chat_snapshot_for_test(&mut app, card, snapshot);
-        app.chat_runtime_mut(target).unwrap().expanded.insert("raw-root".into());
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .expanded
+            .insert("raw-root".into());
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
         let raw_id = selection::logical_identity("raw-root", &[10, 0]);
         let document = Arc::new(find::External {
-            item: "raw-root".into(), revision: 1,
-            blocks: vec![find::Block { identity: raw_id, text: Arc::from("needle original") }].into(),
+            item: "raw-root".into(),
+            revision: 1,
+            blocks: vec![find::Block {
+                identity: raw_id,
+                text: Arc::from("needle original"),
+            }]
+            .into(),
         });
         let header = Arc::downgrade(&document);
         let body = Arc::downgrade(&document.blocks[0].text);
-        app.chat_runtime_mut(target).unwrap().set_find_supplemental(HashMap::from([("raw-root".into(), document)]), false);
-        app.chat_runtime_mut(target).unwrap().set_find_external(HashMap::new(), true);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_supplemental(HashMap::from([("raw-root".into(), document)]), false);
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_external(HashMap::new(), true);
         complete_find_for_test(&mut app, target);
         let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.find_matches.iter().map(|found| found.identity).collect::<Vec<_>>(), vec![raw_id, selection::logical_identity("raw-root", &[5])]);
-        assert!(runtime.find_result_label().contains("Search incomplete"), "one complete family must not override the other family's missing source");
+        assert_eq!(
+            runtime
+                .find_matches
+                .iter()
+                .map(|found| found.identity)
+                .collect::<Vec<_>>(),
+            vec![raw_id, selection::logical_identity("raw-root", &[5])]
+        );
+        assert!(
+            runtime.find_result_label().contains("Search incomplete"),
+            "one complete family must not override the other family's missing source"
+        );
         assert!(runtime.find_paint_for(&runtime.snapshot.items[0]).is_some());
         let old = runtime.find_sources["raw-root"].clone();
         drop(app.handle_chat_ui(Action::CloseFind(target)));
@@ -12362,10 +12412,23 @@ mod tests {
         assert!(runtime.find_supplemental.is_empty());
         assert!(!runtime.find_source_current("raw-root", &old));
         assert!(header.upgrade().is_none() && body.upgrade().is_none());
-        let late = Arc::new(find::External { item: "raw-root".into(), revision: 2, blocks: vec![find::Block { identity: raw_id, text: Arc::from("late body") }].into() });
+        let late = Arc::new(find::External {
+            item: "raw-root".into(),
+            revision: 2,
+            blocks: vec![find::Block {
+                identity: raw_id,
+                text: Arc::from("late body"),
+            }]
+            .into(),
+        });
         let late_body = Arc::downgrade(&late.blocks[0].text);
-        app.chat_runtime_mut(target).unwrap().set_find_supplemental(HashMap::from([("raw-root".into(), late)]), true);
-        assert!(late_body.upgrade().is_none(), "a closed query cannot reacquire supplemental bodies");
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .set_find_supplemental(HashMap::from([("raw-root".into(), late)]), true);
+        assert!(
+            late_body.upgrade().is_none(),
+            "a closed query cannot reacquire supplemental bodies"
+        );
     }
 
     #[test]
