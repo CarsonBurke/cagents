@@ -88,7 +88,7 @@ pub(super) fn message_actions<'a>(
     actions: Element<'a, Message>,
     alignment: Alignment,
 ) -> Element<'a, Message> {
-    iced::widget::hover(
+    super::message_hover::hover(
         widget::column::with_children(vec![
             message,
             widget::Space::new().height(MESSAGE_ACTION_HEIGHT).into(),
@@ -4569,7 +4569,7 @@ fn answers_view<'a>(
     }
     let answers = ordered_answers(request);
     let primary = primary_answer(request).map(|choice| &choice.id);
-    widget::row::with_children(
+    super::answer_row::row(
         answers
             .into_iter()
             .map(|choice| {
@@ -4618,12 +4618,6 @@ fn answers_view<'a>(
             })
             .collect::<Vec<_>>(),
     )
-    .spacing(step::GAP_S)
-    .align_y(Alignment::Center)
-    // Answers wrap rather than run off the edge of a narrow pane: an
-    // answer a reader cannot see is an answer they do not have.
-    .wrap()
-    .into()
 }
 
 pub(super) fn ordered_answers(request: &chat::Request) -> Vec<&chat::Choice> {
@@ -6484,7 +6478,11 @@ mod tests {
                 phase: chat::Phase::Final,
             },
         };
-        let (mut runtime, _handle) = frame_cost::live_runtime(&[item]);
+        let (mut runtime, handle) = frame_cost::live_runtime(&[item]);
+        let mut confirmed = (*handle.snapshot()).clone();
+        confirmed.session_id = Some("confirmed-fixture-session".into());
+        handle.publish_snapshot_for_test(confirmed);
+        runtime.refresh();
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let mut tree = Tree::empty();
         for stage in 0..=12 {
@@ -6593,6 +6591,7 @@ mod tests {
         };
         let answers = Answers::default();
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for width in [160.0, 640.0] {
         for surface in [RequestSurface::Transcript, RequestSurface::Permissions] {
             let mut tree = Tree::empty();
             for restoring in [false, true, false] {
@@ -6609,7 +6608,7 @@ mod tests {
                 let node = element.as_widget_mut().layout(
                     &mut tree,
                     &renderer,
-                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(640.0, 1000.0)),
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 1000.0)),
                 );
                 let accessible = element.as_widget().a11y_nodes(
                     Layout::new(&node),
@@ -6626,7 +6625,8 @@ mod tests {
                         .iter()
                         .chain(accessible.children())
                         .find(|node| {
-                            node.node().label().is_some_and(|name| {
+                            node.node().role() == iced_accessibility::accesskit::Role::Button
+                            && node.node().label().is_some_and(|name| {
                                 name == label
                                     || name.strip_suffix(" (Enter)") == Some(label)
                                     || name.strip_suffix(" (Esc)") == Some(label)
@@ -6636,11 +6636,12 @@ mod tests {
                     assert_eq!(
                         control.node().is_disabled(),
                         disabled,
-                        "{label} while restoring={restoring}"
+                        "{width}px: {label} while restoring={restoring}"
                     );
                 }
             }
         }
+    }
     }
 
     #[test]

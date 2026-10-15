@@ -14,6 +14,8 @@ use std::sync::{
 };
 
 mod auth_recovery;
+mod answer_row;
+mod message_hover;
 mod changes;
 mod clipboard_image;
 mod clipboard_intent;
@@ -17594,7 +17596,7 @@ mod tests {
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let runtime = app.chat_runtime_mut(target).unwrap();
-        let mut snapshot = (*runtime.snapshot).clone();
+        let mut snapshot = (*runtime.handle().unwrap().snapshot()).clone();
         snapshot.items = vec![Arc::new(chat::Item {
             id: "user".into(),
             role: chat::Role::User,
@@ -17670,7 +17672,7 @@ mod tests {
             let target = chat_runtime(&app, card).target;
             let runtime = app.chat_runtime_mut(target).unwrap();
             runtime.session.launch.provider = provider;
-            let mut snapshot = (*runtime.snapshot).clone();
+            let mut snapshot = (*runtime.handle().unwrap().snapshot()).clone();
             snapshot.items = vec![Arc::new(chat::Item {
                 id: "turn/user".into(),
                 role: chat::Role::User,
