@@ -3193,8 +3193,15 @@ fn process_inner(
                 (retained, state.native_closing.contains_key(&chat_id))
             };
             let closed_receipt = if retained.native_continuity.retains_provider() {
-                let state = host.lock().unwrap_or_else(|p| p.into_inner());
-                chat::native_holder::closed_source(&retained, state.proof())
+                let proof = host.lock().unwrap_or_else(|p| p.into_inner()).proof().clone();
+                // Authenticated receipt discovery reads the holder registry and
+                // filesystem. Keep the lifecycle claim, but never HostState.
+                #[cfg(test)]
+                {
+                    let hook = ORDINARY_CLOSE_BEFORE_RECEIPT.lock().unwrap().take();
+                    if let Some(hook) = hook { hook(); }
+                }
+                chat::native_holder::closed_source(&retained, &proof)
                     .map_err(unavailable)?
                     .is_some()
             } else {
@@ -3204,7 +3211,8 @@ fn process_inner(
                 // Closing an exited attachment proves only that local actor is
                 // gone. A server preserved by an earlier failed adoption must
                 // also acknowledge exact cleanup before this close can succeed.
-                close_retained_native(host, &retained).map_err(unavailable)?;
+                native_cleanup::close_retained_under_transition(host, &retained)
+                    .map_err(unavailable)?;
                 return Ok(ServerResponse::ChatClosed { chat_id, snapshot });
             }
             let terminal = {
@@ -5885,4 +5893,13 @@ done
         drop(release);
         handle.close().unwrap();
     }
+}
+
+#[cfg(test)]
+pub(super) use native_cleanup::after_retained_close_reservation;
+#[cfg(test)]
+static ORDINARY_CLOSE_BEFORE_RECEIPT: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(in crate::host) fn before_ordinary_close_receipt(hook: impl FnOnce() + Send + 'static) {
+    *ORDINARY_CLOSE_BEFORE_RECEIPT.lock().unwrap() = Some(Box::new(hook));
 }

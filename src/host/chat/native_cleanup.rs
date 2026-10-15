@@ -56,6 +56,22 @@ struct RetainedPair {
 /// Only the authenticated exact holder and current exclusive daemon lease can
 /// authorize it; disappearance alone never counts as a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
+    // A retained helper can restart a backend without changing its logical
+    // Handle or execution_instance. Serialize the entire cold close with that
+    // lifecycle transition before reconciliation, adoption or close effects.
+    let transition = restart::transition_gate(host, source.id);
+    let _transition = match transition.try_lock() {
+        Ok(guard) => guard,
+        Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return Err("This exact conversation already has a lifecycle transition in progress; retry its current pane".into());
+        }
+    };
+    close_retained_under_transition(host, source)
+}
+
+/// Only callers already retaining this chat's lifecycle claim may enter here.
+pub(super) fn close_retained_under_transition(host: &SharedHost, source: &Session) -> Result<(), String> {
     // Refuse a degraded installed store before even reconciling an exact
     // startup owner, adopting a holder or requesting provider teardown.
     super::super::agent_execution::retirement_registry(host)?;
@@ -159,6 +175,11 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
         state.inventory_generation += 1;
         (state.proof().clone(), pending, actor)
     };
+    #[cfg(test)]
+    if !restart && consent.is_none() {
+        let hook = RETAINED_CLOSE_AFTER_RESERVATION.lock().unwrap().take();
+        if let Some(hook) = hook { hook(); }
+    }
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
@@ -606,4 +627,13 @@ static PRESENTATION_CLOSE_BEFORE_PROVIDER: std::sync::Mutex<Option<Box<dyn FnOnc
 #[cfg(test)]
 pub(in crate::host) fn before_presentation_provider_close(hook: impl FnOnce() + Send + 'static) {
     *PRESENTATION_CLOSE_BEFORE_PROVIDER.lock().unwrap() = Some(Box::new(hook));
+}
+
+// Test scheduling only, after the real transition/reservation and before any
+// holder adoption. The hook supplies no ownership or teardown evidence.
+#[cfg(test)]
+static RETAINED_CLOSE_AFTER_RESERVATION: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(in crate::host) fn after_retained_close_reservation(hook: impl FnOnce() + Send + 'static) {
+    *RETAINED_CLOSE_AFTER_RESERVATION.lock().unwrap() = Some(Box::new(hook));
 }
