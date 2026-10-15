@@ -11,7 +11,6 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 import time
 
 
@@ -30,13 +29,6 @@ def process_is_current(identity):
         return int(fields[19]) == identity["start"]
     except (FileNotFoundError, ProcessLookupError):
         return False
-
-
-def evidence_ignores(directory, names):
-    # Holder sockets use the terminal UUID as their basename, without a suffix.
-    # A failed teardown must still preserve its log and registry evidence.
-    return {name for name in names if name in ("cagents", "cagentsd")
-            or (Path(directory) / name).is_socket()}
 
 
 class Instance:
@@ -127,94 +119,100 @@ def main():
         for product in ("cagents", "cagentsd"):
             with (legacy / product).open("rb") as executable:
                 legacy_products[product] = hashlib.file_digest(executable, "sha256").hexdigest()
-    args.evidence.mkdir(parents=True, exist_ok=False)
+    args.evidence = args.evidence.resolve()
+    args.evidence.mkdir(mode=0o700, parents=True, exist_ok=False)
     checks = []
-    with tempfile.TemporaryDirectory(prefix="cagents-lifecycle-", dir="/var/tmp") as temporary:
-        root = Path(temporary)
+    # Persistent disk-backed evidence is the live recovery root, not a copy.
+    # Never remove it merely because a daemon Child exited or a case failed.
+    root = args.evidence / "instances"
+    root.mkdir(mode=0o700)
+    try:
+        # Leave time to capture the retained holder even on a loaded host.
+        instance = Instance(root / "retention", binaries, retention=3)
         try:
-            # Leave time to capture the retained holder even on a loaded host.
-            instance = Instance(root / "retention", binaries, retention=3)
-            try:
-                terminal = instance.spawn("/bin/true")
-                holder_paths = list(instance.socket.parent.joinpath("holders").glob("*.json"))
-                holders = [json.loads(path.read_text())["holder"] for path in holder_paths]
-                assert holders, "the completed terminal never published a retained holder"
-                wait_until(lambda: not instance.terminals(), description="exited terminal retirement")
-                for holder in holders:
-                    wait_until(lambda: not process_is_current(holder),
-                               description="retired terminal holder exit")
-                checks.append({"contract": "exited_unattached_terminal_and_holder_retire", "terminal": terminal,
-                               "holders": holders})
-            finally:
-                instance.close()
-            instance = Instance(root / "idle", binaries, idle=1)
-            try:
-                instance.process.wait(timeout=10)
-                assert instance.process.returncode == 0
-                checks.append({"contract": "empty_development_daemon_exits", "exit_code": 0})
-            finally:
-                instance.close()
-            instance = Instance(root / "busy", binaries, idle=1)
-            try:
-                terminal = instance.spawn("/bin/sleep", "60")
-                time.sleep(2)
-                assert instance.process.poll() is None, "idle policy stopped a detached live terminal"
-                instance.cli("terminal", "close", terminal)
-                instance.process.wait(timeout=10)
-                checks.append({"contract": "detached_terminal_prevents_idle_exit_until_closed", "terminal": terminal})
-            finally:
-                instance.close()
-            for busy in (False, True):
-                version = root / f"version-{busy}"
-                version.mkdir()
-                for product in ("cagents", "cagentsd"):
-                    try:
-                        os.link(binaries / product, version / product)
-                    except OSError:
-                        shutil.copy2(binaries / product, version / product)
-                instance = Instance(root / f"stale-{busy}", version)
-                try:
-                    terminal = instance.spawn("/bin/sleep", "60") if busy else None
-                    (version / "cagentsd").unlink()
-                    result = instance.cli("daemon", "cleanup-stale-development")
-                    if busy:
-                        assert not result["stopped"], result
-                        assert instance.process.poll() is None
-                        assert instance.terminals(), "cleanup discarded a hosted terminal"
-                    else:
-                        assert result["stopped"], result
-                        instance.process.wait(timeout=5)
-                        assert instance.process.returncode == 0
-                    checks.append({"contract": "stale_executable_cleanup", "busy": busy, "stopped": result["stopped"],
-                                   "terminal": terminal})
-                finally:
-                    instance.close()
-            if legacy:
-                version = root / "legacy-version"
-                version.mkdir()
-                for product in ("cagents", "cagentsd"):
-                    try:
-                        os.link(legacy / product, version / product)
-                    except OSError:
-                        shutil.copy2(legacy / product, version / product)
-                instance = Instance(root / "stale-legacy", version)
-                try:
-                    (version / "cagentsd").unlink()
-                    result = instance.cli("daemon", "cleanup-stale-development",
-                                          executable=binaries / "cagents")
-                    assert not result["stopped"], result
-                    assert instance.process.poll() is None, "unsupported old daemon received a stop signal"
-                    assert not instance.terminals()
-                    checks.append({"contract": "unsupported_old_development_daemon_is_preserved",
-                                   "pid": instance.process.pid, "stopped": False})
-                finally:
-                    instance.close()
+            terminal = instance.spawn("/bin/true")
+            holder_paths = list(instance.socket.parent.joinpath("holders").glob("*.json"))
+            holders = [json.loads(path.read_text())["holder"] for path in holder_paths]
+            assert holders, "the completed terminal never published a retained holder"
+            wait_until(lambda: not instance.terminals(), description="exited terminal retirement")
+            for holder in holders:
+                wait_until(lambda: not process_is_current(holder),
+                           description="retired terminal holder exit")
+            checks.append({"contract": "exited_unattached_terminal_and_holder_retire", "terminal": terminal,
+                           "holders": holders})
         finally:
-            # Preserve failure evidence before TemporaryDirectory removes the
-            # isolated state; no fixture binary copies are retained.
-            shutil.copytree(root, args.evidence / "instances", ignore=evidence_ignores)
-            (args.evidence / "result.json").write_text(json.dumps({"products": products, "legacy_products": legacy_products,
-                "checks": checks, "completed": len(checks) == 5 + bool(legacy)}, indent=2) + "\n")
+            instance.close()
+        instance = Instance(root / "idle", binaries, idle=1)
+        try:
+            instance.process.wait(timeout=10)
+            assert instance.process.returncode == 0
+            checks.append({"contract": "empty_development_daemon_exits", "exit_code": 0})
+        finally:
+            instance.close()
+        instance = Instance(root / "busy", binaries, idle=1)
+        try:
+            terminal = instance.spawn("/bin/sleep", "60")
+            time.sleep(2)
+            assert instance.process.poll() is None, "idle policy stopped a detached live terminal"
+            instance.cli("terminal", "close", terminal)
+            instance.process.wait(timeout=10)
+            checks.append({"contract": "detached_terminal_prevents_idle_exit_until_closed", "terminal": terminal})
+        finally:
+            instance.close()
+        for busy in (False, True):
+            version = root / f"version-{busy}"
+            version.mkdir()
+            for product in ("cagents", "cagentsd"):
+                try:
+                    os.link(binaries / product, version / product)
+                except OSError:
+                    shutil.copy2(binaries / product, version / product)
+            instance = Instance(root / f"stale-{busy}", version)
+            try:
+                terminal = instance.spawn("/bin/sleep", "60") if busy else None
+                (version / "cagentsd").unlink()
+                result = instance.cli("daemon", "cleanup-stale-development")
+                if busy:
+                    assert not result["stopped"], result
+                    assert instance.process.poll() is None
+                    assert instance.terminals(), "cleanup discarded a hosted terminal"
+                else:
+                    assert result["stopped"], result
+                    instance.process.wait(timeout=5)
+                    assert instance.process.returncode == 0
+                checks.append({"contract": "stale_executable_cleanup", "busy": busy, "stopped": result["stopped"],
+                               "terminal": terminal})
+            finally:
+                instance.close()
+        if legacy:
+            version = root / "legacy-version"
+            version.mkdir()
+            for product in ("cagents", "cagentsd"):
+                try:
+                    os.link(legacy / product, version / product)
+                except OSError:
+                    shutil.copy2(legacy / product, version / product)
+            instance = Instance(root / "stale-legacy", version)
+            try:
+                (version / "cagentsd").unlink()
+                result = instance.cli("daemon", "cleanup-stale-development",
+                                      executable=binaries / "cagents")
+                assert not result["stopped"], result
+                assert instance.process.poll() is None, "unsupported old daemon received a stop signal"
+                assert not instance.terminals()
+                checks.append({"contract": "unsupported_old_development_daemon_is_preserved",
+                               "pid": instance.process.pid, "stopped": False})
+            finally:
+                instance.close()
+    finally:
+        # Retain ORIGINAL state, sockets and recovery evidence on every path.
+        # Reaping our daemon Child alone cannot prove that a preserved holder
+        # or its family settled. Only the outer strict guardian may authorize
+        # later cleanup; copying and deleting this root would lose that owner.
+        (args.evidence / "result.json").write_text(json.dumps({"products": products, "legacy_products": legacy_products,
+            "checks": checks, "completed": len(checks) == 5 + bool(legacy),
+            "original_instances": str(root),
+            "family_settlement": "required_from_outer_guardian_not_proved_by_this_fixture"}, indent=2) + "\n")
     print(json.dumps({"passed": len(checks), "evidence": str(args.evidence)}))
 
 
