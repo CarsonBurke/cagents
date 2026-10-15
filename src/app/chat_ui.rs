@@ -728,6 +728,9 @@ impl ChangeToken {
     /// The item's body when the only change since this token was taken is bytes
     /// appended to it, so the cached parse can be extended instead of redone.
     fn appended<'a>(&self, previous: &str, content: &'a ItemContent) -> Option<&'a str> {
+        self.appended_known(previous, content, false)
+    }
+    fn appended_known<'a>(&self, previous: &str, content: &'a ItemContent, proven: bool) -> Option<&'a str> {
         let ItemContent::Text {
             text,
             thinking,
@@ -740,6 +743,7 @@ impl ChangeToken {
             return None;
         }
         // `get` also rejects a rewrite that left the old length mid-character.
+        if proven { return Some(text.as_str()); }
         let parsed = text.get(..self.body)?;
         (parsed == previous).then_some(text.as_str())
     }
@@ -2380,6 +2384,9 @@ impl Runtime {
         for (item, growing) in items {
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
+            let append_proven = self.cache.get(&item.id).and_then(|cached| cached.item.as_ref())
+                .filter(|previous| !Arc::ptr_eq(previous, item))
+                .is_some_and(|previous| self.handle().is_some_and(|handle| handle.known_append(previous, item)));
             if let Some(cached) = self.cache.get_mut(&item.id) {
                 if matches!(item.content, ItemContent::Image { .. }) {
                     // Snapshot items are immutable. A retained Arc makes the
@@ -2407,7 +2414,7 @@ impl Runtime {
                 }
                 if let Some(previous) = cached.item.as_ref()
                     && let ItemContent::Text { text, .. } = &previous.content
-                    && let Some(body) = cached.token.appended(text, &item.content)
+                    && let Some(body) = cached.token.appended_known(text, &item.content, append_proven)
                 {
                     cached.extend(body, growing, self.syntax_theme);
                     presentation_changed = true;
