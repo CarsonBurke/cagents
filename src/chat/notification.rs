@@ -16,8 +16,15 @@ pub struct Preview {
 impl Preview {
     pub(super) fn observe(&mut self, event: &Event) {
         match event {
-            Event::TurnStarted | Event::Reset { .. } => *self = Self::default(),
-            Event::Item(item) if item.role == Role::User && self.topic.is_empty() => {
+            Event::TurnStarted => {
+                // Claude emits its actual user item before TurnStarted in the
+                // accepted Send step. Preserve that message label while the
+                // response excerpt resets; the next live user item replaces it.
+                let topic = std::mem::take(&mut self.topic);
+                *self = Self { topic, ..Default::default() };
+            }
+            Event::Reset { .. } => *self = Self::default(),
+            Event::Item(item) if item.role == Role::User => {
                 if let ItemContent::Text { text, thinking: false, .. } = &item.content {
                     // A provider may have no conversation title. Use only its
                     // current live message as a short opt-in label; this is
@@ -380,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn notification_topic_fallback_is_bounded_and_fenced_to_the_live_turn() {
+    fn notification_topic_fallback_is_bounded_and_fenced_to_live_messages() {
         let mut state = Snapshot::default();
         let message = |text: &str| Event::Item(super::super::Item {
             id: "current-user".into(), role: Role::User, at: None, started_at: None,
@@ -392,7 +399,9 @@ mod tests {
         assert_eq!(state.notification_content(Kind::Succeeded).conversation, "Provider conversation name");
         state.title = None;
         Arc::make_mut(&mut state.notification_preview).observe(&Event::TurnStarted);
-        assert!(state.notification_content(Kind::Waiting).conversation.is_empty());
+        assert_eq!(state.notification_content(Kind::Waiting).conversation, "Repair config_file.rs");
+        Arc::make_mut(&mut state.notification_preview).observe(&message("Review the next change"));
+        assert_eq!(state.notification_content(Kind::Waiting).conversation, "Review the next change");
         Arc::make_mut(&mut state.notification_preview).observe(&message(&"🦀".repeat(100_000)));
         assert!(state.notification_content(Kind::Succeeded).conversation.chars().count() <= presentation::TITLE_LIMIT);
         Arc::make_mut(&mut state.notification_preview).observe(&Event::Reset { reason: "Fixture new conversation".into() });

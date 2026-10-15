@@ -8418,6 +8418,19 @@ mod tests {
     }
 
     #[test]
+    fn notification_label_survives_the_actual_send_step_event_order() {
+        let mut adapter = Claude { ready: true, ..Default::default() };
+        let mut step = adapter.send_prompt("Repair `config_file.rs`".into(), Vec::new(), PromptMode::Send).unwrap();
+        let user = step.events.iter().position(|event| matches!(event, Event::Item(item) if item.role == Role::User)).unwrap();
+        let started = step.events.iter().position(|event| matches!(event, Event::TurnStarted)).unwrap();
+        assert!(user < started, "exercise the real command-step ordering");
+        step.events.push(Event::TurnFinished { key: Some("fixture-turn".into()), outcome: crate::notifications::Kind::Succeeded });
+        let contexts = crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default()).project(&step.events);
+        assert_eq!(contexts.len(), 1);
+        assert_eq!(contexts[0].conversation, "Repair config_file.rs");
+    }
+
+    #[test]
     fn notification_without_provider_title_uses_its_current_message_label() {
         let receipts = crate::chat::runtime::notification_frames_for_test(
             Box::new(Claude { busy: true, ready: true, ..Default::default() }),
