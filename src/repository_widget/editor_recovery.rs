@@ -8,6 +8,13 @@ pub(super) struct State {
     pub(super) pending: Option<crate::editor::RecoveryAuthority>,
 }
 impl RepositoryRuntime {
+    #[cfg(test)]
+    pub(crate) fn cross_presence_observation_fixture(card: CardId, name: &str) -> Self {
+        let (mut runtime, _) = Self::open_fixture(card, name, "");
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.present = false; document.saved_present = false;
+        runtime
+    }
     pub fn has_editor_recovery(&self) -> bool { self.recovery.as_ref().is_some_and(|state| !state.authority.is_resolved()) || self.recovery_capture_ticket.is_some() }
 
     /// A publisher can hand an unopened-file recovery to its owning runtime.

@@ -18481,6 +18481,16 @@ impl Application for Cagents {
                 })
             }
             Message::Repository(action) => {
+                // Exit has already made its ownership decision. Pure metadata
+                // cannot admit its first effectful restoration capture now;
+                // completion receipts from already admitted effects still pass.
+                if self.exit.is_some() && matches!(&action,
+                    RepositoryAction::DiskMetadata { .. } | RepositoryAction::Save { .. }
+                    | RepositoryAction::AutoSaveDue { .. } | RepositoryAction::StageSelected { .. }
+                    | RepositoryAction::ApplyDiffHunk { .. } | RepositoryAction::ApplyDiffSelection { .. }
+                    | RepositoryAction::RevertFile { .. } | RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }) {
+                    return Task::none();
+                }
                 if let RepositoryAction::DiffAnnotations {
                     identity,
                     review_revision,
@@ -24560,6 +24570,25 @@ mod tests {
                 assert!(app.exit.unwrap().is_complete());
             });
         }
+    }
+
+    #[tokio::test]
+    async fn exit_rejects_late_pure_metadata_before_it_can_admit_effectful_capture() {
+        use cosmic::iced::futures::StreamExt;
+        let directory = tempfile::tempdir().unwrap(); std::fs::write(directory.path().join("source.rs"), "outside").unwrap();
+        let mut app = context_inspector_test_app(true); let card = app.workspace.focused().unwrap();
+        let mut runtime = RepositoryRuntime::cross_presence_observation_fixture(card, "source.rs");
+        runtime.descriptor.worktree = directory.path().into();
+        let task = runtime.refresh_open_document(card);
+        let mut stream = iced::runtime::task::into_stream(task).expect("pure metadata probe");
+        let iced::runtime::Action::Output(metadata) = stream.next().await.expect("actual metadata receipt") else { panic!("metadata output"); };
+        assert!(matches!(metadata, RepositoryAction::DiskMetadata { result: Ok(Some(_)), .. }));
+        assert!(!runtime.has_editor_recovery());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.core.set_main_window_id(Some(window::Id::unique()));
+        drop(app.exit_after_language_servers()); assert!(app.exit.is_some());
+        drop(app.update(Message::Repository(metadata)));
+        assert!(!app.card_has_editor_recovery(card), "no effectful capture nonce can be admitted after the window closes");
     }
 
     #[test]

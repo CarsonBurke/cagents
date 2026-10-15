@@ -186,10 +186,10 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn refresh_subscription(&self) -> Subscription<Message> {
-        let sidebar = if self.refresh_ui.focused && !self.modal_is_open() && !self.update_prepared {
+        let sidebar = if self.exit.is_none() && self.refresh_ui.focused && !self.modal_is_open() && !self.update_prepared {
             cosmic::iced::time::every(Duration::from_secs(10)).map(|_| Message::RefreshUi(Action::Tick))
         } else { Subscription::none() };
-        let documents = if !self.update_prepared && !crate::device::is_remote()
+        let documents = if self.exit.is_none() && !self.update_prepared && !crate::device::is_remote()
             && self.cards.values().any(|runtime| matches!(runtime, CardRuntime::Repository(runtime) if runtime.observes_open_sources())) {
             cosmic::iced::time::every(Duration::from_secs(1)).map(|_| Message::RefreshUi(Action::DocumentsTick))
         } else { Subscription::none() };
@@ -201,7 +201,7 @@ impl Cagents {
 
     pub(super) fn update_refresh(&mut self, action: Action) -> Task<Message> {
         if matches!(action, Action::DocumentsTick) {
-            if self.update_prepared || crate::device::is_remote() { return Task::none(); }
+            if self.exit.is_some() || self.update_prepared || crate::device::is_remote() { return Task::none(); }
             return Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| match runtime {
                 CardRuntime::Repository(runtime) => Some(repository_task(runtime.refresh_open_sources(card))),
                 _ => None,
