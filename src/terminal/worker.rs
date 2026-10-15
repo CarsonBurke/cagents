@@ -1811,6 +1811,13 @@ impl Worker {
             }
             None => command_from_recipe(&session.launch),
         };
+        if let Some(program)=&config.execution_program {
+            if config.adoption.is_some() || crate::agent_execution::console_agent(&session.launch).is_none()
+                || config.agent_authority.token().is_none() {
+                return Err("A private matched executable is allowed only for a new authenticated provider-console view".into());
+            }
+            program.validate()?;
+        }
         for name in crate::account::launch_credential_overrides(&session.launch) {
             command.env_remove(name);
         }
@@ -1889,13 +1896,14 @@ impl Worker {
                     command.env("PATH", path);
                 }
                 (
-                    holder::spawn_recoverable_with_authority(
+                    holder::spawn_recoverable_with_execution(
                         command,
                         pty_size(current_size),
                         child_exit_tx,
                         config.holder_recovery.clone(),
                         config.execution_directory.clone(),
                         config.setup_execution_lease.clone(),
+                        config.execution_program.clone(),
                     )?,
                     Vec::new(),
                 )

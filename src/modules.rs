@@ -24,6 +24,8 @@ pub mod browser;
 pub mod capability;
 pub mod chat;
 pub mod companion;
+#[doc(hidden)]
+pub mod console_identity;
 pub mod control;
 pub(crate) mod daemon;
 #[cfg(feature = "ui")]

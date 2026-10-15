@@ -4,6 +4,7 @@
 // daemon install both (see `instance::install_panic_hook`) because their
 // spawners redirect those descriptors to /dev/null.
 fn main() -> std::process::ExitCode {
+    if let Some(exit)=cagents::console_identity::respond_if_requested() {return exit;}
     // SAFETY: first statement of main, before any thread exists. A daemon or
     // window this command starts inherits its environment.
     unsafe { cagents::account::detach_inherited_selections() };

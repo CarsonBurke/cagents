@@ -102,6 +102,9 @@ enum Request {
         anchored_directory: bool,
         #[serde(default)]
         setup_lease_identity: Option<(u64,u64)>,
+        /// Optional third typed descriptor: a privately verified matched CLI.
+        #[serde(default)]
+        execution_program: Option<super::super::execution_program::Descriptor>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -238,6 +241,15 @@ pub(super) fn spawn_recoverable_with_authority(
     command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
     directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
 ) -> Result<Held,String> {
+    spawn_recoverable_with_execution(command,size,exits,recovery,directory,setup_lease,None)
+}
+
+pub(super) fn spawn_recoverable_with_execution(
+    command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
+    program: Option<std::sync::Arc<super::super::execution_program::MatchedCli>>,
+) -> Result<Held,String> {
+    if let Some(program)=&program {program.validate()?;}
     let cleanup_source = recovery.as_ref().map(|recovery|
         registry::cleanup::SourceReceipt::capture(&recovery.source)).transpose()?;
     if let Some(directory) = &directory {
@@ -309,8 +321,9 @@ pub(super) fn spawn_recoverable_with_authority(
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
-    // Typed wire order: directory first, setup lease second.
-    let directory_descriptors: Vec<RawFd> = directory.iter().chain(setup_lease.iter()).map(|file| file.as_raw_fd()).collect();
+    // Typed wire order: directory first, setup lease second, matched CLI third.
+    let directory_descriptors: Vec<RawFd> = directory.iter().chain(setup_lease.iter()).map(|file| file.as_raw_fd())
+        .chain(program.iter().map(|program|program.file().as_raw_fd())).collect();
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -324,6 +337,7 @@ pub(super) fn spawn_recoverable_with_authority(
                     recovery,
                     anchored_directory: directory.is_some(),
                     setup_lease_identity,
+                    execution_program:program.as_ref().map(|program|program.descriptor()),
                 },
                 &directory_descriptors,
             )
@@ -1221,7 +1235,7 @@ fn serve(control: UnixStream) -> i32 {
     if unsafe {libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)} != 0 {
         return fail(format!("Cannot own terminal descendants: {}", io::Error::last_os_error()));
     }
-    let (command, size, mut recovery, anchored_directory, setup_identity, descriptors) = match receive::<Request>(&control) {
+    let (command, size, mut recovery, anchored_directory, setup_identity, program_descriptor, descriptors) = match receive::<Request>(&control) {
         Ok(Some((
             Request::Spawn {
                 command,
@@ -1229,12 +1243,13 @@ fn serve(control: UnixStream) -> i32 {
                 recovery,
                 anchored_directory,
                 setup_lease_identity,
+                execution_program,
             },
             descriptors,
-        ))) => (command, size, recovery, anchored_directory, setup_lease_identity, descriptors),
+        ))) => (command, size, recovery, anchored_directory, setup_lease_identity, execution_program, descriptors),
         _ => return 1,
     };
-    let expected = usize::from(anchored_directory) + usize::from(setup_identity.is_some());
+    let expected = usize::from(anchored_directory) + usize::from(setup_identity.is_some()) + usize::from(program_descriptor.is_some());
     if descriptors.len() != expected {
         return fail("terminal spawn sent the wrong authority descriptors".into());
     }
@@ -1251,6 +1266,14 @@ fn serve(control: UnixStream) -> i32 {
             }
         }
         None => None,
+    };
+    let execution_program=match program_descriptor {
+        Some(descriptor)=>{
+            let file=File::from(descriptors.next().expect("checked matched executable slot"));
+            if let Err(error)=super::super::execution_program::validate_received(&file,&descriptor) {return fail(error);}
+            Some(file)
+        },
+        None=>None,
     };
     if let Some(directory) = &directory {
         if let Err(error) = validate_execution_directory(directory) {
@@ -1296,6 +1319,10 @@ fn serve(control: UnixStream) -> i32 {
         // that close; spawn keeps this descriptor alive through exec success.
         command.cwd(format!("/proc/{}/fd/{}", std::process::id(), directory.as_raw_fd()));
     }
+    if let Some(program)=&execution_program {
+        let Some(argv0)=command.get_argv_mut().first_mut() else {return fail("The matched console command has no program".into());};
+        *argv0=format!("/proc/{}/fd/{}",std::process::id(),program.as_raw_fd()).into();
+    }
     let program = command
         .get_argv()
         .first()
@@ -1317,6 +1344,7 @@ fn serve(control: UnixStream) -> i32 {
     // open argv[0] through /proc/<holder>/fd/N afterwards. Closing this pin at
     // spawn return would race that open even though the child's cwd is valid.
     let _execution_directory = directory;
+    let _execution_program = execution_program;
     drop(pair.slave);
     let Some(pid) = child.process_id().map(|pid| pid as libc::pid_t) else {
         return fail(format!("spawn {program}: no process id"));
@@ -3024,6 +3052,37 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.contains("absent.sock"), "{error}");
+    }
+
+    #[test]
+    #[ignore = "requires CAGENTS_QUALIFY_CLI from the exact matched source/application build"]
+    fn private_console_exec_uses_verified_new_prefix_fd_without_rewriting_the_old_recipe() {
+        use std::os::unix::fs::{PermissionsExt,OpenOptionsExt};
+        let cli=std::env::var_os("CAGENTS_QUALIFY_CLI").expect("matched CLI qualification path");
+        let root=tempfile::tempdir_in("/var/tmp").unwrap();
+        let old=root.path().join("versions/old/bin");let new=root.path().join("versions/current/bin");
+        std::fs::create_dir_all(&old).unwrap();std::fs::create_dir_all(&new).unwrap();
+        let old_cli=old.join("cagents");let current_cli=new.join("cagents");let marker=root.path().join("wrong-program-ran");
+        let wrong=format!("#!/bin/sh\nprintf wrong > '{}'\n",marker.display());
+        std::fs::write(&old_cli,&wrong).unwrap();std::fs::set_permissions(&old_cli,std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::copy(cli,&current_cli).unwrap();std::fs::set_permissions(&current_cli,std::fs::Permissions::from_mode(0o755)).unwrap();
+        let program=std::sync::Arc::new(super::super::super::execution_program::MatchedCli::capture_for_test(&current_cli).unwrap());
+        std::fs::rename(&current_cli,new.join("captured-current-cagents")).unwrap();
+        std::fs::write(&current_cli,&wrong).unwrap();std::fs::set_permissions(&current_cli,std::fs::Permissions::from_mode(0o755)).unwrap();
+        let nonce=uuid::Uuid::new_v4();
+        let recipe=crate::model::LaunchRecipe {program:old_cli.to_string_lossy().into_owned(),arguments:vec![crate::console_identity::ARGUMENT.into(),nonce.to_string()],working_directory:root.path().into(),environment:Default::default(),unset_environment:Default::default()};
+        let issued=recipe.clone();let mut command=CommandBuilder::new(&recipe.program);command.args(&recipe.arguments);command.cwd(&recipe.working_directory);
+        let directory=std::sync::Arc::new(File::open(root.path()).unwrap());
+        let lease=std::sync::Arc::new(std::fs::OpenOptions::new().read(true).write(true).create_new(true).mode(0o600).open(root.path().join("setup.lease")).unwrap());
+        assert_eq!(unsafe {libc::flock(lease.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)},0);
+        let (exits,exited)=crossbeam_channel::bounded(1);
+        let held=spawn_recoverable_with_execution(command,size(),exits,None,Some(directory),Some(lease),Some(program)).unwrap();
+        let text=read_until(&held.master,"cagents-console-cli");
+        let response:crate::console_identity::Identity=serde_json::from_str(text.trim()).unwrap();response.validate(nonce).unwrap();
+        assert!(exited.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().success());
+        assert_eq!(recipe,issued,"only private execution argv0 changes; old issued recipe stays exact");
+        assert!(!marker.exists(),"neither the old issued pathname nor a replacement current pathname may execute");
+        drop(held);
     }
 
     #[test]

@@ -1,5 +1,7 @@
 #[cfg(feature = "host")]
 pub(crate) mod holder;
+#[cfg(feature = "host")]
+pub(crate) mod execution_program;
 mod hosted;
 pub mod ipc;
 mod search;
