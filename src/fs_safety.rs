@@ -435,6 +435,8 @@ pub use recovery_placement::{RecoveryDirectoryStamp, RecoveryPlacement, Recovery
 mod recovery_cache;
 pub use recovery_cache::RecoveryParentCandidates;
 pub(crate) use recovery_cache::{RecoveryDirectory, RecoveryDirectoryError, prepare_recovery_directory, prepare_recovery_directory_with_owner};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use recovery_cache::fixture_recovery_directory_preparation_failure;
 
 /// Changes a held directory's permissions. An O_PATH fd cannot be passed to
 /// fchmod; Linux's descriptor link pins the same inode without re-resolving
