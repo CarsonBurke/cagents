@@ -2260,7 +2260,7 @@ impl Actor {
         Ok(())
     }
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
-        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
+        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() || !self.control_replies.is_empty() {
             UpdateReadiness::Unready
         } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
@@ -3575,6 +3575,26 @@ mod tests {
         assert!(!diagnostic.summary.contains('\x1b'));
         assert!(!diagnostic.output.contains('\x1b'));
         assert!(diagnostic.output.len() > diagnostic.summary.len());
+    }
+
+    #[test]
+    fn unacknowledged_controls_keep_upgrade_readiness_fenced_without_blocking_input() {
+        struct Controls(Option<String>);
+        impl Adapter for Controls {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step {events:vec![Event::Ready(true)],..Default::default()})}
+            fn command(&mut self,command:Command)->Result<Step,String> {if matches!(command,Command::SetPermissionMode{..}) {self.0=Some("mode".into());}Ok(Step::default())}
+            fn command_ack(&mut self)->Option<String> {self.0.take()}
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut adapter:Box<dyn Adapter>=Box::new(Controls(None));let mut initial=adapter.initialize().unwrap();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+        let pending=handle.enqueue_command(Command::SetPermissionMode {mode:"manual".into()}).unwrap();
+        assert_eq!(handle.check_update_readiness().unwrap(),UpdateReadiness::Unready);
+        assert!(pending.try_recv().is_err());
+        assert!(handle.snapshot(None).unwrap().error.is_none());
+        handle.close().unwrap();assert!(pending.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
     }
 
     #[test]
