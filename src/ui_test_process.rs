@@ -56,7 +56,7 @@ fn run(test:&str, child_key:&str, value:&str, deadline:Duration, limits:(usize,u
     let result=SystemProcessExecutor.execute(&spec,&CancellationToken::new());
     // Preserve bounded logs and the private test state for any failed run.
     // No environment values are logged. Outer B0 still owns family settlement.
-    let failed=match &result {Ok(output)=>!output.success,Err(_)=>true};
+    let failed=match &result {Ok(output)=>!exact_pass(output,test),Err(_)=>true};
     if failed {
         let (stdout,stderr)=match &result {Ok(output)=>(&output.stdout,&output.stderr),Err(error)=>(&error.stdout,&error.stderr)};
         for (name,bytes) in [("stdout.log",stdout),("stderr.log",stderr)] {
