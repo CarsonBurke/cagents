@@ -1762,3 +1762,72 @@ fn inactive_native_terminal_click_admits_the_first_key_and_ime_before_app_select
     assert!(!requests.iter().any(|request| matches!(request, ClientRequest::Key { .. } | ClientRequest::Input { .. })), "stale click authority survived a fresh inactive diff: {requests:?}");
     assert_eq!(samples.borrow()[0].0.card, None);
 }
+
+
+#[test]
+fn inactive_native_terminal_review_survives_a11y_publication_before_the_app_focus_diff() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let barrier = ReviewInputBarrier::default();
+    let mut terminal = widget(&peer, "inactive-review", barrier.clone(), false, false);
+    let mut tree = Tree::new(&terminal as &dyn Widget<Message, Theme, Renderer>);
+    let layout = layout::Node::new(Size::new(640.0, 320.0));
+
+    // The actual click activates the mounted pane. Deliberately leave the App
+    // focus callback unapplied, so the builder still describes an inactive pane.
+    let messages = dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left)),
+    );
+    assert!(messages.contains(&Message::Focus));
+    dispatch(
+        &mut terminal,
+        &mut tree,
+        &renderer,
+        Event::Mouse(mouse::Event::ButtonReleased(IcedMouseButton::Left)),
+    );
+    native_focus(&mut terminal, &mut tree, &renderer);
+    assert!(tree.state.downcast_ref::<WidgetState>().input_focused);
+    assert!(!terminal.model_focused);
+    let published = terminal.a11y_nodes(
+        Layout::new(&layout), &tree, mouse::Cursor::Unavailable,
+    );
+    let id = published.root()[0].id().clone();
+    assert_eq!(dispatch(
+        &mut terminal, &mut tree, &renderer,
+        action(id, Action::Focus, None),
+    ), vec![Message::Review(true)]);
+    dispatch(
+        &mut terminal, &mut tree, &renderer,
+        key(keyboard::key::Named::ArrowRight, keyboard::key::Code::ArrowRight, true),
+    );
+    let selection = tree.state.downcast_ref::<WidgetState>()
+        .a11y.borrow().selection.clone().expect("native Review selection");
+    assert!(reviewing(&tree));
+    peer.fence();
+
+    // Native accessibility publication can occur before the queued App update.
+    // It must use the same observed owner as update(), preserving Review state.
+    let published = terminal.a11y_nodes(
+        Layout::new(&layout), &tree, mouse::Cursor::Unavailable,
+    );
+    assert!(reviewing(&tree));
+    assert_eq!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection,
+        Some(selection));
+    assert!(published.root()[0].node().description().unwrap().contains("Review mode"));
+    assert!(!published.root()[0].node().label().unwrap().contains("not focused"));
+    assert_no_pty_input(&peer.fence());
+
+    // An actual subsequent inactive App diff supersedes the native observation.
+    terminal = widget(&peer, "inactive-review", barrier, false, false);
+    tree.diff(&mut terminal as &mut dyn Widget<Message, Theme, Renderer>);
+    let published = terminal.a11y_nodes(
+        Layout::new(&layout), &tree, mouse::Cursor::Unavailable,
+    );
+    assert!(!reviewing(&tree));
+    assert!(tree.state.downcast_ref::<WidgetState>().a11y.borrow().selection.is_none());
+    assert!(published.root()[0].node().description().unwrap().contains("Terminal input"));
+    assert_no_pty_input(&peer.fence());
+}

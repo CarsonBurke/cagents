@@ -2035,6 +2035,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.padding,
         );
         let state = tree.state.downcast_ref::<WidgetState>();
+        let focused = self.native_owner(state)
+            && state.native_window_focused.unwrap_or(self.window_focused);
         let mut a11y = state.a11y.borrow_mut();
         a11y.barrier = self.review_input_barrier.clone();
         a11y.bind(id, self.terminal_identity);
@@ -2049,8 +2051,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 columns: geometry.columns,
                 offset: self.snapshot.scroll.offset,
                 alternate: self.snapshot.scroll.alternate_screen,
-                focused: self.model_focused
-                    && state.native_window_focused.unwrap_or(self.window_focused),
+                focused,
             },
             Instant::now(),
             true,
@@ -2061,11 +2062,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         terminal.set_label(format!(
             "{}, {}",
             self.accessible_name,
-            if self.model_focused {
-                "focused"
-            } else {
-                "not focused"
-            }
+            if focused { "focused" } else { "not focused" }
         ));
         terminal.set_read_only();
         // Streaming output is available for review, never an unsolicited
