@@ -153,3 +153,5 @@ pub mod workspace;
 pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
+
+pub mod edited_root_admission;
