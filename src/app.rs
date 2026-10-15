@@ -3955,10 +3955,11 @@ pub enum Message {
     /// whenever the focused card names a different worktree, so a result whose
     /// key is no longer the bound one is a read of a tree nobody is looking at
     /// and is dropped rather than rendered.
+    SourceControlReleased,
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Box<RepositorySnapshot>, String>,
+        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel)>>, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -3974,11 +3975,20 @@ pub enum Message {
         head: crate::repository::Oid,
         result: Result<Vec<CommitSummary>, String>,
     },
+    SourceControlStageChecked {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        selection: Vec<crate::repository::PathSelection>,
+        markers: std::collections::BTreeMap<
+            crate::repository::RepoPath,
+            crate::repository::ConflictMarkerVersion,
+        >,
+    },
     /// A finished stage, unstage, discard, commit, or push.
     ///
     /// `report` is `None` when the mutation did everything it was asked to do.
-    /// Every outcome triggers a re-snapshot rather than an optimistic edit:
-    /// the only authority on what the index holds is Git.
+    /// A drained queue triggers one authoritative re-snapshot; queued stage
+    /// intents remain visible while the worker finishes its current batch.
     SourceControlMutated {
         key: ActiveWorktreeKey,
         operation: uuid::Uuid,
@@ -4740,10 +4750,63 @@ impl WorkspaceDestination {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Work queued behind a worktree's active command. Destructive operations keep
+/// their original confirmation and never merge with a neighbor.
+#[derive(Debug, Clone)]
+enum QueuedGitMutation {
+    Stage(Vec<crate::repository::PathSelection>),
+    StageApproved {
+        selection: Vec<crate::repository::PathSelection>,
+        approved: std::collections::BTreeMap<
+            crate::repository::RepoPath,
+            crate::repository::ConflictMarkerVersion,
+        >,
+    },
+    Unstage(Vec<crate::repository::PathSelection>),
+    Discard(crate::repository::DiscardRequest),
+    Operation(crate::repository::GitOperation),
+}
+
+impl QueuedGitMutation {
+    fn kind(&self) -> MutationKind {
+        match self {
+            Self::Stage(_) | Self::StageApproved { .. } => MutationKind::Stage,
+            Self::Unstage(_) => MutationKind::Unstage,
+            Self::Discard(_) => MutationKind::Discard,
+            Self::Operation(_) => MutationKind::Other,
+        }
+    }
+
+    fn append(queue: &mut std::collections::VecDeque<Self>, next: Self) {
+        let selections = match (queue.back_mut(), &next) {
+            (Some(Self::Stage(existing)), Self::Stage(new))
+            | (Some(Self::Unstage(existing)), Self::Unstage(new)) => Some((existing, new)),
+            _ => None,
+        };
+        if let Some((existing, new)) = selections {
+            let mut seen = existing
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<HashSet<_>>();
+            existing.extend(
+                new.iter()
+                    .filter(|entry| seen.insert(entry.path.clone()))
+                    .cloned(),
+            );
+        } else {
+            queue.push_back(next);
+        }
+    }
+}
+
+#[derive(Debug)]
 struct SourceControlMutation {
     id: uuid::Uuid,
     kind: MutationKind,
+    cancellation: CancellationToken,
+    pending: std::collections::VecDeque<QueuedGitMutation>,
+    rollback: Option<SourceControlModel>,
+    request: Option<QueuedGitMutation>,
     commit_revision: Option<u64>,
 }
 
@@ -10051,9 +10114,57 @@ impl Cagents {
         }
     }
 
-    /// Rebinds the source-control panel to whatever worktree is now focused,
-    /// and loads a snapshot when that is a different worktree.
-    ///
+    /// Retires the old binding off the UI thread and releases large free arenas.
+    fn release_source_control(&mut self) -> Task<Message> {
+        let previous = self.sidebar_model.source_control.take();
+        let cache = self.refresh_ui.source_cache.take();
+        if previous.is_none() && cache.is_none() {
+            return Task::none();
+        }
+        // Old cancelled readers retain the old binding's invalidation flag.
+        self.refresh_ui.source_invalidated = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let large = previous.as_ref().is_some_and(|source| {
+            source.files.len() > 8192
+                || source
+                    .groups()
+                    .iter()
+                    .map(|group| group.rows().len())
+                    .sum::<usize>()
+                    > 8192
+        });
+        cosmic::task::future(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                // Wait for a cancelled old reader to drop its temporary model.
+                if let Some((_, cache)) = &cache {
+                    drop(
+                        cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                }
+                drop(previous);
+                drop(cache);
+            })
+            .await;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            if large {
+                // Give the native view a frame to release its old widget tree.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    // SAFETY: glibc's allocator trimming is thread-safe and
+                    // takes no application pointers. It never runs on the UI.
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                })
+                .await;
+            }
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            let _ = large;
+            Message::SourceControlReleased
+        })
+    }
+
     /// Runs at the tail of every update, beside the selection sync, because
     /// focus changes for reasons that are not sidebar actions: a card closing,
     /// a session restoring, a project list arriving. Rebinding drops the
@@ -10073,9 +10184,9 @@ impl Cagents {
                 self.history_ui.cancel();
                 self.history_ui.next_page_request();
             }
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return self.release_source_control();
         }
+        self.prioritize_git_watches();
         if !changed {
             return self.load_pending_history();
         }
@@ -10083,9 +10194,9 @@ impl Cagents {
         self.cancel_branch_changes();
         self.history_ui.cancel();
         self.history_ui.next_page_request();
+        let release = self.release_source_control();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return release;
         };
         if self.folder_scope(&key)
             && matches!(
@@ -10102,7 +10213,7 @@ impl Cagents {
                 .map(|mutation| mutation.kind),
         );
         self.sidebar_model.source_control = Some(source);
-        self.source_control_snapshot_task(key)
+        Task::batch([release, self.source_control_snapshot_task(key)])
     }
 
     /// Asks for the first page of history once, and only once the `History`
@@ -10890,15 +11001,42 @@ impl Cagents {
         if !self.source_control_is_bound(key) {
             return Task::none();
         }
+        if self
+            .source_control_mutations
+            .contains_key(&key.canonical_path)
+        {
+            self.refresh_ui.source_last_refresh = Instant::now();
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            return Task::none();
+        }
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
             source.set_reloading(true);
         }
+        self.refresh_ui.source_last_refresh = Instant::now();
         self.source_control_snapshot_task(key.clone())
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
         if crate::device::is_remote() {
             return Task::none();
+        }
+        self.refresh_ui.source_last_refresh = Instant::now();
+        if self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .is_none_or(|source| source.data_state != sidebar::SidebarDataState::Ready)
+        {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
+        }
+        if self.refresh_ui.source_cancel.is_some() {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
@@ -10943,10 +11081,11 @@ impl Cagents {
             });
         }
         let worktree = key.canonical_path.clone();
-        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
+        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
+            || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
             untracked_changes,
-            untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
+            untracked_files: self.context_tab == ContextTab::Files,
         };
         let browse_files = self.context_tab == ContextTab::Files;
         let previous_errors = self
@@ -10961,16 +11100,59 @@ impl Cagents {
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
+        if self
+            .refresh_ui
+            .source_cache
+            .as_ref()
+            .is_none_or(|(path, _)| path != &worktree)
+        {
+            self.refresh_ui.source_cache = Some((
+                worktree.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    crate::repository::SnapshotCache::default(),
+                )),
+            ));
+        }
+        if browse_files
+            && (self.refresh_ui.source_expanded != expanded
+                || self.refresh_ui.source_ignored_errors != previous_errors)
+        {
+            self.refresh_ui.source_expanded = expanded.clone();
+            self.refresh_ui.source_ignored_errors = previous_errors.clone();
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
+        let invalidated = self.refresh_ui.source_invalidated.clone();
+        let model_key = key.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                let mut snapshot = service
-                    .snapshot_with_options(&worktree, options, &cancellation)
-                    .map_err(|error| error.to_string())?;
+                let mut cache = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let invalidation = invalidated.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if invalidation != 0 {
+                    cache.invalidate(invalidation & 2 != 0);
+                }
+                let Some(mut snapshot) = service
+                    .snapshot_cached(&worktree, options, &cancellation, &mut cache)
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            cache.invalidate(false);
+                            error.to_string()
+                        })?;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
@@ -10979,14 +11161,20 @@ impl Cagents {
                         &expanded,
                         &previous_errors,
                         &cancellation,
-                    )?;
+                    )
+                    .inspect_err(|_| cache.invalidate(false))?;
+                    cache.observe_browse(&worktree, &snapshot.files);
                 }
-                Ok(snapshot)
+                let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
+                Ok(Some(Box::new((snapshot, model))))
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
+            .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -11058,34 +11246,191 @@ impl Cagents {
         if source.busy() {
             return None;
         }
+        source.set_error(None);
         let id = uuid::Uuid::new_v4();
         self.source_control_mutations.insert(
             key.canonical_path.clone(),
             SourceControlMutation {
                 id,
                 kind,
+                cancellation: CancellationToken::new(),
+                pending: std::collections::VecDeque::new(),
+                rollback: Some(source.clone()),
+                request: None,
                 commit_revision,
             },
         );
         source.set_error(None);
         source.set_mutation(Some(kind));
+        if self.refresh_ui.source_cancel.is_some() {
+            self.cancel_source_read();
+        }
         Some(id)
+    }
+
+    fn enqueue_git_mutation(
+        &mut self,
+        key: ActiveWorktreeKey,
+        request: QueuedGitMutation,
+    ) -> Task<Message> {
+        if !self.source_control_is_bound(&key) || self.folder_scope(&key) {
+            return Task::none();
+        }
+        let kind = request.kind();
+        if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
+            QueuedGitMutation::append(&mut active.pending, request.clone());
+            if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                if let QueuedGitMutation::Stage(selection)
+                | QueuedGitMutation::StageApproved { selection, .. }
+                | QueuedGitMutation::Unstage(selection) = &request
+                {
+                    source.optimistic_mutation(kind, selection);
+                }
+            }
+            return Task::none();
+        }
+        let Some(operation) = self.begin_mutation(&key, kind, None) else {
+            return Task::none();
+        };
+        if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
+            active.request = Some(request.clone());
+        }
+        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+            if let QueuedGitMutation::Stage(selection)
+            | QueuedGitMutation::StageApproved { selection, .. }
+            | QueuedGitMutation::Unstage(selection) = &request
+            {
+                source.optimistic_mutation(kind, selection);
+            }
+        }
+        self.queued_git_task(key, operation, request)
+    }
+
+    fn queued_git_task(
+        &self,
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        request: QueuedGitMutation,
+    ) -> Task<Message> {
+        let request = match request {
+            QueuedGitMutation::Stage(selection)
+            | QueuedGitMutation::StageApproved { selection, .. } => {
+                let approved = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .filter(|mutation| mutation.id == operation)
+                    .and_then(|mutation| match mutation.request.as_ref() {
+                        Some(QueuedGitMutation::StageApproved { approved, .. }) => {
+                            Some(approved.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let cancellation = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .filter(|mutation| mutation.id == operation)
+                    .map(|mutation| mutation.cancellation.clone())
+                    .unwrap_or_default();
+                return cosmic::task::future(async move {
+                    let request = StageRequest {
+                        worktree: key.canonical_path.clone(),
+                        selection: selection.clone(),
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        let service = RepositoryService::system("git");
+                        match service.check_stage_markers(&request, &approved, &cancellation) {
+                            Ok(Some(markers)) => Ok(markers),
+                            Ok(None) => Err(mutation_report(
+                                "Stage",
+                                service.stage(&request, &cancellation),
+                            )),
+                            Err(error) => Err(Some(format!("Stage could not run: {error}"))),
+                        }
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(markers)) => Message::SourceControlStageChecked {
+                            key,
+                            operation,
+                            selection,
+                            markers,
+                        },
+                        Ok(Err(report)) => Message::SourceControlMutated {
+                            key,
+                            operation,
+                            report,
+                            committed: false,
+                        },
+                        Err(error) => Message::SourceControlMutated {
+                            key,
+                            operation,
+                            report: Some(format!("Stage worker failed: {error}")),
+                            committed: false,
+                        },
+                    }
+                });
+            }
+            request => request,
+        };
+
+        let worktree = key.canonical_path.clone();
+        self.mutation_task(key, operation, move |service, cancellation| {
+            let (label, outcome) = match request {
+                QueuedGitMutation::Stage(selection)
+                | QueuedGitMutation::StageApproved { selection, .. } => (
+                    "Stage",
+                    service.stage(
+                        &StageRequest {
+                            worktree,
+                            selection,
+                        },
+                        cancellation,
+                    ),
+                ),
+                QueuedGitMutation::Unstage(selection) => (
+                    "Unstage",
+                    service.unstage(
+                        &UnstageRequest {
+                            worktree,
+                            selection,
+                        },
+                        cancellation,
+                    ),
+                ),
+                QueuedGitMutation::Discard(request) => {
+                    ("Discard", service.discard(&request, cancellation))
+                }
+                QueuedGitMutation::Operation(operation) => (
+                    operation.label(),
+                    service.git_operation(&worktree, &operation, cancellation),
+                ),
+            };
+            (mutation_report(label, outcome), false)
+        })
     }
 
     /// The task one finished mutation turns into: report what Git did, then
     /// re-read the worktree, because the index is the only authority on what
     /// the mutation left behind.
     fn mutation_task(
+        &self,
         key: ActiveWorktreeKey,
         operation: uuid::Uuid,
         run: impl FnOnce(&RepositoryService, &CancellationToken) -> (Option<String>, bool)
         + Send
         + 'static,
     ) -> Task<Message> {
+        let cancellation = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .filter(|mutation| mutation.id == operation)
+            .map(|mutation| mutation.cancellation.clone())
+            .unwrap_or_default();
         cosmic::task::future(async move {
             let joined = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                run(&service, &CancellationToken::default())
+                run(&service, &cancellation)
             })
             .await;
             let (report, committed) = match joined {
@@ -11276,8 +11621,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -11693,6 +12041,13 @@ impl Cagents {
     /// `rust-analyzer` - and the proc-macro server it owns - from outliving the
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
+    fn cancel_source_control_mutations(&mut self) {
+        for mutation in self.source_control_mutations.values_mut() {
+            mutation.pending.clear();
+            mutation.cancellation.cancel();
+        }
+    }
+
     fn exit_after_language_servers(&mut self) -> Task<Message> {
         if self.exit.is_some() {
             return Task::none();
@@ -11702,6 +12057,7 @@ impl Cagents {
         // window is being raised, and it would open none. Refused, the
         // launcher waits for this process to release the window lease and
         // starts a fresh window.
+        self.cancel_source_control_mutations();
         self.activation_rx.close();
         // `Drop` writes the final state; this snapshot is queued now because
         // someone who has watched the window close may power off before then.
@@ -14497,52 +14853,38 @@ impl Application for Cagents {
                         // tree like any other unstaged change.
                         self.open_working_change(key, path, area)
                     }
-                    SidebarAction::Stage { key, selection } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
-                            return Task::none();
-                        };
-                        let request = StageRequest {
-                            worktree: key.canonical_path.clone(),
-                            selection,
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Stage", service.stage(&request, cancel)),
-                                false,
-                            )
-                        })
+                    SidebarAction::GitOperation { key, operation } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.pending_stash_drop = None; }
+                        self.enqueue_git_mutation(key, QueuedGitMutation::Operation(operation))
                     }
-                    SidebarAction::Unstage { key, selection } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Unstage, None) else {
-                            return Task::none();
-                        };
-                        let request = UnstageRequest {
-                            worktree: key.canonical_path.clone(),
-                            selection,
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Unstage", service.unstage(&request, cancel)),
-                                false,
-                            )
-                        })
+                    SidebarAction::ToggleStashes { key } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.stashes_expanded = !source.stashes_expanded; }
+                        Task::none()
                     }
-                    // The only arm that destroys work, and the only one the
-                    // dialog can raise: `RequestDiscard` builds the request
-                    // with `confirmed: false`, the dialog rebuilds it with
-                    // `confirmed: true`, and the service refuses an
-                    // unconfirmed one outright.
-                    SidebarAction::ConfirmDiscard { key, request } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Discard, None) else {
-                            return Task::none();
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Discard", service.discard(&request, cancel)),
-                                false,
-                            )
-                        })
+                    SidebarAction::RequestStashDrop { key, entry } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.pending_stash_drop = entry; }
+                        Task::none()
                     }
+                    SidebarAction::ConfirmStageMarkers { key, confirmed } => {
+                        let pending = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key).and_then(|source| source.pending_marker_stage.take().map(|selection| (selection, std::mem::take(&mut source.pending_marker_approval))));
+                        if confirmed && let Some((selection, approved)) = pending { self.enqueue_git_mutation(key, QueuedGitMutation::StageApproved { selection, approved }) } else { Task::none() }
+                    }
+                    SidebarAction::CancelGitMutation { key } => {
+                        if let Some(mutation) = self.source_control_mutations.get_mut(&key.canonical_path) {
+                            mutation.pending.clear();
+                            mutation.cancellation.cancel();
+                        }
+                        Task::none()
+                    }
+                    SidebarAction::ToggleGitOutput { key } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) {
+                            source.output_expanded = !source.output_expanded;
+                        }
+                        Task::none()
+                    }
+                    SidebarAction::Stage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Stage(selection)),
+                    SidebarAction::Unstage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Unstage(selection)),
+                    SidebarAction::ConfirmDiscard { key, request } => self.enqueue_git_mutation(key, QueuedGitMutation::Discard(request)),
                     SidebarAction::Commit { key, message, amend } => {
                         let commit_revision = self.sidebar_state.submitted_commit_revision(&key, &message, amend);
                         let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, commit_revision) else {
@@ -14552,7 +14894,7 @@ impl Application for Cagents {
                             worktree: key.canonical_path.clone(),
                             message,
                         };
-                        Self::mutation_task(key, operation, move |service, cancel| {
+                        self.mutation_task(key, operation, move |service, cancel| {
                             commit_report(service.commit_with_amend(&request, amend, cancel))
                         })
                     }
@@ -14569,7 +14911,7 @@ impl Application for Cagents {
                             branch,
                             target,
                         };
-                        Self::mutation_task(key, operation, move |service, cancel| {
+                        self.mutation_task(key, operation, move |service, cancel| {
                             (push_report(service.push(&request, cancel)), false)
                         })
                     }
@@ -16335,6 +16677,7 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::SourceControlReleased => Task::none(),
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -16346,7 +16689,13 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.source_cancel = None;
-                if let Ok(snapshot) = &result
+                if matches!(result, Ok(None)) {
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
+                    return Task::none();
+                }
+                if let Ok(Some(prepared)) = &result
                     && let Some(worktree) = self
                         .sidebar_model
                         .projects
@@ -16359,12 +16708,25 @@ impl Application for Cagents {
                                 .find(|worktree| worktree.id == key.worktree_id)
                         })
                 {
-                    worktree.apply_status(&snapshot.status);
+                    worktree.apply_status(&prepared.0.status);
                 }
-                let mut next = match &result {
-                    Ok(snapshot) => SourceControlModel::ready(key, snapshot),
-                    Err(error) => SourceControlModel::failed(key, error.clone()),
+                let (snapshot, mut next) = match result {
+                    Ok(Some(prepared)) => {
+                        let (snapshot, model) = *prepared;
+                        (Some(snapshot), model)
+                    }
+                    Ok(None) => unreachable!(),
+                    Err(error) => (None, SourceControlModel::failed(key.clone(), error)),
                 };
+                if let Some(snapshot) = snapshot.as_ref() {
+                    self.sidebar_state.prefill_operation_message(
+                        &key,
+                        snapshot
+                            .operation
+                            .as_ref()
+                            .and_then(|operation| operation.message.as_deref()),
+                    );
+                }
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
                 // belong to the binding, not to the page of Git output.
@@ -16372,9 +16734,9 @@ impl Application for Cagents {
                     previous.carry_mutation_into(&mut next);
                 }
                 self.sidebar_model.source_control = Some(next);
-                match result {
-                    Ok(snapshot) => self.refresh_branch_changes(&snapshot),
-                    Err(_) => {
+                match snapshot {
+                    Some(snapshot) => self.refresh_branch_changes(&snapshot),
+                    None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
@@ -16417,23 +16779,140 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::SourceControlStageChecked {
+                key,
+                operation,
+                selection,
+                markers,
+            } => {
+                if !self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .is_some_and(|mutation| mutation.id == operation)
+                {
+                    return Task::none();
+                }
+                let task = self.update(Message::SourceControlMutated {
+                    key: key.clone(),
+                    operation,
+                    report: Some("Stage needs confirmation because conflict markers remain".into()),
+                    committed: false,
+                });
+                if let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_mut()
+                    .filter(|source| source.key.canonical_path == key.canonical_path)
+                {
+                    let pending = source.pending_marker_stage.get_or_insert_with(Vec::new);
+                    let mut seen = pending
+                        .iter()
+                        .map(|entry| entry.path.clone())
+                        .collect::<HashSet<_>>();
+                    pending.extend(
+                        selection
+                            .iter()
+                            .filter(|entry| seen.insert(entry.path.clone()))
+                            .cloned(),
+                    );
+                    source.pending_marker_approval.extend(markers.clone());
+                }
+                if let Some(rollback) = self
+                    .source_control_mutations
+                    .get_mut(&key.canonical_path)
+                    .and_then(|mutation| mutation.rollback.as_mut())
+                {
+                    let pending = rollback.pending_marker_stage.get_or_insert_with(Vec::new);
+                    let mut seen = pending
+                        .iter()
+                        .map(|entry| entry.path.clone())
+                        .collect::<HashSet<_>>();
+                    pending.extend(
+                        selection
+                            .into_iter()
+                            .filter(|entry| seen.insert(entry.path.clone())),
+                    );
+                    rollback.pending_marker_approval.extend(markers);
+                }
+                task
+            }
             Message::SourceControlMutated {
                 key,
                 operation,
                 report,
                 committed,
             } => {
-                let Some(mutation) = self
+                if !self
                     .source_control_mutations
                     .get(&key.canonical_path)
-                    .copied()
-                    .filter(|mutation| mutation.id == operation)
+                    .is_some_and(|mutation| mutation.id == operation)
+                {
+                    return Task::none();
+                }
+                let Some(mut mutation) = self.source_control_mutations.remove(&key.canonical_path)
                 else {
                     return Task::none();
                 };
-                self.source_control_mutations.remove(&key.canonical_path);
+                if self.exit.is_some() {
+                    return Task::none();
+                }
+                let failed = report.is_some();
+                if !failed
+                    && let Some(rollback) = mutation.rollback.as_mut()
+                    && let Some(
+                        QueuedGitMutation::Stage(selection)
+                        | QueuedGitMutation::StageApproved { selection, .. }
+                        | QueuedGitMutation::Unstage(selection),
+                    ) = mutation.request.as_ref()
+                {
+                    rollback.optimistic_mutation(mutation.kind, selection);
+                }
+                if failed
+                    && let Some(rollback) = mutation.rollback.as_ref()
+                    && let Some(source) = self
+                        .sidebar_model
+                        .source_control
+                        .as_mut()
+                        .filter(|source| source.key.canonical_path == key.canonical_path)
+                {
+                    *source = rollback.clone();
+                    for pending in &mutation.pending {
+                        if let QueuedGitMutation::Stage(selection)
+                        | QueuedGitMutation::StageApproved { selection, .. }
+                        | QueuedGitMutation::Unstage(selection) = pending
+                        {
+                            source.optimistic_mutation(pending.kind(), selection);
+                        }
+                    }
+                }
                 if committed && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
+                }
+                if let Some(next) = mutation.pending.pop_front() {
+                    let operation = uuid::Uuid::new_v4();
+                    mutation.id = operation;
+                    mutation.kind = next.kind();
+                    mutation.request = Some(next.clone());
+                    mutation.cancellation = CancellationToken::new();
+                    if let Some(report) = report.as_ref() {
+                        let summary = report.split("\n\nGit output:\n").next().unwrap_or(report);
+                        self.notices.record(TransientNotice::error(format!(
+                            "{}: {summary}",
+                            display_path(&key.canonical_path)
+                        )));
+                    }
+                    if let Some(source) = self
+                        .sidebar_model
+                        .source_control
+                        .as_mut()
+                        .filter(|source| source.key.canonical_path == key.canonical_path)
+                    {
+                        source.set_mutation(Some(mutation.kind));
+                        source.set_error(report.clone());
+                    }
+                    self.source_control_mutations
+                        .insert(key.canonical_path.clone(), mutation);
+                    return self.queued_git_task(key, operation, next);
                 }
                 let mut refreshes = Vec::new();
                 for (&card, runtime) in &mut self.cards {
@@ -16454,14 +16933,19 @@ impl Application for Cagents {
                         source.key.clone()
                     });
                 if let Some(report) = report {
+                    let report = report.split("\n\nGit output:\n").next().unwrap_or(&report);
                     self.status = Some(TransientNotice::error(format!(
                         "{}: {report}",
                         display_path(&key.canonical_path)
                     )));
                 }
+                refreshes.push(self.start_git_reads());
                 // Navigation does not cancel Git. Only this exact completion
                 // releases the worktree, then the index is read afresh.
                 if let Some(bound) = bound {
+                    self.refresh_ui
+                        .source_invalidated
+                        .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
                     refreshes.push(self.reload_source_control(&bound));
                 }
                 Task::batch(refreshes)
@@ -17402,6 +17886,7 @@ impl Application for Cagents {
 
 impl Drop for Cagents {
     fn drop(&mut self) {
+        self.cancel_source_control_mutations();
         self.latency.abandon_pending();
         self.persist();
         self.fold_settings_drafts();
@@ -17804,6 +18289,60 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn git_mutation_queue_coalesces_neighbors_and_keeps_destructive_order() {
+        use super::QueuedGitMutation as Queued;
+        let selection = |name: &str| {
+            vec![crate::repository::PathSelection::new(
+                crate::repository::RepoPath::parse(name).unwrap(),
+            )]
+        };
+        let mut queue = std::collections::VecDeque::new();
+        Queued::append(&mut queue, Queued::Stage(selection("one")));
+        Queued::append(&mut queue, Queued::Stage(selection("two")));
+        Queued::append(&mut queue, Queued::Stage(selection("one")));
+        Queued::append(&mut queue, Queued::Unstage(selection("three")));
+        let discard = crate::repository::DiscardRequest {
+            worktree: "/fixture".into(),
+            tracked: selection("one"),
+            untracked: Vec::new(),
+            confirmed: true,
+        };
+        Queued::append(&mut queue, Queued::Discard(discard.clone()));
+        Queued::append(&mut queue, Queued::Discard(discard));
+        Queued::append(&mut queue, Queued::Stage(selection("four")));
+        assert_eq!(queue.len(), 5);
+        assert!(matches!(&queue[0], Queued::Stage(paths) if paths.len() == 2));
+        assert!(matches!(&queue[1], Queued::Unstage(_)));
+        assert!(matches!(&queue[2], Queued::Discard(_)));
+        assert!(matches!(&queue[3], Queued::Discard(_)));
+        assert!(matches!(&queue[4], Queued::Stage(_)));
+    }
+
+    #[test]
+    fn mutation_error_mapping_keeps_full_hook_output() {
+        let failure = crate::repository::ProcessOutput {
+            exit_code: Some(1),
+            signal: None,
+            success: false,
+            stdout: b"hook output\n".to_vec(),
+            stderr: b"lint: bad variable\nsecond detail\n".to_vec(),
+        }
+        .require_success(std::path::Path::new("git"))
+        .unwrap_err();
+        let report = super::mutation_report(
+            "Stage",
+            Ok(crate::repository::MutationOutcome::NotApplied {
+                failure: failure.into(),
+            }),
+        )
+        .unwrap();
+        assert!(report.contains("lint: bad variable"));
+        assert!(report.contains("\n\nGit output:\n"));
+        assert!(report.contains("hook output"));
+        assert!(!report.contains("Some("));
+    }
+
     #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
@@ -27608,5 +28147,150 @@ mod tests {
             "closing the review forgets the pull request"
         );
         let _ = project;
+    }
+    #[test]
+    fn git_mutation_queue_keeps_ten_clicks_and_refreshes_once_at_drain() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let generation = app.refresh_ui.source_generation;
+        for index in 0..10 {
+            let path = crate::repository::RepoPath::parse(format!("file-{index}.txt")).unwrap();
+            drop(app.enqueue_git_mutation(
+                key.clone(),
+                super::QueuedGitMutation::Stage(vec![crate::repository::PathSelection::new(path)]),
+            ));
+        }
+        let active = &app.source_control_mutations[&key.canonical_path];
+        assert_eq!(active.pending.len(), 1);
+        assert!(
+            matches!(&active.pending[0], super::QueuedGitMutation::Stage(selection) if selection.len() == 9)
+        );
+        let first = active.id;
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: None,
+            committed: false,
+        }));
+        assert_eq!(
+            app.refresh_ui.source_generation, generation,
+            "no read while a queued batch remains"
+        );
+        let active = &app.source_control_mutations[&key.canonical_path];
+        assert!(active.pending.is_empty());
+        assert!(
+            matches!(&active.request, Some(super::QueuedGitMutation::Stage(selection)) if selection.len() == 9)
+        );
+        let second = active.id;
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: second,
+            report: None,
+            committed: false,
+        }));
+        assert!(
+            !app.source_control_mutations
+                .contains_key(&key.canonical_path)
+        );
+        assert_eq!(app.refresh_ui.source_generation, generation + 1);
+    }
+
+    #[test]
+    fn git_mutation_failure_rolls_back_only_failed_intent_and_keeps_pending_rows() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        let failed = source
+            .group(crate::repository::ChangeArea::Unstaged)
+            .unwrap()
+            .rows()[0]
+            .selection();
+        let pending = source
+            .group(crate::repository::ChangeArea::Untracked)
+            .unwrap()
+            .rows()[0]
+            .selection();
+        drop(app.enqueue_git_mutation(
+            key.clone(),
+            super::QueuedGitMutation::Stage(vec![failed.clone()]),
+        ));
+        let first = app.source_control_mutations[&key.canonical_path].id;
+        drop(app.enqueue_git_mutation(
+            key.clone(),
+            super::QueuedGitMutation::Stage(vec![pending.clone()]),
+        ));
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: Some("Stage failed: fixture refusal".into()),
+            committed: false,
+        }));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert!(
+            source
+                .group(crate::repository::ChangeArea::Unstaged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == failed.path)
+        );
+        assert!(
+            source
+                .group(crate::repository::ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == pending.path)
+        );
+        assert!(source.busy());
+        let next = app.source_control_mutations[&key.canonical_path].id;
+        drop(app.update(Message::SourceControlMutated {
+            key,
+            operation: next,
+            report: None,
+            committed: false,
+        }));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_none(),
+            "the next successful mutation clears the inline error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_git_on_exit_clears_pending_and_wakes_active_process() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        for index in 0..2 {
+            let path = crate::repository::RepoPath::parse(format!("exit-{index}.txt")).unwrap();
+            drop(app.enqueue_git_mutation(
+                key.clone(),
+                super::QueuedGitMutation::Stage(vec![crate::repository::PathSelection::new(path)]),
+            ));
+        }
+        let cancel = app.source_control_mutations[&key.canonical_path]
+            .cancellation
+            .clone();
+        drop(app.exit_after_language_servers());
+        assert!(app.exit.is_some());
+        assert!(cancel.is_cancelled());
+        assert!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .is_empty()
+        );
     }
 }
