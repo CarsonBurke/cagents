@@ -7668,7 +7668,6 @@ impl RepositoryRuntime {
                 } else {
                     return self.request_save(card, true);
                 }
-                else { return self.request_save(card, true); }
                 document.conflict = false; document.error = None;
                 self.dismiss_disk_comparison();
                 self.request_save(card, false)

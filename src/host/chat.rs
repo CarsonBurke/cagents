@@ -2912,6 +2912,9 @@ pub(in crate::host) fn attach_reserved_automation_actor(
         })
         .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
     let advanced = subscribe_reserved_automation_reader(record, client, snapshot.generation);
+    // Capture only this already revalidated record's authenticated metadata.
+    let execution_instance = record.execution_instance;
+    let binding = record.source_binding.clone();
     drop(state);
     if let Some(generation) = advanced {
         // The client retains ChatObserved edges received before ChatAttached.
@@ -2925,6 +2928,8 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     }
     Ok(ServerResponse::ChatAttached {
         session: issued,
+        execution_instance,
+        binding,
         snapshot,
     })
 }
@@ -2942,7 +2947,7 @@ pub(in crate::host) fn executable_automation_sessions(
             replacement,
             ..
         } => vec![source.id, replacement.id],
-        ClientRequest::ChatReturnTerminal { chat_id } => vec![*chat_id],
+        ClientRequest::ChatReturnTerminal { chat_id, .. } => vec![*chat_id],
         ClientRequest::ChatCommand { chat_id, command }
             if !matches!(command, chat::Command::Refresh | chat::Command::LoadEarlier) =>
         {
