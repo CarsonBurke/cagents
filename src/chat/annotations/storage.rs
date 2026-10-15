@@ -101,15 +101,21 @@ fn purge_registered_at(root:&Path,id:&crate::account::AccountId)->Result<Option<
     Ok(Some(removed))
 }
 fn associate_for_purge(root:&Path,scope:&LaunchAccountScope)->Result<(),String>{
-    let Some(id)=&scope.registered_id else{return Ok(());};
-    let directory=root.join("purge-index").join(format!("{:x}",Sha256::digest(id.as_str().as_bytes())));
-    crate::secure_file::prepare_private_directory(&directory).map_err(|e|e.to_string())?;
-    let path=directory.join(account_key(scope));
-    let file=fs::OpenOptions::new().write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path).map_err(|e|e.to_string())?;
-    crate::secure_file::validate_and_privatize_open_file(&path,&file).map_err(|e|e.to_string())?;
-    file.sync_all().map_err(|e|e.to_string())?;
-    fs::File::open(directory).and_then(|file|file.sync_all()).map_err(|e|e.to_string())
+    let mut ids=scope.purge_ids.iter().chain(scope.registered_id.iter()).collect::<Vec<_>>();ids.sort();ids.dedup();
+    for id in ids{
+        // These associations grant deletion only. Neither ID nor alias may
+        // reconstruct a missing physical home or authorize metadata reads.
+        let directory=root.join("purge-index").join(format!("{:x}",Sha256::digest(id.as_str().as_bytes())));
+        crate::secure_file::prepare_private_directory(&directory).map_err(|e|e.to_string())?;
+        let path=directory.join(account_key(scope));
+        let file=fs::OpenOptions::new().write(true).create(true).mode(0o600).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK).open(&path).map_err(|e|e.to_string())?;
+        crate::secure_file::validate_and_privatize_open_file(&path,&file).map_err(|e|e.to_string())?;
+        file.sync_all().map_err(|e|e.to_string())?;
+        fs::File::open(directory).and_then(|file|file.sync_all()).map_err(|e|e.to_string())?;
+    }
+    Ok(())
 }
+
 impl Store {
     /// `session` must come from adapter confirmation, never a requested resume
     /// recipe or a later UI selection. Callers retain that provenance.
@@ -526,6 +532,13 @@ mod tests {
         assert_eq!(result,input);
         original.user_id="different-provider-user".into();let capture=pending.capture_text(&input).unwrap();fs::write(&capture.0.attachment.path,vec![b'x';input.len()]).unwrap();
         assert_eq!(confirmed.accept_captured(&original,&capture,&[],&mut []),Err(OriginalError::Changed));assert!(matches!(confirmed.original(Some(&original.user_id),0,4),Err(OriginalError::Unavailable(_))),"changed spool must roll back the entire acceptance");
+    }
+
+    #[test]
+    fn every_validated_physical_alias_keeps_purge_only_association_after_home_loss(){
+        let root=test_directory();let mut account=scope(root.path(),crate::agent::Provider::Claude);let first=crate::account::Account::managed(crate::agent::Provider::Claude,uuid::Uuid::new_v4(),root.path().join("first")).id();let second=crate::account::Account::managed(crate::agent::Provider::Claude,uuid::Uuid::new_v4(),root.path().join("second")).id();account.registered_id=None;account.purge_ids=vec![first.clone(),second.clone(),first.clone()];
+        let annotations=root.path().join("annotations");let mut store=Store::at(&annotations,&account,"session").unwrap();let original=prompt("user","text");store.accept(&original,"text",&[],&mut []).unwrap();drop(store);fs::remove_dir_all(&account.canonical_home).unwrap();
+        assert_eq!(purge_registered_at(&annotations,&second).unwrap(),Some(1));assert_eq!(purge_registered_at(&annotations,&first).unwrap(),Some(0));assert!(!annotations.join(account_key(&account)).exists());assert!(Store::at(&annotations,&account,"session").is_err(),"Purge IDs cannot grant access to an absent physical home");
     }
 
 }
