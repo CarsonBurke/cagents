@@ -52,7 +52,16 @@ while IFS= read -r frame; do"#, 1);
             assert!(Instant::now() < deadline, "cleanly exited provider did not publish completed/non-owning state");
             std::thread::sleep(Duration::from_millis(5));
         }
-        let source = chat::runtime::Handle::inspect_remote(&identity.record, proof).unwrap().source;
+        // Capture the CURRENT hosted descriptor with the same resident-only
+        // projection as chat::session_descriptor, not inspect's raw pre-install
+        // source. Installation publishes RetainedClaudeActor separately.
+        let mut source = host.lock().unwrap().chats[&id].session.clone();
+        source.launch.session_id = handle.session_id();
+        source.native_continuity = handle.native_continuity();
+        assert!(matches!(source.native_continuity, chat::NativeContinuity::RetainedClaudeActor {..}));
+        let inspected = chat::runtime::Handle::inspect_remote(&identity.record, proof).unwrap();
+        assert!(inspected.source == source || inspected.previous_sources.contains(&source),
+            "current hosted descriptor must be a full authenticated helper alias");
         assert!(source.terminal.is_none(), "no deferred matched-CLI/pair restart dependency is substituted");
         assert!(identity.record.holder.is_current());
         assert!(!original.is_current());
@@ -78,8 +87,8 @@ impl Drop for RetainedCloseRaceFixture {
 }
 
 #[test]
-fn retained_close_reservation_excludes_real_attach_restart_before_adoption() {
-    if owning_close_isolated("retained_close_reservation_excludes_real_attach_restart_before_adoption").is_some() { return; }
+fn combined_close_retained_lifecycle_reservation_excludes_real_attach_restart_before_adoption() {
+    if owning_close_isolated("combined_close_retained_lifecycle_reservation_excludes_real_attach_restart_before_adoption").is_some() { return; }
     let fixture = RetainedCloseRaceFixture::start();
     let store = registry(&fixture.host).unwrap();
     let (entered, entering) = std::sync::mpsc::channel();
@@ -113,8 +122,8 @@ fn retained_close_reservation_excludes_real_attach_restart_before_adoption() {
 }
 
 #[test]
-fn retained_close_refuses_while_real_restart_owns_claim_and_preserves_successor() {
-    if owning_close_isolated("retained_close_refuses_while_real_restart_owns_claim_and_preserves_successor").is_some() { return; }
+fn combined_close_retained_lifecycle_refuses_while_real_restart_owns_claim_and_preserves_successor() {
+    if owning_close_isolated("combined_close_retained_lifecycle_refuses_while_real_restart_owns_claim_and_preserves_successor").is_some() { return; }
     let fixture = RetainedCloseRaceFixture::start();
     let store = registry(&fixture.host).unwrap();
     let host = fixture.host.clone(); let source = fixture.source.clone();
@@ -153,8 +162,8 @@ fn retained_close_refuses_while_real_restart_owns_claim_and_preserves_successor(
 }
 
 #[test]
-fn retained_close_ordinary_receipt_lookup_keeps_host_census_responsive() {
-    if owning_close_isolated("retained_close_ordinary_receipt_lookup_keeps_host_census_responsive").is_some() { return; }
+fn combined_close_retained_lifecycle_ordinary_receipt_lookup_keeps_host_census_responsive() {
+    if owning_close_isolated("combined_close_retained_lifecycle_ordinary_receipt_lookup_keeps_host_census_responsive").is_some() { return; }
     let fixture = RetainedCloseRaceFixture::start();
     let store = registry(&fixture.host).unwrap();
     let (entered, entering) = std::sync::mpsc::channel();
