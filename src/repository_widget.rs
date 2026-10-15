@@ -4444,6 +4444,13 @@ impl RepositoryRuntime {
         Ok(())
     }
 
+    /// Schedule derived views after a controller changes the buffer without a
+    /// repository action. Autosave, LSP and working diffs remain in the shell's
+    /// normal intent drain; Find and a mounted preview need their own workers.
+    pub fn programmatic_edit_task(&mut self, card: CardId) -> Task<RepositoryAction> {
+        Task::batch([self.find_task(card), self.markdown_task(card)])
+    }
+
     pub fn editor_text_in_range(&self, range: LspRange) -> Option<String> {
         let text = self.editor_text()?;
         text.get(byte_offset(&text, range.start)?..byte_offset(&text, range.end)?).map(str::to_owned)
@@ -17664,6 +17671,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn programmatic_workspace_edit_refreshes_a_mounted_markdown_preview() {
+        use cosmic::iced::futures::StreamExt;
+        let card = CardId::new();
+        let before = "# Old title\n";
+        let after = "# New title\n";
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "README.md", before);
+        if let DocumentState::Editable(document) = &mut runtime.document { document.markdown = true; }
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode { card, preview: true }));
+        let plan = crate::editor_workspace_edit::DocumentPlan {
+            path: "/repo/README.md".into(), relative: "README.md".into(), before: before.into(), after: after.into(),
+            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: vec![], edits: vec![],
+        };
+        runtime.begin_workspace_edit(90, &plan).unwrap();
+        runtime.finish_workspace_edit(90).unwrap();
+        let task = runtime.programmatic_edit_task(card);
+        let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
+        assert_eq!(document.preview_text, before);
+        assert!(document.markdown_stale);
+        let mut stream = iced::runtime::task::into_stream(task).unwrap();
+        let Some(iced::runtime::Action::Output(action)) = stream.next().await else { panic!("preview debounce completion"); };
+        assert!(matches!(action, RepositoryAction::MarkdownDue { .. }));
+        drop(runtime.update(action));
+        let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
+        assert_eq!(document.preview_text, after);
+        assert!(!document.markdown_stale);
+        assert_eq!(document.markdown_items.len(), 1);
     }
 
     #[test]

@@ -95,6 +95,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_restarts_completed_large_find_without_a_diff_callback() {
+        let root = tempfile::tempdir().unwrap();
+        let before = format!("fn old() {{}}\n{}", "old\n".repeat(3000));
+        std::fs::write(root.path().join("a.rs"), &before).unwrap();
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "a.rs", &before);
+        let query = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Repository(runtime) => {
+                drop(runtime.take_lsp_intents());
+                drop(runtime.update(RepositoryAction::OpenFind { card }));
+                runtime.update(RepositoryAction::FindQueryChanged { card, query: "old".into() })
+            }
+            _ => unreachable!(),
+        };
+        let mut first = iced::runtime::task::into_stream(query).unwrap();
+        let Some(iced::runtime::Action::Output(action @ RepositoryAction::FindLoaded { .. })) = first.next().await else { panic!("initial Find completion"); };
+        assert!(matches!(&action, RepositoryAction::FindLoaded { result: Ok(Some(matches)), .. } if matches.len() == 3001));
+        if let CardRuntime::Repository(runtime) = app.cards.get_mut(&card).unwrap() { drop(runtime.update(action)); }
+        let plan = plan(&app, root.path(), &["a.rs"]);
+        let operation = operation(&app, card);
+        let publication = app.publish_editor_workspace_edit(91, operation, plan);
+        let mut pending = std::collections::VecDeque::from([publication]);
+        let mut refreshed = false;
+        let mut steps = 0;
+        while let Some(task) = pending.pop_front() {
+            steps += 1;
+            assert!(steps < 32, "publication tasks must settle");
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    let iced::runtime::Action::Output(cosmic::Action::App(message)) = action else { continue; };
+                    if let Message::Repository(RepositoryAction::FindLoaded { result: Ok(Some(matches)), .. }) = &message {
+                        assert_eq!(matches.len(), 3000);
+                        refreshed = true;
+                    }
+                    pending.push_back(app.update(message));
+                }
+            }
+        }
+        assert!(refreshed, "Published must start Find without an unrelated diff callback");
+        assert!(text(&app, card).starts_with("fn renamed() {}"));
+    }
+
+    #[tokio::test]
     async fn three_file_publication_updates_unopened_disk_and_retains_independent_buffer_undo() {
         let root = tempfile::tempdir().unwrap();
         let original = "fn old() {}\n";
@@ -1104,7 +1147,10 @@ impl Cagents {
                 let mut failure = None;
                 for card in publication.cards {
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                        if let Err(error) = runtime.finish_workspace_edit(ticket) { failure = Some(error); }
+                        match runtime.finish_workspace_edit(ticket) {
+                            Ok(()) => tasks.push(repository_task(runtime.programmatic_edit_task(card))),
+                            Err(error) => failure = Some(error),
+                        }
                         tasks.push(self.drain_lsp_intents(card));
                     } else { failure = Some("An edited buffer was closed during publication".into()); }
                 }
