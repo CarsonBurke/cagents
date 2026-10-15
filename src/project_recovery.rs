@@ -100,6 +100,8 @@ pub struct ProjectOperationStatus {
 pub enum ProjectOperationOutcome {
     Committed { operation: uuid::Uuid, model: crate::workspace_model::WorkspaceModel },
     Pending { operation: uuid::Uuid, phase: ProjectOperationPhase, reason: String },
+    /// Positive durable pre-effect settlement, not a transport/storage error.
+    Aborted { operation: uuid::Uuid, reason: String },
 }
 impl ProjectOperationRequest {
     pub fn validate(&self)->Result<(),String> {

@@ -1033,7 +1033,8 @@ impl ControlClient {
         match self.request_with_deadline(ClientRequest::ProjectOperation{request},Instant::now()+Duration::from_secs(75))? {
             ServerResponse::ProjectOperation{outcome} if match &outcome {
                 crate::project_recovery::ProjectOperationOutcome::Committed{operation:current,..}
-                |crate::project_recovery::ProjectOperationOutcome::Pending{operation:current,..}=>*current==operation,
+                |crate::project_recovery::ProjectOperationOutcome::Pending{operation:current,..}
+                |crate::project_recovery::ProjectOperationOutcome::Aborted{operation:current,..}=>*current==operation,
             }=>Ok(outcome),
             response=>Err(unexpected_response("retained project operation",&response)),
         }
@@ -1053,7 +1054,8 @@ impl ControlClient {
         match self.request_with_deadline(ClientRequest::ResumeProjectOperation{registry,operation},Instant::now()+Duration::from_secs(75))? {
             ServerResponse::ProjectOperation{outcome} if match &outcome {
                 crate::project_recovery::ProjectOperationOutcome::Committed{operation:received,model}=>!registry.is_nil()&&!operation.is_nil()&&*received==operation&&model.identity==registry,
-                crate::project_recovery::ProjectOperationOutcome::Pending{operation:received,..}=>!registry.is_nil()&&!operation.is_nil()&&*received==operation,
+                crate::project_recovery::ProjectOperationOutcome::Pending{operation:received,..}
+                |crate::project_recovery::ProjectOperationOutcome::Aborted{operation:received,..}=>!registry.is_nil()&&!operation.is_nil()&&*received==operation,
             }=>Ok(outcome),
             response=>Err(unexpected_response("resumed original project operation",&response)),
         }
@@ -4092,6 +4094,27 @@ mod tests {
         server.join().unwrap();
     }
 
+    #[test]
+    fn original_operation_abort_is_a_typed_settled_reply_on_both_request_routes() {
+        use crate::project_recovery::{ProjectInstance,ProjectOperationRequest,ProjectOperationAction,ProjectOperationOutcome};
+        let (client_stream,mut peer_stream)=UnixStream::pair().unwrap();
+        peer_stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();peer_stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let host_proof=proof("pre-effect-abort","boot","incarnation");
+        let request=ProjectOperationRequest{operation:Uuid::new_v4(),project:ProjectInstance{registry:Uuid::new_v4(),repository:"/original".into(),ordinal:1},action:ProjectOperationAction::Remove{sessions:Vec::new()}};
+        let original=request.clone();
+        let server=thread::spawn(move|| {
+            let connected:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+            write_frame(&mut peer_stream,&connected_envelope(connected.request_id,host_proof.clone(),host_proof.clone())).unwrap();
+            for resume in [false,true] {
+                let envelope:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+                assert_eq!(envelope.request,if resume {ClientRequest::ResumeProjectOperation{registry:original.project.registry,operation:original.operation}}else{ClientRequest::ProjectOperation{request:original.clone()}});
+                write_frame(&mut peer_stream,&ServerEnvelope{version:PROTOCOL_VERSION,request_id:Some(envelope.request_id),proof:host_proof.clone(),message:ServerMessage::Response{response:ServerResponse::ProjectOperation{outcome:ProjectOperationOutcome::Aborted{operation:original.operation,reason:"Durable pre-effect abort".into()}}}}).unwrap();
+            }
+        });
+        let mut client=ControlClient::from_stream(client_stream).unwrap();
+        assert!(matches!(client.project_operation(request.clone()).unwrap(),ProjectOperationOutcome::Aborted{operation,..} if operation==request.operation));
+        assert!(matches!(client.resume_project_operation(request.project.registry,request.operation).unwrap(),ProjectOperationOutcome::Aborted{operation,..} if operation==request.operation));server.join().unwrap();
+    }
     #[test]
     fn reconnect_discovers_metadata_then_resumes_only_registry_and_original_operation() {
         use crate::project_recovery::{ProjectInstance,ProjectOperationStatus,ProjectOperationKind,ProjectOperationPhase,ProjectOperationOutcome};

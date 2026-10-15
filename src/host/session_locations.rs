@@ -512,6 +512,7 @@ mod tests {
         match response {
             ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Committed{model,..}}=>Ok((ServerResponse::WorkspaceModel{model},messages,close)),
             ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Pending{reason,..}}=>Err(error(reason)),
+            ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Aborted{reason,..}}=>Err(error(reason)),
             response=>Ok((response,messages,close)),
         }
     }

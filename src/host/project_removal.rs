@@ -333,6 +333,7 @@ mod tests {
         match response {
             ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Committed{model,..}}=>Ok((ServerResponse::WorkspaceModel{model},messages,close)),
             ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Pending{reason,..}}=>Err(ProtocolError::new(ProtocolErrorCode::Internal,reason,true)),
+            ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Aborted{reason,..}}=>Err(error(reason)),
             response=>Ok((response,messages,close)),
         }
     }
@@ -500,6 +501,26 @@ mod tests {
     }
     fn resume_original(host:&SharedHost,client:ClientId,registry:uuid::Uuid,operation:uuid::Uuid)->crate::project_recovery::ProjectOperationOutcome {
         let (ServerResponse::ProjectOperation{outcome},_,_)=super::super::client::process_request(host,client,ClientRequest::ResumeProjectOperation{registry,operation}).unwrap() else {panic!("original-operation response required")};outcome
+    }
+    #[test]
+    fn pre_effect_roster_failure_has_typed_aborted_receipt_and_allows_fresh_explicit_operation() {
+        if isolated_custody("host::project_removal::tests::pre_effect_roster_failure_has_typed_aborted_receipt_and_allows_fresh_explicit_operation") {return;}
+        use crate::project_recovery::{ProjectOperationRequest,ProjectOperationAction,ProjectOperationOutcome};
+        let mut fixture=Fixture::new();let first=fixture.spawn(crate::model::TerminalId::new());let second=fixture.spawn(crate::model::TerminalId::new());
+        let request=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:ProjectOperationAction::Remove{sessions:vec![first.clone()]}};
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Aborted{operation,..} if operation==request.operation));
+        assert!(fixture.handles.iter().all(|handle|!handle.is_completed()));
+        assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_some());
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+        assert_eq!(registry.lock().unwrap().project_operation(request.operation).unwrap().unwrap().phase,super::super::model::project_operations::Phase::Aborted);
+        assert!(pending_status(&fixture.host,1,request.project.registry).is_empty());
+        assert!(matches!(resume_original(&fixture.host,1,request.project.registry,request.operation),ProjectOperationOutcome::Aborted{operation,..} if operation==request.operation));
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Aborted{..}));
+        assert!(fixture.handles.iter().all(|handle|!handle.is_completed()),"settled retry cannot acquire fresh cleanup authority");
+        let fresh=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:request.project,action:ProjectOperationAction::Remove{sessions:vec![first,second]}};
+        assert!(matches!(operation_reply(&fixture.host,fresh),ProjectOperationOutcome::Committed{..}));
+        assert!(fixture.handles.iter().all(|handle|handle.is_completed()));
     }
     #[test]
     fn status_while_exact_operation_is_claimed_never_waits_for_its_prepared_work_lock() {

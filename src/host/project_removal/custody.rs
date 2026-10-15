@@ -103,6 +103,9 @@ pub(in crate::host) fn restore(registry:&super::super::model::Registry,entries:&
 fn pending(operation:uuid::Uuid,phase:PublicPhase,reason:impl Into<String>)->Result<(ServerResponse,Vec<ServerMessage>,bool),ProtocolError> {
     Ok((ServerResponse::ProjectOperation{outcome:Outcome::Pending{operation,phase,reason:reason.into()}},Vec::new(),false))
 }
+fn aborted(operation:uuid::Uuid,reason:impl Into<String>)->Result<(ServerResponse,Vec<ServerMessage>,bool),ProtocolError> {
+    Ok((ServerResponse::ProjectOperation{outcome:Outcome::Aborted{operation,reason:reason.into()}},Vec::new(),false))
+}
 /// A COMMIT response can be lost after SQLite positively settled the row.
 /// Re-reading that exact immutable receipt releases only its original lease;
 /// it never repeats effects or lets an unrelated operation consume custody.
@@ -171,7 +174,7 @@ pub(in crate::host) fn resume(host:&SharedHost,client:ClientId,identity:uuid::Uu
                     if model.identity!=identity {return Err(error("The original operation receipt belongs to another registry"));}
                     return Ok((ServerResponse::ProjectOperation{outcome:Outcome::Committed{operation,model}},Vec::new(),false));
                 }
-                Phase::Aborted=>return Err(error("This operation ended before effects. A fresh explicit project action is required.")),
+                Phase::Aborted=>return aborted(operation,"This original operation ended before repair or session close. Start a fresh explicit project action."),
                 _=>return pending(operation,PublicPhase::UnavailableAfterRestart,"Original prepared custody is unavailable. The affected scope remains reserved; no request, repair or close was reconstructed."),
             }
         }
@@ -203,7 +206,7 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
                 }
                 Phase::Aborted=> {
                     settle_original_receipt(host,request.operation);
-                    return Err(error("This operation ended before effects. Start a fresh explicit project action."));
+                    return aborted(request.operation,"This original operation ended before repair or session close. Start a fresh explicit project action.");
                 }
                 _=>{},
             }
@@ -274,7 +277,11 @@ pub(in crate::host) fn process(host:&SharedHost,client:ClientId,request:Request)
         match prepared {
             Ok(prepared)=>*work=prepared,
             Err(reason)=> {
-                if authority.advance_phase(host,Phase::Admitted,Phase::Aborted).is_ok() {operation.settled.store(true,Ordering::Release);*work=Work::Complete;return Err(reason);}
+                if authority.advance_phase(host,Phase::Admitted,Phase::Aborted).is_ok() {
+                    operation.settled.store(true,Ordering::Release);*work=Work::Complete;
+                    drop(work);drop(claim);drop(reservation);
+                    return aborted(operation.operation,format!("{} No repair or session close began. Start a fresh explicit project action.",reason.message));
+                }
                 return pending(operation.operation,PublicPhase::Preparing,format!("{} The original operation remains reserved because its pre-effect abort could not be persisted.",reason.message));
             }
         }

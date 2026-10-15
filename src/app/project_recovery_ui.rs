@@ -339,6 +339,24 @@ impl Cagents {
             Action::OperationFinished(id,operation,result) => {
                 let Some(pending)=self.project_recovery_ui.operations.get_mut(&id).filter(|pending|pending.request.operation==operation && pending.in_flight) else {return Task::none();};
                 pending.in_flight=false;
+                if let Ok(crate::project_recovery::ProjectOperationOutcome::Aborted{operation:received,reason})=&result {
+                    if *received==operation {
+                        let pending=self.project_recovery_ui.operations.remove(&id).unwrap();
+                        if let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==id)
+                            && row.pending_operation.as_ref().is_some_and(|notice|notice.operation==operation) {row.pending_operation=None;}
+                        match pending.completion {
+                            OperationCompletion::Locate{generation,..}=> {
+                                if self.project_recovery_ui.location_generations.get(&id)==Some(&generation) {self.finish_project_location(id);}
+                            }
+                            OperationCompletion::Remove=> {
+                                if self.project_instance(id).as_ref()==Some(&pending.request.project) {self.project_ui.removing.remove(&pending.request.project.repository);}
+                            }
+                        }
+                        // Exact unresolved publication/recovery associations
+                        // survive this pre-effect project-operation settlement.
+                        self.status=Some(TransientNotice::warning(reason.clone()));return Task::none();
+                    }
+                }
                 let model=match result {
                     Ok(crate::project_recovery::ProjectOperationOutcome::Committed{operation:received,model}) if received==operation=>Some(model),
                     result=> {
@@ -1141,6 +1159,52 @@ mod tests {
         assert!(app.workspace_model.project(&expected.repository).is_some());
     }
 
+    #[test]
+    fn only_matching_positive_abort_retires_project_mode_without_dropping_recovery_or_newer_intent() {
+        for locate in [false,true] {
+            let fixture=tempfile::tempdir().unwrap();let (mut app,id)=app(fixture.path());
+            let project=app.project_instance(id).unwrap();let operation=uuid::Uuid::new_v4();
+            let relocation=Relocation{repository:project.repository.clone(),destination:project.repository.clone(),old_root:project.repository.clone(),new_root:project.repository.clone()};
+            let action=if locate {crate::project_recovery::ProjectOperationAction::Locate{relocation:relocation.clone()}}else{crate::project_recovery::ProjectOperationAction::Remove{sessions:Vec::new()}};
+            let request=crate::project_recovery::ProjectOperationRequest{operation,project:project.clone(),action};
+            let completion=if locate {
+                app.project_recovery_ui.locating.insert(id);app.project_recovery_ui.location_generations.insert(id,operation);
+                app.sidebar_model.projects[0].reloading=true;
+                OperationCompletion::Locate{generation:operation,relocation}
+            }else{app.project_ui.removing.insert(project.repository.clone(),Vec::new());OperationCompletion::Remove};
+            let authority=crate::editor::RecoverySlot::reserve().unwrap().retain("original unresolved publication".into(),||Ok(()));
+            app.project_recovery_ui.relocated_recovery.insert(id,authority.clone());
+            drop(app.install_project_operation(id,request.clone(),completion.clone()));
+            drop(app.update_project_recovery(Action::OperationFinished(id,operation,Err("lost transport".into()))));
+            assert!(app.project_recovery_ui.operations.contains_key(&id));
+            if locate {assert!(app.project_recovery_ui.locating.contains(&id));}else{assert!(app.project_ui.removing.contains_key(&project.repository));}
+            drop(app.retry_project_operation(id));
+            drop(app.update_project_recovery(Action::OperationFinished(id,operation,Ok(crate::project_recovery::ProjectOperationOutcome::Aborted{operation:uuid::Uuid::new_v4(),reason:"wrong receipt".into()}))));
+            assert!(app.project_recovery_ui.operations.contains_key(&id));
+            drop(app.retry_project_operation(id));
+            drop(app.update_project_recovery(Action::OperationFinished(id,operation,Ok(crate::project_recovery::ProjectOperationOutcome::Aborted{operation,reason:"Actual durable pre-effect abort; choose a fresh action".into()}))));
+            assert!(!app.project_recovery_ui.operations.contains_key(&id));
+            assert!(app.sidebar_model.project(id).unwrap().pending_operation.is_none());
+            assert!(!app.project_recovery_ui.locating.contains(&id));assert!(!app.project_recovery_ui.location_generations.contains_key(&id));
+            assert!(!app.project_ui.removing.contains_key(&project.repository));
+            assert!(!app.sidebar_model.project(id).unwrap().reloading);
+            assert_eq!(app.project_recovery_ui.relocated_recovery.get(&id),Some(&authority));assert!(!authority.is_resolved());
+            assert!(app.workspace_model.project(&project.repository).is_some());
+            let mut fresh=request;fresh.operation=uuid::Uuid::new_v4();
+            let fresh_completion=match completion {
+                OperationCompletion::Locate{relocation,..}=> {
+                    app.project_recovery_ui.locating.insert(id);app.project_recovery_ui.location_generations.insert(id,fresh.operation);
+                    OperationCompletion::Locate{generation:fresh.operation,relocation}
+                }
+                OperationCompletion::Remove=> {app.project_ui.removing.insert(project.repository.clone(),Vec::new());OperationCompletion::Remove}
+            };
+            drop(app.install_project_operation(id,fresh.clone(),fresh_completion));
+            let notice=app.sidebar_model.project(id).unwrap().pending_operation.clone();
+            drop(app.update_project_recovery(Action::OperationFinished(id,operation,Ok(crate::project_recovery::ProjectOperationOutcome::Aborted{operation,reason:"late old abort".into()}))));
+            assert_eq!(app.project_recovery_ui.operations[&id].request,fresh);
+            assert_eq!(app.sidebar_model.project(id).unwrap().pending_operation,notice);
+        }
+    }
     #[tokio::test]
     async fn locate_keeps_only_its_original_window_recovery_until_exact_resolution() {
         let fixture=tempfile::tempdir().unwrap();
