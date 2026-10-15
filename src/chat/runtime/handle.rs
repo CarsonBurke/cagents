@@ -61,6 +61,18 @@ impl BackendIdentity {
     }
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) enum BackendSourceClaim {
+    Granted(uuid::Uuid),
+    Refused(String),
+}
+impl BackendSourceClaim {
+    #[cfg(test)]
+    pub(crate) fn into_result(self) -> Result<uuid::Uuid, String> {
+        match self { Self::Granted(token) => Ok(token), Self::Refused(reason) => Err(reason) }
+    }
+}
+
 #[derive(Clone)]
 pub struct Handle(Owner);
 #[derive(Clone)]
@@ -371,7 +383,7 @@ impl Handle {
             }
         }
     }
-    pub(crate) fn claim_backend_source(&self, expected: &BackendIdentity) -> Result<uuid::Uuid, String> {
+    pub(crate) fn claim_backend_source(&self, expected: &BackendIdentity) -> Result<BackendSourceClaim, String> {
         match &self.0 {
             Owner::Local(local) if expected.helper.is_none() => local.claim_backend_source(expected),
             Owner::Remote(remote) if expected.helper == Some(remote.identity().instance) =>

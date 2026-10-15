@@ -34,7 +34,7 @@ pub(crate) fn remove_actor_final_snapshot(
     remote_actor::final_snapshot::remove(record)
 }
 mod handle;
-pub(crate) use handle::BackendIdentity;
+pub(crate) use handle::{BackendIdentity, BackendSourceClaim};
 pub use handle::Handle;
 pub(crate) use remote_actor::RestartState as RetainedRestartState;
 pub(crate) use remote_actor::{
@@ -1392,14 +1392,18 @@ impl LocalHandle {
             .unwrap_or_else(|p| p.into_inner())
             .write(&[1]);
     }
-    pub(crate) fn claim_backend_source(&self, expected: &BackendIdentity) -> Result<uuid::Uuid, String> {
+    pub(crate) fn claim_backend_source(&self, expected: &BackendIdentity) -> Result<BackendSourceClaim, String> {
         if self.is_completed() {
-            return expected.matches_local(self).then(uuid::Uuid::new_v4)
-                .ok_or_else(|| "The completed backend changed; no owner was modified".into());
+            return Ok(if expected.matches_local(self) {
+                BackendSourceClaim::Granted(uuid::Uuid::new_v4())
+            } else { BackendSourceClaim::Refused("The completed backend changed; no owner was modified".into()) });
         }
         let (send, recv) = crossbeam_channel::bounded(1);
         self.ownership_command(ActorCommand::ClaimBackendSource { expected: expected.clone(), result: send })?;
-        recv.recv_timeout(Duration::from_secs(10)).map_err(|_| "Source claim result was lost; retain the exact owner".to_string())?
+        Ok(match recv.recv_timeout(Duration::from_secs(10)).map_err(|_| "Source claim result was lost; retain the exact owner".to_string())? {
+            Ok(token) => BackendSourceClaim::Granted(token),
+            Err(reason) => BackendSourceClaim::Refused(reason),
+        })
     }
     #[cfg(test)]
     pub(crate) fn claim_backend_source_losing_reply_for_test(&self, expected: &BackendIdentity) -> Result<(), String> {

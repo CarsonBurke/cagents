@@ -14,6 +14,7 @@ struct Entry {
     instance: uuid::Uuid,
     resource_epoch: uuid::Uuid,
     unresolved: bool,
+    pending_handoff: Option<(ChatSourceBinding, Option<uuid::Uuid>)>,
     learned_from: Option<ChatSourceBinding>,
     known: Option<(
         chat::runtime::BackendIdentity,
@@ -39,6 +40,7 @@ impl History {
                 instance,
                 resource_epoch: uuid::Uuid::new_v4(),
                 unresolved: false,
+                pending_handoff: None,
                 learned_from: None,
                 known: None,
             },
@@ -159,8 +161,10 @@ impl History {
         Ok(binding)
     }
     fn authorizes_intent(&self, binding: &ChatSourceBinding) -> bool {
-        self.validates(binding)
-            || self.entries.get(&binding.source.id).is_some_and(|entry| {
+        self.entries.get(&binding.source.id).is_some_and(|entry| {
+            !entry.unresolved && entry.instance == binding.execution_instance
+                && entry.known.as_ref().is_some_and(|(_, issued, _)| issued == binding)
+        }) || self.entries.get(&binding.source.id).is_some_and(|entry| {
                 !entry.unresolved
                     && entry.instance == binding.execution_instance
                     && entry.known.is_some()
@@ -170,6 +174,7 @@ impl History {
     pub(in crate::host) fn validates(&self, binding: &ChatSourceBinding) -> bool {
         self.entries.get(&binding.source.id).is_some_and(|entry| {
             !entry.unresolved
+                && entry.pending_handoff.is_none()
                 && entry.instance == binding.execution_instance
                 && entry
                     .known
@@ -293,13 +298,15 @@ pub(in crate::host) fn pair_changed(state: &mut HostState, id: TerminalId) {
 pub(super) struct Continuation {
     instance: uuid::Uuid,
     witness: chat::runtime::BackendIdentity,
+    handle: Handle,
+    claim: Option<uuid::Uuid>,
 }
 pub(super) fn continuation(
     host: &SharedHost,
     binding: &ChatSourceBinding,
 ) -> Result<Continuation, ProtocolError> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if !state.native_sources.validates(binding) {
+    if !state.native_sources.authorizes_intent(binding) {
         return Err(unavailable(
             "The source changed before its own pair transition",
         ));
@@ -310,10 +317,88 @@ pub(super) fn continuation(
         .expect("validated publication")
         .0
         .clone();
+    let handle = state.chats.get(&binding.source.id)
+        .filter(|record| record.execution_instance == binding.execution_instance)
+        .ok_or_else(|| unavailable("The original backend is no longer resident"))?.handle.clone();
     Ok(Continuation {
         instance: binding.execution_instance,
         witness,
+        handle,
+        claim: None,
     })
+}
+
+/// Publish pending ownership before asking the actual backend to linearize a
+/// handoff. Lost replies retain this exact operation and revoke old receipts.
+/// No host lock survives the actor/helper call.
+pub(super) fn claim_continuation(host: &SharedHost, binding: &ChatSourceBinding, continuation: &mut Continuation) -> Result<(), ProtocolError> {
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = state.native_sources.entries.get_mut(&binding.source.id)
+            .filter(|entry| entry.instance == continuation.instance)
+            .ok_or_else(|| unavailable("The backend publication was evicted; no owner was changed"))?;
+        match &entry.pending_handoff {
+            Some((original, _)) if original != binding => return Err(unavailable("Another exact handoff operation retains this backend")),
+            Some(_) => {},
+            None => {
+                entry.resource_epoch = uuid::Uuid::new_v4();
+                entry.pending_handoff = Some((binding.clone(), None));
+            }
+        }
+    }
+    let claim = match continuation.handle.claim_backend_source(&continuation.witness).map_err(unavailable)? {
+        chat::runtime::BackendSourceClaim::Granted(token) => token,
+        chat::runtime::BackendSourceClaim::Refused(reason) => {
+            // Only the authenticated owner can prove non-admission. Transport
+            // uncertainty above deliberately keeps the pending operation.
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(entry) = state.native_sources.entries.get_mut(&binding.source.id)
+                .filter(|entry| entry.instance == continuation.instance)
+                && entry.pending_handoff.as_ref().is_some_and(|(original, token)| original == binding && token.is_none())
+            {
+                entry.pending_handoff = None;
+                if let Some(record) = state.chats.get_mut(&binding.source.id)
+                    .filter(|record| record.execution_instance == continuation.instance && record.handle.same_actor(&continuation.handle)) {
+                    record.returning_terminal = false;
+                }
+            }
+            return Err(unavailable(reason));
+        }
+    };
+    continuation.claim = Some(claim);
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = state.native_sources.entries.get_mut(&binding.source.id)
+        .filter(|entry| entry.instance == continuation.instance)
+        .ok_or_else(|| unavailable("The claimed backend history changed; its exact owner remains retained"))?;
+    let pending = entry.pending_handoff.as_mut().filter(|(original, _)| original == binding)
+        .ok_or_else(|| unavailable("The claimed backend operation changed; its exact owner remains retained"))?;
+    pending.1 = Some(claim);
+    Ok(())
+}
+pub(super) fn update_claimed_source(continuation: &Continuation, source: Session, pair: Option<crate::terminal::holder::Record>) -> Result<(), String> {
+    continuation.handle.update_claimed_native_source(&continuation.witness,
+        continuation.claim.ok_or("No exact backend source claim")?, source, None, pair)
+}
+pub(super) fn finish_continuation(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<(), ProtocolError> {
+    let claim = continuation.claim.ok_or_else(|| unavailable("The exact handoff claim is unconfirmed"))?;
+    continuation.handle.release_backend_source(&continuation.witness, claim).map_err(unavailable)?;
+    clear_continuation(host, id, continuation, claim)
+}
+pub(super) fn close_continuation(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<(), ProtocolError> {
+    let claim = continuation.claim.ok_or_else(|| unavailable("The exact handoff claim is unconfirmed"))?;
+    continuation.handle.close_backend_source(&continuation.witness, claim).map_err(unavailable)?;
+    clear_continuation(host, id, continuation, claim)
+}
+fn clear_continuation(host: &SharedHost, id: TerminalId, continuation: &Continuation, claim: uuid::Uuid) -> Result<(), ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let entry = state.native_sources.entries.get_mut(&id)
+        .filter(|entry| entry.instance == continuation.instance)
+        .ok_or_else(|| unavailable("The disposed handoff history changed; no receipt was issued"))?;
+    if !entry.pending_handoff.as_ref().is_some_and(|(_, token)| *token == Some(claim)) {
+        return Err(unavailable("The disposed handoff operation changed; no receipt was issued"));
+    }
+    entry.pending_handoff = None;
+    Ok(())
 }
 
 /// The operation's own paired source may change, but its actual backend and
@@ -433,6 +518,8 @@ pub(super) fn decorate(host: &SharedHost, response: &mut ServerResponse) {
         .get(&id)
         .map(|r| r.execution_instance)
         .unwrap_or_default();
+    let binding = binding.filter(|_| state.native_sources.entries.get(&id)
+        .is_some_and(|entry| entry.pending_handoff.is_none()));
     match response {
         ServerResponse::ChatAttached {
             execution_instance,
@@ -832,6 +919,33 @@ mod tests {
     }
 
     #[test]
+    fn handoff_owner_claim_refuses_conversation_changed_after_host_require_without_teardown() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let owner = actor_with(&source, Box::new(Learns));
+        let fixture = BackendFixture::new(source.clone(), owner.0.clone(), uuid::Uuid::new_v4());
+        owner.0.command(chat::Command::SetModel { model: "first".into(), reasoning: None }).unwrap();
+        let wait = |thread: &str| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while owner.0.confirmed_session_id().as_deref() != Some(thread) {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(2));
+            }
+        };
+        wait("first");
+        let binding = fixture.capture().unwrap();
+        let mut continuation = continuation(&fixture.host, &binding).unwrap();
+        owner.0.command(chat::Command::SetModel { model: "second".into(), reasoning: None }).unwrap();
+        wait("second");
+        let reason = claim_continuation(&fixture.host, &binding, &mut continuation).unwrap_err();
+        assert!(reason.message.contains("actual provider conversation changed"), "{reason:?}");
+        assert!(!owner.0.is_completed());
+        assert_eq!(owner.0.confirmed_session_id().as_deref(), Some("second"));
+        assert!(fixture.host.lock().unwrap().native_sources.entries[&source.id].pending_handoff.is_none(),
+            "an actual owner refusal clears only the unadmitted operation; transport ambiguity does not");
+    }
+
+    #[test]
     fn lost_source_claim_reply_retains_exact_actor_and_refuses_queued_conversation_changes() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let source = source(directory.path());
@@ -848,8 +962,8 @@ mod tests {
         let refusal = owner.0.command(chat::Command::SetModel { model: "second".into(), reasoning: None }).unwrap_err();
         assert!(refusal.contains("pending terminal handoff"));
         assert_eq!(owner.0.confirmed_session_id().as_deref(), Some("first"));
-        let token = owner.0.claim_backend_source(&witness).unwrap();
-        assert_eq!(owner.0.claim_backend_source(&witness).unwrap(), token,
+        let token = owner.0.claim_backend_source(&witness).unwrap().into_result().unwrap();
+        assert_eq!(owner.0.claim_backend_source(&witness).unwrap().into_result().unwrap(), token,
             "retry recovers the actual retained operation, not a new claim");
         assert!(owner.0.release_backend_source(&witness, uuid::Uuid::new_v4()).is_err());
         assert!(!owner.0.is_completed());
@@ -863,7 +977,7 @@ mod tests {
         assert!(owner.0.close_backend_source(&witness, token).unwrap_err().contains("changed"));
         assert!(!owner.0.is_completed(), "stale consent cannot stop the actual successor conversation");
         let current = owner.0.backend_identity(proof).unwrap();
-        let token = owner.0.claim_backend_source(&current).unwrap();
+        let token = owner.0.claim_backend_source(&current).unwrap().into_result().unwrap();
         owner.0.close_backend_source(&current, token).unwrap();
         assert!(owner.0.is_completed());
     }
@@ -898,7 +1012,7 @@ mod tests {
         assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal, resume.0.as_raw_fd(), libc::SIGSTOP, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
         let witness = owner.0.backend_identity(source.proof.as_ref().unwrap()).unwrap();
         owner.0.command(chat::Command::Refresh).unwrap();
-        let reason = owner.0.claim_backend_source(&witness).unwrap_err();
+        let reason = owner.0.claim_backend_source(&witness).unwrap().into_result().unwrap_err();
         assert!(reason.contains("input/confirmation is pending"), "{reason}");
         assert!(!owner.0.is_completed());
         assert!(owner.0.backend_identity_is_current(&witness));

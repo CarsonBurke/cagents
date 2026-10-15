@@ -1939,7 +1939,7 @@ fn codex_terminal_view_captured(
         })?;
         (binding.source.clone(), record.execution_instance, binding)
     };
-    let continuation = source_binding::continuation(host, &source_binding)?;
+    let mut continuation = source_binding::continuation(host, &source_binding)?;
     let original_intent = captured_intent.unwrap_or_else(|| source_binding.clone());
     handoff_budget::bindings(&original_intent, &source_binding)?;
     handoff_budget::recipe(&recipe)?;
@@ -2061,6 +2061,7 @@ fn codex_terminal_view_captured(
         }
         return Err(error);
     }
+    source_binding::claim_continuation(host, &source_binding, &mut continuation)?;
     if let Some((source, terminal, proof)) = completed {
         let release = (|| {
             if terminal.holder_identity().is_some() {
@@ -2078,8 +2079,7 @@ fn codex_terminal_view_captured(
                 .or_else(|| session.launch.session_id.clone());
             unpaired.native_continuity = handle.native_continuity();
             unpaired.terminal = None;
-            handle
-                .update_native_source(unpaired.clone(), None, None)
+            source_binding::update_claimed_source(&continuation, unpaired.clone(), None)
                 .map_err(unavailable)?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if !state
@@ -2182,11 +2182,11 @@ fn codex_terminal_view_captured(
         }
         let mut updated = before.clone();
         updated.terminal = Some(descriptor.session.clone());
-        handle
-            .update_native_source(updated, None, paired_terminal.holder_identity().cloned())
+        source_binding::update_claimed_source(&continuation, updated, paired_terminal.holder_identity().cloned())
             .map_err(unavailable)?;
         after_source();
         let retained_binding = source_binding::complete_pair(host, chat_id, &continuation)?;
+        source_binding::finish_continuation(host, chat_id, &continuation)?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !state
             .terminals
@@ -2267,8 +2267,7 @@ fn codex_terminal_view_captured(
         })?;
         // Do not forget the durable pair before the exact terminal has its
         // own teardown receipt, including if the daemon stops at this boundary.
-        handle
-            .update_native_source(before, None, None)
+        source_binding::update_claimed_source(&continuation, before, None)
             .map_err(|rollback| {
                 unavailable(format!(
                     "{} Pair rollback is unconfirmed: {rollback}",
@@ -2292,6 +2291,8 @@ fn codex_terminal_view_captured(
             record.paired_terminal = None;
             source_binding::pair_changed(&mut state, chat_id);
         }
+        drop(state);
+        source_binding::finish_continuation(host, chat_id, &continuation)?;
         return Err(error);
     }
     result
@@ -3339,6 +3340,7 @@ fn process_inner(
                     "A shared Codex source must be reattached, not replaced",
                 ));
             }
+            let mut continuation = source_binding::continuation(host, &admitted_binding)?;
             // Capture positive owned-process/approved directory evidence
             // before stopping the native writer. A reused old pathname is
             // never authority for the replacement's working directory.
@@ -3388,7 +3390,8 @@ fn process_inner(
             }
             // Closing interrupts active work and waits for confirmed teardown.
             // Never start a second writer before teardown has been proved.
-            handle.close().map_err(unavailable)?;
+            source_binding::claim_continuation(host, &admitted_binding, &mut continuation)?;
+            source_binding::close_continuation(host, chat_id, &continuation)?;
             let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?;
             if snapshot.session_id != session.launch.session_id {
                 return Err(unavailable(
