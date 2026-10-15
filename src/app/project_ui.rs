@@ -4141,6 +4141,7 @@ mod tests {
             instance: uuid::Uuid::new_v4(),
             close_revision: Some(1),
             turn_generation: Some(3),
+            session_instance: uuid::Uuid::new_v4(),
         };
         app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![agent.clone()];
         app.project_ui.dialog.as_mut().unwrap().session_census = vec![agent];
@@ -4154,7 +4155,7 @@ mod tests {
 
     #[test]
     fn replacing_an_agent_or_its_turn_invalidates_counted_consent() {
-        for change in 0..4 {
+        for change in 0..5 {
             let repository = PathBuf::from("/repo");
             let primary = SidebarWorktree::from_durable(
                 WorktreeId::new(),
@@ -4175,6 +4176,7 @@ mod tests {
                 instance: uuid::Uuid::new_v4(),
                 close_revision: Some(1),
                 turn_generation: Some(3),
+                session_instance: uuid::Uuid::new_v4(),
             };
             app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![original.clone()];
             app.project_ui.dialog.as_mut().unwrap().session_census = vec![original.clone()];
@@ -4186,7 +4188,8 @@ mod tests {
                 0 => changed.session = TerminalId::new(),
                 1 => changed.instance = uuid::Uuid::new_v4(),
                 2 => changed.close_revision = Some(2),
-                _ => changed.turn_generation = Some(4),
+                3 => changed.turn_generation = Some(4),
+                _ => changed.session_instance = uuid::Uuid::new_v4(),
             }
             drop(app.handle_project_action(Action::SafetyRead {
                 request,
@@ -4233,6 +4236,7 @@ mod tests {
             instance: uuid::Uuid::new_v4(),
             close_revision: Some(1),
             turn_generation: Some(0),
+            session_instance: uuid::Uuid::new_v4(),
         };
         drop(app.handle_project_action(Action::DeleteOptionsRead {
             request,
@@ -4299,6 +4303,7 @@ mod tests {
             instance: uuid::Uuid::new_v4(),
             close_revision: Some(1),
             turn_generation: Some(1),
+            session_instance: uuid::Uuid::new_v4(),
         };
         assert!(
             checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions {
@@ -4397,7 +4402,13 @@ mod tests {
         assert!(cosmic::iced::runtime::task::into_stream(confirm).is_none());
         assert!(!app.project_ui.dialog.as_ref().unwrap().loading);
         assert!(!app.project_ui.is_deleting(linked.id));
-        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(1) }];
+        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![BusyAgent {
+            session: TerminalId::new(),
+            instance: uuid::Uuid::new_v4(),
+            close_revision: Some(1),
+            turn_generation: Some(1),
+            session_instance: uuid::Uuid::new_v4(),
+        }];
         drop(app.handle_project_action(Action::BusyAgentsConfirmed(stale, true)));
         assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
         drop(app.handle_project_action(Action::BusyAgentsConfirmed(current, true)));

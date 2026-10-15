@@ -75,6 +75,11 @@ pub enum Operation {
     SetupIntents {
         repository: PathBuf,
     },
+    StopSessions {
+        repository: PathBuf,
+        path: PathBuf,
+        consent: SessionStopConsent,
+    },
 }
 
 impl Operation {
@@ -90,6 +95,7 @@ impl Operation {
             | Self::GetDisposableIgnoredDirectories { repository, .. }
             | Self::BusySessions { repository, .. }
             | Self::CloseSessions { repository, .. }
+            | Self::StopSessions { repository, .. }
             | Self::SetupIntents { repository }
             | Self::SetupIntent { repository, .. }
             | Self::ResumeSetup { repository, .. }
@@ -131,6 +137,21 @@ pub struct BusyAgent {
     pub instance: uuid::Uuid,
     pub close_revision: Option<u64>,
     pub turn_generation: Option<u64>,
+    /// Stable actor lifetime, independent of newly admitted work.
+    pub session_instance: uuid::Uuid,
+}
+
+/// Exact actor lifetime approved for stopping all its ongoing work.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct SessionIdentity {
+    pub session: crate::model::TerminalId,
+    pub instance: uuid::Uuid,
+}
+
+/// Explicit whole-session consent. This does not claim a backend turn fence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionStopConsent {
+    pub sessions: Vec<SessionIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,6 +231,9 @@ pub enum Reply {
     SetupIntents {
         intents: Vec<SetupReceipt>,
         warnings: Vec<String>,
+    },
+    SessionsStopped {
+        path: PathBuf,
     },
 }
 
