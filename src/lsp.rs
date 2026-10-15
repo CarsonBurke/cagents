@@ -844,7 +844,7 @@ impl PartialEq for LspDocumentIncarnation {
 }
 impl Eq for LspDocumentIncarnation {}
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ObservedDocument {
     version: i32,
     incarnation: LspDocumentIncarnation,
@@ -4705,6 +4705,11 @@ impl LspManager {
             Ok(position) => position,
             Err(error) => return fail(&self.events, error),
         };
+        let observed_versions = match &args {
+            RequestArgs::Resolve { observed, .. } => observed.clone(),
+            _ if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ExecuteCommand) => self.snapshots.observations_for_session(&reference.session),
+            _ => HashMap::new(),
+        };
         if let Err(reason) = session
             .commands
             .send(SessionCommand::Request(PendingRequest {
@@ -4715,7 +4720,7 @@ impl LspManager {
                 kind,
                 position,
                 version: snapshot.version,
-                args, timeout, observed_versions: if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ResolveCodeAction|RequestKind::ExecuteCommand) {self.snapshots.observations_for_session(&reference.session)} else {HashMap::new()},
+                args, timeout, observed_versions,
             }))
         {
             return fail(&self.events, LspError::Protocol(reason.to_owned()));
@@ -9513,6 +9518,24 @@ mod tests {
             assert_eq!(manager.document_version(origin),Some(1));
             manager.begin_shutdown().await;
         }
+    }); }
+
+    #[test]
+    fn lazy_code_action_keeps_original_peer_incarnation_through_resolve() { block_on(async {
+        let (_guard,worktree,file)=workspace();let peer=file.with_file_name("peer.rs");std::fs::write(&peer,"old").unwrap();let peer_uri=Url::from_file_path(&peer).unwrap();
+        let mut manager=rust_manager();let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"codeActionProvider":{"resolveProvider":true}}),|_|vec![]);
+        let events=manager.events();let origin=LspDocumentId(1);manager.open_for_test(origin,&file,&worktree,rust_language(),1,"foo");let handle=handle_of(&slot).await;await_ready(&events,origin).await;
+        manager.open_for_test(LspDocumentId(2),&peer,&worktree,rust_language(),1,"old");
+        let request=manager.request_code_actions(origin,LspRange::default(),&[]);let pending=handle.wait_for("textDocument/codeAction").await;
+        handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":[{"title":"Fix peer","data":{"opaque":7}}]}))).unwrap();
+        let item=next_matching(&events,|event|match event {LspEvent::CodeActions{request:id,items,..}if *id==request=>items.first().cloned(),_=>None}).await;
+        assert!(manager.validate_code_action_context(&item).is_ok());
+        manager.close(LspDocumentId(2));manager.open_for_test(LspDocumentId(3),&peer,&worktree,rust_language(),1,"changed");
+        assert!(manager.validate_code_action_context(&item).is_err());
+        let request=manager.request_resolve_code_action(origin,item);let pending=handle.wait_for("codeAction/resolve").await;
+        handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":pending.id,"result":{"title":"Fix peer","edit":{"changes":{peer_uri.as_str():[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"new"}]}}}}))).unwrap();
+        next_matching(&events,|event|match event {LspEvent::RequestFailed{request:id,error:LspError::Unsupported(_),..}if *id==request=>Some(()),_=>None}).await;
+        manager.begin_shutdown().await;
     }); }
 
     #[test]

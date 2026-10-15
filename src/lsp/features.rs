@@ -75,6 +75,9 @@ pub struct LspCodeAction {
     pub needs_resolve: bool,
     raw: lsp_types::CodeActionOrCommand,
     origin_version: i32,
+    // Retains original peer context across an opaque lazy resolve. Recapturing
+    // current versions would bless stale server data after close/reopen.
+    observed_documents: HashMap<Url, ObservedDocument>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,7 +112,7 @@ pub(super) enum RequestArgs {
     Formatting(LspFormattingOptions),
     RangeFormatting {range:lsp_types::Range,options:LspFormattingOptions},
     CodeActions {range:lsp_types::Range,diagnostics:Vec<lsp_types::Diagnostic>},
-    Resolve(lsp_types::CodeAction),
+    Resolve { action:lsp_types::CodeAction, observed:HashMap<Url,ObservedDocument> },
     Execute(LspCommand),
     Signature {trigger:Option<String>,is_retrigger:bool,active:Option<lsp_types::SignatureHelp>},
 }
@@ -181,8 +184,26 @@ impl LspManager {
     }
     pub fn request_resolve_code_action(&mut self,doc:LspDocumentId,item:LspCodeAction)->LspRequestId {
         if self.document_version(doc)!=Some(item.origin_version){return self.fail_feature(doc,LspError::StaleVersion{result:item.origin_version,current:self.document_version(doc).unwrap_or(-1)});}
-        let c=self.capabilities(doc);match item.raw {lsp_types::CodeActionOrCommand::CodeAction(raw)=>self.feature_request(doc,LspPosition::default(),RequestKind::ResolveCodeAction,RequestArgs::Resolve(raw),Duration::from_secs(15),c.ready&&c.code_action_resolve),_=>self.fail_feature(doc,LspError::Unsupported("this action does not require resolution".into()))}
+        let c=self.capabilities(doc);match item.raw {lsp_types::CodeActionOrCommand::CodeAction(raw)=>self.feature_request(doc,LspPosition::default(),RequestKind::ResolveCodeAction,RequestArgs::Resolve {action:raw,observed:item.observed_documents},Duration::from_secs(15),c.ready&&c.code_action_resolve),_=>self.fail_feature(doc,LspError::Unsupported("this action does not require resolution".into()))}
     }
+    /// Before executing an opaque previously offered action command, the UI
+    /// must validate its original peer context. An edit-only action instead
+    /// fences only its actual targets via observed_incarnation in the planner.
+    pub fn validate_code_action_context(&self,item:&LspCodeAction)->Result<(),LspError> {
+        for (uri,observed) in &item.observed_documents {
+            let Some((snapshot,incarnation))=self.snapshots.observation(uri) else {
+                return Err(LspError::Unsupported("A code-action peer document was closed after the action was requested".into()));
+            };
+            if incarnation!=observed.incarnation {
+                return Err(LspError::Unsupported("A code-action peer document was closed and reopened after the action was requested".into()));
+            }
+            if snapshot.version!=observed.version {
+                return Err(LspError::StaleVersion{result:observed.version,current:snapshot.version});
+            }
+        }
+        Ok(())
+    }
+
     pub fn execute_command(&mut self,doc:LspDocumentId,command:LspCommand)->LspRequestId {
         let c=self.capabilities(doc);let supported=c.ready&&c.execute_commands.contains(&command.command);
         self.feature_request(doc,LspPosition::default(),RequestKind::ExecuteCommand,RequestArgs::Execute(command),Duration::from_secs(15),supported)
@@ -211,7 +232,7 @@ pub(super) async fn perform_feature(server:ServerSocket,kind:RequestKind,positio
         (RequestKind::Formatting,RequestArgs::Formatting(options))=>server.request::<request::Formatting>(lsp_types::DocumentFormattingParams{text_document:position.text_document,options:format_options(options),work_done_progress_params:progress}).await.map(R::Formatting),
         (RequestKind::RangeFormatting,RequestArgs::RangeFormatting{range,options})=>server.request::<request::RangeFormatting>(lsp_types::DocumentRangeFormattingParams{text_document:position.text_document,range,options:format_options(options),work_done_progress_params:progress}).await.map(R::Formatting),
         (RequestKind::CodeActions,RequestArgs::CodeActions{range,diagnostics})=>server.request::<request::CodeActionRequest>(lsp_types::CodeActionParams{text_document:position.text_document,range,context:lsp_types::CodeActionContext{diagnostics,only:None,trigger_kind:Some(lsp_types::CodeActionTriggerKind::INVOKED)},work_done_progress_params:progress,partial_result_params:Default::default()}).await.map(R::CodeActions),
-        (RequestKind::ResolveCodeAction,RequestArgs::Resolve(item))=>server.request::<request::CodeActionResolveRequest>(item).await.map(R::CodeActionResolved),
+        (RequestKind::ResolveCodeAction,RequestArgs::Resolve{action,..})=>server.request::<request::CodeActionResolveRequest>(action).await.map(R::CodeActionResolved),
         (RequestKind::ExecuteCommand,RequestArgs::Execute(command))=>server.request::<request::ExecuteCommand>(lsp_types::ExecuteCommandParams{command:command.command,arguments:command.arguments,work_done_progress_params:progress}).await.map(R::CommandExecuted),
         (RequestKind::SignatureHelp,RequestArgs::Signature{trigger,is_retrigger,active})=>server.request::<request::SignatureHelpRequest>(lsp_types::SignatureHelpParams{text_document_position_params:position,work_done_progress_params:progress,context:Some(lsp_types::SignatureHelpContext{trigger_kind:if trigger.is_some(){lsp_types::SignatureHelpTriggerKind::TRIGGER_CHARACTER}else{lsp_types::SignatureHelpTriggerKind::INVOKED},trigger_character:trigger,is_retrigger,active_signature_help:active})}).await.map(R::SignatureHelp),
         _=>Err(async_lsp::Error::Protocol("invalid editor request arguments".into()))
@@ -327,7 +348,7 @@ fn convert_action(store:&SnapshotStore,req:&PendingRequest,raw:lsp_types::CodeAc
         lsp_types::CodeActionOrCommand::Command(c)=>(c.title.clone(),None,false,None,None,Some(command(c.clone())),false),
         lsp_types::CodeActionOrCommand::CodeAction(c)=>(c.title.clone(),c.kind.as_ref().map(|k|k.as_str().to_owned()),c.is_preferred.unwrap_or(false),c.disabled.as_ref().map(|d|d.reason.clone()),c.edit.clone().map(|e|convert_workspace_edit(store,e,Some(&req.observed_versions))).transpose()?,c.command.clone().map(command),(c.edit.is_none()||c.command.is_none())&&c.data.is_some()),
     };
-    Ok(LspCodeAction{title,kind,is_preferred,disabled,edit,command:cmd,needs_resolve,raw,origin_version:req.version})
+    Ok(LspCodeAction{title,kind,is_preferred,disabled,edit,command:cmd,needs_resolve,raw,origin_version:req.version,observed_documents:req.observed_versions.clone()})
 }
 fn documentation(d:lsp_types::Documentation)->String{match d{lsp_types::Documentation::String(s)=>s,lsp_types::Documentation::MarkupContent(c)=>c.value}}
 fn utf16_byte(label:&str,offset:u32)->Option<usize>{let mut units=0;for (byte,ch) in label.char_indices(){if units==offset{return Some(byte);}units+=ch.len_utf16() as u32;if units>offset{return None;}}(units==offset).then_some(label.len())}
@@ -589,7 +610,7 @@ impl RequestArgs {
     pub(super) fn queued_bytes(&self)->usize {match self{
         Self::None=>0,Self::Rename(s)=>s.len(),Self::Formatting(_)|Self::RangeFormatting{..}=>std::mem::size_of::<Self>(),
         Self::CodeActions{diagnostics,..}=>serde_json::to_vec(diagnostics).map_or(MAX_CONTENT_LENGTH,|bytes|bytes.len()),
-        Self::Resolve(item)=>serde_json::to_vec(item).map_or(MAX_CONTENT_LENGTH,|b|b.len()),
+        Self::Resolve{action,observed}=>serde_json::to_vec(action).map_or(MAX_CONTENT_LENGTH,|b|b.len()).saturating_add(observed.iter().map(|(uri,_)|uri.as_str().len().saturating_add(std::mem::size_of::<ObservedDocument>())).sum::<usize>()),
         Self::Execute(c)=>c.command.len()+c.arguments.iter().map(|a|serde_json::to_vec(a).map_or(MAX_CONTENT_LENGTH,|b|b.len())).sum::<usize>(),
         Self::Signature{trigger,active,..}=>trigger.as_ref().map_or(0,String::len).saturating_add(active.as_ref().map_or(0,|help|serde_json::to_vec(help).map_or(MAX_CONTENT_LENGTH,|bytes|bytes.len()))),
     }}
@@ -608,7 +629,7 @@ impl LspCodeAction {
     /// Constructs a local action without protocol resolution data.
     pub fn local(title:String,edit:Option<LspWorkspaceEdit>,command:Option<LspCommand>)->Self {
         let raw=lsp_types::CodeActionOrCommand::CodeAction(lsp_types::CodeAction{title:title.clone(),..Default::default()});
-        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1}
+        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1,observed_documents:HashMap::new()}
     }
 }
 
