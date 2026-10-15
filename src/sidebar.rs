@@ -875,7 +875,10 @@ impl SidebarWorktree {
     pub fn apply_operation(&mut self, observation: &crate::repository::GitOperationObservation) {
         let (operation, error) = match observation {
             Ok(operation) => (*operation, None),
-            Err(error) => (self.operation, Some(error.chars().take(512).collect::<String>())),
+            Err(error) => (
+                self.operation,
+                Some(error.chars().take(512).collect::<String>()),
+            ),
         };
         if self.operation != operation || self.operation_error != error {
             self.operation = operation;
@@ -6038,8 +6041,13 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
 fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
-    if worktree.status_error.is_some() || worktree.operation_error.is_some()
-        || worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) {
+    if worktree.status_error.is_some()
+        || worktree.operation_error.is_some()
+        || worktree
+            .dirty
+            .as_ref()
+            .is_some_and(|dirty| dirty.conflicted > 0)
+    {
         return Icon::Warning;
     }
     use crate::repository::GitOperationKind;
@@ -6053,10 +6061,19 @@ fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
 }
 
 fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
-    if worktree.status_error.is_some() || worktree.operation_error.is_some() { BadgeTone::Warning }
-    else if worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) { BadgeTone::Danger }
-    else if worktree.operation.is_some() { BadgeTone::Neutral }
-    else { BadgeTone::Warning }
+    if worktree.status_error.is_some() || worktree.operation_error.is_some() {
+        BadgeTone::Warning
+    } else if worktree
+        .dirty
+        .as_ref()
+        .is_some_and(|dirty| dirty.conflicted > 0)
+    {
+        BadgeTone::Danger
+    } else if worktree.operation.is_some() {
+        BadgeTone::Neutral
+    } else {
+        BadgeTone::Warning
+    }
 }
 
 fn worktree_change_count(worktree: &SidebarWorktree) -> String {
@@ -6064,10 +6081,20 @@ fn worktree_change_count(worktree: &SidebarWorktree) -> String {
         return "?".to_owned();
     }
     let count = worktree.dirty.as_ref().map_or(0, dirty_count);
-    let count = if count > 999 { "999+".to_owned() } else if worktree.listing_truncated {format!("{count}+")} else { count.to_string() };
-    if worktree.operation_error.is_some() { format!("{count} · ?") }
-    else if let Some(operation) = worktree.operation { format!("{} · {count}", operation.label()) }
-    else { count }
+    let count = if count > 999 {
+        "999+".to_owned()
+    } else if worktree.listing_truncated {
+        format!("{count}+")
+    } else {
+        count.to_string()
+    };
+    if worktree.operation_error.is_some() {
+        format!("{count} · ?")
+    } else if let Some(operation) = worktree.operation {
+        format!("{} · {count}", operation.label())
+    } else {
+        count
+    }
 }
 
 fn worktree_indicator(
@@ -16039,14 +16066,29 @@ pub(crate) mod tests {
         let mut row = worktree(11, "feature/merge", false);
         row.apply_operation(&Ok(Some(GitOperationKind::Merge)));
         row.apply_status(&StatusSnapshot::default());
-        assert!(matches!(worktree_change_icon(&row), Icon::MergedPullRequest));
-        assert!(row.chrome.dirty_badge.as_deref().unwrap().contains("Merge in progress"));
+        assert!(matches!(
+            worktree_change_icon(&row),
+            Icon::MergedPullRequest
+        ));
+        assert!(
+            row.chrome
+                .dirty_badge
+                .as_deref()
+                .unwrap()
+                .contains("Merge in progress")
+        );
         assert!(row.status_description().contains("Merge in progress"));
         assert_eq!(worktree_change_count(&row), "Merge · 0");
         row.apply_operation(&Err("marker unreadable".into()));
-        assert!(row.status_error.is_none(), "operation metadata failure does not assert status failed");
+        assert!(
+            row.status_error.is_none(),
+            "operation metadata failure does not assert status failed"
+        );
         assert!(matches!(worktree_change_icon(&row), Icon::Warning));
-        assert!(row.status_description().contains("Last known: Merge in progress"));
+        assert!(
+            row.status_description()
+                .contains("Last known: Merge in progress")
+        );
         assert_eq!(worktree_change_count(&row), "0 · ?");
         row.apply_operation(&Ok(Some(GitOperationKind::Rebase)));
         assert!(row.operation_error.is_none());

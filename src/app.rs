@@ -1774,11 +1774,17 @@ pub struct LoadedRepository {
 impl LoadedRepository {
     /// Both new-project and duplicate-load publication use the same observed
     /// row facts. Existing rows are still left to their own freshness owner.
-    fn sidebar_worktree(&self, record: &WorktreeRecord, status: Option<&StatusSnapshot>) -> SidebarWorktree {
+    fn sidebar_worktree(
+        &self,
+        record: &WorktreeRecord,
+        status: Option<&StatusSnapshot>,
+    ) -> SidebarWorktree {
         let mut row = SidebarWorktree::from_repository(record, status);
         row.head_repository = self.head_repositories.get(&record.id).cloned();
         row.apply_status_error(self.status_order.errors.get(&record.id).map(String::as_str));
-        if let Some(operation) = self.operations.get(&record.id) { row.apply_operation(operation); }
+        if let Some(operation) = self.operations.get(&record.id) {
+            row.apply_operation(operation);
+        }
         row
     }
 }
@@ -11160,8 +11166,10 @@ impl Cagents {
                     prepared: None,
                     status: status.clone(),
                     head_repository,
-                    operation: cache.row_operation().cloned().ok_or_else(||
-                        "successful source-control read did not expose operation metadata".to_owned())?,
+                    operation: cache.row_operation().cloned().ok_or_else(|| {
+                        "successful source-control read did not expose operation metadata"
+                            .to_owned()
+                    })?,
                     read: status_read,
                 };
                 let Some(mut snapshot) = snapshot else {
@@ -13759,7 +13767,9 @@ impl Application for Cagents {
                                         existence: Existence::Open,
                                     }]);
                                 }
-                                existing.worktrees.push(loaded.sidebar_worktree(record, status.as_ref()));
+                                existing
+                                    .worktrees
+                                    .push(loaded.sidebar_worktree(record, status.as_ref()));
                             }
                             let existing_id = existing.id;
                             self.refresh_ui.git.forget(project_id);
@@ -13809,7 +13819,9 @@ impl Application for Cagents {
                         let worktrees = loaded
                             .worktrees
                             .iter()
-                            .map(|(record, status)| loaded.sidebar_worktree(record, status.as_ref()))
+                            .map(|(record, status)| {
+                                loaded.sidebar_worktree(record, status.as_ref())
+                            })
                             .collect();
                         let pull_requests = match &loaded.github {
                             GitHubAvailability::Ready { pull_requests, .. } => pull_requests
@@ -17831,12 +17843,17 @@ fn load_repository(
             Some((record.id, key))
         })
         .collect();
-    let operations = worktrees.iter().filter(|(record, _)| !record.bare).map(|(record, _)| {
-        let observation = service.operation_state(&record.path, &cancellation)
-            .map(|operation| operation.map(|operation| operation.kind))
-            .map_err(|error| error.to_string().chars().take(512).collect());
-        (record.id, observation)
-    }).collect();
+    let operations = worktrees
+        .iter()
+        .filter(|(record, _)| !record.bare)
+        .map(|(record, _)| {
+            let observation = service
+                .operation_state(&record.path, &cancellation)
+                .map(|operation| operation.map(|operation| operation.kind))
+                .map_err(|error| error.to_string().chars().take(512).collect());
+            (record.id, observation)
+        })
+        .collect();
     let review_repository = service
         .remotes(&repository.selected_path, &cancellation)
         .ok()

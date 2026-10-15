@@ -6,7 +6,10 @@ const MAX_OPERATION_REF_BYTES: u64 = 64 * 1024;
 const MAX_OPERATION_MESSAGE_BYTES: u64 = 1024 * 1024;
 
 fn invalid(reason: impl fmt::Display) -> RepositoryError {
-    RepositoryError::InvalidOutput { field: "Git operation metadata", reason: reason.to_string() }
+    RepositoryError::InvalidOutput {
+        field: "Git operation metadata",
+        reason: reason.to_string(),
+    }
 }
 fn metadata(root: &fs_safety::Root, path: &str) -> Result<Option<fs::Metadata>, RepositoryError> {
     match fs_safety::metadata_beneath(root, Path::new(path)) {
@@ -16,7 +19,16 @@ fn metadata(root: &fs_safety::Root, path: &str) -> Result<Option<fs::Metadata>, 
     }
 }
 fn version(m: &fs::Metadata) -> (u64, u64, u64, u32, i64, i64, i64, i64) {
-    (m.dev(), m.ino(), m.len(), m.mode(), m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec())
+    (
+        m.dev(),
+        m.ino(),
+        m.len(),
+        m.mode(),
+        m.mtime(),
+        m.mtime_nsec(),
+        m.ctime(),
+        m.ctime_nsec(),
+    )
 }
 fn read(root: &fs_safety::Root, path: &str, limit: u64) -> Result<Option<String>, RepositoryError> {
     let mut file = match fs_safety::open_beneath(root, Path::new(path)) {
@@ -25,42 +37,83 @@ fn read(root: &fs_safety::Root, path: &str, limit: u64) -> Result<Option<String>
         Err(error) => return Err(invalid(error)),
     };
     let before = file.metadata().map_err(invalid)?;
-    if !before.is_file() { return Err(invalid(format!("{path} is not a regular file"))); }
-    if before.len() > limit { return Err(invalid(format!("{path} exceeds its {limit}-byte read limit"))); }
+    if !before.is_file() {
+        return Err(invalid(format!("{path} is not a regular file")));
+    }
+    if before.len() > limit {
+        return Err(invalid(format!(
+            "{path} exceeds its {limit}-byte read limit"
+        )));
+    }
     let bytes = fs_safety::read_bounded(&mut file, limit).map_err(invalid)?;
-    if bytes.len() as u64 > limit { return Err(invalid(format!("{path} exceeds its {limit}-byte read limit"))); }
+    if bytes.len() as u64 > limit {
+        return Err(invalid(format!(
+            "{path} exceeds its {limit}-byte read limit"
+        )));
+    }
     let after = file.metadata().map_err(invalid)?;
-    if version(&before) != version(&after) { return Err(invalid(format!("{path} changed while being read"))); }
-    let text = String::from_utf8(bytes).map_err(|_| invalid(format!("{path} is not valid UTF-8")))?;
+    if version(&before) != version(&after) {
+        return Err(invalid(format!("{path} changed while being read")));
+    }
+    let text =
+        String::from_utf8(bytes).map_err(|_| invalid(format!("{path} is not valid UTF-8")))?;
     Ok(Some(text.trim().to_owned()).filter(|text| !text.is_empty()))
 }
 
-pub(super) fn read_operation_state(directory: &Path) -> Result<Option<GitOperationState>, RepositoryError> {
+pub(super) fn read_operation_state(
+    directory: &Path,
+) -> Result<Option<GitOperationState>, RepositoryError> {
     let root = fs_safety::Root::open(directory).map_err(invalid)?;
     let mut rebase = None;
     for path in ["rebase-merge", "rebase-apply"] {
         if let Some(metadata) = metadata(&root, path)? {
-            if !metadata.is_dir() { return Err(invalid(format!("{path} is not a directory"))); }
+            if !metadata.is_dir() {
+                return Err(invalid(format!("{path} is not a directory")));
+            }
             rebase = Some(path);
             break;
         }
     }
     let (kind, incoming_ref, message) = if let Some(prefix) = rebase {
-        let message = read(&root, &format!("{prefix}/message"), MAX_OPERATION_MESSAGE_BYTES)?;
-        (GitOperationKind::Rebase, read(&root, &format!("{prefix}/onto"), MAX_OPERATION_REF_BYTES)?,
-            match message { Some(message) => Some(message), None => read(&root, "MERGE_MSG", MAX_OPERATION_MESSAGE_BYTES)? })
+        let message = read(
+            &root,
+            &format!("{prefix}/message"),
+            MAX_OPERATION_MESSAGE_BYTES,
+        )?;
+        (
+            GitOperationKind::Rebase,
+            read(&root, &format!("{prefix}/onto"), MAX_OPERATION_REF_BYTES)?,
+            match message {
+                Some(message) => Some(message),
+                None => read(&root, "MERGE_MSG", MAX_OPERATION_MESSAGE_BYTES)?,
+            },
+        )
     } else {
         let mut found = None;
-        for (path, kind) in [("MERGE_HEAD", GitOperationKind::Merge), ("CHERRY_PICK_HEAD", GitOperationKind::CherryPick), ("REVERT_HEAD", GitOperationKind::Revert)] {
+        for (path, kind) in [
+            ("MERGE_HEAD", GitOperationKind::Merge),
+            ("CHERRY_PICK_HEAD", GitOperationKind::CherryPick),
+            ("REVERT_HEAD", GitOperationKind::Revert),
+        ] {
             if metadata(&root, path)?.is_some() {
-                found = Some((kind, read(&root, path, MAX_OPERATION_REF_BYTES)?, read(&root, "MERGE_MSG", MAX_OPERATION_MESSAGE_BYTES)?));
+                found = Some((
+                    kind,
+                    read(&root, path, MAX_OPERATION_REF_BYTES)?,
+                    read(&root, "MERGE_MSG", MAX_OPERATION_MESSAGE_BYTES)?,
+                ));
                 break;
             }
         }
-        let Some(state) = found else { return Ok(None); };
+        let Some(state) = found else {
+            return Ok(None);
+        };
         state
     };
-    Ok(Some(GitOperationState { kind, incoming_ref, message }))
+    Ok(Some(GitOperationState {
+        kind,
+        incoming_ref,
+        message,
+    }))
 }
 
 #[cfg(test)]
@@ -100,8 +153,17 @@ mod tests {
                     // SAFETY: path is a valid live NUL-terminated fixture path.
                     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
                 }
-                1 => { let outside = dir.path().join("outside"); fs::write(&outside, "secret").unwrap(); symlink(outside, &message).unwrap(); }
-                2 => { fs::File::create(&message).unwrap().set_len(MAX_OPERATION_MESSAGE_BYTES + 1).unwrap(); }
+                1 => {
+                    let outside = dir.path().join("outside");
+                    fs::write(&outside, "secret").unwrap();
+                    symlink(outside, &message).unwrap();
+                }
+                2 => {
+                    fs::File::create(&message)
+                        .unwrap()
+                        .set_len(MAX_OPERATION_MESSAGE_BYTES + 1)
+                        .unwrap();
+                }
                 _ => fs::write(&message, [0xff]).unwrap(),
             }
             let error = read_operation_state(dir.path()).unwrap_err().to_string();
@@ -113,7 +175,8 @@ mod tests {
     fn operation_metadata_refuses_fifo_head_and_linked_rebase_directory() {
         let dir = tempfile::tempdir().unwrap();
         use std::os::unix::ffi::OsStrExt;
-        let path = std::ffi::CString::new(dir.path().join("MERGE_HEAD").as_os_str().as_bytes()).unwrap();
+        let path =
+            std::ffi::CString::new(dir.path().join("MERGE_HEAD").as_os_str().as_bytes()).unwrap();
         // SAFETY: path is a valid live NUL-terminated fixture path.
         assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
         assert!(read_operation_state(dir.path()).is_err());

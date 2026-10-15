@@ -142,12 +142,22 @@ impl DirtyState {
 
 /// Display-only observation of Git's in-progress operation markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GitOperationKind { Merge, Rebase, CherryPick, Revert }
+pub enum GitOperationKind {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+}
 /// Successful absence is distinct from unreadable operation metadata.
 pub type GitOperationObservation = Result<Option<GitOperationKind>, String>;
 impl GitOperationKind {
     pub fn label(self) -> &'static str {
-        match self { Self::Merge => "Merge", Self::Rebase => "Rebase", Self::CherryPick => "Cherry-pick", Self::Revert => "Revert" }
+        match self {
+            Self::Merge => "Merge",
+            Self::Rebase => "Rebase",
+            Self::CherryPick => "Cherry-pick",
+            Self::Revert => "Revert",
+        }
     }
 }
 
@@ -1016,7 +1026,6 @@ impl SnapshotCache {
     pub fn row_operation(&self) -> Option<&GitOperationObservation> {
         self.row_operation.as_ref()
     }
-
 
     /// The publication remote proven by the last successful snapshot read.
     /// This display identity never grants permission to mutate a worktree.
@@ -4316,20 +4325,35 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
         if cancellation.is_cancelled() {
-            return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled,
-                "Git operation metadata read cancelled", false).into());
+            return Err(process_failure(
+                &CommandSpec::new(&self.git),
+                ProcessFailureKind::Cancelled,
+                "Git operation metadata read cancelled",
+                false,
+            )
+            .into());
         }
         // Operation markers are private-admin data. Resolving that bounded
         // locator does not require enumerating every common ref again for each
         // sidebar row; snapshot_cached already owns its full admin prepass.
-        let directory = local_git_dir(worktree).and_then(|directory|
-            directory.map(fs::canonicalize).transpose())
-            .map_err(|error| ValidationError::Io(format!("Cannot observe Git operation metadata: {error}")))?;
-        let result = directory.as_deref()
-            .map(operation_metadata::read_operation_state).transpose()?.flatten();
+        let directory = local_git_dir(worktree)
+            .and_then(|directory| directory.map(fs::canonicalize).transpose())
+            .map_err(|error| {
+                ValidationError::Io(format!("Cannot observe Git operation metadata: {error}"))
+            })?;
+        let result = directory
+            .as_deref()
+            .map(operation_metadata::read_operation_state)
+            .transpose()?
+            .flatten();
         if cancellation.is_cancelled() {
-            return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled,
-                "Git operation metadata read cancelled", false).into());
+            return Err(process_failure(
+                &CommandSpec::new(&self.git),
+                ProcessFailureKind::Cancelled,
+                "Git operation metadata read cancelled",
+                false,
+            )
+            .into());
         }
         Ok(result)
     }
@@ -8525,8 +8549,14 @@ mod tests {
         fs::write(admin.join("commondir"), "missing-common\n").unwrap();
         let executor = Arc::new(FakeExecutor::default());
         let service = RepositoryService::new("git", executor.clone());
-        assert_eq!(service.operation_state(directory.path(), &CancellationToken::default())
-            .unwrap().unwrap().kind, GitOperationKind::Merge);
+        assert_eq!(
+            service
+                .operation_state(directory.path(), &CancellationToken::default())
+                .unwrap()
+                .unwrap()
+                .kind,
+            GitOperationKind::Merge
+        );
         assert!(executor.commands.lock().unwrap().is_empty());
         let cancel = CancellationToken::default();
         cancel.cancel();
@@ -8551,17 +8581,46 @@ mod tests {
         let git = RepositoryService::new("git", executor.clone());
         let cancel = CancellationToken::default();
         let mut cache = SnapshotCache::default();
-        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
-        assert_eq!(cache.row_operation(), Some(&Ok(Some(GitOperationKind::Merge))));
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            cache.row_operation(),
+            Some(&Ok(Some(GitOperationKind::Merge)))
+        );
         let before = executor.commands.lock().unwrap().len();
         fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap();
-        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
-        assert_eq!(executor.commands.lock().unwrap().len(), before + 1, "unchanged refresh still runs only status");
-        assert!(cache.row_operation().unwrap().as_ref().unwrap_err().contains("Git operation metadata"));
-        assert!(!cache.status_attempt_failed(), "marker/draft parsing failure is not a failed status command");
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            executor.commands.lock().unwrap().len(),
+            before + 1,
+            "unchanged refresh still runs only status"
+        );
+        assert!(
+            cache
+                .row_operation()
+                .unwrap()
+                .as_ref()
+                .unwrap_err()
+                .contains("Git operation metadata")
+        );
+        assert!(
+            !cache.status_attempt_failed(),
+            "marker/draft parsing failure is not a failed status command"
+        );
         fs::remove_file(admin.join("MERGE_MSG")).unwrap();
         fs::remove_file(admin.join("MERGE_HEAD")).unwrap();
-        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+        assert!(
+            git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(cache.row_operation(), Some(&Ok(None)));
     }
 

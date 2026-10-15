@@ -83,8 +83,15 @@ fn display_worktrees(
 
 impl Snapshot {
     fn failed_rows(&self) -> BTreeSet<WorktreeId> {
-        self.status_errors.keys().copied().chain(self.operations.iter()
-            .filter_map(|(id, operation)| operation.is_err().then_some(*id))).collect()
+        self.status_errors
+            .keys()
+            .copied()
+            .chain(
+                self.operations
+                    .iter()
+                    .filter_map(|(id, operation)| operation.is_err().then_some(*id)),
+            )
+            .collect()
     }
 
     /// Independent read streams order row authority by read start, rather than
@@ -118,7 +125,9 @@ impl Snapshot {
             self.status_reads.insert(id, latest_at);
             if let Some(operation) = current.operations.get(&id) {
                 self.operations.insert(id, operation.clone());
-            } else { self.operations.remove(&id); }
+            } else {
+                self.operations.remove(&id);
+            }
             if let Some(error) = current.status_errors.get(&id) {
                 self.status_errors.insert(id, error.clone());
             } else {
@@ -162,7 +171,9 @@ impl Snapshot {
             self.status_reads.insert(id, latest);
             if let Some(operation) = current.operations.get(&id) {
                 self.operations.insert(id, operation.clone());
-            } else { self.operations.remove(&id); }
+            } else {
+                self.operations.remove(&id);
+            }
             if let Some(error) = current.status_errors.get(&id) {
                 self.status_errors.insert(id, error.clone());
             } else {
@@ -511,10 +522,17 @@ impl State {
             entry.plan = Some(Arc::new(plan));
         }
         entry.snapshot.status_errors.remove(&key.worktree_id);
-        entry.snapshot.operations.insert(key.worktree_id, operation.clone());
+        entry
+            .snapshot
+            .operations
+            .insert(key.worktree_id, operation.clone());
         if operation.is_err() {
-            entry.failed_status_attempts.insert(key.worktree_id, Instant::now());
-        } else { entry.failed_status_attempts.remove(&key.worktree_id); }
+            entry
+                .failed_status_attempts
+                .insert(key.worktree_id, Instant::now());
+        } else {
+            entry.failed_status_attempts.remove(&key.worktree_id);
+        }
         entry.snapshot.status_reads.insert(key.worktree_id, read);
         if reconfigure {
             self.configure();
@@ -750,7 +768,12 @@ impl Cagents {
                     .status_order
                     .errors
                     .keys()
-                    .chain(loaded.operations.iter().filter_map(|(id, operation)| operation.is_err().then_some(id)))
+                    .chain(
+                        loaded
+                            .operations
+                            .iter()
+                            .filter_map(|(id, operation)| operation.is_err().then_some(id)),
+                    )
                     .map(|id| (*id, Instant::now()))
                     .collect(),
             },
@@ -1300,9 +1323,12 @@ fn read_local_with_plan(
             }
         };
         snapshot.status_errors.remove(&record.id);
-        snapshot.operations.insert(record.id, git.operation_state(&record.path, &cancellation)
-            .map(|operation| operation.map(|operation| operation.kind))
-            .map_err(|error| error.to_string().chars().take(512).collect()));
+        snapshot.operations.insert(
+            record.id,
+            git.operation_state(&record.path, &cancellation)
+                .map(|operation| operation.map(|operation| operation.kind))
+                .map_err(|error| error.to_string().chars().take(512).collect()),
+        );
         apply_status_head(record, &current);
         let head_changed = status
             .as_ref()
@@ -1450,7 +1476,9 @@ fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
             );
             if apply_status {
                 row.apply_status_error(error.map(String::as_str));
-                if error.is_none() && let Some(operation) = snapshot.operations.get(&record.id) {
+                if error.is_none()
+                    && let Some(operation) = snapshot.operations.get(&record.id)
+                {
                     row.apply_operation(operation);
                 }
             }
@@ -1756,7 +1784,10 @@ mod tests {
         assert_eq!(process.kind, crate::process::ProcessFailureKind::Exit);
         assert!(process.stderr_line().unwrap().contains("index"));
         let (failed, _) = read_local(project.id, snapshot, change(), cancel.clone()).unwrap();
-        assert_eq!(failed.status_errors[&linked_id], expected_failure.to_string());
+        assert_eq!(
+            failed.status_errors[&linked_id],
+            expected_failure.to_string()
+        );
         apply_local(&mut project, &failed);
         let row = project
             .worktrees
@@ -2360,7 +2391,9 @@ mod tests {
     #[test]
     fn full_reload_and_unchanged_bound_proofs_keep_newer_operation_errors_and_recovery() {
         const TEST: &str = "app::git_ui::tests::full_reload_and_unchanged_bound_proofs_keep_newer_operation_errors_and_recovery";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::git_watch::tests::fixture_isolated(TEST) {
+            return;
+        }
         use crate::repository::GitOperationKind;
         for newer_error in [false, true] {
             for bound_sample_first in [false, true] {
@@ -2368,43 +2401,104 @@ mod tests {
                     let directory = tempfile::tempdir().unwrap();
                     let root = directory.path().join("repository");
                     let baseline = fixture(&root);
-                    let key = ActiveWorktreeKey { project_id: ProjectId::new(),
-                        worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+                    let key = ActiveWorktreeKey {
+                        project_id: ProjectId::new(),
+                        worktree_id: baseline.worktrees[0].0.id,
+                        canonical_path: root.clone(),
+                    };
                     let admin = root.join(".git");
-                    fs::write(admin.join("MERGE_HEAD"), fs::read(admin.join("refs/heads/main")).unwrap()).unwrap();
-                    if newer_error { fs::write(admin.join("MERGE_MSG"), "Merge fixture\n").unwrap(); }
-                    else { fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap(); }
+                    fs::write(
+                        admin.join("MERGE_HEAD"),
+                        fs::read(admin.join("refs/heads/main")).unwrap(),
+                    )
+                    .unwrap();
+                    if newer_error {
+                        fs::write(admin.join("MERGE_MSG"), "Merge fixture\n").unwrap();
+                    } else {
+                        fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap();
+                    }
                     let mut app = app_with_status_snapshot(baseline, &key);
                     app.active_workspace = Some(root.clone());
-                    app.sidebar_state.sync_active_worktree(&app.sidebar_model,
-                        &SidebarFocus::Repository { worktree: root.clone() });
-                    let prime = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+                    app.sidebar_state.sync_active_worktree(
+                        &app.sidebar_model,
+                        &SidebarFocus::Repository {
+                            worktree: root.clone(),
+                        },
+                    );
+                    let prime = super::super::tests::task_app_message(
+                        app.source_control_snapshot_task(key.clone()),
+                    );
                     drop(app.update(prime));
                     app.repository_generations.insert(key.project_id, 10);
-                    let mut load = Some(app.repository_read_task(root.clone(), key.project_id, 10, false, Some(ProjectKind::Git)));
+                    let mut load = Some(app.repository_read_task(
+                        root.clone(),
+                        key.project_id,
+                        10,
+                        false,
+                        Some(ProjectKind::Git),
+                    ));
                     let first = if bound_sample_first {
-                        super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
-                    } else { super::super::tests::task_app_message(load.take().unwrap()) };
-                    if newer_error { fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap(); }
-                    else { fs::write(admin.join("MERGE_MSG"), "Repaired fixture\n").unwrap(); }
-                    let second = if bound_sample_first { super::super::tests::task_app_message(load.take().unwrap()) }
-                        else { super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone())) };
-                    let (bound, loaded) = if bound_sample_first { (first, second) } else { (second, first) };
-                    let bound_error = if bound_sample_first { !newer_error } else { newer_error };
-                    assert!(matches!(&bound, Message::SourceControlLoaded { result: Ok(read), .. }
+                        super::super::tests::task_app_message(
+                            app.source_control_snapshot_task(key.clone()),
+                        )
+                    } else {
+                        super::super::tests::task_app_message(load.take().unwrap())
+                    };
+                    if newer_error {
+                        fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap();
+                    } else {
+                        fs::write(admin.join("MERGE_MSG"), "Repaired fixture\n").unwrap();
+                    }
+                    let second = if bound_sample_first {
+                        super::super::tests::task_app_message(load.take().unwrap())
+                    } else {
+                        super::super::tests::task_app_message(
+                            app.source_control_snapshot_task(key.clone()),
+                        )
+                    };
+                    let (bound, loaded) = if bound_sample_first {
+                        (first, second)
+                    } else {
+                        (second, first)
+                    };
+                    let bound_error = if bound_sample_first {
+                        !newer_error
+                    } else {
+                        newer_error
+                    };
+                    assert!(
+                        matches!(&bound, Message::SourceControlLoaded { result: Ok(read), .. }
                         if read.prepared.is_none() && read.operation.is_err() == bound_error),
-                        "the actual unchanged model shortcut must still carry its operation proof");
-                    for message in if bound_delivered_first { [bound, loaded] } else { [loaded, bound] } {
+                        "the actual unchanged model shortcut must still carry its operation proof"
+                    );
+                    for message in if bound_delivered_first {
+                        [bound, loaded]
+                    } else {
+                        [loaded, bound]
+                    } {
                         drop(app.update(message));
                     }
                     let row = &app.sidebar_model.projects[0].worktrees[0];
                     assert!(row.status_error.is_none());
                     assert_eq!(row.operation_error.is_some(), newer_error);
-                    if !newer_error { assert_eq!(row.operation, Some(GitOperationKind::Merge)); }
+                    if !newer_error {
+                        assert_eq!(row.operation, Some(GitOperationKind::Merge));
+                    }
                     let entry = &app.refresh_ui.git.entries[&key.project_id];
-                    assert_eq!(entry.snapshot.operations[&key.worktree_id].is_err(), newer_error);
-                    if !newer_error { assert_eq!(entry.snapshot.operations[&key.worktree_id], Ok(Some(GitOperationKind::Merge))); }
-                    assert_eq!(entry.failed_status_attempts.contains_key(&key.worktree_id), newer_error);
+                    assert_eq!(
+                        entry.snapshot.operations[&key.worktree_id].is_err(),
+                        newer_error
+                    );
+                    if !newer_error {
+                        assert_eq!(
+                            entry.snapshot.operations[&key.worktree_id],
+                            Ok(Some(GitOperationKind::Merge))
+                        );
+                    }
+                    assert_eq!(
+                        entry.failed_status_attempts.contains_key(&key.worktree_id),
+                        newer_error
+                    );
                 }
             }
         }
@@ -2413,57 +2507,110 @@ mod tests {
     #[test]
     fn operation_display_proof_recovers_without_events_and_rejects_delayed_watch_replay() {
         const TEST: &str = "app::git_ui::tests::operation_display_proof_recovers_without_events_and_rejects_delayed_watch_replay";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::git_watch::tests::fixture_isolated(TEST) {
+            return;
+        }
         use crate::repository::GitOperationKind;
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let baseline = fixture(&root);
-        let key = ActiveWorktreeKey { project_id: ProjectId::new(),
-            worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: baseline.worktrees[0].0.id,
+            canonical_path: root.clone(),
+        };
         let mut app = app_with_status_snapshot(baseline, &key);
-        app.refresh_ui.git.entries.get_mut(&key.project_id).unwrap().cancellation = None;
+        app.refresh_ui
+            .git
+            .entries
+            .get_mut(&key.project_id)
+            .unwrap()
+            .cancellation = None;
         let admin = root.join(".git");
         let oid = fs::read(admin.join("refs/heads/main")).unwrap();
         fs::write(admin.join("MERGE_HEAD"), oid).unwrap();
         fs::write(admin.join("MERGE_MSG"), "Merge fixture\n").unwrap();
-        let loaded = super::super::load_repository(&root, None, CancellationToken::default()).unwrap();
-        assert_eq!(loaded.operations.get(&key.worktree_id), Some(&Ok(Some(GitOperationKind::Merge))),
-            "initial worker publication includes operation metadata too");
-        let initial = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+        let loaded =
+            super::super::load_repository(&root, None, CancellationToken::default()).unwrap();
+        assert_eq!(
+            loaded.operations.get(&key.worktree_id),
+            Some(&Ok(Some(GitOperationKind::Merge))),
+            "initial worker publication includes operation metadata too"
+        );
+        let initial =
+            super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
         drop(app.update(initial));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].operation, Some(GitOperationKind::Merge));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0].operation,
+            Some(GitOperationKind::Merge)
+        );
         fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap();
-        let failed = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
-        assert!(matches!(&failed, Message::SourceControlLoaded { result: Ok(read), .. }
+        let failed =
+            super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+        assert!(
+            matches!(&failed, Message::SourceControlLoaded { result: Ok(read), .. }
             if read.prepared.is_none() && read.operation.is_err()),
-            "unchanged full model still publishes the typed operation error");
+            "unchanged full model still publishes the typed operation error"
+        );
         drop(app.update(failed));
         let row = &app.sidebar_model.projects[0].worktrees[0];
         assert!(row.status_error.is_none());
         assert!(row.operation_error.is_some());
-        assert!(row.status_tooltip_for_test().contains("Last known: Merge in progress"));
+        assert!(
+            row.status_tooltip_for_test()
+                .contains("Last known: Merge in progress")
+        );
         fs::write(admin.join("MERGE_MSG"), "Repaired fixture\n").unwrap();
-        app.refresh_ui.git.entries.get_mut(&key.project_id).unwrap().failed_status_attempts
-            .insert(key.worktree_id, Instant::now() - FALLBACK_INTERVAL - Duration::from_secs(1));
+        app.refresh_ui
+            .git
+            .entries
+            .get_mut(&key.project_id)
+            .unwrap()
+            .failed_status_attempts
+            .insert(
+                key.worktree_id,
+                Instant::now() - FALLBACK_INTERVAL - Duration::from_secs(1),
+            );
         let retry = super::super::tests::task_app_message(app.git_fallback_tick());
-        assert!(matches!(&retry, Message::GitUi(Action::Read { result: Ok((snapshot, _)), .. })
-            if snapshot.status_updates == HashSet::from([key.worktree_id])));
+        assert!(
+            matches!(&retry, Message::GitUi(Action::Read { result: Ok((snapshot, _)), .. })
+            if snapshot.status_updates == HashSet::from([key.worktree_id]))
+        );
         drop(app.update(retry));
-        assert!(app.sidebar_model.projects[0].worktrees[0].operation_error.is_none());
-        let (delayed, _) = read_local(key.project_id,
-            app.refresh_ui.git.entries[&key.project_id].snapshot.clone(), git_watch::Change {
-                worktrees: [key.worktree_id].into(), ..Default::default()
-            }, CancellationToken::default()).unwrap();
+        assert!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .operation_error
+                .is_none()
+        );
+        let (delayed, _) = read_local(
+            key.project_id,
+            app.refresh_ui.git.entries[&key.project_id].snapshot.clone(),
+            git_watch::Change {
+                worktrees: [key.worktree_id].into(),
+                ..Default::default()
+            },
+            CancellationToken::default(),
+        )
+        .unwrap();
         fs::remove_file(admin.join("MERGE_HEAD")).unwrap();
-        let complete = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+        let complete =
+            super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
         drop(app.update(complete));
-        assert!(app.sidebar_model.projects[0].worktrees[0].operation.is_none());
+        assert!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .operation
+                .is_none()
+        );
         drop(app.update(Message::GitUi(Action::Read {
-            project: key.project_id, generation: 9, result: Ok((delayed, None)),
+            project: key.project_id,
+            generation: 9,
+            result: Ok((delayed, None)),
         })));
         let row = &app.sidebar_model.projects[0].worktrees[0];
-        assert!(row.operation.is_none() && row.operation_error.is_none(),
-            "a delayed watcher cannot reattach a completed operation");
+        assert!(
+            row.operation.is_none() && row.operation_error.is_none(),
+            "a delayed watcher cannot reattach a completed operation"
+        );
         assert!(row.status_tooltip_for_test().contains("No changes"));
     }
 
@@ -3463,30 +3610,61 @@ mod tests {
     #[test]
     fn duplicate_repository_load_publishes_new_linked_merge_and_metadata_error() {
         const TEST: &str = "app::git_ui::tests::duplicate_repository_load_publishes_new_linked_merge_and_metadata_error";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::git_watch::tests::fixture_isolated(TEST) {
+            return;
+        }
         use crate::repository::GitOperationKind;
         for failed_metadata in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path().join("repository");
             let baseline = fixture(&root);
-            let key = ActiveWorktreeKey { project_id: ProjectId::new(),
-                worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+            let key = ActiveWorktreeKey {
+                project_id: ProjectId::new(),
+                worktree_id: baseline.worktrees[0].0.id,
+                canonical_path: root.clone(),
+            };
             let mut app = app_with_status_snapshot(baseline, &key);
             let original = app.sidebar_model.projects[0].worktrees[0].clone();
             let linked = directory.path().join("linked");
-            git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
-            let binding = RepositoryService::system("git").discover(&linked, &CancellationToken::default()).unwrap();
-            fs::write(binding.git_dir.join("MERGE_HEAD"), fs::read(root.join(".git/refs/heads/main")).unwrap()).unwrap();
-            if failed_metadata { fs::write(binding.git_dir.join("MERGE_MSG"), [0xff]).unwrap(); }
-            else { fs::write(binding.git_dir.join("MERGE_MSG"), "Merge fixture\n").unwrap(); }
+            git(
+                &root,
+                &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+            );
+            let binding = RepositoryService::system("git")
+                .discover(&linked, &CancellationToken::default())
+                .unwrap();
+            fs::write(
+                binding.git_dir.join("MERGE_HEAD"),
+                fs::read(root.join(".git/refs/heads/main")).unwrap(),
+            )
+            .unwrap();
+            if failed_metadata {
+                fs::write(binding.git_dir.join("MERGE_MSG"), [0xff]).unwrap();
+            } else {
+                fs::write(binding.git_dir.join("MERGE_MSG"), "Merge fixture\n").unwrap();
+            }
             let provisional = ProjectId::new();
             app.repository_generations.insert(provisional, 20);
             let loaded = super::super::tests::task_app_message(app.repository_read_task(
-                linked.clone(), provisional, 20, false, Some(ProjectKind::Git)));
+                linked.clone(),
+                provisional,
+                20,
+                false,
+                Some(ProjectKind::Git),
+            ));
             let id = match &loaded {
-                Message::RepositoryLoaded { result: Ok(loaded), .. } => {
-                    let (record, status) = loaded.worktrees.iter().find(|(record, _)| record.path == linked).unwrap();
-                    assert!(!status.as_ref().unwrap().dirty.is_dirty(), "clean index still has operation display state");
+                Message::RepositoryLoaded {
+                    result: Ok(loaded), ..
+                } => {
+                    let (record, status) = loaded
+                        .worktrees
+                        .iter()
+                        .find(|(record, _)| record.path == linked)
+                        .unwrap();
+                    assert!(
+                        !status.as_ref().unwrap().dirty.is_dirty(),
+                        "clean index still has operation display state"
+                    );
                     assert_eq!(loaded.operations[&record.id].is_err(), failed_metadata);
                     record.id
                 }
@@ -3496,17 +3674,33 @@ mod tests {
             assert_eq!(app.sidebar_model.projects.len(), 1);
             let project = &app.sidebar_model.projects[0];
             assert_eq!(project.id, key.project_id);
-            assert_eq!(project.worktrees.iter().find(|row| row.id == key.worktree_id).unwrap(), &original);
+            assert_eq!(
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| row.id == key.worktree_id)
+                    .unwrap(),
+                &original
+            );
             let row = project.worktrees.iter().find(|row| row.id == id).unwrap();
             assert!(row.status_error.is_none());
             assert_eq!(row.operation_error.is_some(), failed_metadata);
             if !failed_metadata {
                 assert_eq!(row.operation, Some(GitOperationKind::Merge));
                 assert!(row.status_tooltip_for_test().contains("Merge in progress"));
-            } else { assert!(row.status_tooltip_for_test().contains("Git operation unavailable")); }
+            } else {
+                assert!(
+                    row.status_tooltip_for_test()
+                        .contains("Git operation unavailable")
+                );
+            }
             let entry = &app.refresh_ui.git.entries[&key.project_id];
             assert_eq!(entry.generation, 9);
-            assert_eq!(entry.snapshot.worktrees.len(), 1, "duplicate presentation does not replace watcher ownership");
+            assert_eq!(
+                entry.snapshot.worktrees.len(),
+                1,
+                "duplicate presentation does not replace watcher ownership"
+            );
             assert!(!app.repository_generations.contains_key(&provisional));
         }
     }
@@ -3514,25 +3708,48 @@ mod tests {
     #[test]
     fn duplicate_repository_load_preserves_new_linked_row_status_error_detail() {
         const TEST: &str = "app::git_ui::tests::duplicate_repository_load_preserves_new_linked_row_status_error_detail";
-        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        if !crate::git_watch::tests::fixture_isolated(TEST) {
+            return;
+        }
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repository");
         let baseline = fixture(&root);
-        let key = ActiveWorktreeKey { project_id: ProjectId::new(),
-            worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: baseline.worktrees[0].0.id,
+            canonical_path: root.clone(),
+        };
         let mut app = app_with_status_snapshot(baseline, &key);
         let original = app.sidebar_model.projects[0].worktrees[0].clone();
         let linked = directory.path().join("linked");
-        git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
-        let binding = RepositoryService::system("git").discover(&linked, &CancellationToken::default()).unwrap();
+        git(
+            &root,
+            &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+        );
+        let binding = RepositoryService::system("git")
+            .discover(&linked, &CancellationToken::default())
+            .unwrap();
         fs::write(binding.git_dir.join("index"), "broken index").unwrap();
         let provisional = ProjectId::new();
         app.repository_generations.insert(provisional, 20);
         let loaded = super::super::tests::task_app_message(app.repository_read_task(
-            linked.clone(), provisional, 20, false, Some(ProjectKind::Git)));
+            linked.clone(),
+            provisional,
+            20,
+            false,
+            Some(ProjectKind::Git),
+        ));
         let (id, expected_error) = match &loaded {
-            Message::RepositoryLoaded { result: Ok(loaded), .. } => {
-                let id = loaded.worktrees.iter().find(|(record, _)| record.path == linked).unwrap().0.id;
+            Message::RepositoryLoaded {
+                result: Ok(loaded), ..
+            } => {
+                let id = loaded
+                    .worktrees
+                    .iter()
+                    .find(|(record, _)| record.path == linked)
+                    .unwrap()
+                    .0
+                    .id;
                 (id, loaded.status_order.errors[&id].clone())
             }
             _ => panic!("actual duplicate loader did not complete"),
@@ -3541,12 +3758,22 @@ mod tests {
         assert_eq!(app.sidebar_model.projects.len(), 1);
         let project = &app.sidebar_model.projects[0];
         assert_eq!(project.id, key.project_id);
-        assert_eq!(project.worktrees.iter().find(|row| row.id == key.worktree_id).unwrap(), &original);
+        assert_eq!(
+            project
+                .worktrees
+                .iter()
+                .find(|row| row.id == key.worktree_id)
+                .unwrap(),
+            &original
+        );
         let row = project.worktrees.iter().find(|row| row.id == id).unwrap();
         assert_eq!(row.status_error.as_deref(), Some(expected_error.as_str()));
         assert!(row.status_tooltip_for_test().contains(&expected_error));
         let entry = &app.refresh_ui.git.entries[&key.project_id];
-        assert_eq!(entry.generation, 9, "duplicate load does not replace the existing watcher owner");
+        assert_eq!(
+            entry.generation, 9,
+            "duplicate load does not replace the existing watcher owner"
+        );
         assert_eq!(entry.snapshot.worktrees.len(), 1);
         assert!(!app.repository_generations.contains_key(&provisional));
     }
