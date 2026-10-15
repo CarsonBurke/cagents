@@ -754,7 +754,7 @@ pub(crate) mod handoff {
                     replacement.launch = terminal.recipe.clone();
                     replacement.continuity = original.continuity.clone();
                     if &replacement != original {
-                        return Err("Paired Codex terminal descriptor would change during restart; source was not stopped".into());
+                        return Err("Paired Codex terminal descriptor would change during restart".into());
                     }
                 }
                 if !chat_ids.insert(chat.source.id)
@@ -884,7 +884,7 @@ pub(crate) mod handoff {
             && let Some(terminal) = &source.terminal
             && Some(&terminal.launch) != launch.terminal_recipe().as_ref()
         {
-            return Err("Paired Codex terminal needs a different restart recipe; close or recover its paired view before upgrading. Its existing provider remains active".into());
+            return Err("Paired Codex terminal needs a different restart recipe; close or recover its paired view before upgrading".into());
         }
         Ok(())
     }
