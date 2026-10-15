@@ -865,11 +865,20 @@ fn settled(host: &SharedHost, run: RunId) -> Run {
             return run;
         }
         if Instant::now() >= deadline {
-            let handles = host.lock().unwrap().chats.iter()
-                .map(|(id, record)| (*id, record.handle.clone())).collect::<Vec<_>>();
-            let startup = handles.iter().map(|(id, handle)|
-                (*id, handle.is_completed(), handle.failure())).collect::<Vec<_>>();
-            panic!("run never settled: {run:?}; actual cached provider startup (id, completed, failure): {startup:?}");
+            let handles = host
+                .lock()
+                .unwrap()
+                .chats
+                .iter()
+                .map(|(id, record)| (*id, record.handle.clone()))
+                .collect::<Vec<_>>();
+            let startup = handles
+                .iter()
+                .map(|(id, handle)| (*id, handle.is_completed(), handle.failure()))
+                .collect::<Vec<_>>();
+            panic!(
+                "run never settled: {run:?}; actual cached provider startup (id, completed, failure): {startup:?}"
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }

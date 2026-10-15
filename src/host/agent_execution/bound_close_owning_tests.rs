@@ -11,7 +11,11 @@ struct BoundCloseOwner {
     previous_host: Option<SharedHost>,
     notifications: Option<crate::host::notifications::Broker>,
     lease: Option<crate::daemon::HostLease>,
-    remote: Option<(chat::runtime::Handle, chat::runtime::ActorIdentity, HostSessionProof)>,
+    remote: Option<(
+        chat::runtime::Handle,
+        chat::runtime::ActorIdentity,
+        HostSessionProof,
+    )>,
 }
 struct BoundCloseCleanup {
     owner: Arc<Mutex<BoundCloseOwner>>,
@@ -20,15 +24,27 @@ struct BoundCloseCleanup {
 impl BoundCloseCleanup {
     fn reserve(host: &SharedHost) -> Self {
         let mut retained = BOUND_CLOSE_OWNER.lock().unwrap_or_else(|p| p.into_inner());
-        assert!(retained.is_none(), "a prior exact bound-close owner remains unconfirmed; no new owner may start");
+        assert!(
+            retained.is_none(),
+            "a prior exact bound-close owner remains unconfirmed; no new owner may start"
+        );
         let owner = Arc::new(Mutex::new(BoundCloseOwner {
-            host: host.clone(), previous_host: None, notifications: None, lease: None, remote: None,
+            host: host.clone(),
+            previous_host: None,
+            notifications: None,
+            lease: None,
+            remote: None,
         }));
         *retained = Some(owner.clone());
-        Self { owner, outcome: None }
+        Self {
+            owner,
+            outcome: None,
+        }
     }
     fn finish_result(&mut self) -> Result<(), String> {
-        if let Some(outcome) = &self.outcome { return outcome.clone(); }
+        if let Some(outcome) = &self.outcome {
+            return outcome.clone();
+        }
         let (host, remote) = {
             let context = self.owner.lock().unwrap_or_else(|p| p.into_inner());
             (context.host.clone(), context.remote.clone())
@@ -40,16 +56,26 @@ impl BoundCloseCleanup {
         if let Some((_owner, identity, proof)) = &remote {
             match chat::runtime::Handle::retained_retirement_proved(&identity.record, proof) {
                 Ok(true) => {}
-                Ok(false) => failures.push("Exact retained helper retirement is unconfirmed".into()),
+                Ok(false) => {
+                    failures.push("Exact retained helper retirement is unconfirmed".into())
+                }
                 Err(error) => failures.push(error),
             }
         }
-        let outcome = if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) };
+        let outcome = if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(failures.join("; "))
+        };
         self.outcome = Some(outcome.clone());
         if outcome.is_ok() {
             let retired = {
                 let mut retained = BOUND_CLOSE_OWNER.lock().unwrap_or_else(|p| p.into_inner());
-                assert!(retained.as_ref().is_some_and(|owner| Arc::ptr_eq(owner, &self.owner)));
+                assert!(
+                    retained
+                        .as_ref()
+                        .is_some_and(|owner| Arc::ptr_eq(owner, &self.owner))
+                );
                 retained.take()
             };
             drop(retired);
@@ -58,13 +84,19 @@ impl BoundCloseCleanup {
     }
     fn finish(&mut self) {
         if let Err(error) = self.finish_result() {
-            eprintln!("Exact bound-close cleanup UNKNOWN; strong original context retained until subprocess exit; outer family owner required: {error}");
-            if !std::thread::panicking() { panic!("Unconfirmed bound-close cleanup: {error}"); }
+            eprintln!(
+                "Exact bound-close cleanup UNKNOWN; strong original context retained until subprocess exit; outer family owner required: {error}"
+            );
+            if !std::thread::panicking() {
+                panic!("Unconfirmed bound-close cleanup: {error}");
+            }
         }
     }
 }
 impl Drop for BoundCloseCleanup {
-    fn drop(&mut self) { self.finish(); }
+    fn drop(&mut self) {
+        self.finish();
+    }
 }
 struct BoundCloseFixture {
     host: SharedHost,
@@ -85,7 +117,8 @@ impl BoundCloseFixture {
         let cleanup = BoundCloseCleanup::reserve(&host);
         let proof = host.lock().unwrap().proof().clone();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
-        cleanup.owner.lock().unwrap().lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        cleanup.owner.lock().unwrap().lease =
+            Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
         cleanup.owner.lock().unwrap().notifications = Some(
             crate::host::notifications::Broker::start(
                 &host,
@@ -93,7 +126,16 @@ impl BoundCloseFixture {
             )
             .unwrap(),
         );
-        host.lock().unwrap().notifications = Some(cleanup.owner.lock().unwrap().notifications.as_ref().unwrap().handle());
+        host.lock().unwrap().notifications = Some(
+            cleanup
+                .owner
+                .lock()
+                .unwrap()
+                .notifications
+                .as_ref()
+                .unwrap()
+                .handle(),
+        );
         host.lock().unwrap().enable_holder_recovery();
         let accepted = submit(&host, &Authority::default(), request).unwrap();
         let run = settled(&host, accepted.run.id);
@@ -109,7 +151,8 @@ impl BoundCloseFixture {
         let identity = handle
             .actor_identity()
             .expect("genuine retained Remote owner");
-        cleanup.owner.lock().unwrap().remote = Some((handle.clone(), identity.clone(), proof.clone()));
+        cleanup.owner.lock().unwrap().remote =
+            Some((handle.clone(), identity.clone(), proof.clone()));
         let binding =
             super::super::chat::source_binding::owning_binding_for_test(&host, id).unwrap();
         let inspection =
@@ -527,7 +570,16 @@ fn combined_close_retained_lifecycle_real_created_pair_stays_held_until_exact_co
         )
         .unwrap(),
     );
-    host.lock().unwrap().notifications = Some(cleanup.owner.lock().unwrap().notifications.as_ref().unwrap().handle());
+    host.lock().unwrap().notifications = Some(
+        cleanup
+            .owner
+            .lock()
+            .unwrap()
+            .notifications
+            .as_ref()
+            .unwrap()
+            .handle(),
+    );
     host.lock().unwrap().enable_holder_recovery();
     let Destination::New(spec) = &mut request.destination else {
         unreachable!()
