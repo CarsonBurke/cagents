@@ -1708,23 +1708,33 @@ fn codex_terminal_view(
             .returning_terminal = true;
         completed
     };
-    let (directory, execution) =
-        match super::session_locations::verified_chat_directory(host, &session, handle) {
-            Ok(verified) => verified,
-            Err(message) => {
-                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(record) = state
-                    .chats
-                    .get_mut(&chat_id)
-                    .filter(|record| record.handle.same_actor(handle))
-                {
-                    record.returning_terminal = false;
-                }
-                return Err(unavailable(message));
+    // Capture once: admission and spawn must inspect the same credentials.
+    let execution_environment = handle.execution_environment();
+    let verified = (|| {
+        let (directory, execution) =
+            super::session_locations::verified_chat_directory(host, &session, handle)
+                .map_err(unavailable)?;
+        let mut recipe = recipe;
+        recipe.working_directory = directory;
+        super::account_lifecycle::ensure_terminal_handoff(
+            host, &recipe, &execution_environment, &execution,
+        )?;
+        Ok((recipe, execution))
+    })();
+    let (recipe, execution) = match verified {
+        Ok(verified) => verified,
+        Err(error) => {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(record) = state
+                .chats
+                .get_mut(&chat_id)
+                .filter(|record| record.handle.same_actor(handle))
+            {
+                record.returning_terminal = false;
             }
-        };
-    let mut recipe = recipe;
-    recipe.working_directory = directory;
+            return Err(error);
+        }
+    };
     if let Some((source, terminal, proof)) = completed {
         let release = (|| {
             if terminal.holder_identity().is_some() {
@@ -1800,7 +1810,7 @@ fn codex_terminal_view(
             initially_visible: false,
             ..Default::default()
         },
-        Some(handle.execution_environment()),
+        Some(execution_environment),
         true,
         execution,
     );
@@ -2788,6 +2798,10 @@ fn process_inner(
                     .map_err(unavailable)?;
             let mut recipe = recipe;
             recipe.working_directory = directory.clone();
+            let execution_environment = handle.execution_environment();
+            super::account_lifecycle::ensure_terminal_handoff(
+                host, &recipe, &execution_environment, &execution,
+            )?;
             let terminal_id = crate::model::TerminalId::new();
             let mut terminal = crate::model::TerminalSession {
                 owned_codex_listener: None,
@@ -2880,7 +2894,7 @@ fn process_inner(
                     initially_visible: false,
                     ..Default::default()
                 },
-                Some(handle.execution_environment()),
+                Some(execution_environment),
                 false,
                 execution,
             )?;

@@ -452,6 +452,13 @@ mod tests {
         }
     }
     fn fixture(context_mode: u8) -> Fixture {
+        fixture_with_credentials(context_mode, BTreeMap::new(), false)
+    }
+    fn fixture_with_credentials(
+        context_mode: u8,
+        environment: BTreeMap<String, String>,
+        completed_console: bool,
+    ) -> Fixture {
         let directory = tempfile::tempdir().unwrap();
         let old = directory.path().join("original");
         std::fs::create_dir(&old).unwrap();
@@ -469,15 +476,15 @@ mod tests {
             boot_id: crate::daemon::read_boot_id().unwrap(),
             host_incarnation: HostIncarnation::new("original"),
         };
-        let source = chat::Session {
+        let mut source = chat::Session {
             id: TerminalId::new(),
             launch: chat::Launch {
-                provider: Provider::Omp,
+                provider: if completed_console { Provider::Codex } else { Provider::Omp },
                 recipe: LaunchRecipe {
                     program: program.to_string_lossy().into_owned(),
                     arguments: Vec::new(),
                     working_directory: old.clone(),
-                    environment: BTreeMap::new(),
+                    environment: environment.clone(),
                     unset_environment: Default::default(),
                 },
                 session_id: Some("22222222-0000-4000-8000-000000000001".into()),
@@ -487,6 +494,35 @@ mod tests {
             native_continuity: Default::default(),
             owned_codex_listener: None,
         };
+        let paired = completed_console.then(|| {
+            let recipe = LaunchRecipe {
+                program: "/bin/sh".into(),
+                arguments: vec!["-c".into(), "printf retained-console".into()],
+                working_directory: old.clone(),
+                environment: environment.clone(),
+                unset_environment: Default::default(),
+            };
+            let terminal = crate::model::TerminalSession {
+                id: source.id,
+                owned_codex_listener: None,
+                recovery_origin: None,
+                predecessor: None,
+                launch: recipe.clone(),
+                transcript_path: None,
+                resume_hint: None,
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe, last_exit: None,
+                },
+            };
+            let handle = TerminalHandle::spawn(terminal.clone(), Default::default(), |_| {}).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !handle.is_completed() {
+                assert!(Instant::now() < deadline, "fixture console did not complete");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            source.terminal = Some(terminal.clone());
+            (terminal, handle)
+        });
         let context = match context_mode {
             0 => Some(Arc::new(
                 chat::protocol::ExecutionContext::capture(&old).unwrap(),
@@ -506,7 +542,7 @@ mod tests {
             program: program.to_string_lossy().into_owned(),
             arguments: vec!["--fixture-native".into()],
             working_directory: old.clone(),
-            environment: BTreeMap::new(),
+            environment: environment.clone(),
         };
         std::fs::write(old.join("relative.txt"), "original provider file").unwrap();
         let mut initial = Step {
@@ -585,7 +621,7 @@ mod tests {
             Record {
                 execution_instance: uuid::Uuid::new_v4(),
                 console_recipe: None,
-                paired_terminal: None,
+                paired_terminal: paired.as_ref().map(|(_, handle)| handle.clone()),
                 session: source.clone(),
                 handle: handle.clone(),
                 source_process: None,
@@ -595,6 +631,9 @@ mod tests {
                 returning_terminal: false,
             },
         );
+        if let Some((terminal, handle)) = paired {
+            state.finish_spawn(1, terminal, handle, false).unwrap();
+        }
         Fixture {
             _directory: directory,
             host: Arc::new(HostLock::new(state)),
@@ -606,6 +645,125 @@ mod tests {
             original_context,
         }
     }
+    #[test]
+    fn terminal_handoff_credential_refusal_preserves_live_and_completed_predecessors() {
+        const CHILD: &str = "CAGENTS_HANDOFF_ACCOUNT_PREFLIGHT_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::Builder::new().prefix("cagents-handoff-account-")
+                .tempdir_in("/var/tmp").unwrap();
+            for name in ["home", "config", "data", "cache", "runtime", "tmp"] {
+                std::fs::create_dir(root.path().join(name)).unwrap();
+            }
+            let log = root.path().join("test.log");
+            let output = std::fs::File::create(&log).unwrap();
+            let child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::session_locations::tests::terminal_handoff_credential_refusal_preserves_live_and_completed_predecessors", "--nocapture"])
+                .env_clear().env(CHILD, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("TMPDIR", root.path().join("tmp"))
+                .env("PATH", "/usr/bin:/bin").env("SHELL", "/bin/sh")
+                .env("TERM", "xterm-256color")
+                .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap();
+            struct OriginalChild(Option<std::process::Child>);
+            impl Drop for OriginalChild {
+                fn drop(&mut self) {
+                    if let Some(child) = self.0.as_mut() {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                }
+            }
+            let mut child = OriginalChild(Some(child));
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let status = loop {
+                if let Some(status) = child.0.as_mut().unwrap().try_wait().unwrap() {
+                    child.0.take();
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    drop(child);
+                    let retained = root.keep();
+                    panic!("handoff preflight fixture timed out; evidence {}", retained.display());
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let evidence = std::fs::read_to_string(&log).unwrap();
+            if !status.success() || !evidence.contains("1 passed; 0 failed") {
+                let retained = root.keep();
+                panic!("handoff preflight fixture failed; evidence {}:\n{evidence}", retained.display());
+            }
+            return;
+        }
+        let root = PathBuf::from(std::env::var_os(CHILD).unwrap());
+        let absolute_codex = root.join("codex-credentials");
+        let absolute_claude = root.join("claude-credentials");
+        for path in [&absolute_codex, &absolute_claude] {
+            std::fs::create_dir(path).unwrap();
+        }
+        // Mixed roots must be inspected independently of the predecessor's
+        // provider. Also exercise an absolute root with an actual reservation.
+        for scope in 0..3 {
+            for completed_native in [false, true] {
+                for completed_console in [false, true] {
+                    let environment = BTreeMap::from([
+                        ("HOME".into(), root.join("home").display().to_string()),
+                        ("CODEX_HOME".into(), if scope == 0 { "relative-codex".into() } else { absolute_codex.display().to_string() }),
+                        ("CLAUDE_CONFIG_DIR".into(), if scope == 1 { "relative-claude".into() } else { absolute_claude.display().to_string() }),
+                    ]);
+                    let fixture = fixture_with_credentials(0, environment, completed_console);
+                    // Positive original process/FD proof first: a refusal in
+                    // directory discovery cannot satisfy this regression.
+                    let original = fixture.handle.capture_execution_directory(&fixture.old).unwrap();
+                    assert!(original.process.is_current());
+                    if completed_native {
+                        fixture.handle.close().unwrap();
+                        assert!(fixture.handle.is_completed());
+                    }
+                    let paired = fixture.host.lock().unwrap().chats[&fixture.source.id]
+                        .paired_terminal.clone();
+                    if let Some(paired) = &paired {
+                        assert!(paired.is_completed());
+                        paired.search(1, "retained-console".into(), false).unwrap();
+                    }
+                    let _reservation = (scope == 2).then(|| {
+                        let account = crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), absolute_codex.clone());
+                        super::super::account_lifecycle::Reservation::install(&fixture.host, &[account]).unwrap()
+                    });
+                    let error = super::super::client::process_request(
+                        &fixture.host, 1,
+                        ClientRequest::ChatReturnTerminal { chat_id: fixture.source.id },
+                    ).unwrap_err();
+                    let message = error.to_string();
+                    assert!(message.contains(if scope == 2 { "account home is being changed" } else { "relative" }), "wrong refusal: {message}");
+                    assert_eq!(fixture.handle.is_completed(), completed_native);
+                    if !completed_native {
+                        assert!(original.process.is_current(), "preflight killed the original provider");
+                        let after = fixture.handle.capture_execution_directory(&fixture.old).unwrap();
+                        assert_eq!(after.process, original.process);
+                    }
+                    let state = fixture.host.lock().unwrap();
+                    let record = &state.chats[&fixture.source.id];
+                    assert!(record.handle.same_actor(&fixture.handle));
+                    assert!(!record.returning_terminal);
+                    assert_eq!(record.session.launch, fixture.source.launch);
+                    assert_eq!(record.session.terminal, fixture.source.terminal);
+                    assert!(state.chat_handoffs.is_empty());
+                    assert_eq!(state.terminals.len(), usize::from(completed_console));
+                    if let Some(paired) = &paired {
+                        assert!(state.terminals[&fixture.source.id].handle.same_worker(paired));
+                        assert!(record.paired_terminal.as_ref().unwrap().same_worker(paired));
+                        paired.search(2, "retained-console".into(), false).unwrap();
+                    }
+                    assert!(!fixture.old.join("handoff.marker").exists());
+                }
+            }
+        }
+    }
+
     fn locate(fixture: &Fixture) -> WorkspaceModel {
         let request = ClientRequest::EditWorkspaceModel {
             edit: ModelEdit::RelocateProject {

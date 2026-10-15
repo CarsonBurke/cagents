@@ -338,6 +338,28 @@ pub(super) fn ensure_launch_at_directory(
     ensure_launch(host, cwd, environment, unset, inherit)
 }
 
+/// Check the exact environment and directory which a terminal handoff will
+/// use before stopping its predecessor. Spawn repeats the check to fence a
+/// reservation which starts after this preflight.
+pub(super) fn ensure_terminal_handoff(
+    host: &SharedHost,
+    recipe: &crate::model::LaunchRecipe,
+    environment: &crate::terminal_ipc::ChatExecutionEnvironment,
+    execution: &crate::chat::protocol::ExecutionContext,
+) -> Result<(), ProtocolError> {
+    let directory = execution.directory_descriptor().ok_or_else(|| {
+        refusal("The terminal handoff has no pinned working directory; recover its location before retrying")
+    })?;
+    ensure_launch_at_directory(
+        host,
+        &recipe.working_directory,
+        &environment.0,
+        &crate::account::launch_credential_overrides(recipe),
+        false,
+        Some(&directory),
+    )
+}
+
 pub(super) fn ensure_update(host: &SharedHost, proposed: &Registry) -> Result<(), ProtocolError> {
     let current = Store::installation()
         .ok_or_else(|| refusal("Account registry unavailable"))?
