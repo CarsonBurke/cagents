@@ -60,11 +60,15 @@ fn check_root(origin: &Origin) -> Result<(), String> {
 }
 
 impl Editor {
-    fn git_review_origin(&self, card: CardId, key: &ActiveWorktreeKey) -> Option<Origin> {
-        self.tab(card).filter(|tab| tab.git
+    fn git_review_bound(&self, card: CardId, key: &ActiveWorktreeKey) -> bool {
+        self.tab(card).is_some_and(|tab| tab.git
             && tab.runtime.descriptor.worktree == key.canonical_path
             && tab.navigation.active_worktree() == Some(key)
-            && tab.sidebar.source_control.as_ref().is_some_and(|source| source.key == *key))?;
+            && tab.sidebar.source_control.as_ref().is_some_and(|source| source.key == *key))
+    }
+
+    fn git_review_origin(&self, card: CardId, key: &ActiveWorktreeKey) -> Option<Origin> {
+        self.git_review_bound(card, key).then_some(())?;
         Some(Origin { card, key: key.clone(), root_identity: root_identity(&key.canonical_path)? })
     }
 
@@ -262,8 +266,10 @@ impl Editor {
 
     pub(super) fn git_review_action(&mut self, mut action: Action) -> Task<Message> {
         let origin = match &action { Action::AmendLoaded { origin, .. } | Action::HistoryLoaded { origin, .. } | Action::CommitLoaded { origin, .. } | Action::Committed { origin, .. } => origin };
-        let Some(current) = self.git_review_origin(origin.card, &origin.key) else { return Task::none(); };
-        if current != *origin {
+        // Physical disappearance refuses effects, but must still settle the
+        // exact logical request that reserved this tab's mutation/read slot.
+        if !self.git_review_bound(origin.card, &origin.key) { return Task::none(); }
+        if root_identity(&origin.key.canonical_path) != Some(origin.root_identity) {
             let error = "The original worktree directory was replaced; reopen it before retrying.".to_owned();
             match &mut action {
                 Action::AmendLoaded { result, .. } => *result = Err(error),
@@ -457,6 +463,32 @@ mod tests {
         assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("replaced")));
         assert!(app.tab(card).unwrap().mutation.is_none());
         assert_eq!(git(&parked.path().join("original"), &["diff", "--cached", "--name-only"]), "tracked.txt");
+    }
+
+    #[test]
+    fn standalone_moved_root_without_replacement_settles_commit_and_read_slots() {
+        for commit in [false, true] {
+            let directory = git_fixture(); let root = directory.path();
+            let parked = tempfile::tempdir().unwrap();
+            let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+            let task = if commit {
+                std::fs::write(root.join("tracked.txt"), "pending contents\n").unwrap();
+                sidebar_action(&mut app, SidebarAction::Stage { key: origin.key.clone(), selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())] });
+                sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: "Keep this draft".into() });
+                app.update(Message::Sidebar(SidebarAction::Commit { key: origin.key, message: "Keep this draft".into(), amend: false }))
+            } else {
+                app.update(Message::Sidebar(SidebarAction::AmendChanged { key: origin.key, amend: true }))
+            };
+            let destination = parked.path().join("original");
+            std::fs::rename(root, &destination).unwrap();
+            run_tasks(&mut app, task);
+            assert!(app.tab(card).unwrap().mutation.is_none());
+            assert!(app.tab(card).unwrap().git_review.submitted_revision.is_none());
+            assert!(app.tab(card).unwrap().git_review.amend_cancel.is_none());
+            assert!(app.tab(card).unwrap().navigation.amend_request_revision().is_none());
+            if commit { assert_eq!(app.tab(card).unwrap().navigation.commit_message(), "Keep this draft"); }
+            assert_eq!(git(&destination, &["rev-list", "--count", "HEAD"]), "1");
+        }
     }
 
     #[test]
