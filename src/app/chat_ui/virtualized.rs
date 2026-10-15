@@ -301,11 +301,18 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             }
             Axis::Horizontal => self.cross_estimate,
         };
-        let width_changed = state.width != width || state.axis != self.axis;
+        // An unbounded horizontal parent needs each physical code line's
+        // natural width. The finite estimate is only for viewport estimates;
+        // it must not cap the child's measured horizontal scroll extent.
+        let constraint = match self.axis {
+            Axis::Vertical => limits.max().width,
+            Axis::Horizontal => self.cross_estimate,
+        };
+        let width_changed = state.width != constraint || state.axis != self.axis;
         state.axis = self.axis;
         if width_changed {
             state.heights.clear();
-            state.width = width;
+            state.width = constraint;
         }
         if width_changed || state.descriptors != self.revision {
             state.positions = self
@@ -393,7 +400,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                     .unwrap_or_else(|| Tree::new(&*element));
                 child.diff(element.as_widget_mut());
                 let child_max = match self.axis {
-                    Axis::Vertical => Size::new(width, f32::INFINITY),
+                    Axis::Vertical => Size::new(limits.max().width, f32::INFINITY),
                     Axis::Horizontal => Size::new(f32::INFINITY, f32::INFINITY),
                 };
                 let mut node = element.as_widget_mut().layout(
