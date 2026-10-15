@@ -6,6 +6,8 @@ mod fs;
 mod index;
 mod lifetime;
 mod rights;
+mod sqlite;
+pub(crate) use sqlite::{VerifiedReadContext, Coverage};
 pub(crate) use lifetime::{RevocationEpoch as SourceRevocationEpoch, RevocationProbe as SourceRevocationProbe};
 pub(crate) use index::{InstallationIndex, Namespace, NamespaceRead, RegisteredBinding};
 pub(crate) use types::{AccountBindingData, BindingData, CacheIdentity, FileIdentity,
@@ -15,6 +17,7 @@ pub(crate) use types::{AccountBindingData, BindingData, CacheIdentity, FileIdent
 pub(crate) enum Error {
     Io(io::Error),
     Json(serde_json::Error),
+    Sql(rusqlite::Error),
     InvalidMetadata(&'static str),
     Unsupported(&'static str),
     Incomplete(&'static str),
@@ -24,12 +27,14 @@ pub(crate) enum Error {
     LegacyInventoryRequired,
 }
 pub(crate) type Result<T> = std::result::Result<T, Error>;
+impl From<rusqlite::Error> for Error { fn from(error: rusqlite::Error) -> Self { Self::Sql(error) } }
 impl From<io::Error> for Error { fn from(error: io::Error) -> Self { Self::Io(error) } }
 impl From<serde_json::Error> for Error { fn from(error: serde_json::Error) -> Self { Self::Json(error) } }
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Io(error) => write!(f, "Export ownership I/O failed: {error}"),
+            Self::Sql(error) => write!(f, "Export source SQLite read failed: {error}"),
             Self::Json(error) => write!(f, "Export ownership record is invalid: {error}"),
             Self::InvalidMetadata(reason) | Self::Unsupported(reason) | Self::Incomplete(reason) => f.write_str(reason),
             Self::Capacity => f.write_str("Export ownership index reached its validated admission bound"),
