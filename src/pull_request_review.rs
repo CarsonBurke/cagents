@@ -245,7 +245,9 @@ impl Action {
                 | Self::ViewedApplied { .. }
                 | Self::ViewedBatchSummary { .. }
                 | Self::Discussion(
-                    discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. } | discussion_ui::Action::Reanchored { .. }
+                    discussion_ui::Action::Loaded { .. }
+                        | discussion_ui::Action::Finished { .. }
+                        | discussion_ui::Action::Reanchored { .. }
                 )
         )
     }
