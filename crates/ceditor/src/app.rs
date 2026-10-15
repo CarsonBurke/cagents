@@ -693,6 +693,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DirectoryListed { .. }
             | RepositoryAction::DirectorySearchLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
+            | RepositoryAction::ConfiguredFileLoaded { .. }
             | RepositoryAction::BinaryPageLoaded { .. }
             | RepositoryAction::DiskMetadata { .. }
             | RepositoryAction::ComparisonMetadata { .. }
@@ -3600,7 +3601,7 @@ impl Application for Editor {
                     let basis_resolved =
                         matches!(action, RepositoryAction::DiffBasisResolved { .. });
                     let loaded = matches!(action, RepositoryAction::FilesLoaded { .. });
-                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. })
+                    let focus_loaded = matches!(action, RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. })
                         && self.active == Some(id)
                         && !self.modal_open();
                     let saved = matches!(action, RepositoryAction::SaveFinished { .. });

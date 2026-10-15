@@ -501,6 +501,24 @@ mod tests {
     }
 
     #[test]
+    fn configured_file_completion_lands_while_preferences_are_open() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("a.rs"), "first\n").unwrap();
+        std::fs::write(root.path().join("b.rs"), "second\n").unwrap();
+        std::fs::write(root.path().join(".editorconfig"), "root = true\n[*.rs]\nindent_style = space\nindent_size = 2\n").unwrap();
+        let mut app = editor();
+        let card = open_file(&mut app, root.path(), "a.rs");
+        let read = app.tab_mut(card).unwrap().runtime.open_file_location(card, "b.rs".into(), 0, 0, 0);
+        app.settings_open = true;
+        run_tasks(&mut app, repository_task(read));
+        assert!(app.settings_open);
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("second\n"));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (2, true));
+        app.settings_open = false;
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("second\n"));
+    }
+
+    #[test]
     fn loaded_navigation_applies_position_without_focusing_behind_a_modal() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "a😀éX\n").unwrap();
