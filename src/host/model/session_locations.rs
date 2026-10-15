@@ -13,6 +13,7 @@ pub(crate) struct Location {
     pub(crate) process: Option<Process>,
     pub(crate) blocked_directory: Option<PathBuf>,
     pub(crate) refusal: Option<String>,
+    previous_sources: Vec<[u8; 32]>,
 }
 
 #[derive(Clone, Debug)]
@@ -42,36 +43,52 @@ fn same_issued_launch(a: &HostedSession, b: &HostedSession) -> bool {
         _ => false,
     }
 }
+fn source_key(source: &HostedSession) -> Result<Option<[u8; 32]>, String> {
+    let value = match source {
+        HostedSession::Chat(session) if session.proof.is_some() => serde_json::to_vec(&("chat", session.id, &session.proof, session.launch.provider, &session.launch.recipe)),
+        HostedSession::Terminal(session) if session.continuity.live_proof().is_some() => serde_json::to_vec(&("terminal", session.id, session.continuity.live_proof(), &session.launch)),
+        _ => return Ok(None),
+    }.map_err(|error| error.to_string())?;
+    Ok(Some(*blake3::hash(&value).as_bytes()))
+}
+fn retain_source(location: &mut Location) -> Result<(), String> {
+    if let Some(key) = source_key(&location.source)? {
+        location.previous_sources.retain(|known| *known != key);
+        location.previous_sources.push(key);
+        if location.previous_sources.len() > 64 { location.previous_sources.remove(0); }
+    }
+    Ok(())
+}
 
 pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate).map_err(|error| error.to_string())?;
     tx.execute_batch("CREATE TABLE IF NOT EXISTS session_locations (
         session TEXT PRIMARY KEY, source TEXT NOT NULL, repository TEXT,
         directory TEXT NOT NULL, approved TEXT, process TEXT,
-        blocked_directory TEXT, refusal TEXT
+        blocked_directory TEXT, refusal TEXT, previous_sources TEXT NOT NULL DEFAULT '[]'
     ) STRICT;").map_err(|error| error.to_string())?;
     tx.pragma_update(None, "user_version", 14).map_err(|error| error.to_string())?;
     tx.commit().map_err(|error| error.to_string())
 }
 
 fn read(db: &Connection, id: TerminalId) -> Result<Option<Location>, String> {
-    let row = db.query_row("SELECT source,repository,directory,approved,process,blocked_directory,refusal FROM session_locations WHERE session=?1", [id.to_string()], |row| {
-        Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?, row.get::<_,String>(2)?, row.get::<_,Option<String>>(3)?, row.get::<_,Option<String>>(4)?, row.get::<_,Option<String>>(5)?, row.get::<_,Option<String>>(6)?))
+    let row = db.query_row("SELECT source,repository,directory,approved,process,blocked_directory,refusal,previous_sources FROM session_locations WHERE session=?1", [id.to_string()], |row| {
+        Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?, row.get::<_,String>(2)?, row.get::<_,Option<String>>(3)?, row.get::<_,Option<String>>(4)?, row.get::<_,Option<String>>(5)?, row.get::<_,Option<String>>(6)?, row.get::<_,String>(7)?))
     }).optional().map_err(|error| error.to_string())?;
-    row.map(|(source, repository, directory, approved, process, blocked, refusal)| Ok(Location {
+    row.map(|(source, repository, directory, approved, process, blocked, refusal, previous)| Ok(Location {
         source: decode(&source)?, repository: repository.map(PathBuf::from), directory: directory.into(),
         approved: approved.map(|value| decode(&value)).transpose()?,
         process: process.map(|value| decode(&value)).transpose()?,
-        blocked_directory: blocked.map(PathBuf::from), refusal,
+        blocked_directory: blocked.map(PathBuf::from), refusal, previous_sources: decode(&previous)?,
     })).transpose()
 }
 
 fn write(db: &Connection, location: &Location) -> Result<(), String> {
-    db.execute("INSERT INTO session_locations(session,source,repository,directory,approved,process,blocked_directory,refusal) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(session) DO UPDATE SET source=excluded.source,repository=excluded.repository,directory=excluded.directory,approved=excluded.approved,process=excluded.process,blocked_directory=excluded.blocked_directory,refusal=excluded.refusal", params![
+    db.execute("INSERT INTO session_locations(session,source,repository,directory,approved,process,blocked_directory,refusal,previous_sources) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) ON CONFLICT(session) DO UPDATE SET source=excluded.source,repository=excluded.repository,directory=excluded.directory,approved=excluded.approved,process=excluded.process,blocked_directory=excluded.blocked_directory,refusal=excluded.refusal,previous_sources=excluded.previous_sources", params![
         location.source.id().to_string(), encode(&location.source)?,
         location.repository.as_deref().map(repository_key).transpose()?, repository_key(&location.directory)?,
         location.approved.as_ref().map(encode).transpose()?, location.process.as_ref().map(encode).transpose()?,
-        location.blocked_directory.as_deref().map(repository_key).transpose()?, location.refusal,
+        location.blocked_directory.as_deref().map(repository_key).transpose()?, location.refusal, encode(&location.previous_sources)?,
     ]).map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -99,7 +116,7 @@ pub(super) fn apply(db: &Connection, moves: &[SessionMove]) -> Result<(), String
         let mut location = previous.unwrap_or_else(|| Location {
             source: movement.source.clone(), repository: None,
             directory: issued_directory(&movement.source).to_owned(), approved: None, process: None,
-            blocked_directory: None, refusal: None,
+            blocked_directory: None, refusal: None, previous_sources: Vec::new(),
         });
         location.repository = Some(movement.repository.clone());
         match &movement.proof {
@@ -141,6 +158,12 @@ pub(super) fn pin_owned_agents(db: &Connection, moves: &[SessionMove]) -> Result
 }
 
 impl Registry {
+    pub(crate) fn authenticated_session_alias(&self, cached: &HostedSession, current: &HostedSession) -> Result<bool, String> {
+        if cached.same_process(current) { return Ok(true); }
+        if cached.id() != current.id() { return Ok(false); }
+        let Some(location) = read(&self.db, current.id())? else { return Ok(false); };
+        Ok(location.source.same_process(current) && source_key(cached)?.is_some_and(|key| location.previous_sources.contains(&key)))
+    }
     pub(crate) fn refuse_session_location(&mut self, source: &HostedSession, candidate: &Path, reason: &str) -> Result<(), String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         let mut location = read(&tx, source.id())?.ok_or("The session directory binding disappeared during Locate")?;
@@ -163,6 +186,7 @@ impl Registry {
         { return Err("Authenticated holder sources do not prove this session directory successor".into()); }
         // A process proof can change during authenticated adoption, while the
         // original approved inode, refusal and operational spelling cannot.
+        retain_source(&mut location)?;
         location.source = successor.clone();
         write(&tx, &location)?;
         tx.commit().map_err(|error| error.to_string())
@@ -189,10 +213,15 @@ impl Registry {
         if old.as_ref().is_some_and(|location| location.approved.is_some_and(|identity| identity != approved)) {
             return Err("The original session directory was replaced; start a new session for the replacement folder".into());
         }
+        let mut previous_sources = old.as_ref().map(|location| location.previous_sources.clone()).unwrap_or_default();
+        if let Some(mut old) = old.clone() && !old.source.same_process(source) {
+            retain_source(&mut old)?;
+            previous_sources = old.previous_sources;
+        }
         write(&tx, &Location {
             source: source.clone(), repository: old.as_ref().and_then(|location| location.repository.clone()),
             directory: directory.to_owned(), approved: Some(approved), process: None,
-            blocked_directory: None, refusal: None,
+            blocked_directory: None, refusal: None, previous_sources,
         })?;
         tx.commit().map_err(|error| error.to_string())
     }

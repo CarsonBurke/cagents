@@ -706,6 +706,7 @@ fn start(
         None,
         None,
         &[],
+        None,
     )
 }
 
@@ -726,7 +727,19 @@ pub(super) fn start_execution(
         Some(context),
         None,
         &[],
+        None,
     )
+}
+
+/// Trusted handoffs supply a pin proved from the original hosted source before
+/// stopping it. The new descriptor retains its issued recipe independently.
+pub(super) fn start_at_execution_directory(
+    host: &SharedHost, client: ClientId, session: Session,
+    environment: crate::terminal_ipc::ChatExecutionEnvironment,
+    context: Arc<chat::protocol::ExecutionContext>, directory: &std::path::Path,
+) -> Result<ServerResponse, ProtocolError> {
+    context.verify_directory(directory).map_err(unavailable)?;
+    start_with_execution(host, client, session, None, false, None, environment, Some(context), None, &[], Some(directory))
 }
 
 /// Discovery can route an old presentation descriptor to recovery, but grants
@@ -754,6 +767,7 @@ fn start_with_execution(
     mut execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
     retained_sources: &[crate::agent_execution::HostedSession],
+    execution_directory: Option<&std::path::Path>,
 ) -> Result<ServerResponse, ProtocolError> {
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
@@ -941,6 +955,12 @@ fn start_with_execution(
     }
     let mut operational_launch = restart_launch.unwrap_or(&session.launch).clone();
     if let Some(binding) = &operational_binding { operational_launch.recipe.working_directory = binding.directory.clone(); }
+    if let Some(directory) = execution_directory {
+        let context = execution.as_ref().ok_or_else(|| unavailable("An operational directory override requires its original approved descriptor"))?;
+        context.verify_directory(directory).map_err(unavailable)?;
+        if context.directory_descriptor().is_none() { return Err(unavailable("An operational directory override requires its original approved descriptor")); }
+        operational_launch.recipe.working_directory = directory.to_owned();
+    }
     let saved_history_only = operational_launch.needs_read_only_history();
     if session.launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&session.launch)?;
@@ -2928,6 +2948,7 @@ pub(super) fn restore_upgrade(
         None,
         restart_launch,
         &retained_sources,
+        None,
     )
     .map_err(|error| error.message)?;
     let id = match response {

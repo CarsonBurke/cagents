@@ -21,6 +21,18 @@ impl DirectoryProof {
 }
 
 impl Handle {
+    /// A completed actor cannot prove a live cwd, but its still-open original
+    /// directory descriptor can authorize an explicit replacement session.
+    pub(crate) fn pinned_execution_directory(&self, candidate: &Path) -> Result<Arc<super::super::protocol::ExecutionContext>, String> {
+        let original = self.0.launch_context.as_ref().and_then(|context| context.directory_descriptor())
+            .ok_or("The completed provider has no retained approved directory descriptor; recover its original context or create a new session explicitly")?;
+        let identity = DirectoryIdentity::from_metadata(&original.metadata().map_err(|error| error.to_string())?);
+        let candidate = Arc::new(super::super::protocol::ExecutionContext::capture(candidate)?);
+        if candidate.directory_identity()? != Some(identity) {
+            return Err("The completed provider's original directory was replaced; its approval cannot transfer to this folder".into());
+        }
+        Ok(candidate)
+    }
     /// Call outside HostState: this is serialized with the owning actor and
     /// may wait behind provider work. An unavailable proof never authorizes a
     /// guessed relocation or a replacement provider.
