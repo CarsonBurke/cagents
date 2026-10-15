@@ -184,6 +184,24 @@ impl Handle {
         Self::start_inner(spec, adapter, initial, store, session_id, None, notify)
     }
 
+    /// Construct a retained-owner failure only in tests of host shutdown.
+    /// The actual holder/cleanup receipt remains authoritative; this does not
+    /// simulate successful cleanup or start another provider actor.
+    #[cfg(test)]
+    pub(crate) fn fixture_retained_native_holder(
+        &self,
+        holder: super::native_holder::Holder,
+        reason: String,
+    ) {
+        assert!(self.is_completed(), "fixture requires an already closed local actor");
+        assert!(self.0.worker.lock().unwrap().is_none());
+        let mut retained = self.0.retained_native.lock().unwrap();
+        assert!(retained.is_none());
+        *retained = Some(holder);
+        *self.0.failure.lock().unwrap() = Some(reason);
+        self.0.completed.store(false, Ordering::Release);
+    }
+
     pub(crate) fn start_owned(
         spec: ProcessSpec,
         adapter: Box<dyn Adapter>,
@@ -6949,9 +6967,7 @@ mod tests {
                 assert!(!record.root.is_current());
                 continue;
             }
-            *handle.0.retained_native.lock().unwrap() = Some(holder);
-            handle.0.completed.store(false, Ordering::Release);
-            *handle.0.failure.lock().unwrap() = Some("Native teardown remains unconfirmed".into());
+            handle.fixture_retained_native_holder(holder, "Native teardown remains unconfirmed".into());
             assert!(
                 handle
                     .close_until(Instant::now() + Duration::from_secs(2))
