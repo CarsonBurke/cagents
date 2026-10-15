@@ -390,6 +390,14 @@ impl RemoteActor {
     pub fn owns_work(&self) -> bool {
         !self.0.preserved.load(Ordering::Acquire) && self.state().owns_work
     }
+    pub fn try_close_identity(&self) -> Result<super::CloseIdentity, String> {
+        let state = self.0.state.try_lock()
+            .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
+        Ok(super::CloseIdentity {session_id: state.session_id.clone(),
+            native_continuity: state.native_continuity.clone(),
+            owns_work: !self.0.preserved.load(Ordering::Acquire) && state.owns_work,
+            completed: state.completed})
+    }
     pub fn state(&self) -> Arc<Resident> {
         self.0
             .state

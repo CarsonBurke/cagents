@@ -24,6 +24,18 @@ impl Handle {
             Owner::Remote(remote) => Some(remote.native_holder_record()),
         }
     }
+    pub(crate) fn try_close_identity(&self) -> Result<super::CloseIdentity, String> {
+        match &self.0 {
+            Owner::Local(local) => local.try_close_identity(),
+            Owner::Remote(remote) => remote.try_close_identity(),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_presentation_state_locked(&self, action: impl FnOnce()) {
+        self.local_actor().expect("fixture requires the actual Local owner")
+            .with_presentation_state_locked(action);
+    }
+
     #[cfg(test)]
     pub(crate) fn with_presentation_store_locked(&self, action: impl FnOnce()) {
         self.local_actor().expect("fixture requires the actual Local owner")

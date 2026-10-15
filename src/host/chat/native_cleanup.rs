@@ -99,14 +99,19 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
         {
             return Err("Native ownership changed or another transition is pending; close the current conversation instead".into());
         }
+        let mut actor_completed = false;
         let actor = if let Some(record) = state.chats.get(&source.id) {
-            if record.handle.owns_work() && consent.is_none() && !(restart && record.handle.is_completed()) {
+            // One nonblocking resident projection: Local snapshot publication
+            // holds the same state mutex during filesystem/transcript work.
+            // Refuse contention instead of waiting on it under HostState.
+            let identity = record.handle.try_close_identity()?;
+            actor_completed = identity.completed;
+            if identity.owns_work && consent.is_none() && !(restart && identity.completed) {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
-            // Admission needs only resident identity metadata. A Local
-            // attachment snapshot may lock/hydrate Store/files and must not
-            // run while the global HostState census is locked.
-            let observed = session_descriptor(record);
+            let mut observed = record.session.clone();
+            observed.launch.session_id = identity.session_id;
+            observed.native_continuity = identity.native_continuity;
             // A fresh managed console publishes its pair to the authenticated
             // helper and hosted record while Agent.session keeps the exact
             // earlier no-pair source. require_current above authenticated that
@@ -134,7 +139,7 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
         } else {
             None
         };
-        if restart && actor.as_ref().is_none_or(|handle| !handle.is_completed()) {
+        if restart && !actor_completed {
             return Err("Only the exact completed native actor can prepare a restart".into());
         }
         let pending = state.native_closing.get(&source.id).cloned();
