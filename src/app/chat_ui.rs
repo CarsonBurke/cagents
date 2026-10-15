@@ -5302,8 +5302,10 @@ impl Cagents {
     /// Starts a draft's conversation for the message in its composer, which
     /// waits in the queue until the conversation can take it.
     ///
-    /// The conversation starts under a new identity, so it never meets
-    /// anything an earlier start of this card may have left in the daemon.
+    /// Ordinary drafts start under a fresh identity. A registered directory
+    /// draft keeps its exact recipient: changing it would abandon the durable
+    /// obligation and the original host grant. This marker never grants a start;
+    /// the owning host must independently admit/claim its retained authority.
     fn start_chat_draft(&mut self, target: Target) -> Task<Message> {
         if self.chat_start_pending(target.card)
             || self
@@ -5313,6 +5315,16 @@ impl Cagents {
         {
             return Task::none();
         }
+        let registry = self.workspace_model.identity;
+        let obligation = self.durable.created_start_requirements.get(&target.card).cloned()
+            .or_else(|| self.workspace_model.created_start_requirements.iter()
+                .find(|requirement| requirement.card == target.card)
+                .map(|requirement| (registry, requirement.clone())));
+        let conflicting_obligation = obligation.as_ref().is_some_and(|(_, required)| {
+            self.workspace_model.created_start_requirements.iter().any(|current| {
+                (current.card == target.card || current.session == required.session) && current != required
+            })
+        });
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -5325,7 +5337,18 @@ impl Cagents {
             .clone()
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
         let mut session = runtime.session.clone();
-        session.id = TerminalId::new();
+        if let Some((original_registry, required)) = &obligation {
+            if required.validate().is_err() || conflicting_obligation
+                || original_registry.is_nil() || *original_registry != registry
+                || required.card != target.card || required.session != session.id
+                || required.kind != crate::model::CreatedStartKind::NativeChat
+            {
+                runtime.error = Some("The original directory-start target changed. Its draft was preserved; reconnect or register a new explicit directory intent.".into());
+                return Task::none();
+            }
+        } else {
+            session.id = TerminalId::new();
+        }
         let text = runtime.composer.text();
         let resolved_text = completion::invocations(
             completion::from_leading_skill(&text, &runtime.snapshot.skills),
@@ -5349,6 +5372,10 @@ impl Cagents {
         runtime.account_picker = false;
         runtime.reasoning_picker = false;
         runtime.session = session.clone();
+        if let Some(obligation) = obligation {
+            Arc::make_mut(&mut self.durable).created_start_requirements
+                .entry(target.card).or_insert(obligation);
+        }
         self.replace_chat_conversation(target.card, session.clone());
         self.start_chat(target.card, session, chat::Intent::Start, None, false)
     }
@@ -11167,6 +11194,64 @@ mod tests {
         );
         assert!(!app.chat_start_pending(card), "and starts nothing");
         card
+    }
+
+    #[test]
+    fn registered_directory_first_submit_keeps_exact_session_or_preserves_refused_draft() {
+        // Tasks are dropped: this exercises the actual App Submit reducer and
+        // startup-intent state, not a provider/FD/native execution claim.
+        for case in 0..7 {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat(&mut app);
+            let original_session = chat_runtime(&app, card).session.id;
+            let registry = uuid::Uuid::new_v4();
+            app.workspace_model.identity = registry;
+            let mut required = crate::model::CreatedStartRequirement {
+                card, session: original_session, operation: crate::model::OperationId::new(),
+                generation: 4, attempt: uuid::Uuid::new_v4(), kind: crate::model::CreatedStartKind::NativeChat,
+            };
+            let mut saved_registry = registry;
+            match case {
+                2 => saved_registry = uuid::Uuid::new_v4(),
+                3 => required.session = TerminalId::new(),
+                4 => required.kind = crate::model::CreatedStartKind::Terminal,
+                5 => required.card = CardId::new(),
+                _ => {}
+            }
+            Arc::make_mut(&mut app.durable).created_start_requirements
+                .insert(card, (saved_registry, required.clone()));
+            if case != 1 {
+                let mut reported = required.clone();
+                if case == 6 { reported.attempt = uuid::Uuid::new_v4(); }
+                app.workspace_model.created_start_requirements.push(reported);
+            }
+            write(&mut app, card, "preserve this original-directory prompt");
+            let original_text = chat_runtime(&app, card).composer.text();
+            submit(&mut app, card);
+            if case <= 1 {
+                let attempt = app.chat_ui.attempt(card).expect("the same target can request host admission");
+                assert_eq!(attempt.session.id, original_session);
+                assert_eq!(chat_runtime(&app, card).queued.as_ref().unwrap().draft.id, original_session);
+                assert_eq!(app.durable.created_start_requirements[&card], (registry, required));
+            } else {
+                assert!(!app.chat_start_pending(card));
+                let runtime = chat_runtime(&app, card);
+                assert_eq!(runtime.session.id, original_session);
+                assert_eq!(runtime.composer.text(), original_text);
+                assert!(runtime.queued.is_none());
+                assert!(runtime.error.as_deref().is_some_and(|error| error.contains("draft was preserved")));
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_first_submit_still_mints_a_fresh_session() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        let draft_session = chat_runtime(&app, card).session.id;
+        write(&mut app, card, "ordinary draft");
+        submit(&mut app, card);
+        assert_ne!(app.chat_ui.attempt(card).unwrap().session.id, draft_session);
     }
 
     fn chat_runtime(app: &Cagents, card: CardId) -> &Runtime {
