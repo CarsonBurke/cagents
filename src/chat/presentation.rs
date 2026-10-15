@@ -179,23 +179,39 @@ fn apply_items(
 }
 
 impl Presentation {
-    /// Build a complete next publication from an immutable previous snapshot.
-    /// A malformed or missed patch cannot change the installed snapshot,
-    /// including its child transcripts. Unchanged payloads remain shared.
-    pub fn apply(self, previous: &Snapshot) -> Result<Snapshot, &'static str> {
+    fn restore_metadata(&mut self, previous: &Snapshot) -> Result<(), &'static str> {
         if self.base_generation != previous.generation
             || self.metadata.generation <= self.base_generation
             || !self.metadata.items.is_empty()
         {
             return Err("Transcript revision mismatch");
         }
-        let mut metadata = self.metadata;
         if self.file_changes_unchanged {
-            if !metadata.file_changes.files.is_empty() {
+            if !self.metadata.file_changes.files.is_empty() {
                 return Err("Retained file summary carries replacement rows");
             }
-            metadata.file_changes = previous.file_changes.clone();
+            self.metadata.file_changes = previous.file_changes.clone();
         }
+        Ok(())
+    }
+
+    /// Hidden control subscribers discard body changes but must obey the same
+    /// revision and retained-metadata fences as a full presentation consumer.
+    /// Consuming the update avoids cloning catalogs or transcript payloads.
+    pub(crate) fn metadata_for(mut self, previous: &Snapshot) -> Result<Snapshot, &'static str> {
+        self.restore_metadata(previous)?;
+        if self.metadata.subagents.iter().any(|agent| !agent.items.is_empty()) {
+            return Err("Unexpected child transcript body");
+        }
+        Ok(self.metadata)
+    }
+
+    /// Build a complete next publication from an immutable previous snapshot.
+    /// A malformed or missed patch cannot change the installed snapshot,
+    /// including its child transcripts. Unchanged payloads remain shared.
+    pub fn apply(mut self, previous: &Snapshot) -> Result<Snapshot, &'static str> {
+        self.restore_metadata(previous)?;
+        let mut metadata = self.metadata;
         metadata.items = apply_items(&previous.items, self.order, self.changes)?;
         let mut children = HashMap::new();
         for child in self.children {
@@ -464,6 +480,15 @@ mod tests {
             children: vec![],
         };
         assert!(postcard::to_stdvec(&update).unwrap().len() < 1024);
+        let hidden = update.clone().metadata_for(&previous).unwrap();
+        assert!(std::sync::Arc::ptr_eq(&summary, &hidden.file_changes));
+        let mut wrong_base = previous.clone();
+        wrong_base.generation = 0;
+        assert!(update.clone().metadata_for(&wrong_base).is_err(),
+            "hidden subscribers cannot retain a summary from another revision");
+        let mut stale = update.clone();
+        stale.metadata.generation = previous.generation;
+        assert!(stale.metadata_for(&previous).is_err());
         let current = update.apply(&previous).unwrap();
         assert!(std::sync::Arc::ptr_eq(&summary, &current.file_changes));
         assert_eq!(current.file_changes.applied_files, 99);

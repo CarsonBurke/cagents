@@ -1203,31 +1203,33 @@ impl ClientHandle {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                         let sampled_at = update.metadata.sampled_at;
-                        user_item_seen.fetch_or(update.changes.iter().any(|change| {
+                        let observed_user = update.changes.iter().any(|change| {
                             let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
                             item.role == super::Role::User
-                        }), Ordering::AcqRel);
+                        });
                         let candidates = append::Lineage::candidates(&update, &state);
                         let retain_body = body_requested.load(Ordering::Acquire);
+                        let mut accepted_metadata = false;
                         let applied = if !retain_body || !transcript_resident.load(Ordering::Acquire) {
                             // Preserve authenticated scalar state/late continuity
                             // even when the body needed to apply a patch is gone.
                             // A later reveal still requires an unconditional read.
-                            if update.metadata.generation >= state.generation {
-                                let mut metadata = update.metadata;
-                                if update.file_changes_unchanged {
-                                    metadata.file_changes = state.file_changes.clone();
-                                }
-                                metadata.evict_transcript();
-                                *state = Arc::new(metadata);
-                                SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
+                            match update.metadata_for(&state) {
+                                Ok(mut metadata) => {
+                                    metadata.evict_transcript();
+                                    *state = Arc::new(metadata);
+                                    accepted_metadata = true;
+                                    SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
+                                    // Hidden control subscribers advance metadata
+                                    // without resyncing a deliberately discarded body.
+                                    !retain_body
+                                },
+                                Err(_) => false,
                             }
-                            // Hidden control subscribers advance metadata
-                            // without immediately resyncing a discarded body.
-                            !retain_body
                         } else {
                             match update.apply(&state) {
                                 Ok(mut next) => {
+                                    accepted_metadata = true;
                                     append_lineage.lock().unwrap_or_else(|p| p.into_inner()).record(candidates, &next);
                                     let resident = body_requested.load(Ordering::Acquire);
                                     if !resident { next.evict_transcript(); }
@@ -1239,6 +1241,7 @@ impl ClientHandle {
                                 Err(_) => false,
                             }
                         };
+                        user_item_seen.fetch_or(accepted_metadata && observed_user, Ordering::AcqRel);
                         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
                             resident_bytes = state.transcript_bytes());
                         drop(state);
@@ -3188,6 +3191,27 @@ mod tests {
                 started_at: None,
                 at: None,
             };
+            respond(&mut codec, &mut server, Some(read.request_id), ServerMessage::Response {
+                response: ServerResponse::ChatUpdate {
+                    chat_id,
+                    update: Presentation {
+                        base_generation: 99, file_changes_unchanged: true,
+                        metadata: Snapshot { generation: 100, ready: true, ..Default::default() },
+                        order: vec![], changes: vec![], children: vec![],
+                    },
+                },
+            });
+            let resync: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(resync.request, ClientRequest::ChatRead { after_generation: None, .. }),
+                "hidden controls must reject an update with a mismatched metadata base");
+            respond(&mut codec, &mut server, Some(resync.request_id), ServerMessage::Response {
+                response: ServerResponse::ChatSnapshot {
+                    chat_id, snapshot: Some(Snapshot { generation: 1, ..Default::default() }),
+                },
+            });
+            respond(&mut codec, &mut server, None, ServerMessage::ChatChanged { chat_id });
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { after_generation: Some(1), .. }));
             respond(
                 &mut codec,
                 &mut server,
