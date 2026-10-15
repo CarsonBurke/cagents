@@ -5730,6 +5730,9 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        if !runtime.original_restore_allows(&command) {
+            return Task::none();
+        }
         // A queued first message goes out ahead of anything else, and
         // nothing is sent past it while it waits.
         if runtime.pending.is_some()
@@ -7030,6 +7033,11 @@ impl Cagents {
                 }
             }
             Action::Submit(target, mode) => {
+                // Guard before account routing or local follow-up queuing, both
+                // of which can mutate intent without reaching chat_send_step.
+                if self.chat_runtime_mut(target).is_some_and(|runtime| runtime.snapshot.original_retry_pending) {
+                    return Task::none();
+                }
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
                 {
@@ -17096,6 +17104,44 @@ mod tests {
         let page=chat::annotations::OriginalPage {session_id:session,original,offset:0,next_offset:end,text:text[..end].into(),complete:end==text.len()};
         original_result(app,card,originals::Value::Metadata(page));
     }
+    #[test]
+    fn pending_original_restore_refuses_new_intent_before_local_queue_or_account_routing() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));let target=chat_runtime(&app,card).target;
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        runtime.replace_draft(text_editor::Content::with_text("my unsent independent draft"));
+        runtime.attachments=vec![Attachment {path:"/user/next.png".into()}];
+        let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.original_retry_pending=true;
+        snapshot.original_retry_diagnostic=Some("Restoration needs verified settings readback.".into());
+        snapshot.error=Some("API Error: 529 Overloaded".into());
+        for mode in [PromptMode::Send,PromptMode::Queue,PromptMode::Steer] {
+            drop(app.handle_chat_ui(Action::Submit(target,mode)));
+            let runtime=chat_runtime(&app,card);
+            assert_eq!(runtime.composer.text(),"my unsent independent draft");
+            assert_eq!(runtime.attachments,vec![Attachment {path:"/user/next.png".into()}]);
+            assert!(runtime.followups.is_empty() && runtime.queued.is_none() && runtime.pending.is_none());
+            assert!(runtime.error.is_none());
+        }
+        let original=original_fixture("native-user","old prompt",vec![]);
+        for command in [
+            Command::Prompt {text:"new work".into(),attachments:vec![],mode:PromptMode::Send},
+            Command::PromptNamed {text:"new work".into(),attachments:vec![],mode:PromptMode::Queue},
+            Command::PromptOriginal {session_id:KNOWN_THREAD.into(),original,turn_generation:0},
+        ] {
+            drop(app.chat_send(target,command,false));
+            assert!(chat_runtime(&app,card).pending.is_none());
+        }
+        assert!(!chat_runtime(&app,card).recovery_available());
+        assert!(chat_runtime(&app,card).original_retry_user().is_none());
+        drop(app.handle_chat_ui(Action::Interrupt(target)));
+        assert!(chat_runtime(&app,card).pending.is_some(),"native busy=false does not hide restoration cancellation");
+        settle(&mut app,card,Ok(()));
+        assert!(chat_runtime(&app,card).snapshot.original_retry_pending,"dispatch ACK cannot clear restoration state");
+        drop(app.chat_send(target,Command::Refresh,false));
+        assert!(chat_runtime(&app,card).pending.is_some());
+        assert_eq!(chat_runtime(&app,card).snapshot.error.as_deref(),Some("API Error: 529 Overloaded"));
+    }
+
     #[test]
     fn failed_turn_retry_preserves_prompt_and_attachments_and_dispatches_once() {
         let mut app=crate::app::tests::context_inspector_test_app(false);

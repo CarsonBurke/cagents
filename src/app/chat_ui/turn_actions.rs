@@ -352,7 +352,7 @@ impl Runtime {
     }
 
     pub(super) fn recovery_available(&self) -> bool {
-        self.snapshot.ready && !self.snapshot.busy && !self.snapshot.exited
+        self.snapshot.ready && !self.snapshot.busy && !self.snapshot.original_retry_pending && !self.snapshot.exited
             && !self.snapshot.waiting && self.snapshot.requests.is_empty()
             && self.snapshot.read_only_reason.is_none() && !self.snapshot.has_later
             && !self.disconnected && self.pending.is_none() && self.queued.is_none()

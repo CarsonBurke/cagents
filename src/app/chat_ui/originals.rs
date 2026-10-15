@@ -142,6 +142,12 @@ fn stream(job:&Job)->Pin<Box<dyn iced::futures::Stream<Item=Message>+Send>> {
 }
 
 impl Runtime {
+    /// Restoration holds provider input until the actor has verified readback.
+    /// Navigation and cancellation remain available even when native busy is false.
+    pub(super) fn original_restore_allows(&self, command: &Command) -> bool {
+        !self.snapshot.original_retry_pending
+            || matches!(command, Command::Interrupt | Command::Refresh | Command::LoadEarlier | Command::LoadLater)
+    }
     fn revoke_originals(&mut self) {
         self.recovery.originals.clear();
         self.recovery.submitted=None;
@@ -170,7 +176,7 @@ impl Runtime {
         if self.recovery.originals.context.as_ref()!=Some(&context) {
             self.recovery.originals.clear();self.recovery.originals.context=Some(context.clone());
         }
-        if self.snapshot.ready && !self.snapshot.busy && !self.snapshot.waiting && self.snapshot.requests.is_empty()
+        if self.snapshot.ready && !self.snapshot.busy && !self.snapshot.original_retry_pending && !self.snapshot.waiting && self.snapshot.requests.is_empty()
             && self.snapshot.read_only_reason.is_none()
             && self.pending.is_none() && self.queued.is_none() && self.selected_subagent.is_none()
             && !self.recovery.originals.attempted && self.recovery.originals.query.is_none()
@@ -183,7 +189,7 @@ impl Runtime {
     /// by recovery_retained_bytes; these values are not allocator/RSS estimates.
     pub(super) fn original_metadata_bytes(&self)->usize {self.recovery.originals.metadata_bytes()}
     pub(super) fn original_retry_user(&self)->Option<&str> {
-        (self.snapshot.capabilities.original_retry
+        (!self.snapshot.original_retry_pending && self.snapshot.capabilities.original_retry
             && self.recovery.originals.metadata.as_ref().is_some_and(|original|original.settings.is_exact())
             && self.recovery.originals.context.as_ref()==Context::current(self).as_ref()
             && !self.recovery.originals.loading()).then(||self.recovery.originals.current_user()).flatten()
@@ -328,6 +334,19 @@ mod tests {
             capabilities:chat::Capabilities {original_retry:true,..Default::default()},..Snapshot::default()}));
         Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,crate::settings::EditorSyntaxTheme::default())
     }
+    #[test]
+    fn restoration_pending_does_not_prefetch_or_offer_another_original() {
+        let mut runtime=runtime();
+        Arc::make_mut(&mut runtime.snapshot).original_retry_pending=true;
+        runtime.sync_original();assert!(runtime.recovery.originals.query.is_none());
+        assert!(runtime.original_retry_user().is_none());
+        for command in [Command::Interrupt,Command::Refresh,Command::LoadEarlier,Command::LoadLater] {
+            assert!(runtime.original_restore_allows(&command));
+        }
+        Arc::make_mut(&mut runtime.snapshot).original_retry_pending=false;
+        runtime.sync_original();assert!(runtime.recovery.originals.query.is_some());
+    }
+
     #[test]
     fn cold_paged_out_latest_uses_authoritative_metadata_without_retaining_input() {
         let mut runtime=runtime();runtime.sync_original();

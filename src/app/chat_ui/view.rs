@@ -1143,6 +1143,7 @@ impl Runtime {
             && self.pending.is_none()
             && self.queued.is_none();
         let snapshot = &self.snapshot;
+        let input_available = available && !snapshot.original_retry_pending;
         // One theme lookup and one settings value per frame, rather than one
         // per rendered message.
         // Answers are read at a size above the shell's own captions and
@@ -1384,6 +1385,15 @@ impl Runtime {
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
         {
             transcript.push(self.failure_notice(error, None));
+        }
+        if snapshot.original_retry_pending || snapshot.original_retry_diagnostic.is_some() {
+            content.push(widget::row::with_children(vec![
+                widget::container(design::caption(snapshot.original_retry_diagnostic.clone().unwrap_or_else(||
+                    "Restoring the original prompt settings…".into())))
+                    .width(Length::Fill).into(),
+                icon(Icon::Refresh, "Refresh original restoration status", available,
+                    Action::Command(target, Command::Refresh)),
+            ]).spacing(step::GAP_S).align_y(Alignment::Center).into());
         }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
@@ -1839,7 +1849,7 @@ impl Runtime {
         // contents. The action handler checks the current draft before sending;
         // tying the binding to a view-time draft snapshot can leave Enter
         // inserting a newline until another pointer event redraws the pane.
-        let key_submit = if available {
+        let key_submit = if input_available {
             (modes.first().copied(), modes.get(1).copied())
         } else {
             (None, None)
@@ -1853,7 +1863,7 @@ impl Runtime {
         // long paste from squeezing the transcript out, past which the editor
         // scrolls as before.
         let composer_ceiling = 12.0 * COMPOSER_LINE_HEIGHT + 2.0 * COMPOSER_PADDING;
-        let suggestion = if available && !transitioning {
+        let suggestion = if input_available && !transitioning {
             self.prompt_suggestion()
         } else {
             None
@@ -1956,7 +1966,7 @@ impl Runtime {
                             Action::AcceptSuggestion(target, suggestion.clone()),
                         )));
                     }
-                    if snapshot.busy
+                    if (snapshot.busy || snapshot.original_retry_pending)
                         && available
                         && self.model_picker.is_none()
                         && !self.reasoning_picker
@@ -2035,7 +2045,7 @@ impl Runtime {
         // A dropdown listing them duplicated that path in a control that was
         // permanently present for something used occasionally.
         let mut submissions = Vec::new();
-        if snapshot.busy {
+        if snapshot.busy || snapshot.original_retry_pending {
             // A provider whose interrupt does not spare background subagents
             // takes them down with the turn. Saying so on the control is not
             // enough for Esc, which is pressed without reading it, so such a
@@ -2063,6 +2073,8 @@ impl Runtime {
                         Cow::Owned(format!(
                             "Cancel active turn (Esc). This also stops {at_stake} background {subagents}"
                         ))
+                    } else if snapshot.original_retry_pending {
+                        Cow::Borrowed("Cancel original prompt restoration (Esc)")
                     } else {
                         Cow::Borrowed("Cancel active turn (Esc)")
                     },
@@ -2084,7 +2096,7 @@ impl Runtime {
                         design::muted_icon_color
                     }))
                     .on_press_maybe(
-                        (available && has_draft).then(|| action(Action::Submit(target, *mode))),
+                        (input_available && has_draft).then(|| action(Action::Submit(target, *mode))),
                     )
                     .into(),
             );
@@ -6345,7 +6357,7 @@ mod tests {
         let (mut runtime,_handle)=frame_cost::live_runtime(&[item]);
         let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
         let mut tree=Tree::empty();
-        for stage in 0..=10 {
+        for stage in 0..=12 {
             match stage {
                 1=>runtime.replace_draft(text_editor::Content::with_text("Unsent draft")),
                 2=>runtime.replace_draft(text_editor::Content::new()),
@@ -6357,6 +6369,8 @@ mod tests {
                 8=>runtime.image_pastes_saving=0,
                 9=>runtime.attachment_chooser_pending=true,
                 10=>runtime.attachment_chooser_pending=false,
+                11=>Arc::make_mut(&mut runtime.snapshot).original_retry_pending=true,
+                12=>Arc::make_mut(&mut runtime.snapshot).original_retry_pending=false,
                 _=>{},
             }
             let mut element=runtime.find_turn_view_for_test();
@@ -6381,6 +6395,38 @@ mod tests {
             let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
             assert_eq!(accessible.root().iter().chain(accessible.children()).any(|node|
                 node.node().label()==Some("Edit and resend in a new branch")),expected);
+        }
+    }
+
+    #[test]
+    fn restoration_notice_and_cancel_controls_follow_pending_without_restarting_the_turn() {
+        use iced::advanced::{Layout,layout,widget::Tree};
+        let (mut runtime,_handle)=frame_cost::live_runtime(&[]);
+        runtime.replace_draft(text_editor::Content::with_text("my next independent draft"));
+        let snapshot=Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy=false;snapshot.error=Some("API Error: 529 Overloaded".into());
+        snapshot.turn_started_at=Some(1_000);snapshot.finished_at=Some(9_000);
+        let elapsed=runtime.turn_elapsed();
+        let renderer=crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree=Tree::empty();let shortcuts=crate::settings::KeyboardShortcuts::default();
+        for pending in [false,true,false] {
+            let snapshot=Arc::make_mut(&mut runtime.snapshot);snapshot.original_retry_pending=pending;
+            snapshot.original_retry_diagnostic=pending.then(||"Settings verification is pending. Refresh after the outstanding change settles.".into());
+            let mut element=runtime.view(None,false,true,&shortcuts,640.0,
+                Place {name:"fixture".into(),branch:None,channel:None},true,None,vec![]);
+            tree.diff(element.as_widget_mut());
+            let node=element.as_widget_mut().layout(&mut tree,&renderer,
+                &layout::Limits::new(iced::Size::ZERO,iced::Size::new(640.0,1000.0)));
+            let accessible=element.as_widget().a11y_nodes(Layout::new(&node),&tree,iced::mouse::Cursor::Unavailable);
+            let nodes=accessible.root().iter().chain(accessible.children()).collect::<Vec<_>>();
+            let send=nodes.iter().find(|node|node.node().label().is_some_and(|label|label.starts_with("Send message"))).expect("send control");
+            assert_eq!(send.node().is_disabled(),pending);
+            assert_eq!(nodes.iter().any(|node|node.node().label()==Some("Cancel original prompt restoration (Esc)") && !node.node().is_disabled()),pending);
+            assert_eq!(nodes.iter().any(|node|node.node().label()==Some("Refresh original restoration status") && !node.node().is_disabled()),pending);
+            drop(element);
+            assert!(!runtime.snapshot.busy);
+            assert_eq!(runtime.snapshot.error.as_deref(),Some("API Error: 529 Overloaded"));
+            assert_eq!(runtime.turn_elapsed(),elapsed);
         }
     }
 
