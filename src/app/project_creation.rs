@@ -23,7 +23,10 @@ impl Cagents {
             return Task::none();
         };
         self.open_worktree_dialog_project_bound(target.project_id, source, WorktreeDraft {
-            base: target.branch.as_deref().unwrap_or("").trim_start_matches("refs/heads/").to_owned(),
+            // Sidebar worktree branches are already short local names. Qualify
+            // exactly once so prefix-like names and same-named tags retain
+            // the original local branch identity.
+            base: target.branch.as_ref().map_or_else(String::new, |branch| format!("refs/heads/{branch}")),
             ..Default::default()
         }, None)
     }
