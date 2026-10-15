@@ -6,12 +6,13 @@ mod v77;
 use crate::install_guard::SourceInspectionRequest as Request;
 use crate::{
     chat::Session,
-    model::{CardKind, HostSessionProof},
+    model::{CardId, CardKind, HostSessionProof},
     upgrade::handoff,
 };
 use std::{
     collections::HashSet,
     io::{self, Write},
+    path::{Path,PathBuf},
     time::{Duration, Instant},
 };
 
@@ -115,6 +116,7 @@ fn inspect(request: Request) -> Result<(), String> {
         .map_err(|_| "Cannot enumerate saved source windows")?;
     let mut saved = Vec::new();
     for path in paths {
+        check_deadline(deadline)?;
         if !path
             .try_exists()
             .map_err(|_| "Cannot verify a saved source database")?
@@ -123,12 +125,18 @@ fn inspect(request: Request) -> Result<(), String> {
         }
         saved.extend(
             crate::persistence::read_open_migration_sessions(&path)
-                .map_err(|_| "A saved source pane is unreadable; source windows remain usable")?,
+                .map_err(|_| "A saved source pane is unreadable; source windows remain usable")?
+                .into_iter().map(|(card,kind)|(path.clone(),card,kind)),
         );
         if saved.len() > 4096 {
             return Err("Saved pane inventory exceeds the migration inspection limit".into());
         }
     }
+    let registry=crate::instance::project_dirs().ok_or("Cannot locate the source archive registry")?
+        .data_dir().join("workspace-model.sqlite3");
+    let saved=require_live_panes(saved,deadline,|database,card,session| {
+        crate::automations::archive::inspect_archived_pane(database,&registry,card,session).map(|receipt|receipt.is_some())
+    })?;
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
         CardKind::Chat(session) => session.is_unstarted(),
         CardKind::Terminal(session) => terminal_ended(session),
@@ -159,6 +167,7 @@ fn inspect(request: Request) -> Result<(), String> {
             .map_err(|_| format!("Source conversation {} has no qualified immutable migration; reconnect or close it before updating. Source windows remain usable", session.id))?;
     }
     for (card, kind) in saved {
+        check_deadline(deadline)?;
         if let CardKind::Terminal(source) = &kind {
             if !terminal_ended(source) {
                 qualify_terminal(source, &terminals, proof)
@@ -176,6 +185,31 @@ fn inspect(request: Request) -> Result<(), String> {
             .map_err(|_| format!("Saved conversation pane {card} has no qualified exact migration. Reconnect, recover, or close that pane before updating; source windows remain usable"))?;
     }
     Ok(())
+}
+
+fn check_deadline(deadline:Instant)->Result<(),String>{
+    if Instant::now()>=deadline {return Err("Source pane inspection exceeded its bounded budget; source windows remain usable".into());}
+    Ok(())
+}
+
+/// An archive receipt proves a readable, closed conversation. It does not
+/// require a daemon or authorize starting/attaching any provider. An absent
+/// binding keeps the ordinary exact-live-owner requirements in force.
+fn require_live_panes(
+    saved:Vec<(PathBuf,CardId,CardKind)>,deadline:Instant,
+    mut archive:impl FnMut(&Path,CardId,&Session)->Result<bool,String>,
+)->Result<Vec<(CardId,CardKind)>,String>{
+    let mut live=Vec::new();
+    for (database,card,kind) in saved {
+        check_deadline(deadline)?;
+        if let CardKind::Chat(session)=&kind && !session.is_unstarted() {
+            let qualified=archive(&database,card,session).map_err(|_|format!("Saved archive pane {card} has no qualified readable history. Recover or close that pane before updating; source windows remain usable"))?;
+            check_deadline(deadline)?;
+            if qualified {continue;}
+        }
+        live.push((card,kind));
+    }
+    Ok(live)
 }
 
 fn terminal_ended(session: &crate::model::TerminalSession) -> bool {
@@ -228,6 +262,22 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[test]
+    fn archived_panes_require_typed_history_and_never_hide_unclaimed_live_panes() {
+        let archived=CardId::new();let live=CardId::new();let mut draft=session();draft.proof=None;draft.launch.session_id=None;
+        let draft_id=CardId::new();
+        let saved=vec![(PathBuf::from("/window/a"),archived,CardKind::Chat(session())),(PathBuf::from("/window/b"),live,CardKind::Chat(session())),(PathBuf::from("/window/c"),draft_id,CardKind::Chat(draft))];
+        let mut inspected=Vec::new();
+        let remaining=require_live_panes(saved,Instant::now()+Duration::from_secs(1),|database,card,_|{inspected.push(database.to_owned());Ok(card==archived)}).unwrap();
+        assert_eq!(remaining.iter().map(|(card,_)|*card).collect::<Vec<_>>(),vec![live,draft_id]);
+        assert_eq!(inspected,vec![PathBuf::from("/window/a"),PathBuf::from("/window/b")]);
+        let saved=vec![(PathBuf::from("/window"),archived,CardKind::Chat(session()))];
+        let error=require_live_panes(saved.clone(),Instant::now()+Duration::from_secs(1),|_,_,_|Err("private archive payload must not leak".into())).unwrap_err();
+        assert!(error.contains(&archived.to_string()));assert!(!error.contains("private archive payload"));
+        assert!(require_live_panes(saved.clone(),Instant::now(),|_,_,_|panic!("expired inspection must not open another database")).is_err());
+        assert!(require_live_panes(saved,Instant::now()+Duration::from_secs(1),|_,_,_|Ok(true)).unwrap().is_empty(),"archives-only saved panes require no live source");
+    }
 
     pub(super) fn session() -> Session {
         Session {
