@@ -8,7 +8,7 @@ pub(super) struct State {
     reassign: Option<(SettingsField, String, usize)>,
     filtering_key: bool,
     query: Option<String>,
-    selected: usize,
+    selected_message: Option<Message>,
     panes_only: bool,
     sidebar_target: Option<sidebar::commands::CommandTarget>,
     move_pane: Option<CardId>,
@@ -95,6 +95,22 @@ fn entry_key(message: &Message) -> String {
         }
         Message::CloseCard(_) => format!("command:{}", Command::CloseFocusedCard.id()),
         _ => "command:resume_conversation".into(),
+    }
+}
+
+/// Compare captured intent without formatting IDs or cloning target snapshots.
+fn same_palette_entry(left: &Message, right: &Message) -> bool {
+    match (left, right) {
+        (Message::RunCommand(left), Message::RunCommand(right)) => left == right,
+        (Message::Palette(Action::RunGitStash(lt, lc, le)), Message::Palette(Action::RunGitStash(rt, rc, re))) => lt == rt && lc == rc && le.reference == re.reference && le.oid == re.oid,
+        (Message::Palette(Action::MovePaneToChannel(lc, lt)), Message::Palette(Action::MovePaneToChannel(rc, rt))) => lc == rc && lt == rt,
+        (Message::Sidebar(SidebarAction::OpenWorktree { worktree_id: left, .. }), Message::Sidebar(SidebarAction::OpenWorktree { worktree_id: right, .. })) => left == right,
+        (Message::Sidebar(SidebarAction::OpenChannel { channel_id: left }), Message::Sidebar(SidebarAction::OpenChannel { channel_id: right })) => left == right,
+        (Message::Sidebar(SidebarAction::OpenRepository { project_id: left, .. }), Message::Sidebar(SidebarAction::OpenRepository { project_id: right, .. })) => left == right,
+        _ => {
+            let pane = |message: &Message| match message { Message::Palette(Action::FocusPane(id)) | Message::FocusCard(id) | Message::FocusAttention(id) => Some(*id), _ => None };
+            pane(left).is_some_and(|left| pane(right) == Some(left))
+        }
     }
 }
 
@@ -261,6 +277,7 @@ impl Cagents {
                 self.palette.stash_picker = None;
                 self.palette.stash_entries.clear();
                 self.palette.recording = Some(field);
+                self.palette.selected_message = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
                 self.palette.recording_error = None;
@@ -271,6 +288,7 @@ impl Cagents {
                 self.palette.filtering_key = true;
                 self.palette.recording = None;
                 self.palette.query = None;
+                self.palette.selected_message = None;
                 self.palette.sidebar_target = None;
                 self.palette.git_target = None;
                 self.palette.git_captured = false;
@@ -372,9 +390,9 @@ impl Cagents {
                 self.palette.panes_only = matches!(action, Action::OpenPanes);
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
-                self.palette.selected = 0;
                 self.palette.move_pane = None;
                 self.palette.move_destinations.clear();
+                self.reset_palette_selection();
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
@@ -399,6 +417,7 @@ impl Cagents {
                 let task = self.update_palette(Action::Open);
                 self.palette.move_pane = Some(card);
                 self.palette.move_destinations = destinations;
+                self.reset_palette_selection();
                 task
             }
             Action::Close => {
@@ -409,6 +428,7 @@ impl Cagents {
                 self.palette.recording = None;
                 self.palette.filtering_key = false;
                 self.palette.query = None;
+                self.palette.selected_message = None;
                 self.palette.sidebar_target = None;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
@@ -421,7 +441,7 @@ impl Cagents {
             }
             Action::Query(query) => {
                 self.palette.query = Some(query);
-                self.palette.selected = 0;
+                self.reset_palette_selection();
                 self.reveal_palette_selection()
             }
             Action::Run(MessageBox(message)) => self.run_palette_command(*message),
@@ -469,14 +489,12 @@ impl Cagents {
                 navigation.chain(self.update(Message::FocusCard(id)))
             }
             Action::Submit => {
-                let entry = self
-                    .palette_entries()
-                    .into_iter()
-                    .nth(self.palette.selected);
-                match entry {
-                    Some((_, _, message)) => self.run_palette_command(message),
-                    None => self.update_palette(Action::Close),
+                let Some(message) = self.palette.selected_message.clone() else { return self.update_palette(Action::Close); };
+                if !self.palette_entries().iter().any(|(_, _, candidate)| same_palette_entry(&message, candidate)) {
+                    self.status = Some(TransientNotice::warning("The selected result is no longer available; choose another result"));
+                    return Task::none();
                 }
+                self.run_palette_command(message)
             }
         }
     }
@@ -489,6 +507,7 @@ impl Cagents {
         self.settings.palette_recents.insert(0, key);
         self.settings.palette_recents.truncate(24);
         self.palette.query = None;
+        self.palette.selected_message = None;
         self.palette.move_pane = None;
         self.palette.move_destinations.clear();
         self.palette.stash_picker = None;
@@ -598,14 +617,18 @@ impl Cagents {
         } = event
             && modifiers.is_empty()
         {
-            let count = self.palette_entries().len();
+            let entries = self.palette_entries();
+            let count = entries.len();
+            let current = self.palette_selection_index(&entries);
             match key {
                 keyboard::key::Named::ArrowDown if count > 0 => {
-                    self.palette.selected = (self.palette.selected + 1) % count;
+                    let index = current.map_or(0, |index| (index + 1) % count);
+                    self.select_palette_entry(index, &entries);
                     return Some(self.reveal_palette_selection());
                 }
                 keyboard::key::Named::ArrowUp if count > 0 => {
-                    self.palette.selected = (self.palette.selected + count - 1) % count;
+                    let index = current.map_or(count - 1, |index| (index + count - 1) % count);
+                    self.select_palette_entry(index, &entries);
                     return Some(self.reveal_palette_selection());
                 }
                 keyboard::key::Named::Enter => return Some(self.update_palette(Action::Submit)),
@@ -613,6 +636,20 @@ impl Cagents {
             }
         }
         Some(Task::none())
+    }
+
+    fn palette_selection_index(&self, entries: &[(String, String, Message)]) -> Option<usize> {
+        let selected = self.palette.selected_message.as_ref()?;
+        entries.iter().position(|(_, _, message)| same_palette_entry(selected, message))
+    }
+
+    fn select_palette_entry(&mut self, index: usize, entries: &[(String, String, Message)]) {
+        self.palette.selected_message = entries.get(index).map(|(_, _, message)| message.clone());
+    }
+
+    fn reset_palette_selection(&mut self) {
+        let entries = self.palette_entries();
+        self.select_palette_entry(0, &entries);
     }
 
     fn record_shortcut(&mut self, field: SettingsField, chord: String) -> Task<Message> {
@@ -678,12 +715,14 @@ impl Cagents {
     fn reveal_palette_selection(&self) -> Task<Message> {
         let mut section = None;
         let mut top = 0.0;
-        for (index, (_, _, message)) in self.palette_entries().iter().enumerate() {
+        let entries = self.palette_entries();
+        let Some(selected) = self.palette_selection_index(&entries) else { return Task::none(); };
+        for (index, (_, _, message)) in entries.iter().enumerate() {
             let next = self.palette_section(message);
             if next.is_some() && next != section {
                 top += SECTION_HEIGHT + ROW_SPACING;
             }
-            if index == self.palette.selected { break; }
+            if index == selected { break; }
             top += ROW_HEIGHT + ROW_SPACING;
             section = next;
         }
@@ -925,6 +964,7 @@ impl Cagents {
         .id(widget::Id::new("palette.query"))
         .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
+        let selected = self.palette_selection_index(&entries);
         let mut section = None;
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
@@ -981,7 +1021,7 @@ impl Cagents {
                         .height(Length::Fill)
                         .align_y(Alignment::Center),
                 )
-                .class(palette_row_style(index == self.palette.selected))
+                .class(palette_row_style(selected == Some(index)))
                 .padding([0, 12])
                 .width(Length::Fill)
                 .height(ROW_HEIGHT)
@@ -1322,6 +1362,7 @@ impl Cagents {
                 self.palette.stash_entries = entries;
                 self.palette.git_target = Some(target);
                 self.palette.stash_picker = Some(command);
+                self.reset_palette_selection();
                 return task;
             }
             let task = target.action(&self.sidebar_model, &self.sidebar_state, command)
@@ -2551,6 +2592,45 @@ mod tests {
                     .all(|entry| entry_category(&entry.2) == prefix)
             );
         }
+    }
+
+    #[test]
+    fn enter_retains_selected_command_identity_when_results_reorder() {
+        let mut app = settings_focus_fixture();
+        drop(app.update_palette(Action::Open));
+        let shown = app.palette_entries();
+        let index = shown.iter().position(|(_, _, message)| matches!(message, Message::RunCommand(Command::OpenSettings))).unwrap();
+        app.select_palette_entry(index, &shown);
+        app.settings.palette_recents = vec![entry_key(&Message::RunCommand(Command::ToggleTheme))];
+        let refreshed = app.palette_entries();
+        let new_index = app.palette_selection_index(&refreshed).unwrap();
+        assert_ne!(index, new_index);
+        assert!(matches!(refreshed[new_index].2, Message::RunCommand(Command::OpenSettings)), "the visible highlight follows the original action");
+        assert!(!matches!(refreshed[index].2, Message::RunCommand(Command::OpenSettings)), "numeric-index activation would choose another result");
+        drop(app.update_palette(Action::Submit));
+        assert_eq!(app.settings.palette_recents.first(), Some(&entry_key(&Message::RunCommand(Command::OpenSettings))));
+    }
+
+    #[test]
+    fn enter_refuses_a_removed_result_instead_of_activating_its_old_row() {
+        let mut app = settings_focus_fixture();
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_state.observe_card_update(card);
+        drop(app.update_palette(Action::Open));
+        let shown = app.palette_entries();
+        let index = shown.iter().position(|(_, _, message)| matches!(message, Message::RunCommand(Command::MarkAllRead))).unwrap();
+        app.select_palette_entry(index, &shown);
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(!app.command_available(Command::MarkAllRead));
+        assert!(app.palette_selection_index(&app.palette_entries()).is_none(), "no different row is highlighted after removal");
+        let before = app.settings.palette_recents.clone();
+        drop(app.update_palette(Action::Submit));
+        assert!(app.palette.is_open());
+        assert_eq!(app.settings.palette_recents, before);
+        assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("selected result")));
+        let down = keyboard::Event::KeyPressed { key: keyboard::Key::Named(keyboard::key::Named::ArrowDown), modified_key: keyboard::Key::Named(keyboard::key::Named::ArrowDown), physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: None, repeat: false };
+        drop(app.palette_key_event(&down));
+        assert_eq!(app.palette_selection_index(&app.palette_entries()), Some(0), "an explicit navigation event chooses the next live result");
     }
 
     #[test]

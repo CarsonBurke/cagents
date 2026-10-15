@@ -9247,8 +9247,8 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
 /// A paged document: the page, and the controls for moving through it.
 ///
 /// The page counter is a label rather than a field because a reader turning
-/// pages wants the next one, not a number entry; `Home` and `End` reach the
-/// ends in one press through the first and last controls.
+/// pages wants the next one, not a number entry. Each page/zoom control is
+/// also a configurable command, with its current binding shown in the tooltip.
 #[allow(clippy::too_many_arguments)]
 fn pdf_document_view<'a>(
     card: CardId,
