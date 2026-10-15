@@ -21,6 +21,7 @@ use std::{
 mod authority;
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod creation_authority;
+mod branch_transaction;
 mod browse_reveal;
 mod ignore_path;
 pub use browse_reveal::include as include_revealed_path;

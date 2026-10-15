@@ -368,6 +368,12 @@ impl VerifiedCreatedRoot {
         Ok((admin, checkout))
     }
 
+    pub(super) fn transaction_roots(&self) -> Result<Vec<fs_safety::Root>, RepositoryError> {
+        self.validate()?;
+        let (checkout, admin, _) = self.authority.retained_roots()?;
+        Ok(vec![self.owned.parent.try_clone().map_err(filesystem)?, checkout, admin])
+    }
+
     pub(super) fn admin_path(&self) -> &Path { &self.admin.path }
 }
 
