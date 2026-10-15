@@ -1870,8 +1870,8 @@ impl HostState {
         client: ClientId,
         windows: &[crate::instance::VerifiedWindow],
     ) -> Result<(), String> {
-        if !self.native_actor_startups.is_empty() {
-            return Err("Unconfirmed native helper startup ownership has not settled".into());
+        if !self.native_actor_startups.is_empty() || !self.local_chat_retirements.is_empty() {
+            return Err("Unconfirmed startup or original Local durable retirement ownership has not settled".into());
         }
         let verified = |id: &ClientId| {
             self.client_pids
@@ -1973,6 +1973,7 @@ impl HostState {
             return Err(ShutdownOutcome::AlreadyShuttingDown);
         }
         if !self.native_actor_startups.is_empty()
+            || !self.local_chat_retirements.is_empty()
             || crate::daemon::child_reaper::has_retained_ownership()
         {
             return Err(ShutdownOutcome::OwnershipUncertain);
@@ -2036,6 +2037,7 @@ impl HostState {
             return Err("Daemon is already shutting down".into());
         }
         if !self.native_actor_startups.is_empty()
+            || !self.local_chat_retirements.is_empty()
             || crate::daemon::child_reaper::has_retained_ownership()
         {
             return Err("Original helper cleanup is still owned outside the session inventory; wait for exact cleanup or resolve retained ownership before upgrading".into());
@@ -2083,6 +2085,7 @@ impl HostState {
         // startup publishes that fence before releasing its host reservation.
         if !self.shutting_down
             && (!self.native_actor_startups.is_empty()
+                || !self.local_chat_retirements.is_empty()
                 || crate::daemon::child_reaper::has_retained_ownership())
         {
             return ShutdownOutcome::OwnershipUncertain;

@@ -81,6 +81,8 @@ impl Fixture {
         let pending=self.pending();assert!(pending.sealed());assert!(pending.snapshot().is_some());
         assert!(matches_owner(&self.host.lock().unwrap(),&pending));
         assert!(!self.registry.lock().unwrap().agent(self.agent).unwrap().closed);
+        assert!(matches!(self.host.lock().unwrap().shutdown_preflight(Instant::now()),
+            Err(crate::terminal_ipc::ShutdownOutcome::OwnershipUncertain)));
     }
     fn allow_commit(&self){self.fault.execute_batch("DROP TRIGGER fail_local_retirement").unwrap();}
     fn assert_retired(&self){
