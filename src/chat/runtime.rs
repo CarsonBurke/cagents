@@ -5265,7 +5265,7 @@ mod tests {
                         id: "a".into(), role: Role::Assistant, started_at: None, at: None,
                         content: ItemContent::Text { text: "First answer".into(), thinking: false, phase: Phase::Final },
                     }), Event::TurnSettled, Event::TurnFinished { key: Some("a".into()), outcome: crate::notifications::Kind::Succeeded }],
-                    2 => vec![Event::TurnStarted],
+                    2 => vec![Event::TurnStarted, Event::Status { busy: true, detail: "Turn B".into() }],
                     3 => vec![Event::TextDelta { id: "b".into(), role: Role::Assistant, thinking: false, delta: "Second answer".into() }],
                     4 => vec![Event::TurnSettled, Event::TurnFinished { key: Some("b".into()), outcome: crate::notifications::Kind::Succeeded }],
                     5 => vec![Event::Reset { reason: "Exact preview reset".into() }],
