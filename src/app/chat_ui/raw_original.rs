@@ -334,12 +334,14 @@ mod tests {
         let mut duplicate=view.clone();duplicate.calls.push((text.clone(),proof.clone()));assert!(state.restore(duplicate).is_err());
         let mut wrong=view.clone();wrong.calls[0].1.epoch.incarnation=uuid::Uuid::from_u128(100);assert!(state.restore(wrong).is_err());
         let mut unadmitted=view.clone();unadmitted.calls[0].0=Arc::from(text.as_ref());assert!(state.restore(unadmitted).is_err());
-        assert_eq!(state.capture().calls[0].1,proof);let weak=Arc::downgrade(&text);drop(text);drop(view);state.clear();
-        // Wait for the real retirement queue, rather than guessing completion
-        // from a timer or merely checking a metadata counter.
-        struct Done(std::sync::mpsc::Sender<()>);impl Drop for Done {fn drop(&mut self) {let _=self.0.send(());}}
-        let (done,finished)=std::sync::mpsc::channel();retire(Done(done));finished.recv_timeout(Duration::from_secs(5)).unwrap();
-        assert!(weak.upgrade().is_none());
+        assert_eq!(state.capture().calls[0].1,proof);let weak=Arc::downgrade(&text);drop(text);drop(view);
+        struct Hold(std::sync::mpsc::Sender<()>,Arc<std::sync::Barrier>);
+        impl Drop for Hold {fn drop(&mut self) {let _=self.0.send(());self.1.wait();}}
+        let(start,started)=std::sync::mpsc::channel();let release=Arc::new(std::sync::Barrier::new(2));retire(Hold(start,release.clone()));
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        state.toggle(&part.item_id,part.field);
+        assert!(weak.upgrade().is_some(),"collapse hands the last restored body to the blocked background reclaimer");
+        release.wait();flush();assert!(weak.upgrade().is_none());
     }
     fn runtime_fixture(text:&str)->(Runtime,RawSourcePart) {
         let part=part(text);let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
