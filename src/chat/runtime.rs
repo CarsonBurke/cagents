@@ -759,12 +759,7 @@ impl LocalHandle {
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
-                    if !actor.attention.settled && !preserve_holder {
-                        (actor.notify)(Update::Attention(crate::notifications::Evidence {
-                            key: actor.attention.key.clone(),
-                            kind: crate::notifications::Kind::Failed,
-                        }));
-                    }
+                    let publish_failure = !actor.attention.settled && !preserve_holder;
                     if direct_closed { *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone()); }
                     let stderr = native_diagnostic.as_ref().map(|diagnostic| diagnostic.stderr.clone())
                         .unwrap_or_else(|| String::from_utf8_lossy(&actor.stderr.make_contiguous()).into_owned());
@@ -777,6 +772,12 @@ impl LocalHandle {
                         fatal: true,
                     });
                     actor.apply(Event::ProviderExit(diagnostic));
+                    if publish_failure {
+                        actor.publish_current_attention(crate::notifications::Evidence {
+                            key: actor.attention.key.clone(),
+                            kind: crate::notifications::Kind::Failed,
+                        });
+                    }
                 }
                 let code = status.and_then(|status| status.code());
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
