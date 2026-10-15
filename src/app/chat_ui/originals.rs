@@ -258,6 +258,13 @@ impl Runtime {
     pub(super) fn revoke_source_originals(&mut self) {
         self.revoke_originals();
     }
+    /// First attachment of an intentionally prepared branch is not a Reset.
+    /// Ready resets the recovery source lineage before attaching its new actor.
+    pub(super) fn revoke_changed_source_originals(&mut self, incarnation: Option<uuid::Uuid>) {
+        if self.recovery.source_changed(incarnation) {
+            self.revoke_source_originals();
+        }
+    }
     fn revoke_originals(&mut self) {
         self.recovery.originals.clear();
         self.recovery.plain_copy.clear();
@@ -1345,6 +1352,30 @@ mod tests {
         runtime.forget_transcript();
         assert!(weak.upgrade().is_some());
         assert_eq!(runtime.recovery.prepared_prompt.as_ref().unwrap().text, "prepared new intent");
+    }
+
+    #[test]
+    fn source_rotation_revokes_observed_history_but_preserves_new_actor_branch_intent() {
+        let mut runtime = runtime();
+        runtime.recovery.submitting(&runtime.snapshot, &Command::Prompt {
+            text: "explicitly prepared branch".into(), attachments: vec![], mode: PromptMode::Send,
+        });
+        let mut prepared = runtime.recovery.submitted.take().unwrap();
+        prepared.origin_backend = true;
+        runtime.recovery.prepared_prompt = Some(Arc::new(prepared));
+        let weak = Arc::downgrade(runtime.recovery.prepared_prompt.as_ref().unwrap());
+        runtime.recovery.connection_replaced();
+        let first = Some(uuid::Uuid::from_u128(1));
+        runtime.revoke_changed_source_originals(first);
+        assert!(weak.upgrade().is_some(), "new actor first attachment preserves intentional branch input");
+        let mut observed = (*runtime.snapshot).clone();observed.source_incarnation = first;
+        runtime.recovery.observe(&observed);
+        runtime.revoke_changed_source_originals(first);
+        assert!(weak.upgrade().is_some(), "unchanged observed source is not revocation");
+        runtime.replace_draft(text_editor::Content::with_text("independent draft"));
+        runtime.revoke_changed_source_originals(Some(uuid::Uuid::from_u128(2)));
+        assert!(weak.upgrade().is_none(), "actual known source rotation retires recovered history");
+        assert_eq!(runtime.composer.text(), "independent draft");
     }
 
     #[test]

@@ -142,13 +142,14 @@ impl State {
         });
     }
 
+    pub(super) fn source_changed(&self, incarnation: Option<uuid::Uuid>) -> bool {
+        self.source_incarnation.is_some() && self.source_incarnation != incarnation
+    }
     pub fn observe(&mut self, snapshot: &Snapshot) {
         // A known source lifetime changing inside one connection proves that
         // old read/replay eligibility ended, even if Session was coalesced.
         // First attachment (None→Some) alone is not evidence of a reset.
-        if self.source_incarnation.is_some()
-            && self.source_incarnation != snapshot.source_incarnation
-        {
+        if self.source_changed(snapshot.source_incarnation) {
             self.originals.clear();
             self.plain_copy.clear();
             self.submitted = None;
