@@ -147,3 +147,52 @@ fn combined_close_retained_lifecycle_final_verification_failure_keeps_exact_owne
     assert!(matches!(f.close_session().unwrap(),crate::terminal_ipc::ServerResponse::ChatClosed {..}));
     f.assert_closed();
 }
+
+#[test]
+fn combined_close_retained_lifecycle_attempted_return_stays_unknown_until_exact_retry() {
+    if owning_close_isolated("combined_close_retained_lifecycle_attempted_return_stays_unknown_until_exact_retry").is_some() {return;}
+    let f = BoundCloseFixture::start();
+    super::super::chat::process(&f.host, 1, crate::terminal_ipc::ClientRequest::ChatAttach {
+        session:f.binding.source.clone()}).unwrap();
+    f.host.lock().unwrap().native_sources.lose_next_return_start_reply_for_test();
+    let mut saved_attempt = None;
+    crate::terminal::TerminalHandle::with_blocked_holder_cleanup_for_test(|| {
+        let error = super::super::chat::process(&f.host, 1, crate::terminal_ipc::ClientRequest::ChatReturnTerminal {
+            chat_id:f.binding.source.id, expected:f.binding.clone()}).unwrap_err();
+        assert!(error.message.contains("exited before startup completed"),"{error:?}");
+        let attempt = f.host.lock().unwrap().native_sources.return_attempt_for_test(f.binding.source.id)
+            .expect("real attempted target, not an assigned phase");
+        assert_eq!(attempt.disposition(),crate::terminal::TerminalStartDisposition::Unknown);
+        let holder = attempt.holder_record().expect("actual exact returned worker holder");
+        assert_eq!(holder.terminal,attempt.terminal_id());
+        let phase = f.phase().expect("original pending phase retained");
+        assert!(phase.0.is_some() && phase.1);
+        let error = f.close_session().unwrap_err();
+        assert!(error.message.contains("attempted or paired terminal ownership"),"{error:?}");
+        assert_eq!(f.phase(),Some(phase));
+        assert_eq!(attempt.disposition(),crate::terminal::TerminalStartDisposition::Unknown);
+        assert!(f.host.lock().unwrap().chats[&f.binding.source.id].handle.same_actor(&f.handle));
+        saved_attempt=Some(attempt);
+    });
+    // Cleanup/retry must reconcile the actual attempt's positive family proof,
+    // never dispose Unknown from the close refusal or a missing record.
+    let attempt=saved_attempt.unwrap();
+    let deadline=Instant::now()+Duration::from_secs(5);
+    loop {
+        if attempt.retry_cleanup()==crate::terminal::TerminalStartDisposition::FamilySettled {break;}
+        assert!(Instant::now()<deadline,"original attempted worker cleanup stayed unconfirmed");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let response=super::super::chat::process(&f.host,1,crate::terminal_ipc::ClientRequest::ChatReturnTerminal {
+        chat_id:f.binding.source.id, expected:f.binding.clone()}).unwrap();
+    let crate::terminal_ipc::ServerResponse::ChatTerminal {receipt,..}=response else {panic!("exact return receipt required");};
+    let returned=f.host.lock().unwrap().terminals[&receipt.terminal.session.id].handle.clone();
+    struct CloseReturned(crate::terminal::TerminalHandle);
+    impl Drop for CloseReturned {fn drop(&mut self) {let _=self.0.shutdown();}}
+    let _returned_cleanup=CloseReturned(returned.clone());
+    assert_eq!(receipt.terminal.session.id,attempt.terminal_id());
+    assert_ne!(Some(receipt.terminal.execution_instance),attempt.worker_instance());
+    assert!(f.phase().is_none());
+    f.host.lock().unwrap().validate_terminal_handoff_receipt(&receipt).unwrap();
+    returned.shutdown().unwrap();
+}
