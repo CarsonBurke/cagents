@@ -2405,7 +2405,7 @@ mod tests {
             assert_eq!(app.workspace.focused(), Some(card));
             assert_eq!(app.durable.cards.len(), cards);
             assert_eq!(app.settings_category, settings_category);
-            assert!(app.status.as_ref().unwrap().message.contains("unavailable"));
+            assert!(app.notices.recent().any(|entry| entry.notice.message.contains("unavailable")));
         }
         for command in [Command::CopyPath, Command::ToggleTheme, Command::FocusProjectSearch, Command::FindInPane] {
             assert!(app.command_available(command), "non-navigating {command:?}");

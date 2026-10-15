@@ -820,6 +820,7 @@ impl Default for SidebarEditors {
         EMPTY.clone()
     }
 }
+#[cfg(test)]
 fn default_sidebar_editors() -> &'static SidebarEditors {
     static EMPTY: LazyLock<SidebarEditors> = LazyLock::new(Default::default);
     &EMPTY
