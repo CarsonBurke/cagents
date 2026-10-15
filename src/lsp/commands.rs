@@ -100,7 +100,7 @@ impl SessionCommand {
             Self::Change {
                 full, incremental, ..
             } => {
-                full.len()
+                full.byte_len()
                     + incremental.as_ref().map_or(0, |changes| {
                         changes
                             .iter()
@@ -257,7 +257,7 @@ mod tests {
                 range_length: None,
                 text: "x".into(),
             }]),
-            full: text,
+            full: Arc::new(Snapshot::new(version,text)),
         }
     }
 

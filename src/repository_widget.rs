@@ -289,6 +289,20 @@ pub struct AsyncIdentity {
 /// The runtime records these; the application drains them with
 /// [`RepositoryRuntime::take_lsp_intents`] and performs them, because the
 /// runtime owns no [`crate::lsp::LspManager`] and does no I/O.
+/// Deferred text for a protocol change. Ordinary edits retain only an
+/// immutable root; full serialization belongs to the session debounce.
+#[derive(Debug, Clone)]
+pub enum LspChangeText { Text(String), Snapshot(text_editor::TextSnapshot) }
+impl From<String> for LspChangeText { fn from(text:String)->Self {Self::Text(text)} }
+impl From<&str> for LspChangeText { fn from(text:&str)->Self {Self::Text(text.into())} }
+impl PartialEq for LspChangeText {
+    fn eq(&self, other:&Self)->bool {match (self,other) {
+        (Self::Text(left),Self::Text(right)) => left == right,
+        (Self::Snapshot(left),Self::Snapshot(right)) => left.same_text(right),
+        (Self::Snapshot(source),Self::Text(text)) | (Self::Text(text),Self::Snapshot(source)) => source.text().as_ref() == text,
+    }}
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum LspIntent {
     /// The buffer became the card's open document. `absolute_path` is
@@ -300,15 +314,9 @@ pub enum LspIntent {
         version: i32,
         text: String,
     },
-    /// The buffer changed. `text` is the whole document, because
-    /// [`text_editor::Action`] and [`text_editor::Edit`] carry no ranges: the
-    /// widget reports *what* was pressed, never *where* the resulting text
-    /// differs. Incremental synchronisation is therefore unavailable by
-    /// construction, not by omission, and the application must call
-    /// [`crate::lsp::LspManager::change`] with an empty edit slice so the
-    /// manager sends the full document rather than trying to reconcile edits
-    /// it was never given.
-    Change { version: i32, text: String },
+    /// The buffer changed. Exact ranges accompany an immutable text root;
+    /// only full/inexact synchronization materializes that root on a worker.
+    Change { version: i32, text: LspChangeText },
     /// The buffer reached disk. `text` is what was written.
     Save { text: String },
     /// The buffer is gone: another file was opened over it, or the card
@@ -3607,7 +3615,7 @@ impl RepositoryRuntime {
                 }));
             self.lsp_intents.push(LspIntent::Change {
                 version,
-                text: updated,
+                text: LspChangeText::Snapshot(document.content.text_snapshot()),
             });
         }
         // The one buffer mutation that does not pass through
@@ -4046,7 +4054,7 @@ impl RepositoryRuntime {
             self.lsp_edits_exact = true;
             return;
         };
-        let text = document.content.text();
+        let text = LspChangeText::Snapshot(document.content.text_snapshot());
         self.lsp_intents.push(LspIntent::Change { version, text });
     }
 

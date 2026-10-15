@@ -10279,7 +10279,10 @@ impl Cagents {
                     // against the old text is dropped in the same breath: a
                     // completion range or a hover span that predates a
                     // keystroke describes characters the buffer no longer has.
-                    self.lsp.change(doc, version, &edits, &text);
+                    match text {
+                        repository_widget::LspChangeText::Text(text) => self.lsp.change(doc,version,&edits,&text),
+                        repository_widget::LspChangeText::Snapshot(source) => self.lsp.change_snapshot(doc,version,&edits,source),
+                    }
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
                         crate::lsp::shift_diagnostics(&mut state.context.diagnostics, &edits);

@@ -42,7 +42,8 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
+use crate::repository_widget::text_editor::{TextSnapshot,Position as NativePosition};
 use std::task::Poll;
 use std::time::Duration;
 
@@ -497,54 +498,66 @@ pub enum LspError {
 #[derive(Debug)]
 struct Snapshot {
     version: i32,
-    text: Arc<str>,
-    /// Byte offset of the first byte of each line. Never empty.
-    line_starts: Vec<u32>,
+    text: OnceLock<Arc<str>>,
+    native: Option<TextSnapshot>,
+    /// Populated on demand for non-native or incompatible line topology.
+    line_starts: OnceLock<Vec<u32>>,
 }
 
 impl Snapshot {
     fn new(version: i32, text: Arc<str>) -> Self {
-        let mut line_starts = Vec::with_capacity(1 + text.len() / 32);
-        line_starts.push(0);
-        for (index, byte) in text.as_bytes().iter().enumerate() {
-            if *byte == b'\n' {
-                // Editable files are capped far below `u32::MAX` bytes by the
-                // repository widget, so this conversion never saturates in
-                // practice.
-                line_starts.push(u32::try_from(index + 1).unwrap_or(u32::MAX));
+        let result = Self {version,text:OnceLock::from(text),native:None,line_starts:OnceLock::new()};
+        result.protocol_lines();
+        result
+    }
+
+    fn from_native(version: i32, native: TextSnapshot) -> Self {
+        Self {version,text:OnceLock::new(),native:Some(native),line_starts:OnceLock::new()}
+    }
+
+    fn full_text(&self) -> &Arc<str> {
+        self.text.get_or_init(|| self.native.as_ref().expect("lazy snapshot has native source").text())
+    }
+
+    fn byte_len(&self) -> usize {
+        self.native.as_ref().map_or_else(|| self.full_text().len(), TextSnapshot::len)
+    }
+
+    fn compatible_native(&self) -> Option<&TextSnapshot> {
+        self.native.as_ref().filter(|source| source.protocol_compatible_lines())
+    }
+
+    fn protocol_lines(&self) -> &[u32] {
+        self.line_starts.get_or_init(|| {
+            let mut lines = vec![0];
+            for (index,byte) in self.full_text().bytes().enumerate() {
+                if byte == b'\n' {lines.push(u32::try_from(index+1).unwrap_or(u32::MAX));}
             }
-        }
-        Self {
-            version,
-            text,
-            line_starts,
-        }
+            lines
+        })
     }
 
     fn line_count(&self) -> u32 {
-        u32::try_from(self.line_starts.len()).unwrap_or(u32::MAX)
+        u32::try_from(self.compatible_native().map_or_else(||self.protocol_lines().len(),TextSnapshot::line_count)).unwrap_or(u32::MAX)
     }
 
-    /// Byte range of the line's content, excluding its terminator. `\r\n` is
-    /// one terminator, so the `\r` is not part of the content.
     fn line_span(&self, line: u32) -> Option<Range<usize>> {
-        let start = *self.line_starts.get(line as usize)? as usize;
-        let end = match self.line_starts.get(line as usize + 1) {
-            // Exclude the '\n' that begins the next line.
-            Some(next) => *next as usize - 1,
-            None => self.text.len(),
-        };
-        let end = if end > start && self.text.as_bytes().get(end - 1) == Some(&b'\r') {
-            end - 1
-        } else {
-            end
-        };
+        if let Some(source) = self.compatible_native() {
+            let line = usize::try_from(line).ok()?;
+            let start = source.byte_offset(NativePosition {line,column:0})?;
+            return Some(start..start+source.line(line)?.text.len());
+        }
+        let lines = self.protocol_lines();
+        let start = *lines.get(line as usize)? as usize;
+        let end = lines.get(line as usize+1).map_or(self.byte_len(),|next| *next as usize-1);
+        let end = if end > start && self.full_text().as_bytes().get(end-1) == Some(&b'\r') {end-1} else {end};
         Some(start..end)
     }
 
-    fn line_content(&self, line: u32) -> Option<&str> {
+    fn line_content(&self, line: u32) -> Option<std::borrow::Cow<'_,str>> {
+        if let Some(source) = self.compatible_native() {return Some(source.line(usize::try_from(line).ok()?)?.text);}
         let span = self.line_span(line)?;
-        Some(&self.text[span])
+        Some(std::borrow::Cow::Borrowed(&self.full_text()[span]))
     }
 
     fn out_of_range(&self, line: u32, character: u32) -> LspError {
@@ -632,7 +645,7 @@ impl Snapshot {
         let span = self
             .line_span(position.line)
             .ok_or_else(|| self.out_of_range(position.line, position.character))?;
-        let content = &self.text[span.clone()];
+        let content = self.line_content(position.line).ok_or_else(|| self.out_of_range(position.line,position.character))?;
         let mut scalars = 0u32;
         for (offset, _) in content.char_indices() {
             if scalars == position.character {
@@ -701,7 +714,7 @@ fn build_incremental(
 ) -> Result<Vec<lsp_types::TextDocumentContentChangeEvent>, LspError> {
     let Some((last, leading)) = edits.split_last() else {
         // No edits describe no transition, so the buffer must not have moved.
-        return if *base.text == *expected {
+        return if **base.full_text() == *expected {
             Ok(Vec::new())
         } else {
             Err(LspError::InconsistentEdits)
@@ -712,18 +725,44 @@ fn build_incremental(
     for edit in leading {
         let working = intermediate.as_ref().unwrap_or(base);
         let (start, end) = measure_edit(working, edit, &mut changes)?;
-        let mut next = String::with_capacity(working.text.len() + edit.new_text.len());
-        next.push_str(&working.text[..start]);
+        let mut next = String::with_capacity(working.full_text().len() + edit.new_text.len());
+        next.push_str(&working.full_text()[..start]);
         next.push_str(&edit.new_text);
-        next.push_str(&working.text[end..]);
+        next.push_str(&working.full_text()[end..]);
         intermediate = Some(Snapshot::new(base.version, Arc::from(next)));
     }
     let working = intermediate.as_ref().unwrap_or(base);
     let (start, end) = measure_edit(working, last, &mut changes)?;
-    if !splices_into(&working.text, start..end, &last.new_text, expected) {
+    if !splices_into(working.full_text(), start..end, &last.new_text, expected) {
         return Err(LspError::InconsistentEdits);
     }
     Ok(changes)
+}
+
+/// Convert only affected source lines. Unusual native line topology or a
+/// legacy source without persistent intermediate lines uses the lazy full
+/// fallback, leaving serialization at the existing debounce boundary.
+fn native_incremental(base:&Snapshot, edits:&[LspTextEdit])->Option<Vec<lsp_types::TextDocumentContentChangeEvent>> {
+    if edits.is_empty() {return None;}
+    let mut changes = Vec::with_capacity(edits.len());
+    let mut intermediate = None;
+    for (index,edit) in edits.iter().enumerate() {
+        let working = intermediate.as_ref().unwrap_or(base);
+        changes.push(lsp_types::TextDocumentContentChangeEvent {range:Some(working.range_to_utf16(edit.range).ok()?),range_length:None,text:edit.new_text.clone()});
+        if index+1 < edits.len() {
+            let source = working.compatible_native()?;
+            let native_position = |at:LspPosition| -> Option<NativePosition> {
+                let line = usize::try_from(at.line).ok()?;
+                let content = source.line(line)?;
+                let scalar = usize::try_from(at.character).ok()?;
+                let column = if scalar == content.text.chars().count() {content.text.len()} else {content.text.char_indices().nth(scalar)?.0};
+                Some(NativePosition {line,column})
+            };
+            let next = source.replaced(native_position(edit.range.start)?,native_position(edit.range.end)?,&edit.new_text)?;
+            intermediate = Some(Snapshot::from_native(base.version,next));
+        }
+    }
+    Some(changes)
 }
 
 /// Records `edit` as a protocol content change measured against `working`,
@@ -876,6 +915,16 @@ impl SnapshotStore {
         let snapshot = Arc::new(Snapshot::new(version, text));
         state.push(Arc::clone(&snapshot));
         RecordOutcome::Recorded { previous, snapshot }
+    }
+
+    fn record_native(&self, uri: &Arc<Url>, requested_version: i32, source: TextSnapshot) -> RecordOutcome {
+        let mut inner = self.lock();
+        let Some(state) = inner.uris.get_mut(uri) else {return RecordOutcome::UnknownUri;};
+        let previous = state.latest();
+        let Some(version) = next_version(previous.version,requested_version) else {return RecordOutcome::VersionExhausted;};
+        let snapshot = Arc::new(Snapshot::from_native(version,source));
+        state.push(Arc::clone(&snapshot));
+        RecordOutcome::Recorded {previous,snapshot}
     }
 
     fn latest(&self, uri: &Url) -> Option<Arc<Snapshot>> {
@@ -1847,7 +1896,7 @@ enum SessionCommand {
         /// `None` when the manager could not build incremental changes, in
         /// which case the whole document is resent.
         incremental: Option<Vec<lsp_types::TextDocumentContentChangeEvent>>,
-        full: Arc<str>,
+        full: Arc<Snapshot>,
     },
     Save {
         uri: Arc<Url>,
@@ -1867,7 +1916,7 @@ enum SessionCommand {
 struct PendingChange {
     version: i32,
     incremental: Option<Vec<lsp_types::TextDocumentContentChangeEvent>>,
-    full: Arc<str>,
+    full: Arc<Snapshot>,
     /// When this URI's coalesced edits are due. Per URI, so a file being
     /// typed into cannot postpone another file's pending notification.
     due: tokio::time::Instant,
@@ -2547,7 +2596,7 @@ impl SessionState {
                         PendingChange {
                             version,
                             incremental: None,
-                            full: text,
+                            full: Arc::new(Snapshot::new(version,text)),
                             due: tokio::time::Instant::now(),
                         },
                     );
@@ -2842,7 +2891,7 @@ impl SessionState {
         let full_content = || lsp_types::TextDocumentContentChangeEvent {
             range: None,
             range_length: None,
-            text: change.full.to_string(),
+            text: change.full.full_text().to_string(),
         };
         let content_changes = match self.sync.change {
             SyncKind::None => return,
@@ -3636,7 +3685,7 @@ impl LspManager {
             uri: Arc::clone(&uri),
             language_id: language.language_id.clone(),
             version: snapshot.version,
-            text: Arc::clone(&snapshot.text),
+            text: Arc::clone(snapshot.full_text()),
         });
         self.documents.insert(
             doc,
@@ -3687,7 +3736,7 @@ impl LspManager {
             };
         let mut incremental = None;
         if !edits.is_empty() {
-            match build_incremental(&previous, edits, &snapshot.text) {
+            match build_incremental(&previous, edits, snapshot.full_text()) {
                 Ok(changes) => incremental = Some(changes),
                 Err(error) => {
                     // The buffer is authoritative and already recorded; the
@@ -3705,8 +3754,25 @@ impl LspManager {
                 uri: Arc::clone(&reference.uri),
                 version: snapshot.version,
                 incremental,
-                full: Arc::clone(&snapshot.text),
+                full: Arc::clone(&snapshot),
             });
+        }
+    }
+
+    /// Records a transition produced by the native recorded-edit layer.
+    /// Its immutable source remains lazy for incremental synchronization.
+    pub fn change_snapshot(&mut self, doc:LspDocumentId, version:i32, edits:&[LspTextEdit], source:TextSnapshot) {
+        let Some(reference) = self.documents.get(&doc).cloned() else {return;};
+        let (previous,snapshot) = match self.snapshots.record_native(&reference.uri,version,source) {
+            RecordOutcome::Recorded {previous,snapshot} => (previous,snapshot),
+            RecordOutcome::UnknownUri => return,
+            RecordOutcome::VersionExhausted => {
+                self.events.emit_now(LspEvent::DocumentDesynced {doc,version:i32::MAX,error:LspError::VersionExhausted});return;
+            }
+        };
+        let incremental = if snapshot.compatible_native().is_some() { native_incremental(&previous,edits) } else {None};
+        if let Some(session) = self.sessions.get(&reference.session) {
+            let _ = session.commands.send(SessionCommand::Change {uri:Arc::clone(&reference.uri),version:snapshot.version,incremental,full:snapshot});
         }
     }
 
@@ -4103,7 +4169,7 @@ impl LspManager {
                 candidate,
                 document,
                 snapshot.version.saturating_add(1),
-                Arc::clone(&snapshot.text),
+                Arc::clone(snapshot.full_text()),
             ));
         }
         for (candidate, ..) in &targets {
@@ -4572,7 +4638,7 @@ mod tests {
                     manager.change(doc, version, &[], &latest);
                 }
                 old_versions.push(Arc::downgrade(
-                    &manager.snapshots.latest(&reference.uri).unwrap().text,
+                    manager.snapshots.latest(&reference.uri).unwrap().full_text(),
                 ));
             }
             assert!(
@@ -4850,9 +4916,9 @@ mod tests {
     #[test]
     fn a_crlf_terminator_is_not_part_of_its_line() {
         let snapshot = Snapshot::new(1, Arc::from("ab\r\ncd\r\n"));
-        assert_eq!(snapshot.line_content(0), Some("ab"));
-        assert_eq!(snapshot.line_content(1), Some("cd"));
-        assert_eq!(snapshot.line_content(2), Some(""));
+        assert_eq!(snapshot.line_content(0), Some(std::borrow::Cow::Borrowed("ab")));
+        assert_eq!(snapshot.line_content(1), Some(std::borrow::Cow::Borrowed("cd")));
+        assert_eq!(snapshot.line_content(2), Some(std::borrow::Cow::Borrowed("")));
         assert_eq!(
             snapshot.to_utf16(LspPosition::new(0, 2)).expect("line end"),
             lsp_types::Position::new(0, 2)
@@ -5319,6 +5385,72 @@ mod tests {
             assert_eq!(changes[0]["text"], json!("resynchronised\n"));
             manager.shutdown();
         });
+    }
+
+    fn native_source(text:&str)->TextSnapshot {
+        crate::repository_widget::text_editor::Content::<cosmic::Renderer>::with_text(text).text_snapshot()
+    }
+
+    #[test]
+    fn native_incremental_typing_never_materializes_full_text() {
+        block_on(async {
+            let (_root,worktree,file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager,incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();let doc = LspDocumentId(1);
+            manager.open(doc,&file,&worktree,rust_language(),1,"a😀\nnext\n");
+            await_ready(&events,doc).await;
+            let source = native_source("a😀x\nnext\n");
+            let edit = LspTextEdit {range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,2)),new_text:"x".into()};
+            manager.change_snapshot(doc,2,&[edit],source.clone());
+            assert!(!source.is_materialized());
+            let fake = handle_of(&slot).await;
+            let change = fake.wait_for("textDocument/didChange").await;
+            assert_eq!(change.params["contentChanges"][0]["range"]["start"]["character"],3);
+            assert_eq!(change.params["contentChanges"][0]["text"],"x");
+            assert!(!source.is_materialized());
+            let next = native_source("a😀x\nzero\nnext\n");
+            manager.change_snapshot(doc,3,&[LspTextEdit {range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,0)),new_text:"zero\n".into()}],next.clone());
+            let changes = fake.wait_for_count("textDocument/didChange",2).await;
+            assert_eq!(changes[1].params["contentChanges"][0]["text"],"zero\n");
+            assert!(!source.is_materialized());assert!(!next.is_materialized());
+            manager.shutdown(); manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn native_full_sync_materializes_only_the_latest_debounced_source() {
+        block_on(async {
+            let (_root,worktree,file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager,full_sync_capabilities(), |_| Vec::new());
+            let events = manager.events();let doc = LspDocumentId(1);
+            manager.open(doc,&file,&worktree,rust_language(),1,"a");await_ready(&events,doc).await;
+            let mut sources = Vec::new();
+            for version in 2..8 {
+                let source = native_source(&"a".repeat(version as usize));
+                manager.change_snapshot(doc,version,&[],source.clone());
+                assert!(!source.is_materialized());sources.push(source);
+            }
+            let fake = handle_of(&slot).await;
+            let change = fake.wait_for("textDocument/didChange").await;
+            assert_eq!(change.params["contentChanges"][0]["text"],"aaaaaaa");
+            assert_eq!(fake.entries("textDocument/didChange").len(),1);
+            assert!(sources.last().unwrap().is_materialized());
+            assert!(sources[..sources.len()-1].iter().all(|source| !source.is_materialized()));
+            manager.shutdown(); manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn native_group_ranges_use_persistent_intermediate_lines() {
+        let base = Snapshot::from_native(1,native_source("a😀\nlast"));
+        let changes = native_incremental(&base,&[
+            LspTextEdit {range:LspRange::new(LspPosition::new(0,0),LspPosition::new(0,0)),new_text:"first\n".into()},
+            LspTextEdit {range:LspRange::new(LspPosition::new(1,2),LspPosition::new(1,2)),new_text:"x".into()},
+        ]).unwrap();
+        assert_eq!(changes[1].range.unwrap().start,lsp_types::Position::new(1,3));
+        assert!(!base.native.unwrap().is_materialized());
     }
 
     #[test]
@@ -5909,7 +6041,7 @@ mod tests {
                     .snapshots
                     .latest(&uri)
                     .expect("the snapshot survives the crash")
-                    .text,
+                    .full_text().as_ref(),
                 "abcd\n"
             );
 
@@ -6157,7 +6289,7 @@ mod tests {
                     .snapshots
                     .latest(&Url::from_file_path(&file).expect("uri"))
                     .expect("snapshot")
-                    .text,
+                    .full_text().as_ref(),
                 "abcd\n",
                 "editing continues without a server"
             );
