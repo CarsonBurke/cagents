@@ -1094,6 +1094,16 @@ impl Cagents {
     }
 
     fn attach_shared_pane(&mut self, pane: &Pane) -> Task<Message> {
+        // Saved terminal outcomes are presentation, never a hydration request.
+        // In particular, RelaunchAvailable retains an explicit restart action.
+        if matches!(&pane.kind, CardKind::Terminal(session) if terminal_ended(session)) {
+            self.cards.insert(pane.id, CardRuntime::Completed);
+            self.lifecycle.remove(pane.id);
+            if let Some(card) = self.card_state_mut(pane.id) {
+                card.residency = Residency::Hibernated;
+            }
+            return Task::none();
+        }
         self.cards.insert(pane.id, CardRuntime::Loading);
         self.lifecycle.register(
             pane.id,

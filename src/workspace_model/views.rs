@@ -146,11 +146,16 @@ impl<'a> ManagedDisplayIndex<'a> {
         pane: &Pane,
     ) -> bool {
         let id = CardId::from_uuid(agent.id.as_uuid());
-        if pane.id != id || !managed_pane_matches(agent, pane) {
+        let matches = |pane: &Pane| {
+            managed_pane_matches(agent, pane)
+                || matches!(&pane.kind, CardKind::Terminal(current)
+                    if ended_managed_terminal_matches(agent, current))
+        };
+        if pane.id != id || !matches(pane) {
             return false;
         }
         match self.owners.get(&id) {
-            Some(Some((_, saved))) => managed_pane_matches(agent, saved),
+            Some(Some((_, saved))) => matches(saved),
             Some(None) => false,
             None => !self.retired.contains(&id),
         }
@@ -215,6 +220,33 @@ fn pane_resource(kind: &CardKind) -> Option<(u8, crate::model::TerminalId)> {
         CardKind::Terminal(session) => Some((1, session.id)),
         _ => None,
     }
+}
+
+/// An observed terminal exit may be displayed without granting live process
+/// authority. Every issued descriptor field except that end state must match.
+fn ended_managed_terminal_matches(
+    agent: &crate::agent_execution::Agent,
+    current: &crate::model::TerminalSession,
+) -> bool {
+    use crate::{agent_execution::HostedSession, model::TerminalContinuity};
+    let ended = match &current.continuity {
+        TerminalContinuity::Exited { .. } => true,
+        TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: Some(_),
+        } => recipe == &current.launch,
+        _ => false,
+    };
+    if !ended {
+        return false;
+    }
+    let matches = |original: &crate::model::TerminalSession| {
+        let mut original = original.clone();
+        original.continuity = current.continuity.clone();
+        original == *current
+    };
+    agent.console.as_ref().is_some_and(matches)
+        || matches!(agent.session.as_ref(), Some(HostedSession::Terminal(original)) if matches(original))
 }
 
 /// An ended automation console is display evidence only: its closed owner may

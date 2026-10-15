@@ -1977,6 +1977,91 @@ mod tests {
     }
 
     #[test]
+    fn observed_managed_terminal_exit_projects_without_live_adoption_or_relaunch() {
+        for relaunch_available in [false, true] {
+            let (mut app, agent, mut pane, destination) = managed_display_fixture();
+            let CardKind::Terminal(session) = &mut pane.kind else {
+                unreachable!()
+            };
+            let exit = crate::model::TerminalExit {
+                code: Some(1),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            };
+            session.continuity = if relaunch_available {
+                TerminalContinuity::RelaunchAvailable {
+                    recipe: session.launch.clone(),
+                    last_exit: Some(exit),
+                }
+            } else {
+                TerminalContinuity::Exited { last_exit: exit }
+            };
+            app.workspace_model.views[1].panes[0] = pane.clone();
+            assert!(
+                crate::workspace_model::views::managed_display(&app.workspace_model, &agent)
+                    .is_none(),
+                "an ended terminal grants no live adoption authority"
+            );
+            let incoming = std::mem::take(&mut app.workspace_model);
+            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            assert!(
+                app.shared_views.blocked.is_empty(),
+                "a normal console exit must not block its channel"
+            );
+            assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+            assert!(matches!(
+                app.cards.get(&pane.id),
+                Some(CardRuntime::Completed)
+            ));
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == destination)
+                    .unwrap()
+                    .cards
+                    .contains(&pane.id)
+            );
+            assert_eq!(app.workspace_model.agents[0], agent);
+        }
+    }
+
+    #[test]
+    fn ended_managed_terminal_cannot_substitute_another_launch_recipe() {
+        for changed in ["launch", "restart"] {
+            let (mut app, _, _, _) = managed_display_fixture();
+            let CardKind::Terminal(session) = &mut app.workspace_model.views[1].panes[0].kind
+            else {
+                unreachable!()
+            };
+            let mut recipe = session.launch.clone();
+            if changed == "launch" {
+                session.launch.working_directory = "/replacement".into();
+                recipe = session.launch.clone();
+            } else {
+                recipe.program = "replacement".into();
+            }
+            session.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: Some(crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                }),
+            };
+            let incoming = std::mem::take(&mut app.workspace_model);
+            drop(app.apply_workspace_model_update(ModelUpdate::Connected(incoming)));
+            assert!(!app.shared_views.blocked.is_empty());
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .all(|channel| channel.cards.is_empty())
+            );
+        }
+    }
+
+    #[test]
     fn attention_model_sync_never_recreates_removed_replaced_or_ambiguous_managed_panes_at_old_target()
      {
         for state in ["removed", "replaced", "ambiguous"] {
