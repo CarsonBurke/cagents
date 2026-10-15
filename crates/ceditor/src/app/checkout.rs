@@ -229,13 +229,14 @@ impl Editor {
             }
             Action::Resolved(id, result) => {
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {
-                    let root_changed = dialog.target.validate().err();
+                    // Scoped resolution validates in its blocking worker;
+                    // Create validates again before effects. UI delivery only
+                    // settles this exact dialog request and cancellation.
                     let cancelled = dialog
                         .cancellation
                         .take()
                         .is_some_and(|token| token.is_cancelled());
-                    if let Some(error) = root_changed { dialog.error = Some(error); }
-                    else if cancelled {
+                    if cancelled {
                         dialog.error = Some("Cancelled before creating a worktree.".into());
                     } else {
                         match result {
