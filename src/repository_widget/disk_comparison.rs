@@ -3,7 +3,7 @@
 use super::*;
 
 #[derive(Clone, PartialEq)]
-struct Key {
+pub(super) struct Key {
     identity: AsyncIdentity,
     revision: u64,
     disk_hash: blake3::Hash,
@@ -29,11 +29,13 @@ impl RepositoryRuntime {
     }
     pub(super) fn dismiss_disk_comparison(&mut self) {
         self.disk_comparison = None;
+        self.disk_comparison_applied = None;
         if let Some(job) = &self.disk_comparison_job { job.cancellation.cancel(); }
     }
     pub(super) fn compare_disk(&mut self, card: CardId) -> Task<RepositoryAction> {
         let Some(key) = self.disk_comparison_key(card) else { return Task::none(); };
         self.source_surface = SourceSurface::Diff;
+        if self.disk_comparison_applied.as_ref() == Some(&key) && matches!(self.disk_comparison, Some(DiffState::Ready { .. })) { return Task::none(); }
         if let Some(job) = &self.disk_comparison_job {
             if job.key != key { job.cancellation.cancel(); }
             // Keep the old slot occupied even if cancellation is slow. Its
@@ -41,6 +43,7 @@ impl RepositoryRuntime {
             self.disk_comparison = Some(DiffState::Loading { request: job.request.as_u128() as u64, cancellation: job.cancellation.clone() });
             return Task::none();
         }
+        self.disk_comparison_applied = None;
         let DocumentState::Editable(document) = &self.document else { unreachable!() };
         let disk = document.external_version.as_ref().expect("key proves external bytes");
         let before: Arc<str> = Arc::from(disk.text.as_str());
@@ -67,10 +70,12 @@ impl RepositoryRuntime {
         let Some(job) = self.disk_comparison_job.as_ref().filter(|job| job.request == request
             && job.key.identity == identity && job.key.revision == revision && job.key.disk_hash == disk_hash) else { return Task::none(); };
         let completed = job.key.clone();
+        let cancelled = job.cancellation.is_cancelled();
         self.disk_comparison_job = None;
         if self.disk_comparison.is_none() { return Task::none(); }
         let Some(current) = self.disk_comparison_key(identity.card) else { self.dismiss_disk_comparison(); return Task::none(); };
-        if current != completed { return self.compare_disk(identity.card); }
+        if cancelled || current != completed { return self.compare_disk(identity.card); }
+        self.disk_comparison_applied = Some(current);
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         self.disk_comparison = Some(DiffState::ready(match model {
             Some(model) => RenderedDiff::Text { model: Arc::new(model), old_label: "Disk".into(), new_label: "Unsaved buffer".into() },

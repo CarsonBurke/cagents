@@ -2430,6 +2430,7 @@ pub struct RepositoryRuntime {
     comparison_metadata: ComparisonMetadataRefresh,
     disk_comparison: Option<DiffState>,
     disk_comparison_job: Option<disk_comparison::Job>,
+    disk_comparison_applied: Option<disk_comparison::Key>,
     keyboard_shortcuts: Arc<crate::settings::KeyboardShortcuts>,
     git_mutation_unavailable_reason: Option<Arc<str>>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
@@ -2696,6 +2697,7 @@ impl RepositoryRuntime {
             comparison_metadata: ComparisonMetadataRefresh::default(),
             disk_comparison: None,
             disk_comparison_job: None,
+            disk_comparison_applied: None,
             keyboard_shortcuts: Arc::new(crate::settings::KeyboardShortcuts::default()),
             git_mutation_unavailable_reason: None,
             generation: 0,
