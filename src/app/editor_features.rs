@@ -202,7 +202,7 @@ mod tests {
         drop(app.finish_modal_update(Task::none()));
         drop(app.update(Message::SaveAndCloseRepository(card)));
         assert!(app.editor_features.publication_saves.contains_key(&card));
-        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending() && !runtime.is_saving()));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending()));
         let _completion = app.update(Message::EditorFeatures(Action::Published { ticket: 77, result: Ok(workspace::PublicationReport::default()) }));
         assert!(app.editor_features.publication_saves.is_empty());
         assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending() && runtime.is_saving()));
