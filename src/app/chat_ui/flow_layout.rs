@@ -1,6 +1,7 @@
 //! Full-context shaping and bounded display projection prototype.
 //!
-//! Active CachedItem owns geometry outside evictable widget Trees. Cold full
+//! Active CachedItem keeps weak geometry descriptors; evicted row owners release
+//! full snapshots while measured heights remain in the virtual column. Cold full
 //! shaping runs on a bounded worker; it remains a measured cost, not a claim of
 //! viewport-only shaping or a fulfilled huge-paragraph performance budget.
 use super::*;
@@ -15,7 +16,7 @@ type ParagraphBuffer = <cosmic::Renderer as iced::advanced::text::Renderer>::Par
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone, Default)]
-pub(super) struct Cache(Rc<RefCell<HashMap<u64, Handle>>>);
+pub(super) struct Cache(Rc<RefCell<HashMap<u64, std::rc::Weak<RefCell<Entry>>>>>);
 pub(super) type Handle = Rc<RefCell<Entry>>;
 
 pub(super) struct Entry {
@@ -44,19 +45,19 @@ struct Key {
 impl Cache {
     pub(super) fn entry(&self, identity: u64, spans: Arc<[Span<'static, String>]>) -> Handle {
         let mut entries = self.0.borrow_mut();
-        if let Some(entry) = entries.get(&identity)
-            && Arc::ptr_eq(&entry.borrow().spans, &spans) { return entry.clone(); }
+        if let Some(entry) = entries.get(&identity).and_then(std::rc::Weak::upgrade)
+            && Arc::ptr_eq(&entry.borrow().spans, &spans) { return entry; }
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let entry = Rc::new(RefCell::new(Entry { id: NEXT.fetch_add(1, Ordering::Relaxed), spans,
             key: None, attempt: 0, requested: false, deferred: None, failed: false, ready: None, cancelled: Arc::new(AtomicBool::new(false)) }));
-        entries.insert(identity, entry.clone());
+        entries.insert(identity, Rc::downgrade(&entry));
         entry
     }
     pub(super) fn find(&self, id: u64) -> Option<Handle> {
-        self.0.borrow().values().find(|entry| entry.borrow().id == id).cloned()
+        self.0.borrow().values().filter_map(std::rc::Weak::upgrade).find(|entry| entry.borrow().id == id)
     }
     pub(super) fn retained_bytes(&self) -> usize {
-        self.0.borrow().values().filter_map(|entry| entry.borrow().ready.clone())
+        self.0.borrow().values().filter_map(std::rc::Weak::upgrade).filter_map(|entry| entry.borrow().ready.clone())
             .map(|prepared| prepared.snapshot.retained_bytes()).sum()
     }
 }
@@ -435,4 +436,40 @@ fn flow_hits_links_and_find_bounds_use_the_original_full_context_source() {
             assert_eq!(bounds.x.to_bits(), glyph.x.min(glyph.x + glyph.w).to_bits());
         }
     }
+}
+
+#[test]
+fn virtual_row_eviction_releases_flow_glyphs_without_hiding_the_chat() {
+    use iced::advanced::{layout, widget::Tree};
+    use std::cell::Cell;
+    let renderer = crate::app::tests::headless_renderer();
+    let cache = Cache::default();
+    let owners = Rc::new(RefCell::new(Vec::new()));
+    let spans: Arc<[Span<'static, String>]> = vec![Span::new("word ".repeat(800))].into();
+    let window = Rc::new(Cell::new(Some(virtualized::Viewport { top: 0.0, height: 200.0, bottom: false })));
+    let rows = (0..200).map(|identity| {
+        let cache = cache.clone(); let owners = owners.clone(); let spans = spans.clone();
+        virtualized::Row::new(identity, 0, 1000.0, None, move || {
+            let flow = cache.entry(identity, spans.clone());
+            flow.borrow_mut().configure(720.0, iced::Pixels(16.0), iced::Font::DEFAULT);
+            let request = flow.borrow_mut().request().unwrap();
+            let ready = Arc::new(Prepared::new(&spans, request.key.size, request.key.font, request.key.width, iced::widget::text::Wrapping::WordOrGlyph));
+            owners.borrow_mut().push(Arc::downgrade(&ready));
+            assert!(flow.borrow_mut().complete(&request, Some(ready)));
+            selectable_prose::flow_text(spans.clone(), iced::Pixels(16.0), iced::Font::DEFAULT,
+                Target { card: CardId::new(), generation: 0 }, None,
+                selectable_prose::Logical { identity, start: 0 }, flow)
+        })
+    }).collect();
+    let mut element = virtualized::column(rows, window.clone());
+    let mut tree = Tree::new(&element);
+    let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(720.0, f32::INFINITY));
+    element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+    let first = owners.borrow().clone();
+    assert!(!first.is_empty());
+    assert!(first.iter().all(|owner| owner.upgrade().is_some()));
+    window.set(Some(virtualized::Viewport { top: 100000.0, height: 200.0, bottom: false }));
+    element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+    assert!(first.iter().all(|owner| owner.upgrade().is_none()), "cached item descriptors must not retain evicted glyph snapshots");
+    assert!(cache.retained_bytes() > 0, "the same active chat still owns visible row geometry");
 }
