@@ -7330,34 +7330,39 @@ fn context_controls<'a>(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChangeContextAction { Open, Reveal, CopyPath, Ignore, Mutate(ChangeGroupCommand) }
+impl ChangeContextAction {
+    fn command(self) -> crate::workspace_widget::GlobalShortcut {
+        use crate::workspace_widget::GlobalShortcut as Command;
+        match self {
+            Self::Open => Command::OpenFile,
+            Self::Reveal => Command::RevealInFiles,
+            Self::CopyPath => Command::CopyRelativePath,
+            Self::Ignore => Command::IgnoreChangePath,
+            Self::Mutate(operation) => commands::change_command_id(operation),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ChangeContextCommand<'a> { key: &'a ActiveWorktreeKey, row: &'a ChangeRow, selection_revision: u64, action: ChangeContextAction }
 impl widget::menu::Action for ChangeContextCommand<'_> {
     type Message = SidebarAction;
     fn message(&self) -> SidebarAction {
         let key = self.key.clone(); let path = self.row.entry.path.clone();
-        match self.action {
-            ChangeContextAction::Open => SidebarAction::OpenFile { key, path },
-            ChangeContextAction::Reveal => SidebarAction::RevealChangeInFiles { key, path },
-            ChangeContextAction::CopyPath => SidebarAction::FileCommand { key, path, command: FileCommand::CopyRelativePath },
-            ChangeContextAction::Ignore => SidebarAction::IgnoreChangePath { key, path },
-            ChangeContextAction::Mutate(command) => SidebarAction::RunChangeCommand {
-                key, row: ChangeSelectionRow { area: self.row.entry.area, path },
-                selection_revision: self.selection_revision,
-                command: commands::change_command_id(command),
-            },
-        }
+        SidebarAction::RunChangeCommand { key, row: ChangeSelectionRow { area: self.row.entry.area, path },
+            selection_revision: self.selection_revision, command: self.action.command() }
     }
 }
 fn change_context_controls<'a>(content: Element<'a, SidebarAction>, key: &'a ActiveWorktreeKey, row: &'a ChangeRow, selection_revision: u64, blocked: bool) -> Element<'a, SidebarAction> {
     if blocked { return content; }
+    let open = if row.entry.kind == ChangeKind::Deleted { widget::menu::Item::ButtonDisabled } else { widget::menu::Item::Button };
     let mut entries = vec![
-        widget::menu::Item::Button("Open file".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Open }),
-        widget::menu::Item::Button("Reveal in Files".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Reveal }),
-        widget::menu::Item::Button("Copy path".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::CopyPath }),
+        open(commands::label(ChangeContextAction::Open.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Open }),
+        open(commands::label(ChangeContextAction::Reveal.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Reveal }),
+        widget::menu::Item::Button(commands::label(ChangeContextAction::CopyPath.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::CopyPath }),
     ];
     let ignore = if row.entry.area == ChangeArea::Untracked { widget::menu::Item::Button } else { widget::menu::Item::ButtonDisabled };
-    entries.push(ignore("Add to .gitignore".into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Ignore }));
+    entries.push(ignore(commands::label(ChangeContextAction::Ignore.command()).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Ignore }));
     let command = if row.entry.area == ChangeArea::Staged { ChangeGroupCommand::Unstage } else { ChangeGroupCommand::Stage };
     entries.push(widget::menu::Item::Button(commands::label(commands::change_command_id(command)).into(), None, ChangeContextCommand { key, row, selection_revision, action: ChangeContextAction::Mutate(command) }));
     if matches!(row.entry.area, ChangeArea::Unstaged | ChangeArea::Untracked) {
@@ -19434,15 +19439,18 @@ mod captured_change_menu_tests {
     use super::*;
     use widget::menu::Action as _;
     #[test]
-    fn change_mutation_menu_carries_registry_identity_and_original_selection_revision() {
+    fn every_change_menu_variant_carries_registry_identity_and_original_selection_revision() {
         let model = super::tests::panel_model();
         let source = model.source_control.as_ref().unwrap();
         let row = source.groups().iter().flat_map(|group| group.rows()).next().unwrap();
-        for operation in [ChangeGroupCommand::Stage, ChangeGroupCommand::Unstage, ChangeGroupCommand::Discard] {
-            let intent = ChangeContextCommand { key: &source.key, row, selection_revision: 71,
-                action: ChangeContextAction::Mutate(operation) }.message();
+        for action in [ChangeContextAction::Open, ChangeContextAction::Reveal, ChangeContextAction::CopyPath,
+            ChangeContextAction::Ignore, ChangeContextAction::Mutate(ChangeGroupCommand::Stage),
+            ChangeContextAction::Mutate(ChangeGroupCommand::Unstage), ChangeContextAction::Mutate(ChangeGroupCommand::Discard)] {
+            let expected=action.command();
+            assert_eq!(crate::workspace_widget::shortcut_descriptor(expected).id(),expected.id());
+            let intent = ChangeContextCommand { key: &source.key, row, selection_revision: 71, action }.message();
             assert!(matches!(intent, SidebarAction::RunChangeCommand { command, key, row: captured, selection_revision: 71 }
-                if command == commands::change_command_id(operation) && key == source.key
+                if command == expected && key == source.key
                     && captured.path == row.entry.path && captured.area == row.entry.area));
         }
     }
