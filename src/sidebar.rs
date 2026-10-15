@@ -3147,15 +3147,19 @@ impl SidebarState {
         true
     }
 
-    pub fn finish_amend_read(&mut self, key: &ActiveWorktreeKey, revision: u64) {
+    pub fn finish_amend_read(&mut self, key: &ActiveWorktreeKey, revision: u64) -> bool {
         let draft = if self.active_worktree.as_ref() == Some(key) {
             Some(&mut self.commit_draft)
         } else {
             self.parked_commit_drafts.get_mut(&key.canonical_path)
         };
-        if let Some(draft) = draft.filter(|draft| draft.revision == revision) {
+        if let Some(draft) = draft.filter(|draft| {
+            draft.amend && draft.amend_loading && draft.revision == revision
+        }) {
             draft.amend_loading = false;
+            return true;
         }
+        false
     }
 
     fn revise_commit_draft(&mut self) {

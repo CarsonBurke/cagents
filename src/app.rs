@@ -16394,9 +16394,9 @@ impl Application for Cagents {
                                 .load_amend_message(&key, revision, &message);
                         }
                         Err(error) => {
-                            self.sidebar_state.finish_amend_read(&key, revision);
-                            if let Some(source) =
-                                self.sidebar_model.source_control.as_mut().filter(|_| bound)
+                            if self.sidebar_state.finish_amend_read(&key, revision)
+                                && let Some(source) =
+                                    self.sidebar_model.source_control.as_mut().filter(|_| bound)
                             {
                                 source.set_error(Some(format!(
                                     "Could not load HEAD’s message: {error}"
@@ -16405,8 +16405,9 @@ impl Application for Cagents {
                         }
                     }
                 } else {
-                    self.sidebar_state.finish_amend_read(&key, revision);
-                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                    if self.sidebar_state.finish_amend_read(&key, revision)
+                        && let Some(source) = self.sidebar_model.source_control.as_mut()
+                    {
                         source.set_error(Some("HEAD changed while loading its message. Toggle Amend again to load the new commit.".into()));
                     }
                 }
@@ -24393,6 +24394,31 @@ mod tests {
                 .error
                 .is_none()
         );
+    }
+
+    #[test]
+    fn amend_stale_read_errors_cannot_replace_later_feedback() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let head = crate::repository::Oid::parse_object("11".repeat(20)).unwrap();
+        app.sidebar_model.source_control.as_mut().unwrap().head_oid = Some(head.as_str().into());
+        app.sidebar_state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+        let revision = app.sidebar_state.amend_request_revision().unwrap();
+        app.sidebar_state.apply(&SidebarAction::CommitMessageChanged { key: key.clone(), message: "Later typed message".into() });
+        for failed_head in [head.clone(), crate::repository::Oid::parse_object("22".repeat(20)).unwrap()] {
+            app.sidebar_model.source_control.as_mut().unwrap().set_error(Some("Newer operation feedback".into()));
+            drop(app.update(Message::SourceControlAmendMessage { key: key.clone(), revision, head: failed_head, result: Err("Old reader failed".into()) }));
+            assert_eq!(app.sidebar_state.commit_message(), "Later typed message");
+            assert_eq!(app.sidebar_model.source_control.as_ref().unwrap().error.as_deref(), Some("Newer operation feedback"));
+        }
+        app.sidebar_state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: false });
+        app.sidebar_state.apply(&SidebarAction::AmendChanged { key: key.clone(), amend: true });
+        let revision = app.sidebar_state.amend_request_revision().unwrap();
+        drop(app.update(Message::SourceControlAmendMessage { key, revision, head, result: Err("Current reader failed".into()) }));
+        assert!(app.sidebar_model.source_control.as_ref().unwrap().error.as_deref().unwrap().contains("Current reader failed"));
     }
 
     #[test]
