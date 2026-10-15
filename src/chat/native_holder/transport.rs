@@ -28,7 +28,7 @@ use std::{
 };
 
 const ARGUMENT: &str = "--cagents-native-holder";
-const PROTOCOL: u32 = 4;
+const PROTOCOL: u32 = 5;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
@@ -184,7 +184,8 @@ pub(crate) struct ExitDiagnostic {
     pub code: Option<i32>,
     pub signal: Option<i32>,
     pub stderr: String,
-    pub log_path: Option<PathBuf>,
+    #[serde(default)]
+    pub log: Option<crate::chat::stderr_log::Descriptor>,
 }
 
 /// Dropping an intentionally closed actor releases its server. An unexpected
@@ -738,7 +739,7 @@ impl Residence {
                             code: status.and_then(|status| status.code()),
                             signal: status.and_then(|status| status.signal()),
                             stderr: String::from_utf8_lossy(self.stderr.tail.make_contiguous()).into_owned(),
-                            log_path: self.stderr.log_path.clone(),
+                            log: status.and_then(|_|self.stderr.log.as_ref().and_then(|log|log.share().ok())),
                         }),
                         Err(error) => Report::Failed(error.to_string()),
                     }
@@ -879,11 +880,10 @@ impl Residence {
 struct StderrCapture {
     reader: Option<std::process::ChildStderr>,
     tail: std::collections::VecDeque<u8>,
-    log: Option<std::fs::File>,
-    log_path: Option<PathBuf>,
+    log: Option<crate::chat::stderr_log::Capture>,
 }
 impl StderrCapture {
-    fn new(reader: Option<std::process::ChildStderr>, terminal: crate::model::TerminalId) -> Result<Self, String> {
+    fn new(reader: Option<std::process::ChildStderr>, _terminal: crate::model::TerminalId) -> Result<Self, String> {
         if let Some(reader) = &reader {
             let fd = reader.as_raw_fd();
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -891,16 +891,8 @@ impl StderrCapture {
                 return Err(io::Error::last_os_error().to_string());
             }
         }
-        let log_path = (std::env::var_os("CAGENTS_LOCAL_DEBUG").as_deref() == Some(std::ffi::OsStr::new("1")))
-            .then(|| crate::instance::project_dirs().map(|dirs| dirs.cache_dir().join("provider-stderr").join(format!("{terminal}-{}.log", std::process::id())))).flatten();
-        let log = log_path.as_ref().and_then(|path| {
-            use std::os::unix::fs::OpenOptionsExt;
-            let parent = path.parent()?;
-            crate::secure_file::prepare_private_directory(parent).ok()?;
-            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path).ok()
-        });
-        let log_path = log.is_some().then_some(log_path).flatten();
-        Ok(Self { reader, tail: Default::default(), log, log_path })
+        let log = crate::chat::stderr_log::Capture::new().map_err(|error| {tracing::warn!(%error,"Provider diagnostic log is unavailable");error}).ok();
+        Ok(Self { reader, tail: Default::default(), log })
     }
     fn drain(&mut self) -> io::Result<()> {
         let mut bytes = [0_u8; 8192];
@@ -911,7 +903,7 @@ impl StderrCapture {
             match reader.read(&mut bytes) {
                 Ok(0) => { self.reader.take(); break; }
                 Ok(count) => {
-                    if let Some(log) = self.log.as_mut() && log.write_all(&bytes[..count]).is_err() { self.log.take(); }
+                    if let Some(log) = self.log.as_mut() {log.push(&bytes[..count]);}
                     for byte in &bytes[..count] {
                         if self.tail.len() == 64 * 1024 { self.tail.pop_front(); }
                         self.tail.push_back(*byte);
@@ -1286,7 +1278,7 @@ mod tests {
                 .env(STAGE,"1").env("XDG_RUNTIME_DIR",directory.path())
                 .env("XDG_DATA_HOME",directory.path().join("data"))
                 .env("XDG_CACHE_HOME",directory.path().join("cache"))
-                .env("CAGENTS_LOCAL_DEBUG","1").output().unwrap();
+                .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
             assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
             return;
         }
@@ -1311,7 +1303,7 @@ mod tests {
         assert_eq!(diagnostic.code,Some(3));
         assert_eq!(diagnostic.signal,None);
         assert_eq!(diagnostic.stderr,"first diagnostic\nlast failure\n");
-        assert_eq!(std::fs::read_to_string(diagnostic.log_path.as_ref().unwrap()).unwrap(),diagnostic.stderr);
+        assert_eq!(std::fs::read_to_string(&diagnostic.log.as_ref().unwrap().path).unwrap(),diagnostic.stderr);
         let frame = serde_json::to_vec(&Report::Diagnostic(diagnostic)).unwrap();
         let Report::Diagnostic(decoded) = serde_json::from_slice(&frame).unwrap() else { panic!("missing diagnostic control response") };
         assert_eq!(decoded.code,Some(3));

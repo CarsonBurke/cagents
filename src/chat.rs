@@ -20,8 +20,13 @@ pub(crate) mod native_holder;
 pub mod protocol;
 #[cfg(feature = "host")]
 pub mod runtime;
+#[cfg(feature = "host")]
+pub(crate) mod stderr_log;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
+#[cfg(any(feature = "ui", feature = "host"))]
+#[path = "chat/protocol/terminal_output.rs"]
+pub(crate) mod terminal_output;
 
 /// Whether a provider-level failure requires the reader to renew the login.
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
@@ -954,8 +959,19 @@ pub struct Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProviderExitDiagnostic {
     pub summary: String,
-    /// Last 64 KiB of readable stderr. The complete stream is in the debug log.
+    /// Last 64 KiB of readable stderr, independent of retained-log availability.
     pub output: String,
+    #[serde(default)]
+    pub log: Option<ProviderExitLog>,
+}
+
+/// Opaque retained diagnostic identity. Full output is loaded only on demand.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderExitLog {
+    pub id: String,
+    pub bytes: u64,
+    /// Raw bytes beyond the per-session disk cap or lost after a write failure.
+    pub omitted: u64,
 }
 
 /// When a provider takes a message it is holding.
@@ -1091,6 +1107,16 @@ pub(crate) fn child_events(id: &str, events: Vec<Event>) -> Vec<Event> {
                 item_id,
                 role,
                 thinking,
+                delta,
+            }],
+            Event::InputDelta {
+                id: item_id,
+                offset,
+                delta,
+            } => vec![Event::SubagentInputDelta {
+                id: id.into(),
+                item_id,
+                offset,
                 delta,
             }],
             Event::OutputDelta {
@@ -1929,6 +1955,19 @@ pub enum Event {
     Skills(Vec<Skill>),
     /// Upsert a completed/history item without duplicating a streamed item.
     Item(Item),
+    /// Append tool input at its exact byte offset without rewriting prior chunks.
+    ProviderExit(ProviderExitDiagnostic),
+    InputDelta {
+        id: String,
+        offset: usize,
+        delta: String,
+    },
+    SubagentInputDelta {
+        id: String,
+        item_id: String,
+        offset: usize,
+        delta: String,
+    },
     /// An append to a tracked command/tool output, never an authoritative rewrite.
     OutputDelta {
         id: String,
@@ -2082,6 +2121,7 @@ mod tests {
                 provider_exit: Some(super::ProviderExitDiagnostic {
                     summary: "Provider exited with status 3. Restart session to continue.".into(),
                     output: "First diagnostic\nAuthentication failed\n".into(),
+                    log: None,
                 }),
                 ..Default::default()
             };
