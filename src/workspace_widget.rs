@@ -85,6 +85,25 @@ pub enum GlobalShortcut {
     MarkAllRead,
     SearchInProject,
     CloneRepository,
+    CopyBranch,
+    OpenOrCreatePullRequest,
+    NewWorktreeFromBranch,
+    MoveProjectUp,
+    MoveProjectDown,
+    ResetSidebarOrder,
+    RevealInFileManager,
+    OpenRepositoryUrl,
+    OpenInExternalEditor,
+    DeleteWorktree,
+    RemoveProject,
+    DeleteSelectedRows,
+    RenameChannel,
+    MarkChannelRead,
+    DeleteChannel,
+    MarkWorktreeRead,
+    RenameFile,
+    DuplicateFile,
+    CopyRelativePath,
 
 
     CommandPalette,
@@ -131,6 +150,36 @@ pub enum GlobalShortcut {
 }
 
 impl GlobalShortcut {
+    pub const fn sidebar_command_bit(self) -> Option<u64> {
+        match self {
+            Self::CopyPath => Some(1 << 0),
+            Self::NewTerminal => Some(1 << 1),
+            Self::NewThread => Some(1 << 2),
+            Self::NewChannel => Some(1 << 3),
+            Self::NewWorktree => Some(1 << 4),
+            Self::CopyBranch => Some(1 << 5),
+            Self::OpenOrCreatePullRequest => Some(1 << 6),
+            Self::NewWorktreeFromBranch => Some(1 << 7),
+            Self::MoveProjectUp => Some(1 << 8),
+            Self::MoveProjectDown => Some(1 << 9),
+            Self::ResetSidebarOrder => Some(1 << 10),
+            Self::RevealInFileManager => Some(1 << 11),
+            Self::OpenRepositoryUrl => Some(1 << 12),
+            Self::OpenInExternalEditor => Some(1 << 13),
+            Self::DeleteWorktree => Some(1 << 14),
+            Self::RemoveProject => Some(1 << 15),
+            Self::DeleteSelectedRows => Some(1 << 16),
+            Self::RenameChannel => Some(1 << 17),
+            Self::MarkChannelRead => Some(1 << 18),
+            Self::DeleteChannel => Some(1 << 19),
+            Self::MarkWorktreeRead => Some(1 << 20),
+            Self::RenameFile => Some(1 << 21),
+            Self::DuplicateFile => Some(1 << 22),
+            Self::CopyRelativePath => Some(1 << 23),
+            _ => None,
+        }
+    }
+
     pub const fn id(self) -> &'static str {
         match self {
             Self::ToggleProjects => "toggle_projects",
@@ -171,6 +220,25 @@ impl GlobalShortcut {
             Self::MarkAllRead => "mark_all_read",
             Self::SearchInProject => "search_in_project",
             Self::CloneRepository => "clone_repository",
+            Self::CopyBranch => "copy_branch",
+            Self::OpenOrCreatePullRequest => "open_or_create_pull_request",
+            Self::NewWorktreeFromBranch => "new_worktree_from_branch",
+            Self::MoveProjectUp => "move_project_up",
+            Self::MoveProjectDown => "move_project_down",
+            Self::ResetSidebarOrder => "reset_sidebar_order",
+            Self::RevealInFileManager => "reveal_in_file_manager",
+            Self::OpenRepositoryUrl => "open_repository_url",
+            Self::OpenInExternalEditor => "open_in_external_editor",
+            Self::DeleteWorktree => "delete_worktree",
+            Self::RemoveProject => "remove_project",
+            Self::DeleteSelectedRows => "delete_selected_rows",
+            Self::RenameChannel => "rename_channel",
+            Self::MarkChannelRead => "mark_channel_read",
+            Self::DeleteChannel => "delete_channel",
+            Self::MarkWorktreeRead => "mark_worktree_read",
+            Self::RenameFile => "rename_file",
+            Self::DuplicateFile => "duplicate_file",
+            Self::CopyRelativePath => "copy_relative_path",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -231,6 +299,8 @@ pub enum ShortcutScope {
     OutsideTerminal,
     /// Leave editing chords to focused text controls.
     OutsideTextInput,
+    /// Commands rooted in the actual focused sidebar row or file surface.
+    Sidebar,
     /// Only while a pull request pane has focus; a terminal or editor with
     /// focus receives the chord as ordinary input.
     Review,
@@ -246,6 +316,7 @@ impl ShortcutScope {
             Self::Workspace => true,
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::OutsideTextInput => !focused.is_text_editing(),
+            Self::Sidebar => matches!(focused, FocusedPane::SidebarRows | FocusedPane::SidebarFiles),
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
         }
@@ -255,6 +326,8 @@ impl ShortcutScope {
 /// The kind of the focused pane, as far as shortcut scopes care.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum FocusedPane {
+    SidebarRows,
+    SidebarFiles,
     /// A terminal, which forwards the keys it is given to its process.
     Terminal,
     /// A pull request review pane.
@@ -292,6 +365,8 @@ pub struct ShortcutDescriptor {
 /// deterministic and can be tested without launching native panes.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct CommandContext {
+    /// Some mask records an originating sidebar target, including a stale target with no actions.
+    pub sidebar_commands: Option<u64>,
     pub focused: FocusedPane,
     pub pane_index: Option<usize>,
     pub pane_count: usize,
@@ -323,6 +398,7 @@ impl ShortcutDescriptor {
     }
 
     pub fn category(self) -> &'static str {
+        if self.scope == ShortcutScope::Sidebar { return "Navigation"; }
         let id = self.id();
         if id.starts_with("settings_")
             || matches!(
@@ -367,6 +443,10 @@ impl ShortcutDescriptor {
     }
 
     pub fn available(self, context: &CommandContext) -> bool {
+        if let Some(mask) = context.sidebar_commands
+            && let Some(bit) = self.action.sidebar_command_bit()
+        { return mask & bit != 0; }
+        if self.scope == ShortcutScope::Sidebar { return false; }
         // OutsideTerminal controls chord reservation; explicit palette
         // invocation remains available when the terminal has its own finder.
         if matches!(self.scope, ShortcutScope::Chat | ShortcutScope::Review)
@@ -376,6 +456,7 @@ impl ShortcutDescriptor {
         }
         let pane = context.pane_index.is_some();
         match self.action {
+            GlobalShortcut::OpenInExternalEditor => false,
             GlobalShortcut::NewWorktree => context.active_git_project,
             GlobalShortcut::MarkAllRead => context.has_unread,
             GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => context.has_attention,
@@ -900,6 +981,26 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Workspace,
     },
 
+    ShortcutDescriptor { action: GlobalShortcut::CopyBranch, label: "Copy branch", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::OpenOrCreatePullRequest, label: "Open or create pull request…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::NewWorktreeFromBranch, label: "New worktree from this branch…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::MoveProjectUp, label: "Move project up", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::MoveProjectDown, label: "Move project down", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::ResetSidebarOrder, label: "Reset sidebar order", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::RevealInFileManager, label: "Reveal in file manager", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::OpenRepositoryUrl, label: "Open repository on GitHub", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::OpenInExternalEditor, label: "Open in external editor", repeatable: false, scope: ShortcutScope::OutsideTerminal },
+    ShortcutDescriptor { action: GlobalShortcut::DeleteWorktree, label: "Delete worktree…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::RemoveProject, label: "Remove project…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::DeleteSelectedRows, label: "Delete selected sidebar rows…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::RenameChannel, label: "Rename channel…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::MarkChannelRead, label: "Mark channel read", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::DeleteChannel, label: "Delete channel…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::MarkWorktreeRead, label: "Mark worktree read", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::RenameFile, label: "Rename file…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::DuplicateFile, label: "Duplicate file…", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::CopyRelativePath, label: "Copy relative path", repeatable: false, scope: ShortcutScope::Sidebar },
+
 ];
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
@@ -950,6 +1051,25 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::MarkAllRead => &shortcuts.mark_all_read,
         GlobalShortcut::SearchInProject => &shortcuts.search_in_project,
         GlobalShortcut::CloneRepository => &shortcuts.clone_repository,
+        GlobalShortcut::CopyBranch => &shortcuts.copy_branch,
+        GlobalShortcut::OpenOrCreatePullRequest => &shortcuts.open_or_create_pull_request,
+        GlobalShortcut::NewWorktreeFromBranch => &shortcuts.new_worktree_from_branch,
+        GlobalShortcut::MoveProjectUp => &shortcuts.move_project_up,
+        GlobalShortcut::MoveProjectDown => &shortcuts.move_project_down,
+        GlobalShortcut::ResetSidebarOrder => &shortcuts.reset_sidebar_order,
+        GlobalShortcut::RevealInFileManager => &shortcuts.reveal_in_file_manager,
+        GlobalShortcut::OpenRepositoryUrl => &shortcuts.open_repository_url,
+        GlobalShortcut::OpenInExternalEditor => &shortcuts.open_in_external_editor,
+        GlobalShortcut::DeleteWorktree => &shortcuts.delete_worktree,
+        GlobalShortcut::RemoveProject => &shortcuts.remove_project,
+        GlobalShortcut::DeleteSelectedRows => &shortcuts.delete_selected_rows,
+        GlobalShortcut::RenameChannel => &shortcuts.rename_channel,
+        GlobalShortcut::MarkChannelRead => &shortcuts.mark_channel_read,
+        GlobalShortcut::DeleteChannel => &shortcuts.delete_channel,
+        GlobalShortcut::MarkWorktreeRead => &shortcuts.mark_worktree_read,
+        GlobalShortcut::RenameFile => &shortcuts.rename_file,
+        GlobalShortcut::DuplicateFile => &shortcuts.duplicate_file,
+        GlobalShortcut::CopyRelativePath => &shortcuts.copy_relative_path,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,

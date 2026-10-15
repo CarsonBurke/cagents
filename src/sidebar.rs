@@ -41,6 +41,7 @@ use crate::{
 };
 use row_interaction::RowInteraction;
 
+pub mod commands;
 mod selection;
 pub use selection::{Intent as SelectionIntent, Row as SelectionRow};
 
@@ -3383,6 +3384,10 @@ impl SidebarState {
         }
     }
 
+    pub fn selected_file(&self) -> Option<&RepoPath> {
+        match self.panel_selection.as_ref() { Some(PanelSelection::File(path)) => Some(path), _ => None }
+    }
+
     pub fn directory_is_expanded(&self, path: &RepoPath) -> bool {
         self.expanded_directories.contains(path)
     }
@@ -3777,6 +3782,8 @@ impl SidebarState {
             | SidebarAction::MarkChannelRead(_)
             | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
+            | SidebarAction::RunCommand { .. }
+            | SidebarAction::DeleteRows(_)
             | SidebarAction::ClearRowSelection => {}
         }
     }
@@ -3807,6 +3814,9 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    RunCommand { command: crate::workspace_widget::GlobalShortcut, action: Box<SidebarAction> },
+    /// Original selection captured before a palette or context menu took focus.
+    DeleteRows(Vec<SelectionRow>),
     ChangeGroup {
         key: ActiveWorktreeKey,
         area: ChangeArea,
@@ -4538,6 +4548,11 @@ pub(crate) fn selected_project<'a>(
 
 pub fn files_scroll_id(key: &ActiveWorktreeKey) -> Id {
     entity_id("panel.files.scroll", key.worktree_id)
+}
+
+pub fn file_panel_focus_id() -> Id { Id::from("sidebar.files-panel") }
+pub fn file_row_focus_id(key: &ActiveWorktreeKey, path: &RepoPath) -> Id {
+    Id::from(format!("sidebar.file:{key:?}:{path:?}"))
 }
 
 pub fn files_filter_focus_id(key: &ActiveWorktreeKey) -> Id {
@@ -5579,7 +5594,7 @@ fn project_view<'a>(
         project
             .state
             .rows
-            .group_size(SelectionRow::Project(project_id)),
+            .context_rows(SelectionRow::Project(project_id)),
     );
     let header = RowInteraction::selectable(
         header,
@@ -5606,7 +5621,7 @@ fn project_view<'a>(
                         project
                             .state
                             .rows
-                            .group_size(SelectionRow::Channel(channel.id)),
+                            .context_rows(SelectionRow::Channel(channel.id)),
                         &project.state.query,
                     ),
                     SelectionRow::Channel(channel.id),
@@ -5645,7 +5660,7 @@ fn project_view<'a>(
                         project
                             .state
                             .rows
-                            .group_size(SelectionRow::Worktree(project_id, worktree.id)),
+                            .context_rows(SelectionRow::Worktree(project_id, worktree.id)),
                         &project.state.query,
                         !project.state.hide_worktree_changes_icons,
                     ),
@@ -5729,7 +5744,7 @@ fn compact_project<'a>(
         project
             .state
             .rows
-            .group_size(SelectionRow::Project(entity.id)),
+            .context_rows(SelectionRow::Project(entity.id)),
     );
     let header = RowInteraction::selectable(
         header,
@@ -5765,7 +5780,7 @@ fn compact_project<'a>(
                 project
                     .state
                     .rows
-                    .group_size(SelectionRow::Channel(channel.id)),
+                    .context_rows(SelectionRow::Channel(channel.id)),
                 &project.state.query,
             ),
             SelectionRow::Channel(channel.id),
@@ -5815,7 +5830,7 @@ fn compact_project<'a>(
                 project
                     .state
                     .rows
-                    .group_size(SelectionRow::Worktree(entity.id, worktree.id)),
+                    .context_rows(SelectionRow::Worktree(entity.id, worktree.id)),
                 &project.state.query,
                 !project.state.hide_worktree_changes_icons,
             ),
@@ -6122,7 +6137,7 @@ fn channel_view(
     channel: &SidebarChannel,
     modal_open: bool,
     compact: bool,
-    selection_count: Option<usize>,
+    selection_rows: Option<Arc<[SelectionRow]>>,
     query: &str,
 ) -> Element<'static, SidebarAction> {
     let grid = RowGrid::child(compact);
@@ -6198,7 +6213,7 @@ fn channel_view(
         compact,
     );
     grid.mount(with_deletion_retry(
-        channel_context_controls(action, channel.id, inert, selection_count),
+        channel_context_controls(action, channel.id, inert, selection_rows),
         deletion,
         compact,
         &channel.title,
@@ -6255,9 +6270,10 @@ fn channel_context_controls<'a>(
     content: impl Into<Element<'static, SidebarAction>>,
     channel_id: ChannelId,
     modal_open: bool,
-    selection_count: Option<usize>,
+    selection_rows: Option<Arc<[SelectionRow]>>,
 ) -> Element<'static, SidebarAction> {
     use widget::menu::{Item, items};
+    let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
     let Some(menu) = (!modal_open && selection_count.is_some()).then(|| {
         let mut entries = vec![Item::Button(
             match selection_count {
@@ -6265,12 +6281,12 @@ fn channel_context_controls<'a>(
                     "{}…",
                     SelectionRow::Channel(channel_id).deletion_label(count)
                 ),
-                _ => "Delete channel…".to_owned(),
+                _ => commands::label(crate::workspace_widget::GlobalShortcut::DeleteChannel).to_owned(),
             },
             None,
             ChannelContextCommand(
                 channel_id,
-                selection_count.unwrap_or(1) > 1,
+                selection_rows.clone().filter(|rows| rows.len() > 1),
                 ChannelMenuCommand::Delete,
             ),
         )];
@@ -6278,17 +6294,17 @@ fn channel_context_controls<'a>(
             entries.insert(
                 0,
                 Item::Button(
-                    "Rename channel…".into(),
+                    commands::label(crate::workspace_widget::GlobalShortcut::RenameChannel).into(),
                     None,
-                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
+                    ChannelContextCommand(channel_id, None, ChannelMenuCommand::Rename),
                 ),
             );
             entries.insert(
                 1,
                 Item::Button(
-                    "Mark as read".into(),
+                    commands::label(crate::workspace_widget::GlobalShortcut::MarkChannelRead).into(),
                     None,
-                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::MarkRead),
+                    ChannelContextCommand(channel_id, None, ChannelMenuCommand::MarkRead),
                 ),
             );
         }
@@ -6299,8 +6315,8 @@ fn channel_context_controls<'a>(
     crate::interaction::context_menu(content, menu)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ChannelContextCommand(ChannelId, bool, ChannelMenuCommand);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ChannelContextCommand(ChannelId, Option<Arc<[SelectionRow]>>, ChannelMenuCommand);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChannelMenuCommand {
@@ -6314,15 +6330,15 @@ impl widget::menu::Action for ChannelContextCommand {
 
     fn message(&self) -> SidebarAction {
         match self.2 {
-            ChannelMenuCommand::Rename => return SidebarAction::RenameChannel(self.0),
-            ChannelMenuCommand::MarkRead => return SidebarAction::MarkChannelRead(self.0),
+            ChannelMenuCommand::Rename => return commands::registered(SidebarAction::RenameChannel(self.0)),
+            ChannelMenuCommand::MarkRead => return commands::registered(SidebarAction::MarkChannelRead(self.0)),
             ChannelMenuCommand::Delete => {}
         }
-        if self.1 {
-            SidebarAction::DeleteSelectedRows
+        commands::registered(if let Some(rows) = &self.1 {
+            SidebarAction::DeleteRows(rows.to_vec())
         } else {
             SidebarAction::DeleteChannel { channel_id: self.0 }
-        }
+        })
     }
 }
 
@@ -6419,7 +6435,7 @@ fn worktree_view<'a>(
     acknowledged_attention: bool,
     has_panes: bool,
     compact: bool,
-    selection_count: Option<usize>,
+    selection_rows: Option<Arc<[SelectionRow]>>,
     query: &str,
     show_changes_icons: bool,
 ) -> Element<'static, SidebarAction> {
@@ -6617,7 +6633,7 @@ fn worktree_view<'a>(
             worktree.branch.is_some(),
             github_ready,
             editors,
-            selection_count,
+            selection_rows,
         ),
         deletion,
         compact,
@@ -6690,26 +6706,26 @@ pub enum ProjectCommand {
     Remove,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ContextCommand<'a>(ProjectId, Option<WorktreeId>, &'a ProjectCommand, bool);
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ContextCommand<'a>(ProjectId, Option<WorktreeId>, &'a ProjectCommand, Option<Arc<[SelectionRow]>>);
 
 impl widget::menu::Action for ContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
-        if self.3 {
-            return SidebarAction::DeleteSelectedRows;
+        if let Some(rows) = &self.3 {
+            return commands::registered(SidebarAction::DeleteRows(rows.to_vec()));
         }
         if *self.2 == ProjectCommand::MarkRead
             && let Some(worktree) = self.1
         {
-            return SidebarAction::MarkWorktreeRead(self.0, worktree);
+            return commands::registered(SidebarAction::MarkWorktreeRead(self.0, worktree));
         }
-        SidebarAction::ProjectCommand {
+        commands::registered(SidebarAction::ProjectCommand {
             project_id: self.0,
             worktree_id: self.1,
             command: self.2.clone(),
-        }
+        })
     }
 }
 
@@ -6722,9 +6738,10 @@ fn context_controls<'a>(
     has_branch: bool,
     github_ready: bool,
     editors: &[SidebarEditor],
-    selection_count: Option<usize>,
+    selection_rows: Option<Arc<[SelectionRow]>>,
 ) -> Element<'a, SidebarAction> {
     use widget::menu::{Item, items};
+    let selection_count = selection_rows.as_ref().map(|rows| rows.len().max(1));
     let editors = editors.to_vec();
     if modal_open || selection_count.is_none() {
         return content.into();
@@ -6801,6 +6818,10 @@ fn context_controls<'a>(
         let entries = commands
             .iter()
             .map(|(label, icon, command)| {
+                let canonical = commands::command_id(&SidebarAction::ProjectCommand {
+                    project_id, worktree_id, command: command.clone(),
+                }).map(commands::label).unwrap_or(label.as_str());
+                let label = if selection_count.is_some_and(|count| count > 1) || matches!(command, ProjectCommand::OpenEditor(_)) { label.as_str() } else { canonical };
                 let item = if !has_branch
                     && matches!(
                         command,
@@ -6823,15 +6844,15 @@ fn context_controls<'a>(
                     {
                         format!("{label} (detached HEAD)")
                     } else {
-                        label.clone()
+                        label.to_owned()
                     },
                     icon.clone(),
                     ContextCommand(
                         project_id,
                         worktree_id,
                         command,
-                        selection_count.is_some_and(|count| count > 1)
-                            && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove),
+                        selection_rows.clone().filter(|rows| rows.len() > 1
+                            && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove)),
                     ),
                 )
             })
@@ -6858,7 +6879,7 @@ impl widget::menu::Action for FileContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
-        match self {
+        commands::registered(match self {
             Self::Manage { key, path, command } => SidebarAction::FileCommand {
                 key: (*key).clone(),
                 path: (*path).clone(),
@@ -6873,7 +6894,7 @@ impl widget::menu::Action for FileContextCommand<'_> {
                 path: (*path).clone(),
                 editor_id: (*editor_id).to_owned(),
             },
-        }
+        })
     }
 }
 
@@ -6889,8 +6910,8 @@ fn file_commands(
     file_management: bool,
 ) -> impl Iterator<Item = (&'static str, Icon, FileCommand)> {
     [
-        ("Rename…", Icon::Rename, FileCommand::Rename),
-        ("Duplicate file…", Icon::Duplicate, FileCommand::CopyFile),
+        (commands::label(crate::workspace_widget::GlobalShortcut::RenameFile), Icon::Rename, FileCommand::Rename),
+        (commands::label(crate::workspace_widget::GlobalShortcut::DuplicateFile), Icon::Duplicate, FileCommand::CopyFile),
         ("Copy path", Icon::CopyPath, FileCommand::CopyPath),
         (
             "Copy relative path",
@@ -7355,6 +7376,7 @@ fn worktree_panel<'a>(
         content
     };
     widget::container(pane)
+        .id(match panel { WorktreePanel::Files => file_panel_focus_id(), _ => Id::from("sidebar.git-panel") })
         .width(Length::Fixed(width))
         .height(Length::Fill)
         .into()
@@ -9567,6 +9589,10 @@ fn panel_row<'a>(
     selected: bool,
     modal_open: bool,
 ) -> Element<'a, SidebarAction> {
+    let identity = match &action {
+        Some(SidebarAction::OpenFile { key, path } | SidebarAction::ToggleDirectory { key, path }) => file_row_focus_id(key, path),
+        _ => Id::unique(),
+    };
     let indent = u16::try_from(depth).unwrap_or(u16::MAX).saturating_mul(12);
     crate::interaction::keyboard_list_row(crate::interaction::hover(
         button::custom(
@@ -9580,6 +9606,7 @@ fn panel_row<'a>(
             .height(Length::Fill),
         )
         .class(sidebar_button_style(selected))
+        .id(identity)
         .name(name)
         .selected(selected)
         .padding([0.0, space::XS])
@@ -12057,7 +12084,7 @@ pub(crate) mod tests {
         );
         for (compact, modal) in [(false, false), (true, false), (false, true), (true, true)] {
             let renderer = headless_renderer();
-            let mut element = channel_view(&channel, modal, compact, Some(1), "");
+            let mut element = channel_view(&channel, modal, compact, Some(Arc::from([SelectionRow::Channel(channel.id)])), "");
             let mut tree = Tree::new(&element);
             let width = if compact { COMPACT_ROW_WIDTH } else { 240.0 };
             let viewport = Rectangle::with_size(Size::new(width, WORKTREE_ROW_HEIGHT));
@@ -12203,7 +12230,7 @@ pub(crate) mod tests {
                 false,
                 false,
                 false,
-                Some(1),
+                Some(Arc::from([SelectionRow::Worktree(project_id(1), worktree.id)])),
                 "",
                 true,
             );
@@ -13063,7 +13090,7 @@ pub(crate) mod tests {
             )
         };
         let label_slot = |channel: &SidebarChannel| {
-            let mut element = channel_view(channel, false, false, Some(1), "");
+            let mut element = channel_view(channel, false, false, Some(Arc::from([SelectionRow::Channel(channel.id)])), "");
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -13653,7 +13680,7 @@ pub(crate) mod tests {
             true,
             false,
             &[],
-            Some(1),
+            Some(Arc::from([SelectionRow::Project(project_id(1))])),
         );
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(240.0, 32.0));
@@ -14815,7 +14842,7 @@ pub(crate) mod tests {
                 true,
                 true,
                 &[],
-                Some(1),
+                Some(Arc::from([SelectionRow::Worktree(project_id(1), WorktreeId::from_uuid(Uuid::from_u128(2)))])),
             )
         };
         let renderer = headless_renderer();

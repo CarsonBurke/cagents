@@ -319,6 +319,25 @@ pub struct KeyboardShortcuts {
     pub mark_all_read: Vec<String>,
     pub search_in_project: Vec<String>,
     pub clone_repository: Vec<String>,
+    pub copy_branch: Vec<String>,
+    pub open_or_create_pull_request: Vec<String>,
+    pub new_worktree_from_branch: Vec<String>,
+    pub move_project_up: Vec<String>,
+    pub move_project_down: Vec<String>,
+    pub reset_sidebar_order: Vec<String>,
+    pub reveal_in_file_manager: Vec<String>,
+    pub open_repository_url: Vec<String>,
+    pub open_in_external_editor: Vec<String>,
+    pub delete_worktree: Vec<String>,
+    pub remove_project: Vec<String>,
+    pub delete_selected_rows: Vec<String>,
+    pub rename_channel: Vec<String>,
+    pub mark_channel_read: Vec<String>,
+    pub delete_channel: Vec<String>,
+    pub mark_worktree_read: Vec<String>,
+    pub rename_file: Vec<String>,
+    pub duplicate_file: Vec<String>,
+    pub copy_relative_path: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -404,6 +423,25 @@ impl Default for KeyboardShortcuts {
             mark_all_read: vec![],
             search_in_project: vec!["Ctrl+Alt+F".into()],
             clone_repository: vec![],
+            copy_branch: vec![],
+            open_or_create_pull_request: vec![],
+            new_worktree_from_branch: vec![],
+            move_project_up: vec![],
+            move_project_down: vec![],
+            reset_sidebar_order: vec![],
+            reveal_in_file_manager: vec![],
+            open_repository_url: vec![],
+            open_in_external_editor: vec![],
+            delete_worktree: vec![],
+            remove_project: vec![],
+            delete_selected_rows: vec![],
+            rename_channel: vec![],
+            mark_channel_read: vec![],
+            delete_channel: vec![],
+            mark_worktree_read: vec![],
+            rename_file: vec![],
+            duplicate_file: vec![],
+            copy_relative_path: vec![],
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -436,7 +474,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 77] {
+    pub fn actions(&self) -> [&Vec<String>; 96] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -515,13 +553,32 @@ impl KeyboardShortcuts {
             &self.mark_all_read,
             &self.search_in_project,
             &self.clone_repository,
+            &self.copy_branch,
+            &self.open_or_create_pull_request,
+            &self.new_worktree_from_branch,
+            &self.move_project_up,
+            &self.move_project_down,
+            &self.reset_sidebar_order,
+            &self.reveal_in_file_manager,
+            &self.open_repository_url,
+            &self.open_in_external_editor,
+            &self.delete_worktree,
+            &self.remove_project,
+            &self.delete_selected_rows,
+            &self.rename_channel,
+            &self.mark_channel_read,
+            &self.delete_channel,
+            &self.mark_worktree_read,
+            &self.rename_file,
+            &self.duplicate_file,
+            &self.copy_relative_path,
 
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 77] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 96] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -600,6 +657,25 @@ impl KeyboardShortcuts {
             &mut self.mark_all_read,
             &mut self.search_in_project,
             &mut self.clone_repository,
+            &mut self.copy_branch,
+            &mut self.open_or_create_pull_request,
+            &mut self.new_worktree_from_branch,
+            &mut self.move_project_up,
+            &mut self.move_project_down,
+            &mut self.reset_sidebar_order,
+            &mut self.reveal_in_file_manager,
+            &mut self.open_repository_url,
+            &mut self.open_in_external_editor,
+            &mut self.delete_worktree,
+            &mut self.remove_project,
+            &mut self.delete_selected_rows,
+            &mut self.rename_channel,
+            &mut self.mark_channel_read,
+            &mut self.delete_channel,
+            &mut self.mark_worktree_read,
+            &mut self.rename_file,
+            &mut self.duplicate_file,
+            &mut self.copy_relative_path,
         ]
     }
 
@@ -649,7 +725,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 77] = [
+const SHORTCUT_ACTIONS: [&str; 96] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -727,6 +803,25 @@ const SHORTCUT_ACTIONS: [&str; 77] = [
     "mark_all_read",
     "search_in_project",
     "clone_repository",
+    "copy_branch",
+    "open_or_create_pull_request",
+    "new_worktree_from_branch",
+    "move_project_up",
+    "move_project_down",
+    "reset_sidebar_order",
+    "reveal_in_file_manager",
+    "open_repository_url",
+    "open_in_external_editor",
+    "delete_worktree",
+    "remove_project",
+    "delete_selected_rows",
+    "rename_channel",
+    "mark_channel_read",
+    "delete_channel",
+    "mark_worktree_read",
+    "rename_file",
+    "duplicate_file",
+    "copy_relative_path",
 
 ];
 
@@ -1837,7 +1932,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 72] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 91] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1910,6 +2005,25 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 72] = [
     "mark_all_read",
     "search_in_project",
     "clone_repository",
+    "copy_branch",
+    "open_or_create_pull_request",
+    "new_worktree_from_branch",
+    "move_project_up",
+    "move_project_down",
+    "reset_sidebar_order",
+    "reveal_in_file_manager",
+    "open_repository_url",
+    "open_in_external_editor",
+    "delete_worktree",
+    "remove_project",
+    "delete_selected_rows",
+    "rename_channel",
+    "mark_channel_read",
+    "delete_channel",
+    "mark_worktree_read",
+    "rename_file",
+    "duplicate_file",
+    "copy_relative_path",
 
 ];
 

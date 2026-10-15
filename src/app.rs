@@ -2867,12 +2867,31 @@ pub enum SettingsField {
     ShortcutMarkAllRead,
     ShortcutSearchInProject,
     ShortcutCloneRepository,
+    ShortcutCopyBranch,
+    ShortcutOpenOrCreatePullRequest,
+    ShortcutNewWorktreeFromBranch,
+    ShortcutMoveProjectUp,
+    ShortcutMoveProjectDown,
+    ShortcutResetSidebarOrder,
+    ShortcutRevealInFileManager,
+    ShortcutOpenRepositoryUrl,
+    ShortcutOpenInExternalEditor,
+    ShortcutDeleteWorktree,
+    ShortcutRemoveProject,
+    ShortcutDeleteSelectedRows,
+    ShortcutRenameChannel,
+    ShortcutMarkChannelRead,
+    ShortcutDeleteChannel,
+    ShortcutMarkWorktreeRead,
+    ShortcutRenameFile,
+    ShortcutDuplicateFile,
+    ShortcutCopyRelativePath,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 77] = [
+    const SHORTCUTS: [Self; 96] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2950,6 +2969,25 @@ impl SettingsField {
         Self::ShortcutMarkAllRead,
         Self::ShortcutSearchInProject,
         Self::ShortcutCloneRepository,
+        Self::ShortcutCopyBranch,
+        Self::ShortcutOpenOrCreatePullRequest,
+        Self::ShortcutNewWorktreeFromBranch,
+        Self::ShortcutMoveProjectUp,
+        Self::ShortcutMoveProjectDown,
+        Self::ShortcutResetSidebarOrder,
+        Self::ShortcutRevealInFileManager,
+        Self::ShortcutOpenRepositoryUrl,
+        Self::ShortcutOpenInExternalEditor,
+        Self::ShortcutDeleteWorktree,
+        Self::ShortcutRemoveProject,
+        Self::ShortcutDeleteSelectedRows,
+        Self::ShortcutRenameChannel,
+        Self::ShortcutMarkChannelRead,
+        Self::ShortcutDeleteChannel,
+        Self::ShortcutMarkWorktreeRead,
+        Self::ShortcutRenameFile,
+        Self::ShortcutDuplicateFile,
+        Self::ShortcutCopyRelativePath,
 
     ];
 
@@ -3031,6 +3069,25 @@ impl SettingsField {
             Self::ShortcutMarkAllRead => "Mark all as read",
             Self::ShortcutSearchInProject => "Search in project",
             Self::ShortcutCloneRepository => "Clone repository",
+            Self::ShortcutCopyBranch => "Copy branch",
+            Self::ShortcutOpenOrCreatePullRequest => "Open or create pull request…",
+            Self::ShortcutNewWorktreeFromBranch => "New worktree from this branch…",
+            Self::ShortcutMoveProjectUp => "Move project up",
+            Self::ShortcutMoveProjectDown => "Move project down",
+            Self::ShortcutResetSidebarOrder => "Reset sidebar order",
+            Self::ShortcutRevealInFileManager => "Reveal in file manager",
+            Self::ShortcutOpenRepositoryUrl => "Open repository on GitHub",
+            Self::ShortcutOpenInExternalEditor => "Open in external editor",
+            Self::ShortcutDeleteWorktree => "Delete worktree…",
+            Self::ShortcutRemoveProject => "Remove project…",
+            Self::ShortcutDeleteSelectedRows => "Delete selected sidebar rows…",
+            Self::ShortcutRenameChannel => "Rename channel…",
+            Self::ShortcutMarkChannelRead => "Mark channel read",
+            Self::ShortcutDeleteChannel => "Delete channel…",
+            Self::ShortcutMarkWorktreeRead => "Mark worktree read",
+            Self::ShortcutRenameFile => "Rename file…",
+            Self::ShortcutDuplicateFile => "Duplicate file…",
+            Self::ShortcutCopyRelativePath => "Copy relative path",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3171,6 +3228,25 @@ impl SettingsField {
             | Self::ShortcutMarkAllRead
             | Self::ShortcutSearchInProject
             | Self::ShortcutCloneRepository
+            | Self::ShortcutCopyBranch
+            | Self::ShortcutOpenOrCreatePullRequest
+            | Self::ShortcutNewWorktreeFromBranch
+            | Self::ShortcutMoveProjectUp
+            | Self::ShortcutMoveProjectDown
+            | Self::ShortcutResetSidebarOrder
+            | Self::ShortcutRevealInFileManager
+            | Self::ShortcutOpenRepositoryUrl
+            | Self::ShortcutOpenInExternalEditor
+            | Self::ShortcutDeleteWorktree
+            | Self::ShortcutRemoveProject
+            | Self::ShortcutDeleteSelectedRows
+            | Self::ShortcutRenameChannel
+            | Self::ShortcutMarkChannelRead
+            | Self::ShortcutDeleteChannel
+            | Self::ShortcutMarkWorktreeRead
+            | Self::ShortcutRenameFile
+            | Self::ShortcutDuplicateFile
+            | Self::ShortcutCopyRelativePath
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3270,6 +3346,25 @@ struct ShortcutDraft {
     mark_all_read: String,
     search_in_project: String,
     clone_repository: String,
+    copy_branch: String,
+    open_or_create_pull_request: String,
+    new_worktree_from_branch: String,
+    move_project_up: String,
+    move_project_down: String,
+    reset_sidebar_order: String,
+    reveal_in_file_manager: String,
+    open_repository_url: String,
+    open_in_external_editor: String,
+    delete_worktree: String,
+    remove_project: String,
+    delete_selected_rows: String,
+    rename_channel: String,
+    mark_channel_read: String,
+    delete_channel: String,
+    mark_worktree_read: String,
+    rename_file: String,
+    duplicate_file: String,
+    copy_relative_path: String,
 
 
     command_palette: String,
@@ -3357,6 +3452,25 @@ impl ShortcutDraft {
             mark_all_read: settings::format_chords(&shortcuts.mark_all_read),
             search_in_project: settings::format_chords(&shortcuts.search_in_project),
             clone_repository: settings::format_chords(&shortcuts.clone_repository),
+            copy_branch: settings::format_chords(&shortcuts.copy_branch),
+            open_or_create_pull_request: settings::format_chords(&shortcuts.open_or_create_pull_request),
+            new_worktree_from_branch: settings::format_chords(&shortcuts.new_worktree_from_branch),
+            move_project_up: settings::format_chords(&shortcuts.move_project_up),
+            move_project_down: settings::format_chords(&shortcuts.move_project_down),
+            reset_sidebar_order: settings::format_chords(&shortcuts.reset_sidebar_order),
+            reveal_in_file_manager: settings::format_chords(&shortcuts.reveal_in_file_manager),
+            open_repository_url: settings::format_chords(&shortcuts.open_repository_url),
+            open_in_external_editor: settings::format_chords(&shortcuts.open_in_external_editor),
+            delete_worktree: settings::format_chords(&shortcuts.delete_worktree),
+            remove_project: settings::format_chords(&shortcuts.remove_project),
+            delete_selected_rows: settings::format_chords(&shortcuts.delete_selected_rows),
+            rename_channel: settings::format_chords(&shortcuts.rename_channel),
+            mark_channel_read: settings::format_chords(&shortcuts.mark_channel_read),
+            delete_channel: settings::format_chords(&shortcuts.delete_channel),
+            mark_worktree_read: settings::format_chords(&shortcuts.mark_worktree_read),
+            rename_file: settings::format_chords(&shortcuts.rename_file),
+            duplicate_file: settings::format_chords(&shortcuts.duplicate_file),
+            copy_relative_path: settings::format_chords(&shortcuts.copy_relative_path),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -3656,6 +3770,25 @@ impl SettingsDraft {
             SettingsField::ShortcutMarkAllRead => self.keyboard_shortcuts.mark_all_read = value,
             SettingsField::ShortcutSearchInProject => self.keyboard_shortcuts.search_in_project = value,
             SettingsField::ShortcutCloneRepository => self.keyboard_shortcuts.clone_repository = value,
+            SettingsField::ShortcutCopyBranch => self.keyboard_shortcuts.copy_branch = value,
+            SettingsField::ShortcutOpenOrCreatePullRequest => self.keyboard_shortcuts.open_or_create_pull_request = value,
+            SettingsField::ShortcutNewWorktreeFromBranch => self.keyboard_shortcuts.new_worktree_from_branch = value,
+            SettingsField::ShortcutMoveProjectUp => self.keyboard_shortcuts.move_project_up = value,
+            SettingsField::ShortcutMoveProjectDown => self.keyboard_shortcuts.move_project_down = value,
+            SettingsField::ShortcutResetSidebarOrder => self.keyboard_shortcuts.reset_sidebar_order = value,
+            SettingsField::ShortcutRevealInFileManager => self.keyboard_shortcuts.reveal_in_file_manager = value,
+            SettingsField::ShortcutOpenRepositoryUrl => self.keyboard_shortcuts.open_repository_url = value,
+            SettingsField::ShortcutOpenInExternalEditor => self.keyboard_shortcuts.open_in_external_editor = value,
+            SettingsField::ShortcutDeleteWorktree => self.keyboard_shortcuts.delete_worktree = value,
+            SettingsField::ShortcutRemoveProject => self.keyboard_shortcuts.remove_project = value,
+            SettingsField::ShortcutDeleteSelectedRows => self.keyboard_shortcuts.delete_selected_rows = value,
+            SettingsField::ShortcutRenameChannel => self.keyboard_shortcuts.rename_channel = value,
+            SettingsField::ShortcutMarkChannelRead => self.keyboard_shortcuts.mark_channel_read = value,
+            SettingsField::ShortcutDeleteChannel => self.keyboard_shortcuts.delete_channel = value,
+            SettingsField::ShortcutMarkWorktreeRead => self.keyboard_shortcuts.mark_worktree_read = value,
+            SettingsField::ShortcutRenameFile => self.keyboard_shortcuts.rename_file = value,
+            SettingsField::ShortcutDuplicateFile => self.keyboard_shortcuts.duplicate_file = value,
+            SettingsField::ShortcutCopyRelativePath => self.keyboard_shortcuts.copy_relative_path = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -3900,6 +4033,25 @@ fn settings_update(
             next.keyboard_shortcuts.clone_repository = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutCopyBranch => { next.keyboard_shortcuts.copy_branch = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutOpenOrCreatePullRequest => { next.keyboard_shortcuts.open_or_create_pull_request = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutNewWorktreeFromBranch => { next.keyboard_shortcuts.new_worktree_from_branch = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutMoveProjectUp => { next.keyboard_shortcuts.move_project_up = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutMoveProjectDown => { next.keyboard_shortcuts.move_project_down = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutResetSidebarOrder => { next.keyboard_shortcuts.reset_sidebar_order = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutRevealInFileManager => { next.keyboard_shortcuts.reveal_in_file_manager = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutOpenRepositoryUrl => { next.keyboard_shortcuts.open_repository_url = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutOpenInExternalEditor => { next.keyboard_shortcuts.open_in_external_editor = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDeleteWorktree => { next.keyboard_shortcuts.delete_worktree = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutRemoveProject => { next.keyboard_shortcuts.remove_project = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDeleteSelectedRows => { next.keyboard_shortcuts.delete_selected_rows = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutRenameChannel => { next.keyboard_shortcuts.rename_channel = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutMarkChannelRead => { next.keyboard_shortcuts.mark_channel_read = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDeleteChannel => { next.keyboard_shortcuts.delete_channel = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutMarkWorktreeRead => { next.keyboard_shortcuts.mark_worktree_read = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutRenameFile => { next.keyboard_shortcuts.rename_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDuplicateFile => { next.keyboard_shortcuts.duplicate_file = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutCopyRelativePath => { next.keyboard_shortcuts.copy_relative_path = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -4797,6 +4949,7 @@ pub enum Message {
         event: keyboard::Event,
         captured: bool,
         region: crate::input_trace::KeyboardRegion,
+        widget: Option<widget::Id>,
     },
     KeyEvent {
         event: keyboard::Event,
@@ -14032,9 +14185,10 @@ impl Application for Cagents {
                 event,
                 captured,
                 region,
+                widget,
             } => (
                 Message::KeyEvent { event, captured },
-                Some(self.input_trace.scoped_keyboard_region(region)),
+                Some(self.input_trace.scoped_keyboard_focus(region, widget)),
             ),
             message => (message, None),
         };
@@ -14982,6 +15136,9 @@ impl Application for Cagents {
                 Task::batch(tasks)
             }
             Message::Sidebar(action) => {
+                if let SidebarAction::RunCommand { command, action } = action {
+                    return self.run_sidebar_registered_command(command, *action);
+                }
                 // A control in the pane can still be activated while a dialog
                 // is up: the modal captures the pointer, and the focus
                 // operation the dialog issues on open cannot reach a pane
@@ -15109,6 +15266,20 @@ impl Application for Cagents {
                         } else { Task::none() }
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
+                    SidebarAction::RunCommand { .. } => unreachable!("registered commands are validated before dispatch"),
+                    SidebarAction::DeleteRows(rows) => {
+                        if rows.len() == 1 {
+                            self.delete_sidebar_row(rows[0])
+                        } else {
+                            let visible = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, self.projects_sidebar_mode() == SidebarMode::Compact);
+                            if self.sidebar_state.selected_rows(&visible).into_iter().collect::<std::collections::BTreeSet<_>>() == rows.iter().copied().collect() {
+                                self.begin_sidebar_group_delete()
+                            } else {
+                                self.status = Some(TransientNotice::warning("The sidebar selection changed; select the rows again before deleting"));
+                                Task::none()
+                            }
+                        }
+                    }
                     SidebarAction::DeleteSelectedRows => self.begin_sidebar_group_delete(),
                     SidebarAction::ClearRowSelection => {
                         self.sidebar_state.clear_row_selection();
@@ -16671,6 +16842,8 @@ impl Application for Cagents {
                             self.focused_pane(),
                             workspace_widget::FocusedPane::TextInput
                                 | workspace_widget::FocusedPane::OutsideWorkspace
+                                | workspace_widget::FocusedPane::SidebarRows
+                                | workspace_widget::FocusedPane::SidebarFiles
                         )
                         && workspace_widget::global_shortcut(
                             &event,
@@ -16935,6 +17108,8 @@ impl Application for Cagents {
                             self.focused_pane(),
                             workspace_widget::FocusedPane::TextInput
                                 | workspace_widget::FocusedPane::OutsideWorkspace
+                                | workspace_widget::FocusedPane::SidebarRows
+                                | workspace_widget::FocusedPane::SidebarFiles
                         )
                         && let Some(card) = self.workspace.focused()
                         && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
@@ -18237,6 +18412,10 @@ impl Application for Cagents {
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
         let mut focus_regions = Vec::new();
+        for row in sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, self.projects_sidebar_mode() == SidebarMode::Compact) {
+            focus_regions.push((sidebar::selection_row_focus_id(row), workspace_widget::FocusedPane::SidebarRows.into()));
+        }
+        focus_regions.push((sidebar::file_panel_focus_id(), workspace_widget::FocusedPane::SidebarFiles.into()));
         let projection = self.workspace.projection(self.workspace.viewport_width());
         for mounted in &projection.mounted {
             let card = mounted.id;
@@ -18286,10 +18465,11 @@ impl Application for Cagents {
             surface,
             &self.input_trace,
             focus_regions,
-            |event, captured, region| Message::RoutedKeyEvent {
+            |event, captured, region, widget| Message::RoutedKeyEvent {
                 event,
                 captured,
                 region,
+                widget,
             },
         );
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
