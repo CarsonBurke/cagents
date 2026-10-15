@@ -60,10 +60,7 @@ impl Editor {
         let (kind, at) = match action {
             EditorLspAction::Definition(position) => (LocationKind::Definition, position.unwrap_or(at)),
             EditorLspAction::References => (LocationKind::References, at),
-            EditorLspAction::Dismiss => return self.update_navigation(Action::Dismiss(card)),
-            EditorLspAction::Complete => return self.update(Message::Complete),
-            EditorLspAction::Hover(position) => { self.lsp.request_hover(doc, position.unwrap_or(at)); return Task::none(); },
-            _ => { self.notice = Some("This language action is not available in standalone ceditor yet.".into()); return Task::none(); }
+            _ => return Task::none(),
         };
         let Some(version) = self.lsp.document_version(doc) else { return Task::none(); };
         if let Some(old) = self.lsp_navigation.requests.remove(&card) { self.lsp.cancel(old.request); }

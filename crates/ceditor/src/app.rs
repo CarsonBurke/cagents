@@ -3415,7 +3415,7 @@ impl Application for Editor {
                     self.handle_review(card, action)
                 }
                 Message::Navigation(action) => self.update_navigation(action),
-                Message::Repository(RepositoryAction::Language { card, action }) => self.request_navigation(card, action),
+                Message::Repository(RepositoryAction::Language { card, action: action @ (repository_widget::EditorLspAction::Definition(_) | repository_widget::EditorLspAction::References) }) => self.request_navigation(card, action),
                 Message::Repository(action) => {
                     if let RepositoryAction::DiffAnnotations {
                         identity,
