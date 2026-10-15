@@ -1565,6 +1565,8 @@ pub(super) struct Runtime {
     submit_after_paste: Option<PromptMode>,
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
+    child_expanded: HashMap<String, HashSet<String>>,
+    child_unfolded: HashMap<String, HashSet<String>>,
     /// Coordination card parts shown in full, as `{item id}#{part}`.
     unfolded: HashSet<String>,
     answers: view::Answers,
@@ -2135,6 +2137,8 @@ impl Runtime {
             submit_after_paste: None,
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
+            child_expanded: HashMap::new(),
+            child_unfolded: HashMap::new(),
             unfolded: HashSet::new(),
             answers: HashMap::new(),
             pending: None,
@@ -2184,6 +2188,8 @@ impl Runtime {
         self.find_disclosure = find::Disclosure::default();
         self.opened.clear();
         self.expanded.clear();
+        self.child_expanded.clear();
+        self.child_unfolded.clear();
         self.answers.clear();
         self.failures.clear();
         self.listed_models = 0;
@@ -2280,6 +2286,24 @@ impl Runtime {
         match self.selected_subagent.as_ref() {
             Some(id) => self.subagent_scroll.get(id).copied().unwrap_or_default(),
             None => self.scroll,
+        }
+    }
+    fn item_expanded(&self, id: &str) -> bool {
+        match &self.selected_subagent {
+            Some(child) => self
+                .child_expanded
+                .get(child)
+                .is_some_and(|set| set.contains(id)),
+            None => self.expanded.contains(id),
+        }
+    }
+    fn part_unfolded(&self, key: &str) -> bool {
+        match &self.selected_subagent {
+            Some(child) => self
+                .child_unfolded
+                .get(child)
+                .is_some_and(|set| set.contains(key)),
+            None => self.unfolded.contains(key),
         }
     }
     fn presentation_cache(&self) -> &HashMap<String, CachedItem> {
@@ -2405,7 +2429,7 @@ impl Runtime {
                 &mut self.child_cache,
                 &agent.items,
                 agent.status == chat::ToolStatus::Running,
-                &self.expanded,
+                self.child_expanded.entry(agent.id.clone()).or_default(),
                 self.syntax_theme,
                 self.session.launch.provider,
             );
@@ -2511,6 +2535,15 @@ impl Runtime {
         {
             self.selected_subagent = None;
         }
+        let child_ids: HashSet<&str> = snapshot
+            .subagents
+            .iter()
+            .map(|agent| agent.id.as_str())
+            .collect();
+        self.child_expanded
+            .retain(|id, _| child_ids.contains(id.as_str()));
+        self.child_unfolded
+            .retain(|id, _| child_ids.contains(id.as_str()));
         // Keep disclosure choices across page eviction, with a bounded budget.
         // Question anchors only describe the currently loaded window.
         if self.expanded.len() > 4096 {
@@ -7616,9 +7649,14 @@ impl Cagents {
             }
             Action::Toggle(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_disclosure.manual_item(&id);
-                    if !runtime.expanded.remove(&id) {
-                        runtime.expanded.insert(id.clone());
+                    let expanded = if let Some(child) = &runtime.selected_subagent {
+                        runtime.child_expanded.entry(child.clone()).or_default()
+                    } else {
+                        runtime.find_disclosure.manual_item(&id);
+                        &mut runtime.expanded
+                    };
+                    if !expanded.remove(&id) {
+                        expanded.insert(id.clone());
                     }
                     if let Some(item) = runtime.active_item(&id).cloned() {
                         let previous = runtime.presentation_cache_mut().remove(&id);
@@ -7626,7 +7664,7 @@ impl Cagents {
                             &item.content,
                             runtime.syntax_theme,
                             previous,
-                            runtime.expanded.contains(&id),
+                            runtime.item_expanded(&id),
                             false,
                             chat::coordination::recognize(&item, runtime.session.launch.provider),
                         );
@@ -7709,9 +7747,14 @@ impl Cagents {
             }
             Action::Unfold(target, key) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_disclosure.manual_part(&key);
-                    if !runtime.unfolded.remove(&key) {
-                        runtime.unfolded.insert(key);
+                    let unfolded = if let Some(child) = &runtime.selected_subagent {
+                        runtime.child_unfolded.entry(child.clone()).or_default()
+                    } else {
+                        runtime.find_disclosure.manual_part(&key);
+                        &mut runtime.unfolded
+                    };
+                    if !unfolded.remove(&key) {
+                        unfolded.insert(key);
                     }
                 }
             }
@@ -11288,11 +11331,8 @@ mod tests {
         assert_eq!(runtime.cache.len(), 1);
         let parent_revision = runtime.cache[&parent.id].revision;
         let raw = runtime.snapshot.clone();
-        app.chat_runtime_mut(target)
-            .unwrap()
-            .expanded
-            .insert(tool.id.clone());
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-0".into()))));
+        drop(app.handle_chat_ui(Action::Toggle(target, tool.id.clone())));
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.child_cache.len(), 1);
         assert!(Arc::ptr_eq(&raw, &runtime.snapshot));

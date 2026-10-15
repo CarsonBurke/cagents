@@ -1244,8 +1244,7 @@ impl Runtime {
                         .filter(|coordinated| coordinated.is_card())
                     {
                         let raw = self
-                            .expanded
-                            .contains(&item.id)
+                            .item_expanded(&item.id)
                             .then(|| self.step_detail(item, cached, markdown_settings));
                         self.coordination_card(item, cached, coordinated, markdown_settings, raw)
                     } else {
@@ -3595,7 +3594,7 @@ impl Runtime {
         // another filled bubble, so a message with two images does not read as
         // three separate things the reader said.
         let long = !attachment && (text.lines().count() > 12 || text.chars().count() > 2000);
-        let expanded = self.expanded.contains(&item.id);
+        let expanded = self.item_expanded(&item.id);
         let text = if long && !expanded {
             text.lines()
                 .take(12)
@@ -3692,7 +3691,7 @@ impl Runtime {
         else {
             return self.prompt_view(item);
         };
-        let expanded = self.expanded.contains(&item.id);
+        let expanded = self.item_expanded(&item.id);
         let toggle = |label: &'static str| -> Element<'static, Message> {
             widget::button::custom(design::caption(if expanded { "Show less" } else { label }))
                 .class(crate::ui_controls::control_style(false, None))
@@ -3873,7 +3872,7 @@ impl Runtime {
                     },
                 );
             let finished = reasoning_finished(items, busy, &item.id);
-            let expanded = self.expanded.contains(&item.id);
+            let expanded = self.item_expanded(&item.id);
             let elapsed = item.started_at.or(item.at).and_then(|start| {
                 items
                     .iter()
@@ -4959,6 +4958,115 @@ mod tests {
             runtime.child_cache[&child.id].stamp.is_none(),
             "missing recorded time never falls back to the current clock"
         );
+    }
+
+    #[test]
+    fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let parent = chat::Item {
+            id: "shared-thought".into(),
+            role: chat::Role::Assistant,
+            at: Some(1_700_000_000_000),
+            started_at: Some(1_700_000_000_000),
+            content: ItemContent::Text {
+                text: "Distinct parent reasoning".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+        };
+        let child = chat::Item {
+            content: ItemContent::Text {
+                text: "Distinct child reasoning".into(),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            ..parent.clone()
+        };
+        let (mut runtime, handle) = frame_cost::live_runtime(&[parent]);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.subagents.push(chat::Subagent {
+            status: chat::ToolStatus::Succeeded,
+            items: vec![Arc::new(child)],
+            ..native_child_fixture()
+        });
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let renderer = crate::app::tests::headless_renderer();
+        let inspect = |runtime: &Runtime| {
+            let item = runtime.active_item("shared-thought").unwrap();
+            let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_PROSE);
+            let mut element = runtime.prose_view(
+                item,
+                &runtime.presentation_cache()[&item.id],
+                turn::Slot::Thinking,
+                settings,
+            );
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 1000.0)),
+            );
+            let mut texts = Texts::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+            texts.0.join(" ")
+        };
+        assert!(
+            !inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
+        );
+        drop(app.handle_chat_ui(Action::Find(target, "Distinct parent reasoning".into())));
+        assert!(
+            inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+        assert!(
+            inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct child reasoning")
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(!runtime.item_expanded("shared-thought"));
+        assert!(!runtime.part_unfolded("shared-thought#output"));
+        assert!(!inspect(runtime).contains("Distinct parent reasoning"));
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+        assert!(
+            inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning")
+        );
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.item_expanded("shared-thought"));
+        assert!(runtime.part_unfolded("shared-thought#output"));
+        assert!(inspect(runtime).contains("Distinct child reasoning"));
+        drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
+        drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+        drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.item_expanded("shared-thought"));
+        assert!(runtime.part_unfolded("shared-thought#output"));
+        assert!(inspect(runtime).contains("Distinct parent reasoning"));
     }
 
     #[test]
