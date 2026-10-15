@@ -7284,8 +7284,17 @@ mod tests {
             super::super::ipc::TerminalCloseResult::Unknown(reason)
                 if reason.contains("no retained cleanup owner or published family proof")
         ));
-        assert_eq!(handle.inner.published.worker_join.load(Ordering::Acquire), 2);
-        assert!(!handle.inner.published.cleanup_published.load(Ordering::Acquire));
+        assert_eq!(
+            handle.inner.published.worker_join.load(Ordering::Acquire),
+            2
+        );
+        assert!(
+            !handle
+                .inner
+                .published
+                .cleanup_published
+                .load(Ordering::Acquire)
+        );
     }
 
     #[test]
