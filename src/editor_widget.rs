@@ -1121,32 +1121,42 @@ where
             let candidate = line.get(column..)?.chars().next().filter(|character| "()[]{}".contains(*character)).map(|character| (column, character))
                 .or_else(|| line.get(..column)?.char_indices().next_back().filter(|(_, character)| "()[]{}".contains(*character)));
             let (column, character) = candidate?; let first = Position { line: cursor.position.line, column };
-            let (open, close, forward) = match character { '(' => ('(', ')', true), '[' => ('[', ']', true), '{' => ('{', '}', true), ')' => ('(', ')', false), ']' => ('[', ']', false), '}' => ('{', '}', false), _ => return None };
-            let current = brackets::on_line(line, false).0;
-            if !current.iter().any(|(column, _)| *column == first.column) { return None; }
-            let mut depth = 1usize; let mut budget = 8 * 1024 * 1024usize;
-            if forward {
-                let mut block = false;
-                for (line_index, line) in lines.iter().enumerate().skip(first.line) {
-                    if line.text().len() > budget { return None; } budget -= line.text().len();
-                    let (tokens, end_block, _) = brackets::on_line(line.text(), block); block = end_block;
-                    for (column, character) in tokens {
-                        if line_index == first.line && column <= first.column { continue; }
-                        if character == open { depth += 1; } else if character == close { depth -= 1; if depth == 0 { return Some((first, Position { line: line_index, column })); } }
+            let forward = match character { '(' | '[' | '{' => true, ')' | ']' | '}' => false, _ => return None };
+            // Scan in source order so multiline comment state is exact on both
+            // sides of the caret. Keep only nesting positions, never source text.
+            let mut stack = Vec::new();
+            let mut block = false;
+            let mut budget = 8 * 1024 * 1024usize;
+            let mut reached = false;
+            for (line_index, line) in lines.iter().enumerate() {
+                if line.text().len() > budget { return None; }
+                budget -= line.text().len();
+                let (tokens, end_block, _) = brackets::on_line(line.text(), block);
+                block = end_block;
+                for (column, token) in tokens {
+                    let position = Position { line: line_index, column };
+                    if position == first { reached = true; }
+                    if forward && !reached { continue; }
+                    if matches!(token, '(' | '[' | '{') {
+                        if stack.len() >= 4096 { return None; }
+                        stack.push((token, position));
+                    } else {
+                        let expected = match token { ')' => '(', ']' => '[', '}' => '{', _ => continue };
+                        let Some((opening, opening_position)) = stack.pop() else {
+                            if position == first { return None; }
+                            continue;
+                        };
+                        if opening != expected {
+                            stack.clear();
+                            if reached { return None; }
+                            continue;
+                        }
+                        if !forward && position == first { return Some((opening_position, first)); }
+                        if forward && reached && stack.is_empty() { return Some((first, position)); }
                     }
                 }
-            } else {
-                let mut reverse_block = false;
-                for line_index in (0..=first.line).rev() {
-                    if lines[line_index].text().len() > budget { return None; } budget -= lines[line_index].text().len();
-                    let (tokens, end_block, starts_in_block) = brackets::on_line(lines[line_index].text(), false);
-                    if reverse_block && !end_block { continue; }
-                    reverse_block = starts_in_block;
-                    for (column, character) in tokens.into_iter().rev() {
-                        if line_index == first.line && column >= first.column { continue; }
-                        if character == close { depth += 1; } else if character == open { depth -= 1; if depth == 0 { return Some((Position { line: line_index, column }, first)); } }
-                    }
-                }
+                if line_index == first.line && !reached { return None; }
+                if !forward && reached { return None; }
             }
             None
         };
@@ -5428,6 +5438,18 @@ mod tests {
         content.perform_edit(Edit::Enter).unwrap();
         assert_eq!(content.text(), "{\n    \n}");
         assert_eq!(content.cursor().position, Position { line: 1, column: 4 });
+    }
+
+    #[test]
+    fn bracket_matching_keeps_multiline_comments_and_mixed_nesting_exact() {
+        let mut content = Content::with_text("fn f() {\n/*\n } ignored\n */\n [()]\n}");
+        content.set_cursor(Cursor { position: Position { line: 5, column: 1 }, selection: None });
+        assert_eq!(content.matching_brackets(), Some((Position { line: 0, column: 7 }, Position { line: 5, column: 0 })));
+        content.set_cursor(Cursor { position: Position { line: 2, column: 1 }, selection: None });
+        assert_eq!(content.matching_brackets(), None);
+        let mut malformed = Content::with_text("([)]");
+        malformed.set_cursor(Cursor { position: Position { line: 0, column: 0 }, selection: None });
+        assert_eq!(malformed.matching_brackets(), None);
     }
 
     #[test]
