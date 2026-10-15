@@ -16,6 +16,8 @@ use std::sync::{
 mod auth_recovery;
 mod changes;
 mod clipboard_image;
+mod clipboard_intent;
+mod clipboard_surface;
 mod completion;
 mod coordination;
 mod find;
@@ -35,8 +37,6 @@ mod retained;
 mod scroll;
 mod selectable_prose;
 mod selection;
-mod clipboard_intent;
-mod clipboard_surface;
 mod step;
 mod thumbnails;
 mod tool_text;
@@ -530,7 +530,10 @@ impl Default for State {
 impl State {
     /// Scope every native widget clipboard write to the same hub as async chat
     /// copies. Keep the hub private; the app root only wraps its final surface.
-    pub(super) fn clipboard_surface<'a, M: 'a>(&self, content: cosmic::Element<'a, M>) -> cosmic::Element<'a, M> {
+    pub(super) fn clipboard_surface<'a, M: 'a>(
+        &self,
+        content: cosmic::Element<'a, M>,
+    ) -> cosmic::Element<'a, M> {
         clipboard_surface::surface(content, self.copy_intents.clone())
     }
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {

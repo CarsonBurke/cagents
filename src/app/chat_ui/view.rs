@@ -1819,38 +1819,41 @@ impl Runtime {
         let transcript_index = content.len();
         content.push(if self.visible.load(Ordering::Relaxed) {
             let (catalog, bookmark) = self.selection_document();
-            crate::ui_memory::scoped_gate(selection::transcript_virtualized(
-                scroll::transcript_observed(
-                    transcript,
+            crate::ui_memory::scoped_gate(
+                selection::transcript_virtualized(
+                    scroll::transcript_observed(
+                        transcript,
+                        target,
+                        self.selected_subagent.as_deref(),
+                        anchors,
+                        selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
+                        selected
+                            .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
+                            .iter()
+                            .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
+                            .chain(self.turns.iter().flat_map(|turn| {
+                                let key = turn
+                                    .steps
+                                    .first()
+                                    .and_then(|step| snapshot.items.get(step.index));
+                                turn.steps.iter().filter_map(move |step| {
+                                    Some((
+                                        scroll::steps_id(&key?.id),
+                                        snapshot.items.get(step.index)?.id.as_str(),
+                                    ))
+                                })
+                            }))
+                            .collect(),
+                        self.observed_scroll.clone(),
+                        self.scroll_memory.clone(),
+                    ),
                     target,
                     self.selected_subagent.as_deref(),
-                    anchors,
-                    selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
-                    selected
-                        .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
-                        .iter()
-                        .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
-                        .chain(self.turns.iter().flat_map(|turn| {
-                            let key = turn
-                                .steps
-                                .first()
-                                .and_then(|step| snapshot.items.get(step.index));
-                            turn.steps.iter().filter_map(move |step| {
-                                Some((
-                                    scroll::steps_id(&key?.id),
-                                    snapshot.items.get(step.index)?.id.as_str(),
-                                ))
-                            })
-                        }))
-                        .collect(),
-                    self.observed_scroll.clone(),
-                    self.scroll_memory.clone(),
+                    catalog,
+                    bookmark,
                 ),
-                target,
-                self.selected_subagent.as_deref(),
-                catalog,
-                bookmark,
-            ), self.transcript_scope)
+                self.transcript_scope,
+            )
         } else {
             // Overscan cards can remain mounted after model dehydration.
             // Diff to a cheap child so no old retained paragraph survives.
@@ -6491,10 +6494,16 @@ mod tests {
         let target = runtime.target;
         let scope = runtime.transcript_scope;
         runtime.release_transcript_caches();
-        assert_eq!(runtime.transcript_scope, scope, "residency eviction is not Reset");
+        assert_eq!(
+            runtime.transcript_scope, scope,
+            "residency eviction is not Reset"
+        );
         runtime.forget_transcript();
         assert_eq!(runtime.transcript_scope, scope.wrapping_add(1));
-        assert_eq!(runtime.target, target, "Reset is not app target replacement");
+        assert_eq!(
+            runtime.target, target,
+            "Reset is not app target replacement"
+        );
         assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
         assert!(runtime.copied.is_none());
         assert!(runtime.selection_document.borrow().is_none());

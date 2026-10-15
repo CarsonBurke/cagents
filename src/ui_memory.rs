@@ -22,12 +22,23 @@ pub fn gate<'a, Message: 'a>(content: impl Into<Element<'a, Message>>) -> Elemen
 /// Recreate only this disposable subtree on an actual transcript reset.
 /// The model must keep the scope stable across publication, reflow and hide.
 /// The composer and other durable interaction state belong outside this gate.
-pub fn scoped_gate<'a, Message: 'a>(content: impl Into<Element<'a, Message>>, scope: u64) -> Element<'a, Message> {
-    Element::new(Gate { content: content.into(), scope })
+pub fn scoped_gate<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    scope: u64,
+) -> Element<'a, Message> {
+    Element::new(Gate {
+        content: content.into(),
+        scope,
+    })
 }
 
-struct Gate<'a, Message> { content: Element<'a, Message>, scope: u64 }
-struct Residency { scope: u64 }
+struct Gate<'a, Message> {
+    content: Element<'a, Message>,
+    scope: u64,
+}
+struct Residency {
+    scope: u64,
+}
 
 /// Called after reclaiming named state, before parking a tree. Traversal stops
 /// at each boundary: dropping its children releases the whole presentation.
@@ -150,9 +161,13 @@ impl<Message> Widget<Message, Theme, Renderer> for Gate<'_, Message> {
         viewport: &Rectangle,
         renderer: &Renderer,
     ) -> mouse::Interaction {
-        self.content
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
     }
 
     fn overlay<'b>(
@@ -264,30 +279,54 @@ mod tests {
     }
     #[test]
     fn actual_scope_change_discards_extracted_named_descendants_but_preserves_composer() {
-        let presentation=Rc::new(RefCell::new(Weak::new()));let composer=Rc::new(RefCell::new(Weak::new()));
-        let make=|scope|scoped_gate(
-            cosmic::widget::container(Element::new(Probe(presentation.clone())))
-                .id(cosmic::widget::Id::new("scope.transcript.reader")),scope);
-        let mut gate=make(7);let input:Element<'_,()>=cosmic::widget::container(Element::new(Probe(composer)))
-            .id(cosmic::widget::Id::new("scope.composer")).into();
-        let mut root=Tree::empty();root.children=vec![Tree::new(&gate),Tree::new(&input)];
-        let old_reader=presentation.borrow().clone();
-        let old_composer=root.children[1].children[0].state.downcast_ref::<Arc<()>>().clone();
-        let weak_composer=Arc::downgrade(&old_composer);drop(old_composer);
-        tree::NAMED.with(|named|*named.borrow_mut()=root.take_all_named());
+        let presentation = Rc::new(RefCell::new(Weak::new()));
+        let composer = Rc::new(RefCell::new(Weak::new()));
+        let make = |scope| {
+            scoped_gate(
+                cosmic::widget::container(Element::new(Probe(presentation.clone())))
+                    .id(cosmic::widget::Id::new("scope.transcript.reader")),
+                scope,
+            )
+        };
+        let mut gate = make(7);
+        let input: Element<'_, ()> = cosmic::widget::container(Element::new(Probe(composer)))
+            .id(cosmic::widget::Id::new("scope.composer"))
+            .into();
+        let mut root = Tree::empty();
+        root.children = vec![Tree::new(&gate), Tree::new(&input)];
+        let old_reader = presentation.borrow().clone();
+        let old_composer = root.children[1].children[0]
+            .state
+            .downcast_ref::<Arc<()>>()
+            .clone();
+        let weak_composer = Arc::downgrade(&old_composer);
+        drop(old_composer);
+        tree::NAMED.with(|named| *named.borrow_mut() = root.take_all_named());
         root.children[0].diff(&mut gate);
         cosmic::iced::runtime::user_interface::restore_cached_named_states(&mut root);
-        assert!(old_reader.upgrade().is_some(),"same-scope publication preserves native state");
+        assert!(
+            old_reader.upgrade().is_some(),
+            "same-scope publication preserves native state"
+        );
         assert!(weak_composer.upgrade().is_some());
         // Identical named IDs pass through the real extraction/restoration
         // cycle; resetting unnamed Tree children alone cannot prove this.
-        tree::NAMED.with(|named|*named.borrow_mut()=root.take_all_named());
-        let mut reset=make(8);root.children[0].diff(&mut reset);
+        tree::NAMED.with(|named| *named.borrow_mut() = root.take_all_named());
+        let mut reset = make(8);
+        root.children[0].diff(&mut reset);
         cosmic::iced::runtime::user_interface::restore_cached_named_states(&mut root);
-        assert!(old_reader.upgrade().is_none(),"same-ID old named reader cannot resurrect after Reset");
-        assert!(presentation.borrow().upgrade().is_some(),"fresh reader installed");
-        assert!(weak_composer.upgrade().is_some(),"composer remains outside disposable scope");
-        assert!(tree::NAMED.with(|named|named.borrow().is_empty()));
+        assert!(
+            old_reader.upgrade().is_none(),
+            "same-ID old named reader cannot resurrect after Reset"
+        );
+        assert!(
+            presentation.borrow().upgrade().is_some(),
+            "fresh reader installed"
+        );
+        assert!(
+            weak_composer.upgrade().is_some(),
+            "composer remains outside disposable scope"
+        );
+        assert!(tree::NAMED.with(|named| named.borrow().is_empty()));
     }
-
 }

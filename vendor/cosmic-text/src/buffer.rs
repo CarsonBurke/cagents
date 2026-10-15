@@ -10,10 +10,9 @@ use core_maths::CoreFloat;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
-    render_decoration, Affinity, Align, Attrs, AttrsList, BidiParagraphs, BorrowedWithFontSystem,
-    BufferLine, Color, Cursor, DecorationSpan, Ellipsize, FontSystem, Hinting, LayoutCursor,
-    LayoutGlyph, LayoutLine, LineEnding, LineIter, Motion, Renderer, Scroll, ShapeLine, Shaping,
-    Wrap,
+    Affinity, Align, Attrs, AttrsList, BidiParagraphs, BorrowedWithFontSystem, BufferLine, Color,
+    Cursor, DecorationSpan, Ellipsize, FontSystem, Hinting, LayoutCursor, LayoutGlyph, LayoutLine,
+    LineEnding, LineIter, Motion, Renderer, Scroll, ShapeLine, Shaping, Wrap, render_decoration,
 };
 
 bitflags::bitflags! {
