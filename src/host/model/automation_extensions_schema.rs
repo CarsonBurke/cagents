@@ -198,6 +198,21 @@ pub(super) fn discard_for_legacy_fixture(db:&Connection) {
     }
 }
 
+/// Historical project identity/filing values are exact. Only the two admitted
+/// discovery columns may appear, both NULL rather than guessed from old paths.
+#[cfg(test)]
+pub(super) fn assert_checkout_only_extension(old_ddl:&str,old_rows:&[Vec<rusqlite::types::Value>],new_ddl:&str,new_rows:&[Vec<rusqlite::types::Value>]) {
+    assert_eq!(super::schema::normalized(old_ddl),super::schema::normalized(PROJECTS_BASE));
+    assert_eq!(super::schema::normalized(new_ddl),super::schema::normalized(PROJECTS_TARGET));
+    assert_eq!(new_rows.len(),old_rows.len(),"original projects must not be inserted or removed");
+    for (old,new) in old_rows.iter().zip(new_rows) {
+        assert_eq!(old.len(),4,"genuine predecessor project layout");
+        assert_eq!(new.len(),6,"only two discovery columns are appended");
+        assert_eq!(&new[..4],old,"original repository/name/ordinal/kind remain exact");
+        assert_eq!(&new[4..],&[rusqlite::types::Value::Null,rusqlite::types::Value::Null],"no checkout is inferred from original project metadata");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
