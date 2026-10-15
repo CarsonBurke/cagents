@@ -57,6 +57,8 @@ use std::{
 
 mod snapshot;
 pub use snapshot::TextSnapshot;
+#[cfg(test)]
+pub use snapshot::SnapshotMemory;
 
 #[cfg(test)]
 thread_local! { static TEXT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }

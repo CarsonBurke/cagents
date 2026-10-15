@@ -266,6 +266,56 @@ impl PartialEq for TextSnapshot {
     }
 }
 impl Eq for TextSnapshot {}
+/// Heap payload owned by a set of snapshots, counting shared allocations
+/// once. Allocator metadata/rounding and test-only counters are excluded.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct SnapshotMemory {
+    pub nodes: usize,
+    pub line_text_bytes: usize,
+    pub serialized_bytes: usize,
+    pub payload_bytes: usize,
+}
+
+#[cfg(test)]
+impl TextSnapshot {
+    pub fn retained_payload<'a>(snapshots: impl IntoIterator<Item = &'a Self>) -> SnapshotMemory {
+        use std::collections::HashSet;
+        let mut memory = SnapshotMemory::default();
+        let mut nodes = HashSet::new();
+        let mut texts = HashSet::new();
+        let mut cells = HashSet::new();
+        let mut stack = Vec::new();
+        let header = 2 * std::mem::size_of::<usize>();
+        for snapshot in snapshots {
+            stack.extend(snapshot.root.as_deref());
+            if cells.insert(Arc::as_ptr(&snapshot.serialized) as usize) {
+                memory.payload_bytes += std::mem::size_of::<OnceLock<Arc<str>>>() + header;
+                if let Some(text) = snapshot.serialized.get()
+                    && texts.insert(Arc::as_ptr(text) as *const () as usize) {
+                    memory.serialized_bytes += text.len();
+                    memory.payload_bytes += text.len() + header;
+                }
+            }
+        }
+        while let Some(node) = stack.pop() {
+            if !nodes.insert(std::ptr::from_ref(node) as usize) { continue; }
+            memory.nodes += 1;
+            memory.payload_bytes += std::mem::size_of::<Node>() + header;
+            match node {
+                Node::Line(line) => {
+                    if texts.insert(Arc::as_ptr(&line.text) as *const () as usize) {
+                        memory.line_text_bytes += line.text.len();
+                        memory.payload_bytes += line.text.len() + header;
+                    }
+                }
+                Node::Branch { left, right, .. } => { stack.push(left); stack.push(right); }
+            }
+        }
+        memory
+    }
+}
+
 impl fmt::Debug for TextSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TextSnapshot")
@@ -467,6 +517,32 @@ mod tests {
             assert_balanced(right);
         }
     }
+    #[test]
+    fn retained_payload_distinguishes_shared_edits_from_whole_rewrites() {
+        let values: Vec<_> = (0..1024).map(|line| format!("line{line}")).collect();
+        let build = || TextSnapshot::from_lines(values.iter().map(|line| (line.as_str(),LineEnding::Lf,"\n")));
+        let mut shared = vec![build()];
+        for line in 0..3 {
+            let next = shared.last().unwrap().replaced(Position {line,column:0},Position {line,column:0},"x").unwrap();
+            shared.push(next);
+        }
+        let disjoint: Vec<_> = (0..4).map(|_| build()).collect();
+        let incremental = TextSnapshot::retained_payload(&shared);
+        let rewritten = TextSnapshot::retained_payload(&disjoint);
+        assert_eq!(rewritten.nodes,4*(2*1024-1));
+        assert!(incremental.nodes < rewritten.nodes/2,"unchanged AVL allocations must remain shared");
+        assert!(incremental.payload_bytes < rewritten.payload_bytes/2);
+        assert_eq!(incremental.serialized_bytes,0);
+        let _text = shared[0].text();
+        let cached = TextSnapshot::retained_payload(&shared);
+        assert_eq!(cached.serialized_bytes,shared[0].len());
+        let protocol: Vec<_> = shared.iter().map(TextSnapshot::without_cached_text).collect();
+        let detached = TextSnapshot::retained_payload(&protocol);
+        assert_eq!(detached.nodes,incremental.nodes);
+        assert_eq!(detached.line_text_bytes,incremental.line_text_bytes);
+        assert_eq!(detached.serialized_bytes,0);
+    }
+
     #[test]
     fn detached_consumer_cache_shares_lines_without_retaining_full_text() {
         let source = TextSnapshot::from_lines([("first",LineEnding::Lf,"\n"),("second",LineEnding::None,"")]);
