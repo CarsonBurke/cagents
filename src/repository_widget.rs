@@ -3768,6 +3768,16 @@ impl RepositoryRuntime {
         })
     }
 
+    /// Pure held-root census for domain registration/recovery exclusion.
+    /// Includes an unbound located editor's ORIGINAL root. This is not a save
+    /// capability: all current document/Locate/effect gates still apply.
+    pub fn retained_filesystem_root(&self) -> Option<Arc<crate::fs_safety::Root>> {
+        match &self.document {
+            DocumentState::Editable(document) => document.undo_root.as_ref().map(crate::editor::FileRootIdentity::retained_root),
+            _ => None,
+        }
+    }
+
     fn editor_root_unbound(&self) -> bool { matches!(&self.document, DocumentState::Editable(document) if document.root_unbound) }
 
     /// One descriptor metadata probe per second; unchanged files are never
@@ -13869,6 +13879,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn retained_root_census_clones_the_actual_read_root_through_logical_relocation() {
+        let directory = tempfile::tempdir().unwrap(); let named = directory.path().join("root"); let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("source.rs"), "original").unwrap();
+        let card = CardId::new(); let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(card, "source.rs");
+        runtime.descriptor.worktree = named.clone(); identity.worktree = named.clone();
+        assert!(runtime.retained_filesystem_root().is_none(), "pending native read has no invented Root");
+        let task = file_task(identity, crate::editor::PdfTone::Original, None);
+        finish_navigation_task(&mut runtime, task).await;
+        let original = runtime.retained_filesystem_root().expect("actual configured worker loaded its Root");
+        assert!(Arc::ptr_eq(&original, &runtime.retained_filesystem_root().unwrap()), "census does not duplicate FDs or reopen paths");
+        std::fs::rename(&named, &moved).unwrap(); std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("foreign"), "keep").unwrap();
+        // The explicit Locate reducer pauses effects before its worker result.
+        drop(runtime.rebind_editor_root_after_relocation(card));
+        assert!(runtime.editor_root_unbound());
+        assert!(Arc::ptr_eq(&original, &runtime.retained_filesystem_root().unwrap()));
+        assert_eq!(runtime.editor_text().as_deref(), Some("original"));
+        assert_eq!(std::fs::read(named.join("foreign")).unwrap(), b"keep");
     }
 
     #[tokio::test]

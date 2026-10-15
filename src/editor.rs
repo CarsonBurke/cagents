@@ -406,6 +406,9 @@ impl PartialEq for FileRootIdentity {
 }
 impl Eq for FileRootIdentity {}
 impl FileRootIdentity {
+    /// Pure clone of the original worker-opened descriptor. A stale spelling
+    /// does not turn this into authority over a newly located/replaced root.
+    pub fn retained_root(&self) -> std::sync::Arc<Root> { std::sync::Arc::clone(&self._root) }
     /// Called on the publication worker. A stale read receipt may still name
     /// this held root, but its old pathname cannot authorize a new checkout.
     pub(crate) fn validate_named(&self, worktree: &Path) -> Result<&Root, FileIoError> {
