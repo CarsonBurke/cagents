@@ -104,8 +104,10 @@ struct Tab {
     change_source_revision: u64,
     worktree_authority: Option<WorktreeAuthority>,
     discard_authority: Option<WorktreeAuthority>,
+    discard_queue_turn: Option<u64>,
     marker_authority: Option<WorktreeAuthority>,
     mutation_operation: u64,
+    mutation_cancel: Option<CancellationToken>,
     git_mutation_revision: u64,
     discard_recovery: Option<Arc<cagents::repository::DiscardRecovery>>,
     /// The pull request review behind the sidebar's Pull requests panel. It
@@ -1585,8 +1587,10 @@ impl Editor {
             change_source_revision: 1,
             worktree_authority: opened.authority,
             discard_authority: None,
+            discard_queue_turn: None,
             marker_authority: None,
             mutation_operation: 0,
+            mutation_cancel: None,
             git_mutation_revision: 0,
             discard_recovery: None,
             review,
@@ -2772,8 +2776,10 @@ impl Editor {
         }
         let operation = self.next_group_operation;
         self.next_group_operation = self.next_group_operation.wrapping_add(1);
+        let cancellation = CancellationToken::default();
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
+                tab.mutation_cancel = Some(cancellation.clone());
                 tab.mutation_operation = operation;
                 tab.mutation = Some(kind);
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
@@ -2782,6 +2788,10 @@ impl Editor {
             }
         }
         Some(root)
+    }
+
+    pub(super) fn mutation_cancellation(&self, id: CardId) -> Option<CancellationToken> {
+        self.tab(id)?.mutation_cancel.clone()
     }
 
     fn finish_mutation(&mut self, id: CardId, notice: Option<String>) -> Task<Message> {
@@ -2799,6 +2809,7 @@ impl Editor {
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = None;
+                tab.mutation_cancel = None;
                 tab.git_mutation_revision = tab.git_mutation_revision.wrapping_add(1);
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(None);
@@ -2867,11 +2878,12 @@ impl Editor {
             return Task::none();
         };
         let operation = self.tab(id).unwrap().mutation_operation;
+        let cancellation = self.mutation_cancellation(id).expect("admitted mutation has cancellation");
         let marker_authority = authority.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git").with_worktree_authority(authority)?;
-                let token = CancellationToken::default();
+                let token = cancellation;
                 if stage {
                     let request = StageRequest { worktree: root, selection };
                     if let Some(markers) = service.check_stage_markers(&request, &approved, &token)? {
@@ -3997,6 +4009,7 @@ impl Application for Editor {
                         | SidebarAction::ConfirmStageMarkers { key, .. }
                         | SidebarAction::UndoDiscard { key }
                         | SidebarAction::ToggleGitOutput { key }
+                        | SidebarAction::CancelGitMutation { key }
                         | SidebarAction::CommitMessageChanged { key, .. }
                         | SidebarAction::Commit { key, .. }
                         | SidebarAction::AmendChanged { key, .. }
@@ -4028,13 +4041,15 @@ impl Application for Editor {
                     }
                     if let SidebarAction::RequestDiscard { request, .. } = &action
                         && (request.worktree != tab.runtime.descriptor.worktree
-                            || tab.mutation.is_some())
+                            || tab.mutation.is_some()
+                            || tab.sidebar.source_control.as_ref().is_some_and(|source| source.busy()))
                     {
                         return Task::none();
                     }
                     tab.navigation.apply(&action);
                     let persist_expansion = matches!(action, SidebarAction::ToggleDirectory { .. });
                     let task = match action {
+                        SidebarAction::CancelGitMutation { .. } => self.cancel_git_mutations(id),
                         SidebarAction::ToggleGitOutput { .. } => {
                             if let Some(source) = tab.sidebar.source_control.as_mut() { source.output_expanded = !source.output_expanded; }
                             Task::none()
@@ -4043,10 +4058,11 @@ impl Application for Editor {
                             let Some(recovery) = tab.discard_recovery.clone().filter(|recovery| recovery.can_undo()) else { return Task::none(); };
                             let Some(authority) = tab.worktree_authority.clone() else { return Task::none(); };
                             if self.begin_mutation(id, MutationKind::Discard).is_none() { return Task::none(); }
+                            let cancellation = self.mutation_cancellation(id).expect("admitted mutation has cancellation");
                             let expires_unix_ms = recovery.expires_unix_ms;
                             let paths = recovery.entries.iter().map(|entry| entry.path.clone()).collect();
                             cosmic::task::future(async move {
-                                let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").with_worktree_authority(authority)?.undo_discard(&recovery, &CancellationToken::default()))
+                                let result = tokio::task::spawn_blocking(move || RepositoryService::system("git").with_worktree_authority(authority)?.undo_discard(&recovery, &cancellation))
                                     .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
                                 Message::UndoMutationFinished { card: id, expires_unix_ms, paths, result }
                             })
@@ -4068,23 +4084,35 @@ impl Application for Editor {
                         }
                         SidebarAction::RequestDiscard { .. } => {
                             tab.discard_authority = tab.worktree_authority.clone();
+                            tab.discard_queue_turn = None;
                             widget::text_input::focus(sidebar::discard_cancel_id())
                                 .map(cosmic::Action::App)
                         }
                         SidebarAction::CancelDiscard => {
                             tab.discard_authority = None;
+                            let turn = tab.discard_queue_turn.take();
+                            let root = tab.runtime.descriptor.worktree.clone();
+                            if let Some(queue) = self.git_groups.get_mut(&root)
+                                && queue.active == turn
+                            { queue.active = None; }
                             Task::batch([self.resume_change_groups(), self.resume_pending_files()])
                         },
                         SidebarAction::ConfirmDiscard { request, .. } => {
                             let Some(authority) = tab.discard_authority.take() else { return Task::none(); };
-                            if self.begin_mutation(id, MutationKind::Discard).is_none() {
-                                return Task::none();
+                            let turn = tab.discard_queue_turn.take();
+                            let root = tab.runtime.descriptor.worktree.clone();
+                            if self.begin_mutation_with_buffer_policy(id, MutationKind::Discard, false, turn).is_none() {
+                                if let Some(queue) = self.git_groups.get_mut(&root)
+                                    && queue.active == turn
+                                { queue.active = None; }
+                                return self.resume_change_groups();
                             }
+                            let cancellation = self.mutation_cancellation(id).expect("admitted mutation has cancellation");
                             cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     RepositoryService::system("git")
                                         .with_worktree_authority(authority)?
-                                        .discard_recoverable(&request, &CancellationToken::default())
+                                        .discard_recoverable(&request, &cancellation)
                                 })
                                 .await
                                 .map_err(|error| error.to_string())
@@ -4160,12 +4188,13 @@ impl Application for Editor {
                             {
                                 source.pending_stash_drop = None;
                             }
+                            let cancellation = self.mutation_cancellation(id).expect("admitted mutation has cancellation");
                             cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     RepositoryService::system("git").with_worktree_authority(authority)?.git_operation(
                                         &worktree,
                                         &operation,
-                                        &CancellationToken::default(),
+                                        &cancellation,
                                     )
                                 })
                                 .await
@@ -4179,6 +4208,7 @@ impl Application for Editor {
                             let Some(worktree) = self.begin_mutation(id, MutationKind::Push) else {
                                 return Task::none();
                             };
+                            let cancellation = self.mutation_cancellation(id).expect("admitted mutation has cancellation");
                             cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     RepositoryService::system("git").with_worktree_authority(authority)?.push(
@@ -4187,7 +4217,7 @@ impl Application for Editor {
                                             branch,
                                             target,
                                         },
-                                        &CancellationToken::default(),
+                                        &cancellation,
                                     )
                                 })
                                 .await
@@ -4252,12 +4282,13 @@ impl Application for Editor {
                             let Some(root) = self.begin_mutation(id, MutationKind::Other) else {
                                 return Task::none();
                             };
+                            let cancellation = self.mutation_cancellation(id).expect("admitted mutation has cancellation");
                             cosmic::task::future(async move {
                                 let result = tokio::task::spawn_blocking(move || {
                                     RepositoryService::system("git").with_worktree_authority(authority)?.git_operation(
                                         &root,
                                         &cagents::repository::GitOperation::IgnorePath { path },
-                                        &CancellationToken::default(),
+                                        &cancellation,
                                     )
                                 })
                                 .await
@@ -8133,6 +8164,51 @@ mod tests {
         let task = app.update(Message::Repository(selected));
         run_tasks(&mut app, task);
         assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
+    }
+
+    #[test]
+    fn standalone_group_discard_confirmation_keeps_its_turn_ahead_of_later_stage() {
+        use cagents::repository::ChangeArea;
+        use sidebar::ChangeGroupCommand as Group;
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("old.txt"), "old\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        let first = app.update(Message::Sidebar(SidebarAction::ChangeGroup { key: key.clone(), area: ChangeArea::Untracked, command: Group::Discard }));
+        drop(app.update(Message::Sidebar(SidebarAction::ChangeGroup { key: key.clone(), area: ChangeArea::Untracked, command: Group::Stage })));
+        run_tasks(&mut app, first);
+        let confirmation = app.pending_discard().unwrap().confirm_action();
+        std::fs::write(root.join("later.txt"), "later\n").unwrap();
+        sidebar_action(&mut app, confirmation);
+        assert!(!root.join("old.txt").exists());
+        assert!(root.join("later.txt").exists());
+        assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "later.txt");
+        assert!(app.git_groups.is_empty());
+        assert!(app.tabs.iter().all(|tab| tab.mutation.is_none()));
+    }
+
+    #[test]
+    fn standalone_cancel_preparation_releases_reservation_and_late_completion_cannot_mutate() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "working hunk\n").unwrap();
+        let mut app = editor();
+        app.settings.editor_auto_save = false;
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        open_real_change(&mut app, id, "tracked.txt", cagents::repository::ChangeArea::Unstaged);
+        let action = app.tab(id).unwrap().runtime.diff_hunk_mutation_action(id, cagents::git_patch::Kind::Stage).unwrap();
+        let parked = app.update(Message::Repository(action));
+        assert!(app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().busy());
+        sidebar_action(&mut app, SidebarAction::CancelGitMutation { key: key.clone() });
+        assert!(app.git_groups.is_empty());
+        assert!(!app.tab(id).unwrap().sidebar.source_control.as_ref().unwrap().busy());
+        run_tasks(&mut app, parked);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        sidebar_action(&mut app, SidebarAction::Stage { key, selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())] });
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "working hunk", "a new intention owns a fresh cancellation token");
     }
 
     #[test]
