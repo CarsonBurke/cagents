@@ -227,12 +227,11 @@ mod tests {
         output.stdout
     }
 
-    fn key(root: &Path) -> ActiveWorktreeKey {
-        ActiveWorktreeKey {
-            project_id: ProjectId::new(),
-            worktree_id: crate::model::WorktreeId::new(),
-            canonical_path: root.to_owned(),
-        }
+    fn group_task(app: &mut Cagents, key: ActiveWorktreeKey, area: ChangeArea, command: ChangeGroupCommand) -> Task<Message> {
+        if let Some(active) = app.source_control_mutations.remove(&key.canonical_path) { active.cancellation.cancel(); }
+        app.sidebar_model.source_control.as_mut().unwrap().set_mutation(None);
+        let operation = app.begin_mutation(&key, MutationKind::Other, None).unwrap();
+        app.queued_group_task(key, operation, area, command)
     }
 
     async fn run(task: Task<Message>) -> Message {
@@ -248,14 +247,13 @@ mod tests {
 
     #[tokio::test]
     async fn whole_group_stage_and_unstage_resolve_paths_at_execution_time() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-b", "main"]);
-        let app = super::super::tests::context_inspector_test_app(false);
-        let key = key(root.path());
+        let (mut app, key) = super::super::git_binding::tests::app_for(root.path());
         fs::write(root.path().join("first.txt"), "first\n").unwrap();
-        let task = app.queued_group_task(
+        let task = group_task(&mut app,
             key.clone(),
-            uuid::Uuid::new_v4(),
             ChangeArea::Untracked,
             ChangeGroupCommand::Stage,
         );
@@ -274,9 +272,8 @@ mod tests {
                 .count(),
             3
         );
-        let task = app.queued_group_task(
+        let task = group_task(&mut app,
             key,
-            uuid::Uuid::new_v4(),
             ChangeArea::Staged,
             ChangeGroupCommand::Unstage,
         );
@@ -292,6 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn whole_group_stage_preserves_marker_confirmation_and_discard_binds_exact_paths() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-b", "main"]);
         fs::write(root.path().join("merge.txt"), "baseline\n").unwrap();
@@ -323,11 +321,9 @@ mod tests {
         assert!(!conflict.status.success());
         fs::write(root.path().join("safe.txt"), "safe\n").unwrap();
         fs::write(root.path().join("markers.txt"), "untracked text\n").unwrap();
-        let app = super::super::tests::context_inspector_test_app(false);
-        let key = key(root.path());
-        let stage = app.queued_group_task(
+        let (mut app, key) = super::super::git_binding::tests::app_for(root.path());
+        let stage = group_task(&mut app,
             key.clone(),
-            uuid::Uuid::new_v4(),
             ChangeArea::Conflict,
             ChangeGroupCommand::Stage,
         );
@@ -340,9 +336,8 @@ mod tests {
         assert_eq!(selection.len(), 1);
         assert!(!markers.is_empty());
         assert!(!git(root.path(), &["ls-files", "--unmerged", "-z"]).is_empty());
-        let discard = app.queued_group_task(
+        let discard = group_task(&mut app,
             key.clone(),
-            uuid::Uuid::new_v4(),
             ChangeArea::Untracked,
             ChangeGroupCommand::Discard,
         );

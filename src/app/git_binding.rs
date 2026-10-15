@@ -234,4 +234,31 @@ pub(super) mod tests {
         drop(app.enqueue_git_mutation(key.clone(), QueuedGitMutation::Unstage(Vec::new())));
         assert!(app.source_control_mutations[&key.canonical_path].pending.is_empty(), "new logical actor cannot coalesce with the old actor's queue");
     }
+    #[test]
+    fn cancelled_parked_success_cannot_create_discard_or_marker_confirmation() {
+        if !WorktreeAuthority::supported() { return; }
+        for markers in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            init(temporary.path(), "original\n");
+            let (mut app, key) = app_for(temporary.path());
+            let operation = app.begin_mutation(&key, MutationKind::Other, None).unwrap();
+            let selection = vec![crate::repository::PathSelection::new(RepoPath::parse("file.txt").unwrap())];
+            // A worker completed successfully, but its message is parked until
+            // the user's cancellation has been reduced.
+            let parked = if markers {
+                Message::SourceControlStageChecked { key: key.clone(), operation, selection, markers: Default::default() }
+            } else {
+                Message::SourceControlGroupSelection { key: key.clone(), operation,
+                    area: crate::repository::ChangeArea::Untracked, command: sidebar::ChangeGroupCommand::Discard,
+                    result: Ok(selection) }
+            };
+            drop(app.update(Message::Sidebar(SidebarAction::CancelGitMutation { key: key.clone() })));
+            assert!(app.source_control_mutations[&key.canonical_path].cancellation.is_cancelled());
+            drop(app.update(parked));
+            assert!(!app.source_control_mutations.contains_key(&key.canonical_path));
+            assert!(app.sidebar_state.pending_discard().is_none());
+            assert!(app.sidebar_model.source_control.as_ref().unwrap().pending_marker_stage.is_none());
+        }
+    }
+
 }

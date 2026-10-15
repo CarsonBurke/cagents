@@ -14662,9 +14662,15 @@ impl Cagents {
         }
         let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
         let invalidated = self.refresh_ui.source_invalidated.clone();
-        let binding = self.refresh_ui.source_binding.get_or_insert_with(|| git_binding::Binding::new(key.clone())).clone();
+        let retained = self.source_control_mutations.get(&key.canonical_path)
+            .filter(|active| active.binding.key == key).map(|active| active.binding.clone());
+        let binding = self.refresh_ui.source_binding.get_or_insert_with(|| retained.unwrap_or_else(|| git_binding::Binding::new(key.clone()))).clone();
         if binding.key != key { return Task::none(); }
-        if let Some(source) = self.sidebar_model.source_control.as_mut() { source.set_command_binding_id(binding.id); }
+        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+            source.set_command_binding_id(binding.id);
+            source.set_mutation(self.source_control_mutations.get(&key.canonical_path)
+                .filter(|active| active.binding.id == binding.id).map(|active| active.kind));
+        }
         let model_key = key.clone();
         let reveal_demand = self.sidebar_state.files_reveal_demand().cloned();
         cosmic::task::future(async move {
@@ -30867,21 +30873,46 @@ mod tests {
         assert_eq!(notice(&app), None);
     }
 
-    #[test]
-    fn git_mutation_ownership_survives_navigation_and_fences_old_completions() {
+    fn source_control_test_app() -> (tempfile::TempDir, Cagents, ActiveWorktreeKey, ActiveWorktreeKey) {
+        let temporary = tempfile::tempdir().unwrap();
+        let main = temporary.path().join("main");
+        let other = temporary.path().join("fix-sidebar");
+        super::git_binding::tests::init(&main, "main\n");
+        super::git_binding::tests::init(&other, "other\n");
         let mut app = context_inspector_test_app(false);
         app.sidebar_model = sidebar::tests::panel_model();
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let original = app.sidebar_state.active_worktree().unwrap().clone();
+        for project in &mut app.sidebar_model.projects {
+            for worktree in &mut project.worktrees {
+                worktree.path = if worktree.id == original.worktree_id { main.clone() } else { other.clone() };
+            }
+        }
+        app.sidebar_model.source_control.as_mut().unwrap().key.canonical_path = main.clone();
+        app.sidebar_state.sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree: main.clone() });
         let key = app.sidebar_state.active_worktree().unwrap().clone();
-        let sibling = app
-            .sidebar_model
-            .worktree_at(Path::new("/repo/fix-sidebar"))
-            .unwrap();
+        let sibling = app.sidebar_model.worktree_at(&other).unwrap();
+        let mut binding = super::git_binding::Binding::new(key.clone());
+        binding.initialize().unwrap();
+        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(binding.id);
+        app.refresh_ui.source_binding = Some(binding);
+        app.active_workspace = Some(main);
+        (temporary, app, key, sibling)
+    }
+
+    #[test]
+    fn git_mutation_ownership_survives_navigation_and_fences_old_completions() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let first = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
         app.active_workspace = Some(sibling.canonical_path.clone());
         drop(app.rebind_source_control());
         assert!(!app.sidebar_model.source_control.as_ref().unwrap().busy());
+        let mut sibling_binding = super::git_binding::Binding::new(sibling.clone());
+        sibling_binding.initialize().unwrap();
+        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(sibling_binding.id);
+        app.refresh_ui.source_binding = Some(sibling_binding);
         let other = app
             .begin_mutation(&sibling, MutationKind::Push, None)
             .unwrap();
@@ -31042,14 +31073,8 @@ mod tests {
 
     #[test]
     fn git_commit_completion_preserves_later_edits_and_settles_parked_drafts() {
-        let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
-        let sibling = app
-            .sidebar_model
-            .worktree_at(Path::new("/repo/fix-sidebar"))
-            .unwrap();
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         drop(
             app.update(Message::Sidebar(SidebarAction::CommitMessageChanged {
@@ -34044,10 +34069,8 @@ mod tests {
 
     #[test]
     fn read_only_git_refuses_actual_mutation_dispatch_and_queue_admission() {
-        let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (_temporary, mut app, key, sibling) = source_control_test_app();
         let source = app.sidebar_model.source_control.as_ref().unwrap();
         let branch = source.branch.clone().unwrap();
         let target = source.upstream.clone().unwrap();
@@ -34880,10 +34903,8 @@ mod tests {
 
     #[test]
     fn git_mutation_queue_keeps_ten_clicks_and_refreshes_once_at_drain() {
-        let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let generation = app.refresh_ui.source_generation;
         for index in 0..10 {
@@ -34930,12 +34951,10 @@ mod tests {
 
     #[test]
     fn mutation_completion_preserves_host_refusal_and_retires_queued_projections() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
         for failed in [false, true] {
             for queued in [false, true] {
-                let mut app = context_inspector_test_app(false);
-                app.sidebar_model = sidebar::tests::panel_model();
-                app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-                let key = app.sidebar_state.active_worktree().unwrap().clone();
+                let (_temporary, mut app, key, sibling) = source_control_test_app();
                 app.active_workspace = Some(key.canonical_path.clone());
                 let source = app.sidebar_model.source_control.as_ref().unwrap();
                 let first = source.group(crate::repository::ChangeArea::Unstaged).unwrap().rows()[0].selection();
@@ -34968,10 +34987,8 @@ mod tests {
 
     #[test]
     fn git_mutation_failure_rolls_back_only_failed_intent_and_keeps_pending_rows() {
-        let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let source = app.sidebar_model.source_control.as_ref().unwrap();
         let failed = source
@@ -35037,10 +35054,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_git_on_exit_clears_pending_and_wakes_active_process() {
-        let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         for index in 0..2 {
             let path = crate::repository::RepoPath::parse(format!("exit-{index}.txt")).unwrap();
@@ -35063,10 +35077,8 @@ mod tests {
     }
     #[test]
     fn partial_discard_keeps_undo_after_rollback_and_rebinding() {
-        let mut app = context_inspector_test_app(false);
-        app.sidebar_model = sidebar::tests::panel_model();
-        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
-        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        if !crate::repository::WorktreeAuthority::supported() { return; }
+        let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         let path = crate::repository::RepoPath::parse("discarded.txt").unwrap();
         let request = crate::repository::DiscardRequest {
@@ -35139,7 +35151,7 @@ mod tests {
         drop(app.update(Message::SourceControlLoaded {
             key: key.clone(),
             request: app.refresh_ui.source_generation,
-            result: Ok(Some(Box::new((snapshot, model)))),
+            result: Ok(Some(Box::new((snapshot, model, app.refresh_ui.source_binding.clone().unwrap())))),
         }));
         assert_eq!(
             app.sidebar_model
