@@ -329,6 +329,10 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     let handle=host.lock().unwrap().chats[&id].handle.clone();
     wait_until(||handle.attachment_snapshot().ready,"actor never initialized");
     let identity=handle.actor_identity().unwrap();
+    assert!(matches!(host.lock().unwrap().chats[&id].session.native_continuity,chat::NativeContinuity::RetainedClaudeActor {protocol:1}),"registered source must equal published actor capability before first input");
+    let registry=super::super::agent_execution::registry(&host).unwrap();
+    let authority=registry.lock().unwrap().retained_agent_authority_source(id).unwrap().unwrap();
+    assert_eq!(authority,crate::agent_execution::HostedSession::Chat(host.lock().unwrap().chats[&id].session.clone()));
     struct Cleanup(crate::daemon::holder_registry::Record);
     impl Drop for Cleanup {fn drop(&mut self) {for process in [&self.0.root,&self.0.holder] {if process.is_current() {unsafe {libc::kill(process.pid,libc::SIGKILL);}}}}}
     let _cleanup=Cleanup(identity.record.clone());

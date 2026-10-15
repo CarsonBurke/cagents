@@ -1301,6 +1301,7 @@ fn start_with_execution(
         }
         spec.remove_unset_environment();
         let recovery_environment = spec.environment.clone();
+        let delegated_source = session.clone();
         // Capability is transient process context, never a public launch
         // recipe. A fresh provider may delegate only as its real session.
         if !matches!(
@@ -1418,6 +1419,31 @@ fn start_with_execution(
         // A helper commit is fallible RPC and must run outside HostState.
         // Keep its exact context in native_actor_startups on any uncertainty.
         handle.commit_native_installation().map_err(unavailable)?;
+        if remote {
+            let mut published = session.clone();
+            published.native_continuity = handle.native_continuity();
+            published.launch.session_id = handle.confirmed_session_id().or(published.launch.session_id);
+            if !published.has_valid_native_continuity() {
+                return Err(unavailable("The installed Claude actor did not prove valid retained ownership"));
+            }
+            // Advance the exact authority/pending-launch aliases before issuing
+            // the typed descriptor. Otherwise its late confirmed ID could not
+            // be retained: the registry would still name ReconnectOnly while
+            // the resident handle and client already name the installed actor.
+            let mut sources=vec![
+                crate::agent_execution::HostedSession::Chat(requested_source.clone()),
+                crate::agent_execution::HostedSession::Chat(delegated_source.clone()),
+                crate::agent_execution::HostedSession::Chat(session.clone()),
+            ];
+            if stopped_source_terminal && let Some(terminal)=&delegated_source.terminal {
+                sources.push(crate::agent_execution::HostedSession::Terminal(terminal.clone()));
+            }
+            super::agent_execution::registry(host).map_err(unavailable)?
+                .lock().unwrap_or_else(|p|p.into_inner())
+                .adopt_authenticated_agent_session(&sources,&crate::agent_execution::HostedSession::Chat(published.clone()))
+                .map_err(unavailable)?;
+            session=published;
+        }
         let execution_instance = handle.actor_identity().map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
