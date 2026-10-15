@@ -91,6 +91,9 @@ impl Choices {
             let count = |prefix| counts.iter().find_map(|part| part.strip_prefix(prefix).and_then(|value| value.parse().ok())).unwrap_or(0);
             choices.refs.push(Choice { name: name.to_string(), reference: reference.to_string(), oid: oid.to_string(), kind, ahead: count("ahead "), behind: count("behind "), remote_branch: (kind == Kind::Remote).then(|| name.split_once('/').map(|(_, branch)| branch.to_string())).flatten() });
         }
+        if !choices.refs.iter().any(|choice| choice.name == choices.default_base || choice.reference == choices.default_base) {
+            choices.default_base.clear();
+        }
         if choices.default_base.is_empty() {
             choices.default_base = ["origin/main", "origin/master"].into_iter()
                 .find(|name| choices.refs.iter().any(|choice| choice.kind == Kind::Remote && choice.name == *name))
@@ -131,6 +134,16 @@ impl Choices {
         if self.prefix.is_empty() || typed.starts_with(&self.prefix) || self.existing_branch(typed).is_some() || self.remotes.iter().any(|remote| typed.starts_with(&format!("{remote}/"))) || typed.contains("://") {
             typed.to_owned()
         } else { format!("{}{typed}", self.prefix) }
+    }
+
+    /// Pin the exact cached ref advertised by the caption. Existing branches
+    /// keep their own history, including explicit remote names not cached yet.
+    pub fn creation_base(&self, branch: &str, typed: &str, selected: Option<&str>) -> String {
+        if !typed.trim().is_empty() { return typed.to_owned(); }
+        let branch = self.effective_branch(branch);
+        if selected.is_some() || self.existing_branch(&branch).is_some()
+            || self.remotes.iter().any(|remote| branch.starts_with(&format!("{remote}/"))) { return String::new(); }
+        self.find(&self.default_base).map(|choice| choice.reference.clone()).unwrap_or_default()
     }
 
     pub fn outcome(&self, branch: &str, base: &str) -> String {
@@ -203,6 +216,17 @@ mod tests {
         choices.refs.push(local);
         assert_eq!(choices.outcome("origin/feature/y", ""), "Checks out existing origin/feature/y");
         assert_eq!(choices.outcome_selected("origin/feature/y", "", Some("refs/heads/origin/feature/y")), "Checks out existing origin/feature/y (7 ahead)");
+    }
+        #[test] fn blank_base_pins_the_captioned_ref_across_remote_default_ambiguity() {
+        let mut choices = Choices::parse(b"refs/heads/main\0aaaa\0\0\0*\nrefs/remotes/origin/main\0bbbb\0\0\0 \nrefs/remotes/upstream/release\0cccc\0\0\0 \nrefs/remotes/upstream/HEAD\0cccc\0\0refs/remotes/upstream/release\0 \n").unwrap();
+        choices.remotes = vec!["origin".into(), "upstream".into()];
+        assert!(choices.outcome("new", "").ends_with("from upstream/release"));
+        assert_eq!(choices.creation_base("new", "", None), "refs/remotes/upstream/release");
+        choices.remotes = vec!["upstream".into(), "another".into()];
+        assert_eq!(choices.creation_base("new", "", None), "refs/remotes/upstream/release");
+        assert_eq!(choices.creation_base("main", "", None), "");
+        assert_eq!(choices.creation_base("upstream/not-cached", "", None), "");
+        assert_eq!(choices.creation_base("new", "main", None), "main");
     }
         #[test] fn autocomplete_includes_remote_branches_and_base_tags() {
         let choices = choices();

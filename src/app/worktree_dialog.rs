@@ -559,10 +559,11 @@ impl Cagents {
         let prefix = dialog.prefix_dirty.then(|| dialog.choices.prefix.clone());
         let trust = (dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted)
             .then(|| dialog.choices.primary.clone().zip(dialog.choices.setup_plan.clone())).flatten();
+        let branch = dialog.effective_branch().expect("branch was validated before resolving");
         let input = WorktreeInput {
             repository: dialog.repository.clone(),
-            input: dialog.effective_branch().expect("branch was validated before resolving"),
-            base: draft.base.clone(),
+            base: dialog.choices.creation_base(&branch, &draft.base, selected_ref.as_deref()),
+            input: branch,
             managed_directory,
             destination: draft.destination.clone(),
             operation_id,
