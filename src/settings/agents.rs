@@ -76,7 +76,9 @@ impl AgentLaunchSettings {
         crate::account::probe::find_executable(provider.executable(), search_path).ok_or_else(|| format!("{} is not installed", provider.label()))
     }
 
-    pub fn validate(&self, provider: Provider) -> Result<(), String> {
+    /// Authentication and discovery consume execution policy without model,
+    /// effort or permission defaults, which are conversation choices.
+    pub fn validate_execution(&self, provider: Provider) -> Result<(), String> {
         if self.executable.as_deref().is_some_and(|path| !executable_available(path)) {
             return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
         }
@@ -85,13 +87,18 @@ impl AgentLaunchSettings {
             if environment_reserved(provider, name) { return Err(format!("{name} is reserved for account isolation and cannot be overridden.")); }
             if value.contains('\0') { return Err("Environment values cannot contain a NUL character.".into()); }
         }
+        if self.arguments.iter().any(|argument| argument.contains('\0')) { return Err("Arguments cannot contain a NUL character.".into()); }
+        Ok(())
+    }
+
+    pub fn validate(&self, provider: Provider) -> Result<(), String> {
+        self.validate_execution(provider)?;
         for value in self.model.iter().chain(self.effort.iter()) {
             if value.trim().is_empty() || value.chars().any(char::is_control) { return Err("Model and effort must be non-empty names without control characters.".into()); }
         }
         if self.permission_mode.as_deref().is_some_and(|mode| !permission_modes(provider).contains(&mode)) {
             return Err(format!("Choose a permission mode offered by {}.", provider.label()));
         }
-        if self.arguments.iter().any(|argument| argument.contains('\0')) { return Err("Arguments cannot contain a NUL character.".into()); }
         Ok(())
     }
 
@@ -306,6 +313,15 @@ mod tests {
         assert!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/usr/bin:/bin"))).is_err());
         assert_eq!(crate::model::login_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
         assert!(crate::control::terminal_spawn_recipe(root, vec![]).is_err(), "a missing pinned shell cannot silently switch to the login shell");
+    }
+
+    #[test]
+    fn account_execution_validation_ignores_conversation_defaults_only() {
+        let configuration = AgentLaunchSettings { model: Some("future\nmodel".into()), permission_mode: Some("future-mode".into()), ..Default::default() };
+        assert!(configuration.validate(Provider::Claude).is_err());
+        configuration.validate_execution(Provider::Claude).unwrap();
+        let invalid = AgentLaunchSettings { executable: Some("/missing/pinned-wrapper".into()), ..configuration };
+        assert!(invalid.validate_execution(Provider::Claude).is_err());
     }
 
     #[test]
