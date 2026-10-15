@@ -12,11 +12,19 @@ const MAX_RECOVERY_ROOTS: usize = 256;
 /// worktrees which this window has never opened.
 #[derive(Clone, Debug)]
 pub(super) struct WindowRecoveryRoots {
+    registry: uuid::Uuid,
+    required_projects: Vec<(PathBuf, u32)>,
     projects: Vec<worktree_dialog::WorktreeCreationSource>,
     edited: Vec<Arc<Root>>,
 }
 
 pub(super) struct ResolvedWindowRoots {
+    pub(super) registry: uuid::Uuid,
+    /// The issuer must cover these observed logical instances with its CURRENT
+    /// catalog, including Folder/bare/initial-load rows without a cached actor.
+    /// These are initial admission expectations, not a permanently frozen epoch
+    /// for an already accepted cleanup lease.
+    pub(super) required_projects: Vec<(PathBuf, u32)>,
     pub(super) edited_and_project_roots: Vec<Arc<Root>>,
     pub(super) common_directory_candidates: Vec<Arc<Root>>,
 }
@@ -29,18 +37,31 @@ impl Cagents {
         if crate::device::is_remote() {
             return Err("Local filesystem recovery is unavailable for a remote device.".into());
         }
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Err("Wait for the shared project registry before changing files with recovery.".into());
+        }
+        let mut required_projects = Vec::new();
+        for project in self.sidebar_model.projects.iter().take(MAX_RECOVERY_ROOTS + 1) {
+            let Some(shared) = self.workspace_model.projects.iter().find(|shared| shared.repository == project.repository) else {
+                return Err("Wait for the project to be registered before changing files with recovery.".into());
+            };
+            required_projects.push((shared.repository.clone(), shared.ordinal));
+        }
+        if required_projects.len() > MAX_RECOVERY_ROOTS {
+            return Err("Recovery exceeds the bounded registered-project census; no file was changed.".into());
+        }
         let projects: Vec<_> = self.sidebar_model.projects.iter()
             .filter_map(|project| self.retained_project_creation_source(project.id))
             .take(MAX_RECOVERY_ROOTS + 1)
             .collect();
         let edited: Vec<_> = self.cards.values().filter_map(|runtime| match runtime {
-            CardRuntime::Repository(repository) => repository.retained_filesystem_root(),
+            CardRuntime::Repository(repository) => Some(repository.retained_filesystem_roots()),
             _ => None,
-        }).take(MAX_RECOVERY_ROOTS + 1).collect();
+        }).flatten().take(MAX_RECOVERY_ROOTS + 1).collect();
         if projects.len().checked_add(edited.len()).is_none_or(|count| count > MAX_RECOVERY_ROOTS) {
             return Err("Recovery exceeds the bounded current-window root census; no file was changed.".into());
         }
-        Ok(WindowRecoveryRoots { projects, edited })
+        Ok(WindowRecoveryRoots { registry: self.workspace_model.identity, required_projects, projects, edited })
     }
 }
 
@@ -74,7 +95,7 @@ impl WindowRecoveryRoots {
             return Err(io::Error::new(io::ErrorKind::Unsupported, "Recovery exceeds the bounded current-window root census; no file was changed."));
         }
         check_cancelled()?;
-        Ok(ResolvedWindowRoots { edited_and_project_roots: unique, common_directory_candidates: common })
+        Ok(ResolvedWindowRoots { registry: self.registry, required_projects: self.required_projects, edited_and_project_roots: unique, common_directory_candidates: common })
     }
 }
 
@@ -95,14 +116,30 @@ mod tests {
         drop(app.update(Message::RepositoryLoaded {
             project_id: key.project_id, generation: 1, open_cards: false, result: Ok(Box::new(loaded)),
         }));
+        let row = app.sidebar_model.project(key.project_id).unwrap();
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.projects.push(serde_json::from_value(serde_json::json!({
+            "repository": row.repository, "name": row.name, "kind": row.kind, "ordinal": 7,
+        })).unwrap());
         let source = app.retained_project_creation_source(key.project_id).unwrap();
         let (original, common) = source.recovery_roots().unwrap();
         let resolved = app.recovery_window_roots().unwrap().resolve(&CancellationToken::new()).unwrap();
         assert!(resolved.edited_and_project_roots.iter().any(|root| Arc::ptr_eq(root, &original)));
         assert!(resolved.common_directory_candidates.iter().any(|root| Arc::ptr_eq(root, &common)));
+        let shared = app.workspace_model.projects.pop().unwrap();
+        assert!(app.recovery_window_roots().is_err(), "unregistered provisional roots cannot silently disappear from the known domain");
+        app.workspace_model.projects.push(shared);
         let delayed = app.recovery_window_roots().unwrap();
         app.retire_project_creation_source(key.project_id);
         assert!(delayed.resolve(&CancellationToken::new()).is_err(), "queued intake cannot replace a retired actor");
+        // Initial-load/non-Git/bare rows have no creation Source. They still
+        // carry a required registry identity, so an issuer must census the
+        // owning daemon's current root catalog or explicitly refuse admission.
+        let cold = app.recovery_window_roots().unwrap().resolve(&CancellationToken::new()).unwrap();
+        assert_eq!(cold.registry, app.workspace_model.identity);
+        assert_eq!(cold.required_projects, vec![(app.sidebar_model.project(key.project_id).unwrap().repository.clone(), 7)]);
+        assert!(cold.common_directory_candidates.is_empty());
+
         // Already resolved roots are still inputs, not an effect capability.
         // A separately accepted daemon/protection context may keep these exact
         // objects for cleanup after the originating project is closed.
@@ -112,7 +149,7 @@ mod tests {
     #[test]
     fn cancelled_census_does_not_resolve_any_project_or_open_a_replacement() {
         let token = CancellationToken::new(); token.cancel();
-        let input = WindowRecoveryRoots { projects: Vec::new(), edited: Vec::new() };
+        let input = WindowRecoveryRoots { registry: uuid::Uuid::new_v4(), required_projects: Vec::new(), projects: Vec::new(), edited: Vec::new() };
         let error = match input.resolve(&token) { Ok(_) => panic!("cancelled intake succeeded"), Err(error) => error };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     }
