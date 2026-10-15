@@ -227,7 +227,7 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
             "content":[{"type":"output_text","text":"SCENARIO_COMPLETE"}]
         }),
         None if scenario.contains("SCENARIO orphan-reaping") => shell(
-            "orphan-tools", "i=0; while [ \"$i\" -lt 3600 ] && [ ! -e stop-orphan-loop ]; do sh -c 'sleep 0.05 & echo $! >> orphan-pids'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED".into(), 1000,
+            "orphan-tools", "i=0; while [ \"$i\" -lt 3600 ] && [ ! -e stop-orphan-loop ]; do sh -c 'sleep 1 & echo $! >> orphan-pids'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED".into(), 1000,
         ),
         None if scenario.contains("SCENARIO long") => shell(
             "long",
@@ -1027,7 +1027,8 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
     // Every exit has a finite SIGCHLD delivery/reap window. Record raw Z
     // observations honestly, and separately detect accumulation persisting
     // across a 250ms grace period; a product polling timer is not involved.
-    let census = || {
+    let mut witnessed_children = BTreeSet::new();
+    let mut census = || {
         let identity = || {
             let stat = fs::read_to_string(format!("/proc/{holder}/stat")).expect("fixture holder vanished");
             let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
@@ -1046,8 +1047,10 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
         for pid in children {
             if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
                 let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
-                if fields.first() == Some(&"Z") && fields.get(1).and_then(|parent| parent.parse::<u64>().ok()) == Some(holder) {
-                    zombies.insert((pid, fields[19].parse::<u64>().unwrap()));
+                if fields.get(1).and_then(|parent| parent.parse::<u64>().ok()) == Some(holder) {
+                    let identity = (pid, fields[19].parse::<u64>().unwrap());
+                    witnessed_children.insert(identity.clone());
+                    if fields.first() == Some(&"Z") { zombies.insert(identity); }
                 }
             }
         }
@@ -1087,16 +1090,22 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
         if zombies.is_empty() || Instant::now() >= settle_deadline { break zombies; }
         thread::sleep(Duration::from_millis(10));
     };
-    let tools = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap().lines().count();
+    drop(census);
+    let tool_pids = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap();
+    let tools = tool_pids.lines().count();
+    let tool_pids = tool_pids.lines().map(str::to_owned).collect::<BTreeSet<_>>();
+    let witnessed_adoptions = witnessed_children.iter().filter(|(pid, _)| tool_pids.contains(pid)).count();
     let report = json!({"provider":fixture.version, "seconds":started.elapsed().as_secs_f64(),
         "holder":holder, "holder_start":holder_start, "provider_exited":final_provider.exited,
         "provider_ready":final_provider.ready, "samples":samples, "background_children":tools,
+        "witnessed_background_adoptions":witnessed_adoptions,
         "raw_zombie_observations":observed, "persistent_zombies_250ms":persistent, "final_zombies":final_zombies});
     eprintln!("{report}");
     if let Some(path) = std::env::var_os("CAGENTS_QUALIFICATION_EVIDENCE") {
         fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
     assert!(tools >= 1000, "the provider did not repeatedly background tools: {report}");
+    assert!(witnessed_adoptions >= 100, "the fixture did not witness repeated background-child adoption by this holder: {report}");
     assert!(persistent.is_empty(), "holder children remained unreaped across the measured grace period: {report}");
     assert!(final_zombies.is_empty(), "the same live holder retained zombies after its tool loop settled: {report}");
     let diagnostics = fixture.cli(&["diagnostics"]);
