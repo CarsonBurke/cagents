@@ -7,9 +7,7 @@ mod index;
 mod lifetime;
 mod rights;
 mod sqlite;
-#[cfg(feature = "host")]
 mod source;
-#[cfg(feature = "host")]
 pub(crate) use source::StoreSourceReceipt;
 pub(crate) use sqlite::{VerifiedReadContext, Coverage};
 pub(crate) use lifetime::{RevocationEpoch as SourceRevocationEpoch, RevocationProbe as SourceRevocationProbe};
