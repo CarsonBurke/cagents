@@ -421,6 +421,13 @@ pub struct KeyboardShortcuts {
     pub diff_stage_hunk: Vec<String>,
     pub diff_unstage_hunk: Vec<String>,
     pub diff_revert_hunk: Vec<String>,
+    pub browser_back: Vec<String>,
+    pub browser_forward: Vec<String>,
+    pub browser_reload: Vec<String>,
+    pub browser_stop: Vec<String>,
+    pub browser_address: Vec<String>,
+    pub browser_open_system: Vec<String>,
+    pub browser_import_logins: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -608,6 +615,13 @@ impl Default for KeyboardShortcuts {
             diff_stage_hunk: Vec::new(),
             diff_unstage_hunk: Vec::new(),
             diff_revert_hunk: Vec::new(),
+            browser_back: vec!["Alt+Left".into()],
+            browser_forward: vec!["Alt+Right".into()],
+            browser_reload: vec!["Ctrl+R".into(), "F5".into()],
+            browser_stop: Vec::new(),
+            browser_address: vec!["Ctrl+L".into()],
+            browser_open_system: Vec::new(),
+            browser_import_logins: Vec::new(),
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -640,7 +654,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 174] {
+    pub fn actions(&self) -> [&Vec<String>; 181] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -816,12 +830,19 @@ impl KeyboardShortcuts {
             &self.diff_stage_hunk,
             &self.diff_unstage_hunk,
             &self.diff_revert_hunk,
+            &self.browser_back,
+            &self.browser_forward,
+            &self.browser_reload,
+            &self.browser_stop,
+            &self.browser_address,
+            &self.browser_open_system,
+            &self.browser_import_logins,
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 174] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 181] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -997,6 +1018,13 @@ impl KeyboardShortcuts {
             &mut self.diff_stage_hunk,
             &mut self.diff_unstage_hunk,
             &mut self.diff_revert_hunk,
+            &mut self.browser_back,
+            &mut self.browser_forward,
+            &mut self.browser_reload,
+            &mut self.browser_stop,
+            &mut self.browser_address,
+            &mut self.browser_open_system,
+            &mut self.browser_import_logins,
         ]
     }
 
@@ -1058,7 +1086,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 174] = [
+const SHORTCUT_ACTIONS: [&str; 181] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -1233,6 +1261,13 @@ const SHORTCUT_ACTIONS: [&str; 174] = [
     "diff_stage_hunk",
     "diff_unstage_hunk",
     "diff_revert_hunk",
+    "browser_back",
+    "browser_forward",
+    "browser_reload",
+    "browser_stop",
+    "browser_address",
+    "browser_open_system",
+    "browser_import_logins",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1385,6 +1420,8 @@ pub fn text_editing_shortcut_conflict_for(
 ) -> Option<&'static str> {
     if is_editor_command(action)
         || (action == "find_in_pane" && parse_shortcut("Ctrl+F").ok() == Some(binding))
+        || (action == "browser_back" && parse_shortcut("Alt+Left").ok() == Some(binding))
+        || (action == "browser_forward" && parse_shortcut("Alt+Right").ok() == Some(binding))
     {
         None
     } else {
@@ -2487,7 +2524,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 169] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 176] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2657,6 +2694,13 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 169] = [
     "diff_stage_hunk",
     "diff_unstage_hunk",
     "diff_revert_hunk",
+    "browser_back",
+    "browser_forward",
+    "browser_reload",
+    "browser_stop",
+    "browser_address",
+    "browser_open_system",
+    "browser_import_logins",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {

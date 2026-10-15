@@ -194,6 +194,13 @@ pub enum GlobalShortcut {
     DiffStageHunk,
     DiffUnstageHunk,
     DiffRevertHunk,
+    BrowserBack,
+    BrowserForward,
+    BrowserReload,
+    BrowserStop,
+    BrowserAddress,
+    BrowserOpenSystem,
+    BrowserImportLogins,
 
     CommandPalette,
     NewThread,
@@ -480,6 +487,13 @@ impl GlobalShortcut {
             Self::DiffStageHunk => "diff_stage_hunk",
             Self::DiffUnstageHunk => "diff_unstage_hunk",
             Self::DiffRevertHunk => "diff_revert_hunk",
+            Self::BrowserBack => "browser_back",
+            Self::BrowserForward => "browser_forward",
+            Self::BrowserReload => "browser_reload",
+            Self::BrowserStop => "browser_stop",
+            Self::BrowserAddress => "browser_address",
+            Self::BrowserOpenSystem => "browser_open_system",
+            Self::BrowserImportLogins => "browser_import_logins",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -553,6 +567,8 @@ pub enum ShortcutScope {
     EditorHistory,
     /// Repository content or its non-text pane controls, including local diff.
     Repository,
+    /// Embedded browser content or its non-text chrome. Address fields remain native text.
+    Browser,
 }
 
 impl ShortcutScope {
@@ -571,6 +587,7 @@ impl ShortcutScope {
     /// the card, while `focused` has focus.
     pub fn applies_to(self, focused: FocusedPane) -> bool {
         match self {
+            Self::Browser => focused == FocusedPane::Browser,
             Self::Workspace => true,
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::OutsideTextInput => !focused.is_text_editing(),
@@ -615,6 +632,8 @@ pub enum FocusedPane {
     ChatPane,
     /// The native code editor.
     Editor,
+    /// Browser content can own a DOM field; preserve native editing vocabulary.
+    Browser,
     /// A text control outside the focused pane (sidebar, inspector, find bar).
     TextInput,
     /// A non-text control outside a pane.
@@ -628,7 +647,7 @@ impl FocusedPane {
     pub fn is_text_editing(self) -> bool {
         matches!(
             self,
-            Self::Editor | Self::WorkingDiff | Self::Chat | Self::TextInput
+            Self::Editor | Self::WorkingDiff | Self::Chat | Self::TextInput | Self::Browser
         )
     }
 }
@@ -676,6 +695,7 @@ pub struct CommandContext {
     pub diff_selection_commands: u8,
     pub diff_hunk_commands: u8,
     pub pdf_commands: u8,
+    pub browser_commands: u8,
     pub editor_surface_commands: u8,
     pub editor_language_commands: u8,
     pub diff_commands: u8,
@@ -687,8 +707,8 @@ pub struct CommandContext {
 }
 
 /// Display order shared by the Keyboard table and its registry coverage checks.
-pub const SHORTCUT_CATEGORIES: [&str; 6] =
-    ["Panes", "Navigation", "Chat", "Review", "Editor", "Git"];
+pub const SHORTCUT_CATEGORIES: [&str; 7] =
+    ["Panes", "Navigation", "Chat", "Review", "Editor", "Git", "Browser"];
 
 impl ShortcutDescriptor {
     pub const fn id(self) -> &'static str {
@@ -743,6 +763,8 @@ impl ShortcutDescriptor {
             ShortcutScope::Editor | ShortcutScope::EditorHistory | ShortcutScope::Repository
         ) {
             "Editor"
+        } else if self.scope == ShortcutScope::Browser {
+            "Browser"
         } else if self.scope == ShortcutScope::Review {
             "Review"
         } else {
@@ -777,6 +799,7 @@ impl ShortcutDescriptor {
                 | ShortcutScope::Review
                 | ShortcutScope::Editor
                 | ShortcutScope::EditorHistory
+                | ShortcutScope::Browser
         ) && !self.scope.applies_to(context.focused)
         {
             return false;
@@ -793,6 +816,7 @@ impl ShortcutDescriptor {
         if let Some(bit) = editor_language_command_bit(self.action) {
             return context.editor_language_commands & bit != 0;
         }
+        if let Some(bit) = browser_command_bit(self.action) { return context.browser_commands & bit != 0; }
         if let Some(bit) = pdf_command_bit(self.action) {
             return context.pdf_commands & bit != 0;
         }
@@ -1826,6 +1850,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::DiffStageHunk, label: "Stage current diff hunk", repeatable: false, scope: ShortcutScope::Review },
     ShortcutDescriptor { action: GlobalShortcut::DiffUnstageHunk, label: "Unstage current diff hunk", repeatable: false, scope: ShortcutScope::Review },
     ShortcutDescriptor { action: GlobalShortcut::DiffRevertHunk, label: "Revert current diff hunk", repeatable: false, scope: ShortcutScope::Review },
+    ShortcutDescriptor { action: GlobalShortcut::BrowserBack, label: "Browser back", repeatable: false, scope: ShortcutScope::Browser },
+    ShortcutDescriptor { action: GlobalShortcut::BrowserForward, label: "Browser forward", repeatable: false, scope: ShortcutScope::Browser },
+    ShortcutDescriptor { action: GlobalShortcut::BrowserReload, label: "Reload browser page", repeatable: false, scope: ShortcutScope::Browser },
+    ShortcutDescriptor { action: GlobalShortcut::BrowserStop, label: "Stop loading browser page", repeatable: false, scope: ShortcutScope::Browser },
+    ShortcutDescriptor { action: GlobalShortcut::BrowserAddress, label: "Focus browser address", repeatable: false, scope: ShortcutScope::Browser },
+    ShortcutDescriptor { action: GlobalShortcut::BrowserOpenSystem, label: "Open page in system browser", repeatable: false, scope: ShortcutScope::Browser },
+    ShortcutDescriptor { action: GlobalShortcut::BrowserImportLogins, label: "Import browser logins", repeatable: false, scope: ShortcutScope::Browser },
 ];
 
 static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
@@ -1985,6 +2016,13 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::DiffStageHunk => &shortcuts.diff_stage_hunk,
         GlobalShortcut::DiffUnstageHunk => &shortcuts.diff_unstage_hunk,
         GlobalShortcut::DiffRevertHunk => &shortcuts.diff_revert_hunk,
+        GlobalShortcut::BrowserBack => &shortcuts.browser_back,
+        GlobalShortcut::BrowserForward => &shortcuts.browser_forward,
+        GlobalShortcut::BrowserReload => &shortcuts.browser_reload,
+        GlobalShortcut::BrowserStop => &shortcuts.browser_stop,
+        GlobalShortcut::BrowserAddress => &shortcuts.browser_address,
+        GlobalShortcut::BrowserOpenSystem => &shortcuts.browser_open_system,
+        GlobalShortcut::BrowserImportLogins => &shortcuts.browser_import_logins,
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -2383,6 +2421,10 @@ fn text_editing_conflict(
     physical: keyboard::key::Physical,
     modifiers: keyboard::Modifiers,
 ) -> bool {
+    if modifiers.alt() && !modifiers.control() && !modifiers.shift() && !modifiers.logo()
+        && matches!((action, key.as_ref()), (GlobalShortcut::BrowserBack, keyboard::Key::Named(keyboard::key::Named::ArrowLeft)) | (GlobalShortcut::BrowserForward, keyboard::Key::Named(keyboard::key::Named::ArrowRight))) {
+        return false;
+    }
     text_editing_chord(key, physical, modifiers)
         || (action != GlobalShortcut::FindInPane
             && modifiers.control()
@@ -2629,6 +2671,16 @@ pub const fn diff_mutation_registry_command(kind: crate::git_patch::Kind, select
         (crate::git_patch::Kind::Stage, false) => GlobalShortcut::DiffStageHunk,
         (crate::git_patch::Kind::Unstage, false) => GlobalShortcut::DiffUnstageHunk,
         (crate::git_patch::Kind::Revert, false) => GlobalShortcut::DiffRevertHunk,
+    }
+}
+
+pub const BROWSER_COMMANDS: [GlobalShortcut; 7] = [GlobalShortcut::BrowserBack, GlobalShortcut::BrowserForward, GlobalShortcut::BrowserReload, GlobalShortcut::BrowserStop, GlobalShortcut::BrowserAddress, GlobalShortcut::BrowserOpenSystem, GlobalShortcut::BrowserImportLogins];
+pub const fn browser_command_bit(command: GlobalShortcut) -> Option<u8> {
+    match command {
+        GlobalShortcut::BrowserBack => Some(1 << 0), GlobalShortcut::BrowserForward => Some(1 << 1),
+        GlobalShortcut::BrowserReload => Some(1 << 2), GlobalShortcut::BrowserStop => Some(1 << 3),
+        GlobalShortcut::BrowserAddress => Some(1 << 4), GlobalShortcut::BrowserOpenSystem => Some(1 << 5),
+        GlobalShortcut::BrowserImportLogins => Some(1 << 6), _ => None,
     }
 }
 
@@ -7116,6 +7168,42 @@ mod tests {
         editing.editor_redo.clear();
         assert_eq!(global_shortcut(&word, &editing, FocusedPane::Editor), None);
         assert_eq!(global_shortcut(&word, &editing, FocusedPane::RepositoryPane), Some(GlobalShortcut::EditorSave));
+    }
+
+    #[test]
+    fn registered_browser_navigation_retires_old_aliases_and_preserves_native_fields() {
+        use keyboard::key::{Code, Physical};
+        let event = |named, code, modifiers| keyboard::Event::KeyPressed { key: keyboard::Key::Named(named), modified_key: keyboard::Key::Named(named), physical_key: Physical::Code(code), location: keyboard::Location::Standard, modifiers, text: None, repeat: false };
+        let mut shortcuts = KeyboardShortcuts::default();
+        let back = event(keyboard::key::Named::ArrowLeft, Code::ArrowLeft, keyboard::Modifiers::ALT);
+        let forward = event(keyboard::key::Named::ArrowRight, Code::ArrowRight, keyboard::Modifiers::ALT);
+        for (press, command) in [(&back, GlobalShortcut::BrowserBack), (&forward, GlobalShortcut::BrowserForward)] {
+            assert_eq!(global_shortcut(press, &shortcuts, FocusedPane::Browser), Some(command));
+            let keyboard::Event::KeyPressed { key, physical_key, modifiers, .. } = press else { unreachable!() };
+            assert!(is_global_shortcut_chord(key, *physical_key, *modifiers, &shortcuts, FocusedPane::Browser));
+            for focus in [FocusedPane::TextInput, FocusedPane::Editor, FocusedPane::Chat, FocusedPane::Terminal, FocusedPane::SidebarFiles] {
+                assert_eq!(global_shortcut(press, &shortcuts, focus), None, "{focus:?} retains its native motion");
+            }
+        }
+        for (press, command) in [(key_press("l", Code::KeyL, keyboard::Modifiers::CTRL, false), GlobalShortcut::BrowserAddress), (key_press("r", Code::KeyR, keyboard::Modifiers::CTRL, false), GlobalShortcut::BrowserReload), (event(keyboard::key::Named::F5, Code::F5, keyboard::Modifiers::empty()), GlobalShortcut::BrowserReload)] {
+            assert_eq!(global_shortcut(&press, &shortcuts, FocusedPane::Browser), Some(command));
+            assert_eq!(global_shortcut(&press, &shortcuts, FocusedPane::TextInput), None);
+        }
+        shortcuts.browser_back.clear();
+        shortcuts.browser_reload.clear();
+        assert_eq!(global_shortcut(&back, &shortcuts, FocusedPane::Browser), None);
+        assert_eq!(global_shortcut(&event(keyboard::key::Named::F5, Code::F5, keyboard::Modifiers::empty()), &shortcuts, FocusedPane::Browser), None);
+        shortcuts.browser_back = vec!["Alt+F9".into()];
+        assert!(shortcuts.fault().is_none());
+        assert_eq!(global_shortcut(&event(keyboard::key::Named::F9, Code::F9, keyboard::Modifiers::ALT), &shortcuts, FocusedPane::Browser), Some(GlobalShortcut::BrowserBack));
+        shortcuts.browser_back = vec!["Alt+Right".into()];
+        shortcuts.browser_forward.clear();
+        assert!(shortcuts.fault().is_none());
+        assert_eq!(global_shortcut(&forward, &shortcuts, FocusedPane::Browser), None, "only the conventional action/chord pair owns DOM word navigation");
+        for chord in ["Ctrl+Z", "Ctrl+Shift+Z", "Ctrl+A", "Ctrl+V", "Ctrl+Left"] {
+            let binding = parse_shortcut(chord).unwrap();
+            assert!(crate::settings::text_editing_shortcut_conflict_for("browser_reload", binding).is_some());
+        }
     }
 
     #[test]

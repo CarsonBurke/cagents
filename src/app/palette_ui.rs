@@ -313,6 +313,20 @@ fn settings_command_category(command: Command) -> Option<SettingsCategory> {
     }
 }
 
+/// Embedded controls use the live runtime's loading state and the durable
+/// history cursor. Saved descriptors without that runtime never call this.
+#[cfg(any(test, feature = "integrated-browser"))]
+fn browser_embedded_command_available(command: Command, history_index: usize, history_len: usize, loading: bool, import_busy: bool) -> bool {
+    match command {
+        Command::BrowserBack => history_index > 0,
+        Command::BrowserForward => history_index.saturating_add(1) < history_len,
+        Command::BrowserReload | Command::BrowserAddress => true,
+        Command::BrowserStop => loading,
+        Command::BrowserImportLogins => !import_busy,
+        _ => false,
+    }
+}
+
 impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
         match action {
@@ -1648,6 +1662,7 @@ impl Cagents {
                 Some(CardRuntime::Repository(runtime)) if card.is_some_and(|card| runtime.editor_focus_target(card).is_some()) => workspace_widget::FocusedPane::Editor,
                 Some(CardRuntime::Repository(_)) => workspace_widget::FocusedPane::RepositoryPane,
                 _ if state.is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) => workspace_widget::FocusedPane::ChatPane,
+                _ if state.is_some_and(|state| matches!(state.kind, CardKind::Browser(_))) => workspace_widget::FocusedPane::Browser,
                 _ => workspace_widget::FocusedPane::Other,
             },
             can_navigate_diagnostics: card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.diagnostic_navigation_available())),
@@ -1657,6 +1672,7 @@ impl Cagents {
                 Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
                 _ => None,
             }.map_or(0, |runtime| workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| workspace_widget::diff_command_bit(descriptor.action).filter(|_| runtime.diff_command_available(descriptor.id()))).fold(0, |flags, bit| flags | bit))),
+            browser_commands: card.map_or(0, |card| self.browser_command_capabilities(card)),
             pdf_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.pdf_command_capabilities(id), _ => 0 }),
             diff_presentation_commands: card.map_or(0, |card| self.diff_presentation_command_capabilities(card)),
             diff_selection_commands: card.map_or(0, |card| self.diff_selection_command_capabilities(card)),
@@ -1780,6 +1796,36 @@ impl Cagents {
         }).fold(0, |mask, bit| mask | bit)
     }
 
+    pub(super) fn registered_browser_action(&self, card: CardId, command: Command) -> Option<Message> {
+        let state = self.card_state(card).filter(|state| state.existence.is_open())?;
+        let CardKind::Browser(session) = &state.kind else { return None; };
+        if command == Command::BrowserOpenSystem {
+            return self.browser_system_request(card).map(|_| Message::OpenBrowserInSystem(card));
+        }
+        #[cfg(feature = "integrated-browser")]
+        {
+            let Some(CardRuntime::Browser(runtime)) = self.cards.get(&card) else { return None; };
+            let loading = runtime.lifecycle == BrowserLifecycle::Restoring || runtime.load_state.is_some();
+            if !browser_embedded_command_available(command, session.history_index, session.history.len(), loading, self.browser_import.busy()) { return None; }
+            match command {
+                Command::BrowserBack => Some(Message::BrowserBack(card)),
+                Command::BrowserForward => Some(Message::BrowserForward(card)),
+                Command::BrowserReload => Some(Message::BrowserReload(card)),
+                Command::BrowserStop => Some(Message::BrowserStop(card)),
+                Command::BrowserAddress => Some(Message::FocusBrowserAddress(card)),
+                Command::BrowserImportLogins => Some(Message::BrowserImport(browser_import_ui::Action::Open)),
+                _ => None,
+            }
+
+        }
+        #[cfg(not(feature = "integrated-browser"))]
+        { let _ = session; None }
+    }
+
+    fn browser_command_capabilities(&self, card: CardId) -> u8 {
+        workspace_widget::BROWSER_COMMANDS.into_iter().filter_map(|command| self.registered_browser_action(card, command).and_then(|_| workspace_widget::browser_command_bit(command))).fold(0, |mask, bit| mask | bit)
+    }
+
     fn registered_diff_mutation_action(&self, card: CardId, command: Command) -> Option<RepositoryAction> {
         self.diff_mutation_source(card)?;
         let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else { return None; };
@@ -1811,6 +1857,10 @@ impl Cagents {
     }
 
     fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if workspace_widget::browser_command_bit(command).is_some() {
+            return self.workspace.focused().and_then(|card| self.registered_browser_action(card, command)).map_or_else(Task::none, |message| self.update(message));
+        }
+
         if let Some(kind) = workspace_widget::diff_presentation_command(command) {
             let action = self.workspace.focused().and_then(|card| match self.cards.get(&card) {
                 Some(CardRuntime::Repository(runtime)) => runtime.diff_presentation_action(card, kind), Some(CardRuntime::PullRequests(pane)) => pane.runtime.diff_presentation_action(card, kind), _ => None,
@@ -2199,6 +2249,13 @@ impl Cagents {
             | Command::DiffStageHunk
             | Command::DiffUnstageHunk
             | Command::DiffRevertHunk
+            | Command::BrowserBack
+            | Command::BrowserForward
+            | Command::BrowserReload
+            | Command::BrowserStop
+            | Command::BrowserAddress
+            | Command::BrowserOpenSystem
+            | Command::BrowserImportLogins
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -2507,6 +2564,13 @@ impl SettingsField {
             Self::ShortcutDiffStageHunk => Some(Command::DiffStageHunk),
             Self::ShortcutDiffUnstageHunk => Some(Command::DiffUnstageHunk),
             Self::ShortcutDiffRevertHunk => Some(Command::DiffRevertHunk),
+            Self::ShortcutBrowserBack => Some(Command::BrowserBack),
+            Self::ShortcutBrowserForward => Some(Command::BrowserForward),
+            Self::ShortcutBrowserReload => Some(Command::BrowserReload),
+            Self::ShortcutBrowserStop => Some(Command::BrowserStop),
+            Self::ShortcutBrowserAddress => Some(Command::BrowserAddress),
+            Self::ShortcutBrowserOpenSystem => Some(Command::BrowserOpenSystem),
+            Self::ShortcutBrowserImportLogins => Some(Command::BrowserImportLogins),
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -2760,6 +2824,13 @@ impl ShortcutDraft {
             (Command::DiffStageHunk, self.diff_stage_hunk.as_str()),
             (Command::DiffUnstageHunk, self.diff_unstage_hunk.as_str()),
             (Command::DiffRevertHunk, self.diff_revert_hunk.as_str()),
+            (Command::BrowserBack, self.browser_back.as_str()),
+            (Command::BrowserForward, self.browser_forward.as_str()),
+            (Command::BrowserReload, self.browser_reload.as_str()),
+            (Command::BrowserStop, self.browser_stop.as_str()),
+            (Command::BrowserAddress, self.browser_address.as_str()),
+            (Command::BrowserOpenSystem, self.browser_open_system.as_str()),
+            (Command::BrowserImportLogins, self.browser_import_logins.as_str()),
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
             (Command::ClonePane, self.clone_pane.as_str()),
@@ -3800,6 +3871,40 @@ mod tests {
         app.sidebar_model.source_control = None;
         for command in [Command::DiffStageSelection, Command::DiffUnstageSelection, Command::DiffRevertSelection, Command::StageFile, Command::UnstageFile, Command::StageOrUnstageFile] { assert!(!app.command_available(command), "{command:?} needs the actual current worktree source"); }
         assert!(app.command_available(Command::DiffSplit), "presentation remains usable without mutation authority");
+    }
+
+    #[test]
+    fn embedded_browser_command_boundaries_follow_actual_history_and_loading() {
+        for (index, count, back, forward) in [(0, 0, false, false), (0, 1, false, false), (0, 3, false, true), (1, 3, true, true), (2, 3, true, false), (usize::MAX, usize::MAX, true, false)] {
+            assert_eq!(browser_embedded_command_available(Command::BrowserBack, index, count, false, false), back);
+            assert_eq!(browser_embedded_command_available(Command::BrowserForward, index, count, false, false), forward);
+        }
+        for loading in [false, true] {
+            assert_eq!(browser_embedded_command_available(Command::BrowserStop, 0, 1, loading, false), loading);
+            assert!(browser_embedded_command_available(Command::BrowserReload, 0, 1, loading, false), "an explicit reload remains available while loading");
+        }
+        assert!(!browser_embedded_command_available(Command::BrowserImportLogins, 0, 1, false, true));
+    }
+
+    #[test]
+    fn saved_browser_descriptors_offer_system_open_without_embedded_runtime_commands() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let url = Url::parse("https://example.test/saved").unwrap();
+        let session = crate::model::BrowserSession {
+            id: crate::model::BrowserId::new(), current_url: url.clone(), history: vec![url], history_index: 0,
+            scroll_x: 12.0, scroll_y: 34.0, fidelity: crate::model::BrowserRestoreFidelity::HistoryAndScroll,
+        };
+        app.card_state_mut(card).unwrap().kind = CardKind::Browser(session.clone());
+        app.cards.remove(&card);
+        assert!(app.command_available(Command::BrowserOpenSystem));
+        assert!(matches!(app.registered_browser_action(card, Command::BrowserOpenSystem), Some(Message::OpenBrowserInSystem(target)) if target == card));
+        for command in [Command::BrowserBack, Command::BrowserForward, Command::BrowserReload, Command::BrowserStop, Command::BrowserAddress, Command::BrowserImportLogins] {
+            assert!(!app.command_available(command));
+            assert!(app.registered_browser_action(card, command).is_none());
+            drop(app.run_workspace_command(command, keyboard::Modifiers::empty()));
+        }
+        assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Browser(saved) if *saved == session), "browserless and loading lanes retain the complete descriptor");
     }
 
     #[test]

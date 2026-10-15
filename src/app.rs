@@ -2309,44 +2309,6 @@ fn is_escape_press(event: &keyboard::Event) -> bool {
     )
 }
 
-#[cfg(feature = "integrated-browser")]
-fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
-    use keyboard::{Key, key::Named};
-    let keyboard::Event::KeyPressed {
-        key,
-        physical_key,
-        modifiers,
-        repeat: false,
-        ..
-    } = event
-    else {
-        return None;
-    };
-    if modifiers.logo() || modifiers.shift() {
-        return None;
-    }
-    if modifiers.control() && !modifiers.alt() {
-        return match key
-            .to_latin(*physical_key)
-            .map(|key| key.to_ascii_lowercase())
-        {
-            Some('l') => Some(Message::FocusBrowserAddress(card)),
-            Some('r') => Some(Message::BrowserReload(card)),
-            _ => None,
-        };
-    }
-    match key.as_ref() {
-        Key::Named(Named::ArrowLeft) if modifiers.alt() && !modifiers.control() => {
-            Some(Message::BrowserBack(card))
-        }
-        Key::Named(Named::ArrowRight) if modifiers.alt() && !modifiers.control() => {
-            Some(Message::BrowserForward(card))
-        }
-        Key::Named(Named::F5) if modifiers.is_empty() => Some(Message::BrowserReload(card)),
-        _ => None,
-    }
-}
-
 /// The first native size is reported as Opened, before any resize. Both
 /// events carry logical dimensions and replace the pre-map estimate.
 fn window_geometry_message(event: &window::Event) -> Option<Message> {
@@ -2970,11 +2932,18 @@ pub enum SettingsField {
     ShortcutDiffStageHunk,
     ShortcutDiffUnstageHunk,
     ShortcutDiffRevertHunk,
+    ShortcutBrowserBack,
+    ShortcutBrowserForward,
+    ShortcutBrowserReload,
+    ShortcutBrowserStop,
+    ShortcutBrowserAddress,
+    ShortcutBrowserOpenSystem,
+    ShortcutBrowserImportLogins,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 174] = [
+    const SHORTCUTS: [Self; 181] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3149,6 +3118,13 @@ impl SettingsField {
         Self::ShortcutDiffStageHunk,
         Self::ShortcutDiffUnstageHunk,
         Self::ShortcutDiffRevertHunk,
+        Self::ShortcutBrowserBack,
+        Self::ShortcutBrowserForward,
+        Self::ShortcutBrowserReload,
+        Self::ShortcutBrowserStop,
+        Self::ShortcutBrowserAddress,
+        Self::ShortcutBrowserOpenSystem,
+        Self::ShortcutBrowserImportLogins,
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3332,6 +3308,13 @@ impl SettingsField {
             Self::ShortcutDiffStageHunk => "Stage current diff hunk",
             Self::ShortcutDiffUnstageHunk => "Unstage current diff hunk",
             Self::ShortcutDiffRevertHunk => "Revert current diff hunk",
+            Self::ShortcutBrowserBack => "Browser back",
+            Self::ShortcutBrowserForward => "Browser forward",
+            Self::ShortcutBrowserReload => "Reload browser page",
+            Self::ShortcutBrowserStop => "Stop loading browser page",
+            Self::ShortcutBrowserAddress => "Focus browser address",
+            Self::ShortcutBrowserOpenSystem => "Open page in system browser",
+            Self::ShortcutBrowserImportLogins => "Import browser logins",
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3569,6 +3552,13 @@ impl SettingsField {
             | Self::ShortcutDiffStageHunk
             | Self::ShortcutDiffUnstageHunk
             | Self::ShortcutDiffRevertHunk
+            | Self::ShortcutBrowserBack
+            | Self::ShortcutBrowserForward
+            | Self::ShortcutBrowserReload
+            | Self::ShortcutBrowserStop
+            | Self::ShortcutBrowserAddress
+            | Self::ShortcutBrowserOpenSystem
+            | Self::ShortcutBrowserImportLogins
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3770,6 +3760,13 @@ struct ShortcutDraft {
     diff_stage_hunk: String,
     diff_unstage_hunk: String,
     diff_revert_hunk: String,
+    browser_back: String,
+    browser_forward: String,
+    browser_reload: String,
+    browser_stop: String,
+    browser_address: String,
+    browser_open_system: String,
+    browser_import_logins: String,
 
     command_palette: String,
     new_native_thread: String,
@@ -3960,6 +3957,13 @@ impl ShortcutDraft {
             diff_stage_hunk: settings::format_chords(&shortcuts.diff_stage_hunk),
             diff_unstage_hunk: settings::format_chords(&shortcuts.diff_unstage_hunk),
             diff_revert_hunk: settings::format_chords(&shortcuts.diff_revert_hunk),
+            browser_back: settings::format_chords(&shortcuts.browser_back),
+            browser_forward: settings::format_chords(&shortcuts.browser_forward),
+            browser_reload: settings::format_chords(&shortcuts.browser_reload),
+            browser_stop: settings::format_chords(&shortcuts.browser_stop),
+            browser_address: settings::format_chords(&shortcuts.browser_address),
+            browser_open_system: settings::format_chords(&shortcuts.browser_open_system),
+            browser_import_logins: settings::format_chords(&shortcuts.browser_import_logins),
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -4431,6 +4435,13 @@ impl SettingsDraft {
             SettingsField::ShortcutDiffStageHunk => self.keyboard_shortcuts.diff_stage_hunk = value,
             SettingsField::ShortcutDiffUnstageHunk => self.keyboard_shortcuts.diff_unstage_hunk = value,
             SettingsField::ShortcutDiffRevertHunk => self.keyboard_shortcuts.diff_revert_hunk = value,
+            SettingsField::ShortcutBrowserBack => self.keyboard_shortcuts.browser_back = value,
+            SettingsField::ShortcutBrowserForward => self.keyboard_shortcuts.browser_forward = value,
+            SettingsField::ShortcutBrowserReload => self.keyboard_shortcuts.browser_reload = value,
+            SettingsField::ShortcutBrowserStop => self.keyboard_shortcuts.browser_stop = value,
+            SettingsField::ShortcutBrowserAddress => self.keyboard_shortcuts.browser_address = value,
+            SettingsField::ShortcutBrowserOpenSystem => self.keyboard_shortcuts.browser_open_system = value,
+            SettingsField::ShortcutBrowserImportLogins => self.keyboard_shortcuts.browser_import_logins = value,
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -5013,6 +5024,13 @@ fn settings_update(
         SettingsField::ShortcutDiffStageHunk => { next.keyboard_shortcuts.diff_stage_hunk = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutDiffUnstageHunk => { next.keyboard_shortcuts.diff_unstage_hunk = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutDiffRevertHunk => { next.keyboard_shortcuts.diff_revert_hunk = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutBrowserBack => { next.keyboard_shortcuts.browser_back = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutBrowserForward => { next.keyboard_shortcuts.browser_forward = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutBrowserReload => { next.keyboard_shortcuts.browser_reload = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutBrowserStop => { next.keyboard_shortcuts.browser_stop = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutBrowserAddress => { next.keyboard_shortcuts.browser_address = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutBrowserOpenSystem => { next.keyboard_shortcuts.browser_open_system = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutBrowserImportLogins => { next.keyboard_shortcuts.browser_import_logins = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -8307,6 +8325,7 @@ impl Cagents {
             {
                 workspace_widget::FocusedPane::ChatPane
             }
+            _ if self.card_state(card).is_some_and(|state| matches!(state.kind, CardKind::Browser(_))) => workspace_widget::FocusedPane::Browser,
             _ => workspace_widget::FocusedPane::Other,
         }
     }
@@ -11034,7 +11053,7 @@ impl Cagents {
         });
 
         #[cfg(feature = "integrated-browser")]
-        let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|session| {
+        let browser_toolbar: Option<Element<'a, Message>> = browser_session.map(|_session| {
             let browser_loading = browser_runtime.is_some_and(|browser| {
                 browser.lifecycle == BrowserLifecycle::Restoring || browser.load_state.is_some()
             });
@@ -11042,10 +11061,8 @@ impl Cagents {
                 .map(|browser| browser.address.editable_str(browser.address_focused))
                 .or_else(|| chrome.map(|chrome| chrome.caption.as_str()))
                 .unwrap_or(SanitizedLocation::INVALID);
+            use workspace_widget::GlobalShortcut as BrowserCommand;
             let active = browser_runtime.is_some();
-            let can_go_back = active && session.history_index > 0;
-            let can_go_forward =
-                active && session.history_index.saturating_add(1) < session.history.len();
             let mut address_input = crate::ui_controls::field::text("URL", address)
                 .private()
                 .id(chrome.map_or_else(
@@ -11077,8 +11094,8 @@ impl Cagents {
                             .name("Back")
                             .width(ICON_CONTROL_SIZE)
                             .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(can_go_back.then_some(Message::BrowserBack(id))),
-                        "Back",
+                            .on_press_maybe(self.registered_browser_action(id, BrowserCommand::BrowserBack)),
+                        workspace_widget::shortcut_tooltip_named(BrowserCommand::BrowserBack, &self.settings.keyboard_shortcuts, "Back"),
                     ),
                     crate::interaction::tooltip_above(
                         widget::button::icon(Icon::ChevronRight)
@@ -11089,8 +11106,8 @@ impl Cagents {
                             .name("Forward")
                             .width(ICON_CONTROL_SIZE)
                             .height(ICON_CONTROL_SIZE)
-                            .on_press_maybe(can_go_forward.then_some(Message::BrowserForward(id))),
-                        "Forward",
+                            .on_press_maybe(self.registered_browser_action(id, BrowserCommand::BrowserForward)),
+                        workspace_widget::shortcut_tooltip_named(BrowserCommand::BrowserForward, &self.settings.keyboard_shortcuts, "Forward"),
                     ),
                     crate::interaction::tooltip_above(
                         widget::button::icon(if browser_loading {
@@ -11105,19 +11122,13 @@ impl Cagents {
                         .name(if browser_loading { "Stop" } else { "Reload" })
                         .width(ICON_CONTROL_SIZE)
                         .height(ICON_CONTROL_SIZE)
-                        .on_press_maybe(active.then_some(
-                            if browser_loading {
-                                Message::BrowserStop(id)
-                            } else {
-                                Message::BrowserReload(id)
-                            },
-                        )),
-                        if browser_loading { "Stop" } else { "Reload" },
+                        .on_press_maybe(self.registered_browser_action(id, if browser_loading { BrowserCommand::BrowserStop } else { BrowserCommand::BrowserReload })),
+                        workspace_widget::shortcut_tooltip_named(if browser_loading { BrowserCommand::BrowserStop } else { BrowserCommand::BrowserReload }, &self.settings.keyboard_shortcuts, if browser_loading { "Stop" } else { "Reload" }),
                     ),
                     address_input.into(),
                     crate::ui_controls::button::secondary("Open in system browser")
                         .id(card_control_id(id, "browser.system"))
-                        .on_press(Message::OpenBrowserInSystem(id))
+                        .on_press_maybe(self.registered_browser_action(id, workspace_widget::GlobalShortcut::BrowserOpenSystem))
                         .into(),
                     crate::interaction::tooltip_above(
                         widget::button::icon(Icon::Import)
@@ -11125,7 +11136,7 @@ impl Cagents {
                             .name("Import browser logins")
                             .width(ICON_CONTROL_SIZE)
                             .height(ICON_CONTROL_SIZE)
-                            .on_press(Message::BrowserImport(browser_import_ui::Action::Open)),
+                            .on_press_maybe(self.registered_browser_action(id, BrowserCommand::BrowserImportLogins)),
                         "Import browser logins",
                     ),
                 ])
@@ -11206,7 +11217,7 @@ impl Cagents {
                     address.into(),
                     crate::ui_controls::button::primary("Open in system browser")
                         .id(card_control_id(id, "browser.system"))
-                        .on_press(Message::OpenBrowserInSystem(id))
+                        .on_press_maybe(self.registered_browser_action(id, workspace_widget::GlobalShortcut::BrowserOpenSystem))
                         .into(),
                 ])
                 .align_y(Alignment::Center)
@@ -11371,7 +11382,6 @@ impl Cagents {
             #[cfg(feature = "integrated-browser")]
             Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
                 .obscured(self.workspace_inputs_blocked())
-                .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(card_focused)
                 .on_focus(Message::FocusCard(id))
                 .scale_factor(effective_surface_scale(
@@ -18895,14 +18905,6 @@ impl Application for Cagents {
                             RepositoryAction::FindNext { card }
                         }));
                     }
-                    #[cfg(feature = "integrated-browser")]
-                    if !captured
-                        && let Some(card) = self.workspace.focused()
-                        && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
-                        && let Some(message) = browser_shortcut(card, &event)
-                    {
-                        return cosmic::task::message(message);
-                    }
                     if !captured && let Some(task) = self.chat_scroll_key(&event) {
                         return task;
                     }
@@ -20405,6 +20407,7 @@ impl Application for Cagents {
                     | workspace_widget::FocusedPane::WorkingDiff
                     | workspace_widget::FocusedPane::ChatPane
                     | workspace_widget::FocusedPane::RepositoryPane
+                    | workspace_widget::FocusedPane::Browser
             ) {
                 kind
             } else {
