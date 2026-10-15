@@ -66,8 +66,12 @@ impl Cagents {
         }
     }
     pub(super) fn resume_recovered_editor_autosaves(&mut self) -> Task<Message> {
-        let tasks = self.cards.iter_mut().filter_map(|(card, runtime)| match runtime {
-            CardRuntime::Repository(runtime) => Some(repository_task(runtime.auto_save_task(*card))),
+        let cards = self.cards.iter().filter_map(|(card, runtime)| match runtime {
+            CardRuntime::Repository(runtime) if !self.publication_recovery_blocks(&runtime.descriptor.worktree) => Some(*card),
+            _ => None,
+        }).collect::<Vec<_>>();
+        let tasks = cards.into_iter().filter_map(|card| match self.cards.get_mut(&card) {
+            Some(CardRuntime::Repository(runtime)) => Some(repository_task(runtime.auto_save_task(card))),
             _ => None,
         }).collect::<Vec<_>>();
         Task::batch(tasks)
@@ -87,6 +91,48 @@ mod tests {
     use super::*;
     use cosmic::iced::futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[tokio::test]
+    async fn refused_actual_autosave_timer_is_retired_and_resumed_after_recovery() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let directory = tempfile::tempdir().unwrap(); let card = CardId::new();
+        let (mut runtime, _) = repository_widget::RepositoryRuntime::open_fixture(card, "note.rs", "baseline");
+        runtime.descriptor.worktree = directory.path().into(); runtime.set_auto_save(true);
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert('x')) }));
+        let mut timer = iced::runtime::task::into_stream(runtime.auto_save_task(card)).expect("actual autosave timer");
+        let due = loop {
+            match timer.next().await.expect("timer must deliver") {
+                iced::runtime::Action::Output(action @ RepositoryAction::AutoSaveDue { .. }) => break action,
+                _ => {},
+            }
+        };
+        let RepositoryAction::AutoSaveDue { ticket: old_ticket, .. } = &due else { unreachable!() }; let old_ticket = *old_ticket;
+        app.cards.insert(card, CardRuntime::Repository(runtime));
+        let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("another publisher's exact cleanup".into(), || Ok(()));
+        let failure = crate::editor_workspace_edit::PublicationFailure { message: "cleanup pending".into(), recovery: Some(authority.clone()), worktree: Some(directory.path().into()) };
+        drop(app.update(Message::EditorFeatures(Action::Published { ticket: 999, result: Err(failure) })));
+        drop(app.update(Message::Repository(due)));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.is_saving() && runtime.is_dirty()));
+        let retry = app.update(Message::EditorFeatures(Action::RetryPublicationRecovery(authority)));
+        let mut worker = iced::runtime::task::into_stream(retry).expect("real retry worker");
+        let resumed = loop {
+            match worker.next().await.expect("worker completion must deliver") {
+                iced::runtime::Action::Output(cosmic::Action::App(message @ Message::EditorFeatures(Action::PublicationRecoveryResolved { .. }))) => break app.update(message),
+                _ => {},
+            }
+        };
+        assert!(!app.publication_recovery_pending());
+        let mut timer = iced::runtime::task::into_stream(resumed).expect("recovery must install a replacement timer");
+        let due = loop {
+            match timer.next().await.expect("replacement timer must deliver") {
+                iced::runtime::Action::Output(cosmic::Action::App(Message::Repository(action @ RepositoryAction::AutoSaveDue { .. }))) => break action,
+                _ => {},
+            }
+        };
+        assert!(matches!(&due, RepositoryAction::AutoSaveDue { ticket, .. } if *ticket != old_ticket));
+        drop(app.update(Message::Repository(due)));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.is_saving()), "unchanged dirty revision must regain its ordinary save intent");
+    }
+
     #[tokio::test]
     async fn orphaned_publication_receipt_keeps_scoped_recovery_and_real_retry_after_failed_attempt() {
         let mut app = super::super::tests::context_inspector_test_app(false);
