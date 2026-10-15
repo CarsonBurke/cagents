@@ -7572,7 +7572,9 @@ impl Cagents {
         };
         let succeeded = result.is_ok();
         let result = result.map_err(|message| RuntimeError {
-            code: "runtime_hydration_failed".into(),
+            code: if message.contains(crate::terminal_ipc::WORKING_DIRECTORY_UNAVAILABLE) {
+                crate::terminal_ipc::WORKING_DIRECTORY_UNAVAILABLE.into()
+            } else { "runtime_hydration_failed".into() },
             message,
         });
         if !self.lifecycle.hydration_finished(card, epoch, result) {

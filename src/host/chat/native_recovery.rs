@@ -287,10 +287,12 @@ fn restore_authenticated(
                     && current.handle.holder_identity() == paired_holder.as_ref()
                     && current.session.launch == terminal.launch
                     && current.session.owned_codex_listener == terminal.owned_codex_listener
-                    && current.session.continuity.live_proof().as_ref() == Some(proof)
             })
             .ok_or("The paired terminal could not be recovered; native ownership was preserved")?;
-        *terminal = current.session.clone();
+        *terminal = state.native_terminal_projection(terminal.id)?;
+        if terminal.continuity.live_proof().as_ref() != Some(proof) {
+            return Err("The native console worker belongs to a different daemon owner".into());
+        }
         Ok(Some(current.handle.clone()))
     })();
     let paired = match paired {
@@ -371,7 +373,11 @@ fn restore_authenticated(
     };
     let response = session_snapshot(&record);
     record.handle.commit_native_installation();
+    let has_pair = record.paired_terminal.is_some();
     let retired = state.chats.insert(id, record);
+    if has_pair && !state.confirm_native_terminal_binding(id) {
+        tracing::warn!(terminal = %id, "Retained native actor installed but its exact console binding remains unavailable");
+    }
     if let Some(context) = execution_context {
         context.installed();
     }

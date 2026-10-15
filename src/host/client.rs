@@ -386,7 +386,9 @@ pub(super) fn process_request(
     // effects, including provider closes that finish outside HostState.
     let exclusive = matches!(
         &request,
-        ClientRequest::PrepareUpgrade { .. }
+        ClientRequest::ReconcileTerminal { .. }
+            | ClientRequest::ReconcileTerminalClose { .. }
+            | ClientRequest::PrepareUpgrade { .. }
             | ClientRequest::PrepareConfirmedUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
@@ -735,6 +737,53 @@ pub(super) fn process_request(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .edit_model(client_id, edit)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
+        ClientRequest::ReconcileTerminal { session } => {
+            let terminal = super::state::terminal_reconcile::reconcile(host, client_id, &session)?;
+            let snapshot = super::state::client_snapshot(host, client_id, session.id, 0)?;
+            let mut extras = snapshot.map(|snapshot| ServerMessage::Snapshot { terminal_id: session.id, snapshot }).into_iter().collect::<Vec<_>>();
+            extras.push(ServerMessage::Synchronized { terminal_id: session.id, generation: terminal.generation, event_sequence: terminal.event_sequence });
+            host.lock().unwrap_or_else(|p| p.into_inner()).announce_created(client_id, session.id);
+            Ok((ServerResponse::Spawned { terminal }, extras, false))
+        }
+        ClientRequest::ReconcileTerminalClose { session, allow_active } => {
+            match super::state::terminal_reconcile::reconcile(host, client_id, &session) {
+                Ok(_) => {}
+                Err(error) if error.code == ProtocolErrorCode::TerminalNotFound => {
+                    let proof = current_proof(host);
+                    if crate::terminal::holder::cleanup::confirmed_source(&session, &proof).map_err(|message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, false))? {
+                        return Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id, outcome: crate::terminal_ipc::TerminalCloseResult::Closed }, Vec::new(), false));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+            let (handle, paired_busy) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let handle = state.history_handle(client_id, session.id)?;
+                let paired_busy = state.chats.get(&session.id).map(|record| {
+                    if !record.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&handle))
+                        || !record.session.terminal.as_ref().is_some_and(|terminal| terminal.id == session.id && terminal.launch == session.launch) {
+                        return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
+                            "The terminal worker no longer belongs to this provider pairing; nothing was closed", false));
+                    }
+                    Ok(record.handle.owns_work())
+                }).transpose()?.unwrap_or(false);
+                (handle, paired_busy)
+            };
+            if paired_busy && !allow_active {
+                return Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id,
+                    outcome: crate::terminal_ipc::TerminalCloseResult::Active }, Vec::new(), false));
+            }
+            let outcome = if handle.is_completed() {
+                handle.shutdown().map_err(send_error)?;
+                crate::terminal_ipc::TerminalCloseResult::Closed
+            } else { handle.close_checked(allow_active) };
+            if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+                host.lock().unwrap_or_else(|p| p.into_inner()).close_terminal_attention(session.id, Some(&handle));
+                super::chat::close_for_terminal(host, session.id)?;
+            }
+            Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id, outcome }, Vec::new(), false))
         }
         ClientRequest::Spawn { session, options } => {
             super::agent_execution::terminals::adopt(host, client_id, session.id)?;
@@ -1481,15 +1530,25 @@ mod tests {
 
     #[test]
     fn completed_terminal_requires_confirmation_for_its_exact_native_actor() {
-        assert_completed_native_confirmation(crate::agent::Provider::Codex);
+        assert_completed_native_confirmation(crate::agent::Provider::Codex, false);
     }
 
     #[test]
     fn completed_console_requires_confirmation_for_its_exact_native_actor() {
-        assert_completed_native_confirmation(crate::agent::Provider::Claude);
+        assert_completed_native_confirmation(crate::agent::Provider::Claude, false);
     }
 
-    fn assert_completed_native_confirmation(provider: crate::agent::Provider) {
+    #[test]
+    fn exact_live_close_retains_native_confirmation_after_the_pty_completes() {
+        assert_completed_native_confirmation(crate::agent::Provider::Codex, true);
+    }
+
+    #[test]
+    fn exact_live_close_retains_console_confirmation_after_the_pty_completes() {
+        assert_completed_native_confirmation(crate::agent::Provider::Claude, true);
+    }
+
+    fn assert_completed_native_confirmation(provider: crate::agent::Provider, reconcile: bool) {
         use crate::{
             chat::{
                 self,
@@ -1595,9 +1654,14 @@ mod tests {
                 },
             );
         }
-        let request = |allow_active| ClientRequest::ReleaseCompletedTerminal {
-            session: session.clone(),
-            allow_active,
+        let request = |allow_active| {
+            if reconcile {
+                let proof = host.lock().unwrap().proof().clone();
+                let mut source = session.clone();
+                source.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id,
+                    boot_id: proof.boot_id, host_incarnation: proof.host_incarnation };
+                ClientRequest::ReconcileTerminalClose { session: source, allow_active }
+            } else { ClientRequest::ReleaseCompletedTerminal { session: session.clone(), allow_active } }
         };
         assert!(matches!(
             process_request(&host, 1, request(false)).unwrap().0,

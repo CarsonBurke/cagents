@@ -91,6 +91,23 @@ fn reconcile_at(
     let original = terminals.iter().find(|terminal| {
         terminal.session.id == session.id && terminal.session.launch == session.launch
     });
+    if explicit_retry {
+        match client.reconcile_terminal(session.clone()) {
+            Ok(terminal) => {
+                crate::daemon::replacement_owner(socket, &proof)
+                    .map_err(|error| format!("cannot establish reconciled daemon ownership: {error}"))?;
+                return Ok(RecoveredTerminal {
+                    attach_completed: !terminal.session.continuity.can_resume_live(&proof),
+                    session: terminal.session, expected_host: Some(proof), recovery_lease,
+                });
+            }
+            // A genuinely absent holder leaves the existing positive process
+            // census and explicit replay policy in charge. Unsafe, foreign or
+            // unrecognized holder evidence never falls through to a spawn.
+            Err(crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound, .. }) => {}
+            Err(error) => return Err(format!("Cannot authenticate the original terminal holder: {error}. Its processes were preserved; no replacement was started")),
+        }
+    }
     if proof == expected {
         if let Some(terminal) = original
             && terminal.session.continuity.can_resume_live(&expected)
@@ -254,6 +271,10 @@ fn reconcile_at(
         Err(_) if explicit_retry => (session.launch.clone(), "explicit replay"),
         Err(error) => return Err(error),
     };
+    if !std::fs::metadata(&recipe.working_directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(format!("{}: The saved terminal folder {} is unavailable. Locate or restore that folder before launching this terminal.",
+            crate::terminal_ipc::WORKING_DIRECTORY_UNAVAILABLE, recipe.working_directory.display()));
+    }
     tracing::info!(
         terminal = %session.id,
         replacement = %replacement_id,
@@ -397,16 +418,23 @@ mod tests {
                 &ServerEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: Some(list.request_id),
-                    proof,
+                    proof: proof.clone(),
                     message: ServerMessage::Response {
                         response: ServerResponse::Listed { terminals },
                     },
                 },
             )
             .unwrap();
-            // Recovery is read-only: no Spawn, Attach, Shutdown, or Input reaches
-            // this connection. A newly returned plan must use a fresh handle.
-            assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
+            // Explicit Retry may inspect/adopt a holder; this fixture has none.
+            // No Spawn, Attach, Shutdown or Input is authorized here.
+            if let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                assert!(matches!(request.request, ClientRequest::ReconcileTerminal { .. }));
+                write_frame(&mut stream, &ServerEnvelope { version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id), proof,
+                    message: ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                        crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound, "fixture has no holder", false)) }).unwrap();
+                assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
+            }
             for _ in 0..probes {
                 listener.accept().unwrap();
             }

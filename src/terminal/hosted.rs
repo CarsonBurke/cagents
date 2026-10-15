@@ -1878,9 +1878,10 @@ fn serve_connection(
                 options.initially_visible = published.is_visible();
                 (
                     PendingRequest::Spawn,
-                    ClientRequest::Spawn {
-                        session: spawn.session.clone(),
-                        options,
+                    if spawn.session.continuity.live_proof().is_some() {
+                        ClientRequest::ReconcileTerminal { session: spawn.session.clone() }
+                    } else {
+                        ClientRequest::Spawn { session: spawn.session.clone(), options }
                     },
                 )
             }
