@@ -2466,6 +2466,7 @@ impl Actor {
                 Ok(step) => {
                     effects.possible();
                     let acknowledgement = self.adapter.command_ack();
+                    let compaction_tracked=step.events.iter().any(|event|matches!(event,Event::Compaction{..}));
                     let compaction_finished=step.events.iter().any(|event|matches!(event,Event::Compaction{active:false}));
                     let observed_boundary=step.events.iter().any(|event|matches!(event,Event::TurnStarted|Event::TurnFinished{..}|Event::Exited{..}|Event::Error{fatal:true,..}));
                     if login_recovery.is_some() {
@@ -2476,8 +2477,12 @@ impl Actor {
                         let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
                         let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
                         close.revision=close.revision.saturating_add(1);
-                        close.admitted_work |= starts_new_work && !observed_boundary;
-                        close.compacting |= compacts && !compaction_finished;
+                        // Claude submits /compact as a normal prompt. Only
+                        // adapters with explicit maintenance boundaries own a
+                        // separate compaction marker; other compacts follow
+                        // their ordinary turn admission/result lifecycle.
+                        close.admitted_work |= (starts_new_work || compacts && !compaction_tracked) && !observed_boundary;
+                        close.compacting |= compacts && compaction_tracked && !compaction_finished;
                     }
                     // Busy before the caller hears back, so whoever checks
                     // for an idle conversation next sees this turn.
@@ -4043,6 +4048,35 @@ mod tests {
         assert!(!handle.close_observation().closing);
         handle.close_if_revision(autonomous.close_revision).unwrap();
         assert!(handle.is_completed());
+    }
+
+    #[test]
+    fn prompt_style_compaction_releases_close_admission_on_its_turn_result() {
+        struct PromptCompact;
+        impl Adapter for PromptCompact {
+            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self,command:Command)->Result<Step,String> {
+                let events=match command {
+                    Command::Compact=>vec![Event::TurnStarted,Event::Status {busy:true,detail:"Compacting".into()}],
+                    Command::SetFastMode{..}=>vec![Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Succeeded},Event::Status {busy:false,detail:"Ready".into()}],
+                    _=>return Err("Unexpected prompt compact fixture command".into()),
+                };
+                Ok(Step {events,..Default::default()})
+            }
+            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+        }
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(PromptCompact),initial,store,None,|_|{}).unwrap();
+        until(&handle,|state|state.ready);
+        handle.command(Command::Compact).unwrap();
+        assert_eq!(handle.close_observation().activity,ActivityState::Working);
+        handle.command(Command::SetFastMode {enabled:true}).unwrap();
+        let completed=handle.close_observation();
+        assert_eq!(completed.activity,ActivityState::Idle);
+        handle.close_if_revision(completed.close_revision).unwrap();
     }
 
     #[test]
