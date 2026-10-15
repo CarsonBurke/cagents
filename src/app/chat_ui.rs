@@ -5208,19 +5208,17 @@ impl Cagents {
             .or_insert(runtime.snapshot.busy);
     }
 
-    fn finish_chat_reconnect(&mut self, card: CardId, succeeded: bool, still_working: bool) {
-        let held = matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime))
-            if matches!(runtime.session.native_continuity, chat::NativeContinuity::Durable { .. }));
+    fn finish_chat_reconnect(&mut self, card: CardId, succeeded: bool, outcome: Option<&crate::agent::ActivityOutcome>) {
         let Some(batch) = self.chat_ui.reconnecting.as_mut() else {
             return;
         };
-        let Some(was_working) = batch.pending.remove(&card) else {
+        let Some(_) = batch.pending.remove(&card) else {
             return;
         };
         if succeeded {
             self.notices.resolve_target("daemon-chat-reconnect", card);
             batch.reconnected += 1;
-            if was_working && !still_working && !held {
+            if matches!(outcome, Some(crate::agent::ActivityOutcome::Interrupted { .. })) {
                 batch.interrupted.push(card);
             }
         } else {
@@ -5254,7 +5252,7 @@ impl Cagents {
             targets.sort();
             targets.dedup();
             self.notices.record(TransientNotice::warning(format!(
-                "{} previously active turns may need restarting after the daemon reconnected.", targets.len()
+                "{} turns were interrupted while the daemon was disconnected. Open an affected chat to restart its session.", targets.len()
             )).key(key).targets(targets));
         }
         if !batch.failed.is_empty() {
@@ -5291,7 +5289,7 @@ impl Cagents {
                 Message::ChatUi(Action::RestoreDisconnected(target))
             });
         }
-        self.finish_chat_reconnect(card, false, false);
+        self.finish_chat_reconnect(card, false, None);
         Task::none()
     }
 
@@ -6374,7 +6372,7 @@ impl Cagents {
                                 });
                             }
                         }
-                        self.finish_chat_reconnect(target.card, true, handle.snapshot().busy);
+                        self.finish_chat_reconnect(target.card, true, handle.activity_outcome().as_ref());
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
                         let mut session = handle.session();
@@ -6857,7 +6855,7 @@ impl Cagents {
                     return Task::none();
                 }
                 if runtime.reconnect_attempts >= 4 {
-                    self.finish_chat_reconnect(target.card, false, false);
+                    self.finish_chat_reconnect(target.card, false, None);
                     return Task::none();
                 }
                 self.begin_chat_reconnect(target);
@@ -12863,14 +12861,14 @@ mod tests {
             Arc::make_mut(&mut runtime.snapshot).busy = true;
         }
         app.begin_chat_reconnect(chat_runtime(&app, first).target);
-        app.finish_chat_reconnect(first, true, false);
+        app.finish_chat_reconnect(first, true, Some(&crate::agent::ActivityOutcome::Interrupted { reason: "Fixture interrupted first turn".into() }));
         let key = "daemon-interrupted-turns";
         assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![first]);
         app.begin_chat_reconnect(chat_runtime(&app, second).target);
         app.begin_chat_reconnect(chat_runtime(&app, failed).target);
-        app.finish_chat_reconnect(second, true, false);
+        app.finish_chat_reconnect(second, true, Some(&crate::agent::ActivityOutcome::Interrupted { reason: "Fixture interrupted second turn".into() }));
         assert!(app.chat_ui.reconnecting.is_some(), "wait for every affected chat");
-        app.finish_chat_reconnect(failed, false, false);
+        app.finish_chat_reconnect(failed, false, None);
         let warning = app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap();
         assert_eq!(warning.notice.targets.len(), 2);
         assert!(warning.notice.targets.contains(&first));
@@ -12878,6 +12876,24 @@ mod tests {
         assert!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("daemon-chat-reconnect") && entry.notice.targets == vec![failed]));
         app.notices.resolve_target(key, first);
         assert_eq!(app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(key)).unwrap().notice.targets, vec![second]);
+    }
+
+    #[test]
+    fn reconnect_interruption_notice_uses_authoritative_outcome_for_both_durable_and_legacy_chats() {
+        for durable in [false, true] {
+            for outcome in [None, Some(crate::agent::ActivityOutcome::Succeeded), Some(crate::agent::ActivityOutcome::Interrupted { reason: "Confirmed provider turn interruption".into() })] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                let target = chat_runtime(&app, card).target;
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.disconnected = true;
+                Arc::make_mut(&mut runtime.snapshot).busy = true;
+                if durable { runtime.session.native_continuity = chat::NativeContinuity::Durable { provider_version: "0.162.0".into() }; }
+                app.begin_chat_reconnect(target);
+                app.finish_chat_reconnect(card, true, outcome.as_ref());
+                assert_eq!(app.notices.entries.iter().any(|entry| entry.notice.key.as_deref() == Some("daemon-interrupted-turns")), matches!(outcome, Some(crate::agent::ActivityOutcome::Interrupted { .. })), "ownership/busy cannot replace an authoritative outcome");
+            }
+        }
     }
 
     #[test]
