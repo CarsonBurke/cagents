@@ -6761,7 +6761,10 @@ mod tests {
     fn native_changes_during_root_discovery_remain_lazy_until_worker_open() {
         block_on(async {
             let (_root,worktree,file) = workspace();
-            let mut manager = rust_manager();
+            let (release, waiting) = tokio::sync::oneshot::channel::<()>();
+            let mut manager = rust_manager().after_shutdown(async move {
+                let _ = waiting.await;
+            });
             let slot = install_fake(&mut manager,incremental_capabilities(), |_| Vec::new());
             let events = manager.events();let doc = LspDocumentId(1);
             let initial = native_source("before");let changed = native_source("after");
@@ -6769,7 +6772,13 @@ mod tests {
             manager.change_snapshot(doc,2,&[],changed.clone());
             assert!(!initial.is_materialized());assert!(!changed.is_materialized());
             let (ticket,root) = next_matching(&events,|event| match event {LspEvent::RootDiscovered {doc:at,ticket,root} if *at == doc => Some((*ticket,root.clone())),_=>None}).await;
-            manager.finish_discovery(doc,ticket,root);await_ready(&events,doc).await;
+            manager.finish_discovery(doc,ticket,root);
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(slot.lock().unwrap().is_none(), "replacement must wait for the old manager to reap");
+            assert_eq!(initial.serialization_count(), 0);
+            assert_eq!(changed.serialization_count(), 0);
+            release.send(()).unwrap();
+            await_ready(&events,doc).await;
             let fake = handle_of(&slot).await;
             let opened = fake.wait_for("textDocument/didOpen").await;
             assert_eq!(opened.params["textDocument"]["text"],"after");
