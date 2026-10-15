@@ -392,14 +392,10 @@ fn settings_category_controls<'a>(
             ).keywords("configuration TOML dotfiles language_servers custom_terminal_theme");
             let reset = setting_field(
                 "Reset all settings",
-                "Restore default preferences; saved conversations and tabs are preserved.",
-                widget::row::with_children(vec![
-                    crate::ui_controls::button::destructive("Reset all settings")
-                        .id(widget::Id::new("settings.reset"))
-                        .on_press(Message::ResetSettings).into(),
-                    crate::ui_controls::button::secondary("Undo reset")
-                        .on_press_maybe(context.can_undo.then_some(Message::UndoSettingsReset)).into(),
-                ]).spacing(space::S).into(),
+                "Restore default preferences. A backup is saved first, and Undo restores it. Conversations and tabs are preserved.",
+                crate::ui_controls::button::destructive("Reset all settings")
+                    .id(widget::Id::new("settings.reset"))
+                    .on_press(Message::ResetSettings).into(),
             );
             let directory = setting_input(
                 "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
