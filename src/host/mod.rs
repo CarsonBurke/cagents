@@ -244,11 +244,12 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
     // A committed acceptance is not proof of provider delivery. Until a
     // restored actor supplies exact run evidence, never authorize a resend.
+    let retained_runs = chat::retained_actor::retained_runs(&host);
     if let Ok(registry) = agent_execution::registry(&host) {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .interrupt_unproven_agent_runs(crate::chat::now_ms().unwrap_or(0))
+            .interrupt_unproven_agent_runs_except(crate::chat::now_ms().unwrap_or(0), &retained_runs)
             .map_err(io::Error::other)?;
     }
     let _agent_activity = activity::Monitor::start(&host)?;

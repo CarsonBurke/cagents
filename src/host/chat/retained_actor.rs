@@ -205,3 +205,17 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
     super::super::state::retire_unattached_upgrade_chat(host, id);
     Ok(response)
 }
+
+/// These IDs came from the authenticated actor's journal at attachment, not
+/// from a user pane, busy bit, or a prior daemon's accepted dispatch record.
+pub(in crate::host) fn retained_runs(host: &SharedHost) -> Vec<(crate::model::RunId, crate::agent_execution::HostedSession)> {
+    let actors = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.chats.values().filter_map(|record| {
+            let identity = record.handle.actor_identity()?;
+            (identity.instance == record.execution_instance).then(|| (record.handle.clone(), record.session.clone()))
+        }).collect::<Vec<_>>()
+    };
+    actors.into_iter().flat_map(|(handle, source)| handle.retained_runs().into_iter()
+        .map(move |run| (run, crate::agent_execution::HostedSession::Chat(source.clone())))).collect()
+}

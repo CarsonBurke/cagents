@@ -2107,7 +2107,7 @@ mod tests {
             let actual = registry.agent_run(accepted.run.id).unwrap();
             if changed == "none" {
                 assert_eq!(actual, running, "authenticated live reducer retains the original accepted run");
-                assert!(!registry.claim_agent_dispatch(&accepted, 13).unwrap(), "retaining a run never authorizes redelivery");
+                assert!(!matches!(registry.claim_agent_dispatch(&accepted, 13), Ok(true)), "retaining a run never authorizes redelivery");
             } else {
                 assert_eq!(actual.state, State::Interrupted, "{changed} is not evidence for this accepted run");
             }
