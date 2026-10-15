@@ -213,7 +213,11 @@ impl Server {
         operational.recipe.working_directory = request.working_directory.clone();
         operational.recipe.environment = request.environment.clone();
         operational.recipe.unset_environment.clear();
-        let (mut spec, mut adapter) = chat::protocol::create(&operational)?;
+        let (mut spec, mut adapter) =
+            chat::protocol::claude::create_from_prepared_arguments(
+                &operational,
+                &request.arguments,
+            )?;
         if !matches!(spec.transport, TransportSpec::JsonLines) {
             return Err("Restart requires the same Claude stream-json transport".into());
         }

@@ -2792,6 +2792,24 @@ mod tests {
             _root: root,
         }
     }
+    /// The private peer receives the actual canonical argv prepared by the
+    /// parent factory, including its one generated fresh conversation UUID.
+    fn prepared_restart_spec(source: &chat::Session, script: &str) -> ProcessSpec {
+        use std::os::unix::fs::OpenOptionsExt;
+        let program = source.launch.recipe.working_directory.join("restart-provider");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&program)
+            .unwrap();
+        file.write_all(format!("#!/bin/sh\n{script}").as_bytes()).unwrap();
+        drop(file);
+        let (mut spec, _) = chat::protocol::create(&source.launch).unwrap();
+        spec.program = program.to_string_lossy().into_owned();
+        spec
+    }
     #[test]
     fn backend_binding_survives_lost_restart_reply_without_authorizing_same_handle_successor() {
         let exact = thread::current()
@@ -2885,9 +2903,7 @@ while IFS= read -r frame; do
       ;;
   esac
 done"#;
-        let mut spec = ProcessSpec::from(&source.launch.recipe);
-        spec.program = "/bin/sh".into();
-        spec.arguments = vec!["-c".into(), script.into()];
+        let spec = prepared_restart_spec(&source, script);
         let request = uuid::Uuid::new_v4();
         assert!(
             handle
@@ -2995,7 +3011,8 @@ while IFS= read -r frame; do
     *'"type":"user"'*) printf 'unexpected prompt\n' >> prompts ;;
   esac
 done"#;
-        let payload = json!({"id":id,"source":server.source,"program":"/bin/sh","arguments":["-c",script],"environment":{},"working_directory":fixture._root.path(),"recovery_environment":{}});
+        let spec = prepared_restart_spec(&server.source, script);
+        let payload = json!({"id":id,"source":server.source,"program":spec.program,"arguments":spec.arguments,"environment":spec.environment,"working_directory":fixture._root.path(),"recovery_environment":{}});
         let request: restart::Request = serde_json::from_value(payload.clone()).unwrap();
         let receipt = server.restart(request).unwrap();
         let restart::RestartState::Acknowledged(Ok(process)) = receipt.state else {
@@ -3060,6 +3077,84 @@ done"#;
             .actor
             .close_until(Instant::now() + Duration::from_secs(5))
             .unwrap();
+    }
+    #[test]
+    fn fresh_restart_binds_actual_prepared_uuid_and_rejects_a_different_wire_identity() {
+        let exact = thread::current().name().expect("named contract").to_owned();
+        if backend_binding_test::isolated(&exact) {
+            return;
+        }
+        // Restart reconciliation is process-wide. This bounded private child
+        // owns every provider and orphan it creates during both cases.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
+        for wrong_identity in [false, true] {
+            let mut fixture = resident_fixture();
+            let server = &mut fixture.server;
+            assert!(server.source.launch.session_id.is_none());
+            assert!(server.actor.confirmed_session_id().is_none());
+            let original_store = server.actor.0.store.clone();
+            server.actor.close().unwrap();
+            let script = r#"printf 'spawn\n' >> spawns
+session=
+for argument do
+  case "$argument" in --session-id=*) session=${argument#--session-id=} ;; esac
+done
+printf '%s\n' "$session" > actual-session
+reported=$session
+if [ -e wrong-session ]; then reported=00000000-0000-4000-8000-000000000002; fi
+while IFS= read -r frame; do
+  case "$frame" in
+    *'"type":"control_request"'*)
+      id=${frame#*'"request_id":"'}; id=${id%%'"'*}
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      printf '{"type":"system","subtype":"init","session_id":"%s"}\n' "$reported"
+      ;;
+    *'"type":"user"'*) printf 'unexpected prompt\n' >> prompts ;;
+  esac
+done"#;
+            let spec = prepared_restart_spec(&server.source, script);
+            let expected = spec.arguments.last().unwrap().strip_prefix("--session-id=").unwrap().to_owned();
+            assert_ne!(expected, "00000000-0000-4000-8000-000000000002");
+            if wrong_identity {
+                std::fs::write(fixture._root.path().join("wrong-session"), b"").unwrap();
+            }
+            let id = uuid::Uuid::new_v4();
+            let payload = json!({"id":id,"source":server.source,"program":spec.program,
+                "arguments":spec.arguments,"environment":spec.environment,
+                "working_directory":fixture._root.path(),"recovery_environment":{}});
+            let receipt = server.restart(serde_json::from_value(payload.clone()).unwrap()).unwrap();
+            let restart::RestartState::Acknowledged(Ok(process)) = receipt.state else {
+                panic!("prepared restart did not retain its actual process receipt");
+            };
+            let deadline = Instant::now() + Duration::from_secs(5);
+            if wrong_identity {
+                while !server.actor.is_completed() {
+                    assert!(Instant::now() < deadline, "mismatched init did not settle its original actor");
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(server.actor.failure().unwrap().contains("different session ID"));
+                assert!(server.actor.confirmed_session_id().is_none());
+            } else {
+                loop {
+                    if server.actor.confirmed_session_id().as_deref() == Some(expected.as_str())
+                        && server.actor.0.state.lock().unwrap().ready
+                    {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline, "actual prepared system/init was not confirmed: {:?}", server.actor.failure());
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(process.is_current());
+            }
+            assert!(Arc::ptr_eq(&original_store, &server.actor.0.store));
+            assert!(server.source.launch.session_id.is_none(), "a generated expectation never becomes an issued resume descriptor");
+            assert_eq!(std::fs::read_to_string(fixture._root.path().join("actual-session")).unwrap().trim(), expected);
+            let repeated = server.restart(serde_json::from_value(payload).unwrap()).unwrap();
+            assert_eq!(repeated.state, restart::RestartState::Acknowledged(Ok(process)));
+            assert_eq!(std::fs::read_to_string(fixture._root.path().join("spawns")).unwrap(), "spawn\n");
+            assert!(!fixture._root.path().join("prompts").exists(), "neither success nor identity refusal replays a prompt");
+            server.actor.close_until(Instant::now() + Duration::from_secs(5)).unwrap();
+        }
     }
     #[test]
     fn stopped_provider_keeps_its_semantic_journal_until_outcome_and_loss_ack() {
