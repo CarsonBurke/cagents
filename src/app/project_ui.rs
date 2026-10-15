@@ -815,8 +815,15 @@ impl Cagents {
         self.launch_editor(path, &editor_id)
     }
 
-    pub(super) fn open_file_in_editor_at(&mut self, path: PathBuf, editor_id: String, position: Option<(usize, usize)>) -> Task<Message> {
-        if self.modal_is_open() { return Task::none(); }
+    pub(super) fn open_file_in_editor_at(
+        &mut self,
+        path: PathBuf,
+        editor_id: String,
+        position: Option<(usize, usize)>,
+    ) -> Task<Message> {
+        if self.modal_is_open() {
+            return Task::none();
+        }
         self.launch_editor_at(path, &editor_id, position)
     }
 
@@ -824,7 +831,12 @@ impl Cagents {
         self.launch_editor_at(path, editor_id, None)
     }
 
-    fn launch_editor_at(&mut self, path: PathBuf, editor_id: &str, position: Option<(usize, usize)>) -> Task<Message> {
+    fn launch_editor_at(
+        &mut self,
+        path: PathBuf,
+        editor_id: &str,
+        position: Option<(usize, usize)>,
+    ) -> Task<Message> {
         let Some(editor) = self
             .project_ui
             .editors
@@ -838,11 +850,12 @@ impl Cagents {
             return Task::none();
         };
         cosmic::task::future(async move {
-            let result =
-                tokio::task::spawn_blocking(move || crate::external_editor::launch_at(&editor, &path, position))
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || {
+                crate::external_editor::launch_at(&editor, &path, position)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
             Message::ProjectUi(Action::Finished(result))
         })
     }

@@ -102,29 +102,51 @@ pub struct BinaryPreview {
 pub const BINARY_PREVIEW_BYTES: u64 = 64 * 1024;
 
 fn binary_mime(bytes: &[u8]) -> &'static str {
-    if bytes.starts_with(b"\x7fELF") { "application/x-elf" }
-    else if bytes.starts_with(b"PK\x03\x04") { "application/zip" }
-    else if bytes.starts_with(b"\x1f\x8b") { "application/gzip" }
-    else if bytes.starts_with(b"SQLite format 3\0") { "application/vnd.sqlite3" }
-    else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") { "image/png" }
-    else if bytes.starts_with(b"BM") { "image/bmp" }
-    else { "application/octet-stream" }
+    if bytes.starts_with(b"\x7fELF") {
+        "application/x-elf"
+    } else if bytes.starts_with(b"PK\x03\x04") {
+        "application/zip"
+    } else if bytes.starts_with(b"\x1f\x8b") {
+        "application/gzip"
+    } else if bytes.starts_with(b"SQLite format 3\0") {
+        "application/vnd.sqlite3"
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        "image/png"
+    } else if bytes.starts_with(b"BM") {
+        "image/bmp"
+    } else {
+        "application/octet-stream"
+    }
 }
 
 fn binary_preview(mut file: File, offset: u64) -> Result<BinaryPreview, FileIoError> {
     let metadata = file.metadata().map_err(io_error)?;
-    if !metadata.is_file() { return Err(FileIoError::Io("Not a regular file".into())); }
+    if !metadata.is_file() {
+        return Err(FileIoError::Io("Not a regular file".into()));
+    }
     file.seek(io::SeekFrom::Start(0)).map_err(io_error)?;
     let mut header = [0; 32];
     let read = file.read(&mut header).map_err(io_error)?;
     file.seek(io::SeekFrom::Start(offset)).map_err(io_error)?;
     let mut data = Vec::new();
-    file.take(BINARY_PREVIEW_BYTES).read_to_end(&mut data).map_err(io_error)?;
-    Ok(BinaryPreview { bytes: metadata.len(), modified: metadata.modified().ok(),
-        mime: binary_mime(&header[..read]), error: None, offset, data: data.into() })
+    file.take(BINARY_PREVIEW_BYTES)
+        .read_to_end(&mut data)
+        .map_err(io_error)?;
+    Ok(BinaryPreview {
+        bytes: metadata.len(),
+        modified: metadata.modified().ok(),
+        mime: binary_mime(&header[..read]),
+        error: None,
+        offset,
+        data: data.into(),
+    })
 }
 
-pub fn load_binary_page(worktree: &Path, path: &Path, offset: u64) -> Result<BinaryPreview, FileIoError> {
+pub fn load_binary_page(
+    worktree: &Path,
+    path: &Path,
+    offset: u64,
+) -> Result<BinaryPreview, FileIoError> {
     validate_repo_path(path)?;
     let root = worktree_root(worktree)?;
     let file = fs_safety::open_beneath(&root, path).map_err(resolve_error)?;
@@ -467,8 +489,12 @@ fn load_regular_file(
         let mut descriptor = &file;
         let read = descriptor.read(&mut sample).map_err(io_error)?;
         descriptor.seek(io::SeekFrom::Start(0)).map_err(io_error)?;
-        if sample[..read].contains(&0) || std::str::from_utf8(&sample[..read]).is_err_and(|error| error.error_len().is_some()) {
-            return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(binary_preview(file, 0)?)));
+        if sample[..read].contains(&0)
+            || std::str::from_utf8(&sample[..read]).is_err_and(|error| error.error_len().is_some())
+        {
+            return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
+                binary_preview(file, 0)?,
+            )));
         }
     }
     if metadata.len() > limit {
@@ -502,7 +528,8 @@ fn load_regular_file(
     // A file can grow after metadata was read. Bound the read itself, not only
     // its result, so a concurrently growing file cannot exhaust memory.
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    (&file).take(limit + 1)
+    (&file)
+        .take(limit + 1)
         .read_to_end(&mut bytes)
         .map_err(io_error)?;
     if bytes.len() as u64 > limit {
@@ -512,7 +539,9 @@ fn load_regular_file(
             kind,
         }));
     }
-    if relative_path.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+    if relative_path
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
         && let Ok(image) = decode_svg(&bytes)
     {
         return Ok(image);
@@ -528,7 +557,9 @@ fn load_regular_file(
         return Ok(image);
     }
     if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
-        return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(binary_preview(file, 0)?)));
+        return Ok(FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(
+            binary_preview(file, 0)?,
+        )));
     }
     let text = String::from_utf8(bytes).expect("UTF-8 validated above");
     let markdown = relative_path
@@ -1197,15 +1228,35 @@ mod tests {
     #[test]
     fn prose_with_weak_image_magic_and_failed_decodes_remains_text() {
         let root = tempdir().unwrap();
-        for (name, text) in [("rank.md", "BM25 ranking..."), ("notes.txt", "P3: notes"), ("broken.bmp", "BMbroken"), ("broken.png", "plain text")] {
+        for (name, text) in [
+            ("rank.md", "BM25 ranking..."),
+            ("notes.txt", "P3: notes"),
+            ("broken.bmp", "BMbroken"),
+            ("broken.png", "plain text"),
+        ] {
             fs::write(root.path().join(name), text).unwrap();
-            assert!(matches!(content(root.path(), name), FileContent::Editable { .. }), "{name}");
+            assert!(
+                matches!(content(root.path(), name), FileContent::Editable { .. }),
+                "{name}"
+            );
         }
         let path = root.path().join("pixel.bmp");
-        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255])).save_with_format(&path, image::ImageFormat::Bmp).unwrap();
-        assert!(matches!(content(root.path(), "pixel.bmp"), FileContent::Image { width: 1, height: 1, .. }));
+        image::RgbaImage::from_pixel(1, 1, image::Rgba([1, 2, 3, 255]))
+            .save_with_format(&path, image::ImageFormat::Bmp)
+            .unwrap();
+        assert!(matches!(
+            content(root.path(), "pixel.bmp"),
+            FileContent::Image {
+                width: 1,
+                height: 1,
+                ..
+            }
+        ));
         fs::write(root.path().join("invalid.bmp"), b"BM\0\xff").unwrap();
-        assert!(matches!(content(root.path(), "invalid.bmp"), FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))));
+        assert!(matches!(
+            content(root.path(), "invalid.bmp"),
+            FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))
+        ));
     }
 
     #[test]
@@ -1215,11 +1266,16 @@ mod tests {
         let mut file = File::create(path).unwrap();
         file.write_all(b"\x7fELF\0").unwrap();
         file.set_len(1024 * 1024 * 1024).unwrap();
-        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) = content(root.path(), "artifact.bin") else { panic!("binary"); };
+        let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) =
+            content(root.path(), "artifact.bin")
+        else {
+            panic!("binary");
+        };
         assert_eq!(preview.bytes, 1024 * 1024 * 1024);
         assert_eq!(preview.mime, "application/x-elf");
         assert_eq!(preview.data.len(), BINARY_PREVIEW_BYTES as usize);
-        let next = load_binary_page(root.path(), Path::new("artifact.bin"), BINARY_PREVIEW_BYTES).unwrap();
+        let next =
+            load_binary_page(root.path(), Path::new("artifact.bin"), BINARY_PREVIEW_BYTES).unwrap();
         assert_eq!(next.offset, BINARY_PREVIEW_BYTES);
         assert_eq!(next.data.len(), BINARY_PREVIEW_BYTES as usize);
         symlink("/etc/passwd", root.path().join("escape.bin")).unwrap();
@@ -1380,15 +1436,21 @@ mod tests {
         fs::write(root.path().join("invalid.txt"), [0xff, 0xfe]).unwrap();
         symlink("binary.bin", root.path().join("link.txt")).unwrap();
 
-        for (name, source, bytes) in [("binary.bin", "binary.bin", 11), ("invalid.txt", "invalid.txt", 2), ("link.txt", "binary.bin", 11)] {
+        for (name, source, bytes) in [
+            ("binary.bin", "binary.bin", 11),
+            ("invalid.txt", "invalid.txt", 2),
+            ("link.txt", "binary.bin", 11),
+        ] {
             let loaded = load_file(root.path(), Path::new(name), PdfTone::Original).unwrap();
             assert_eq!(loaded.source, Path::new(source));
-            let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) = loaded.content else { panic!("binary preview expected"); };
+            let FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(preview)) = loaded.content
+            else {
+                panic!("binary preview expected");
+            };
             assert_eq!(preview.bytes, bytes);
             assert_eq!(preview.offset, 0);
             assert!(preview.modified.is_some());
         }
-
     }
 
     /// What the file at `path` presents as, for the tests that are about the
@@ -1424,8 +1486,12 @@ mod tests {
             );
         }
         std::fs::write(root.path().join("binary"), b"a\0b").unwrap();
-        assert!(matches!(load_file(root.path(), Path::new("binary"), PdfTone::Original).unwrap().content, FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))));
-
+        assert!(matches!(
+            load_file(root.path(), Path::new("binary"), PdfTone::Original)
+                .unwrap()
+                .content,
+            FileContent::ReadOnly(ReadOnlyReason::BinaryPreview(_))
+        ));
     }
 
     fn editable(text: &str, markdown: bool) -> FileContent {

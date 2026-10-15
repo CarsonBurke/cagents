@@ -537,10 +537,20 @@ pub enum RepositoryAction {
         card: CardId,
         editor_id: String,
     },
-    OpenSystem { card: CardId },
-    RevealFile { card: CardId },
-    BinaryPage { card: CardId, offset: u64 },
-    BinaryPageLoaded { identity: AsyncIdentity, result: Result<crate::editor::BinaryPreview, FileIoError> },
+    OpenSystem {
+        card: CardId,
+    },
+    RevealFile {
+        card: CardId,
+    },
+    BinaryPage {
+        card: CardId,
+        offset: u64,
+    },
+    BinaryPageLoaded {
+        identity: AsyncIdentity,
+        result: Result<crate::editor::BinaryPreview, FileIoError>,
+    },
     StageSelected {
         card: CardId,
         stage: bool,
@@ -3634,9 +3644,13 @@ impl RepositoryRuntime {
 
     /// One-based character coordinates for external editor launchers.
     pub fn editor_caret(&self) -> Option<(usize, usize)> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         let cursor = document.content.cursor().position;
-        let column = document.content.with_line(cursor.line, |line, _| line[..cursor.column.min(line.len())].chars().count() + 1)?;
+        let column = document.content.with_line(cursor.line, |line, _| {
+            line[..cursor.column.min(line.len())].chars().count() + 1
+        })?;
         Some((cursor.line + 1, column))
     }
 
@@ -4715,13 +4729,24 @@ impl RepositoryRuntime {
         }
         match action {
             RepositoryAction::BinaryPage { card, offset } => {
-                let DocumentState::ReadOnly { path, reason: ReadOnlyReason::BinaryPreview(_) } = &self.document else { return Task::none(); };
-                let identity = self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
+                let DocumentState::ReadOnly {
+                    path,
+                    reason: ReadOnlyReason::BinaryPreview(_),
+                } = &self.document
+                else {
+                    return Task::none();
+                };
+                let identity =
+                    self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
                 let worktree = self.descriptor.worktree.clone();
                 let path = path.clone();
                 cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || crate::editor::load_binary_page(&worktree, &path, offset)).await
-                        .map_err(|error| FileIoError::Io(error.to_string())).and_then(|result| result);
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::editor::load_binary_page(&worktree, &path, offset)
+                    })
+                    .await
+                    .map_err(|error| FileIoError::Io(error.to_string()))
+                    .and_then(|result| result);
                     RepositoryAction::BinaryPageLoaded { identity, result }
                 })
             }
@@ -4729,11 +4754,20 @@ impl RepositoryRuntime {
                 if self.accepts_selected(&identity)
                     && let DocumentState::ReadOnly { reason, .. } = &mut self.document
                 {
-                    match result { Ok(preview) => *reason = ReadOnlyReason::BinaryPreview(preview), Err(error) => { if let ReadOnlyReason::BinaryPreview(preview) = reason { preview.error = Some(error.to_string()); } } }
+                    match result {
+                        Ok(preview) => *reason = ReadOnlyReason::BinaryPreview(preview),
+                        Err(error) => {
+                            if let ReadOnlyReason::BinaryPreview(preview) = reason {
+                                preview.error = Some(error.to_string());
+                            }
+                        }
+                    }
                 }
                 Task::none()
             }
-            RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. } => Task::none(),
+            RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. } => {
+                Task::none()
+            }
             RepositoryAction::RefreshFiles { card } => self.initial_load(card),
             RepositoryAction::ListDirectory { card, path } => self.list_directory(card, path),
             RepositoryAction::SearchDirectory { card, query } => self.search_directory(card, query),
@@ -6109,31 +6143,70 @@ impl RepositoryRuntime {
     /// Open a repository-relative location, even before the directory listing
     /// arrives. Coordinates are zero-based native line/UTF-8 byte positions.
     /// The requested range is clamped when the asynchronous file read finishes.
-    pub fn open_file_location(&mut self, card: CardId, path: PathBuf, line: usize, column: usize, selection_bytes: usize) -> Task<RepositoryAction> {
-        if crate::repository::RepoPath::parse(&path).is_err() { return Task::none(); }
+    pub fn open_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+        selection_bytes: usize,
+    ) -> Task<RepositoryAction> {
+        if crate::repository::RepoPath::parse(&path).is_err() {
+            return Task::none();
+        }
         let caret = text_editor::Position { line, column };
-        let selection = (selection_bytes > 0).then_some(text_editor::Position { line, column: column.saturating_add(selection_bytes) });
+        let selection = (selection_bytes > 0).then_some(text_editor::Position {
+            line,
+            column: column.saturating_add(selection_bytes),
+        });
         if self.selected_path() == Some(path.as_path())
             && let DocumentState::Editable(document) = &mut self.document
         {
-            document.content.set_cursor(text_editor::Cursor { position: caret, selection });
-            document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+            document.content.set_cursor(text_editor::Cursor {
+                position: caret,
+                selection,
+            });
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                });
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
             return self.focus_editor(card);
         }
-        if self.blocks_navigation() { return Task::none(); }
-        let loading_same = self.selected_path() == Some(path.as_path()) && matches!(self.document, DocumentState::Loading);
-        let task = if loading_same { Task::none() } else {
-            let file = self.file(&path).cloned().unwrap_or(RepositoryFile { path: path.clone(), ..RepositoryFile::default() });
-            if file.directory { return Task::none(); }
+        if self.blocks_navigation() {
+            return Task::none();
+        }
+        let loading_same = self.selected_path() == Some(path.as_path())
+            && matches!(self.document, DocumentState::Loading);
+        let task = if loading_same {
+            Task::none()
+        } else {
+            let file = self.file(&path).cloned().unwrap_or(RepositoryFile {
+                path: path.clone(),
+                ..RepositoryFile::default()
+            });
+            if file.directory {
+                return Task::none();
+            }
             self.open_file_entry(card, file)
         };
-        self.pending_editor_navigation = Some((path, crate::model::EditorNavigation {
-            caret: crate::model::EditorPosition { line, column },
-            selection: selection.map(|position| crate::model::EditorPosition { line: position.line, column: position.column }),
-            scroll_line: line.saturating_sub(10), scroll_vertical: 0.0, scroll_horizontal: 0.0,
-        }));
+        self.pending_editor_navigation = Some((
+            path,
+            crate::model::EditorNavigation {
+                caret: crate::model::EditorPosition { line, column },
+                selection: selection.map(|position| crate::model::EditorPosition {
+                    line: position.line,
+                    column: position.column,
+                }),
+                scroll_line: line.saturating_sub(10),
+                scroll_vertical: 0.0,
+                scroll_horizontal: 0.0,
+            },
+        ));
         task
     }
 
@@ -8059,7 +8132,10 @@ fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, Repo
         DocumentState::Failed { path, message } => {
             information_state(format!("Could not open {}", path.display()), message)
         }
-        DocumentState::ReadOnly { path, reason: ReadOnlyReason::BinaryPreview(preview) } => binary_file_view(card, path, preview),
+        DocumentState::ReadOnly {
+            path,
+            reason: ReadOnlyReason::BinaryPreview(preview),
+        } => binary_file_view(card, path, preview),
         DocumentState::ReadOnly { path, reason } => read_only_state(path, reason),
         DocumentState::Editable(document) => editable_document_view(card, runtime, document),
         DocumentState::Image {
@@ -10464,30 +10540,99 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     }
 }
 
-fn binary_file_view(card: CardId, path: &Path, preview: &crate::editor::BinaryPreview) -> Element<'static, RepositoryAction> {
+fn binary_file_view(
+    card: CardId,
+    path: &Path,
+    preview: &crate::editor::BinaryPreview,
+) -> Element<'static, RepositoryAction> {
     use std::fmt::Write as _;
     let mut hex = String::with_capacity(preview.data.len() * 5);
     for (row, bytes) in preview.data.chunks(16).enumerate() {
         let _ = write!(hex, "{:08x}  ", preview.offset + (row * 16) as u64);
-        for index in 0..16 { match bytes.get(index) { Some(byte) => { let _ = write!(hex, "{byte:02x} "); }, None => hex.push_str("   ") } }
+        for index in 0..16 {
+            match bytes.get(index) {
+                Some(byte) => {
+                    let _ = write!(hex, "{byte:02x} ");
+                }
+                None => hex.push_str("   "),
+            }
+        }
         hex.push_str(" | ");
-        for byte in bytes { hex.push(if byte.is_ascii_graphic() || *byte == b' ' { *byte as char } else { '.' }); }
+        for byte in bytes {
+            hex.push(if byte.is_ascii_graphic() || *byte == b' ' {
+                *byte as char
+            } else {
+                '.'
+            });
+        }
         hex.push('\n');
     }
-    let modified = preview.modified.and_then(|time| jiff::Timestamp::try_from(time).ok()).map(|time| time.to_string()).unwrap_or_else(|| "unknown".into());
+    let modified = preview
+        .modified
+        .and_then(|time| jiff::Timestamp::try_from(time).ok())
+        .map(|time| time.to_string())
+        .unwrap_or_else(|| "unknown".into());
     let actions = widget::row::with_children(vec![
-        crate::ui_controls::button::secondary("Open with system app").on_press_maybe((!crate::device::is_remote()).then_some(RepositoryAction::OpenSystem { card })).into(),
-        crate::ui_controls::button::secondary("Reveal in file manager").on_press_maybe((!crate::device::is_remote()).then_some(RepositoryAction::RevealFile { card })).into(),
-        crate::ui_controls::button::secondary("Previous 64 KiB").on_press_maybe((preview.offset > 0).then_some(RepositoryAction::BinaryPage { card, offset: preview.offset.saturating_sub(crate::editor::BINARY_PREVIEW_BYTES) })).into(),
-        crate::ui_controls::button::secondary("Load more (next 64 KiB)").on_press_maybe((preview.offset + (preview.data.len() as u64) < preview.bytes).then_some(RepositoryAction::BinaryPage { card, offset: preview.offset + crate::editor::BINARY_PREVIEW_BYTES })).into(),
-    ]).spacing(space::S);
-    widget::container(widget::column::with_children(vec![
-        crate::design::body(format!("{} · {} bytes · {}", path.display(), preview.bytes, preview.mime)).into(),
-        crate::design::caption(format!("Modified {modified} · bytes {}–{}", preview.offset, preview.offset + preview.data.len() as u64)).into(),
-        crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
-        actions.into(),
-        widget::scrollable(widget::text(hex).font(cosmic::iced::Font::MONOSPACE)).width(Length::Fill).height(Length::Fill).into(),
-    ]).spacing(space::M)).padding(space::M).width(Length::Fill).height(Length::Fill).into()
+        crate::ui_controls::button::secondary("Open with system app")
+            .on_press_maybe(
+                (!crate::device::is_remote()).then_some(RepositoryAction::OpenSystem { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Reveal in file manager")
+            .on_press_maybe(
+                (!crate::device::is_remote()).then_some(RepositoryAction::RevealFile { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Previous 64 KiB")
+            .on_press_maybe(
+                (preview.offset > 0).then_some(RepositoryAction::BinaryPage {
+                    card,
+                    offset: preview
+                        .offset
+                        .saturating_sub(crate::editor::BINARY_PREVIEW_BYTES),
+                }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Load more (next 64 KiB)")
+            .on_press_maybe(
+                (preview.offset + (preview.data.len() as u64) < preview.bytes).then_some(
+                    RepositoryAction::BinaryPage {
+                        card,
+                        offset: preview.offset + crate::editor::BINARY_PREVIEW_BYTES,
+                    },
+                ),
+            )
+            .into(),
+    ])
+    .spacing(space::S);
+    widget::container(
+        widget::column::with_children(vec![
+            crate::design::body(format!(
+                "{} · {} bytes · {}",
+                path.display(),
+                preview.bytes,
+                preview.mime
+            ))
+            .into(),
+            crate::design::caption(format!(
+                "Modified {modified} · bytes {}–{}",
+                preview.offset,
+                preview.offset + preview.data.len() as u64
+            ))
+            .into(),
+            crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
+            actions.into(),
+            widget::scrollable(widget::text(hex).font(cosmic::iced::Font::MONOSPACE))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
+        ])
+        .spacing(space::M),
+    )
+    .padding(space::M)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 /// The sentence under the read-only title, about the file that was classified.
@@ -10506,7 +10651,12 @@ fn read_only_detail(path: &Path, reason: &ReadOnlyReason) -> String {
                 LinkRefusal::TooManyLinks => "which leads through too many links to follow.",
             }
         ),
-        ReadOnlyReason::BinaryPreview(preview) => format!("{} · {} bytes · {}", path.display(), preview.bytes, preview.mime),
+        ReadOnlyReason::BinaryPreview(preview) => format!(
+            "{} · {} bytes · {}",
+            path.display(),
+            preview.bytes,
+            preview.mime
+        ),
         ReadOnlyReason::Binary => format!("{} contains binary data.", path.display()),
         ReadOnlyReason::InvalidUtf8 => format!("{} is not valid UTF-8.", path.display()),
         ReadOnlyReason::Image(message) | ReadOnlyReason::Document(message) => {
