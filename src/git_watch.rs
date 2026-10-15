@@ -381,6 +381,11 @@ impl Project {
                             .is_some_and(|parent| worktree.directories.contains(parent)))
                 {
                     change.worktrees.insert(worktree.id);
+                    // Creation, removal and rename can change the untracked
+                    // count. Ordinary file writes retain the last complete count.
+                    change.untracked |= matches!(event.kind,
+                        EventKind::Create(_) | EventKind::Remove(_)
+                        | EventKind::Modify(notify::event::ModifyKind::Name(_)));
                     // A removed/recreated ancestor needs new directory watches;
                     // simple file edits keep the existing tracked-path census.
                     change.membership |= worktree.directories.contains(path)
@@ -403,6 +408,8 @@ pub(crate) struct Change {
     pub worktrees: BTreeSet<WorktreeId>,
     pub topology: bool,
     pub membership: bool,
+    /// A content entry appeared/disappeared; replace the cached untracked count.
+    pub untracked: bool,
     /// Index, HEAD, refs or config changed, invalidating cached panel metadata.
     pub metadata: bool,
     /// Shared stash data changes the one bound panel, without rereading every checkout.
@@ -416,6 +423,7 @@ impl Change {
         self.worktrees.extend(other.worktrees);
         self.topology |= other.topology;
         self.membership |= other.membership;
+        self.untracked |= other.untracked;
         self.metadata |= other.metadata;
         self.shared_snapshot |= other.shared_snapshot;
         if let Some(coverage) = other.coverage {
@@ -945,6 +953,24 @@ mod tests {
 
     fn modified(path: PathBuf) -> Event {
         Event::new(EventKind::Modify(ModifyKind::Data(DataChange::Any))).add_path(path)
+    }
+
+    #[test]
+    fn content_membership_events_refresh_full_counts_without_admin_fanout() {
+        let project = project(Path::new("/repo"));
+        let worktree = &project.worktrees[0];
+        for kind in [
+            EventKind::Create(notify::event::CreateKind::File),
+            EventKind::Remove(notify::event::RemoveKind::File),
+            EventKind::Modify(ModifyKind::Name(notify::event::RenameMode::Both)),
+        ] {
+            let change = project.change(&Event::new(kind).add_path(worktree.root.join("src/new.txt"))).unwrap();
+            assert!(change.untracked);
+            assert_eq!(change.worktrees, BTreeSet::from([worktree.id]));
+            assert!(!change.metadata);
+            assert!(!change.topology);
+        }
+        assert!(!project.change(&modified(worktree.root.join("src/main.rs"))).unwrap().untracked);
     }
 
     #[test]
