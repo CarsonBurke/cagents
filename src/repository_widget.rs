@@ -19,6 +19,8 @@ mod diff_layout;
 mod diff_mutations;
 pub use diff_mutations::{Capture as DiffMutationCapture, Prepared as PreparedDiffMutation, Request as DiffMutationRequest};
 mod preview;
+mod root_admission;
+pub use root_admission::{RootFilePreparation, RootFileAdmission};
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
@@ -711,6 +713,8 @@ pub enum RepositoryAction {
         request: u64,
         result: Result<crate::editor::BinaryPreview, FileIoError>,
     },
+    EditorFilePrepared { identity: AsyncIdentity, preparation: RootFilePreparation },
+    EditorFileAdmitted { identity: AsyncIdentity, admission: RootFileAdmission },
     ConfiguredFileLoaded { identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides, root: Option<crate::editor::FileRootIdentity> },
     EditorRootRebound { identity: AsyncIdentity, source: PathBuf, ticket: u64, previous: crate::editor::FileRootIdentity, result: Result<crate::editor::FileRootIdentity, String> },
     OpenWorkingFileLocation {
@@ -1000,6 +1004,8 @@ impl RepositoryAction {
             | Self::FileListUnchanged { identity }
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
+            | Self::EditorFilePrepared { identity, .. }
+            | Self::EditorFileAdmitted { identity, .. }
             | Self::ConfiguredFileLoaded { identity, .. }
             | Self::EditorRootRebound { identity, .. }
             | Self::DiskMetadata { identity, .. }
@@ -2392,6 +2398,7 @@ pub struct RepositoryRuntime {
     recovery_endpoint: Option<crate::recovery_domain::LocalRecoveryEndpoint>,
     edited_root_admissions: Option<crate::edited_root_admission::SharedEditedRootAdmissions>,
     original_editor_root: Option<crate::editor::FileRootIdentity>,
+    editor_root_load: Option<uuid::Uuid>,
     directory_only: bool,
     external_source: Option<PathBuf>,
     standalone: bool,
@@ -2657,6 +2664,7 @@ impl RepositoryRuntime {
             recovery_endpoint: None,
             edited_root_admissions: None,
             original_editor_root: None,
+            editor_root_load: None,
             standalone: false,
             external_editors: crate::sidebar::SidebarEditors::default(),
             editor_tab_width: 4,
@@ -3540,9 +3548,9 @@ impl RepositoryRuntime {
     #[cfg(test)]
     pub(crate) fn open_fixture(card: CardId, name: &str, text: &str) -> (Self, AsyncIdentity) {
         let (mut runtime, identity) = Self::selection_fixture(card, name);
-        drop(runtime.update(RepositoryAction::FileLoaded {
-            identity: identity.clone(),
-            result: Ok(LoadedFile {
+        drop(runtime.install_loaded_file(
+            identity.clone(),
+            Ok(LoadedFile {
                 source: identity.path.clone(),
                 content: FileContent::Editable {
                     text: text.into(),
@@ -3550,7 +3558,7 @@ impl RepositoryRuntime {
                     markdown: false,
                 },
             }),
-        }));
+        None));
         (runtime, identity)
     }
 
@@ -6591,6 +6599,189 @@ impl RepositoryRuntime {
         })
     }
 
+    fn install_loaded_file(&mut self, identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, root: Option<crate::editor::FileRootIdentity>) -> Task<RepositoryAction> {
+        if !self.accepts_selected(&identity) {
+            return Task::none();
+        }
+        let restored_focus = self
+            .restores_editor_navigation(&identity)
+            .then(|| identity.clone());
+        if !matches!(&result, Ok(LoadedFile { content: FileContent::Editable { .. } | FileContent::SavedAbsence, .. })) {
+            self.undo_lru.remove(&identity.path);
+        }
+        self.document = match result {
+            Ok(LoadedFile {
+                source,
+                content:
+                    FileContent::Editable {
+                        text,
+                        content_hash,
+                        markdown,
+                    },
+            }) => {
+                let retained = self.undo_lru.take(&identity.path, &source, content_hash, true);
+                let mut document = EditorDocument::new(identity.path, source, text, content_hash, markdown);
+                if let Some(retained) = retained {
+                    document.restore_undo(retained);
+                }
+                DocumentState::Editable(document)
+            },
+            Ok(LoadedFile { source, content: FileContent::SavedAbsence }) => {
+                match self.undo_lru.take(&identity.path, &source, blake3::hash(b""), false) {
+                    Some(retained) => {
+                        let markdown = crate::editor::is_markdown_path(&source);
+                        let mut document = EditorDocument::new(identity.path, source, String::new(), blake3::hash(b""), markdown);
+                        document.restore_undo(retained);
+                        DocumentState::Editable(document)
+                    }
+                    None => DocumentState::Failed { path: identity.path, message: "The retained missing-file history is no longer available.".into() },
+                }
+            },
+            Ok(LoadedFile {
+                source,
+                content:
+                    FileContent::Image {
+                        width,
+                        height,
+                        rgba,
+                    },
+            }) => DocumentState::Image {
+                source,
+                handle: iced::widget::image::Handle::from_rgba(
+                    width,
+                    height,
+                    iced::advanced::graphics::core::Bytes::from_owner(rgba),
+                ),
+                width,
+                height,
+            },
+            Ok(LoadedFile {
+                source,
+                content: FileContent::Pdf { pages, page },
+            }) => DocumentState::Pdf {
+                handle: iced::widget::image::Handle::from_rgba(
+                    page.width,
+                    page.height,
+                    iced::advanced::graphics::core::Bytes::from_owner(page.rgba),
+                ),
+                width: page.width,
+                height: page.height,
+                points_wide: page.points_wide,
+                page: page.index,
+                // A freshly opened document is drawn at the pane's
+                // width, which is the zoom the load rendered it for.
+                zoom: crate::editor::PdfZoom::default(),
+                // The tone the load baked into these pixels, not the
+                // theme as it is now: the two differ when the reader
+                // changed their shell while the document rendered.
+                tone: self.document_tone,
+                // The same absolute path the load resolved, because
+                // every later page is read from the file again.
+                path: identity.worktree.join(&source),
+                source,
+                pages,
+                rendering: None,
+                message: None,
+                // A freshly opened document follows the theme until
+                // the reader says otherwise.
+                chosen_tone: None,
+            },
+            // The notice is about the file that was classified: for
+            // a refused link the link that failed, which in a chain
+            // is not the row, and otherwise the file the row led to.
+            Ok(LoadedFile {
+                source,
+                content: FileContent::ReadOnly(reason),
+            }) => DocumentState::ReadOnly {
+                path: source,
+                reason,
+            },
+            Err(error) => DocumentState::Failed {
+                path: identity.path,
+                message: error.to_string(),
+            },
+        };
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.undo_root = root;
+            document.content.set_auto_close(self.editor_auto_close);
+            if let Some((path, source_line)) = self.pending_source_location.take()
+                && document.path == path
+                && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
+                && *pending_path == path {
+                let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+                navigation.caret.line = line;
+                navigation.caret.column = 0;
+                navigation.scroll_line = line.saturating_sub(10);
+            }
+            if let Some((path, line, column)) = self.pending_scalar_location.take()
+                && document.path == path
+                && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
+                && *pending_path == path {
+                navigation.caret.column = document.content.with_line(line, |text, _| text.char_indices().nth(column).map_or(text.len(), |(byte, _)| byte)).unwrap_or(column);
+            }
+            if let Some((path, editor)) = self.pending_editor_navigation.take()
+                && self.selected.as_ref().is_some_and(|file| file.path == path)
+            {
+                let position =
+                    |position: crate::model::EditorPosition| text_editor::Position {
+                        line: position.line,
+                        column: position.column,
+                    };
+                document.content.set_cursor(text_editor::Cursor {
+                    position: position(editor.caret),
+                    selection: editor.selection.map(position),
+                });
+                self.pending_editor_focus = restored_focus;
+                self.viewports.editor = text_editor::ScrollPosition {
+                    line: editor.scroll_line,
+                    vertical: editor.scroll_vertical,
+                    horizontal: editor.scroll_horizontal,
+                };
+            }
+            document
+                .content
+                .restore_scroll_position(self.viewports.editor);
+        }
+        // A read-only or unreadable file is not a document a language
+        // server can serve, and `push_lsp_open` reports nothing for
+        // either of them.
+        self.push_lsp_open(&identity.worktree);
+        // A theme change while the document was rendering had no page
+        // to re-render, so the page reconciles with the shell as it is
+        // now. Nothing to reconcile renders nothing.
+        let retone = self.retone_document(identity.card, &cosmic::theme::active());
+        // The row may already have asked Git about itself, which for a
+        // symbolic link is the link. The buffer is the target, so that
+        // comparison is discarded and read again from the target.
+        let followed = self.followed_source().is_some();
+        if followed {
+            self.diffs.retain(|(basis, _)| basis.is_immutable());
+        }
+        let reload = if followed {
+            self.ensure_current_diff(identity.card)
+        } else {
+            Task::none()
+        };
+        let fragment = self
+            .pending_fragment
+            .take()
+            .map_or_else(Task::none, |fragment| {
+                self.preview_fragment(identity.card, &fragment)
+            });
+        Task::batch([retone, self.restore_visible_scroll(), reload, fragment])
+    }
+
+    fn finish_configured_file(&mut self, identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides, root: Option<crate::editor::FileRootIdentity>) -> Task<RepositoryAction> {
+        let current = self.accepts_selected(&identity);
+        if current { self.undo_lru.validate_root(&identity.path, root.as_ref()); }
+        let task = self.install_loaded_file(identity, result, root);
+        if current && let DocumentState::Editable(document) = &mut self.document {
+            document.indentation = indentation;
+            document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, indentation));
+        }
+        task
+    }
+
     pub fn update(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
         let card = action.card();
         let task = self.update_inner(action);
@@ -6630,16 +6821,14 @@ impl RepositoryRuntime {
                 }
                 Task::none()
             }
+            RepositoryAction::EditorFilePrepared { identity, preparation } => self.editor_file_prepared(identity, preparation),
+            RepositoryAction::EditorFileAdmitted { identity, admission } => self.editor_file_admitted(identity, admission),
             RepositoryAction::ConfiguredFileLoaded { identity, result, indentation, root } => {
-                let current = self.accepts_selected(&identity);
-                if current { self.undo_lru.validate_root(&identity.path, root.as_ref()); }
-                let task = self.update_inner(RepositoryAction::FileLoaded { identity, result });
-                if current && let DocumentState::Editable(document) = &mut self.document {
-                    document.undo_root = root;
-                    document.indentation = indentation;
-                    document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, indentation));
-                }
-                task
+                // Legacy/unscoped completions cannot mint a mutable document.
+                let result = if root_admission::is_mutable(&result) {
+                    Err(FileIoError::Io("The original edited-root load receipt is required before this file can become editable.".into()))
+                } else { result };
+                self.finish_configured_file(identity, result, indentation, root)
             }
             RepositoryAction::BinaryPage { card, offset } => {
                 let DocumentState::ReadOnly { path, reason: ReadOnlyReason::BinaryPreview(_) } = &self.document else { return Task::none(); };
@@ -6955,174 +7144,12 @@ impl RepositoryRuntime {
                 self.open_file_entry(card, file)
             }
             RepositoryAction::FileLoaded { identity, result } => {
-                if !self.accepts_selected(&identity) {
-                    return Task::none();
-                }
-                let restored_focus = self
-                    .restores_editor_navigation(&identity)
-                    .then(|| identity.clone());
-                if !matches!(&result, Ok(LoadedFile { content: FileContent::Editable { .. } | FileContent::SavedAbsence, .. })) {
-                    self.undo_lru.remove(&identity.path);
-                }
-                self.document = match result {
-                    Ok(LoadedFile {
-                        source,
-                        content:
-                            FileContent::Editable {
-                                text,
-                                content_hash,
-                                markdown,
-                            },
-                    }) => {
-                        let retained = self.undo_lru.take(&identity.path, &source, content_hash, true);
-                        let mut document = EditorDocument::new(identity.path, source, text, content_hash, markdown);
-                        if let Some(retained) = retained {
-                            document.restore_undo(retained);
-                        }
-                        DocumentState::Editable(document)
-                    },
-                    Ok(LoadedFile { source, content: FileContent::SavedAbsence }) => {
-                        match self.undo_lru.take(&identity.path, &source, blake3::hash(b""), false) {
-                            Some(retained) => {
-                                let markdown = crate::editor::is_markdown_path(&source);
-                                let mut document = EditorDocument::new(identity.path, source, String::new(), blake3::hash(b""), markdown);
-                                document.restore_undo(retained);
-                                DocumentState::Editable(document)
-                            }
-                            None => DocumentState::Failed { path: identity.path, message: "The retained missing-file history is no longer available.".into() },
-                        }
-                    },
-                    Ok(LoadedFile {
-                        source,
-                        content:
-                            FileContent::Image {
-                                width,
-                                height,
-                                rgba,
-                            },
-                    }) => DocumentState::Image {
-                        source,
-                        handle: iced::widget::image::Handle::from_rgba(
-                            width,
-                            height,
-                            iced::advanced::graphics::core::Bytes::from_owner(rgba),
-                        ),
-                        width,
-                        height,
-                    },
-                    Ok(LoadedFile {
-                        source,
-                        content: FileContent::Pdf { pages, page },
-                    }) => DocumentState::Pdf {
-                        handle: iced::widget::image::Handle::from_rgba(
-                            page.width,
-                            page.height,
-                            iced::advanced::graphics::core::Bytes::from_owner(page.rgba),
-                        ),
-                        width: page.width,
-                        height: page.height,
-                        points_wide: page.points_wide,
-                        page: page.index,
-                        // A freshly opened document is drawn at the pane's
-                        // width, which is the zoom the load rendered it for.
-                        zoom: crate::editor::PdfZoom::default(),
-                        // The tone the load baked into these pixels, not the
-                        // theme as it is now: the two differ when the reader
-                        // changed their shell while the document rendered.
-                        tone: self.document_tone,
-                        // The same absolute path the load resolved, because
-                        // every later page is read from the file again.
-                        path: identity.worktree.join(&source),
-                        source,
-                        pages,
-                        rendering: None,
-                        message: None,
-                        // A freshly opened document follows the theme until
-                        // the reader says otherwise.
-                        chosen_tone: None,
-                    },
-                    // The notice is about the file that was classified: for
-                    // a refused link the link that failed, which in a chain
-                    // is not the row, and otherwise the file the row led to.
-                    Ok(LoadedFile {
-                        source,
-                        content: FileContent::ReadOnly(reason),
-                    }) => DocumentState::ReadOnly {
-                        path: source,
-                        reason,
-                    },
-                    Err(error) => DocumentState::Failed {
-                        path: identity.path,
-                        message: error.to_string(),
-                    },
-                };
-                if let DocumentState::Editable(document) = &mut self.document {
-                    document.content.set_auto_close(self.editor_auto_close);
-                    if let Some((path, source_line)) = self.pending_source_location.take()
-                        && document.path == path
-                        && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
-                        && *pending_path == path {
-                        let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
-                        navigation.caret.line = line;
-                        navigation.caret.column = 0;
-                        navigation.scroll_line = line.saturating_sub(10);
-                    }
-                    if let Some((path, line, column)) = self.pending_scalar_location.take()
-                        && document.path == path
-                        && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
-                        && *pending_path == path {
-                        navigation.caret.column = document.content.with_line(line, |text, _| text.char_indices().nth(column).map_or(text.len(), |(byte, _)| byte)).unwrap_or(column);
-                    }
-                    if let Some((path, editor)) = self.pending_editor_navigation.take()
-                        && self.selected.as_ref().is_some_and(|file| file.path == path)
-                    {
-                        let position =
-                            |position: crate::model::EditorPosition| text_editor::Position {
-                                line: position.line,
-                                column: position.column,
-                            };
-                        document.content.set_cursor(text_editor::Cursor {
-                            position: position(editor.caret),
-                            selection: editor.selection.map(position),
-                        });
-                        self.pending_editor_focus = restored_focus;
-                        self.viewports.editor = text_editor::ScrollPosition {
-                            line: editor.scroll_line,
-                            vertical: editor.scroll_vertical,
-                            horizontal: editor.scroll_horizontal,
-                        };
-                    }
-                    document
-                        .content
-                        .restore_scroll_position(self.viewports.editor);
-                }
-                // A read-only or unreadable file is not a document a language
-                // server can serve, and `push_lsp_open` reports nothing for
-                // either of them.
-                self.push_lsp_open(&identity.worktree);
-                // A theme change while the document was rendering had no page
-                // to re-render, so the page reconciles with the shell as it is
-                // now. Nothing to reconcile renders nothing.
-                let retone = self.retone_document(identity.card, &cosmic::theme::active());
-                // The row may already have asked Git about itself, which for a
-                // symbolic link is the link. The buffer is the target, so that
-                // comparison is discarded and read again from the target.
-                let followed = self.followed_source().is_some();
-                if followed {
-                    self.diffs.retain(|(basis, _)| basis.is_immutable());
-                }
-                let reload = if followed {
-                    self.ensure_current_diff(identity.card)
-                } else {
-                    Task::none()
-                };
-                let fragment = self
-                    .pending_fragment
-                    .take()
-                    .map_or_else(Task::none, |fragment| {
-                        self.preview_fragment(identity.card, &fragment)
-                    });
-                Task::batch([retone, self.restore_visible_scroll(), reload, fragment])
+                // External source readers are read-only. Internal mutable reads
+                // must use the two-phase ConfiguredFileLoaded admission path.
+                let result = if root_admission::is_mutable(&result) {
+                    Err(FileIoError::Io("Original edited-root admission is required before opening an editable document.".into()))
+                } else { result };
+                self.install_loaded_file(identity, result, None)
             }
             RepositoryAction::PdfTone { card, tone } => {
                 let DocumentState::Pdf {
@@ -8794,7 +8821,7 @@ impl RepositoryRuntime {
         self.document_tone = pdf_tone(&cosmic::theme::active());
         let identity = self.next_identity(card, path);
         let absent = self.undo_lru.expected_absence(&identity.path);
-        file_task(identity, self.document_tone, absent)
+        self.admitted_file_task(identity, absent)
     }
 
     fn diff_mode_index(&self) -> usize {
@@ -9428,7 +9455,8 @@ fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
     }
 }
 
-/// Reads the file, rendering a document's first page with `tone`.
+/// Legacy raw read used only by source/history fixtures; it grants no admission.
+#[cfg(test)]
 fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone, absent: Option<(PathBuf, crate::editor::FileRootIdentity)>) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();

@@ -417,6 +417,11 @@ impl FileRootIdentity {
     /// Pure clone of the original worker-opened descriptor. A stale spelling
     /// does not turn this into authority over a newly located/replaced root.
     pub fn retained_root(&self) -> std::sync::Arc<Root> { std::sync::Arc::clone(&self._root) }
+    /// Cached candidate comparison only. Worker lease validation must also
+    /// prove the mount instance before an original admission can be reused.
+    pub(crate) fn same_directory_candidate(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
     /// Pure clone of an already admitted original owner. This does not enroll,
     /// validate or authorize a different directory from its diagnostic path.
     pub fn retained_admission(&self) -> Option<crate::edited_root_admission::AdmittedRoot> {
@@ -442,6 +447,8 @@ impl FileRootIdentity {
     pub(crate) fn validate_named(&self, worktree: &Path) -> Result<&Root, FileIoError> {
         let named = Self::of(std::sync::Arc::new(worktree_root(worktree)?))?;
         if &named != self { return Err(FileIoError::Io("The editor worktree was moved or replaced. Reopen the file before saving.".into())); }
+        let admission = self.admission.as_ref().ok_or_else(|| FileIoError::Io("Original edited-root registration is unavailable. The buffer has been kept.".into()))?;
+        admission.validate_for_root(&self._root, std::time::Instant::now() + std::time::Duration::from_secs(5)).map_err(io_error)?;
         Ok(&self._root)
     }
     /// Worker-only proof for an explicit Locate/relocation. A replacement
