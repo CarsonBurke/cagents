@@ -26,6 +26,7 @@ pub(crate) use directory::DirectoryProof;
 mod store;
 mod websocket;
 mod remote_actor;
+pub(crate) fn remove_actor_final_snapshot(record:&crate::daemon::holder_registry::Record)->Result<(),String> {remote_actor::final_snapshot::remove(record)}
 mod handle;
 pub use handle::Handle;
 pub(crate) use remote_actor::{ActorIdentity,ActorInspection,InputIdentity,InputReceipt,InputState,OutboxEntry};
