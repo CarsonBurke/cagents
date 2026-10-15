@@ -13793,12 +13793,17 @@ impl Application for Cagents {
                         // completed read cannot rename an existing one. Use
                         // the latest shared name after the read, including a
                         // rename observed while it was running.
-                        let known_name = self.workspace_model
+                        let known_name = self
+                            .workspace_model
                             .project(&loaded.project.repository)
                             .map(|project| project.name.clone())
-                            .or_else(|| self.sidebar_model.projects.iter()
-                                .find(|project| project.repository == loaded.project.repository)
-                                .map(|project| project.name.clone()));
+                            .or_else(|| {
+                                self.sidebar_model
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.repository == loaded.project.repository)
+                                    .map(|project| project.name.clone())
+                            });
                         if let Some(name) = &known_name {
                             loaded.project.name.clone_from(name);
                         }

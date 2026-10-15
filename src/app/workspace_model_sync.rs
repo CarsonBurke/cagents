@@ -208,7 +208,12 @@ fn publish(
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
                     if let ModelEdit::ReopenProject { repository, .. }
-                        | ModelEdit::VisitProject { repository, reopen: true, .. } = request {
+                    | ModelEdit::VisitProject {
+                        repository,
+                        reopen: true,
+                        ..
+                    } = request
+                    {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
                             error: error.to_string(),
@@ -236,7 +241,11 @@ fn send(
     };
     let reopened = match &edit {
         ModelEdit::ReopenProject { repository, .. }
-        | ModelEdit::VisitProject { repository, reopen: true, .. } => Some(repository.clone()),
+        | ModelEdit::VisitProject {
+            repository,
+            reopen: true,
+            ..
+        } => Some(repository.clone()),
         _ => None,
     };
     let view_edit = match &edit {
@@ -934,8 +943,12 @@ impl Cagents {
                 != Some(checkout)
         });
         if let Some(project_id) = self.project_for_repository(&shared.repository) {
-            if let Some(project) = self.sidebar_model.projects.iter_mut()
-                .find(|project| project.id == project_id) {
+            if let Some(project) = self
+                .sidebar_model
+                .projects
+                .iter_mut()
+                .find(|project| project.id == project_id)
+            {
                 project.name.clone_from(&shared.name);
             }
             let needs_checkout_read = primary_changed
@@ -2033,19 +2046,28 @@ mod tests {
 
     #[test]
     fn shared_checkout_reload_keeps_the_latest_name_and_publishes_a_visit() {
-        let Some(checkout) = git_checkout() else { return; };
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
         let root = checkout.path().canonicalize().unwrap();
         let repository = canonical_repository(&root.join(".git")).unwrap();
         let (mut app, project, _) = app_with_project();
         app.sidebar_model.projects = vec![SidebarProject::new(
-            project, RepositoryId::new(), "Old local label".into(),
-            repository.clone(), Vec::new(), Vec::new(),
+            project,
+            RepositoryId::new(),
+            "Old local label".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
         )];
         app.sidebar_model.projects[0].unreachable = Some("Previous read failed".into());
         let shared = ModelProject {
-            repository: repository.clone(), checkout: Some(root),
-            primary_checkout: None, name: "Custom shared label".into(),
-            kind: ProjectKind::Git, ordinal: 1,
+            repository: repository.clone(),
+            checkout: Some(root),
+            primary_checkout: None,
+            name: "Custom shared label".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
         };
         app.workspace_model = registry(Vec::new());
         app.workspace_model.projects.push(shared.clone());
@@ -2055,7 +2077,10 @@ mod tests {
         };
         assert_eq!(app.sidebar_model.projects[0].name, "Custom shared label");
         let message = first_message(task).expect("actual repository read completion");
-        let Message::RepositoryLoaded { result: Ok(loaded), .. } = &message else {
+        let Message::RepositoryLoaded {
+            result: Ok(loaded), ..
+        } = &message
+        else {
             panic!("expected a successful actual Git read");
         };
         assert_ne!(loaded.project.name, "Custom shared label");
@@ -2063,24 +2088,34 @@ mod tests {
         // rename must win when its old completion reaches the UI.
         app.workspace_model.projects[0].name = "Newest shared label".into();
         drop(app.update(message));
-        assert_eq!(app.sidebar_model.project(project).unwrap().name, "Newest shared label");
+        assert_eq!(
+            app.sidebar_model.project(project).unwrap().name,
+            "Newest shared label"
+        );
         let edits = drain(&publishes);
         assert!(edits.iter().any(|edit| matches!(edit,
             ModelEdit::VisitProject { repository: key, name, reopen: false, .. }
                 if key == &repository && name == "Newest shared label")));
-        assert!(!edits.iter().any(|edit| matches!(edit,
-            ModelEdit::OpenProject { .. } | ModelEdit::ReopenProject { .. })),
-            "read completion may publish discovery, never a rename");
+        assert!(
+            !edits.iter().any(|edit| matches!(
+                edit,
+                ModelEdit::OpenProject { .. } | ModelEdit::ReopenProject { .. }
+            )),
+            "read completion may publish discovery, never a rename"
+        );
         // Even a rename not yet observed by this window must survive its
         // queued publication: the visit remains only an insert-time hint.
         app.sidebar_model.projects[0].name = "Older local label".into();
         app.project_ui.reopening.insert(project, repository.clone());
         app.publish_project_opened(project);
-        assert!(matches!(publishes.try_recv().unwrap(), ModelEdit::VisitProject {
+        assert!(
+            matches!(publishes.try_recv().unwrap(), ModelEdit::VisitProject {
             repository: key, reopen: true, ..
-        } if key == repository));
+        } if key == repository)
+        );
         drop(app.apply_workspace_model_update(ModelUpdate::Reopened {
-            repository: repository.clone(), model: app.workspace_model.clone(),
+            repository: repository.clone(),
+            model: app.workspace_model.clone(),
         }));
         assert!(!app.project_ui.is_reopening(&repository));
     }
