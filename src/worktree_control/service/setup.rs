@@ -45,7 +45,7 @@ pub(super) fn list(service:&Service,store:&crate::persistence::StateStore,reposi
         let Some(record)=serde_json::from_value::<PathBuf>(row.payload["request"]["destination"].clone()).ok().and_then(|path|records.get(&path).copied()) else {continue;};
         match verified_report(service,&row,&common,record,cancel) {
             Ok(report)=>if let Some(intent)=report.request.as_ref().and_then(|request|request.setup_intent.as_ref()) {
-                intents.push(SetupReceipt {path:record.path.clone(),creation_id:report.operation_id,intent:serde_json::to_string(intent).map_err(|error|error.to_string())?});
+                intents.push(SetupReceipt {path:record.path.clone(),creation_id:report.operation_id,run_id:intent.run_id,skip:intent.skip,copy_done:intent.copy_done,has_commands:intent.plan.as_ref().is_some_and(|plan|plan.requires_trust())});
             },
             Err(error)=>warnings.push(format!("Could not verify retained setup for {}: {error}",record.path.display())),
         }

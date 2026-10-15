@@ -58,7 +58,14 @@ impl Operation {
 /// Retained creation metadata, including runs interrupted before a terminal
 /// pane could be published. It is evidence for review, never replay permission.
 #[derive(Clone,Debug,PartialEq,Eq,Serialize,Deserialize)]
-pub struct SetupReceipt {pub path:PathBuf,pub creation_id:crate::model::OperationId,pub intent:String}
+pub struct SetupReceipt {
+    pub path:PathBuf,
+    pub creation_id:crate::model::OperationId,
+    pub run_id:Option<crate::model::OperationId>,
+    pub skip:bool,
+    pub copy_done:bool,
+    pub has_commands:bool,
+}
 
 /// Daemon-observed actor identity and close revision; the full census includes
 /// idle actors while `agents` identifies the subset requiring interruption.
