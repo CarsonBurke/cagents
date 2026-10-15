@@ -165,9 +165,8 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
-            db.execute_batch(child_tools::SCHEMA)
-                .map_err(|e| e.to_string())?;
             let raw_sources = raw::initialize(&mut db)?;
+            child_tools::initialize(&mut db, raw_sources.nonce)?;
             Ok(Self {
                 raw_sources,
                 canonical_generation: uuid::Uuid::new_v4(),
