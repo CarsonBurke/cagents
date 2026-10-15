@@ -300,4 +300,17 @@ mod tests {
         assert!(authority.originals(vec![OriginalUpdate::Latest{session_id:"session".into(),user_id:"newest-unavailable-user".into()}]).is_some());assert_eq!(authority.latest_proven.as_deref(),Some("newest-unavailable-user"));assert!(matches!(authority.original(None,0,32),Err(OriginalError::Unavailable(_))));assert_eq!(authority.original(Some("older-user"),0,32).unwrap().text,"older");
     }
 
+    #[test]
+    fn first_claude_prompt_decoder_and_authority_preserve_operator_input_over_rewritten_echo(){
+        let root=annotations::storage::test_directory();let home=root.path().join("claude-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Claude,root.path(),|key|(key=="CLAUDE_CONFIG_DIR").then(||home.as_os_str().to_owned())).unwrap();
+        let mut authority=Authority::new(Ok(scope));authority.root=Some(root.path().join("annotations"));let mut adapter=protocol::claude::annotation_test_adapter();
+        let mut command=Command::Prompt{text:"original /slash-command".into(),attachments:vec![],mode:crate::chat::PromptMode::Send};assert!(adapter.supports_original_commands(&command));let id=authority.prepare(&mut command,root.path()).unwrap().unwrap();adapter.original_command(Some(id.clone()));let read=adapter.command(command).unwrap();
+        let dispatched=adapter.receive(json!({"type":"control_response","response":{"request_id":read.writes[0]["request_id"],"subtype":"success","response":{"applied":{"model":"reported-model","effort":"low"}}}})).unwrap();assert_eq!(dispatched.writes[0]["uuid"],id);
+        let session="00000000-0000-4000-8000-000000000001";
+        for frame in [json!({"type":"system","subtype":"init","session_id":session,"model":"reported-model","effort":"low","permissionMode":"default","fast_mode_state":"off"}),json!({"type":"command_lifecycle","command_uuid":id,"state":"started"}),json!({"type":"user","uuid":id,"session_id":session,"parent_tool_use_id":null,"message":{"id":"actual-root","role":"user","content":[{"type":"text","text":"rewritten provider echo"}]}})]{
+            let mut step=adapter.receive(frame).unwrap();let confirmed=step.events.iter().find_map(|event|if let Event::Session{id,..}=event{Some(Some(id.clone()))}else{None});assert!(authority.apply(confirmed.as_ref(),adapter.take_approval_updates(),&mut step.events).is_none());assert!(authority.originals(adapter.take_original_updates()).is_none());
+        }
+        let original=authority.original(None,0,1024).unwrap();assert_eq!(original.text,"original /slash-command");assert_eq!(original.session_id,session);assert_eq!(original.original.user_id,id);assert_eq!(authority.original(Some("actual-root:0"),0,1024).ok().map(|page|page.text),Some("original /slash-command".into()));
+    }
+
 }
