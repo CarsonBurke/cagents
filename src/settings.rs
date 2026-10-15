@@ -4311,10 +4311,19 @@ new_thread = "Alt+Shift+G"
         // The gesture only reaches the child as a control character when Ctrl
         // is alone: the shifted and Alt forms send something else, or nothing,
         // and stay bindable.
-        for chord in ["Ctrl+Shift+C", "Ctrl+Alt+D", "Super+Z"] {
+        for chord in ["Ctrl+Shift+X", "Ctrl+Alt+D", "Super+Z"] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.new_terminal = vec![chord.to_owned()];
             assert!(settings.validate().is_ok(), "{chord} was refused");
+        }
+    }
+
+    #[test]
+    fn native_fixed_chords_refuse_conflicting_actions_by_name() {
+        for (chord, label) in [("Ctrl+Tab", "Cycle recent panes"), ("Ctrl+=", "Increase font size"), ("Ctrl+Shift+C", "Copy terminal selection"), ("Ctrl+Shift+S", "Stage / unstage selected lines")] {
+            let mut settings = AppSettings::default();
+            settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
+            assert!(matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)), "{chord}");
         }
     }
 
