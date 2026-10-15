@@ -1419,8 +1419,9 @@ mod tests {
         app.context_inspector_open = false;
         let project = app.sidebar_model.projects[0].id;
         let worktree = crate::model::WorktreeId::new();
+        let old_worktree = crate::model::WorktreeId::new();
         app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
-            crate::model::WorktreeId::new(), "/old/worktree".into(), Some("old-branch".into())));
+            old_worktree, "/old/worktree".into(), Some("old-branch".into())));
         app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
             crate::model::WorktreeId::new(), "/located".into(), Some("parent-control".into())));
         app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
@@ -1452,16 +1453,31 @@ mod tests {
         // not explicit filing authority and cannot override verified evidence.
         app.refresh_worktree_owners(None);
         assert_eq!(app.worktree_owners.get(&card).map(PathBuf::as_path), Some(Path::new("/old/worktree")));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.sequence = 1;
+        app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
+            repository: "/repo".into(), name: "project".into(), kind: ProjectKind::Git, ordinal: 0,
+        }];
+        app.workspace_model.channels = app.durable.channels.iter().map(|row| crate::workspace_model::ModelChannel {
+            id: row.id, repository: "/repo".into(), title: row.title.clone(),
+            title_source: row.title_source, ordinal: row.ordinal,
+        }).collect();
         app.workspace_model.agents = vec![agent.clone()];
         app.workspace_model.agent_locations = vec![AgentLocation {
-            agent: agent.id, repository: "/located/repository".into(),
-            directory: "/located/worktree/src".into(), blocked_directory: None,
+            agent: agent.id, repository: "/old/repository".into(),
+            directory: "/old/worktree/src".into(), blocked_directory: None,
         }];
         app.workspace_model.views = vec![View { scope: placement, revision: 1, panes: vec![pane], retired: vec![] }];
         app.observe_agent_activity_for_card(card, Some(crate::agent::Activity {
             provider: crate::agent::Provider::Omp, state: ActivityState::Waiting,
         }));
         app.refresh_sidebar_channels();
+        assert_eq!(app.sidebar_state.agent_activity(project, old_worktree), Some(ActivityState::Waiting));
+        let mut incoming = app.workspace_model.clone();
+        incoming.sequence += 1;
+        incoming.agent_locations[0].repository = "/located/repository".into();
+        incoming.agent_locations[0].directory = "/located/worktree/src".into();
+        drop(app.update(Message::WorkspaceModelObserved(super::super::workspace_model_sync::ModelUpdate::Read(incoming))));
         assert_eq!(app.sidebar_model.projects[0].channels[0].worktree,
             Some((worktree, "relocated-branch".into())));
         assert!(app.sidebar_model.projects[0].channels[0].tooltip_for_test().contains("relocated-branch"));
@@ -1483,9 +1499,10 @@ mod tests {
         session.launch.recipe.working_directory = "/located/worktree/other".into();
         durable.channels.iter_mut().find(|row| row.id == channel).unwrap().cards.push(other.id);
         durable.cards.push(other);
-        app.workspace_model.agent_locations[0].blocked_directory = Some("/located/candidate".into());
-        app.reconcile_agent_attention_owners();
-        app.refresh_sidebar_channels();
+        let mut incoming = app.workspace_model.clone();
+        incoming.sequence += 1;
+        incoming.agent_locations[0].blocked_directory = Some("/located/candidate".into());
+        drop(app.update(Message::WorkspaceModelObserved(super::super::workspace_model_sync::ModelUpdate::Read(incoming))));
         assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none());
         assert!(app.agent_worktree(card).is_none());
         assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
@@ -1494,8 +1511,16 @@ mod tests {
         assert_eq!(app.agent_worktree(card).map(|key| key.worktree_id), Some(worktree),
             "explicit saved filing remains display authority even when process relocation refuses");
         assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
+        Arc::make_mut(&mut app.durable).card_scopes.insert(card, "/located/unloaded-explicit".into());
+        app.reconcile_agent_attention_owners();
+        assert!(app.agent_worktree(card).is_none(), "explicit scope requires its exact loaded checkout");
+        assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
         Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
-        app.workspace_model.agent_locations[0].blocked_directory = None;
+        let mut incoming = app.workspace_model.clone();
+        incoming.sequence += 1;
+        incoming.agent_locations[0].blocked_directory = None;
+        drop(app.update(Message::WorkspaceModelObserved(super::super::workspace_model_sync::ModelUpdate::Read(incoming))));
+        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
         app.sidebar_model.projects[0].worktrees.retain(|row| row.id != worktree);
         app.reconcile_agent_attention_owners();
         app.refresh_sidebar_channels();

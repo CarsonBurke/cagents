@@ -7257,11 +7257,11 @@ impl Cagents {
         self.agent_worktree_indexed(state, &locations, &roots, &loaded)
     }
 
-    fn agent_worktree_indexed(
-        &self,
-        state: &CardState,
+    fn agent_worktree_indexed<'a>(
+        &'a self,
+        state: &'a CardState,
         locations: &crate::workspace_model::views::AttentionDirectoryIndex<'_>,
-        roots: &worktree_ui::WorktreeRoots<'_>,
+        roots: &worktree_ui::WorktreeRoots<'a>,
         loaded: &HashMap<PathBuf, ActiveWorktreeKey>,
     ) -> Option<ActiveWorktreeKey> {
         if !state.existence.is_open() || !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
@@ -7270,12 +7270,12 @@ impl Cagents {
         // Explicit filing remains display authority. Verified operational
         // location only replaces the historical launch-directory fallback.
         if let Some(scope) = self.durable.card_scopes.get(&state.id) {
-            return loaded.get(roots.resolve(scope).unwrap_or(scope)).cloned();
+            return loaded.get(scope).cloned();
         }
         use crate::workspace_model::views::AttentionDirectory;
         let directory = match locations.directory(state) {
             AttentionDirectory::Verified(directory) => directory,
-            AttentionDirectory::Launch => return loaded.get(self.unchanneled_card_worktree(state)?).cloned(),
+            AttentionDirectory::Launch => return loaded.get(self.unchanneled_card_worktree_indexed(state, roots)?).cloned(),
             AttentionDirectory::Unavailable => return None,
         };
         loaded.get(roots.resolve(directory).unwrap_or(directory)).cloned()
@@ -7303,7 +7303,7 @@ impl Cagents {
             })
             .map(|card| {
                 let owner = if let Some(scope) = self.durable.card_scopes.get(&card.id) {
-                    resolve(scope)
+                    loaded.get(scope).map(|key| (key.project_id, key.worktree_id))
                 } else {
                     use crate::workspace_model::views::AttentionDirectory;
                     match locations.directory(card) {
@@ -13428,8 +13428,23 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        let reconcile_attention_roots =
-            matches!(&message, Message::RepositoryLoaded { result: Ok(_), .. });
+        let reconcile_attention_roots = match &message {
+            Message::RepositoryLoaded { result: Ok(_), .. } => true,
+            Message::WorkspaceModelObserved(
+                workspace_model_sync::ModelUpdate::Connected(model)
+                | workspace_model_sync::ModelUpdate::Read(model)
+                | workspace_model_sync::ModelUpdate::Reopened { model, .. }
+                | workspace_model_sync::ModelUpdate::ViewApplied { model, .. }
+            ) => (model.identity != self.workspace_model.identity
+                    || model.sequence >= self.workspace_model.sequence)
+                && (model.identity != self.workspace_model.identity
+                    || model.agent_locations != self.workspace_model.agent_locations
+                    || model.agents != self.workspace_model.agents
+                    || model.views != self.workspace_model.views),
+            Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Edited { sequence, .. }) =>
+                *sequence > self.workspace_model.sequence,
+            _ => false,
+        };
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
