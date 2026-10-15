@@ -1677,9 +1677,9 @@ impl Claude {
 }
 
 impl Adapter for Claude {
-    fn account_continuation_policy(&self) -> Result<chat::PermissionSettings, String> {
+    fn account_continuation_policy(&self, snapshot: &chat::Snapshot) -> Result<chat::PermissionSettings, String> {
         let policy = self.permissions.as_ref().ok_or("Refresh Claude permission settings before Automatic continuation")?;
-        policy.continuation_settings()
+        policy.continuation_settings(snapshot)
     }
 
     fn account_switch_ready(&self) -> bool {
@@ -10229,12 +10229,16 @@ mod account_continuation_capture_tests {
             program: "/usr/bin/python3".into(),
             arguments: vec!["-u".into(), "-c".into(), r#"import json,sys
 policy=json.loads(sys.argv[1])
+flags=next((source['settings'] for source in policy['sources'] if source['source']=='flagSettings'),None)
+if flags is None:
+    flags={}; policy['sources'].append({'source':'flagSettings','settings':flags})
 for line in sys.stdin:
     frame=json.loads(line)
     with open(sys.argv[2], 'a') as log: log.write(json.dumps(frame)+'\n')
     assert frame['type']=='control_request', 'capture must never send a prompt'
     request=frame['request']
     assert request['subtype'] in ['get_settings','set_model','apply_flag_settings'], request
+    if request['subtype']=='apply_flag_settings': flags.update(request['settings'])
     response=policy if request['subtype']=='get_settings' else {}
     print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':response}}),flush=True)
 "#.into(), policy.to_string(), log.to_string_lossy().into_owned()],

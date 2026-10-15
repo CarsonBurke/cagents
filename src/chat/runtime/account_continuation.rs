@@ -45,7 +45,7 @@ pub(super) fn capture_actor(actor: &Actor, deadline: Instant) -> Result<Option<O
         || !actor.adapter.account_switch_ready() || !snapshot.queued_messages.is_empty() {
         return Ok(None);
     }
-    let policy = actor.adapter.account_continuation_policy()?;
+    let policy = actor.adapter.account_continuation_policy(&snapshot)?;
     let result = capture_known(&snapshot, policy)?;
     if Instant::now() >= deadline { return Err("Automatic continuation capture budget expired while validating controls".into()); }
     Ok(Some(result))

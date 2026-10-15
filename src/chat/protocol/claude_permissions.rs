@@ -14,7 +14,7 @@ const FLAG_SOURCE: &str = "flagSettings";
 #[derive(Debug, Clone)]
 pub(super) struct Snapshot {
     pub settings: PermissionSettings,
-    continuation_complete: bool,
+    continuation_controls: Option<Vec<(String, Value)>>,
     permissions: Map<String, Value>,
     auto_mode: Map<String, Value>,
     initial_environment: Vec<Value>,
@@ -30,7 +30,7 @@ impl Snapshot {
             .ok_or("Claude did not return permission settings sources")?;
         let mut snapshot = Self {
             settings: PermissionSettings::default(),
-            continuation_complete: continuation_is_representable(response),
+            continuation_controls: continuation_coverage(response),
             permissions: Map::new(),
             auto_mode: Map::new(),
             initial_environment: effective
@@ -113,9 +113,15 @@ impl Snapshot {
 
     /// Conservative coverage gate for automatic forwarding. Unrepresented
     /// provider fields are never treated as empty or replaced by target defaults.
-    pub fn continuation_settings(&self) -> Result<PermissionSettings, String> {
-        if !self.continuation_complete {
-            return Err("Claude returned permission fields or implicit Auto context that cannot be transferred and confirmed completely; continue separately with explicit controls".into());
+    pub fn continuation_settings(&self, snapshot: &crate::chat::Snapshot) -> Result<PermissionSettings, String> {
+        let controls=self.continuation_controls.as_ref().ok_or("Claude returned permission fields or implicit Auto context that cannot be transferred and confirmed completely; continue separately with explicit controls")?;
+        for (key,value) in controls {
+            let matches=match key.as_str() {
+                "effortLevel" => value.as_str()==snapshot.reasoning.as_deref(),
+                "fastMode" => value.as_bool()==snapshot.fast_mode.as_ref().map(crate::chat::FastMode::enabled),
+                _ => false,
+            };
+            if !matches { return Err("Claude's settings read-back differs from its current effort or speed metadata; Automatic continuation was refused".into()); }
         }
         Ok(self.settings.clone())
     }
@@ -362,10 +368,14 @@ mod tests {
 /// The existing transfer protocol can edit allow/ask/deny and explicit Auto
 /// environment entries only. In particular, additionalDirectories, defaults and
 /// future policy fields require a stronger transfer contract, never omission.
-fn continuation_is_representable(response: &Value) -> bool {
+fn continuation_coverage(response: &Value) -> Option<Vec<(String, Value)>> {
     fn policy(settings: &Value) -> Option<(Vec<(String, String)>, Vec<String>)> {
         let settings_object = settings.as_object()?;
-        if settings_object.keys().any(|key| !matches!(key.as_str(), "permissions" | "autoMode")) { return None; }
+        if settings_object.keys().any(|key| !matches!(key.as_str(), "permissions" | "autoMode" | "effortLevel" | "fastMode")) { return None; }
+        if let Some(effort)=settings.get("effortLevel") {
+            if !effort.is_null() { entry(effort).ok()?; }
+        }
+        if settings.get("fastMode").is_some_and(|value| !value.is_boolean()) { return None; }
         let permissions = settings.get("permissions")?.as_object()?;
         if permissions.keys().any(|key| !matches!(key.as_str(), "allow" | "ask" | "deny")) { return None; }
         let mut rules = Vec::new();
@@ -384,27 +394,40 @@ fn continuation_is_representable(response: &Value) -> bool {
             if environment.len() >= MAX_ENTRIES { return None; }
             environment.push(value.to_owned());
         }
-        // Effective policy must explicitly cover even empty lists. Per-source
-        // callers below materialize absent policy objects as explicit empties.
         rules.sort(); rules.dedup(); environment.sort(); environment.dedup();
         Some((rules, environment))
     }
-    let Some(effective) = response.get("effective").and_then(|value| policy(value)) else { return false; };
-    let Some(sources) = response.get("sources").and_then(Value::as_array) else { return false; };
-    if sources.len() > MAX_ENTRIES { return false; }
+    fn controls(settings: &Value, proof: &mut Vec<(String,Value)>) {
+        for key in ["effortLevel","fastMode"] {
+            if let Some(value)=settings.get(key) { proof.push((key.into(),value.clone())); }
+        }
+    }
+    let effective_settings=response.get("effective")?;
+    let effective=policy(effective_settings)?;
+    let sources=response.get("sources")?.as_array()?;
+    if sources.len() > MAX_ENTRIES { return None; }
+    let mut proof=Vec::new(); controls(effective_settings,&mut proof);
+    let mut names=std::collections::HashSet::new();
     let mut rules = Vec::new(); let mut environment = Vec::new();
     for source in sources {
-        let Some(settings) = source.get("settings").and_then(Value::as_object) else { return false; };
-        if settings.keys().any(|key| !matches!(key.as_str(), "permissions" | "autoMode")) { return false; }
-        let mut represented = Map::new();
-        represented.insert("permissions".into(), settings.get("permissions").cloned().unwrap_or_else(|| json!({})));
-        represented.insert("autoMode".into(), settings.get("autoMode").cloned().unwrap_or_else(|| json!({"environment":[]})));
-        let Some((source_rules, source_environment)) = policy(&Value::Object(represented)) else { return false; };
+        let name=source.get("source")?.as_str()?;
+        if !names.insert(name) { return None; }
+        let settings=source.get("settings")?.as_object()?;
+        if settings.keys().any(|key| !matches!(key.as_str(), "permissions" | "autoMode" | "effortLevel" | "fastMode")) { return None; }
+        let mut represented=settings.clone();
+        represented.entry("permissions").or_insert_with(||json!({}));
+        represented.entry("autoMode").or_insert_with(||json!({"environment":[]}));
+        let represented=Value::Object(represented);
+        let (source_rules,source_environment)=policy(&represented)?;
+        // The active session overlay and effective settings must agree with
+        // actual current controls. Inherited known defaults may differ: the
+        // successor must restore current controls, never adopt those defaults.
+        if name==FLAG_SOURCE { controls(&represented,&mut proof); }
         rules.extend(source_rules); environment.extend(source_environment);
-        if rules.len() > MAX_ENTRIES || environment.len() > MAX_ENTRIES { return false; }
+        if rules.len() > MAX_ENTRIES || environment.len() > MAX_ENTRIES { return None; }
     }
     rules.sort(); rules.dedup(); environment.sort(); environment.dedup();
-    effective == (rules, environment)
+    (effective==(rules,environment)).then_some(proof)
 }
 
 #[cfg(test)]
@@ -421,7 +444,7 @@ mod continuation_coverage_tests {
     #[test]
     fn continuation_requires_complete_representable_effective_policy() {
         let known = response();
-        assert!(Snapshot::parse(&known).unwrap().continuation_settings().is_ok());
+        assert!(Snapshot::parse(&known).unwrap().continuation_settings(&crate::chat::Snapshot::default()).is_ok());
         for change in ["extra-directory", "future-permission", "future-auto", "missing-effective-rule", "implicit-defaults", "unknown-settings-section"] {
             let mut changed = known.clone();
             match change {
@@ -433,10 +456,25 @@ mod continuation_coverage_tests {
                 "unknown-settings-section" => changed["sources"][0]["settings"]["sandbox"] = json!({"enabled":true}),
                 _ => unreachable!(),
             }
-            assert!(Snapshot::parse(&changed).unwrap().continuation_settings().is_err(), "{change}");
+            assert!(Snapshot::parse(&changed).unwrap().continuation_settings(&crate::chat::Snapshot::default()).is_err(), "{change}");
         }
         let mut absent = known;
         absent["effective"].as_object_mut().unwrap().remove("autoMode");
-        assert!(Snapshot::parse(&absent).unwrap().continuation_settings().is_err());
+        assert!(Snapshot::parse(&absent).unwrap().continuation_settings(&crate::chat::Snapshot::default()).is_err());
     }
+    #[test]
+    fn continuation_checks_known_flag_controls_against_actual_readback() {
+        let mut known=response();
+        known["sources"][0]["settings"]["effortLevel"]=json!("high");
+        known["sources"][0]["settings"]["fastMode"]=json!(false);
+        let mut current=crate::chat::Snapshot::default(); current.reasoning=Some("high".into()); current.fast_mode=Some(crate::chat::FastMode::default());
+        assert!(Snapshot::parse(&known).unwrap().continuation_settings(&current).is_ok());
+        current.reasoning=Some("low".into());
+        assert!(Snapshot::parse(&known).unwrap().continuation_settings(&current).is_err());
+        current.reasoning=Some("high".into()); current.fast_mode=Some(crate::chat::FastMode {state:crate::chat::FastModeState::On,disabled_reason:None});
+        assert!(Snapshot::parse(&known).unwrap().continuation_settings(&current).is_err());
+        let duplicate=known["sources"][0].clone(); known["sources"].as_array_mut().unwrap().push(duplicate);
+        assert!(Snapshot::parse(&known).unwrap().continuation_settings(&current).is_err(),"duplicate source identities cannot attest policy coverage");
+    }
+
 }
