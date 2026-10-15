@@ -365,7 +365,7 @@ fn queue_key(press: &text_editor::KeyPress, empty: bool) -> bool {
 
 /// A failure, as an entry of the transcript: what went wrong, set apart the
 /// way a system notice is and read in sequence with what it interrupted.
-fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
+pub(super) fn notice_entry(message: &str, target: Target) -> Element<'static, Message> {
     widget::container(
         widget::row::with_children(vec![
             widget::icon(Icon::Warning.handle())
@@ -1148,6 +1148,7 @@ impl Runtime {
             .as_ref()
             .and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
         let mut anchors = Vec::new();
+        let provider_exit_failure = self.provider_exit_failure_index();
         let mut transcript = TranscriptRows::new(step::GAP_L);
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
@@ -1294,10 +1295,13 @@ impl Runtime {
                     .into(),
                 );
             }
-            for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                anchor.is_none() && !self.active_auth_notice(anchor, error)
-            }) {
-                transcript.push(notice_entry(error, target));
+            for (index, (anchor, error)) in self.failures.iter().enumerate() {
+                if anchor.is_none()
+                    && !self.active_auth_notice(anchor, error)
+                    && Some(index) != provider_exit_failure
+                {
+                    transcript.push(notice_entry(error, target));
+                }
             }
             for turn in &self.turns {
                 transcript.push_with_gap(
@@ -1309,10 +1313,13 @@ impl Runtime {
                     },
                     self.turn_trailing_footer(turn),
                 );
-                for (_, error) in self.failures.iter().filter(|(anchor, error)| {
-                    anchor.as_ref() == Some(&turn.key) && !self.active_auth_notice(anchor, error)
-                }) {
-                    transcript.push(notice_entry(error, target));
+                for (index, (anchor, error)) in self.failures.iter().enumerate() {
+                    if anchor.as_ref() == Some(&turn.key)
+                        && !self.active_auth_notice(anchor, error)
+                        && Some(index) != provider_exit_failure
+                    {
+                        transcript.push(notice_entry(error, target));
+                    }
                 }
             }
             if !snapshot.has_later
@@ -1373,8 +1380,12 @@ impl Runtime {
         if let Some(error) = self.error.as_ref().or(snapshot.error.as_ref())
             && !chat::requires_sign_in(self.session.launch.provider, error)
             && !self.failures.iter().any(|(_, recorded)| recorded == error)
+            && !self.provider_exit_notice(error)
         {
             transcript.push(notice_entry(error, target));
+        }
+        if let Some(diagnostic) = self.provider_exit_view() {
+            transcript.push(diagnostic);
         }
         content.extend(self.plan_view());
         if let Some(query) = &self.find {
