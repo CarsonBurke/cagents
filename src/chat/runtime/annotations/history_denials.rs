@@ -170,6 +170,33 @@ mod tests {
     }
 
     #[test]
+    fn actual_codex_initialize_resume_page_denials_reach_qualified_cache_ingestion() {
+        use crate::chat::{protocol::{codex, ProcessSpec, TransportSpec}, annotations::ApprovalDecision};
+        use serde_json::json;
+        let root = annotations::storage::test_directory();
+        let home = root.path().join("codex-home"); std::fs::create_dir(&home).unwrap();
+        let source = LaunchAccountScope::resolve(Provider::Codex, root.path(), |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
+        let mut adapter = codex::annotation_history_test_adapter(source.clone());
+        let initialize = adapter.initialize().unwrap();
+        let initialized = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":source.canonical_home}})).unwrap();
+        let resume = initialized.writes.iter().find(|frame| frame["method"] == "thread/resume").expect("real initialize must request native resume");
+        let mut initial = adapter.receive(json!({"id":resume["id"],"result":{"thread":{"id":"thread-exact","status":{"type":"idle"}},"initialTurnsPage":{"data":[{"id":"native-turn","status":"failed","items":[{"id":"tool","type":"commandExecution","command":"git status","cwd":"/repo","status":"failed","aggregatedOutput":"generic native replay"}]}],"nextCursor":null}}})).unwrap();
+        let path = root.path().join("annotations");
+        let mut durable = annotations::storage::Store::for_test(&path, &source, "thread-exact").unwrap();
+        let key = ApprovalKey { agent_id: None, item_id: "native-turn/tool".into() };
+        durable.approval(&key, "request", ApprovalDecision::Awaiting).unwrap();
+        durable.approval(&key, "request", ApprovalDecision::Denied).unwrap();
+        drop(durable);
+        let mut authority = Authority::for_history_outcomes_test(path);
+        assert_eq!(authority.normalize_history_events(&mut initial.events).unwrap(), 1);
+        let spec = ProcessSpec { execution: None, messages: None, transport: TransportSpec::History, program: "/bin/cat".into(), arguments: vec![], working_directory: root.path().into(), environment: Default::default(), unset_environment: Default::default() };
+        let mut cache = super::super::super::preflight(&spec, &mut initial).unwrap();
+        let window = cache.window().unwrap();
+        assert_eq!(window.items.iter().find(|item| item.id == "native-turn/tool").unwrap().content.status(), Some(ToolStatus::Denied));
+        assert!(authority.session().is_none(), "source projection must not confirm live/original authority");
+    }
+
+    #[test]
     fn actual_readonly_claude_history_normalizes_before_preflight_cache_ingestion() {
         use crate::chat::{Launch, protocol::claude};
         use serde_json::json;

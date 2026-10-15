@@ -2166,7 +2166,12 @@ impl Adapter for Codex {
                         Pending::ChildList,
                     )?;
                     if result["initialTurnsPage"].is_object() {
+                        let begin = step.events.len();
                         self.page(&result["initialTurnsPage"], &mut step, false)?;
+                        if !self.is_child && let Some(account) = self.annotation_scope.as_ref()
+                            && account.revalidate().is_ok() {
+                            self.history_annotation_origins(account, id, begin, &mut step);
+                        }
                     } else {
                         self.history(&mut step, None)?;
                     }
@@ -3937,6 +3942,13 @@ pub(crate) fn annotation_test_adapter(with_child: bool) -> Box<dyn Adapter> {
         child.is_child = true;
         adapter.children.insert("child-exact".into(), Box::new(child));
     }
+    Box::new(adapter)
+}
+#[cfg(test)]
+pub(crate) fn annotation_history_test_adapter(scope: crate::account::scope::LaunchAccountScope) -> Box<dyn Adapter> {
+    let mut adapter = tests::adapter();
+    adapter.expected_home = scope.canonical_home.clone();
+    adapter.annotation_scope(Some(scope));
     Box::new(adapter)
 }
 #[cfg(test)]
