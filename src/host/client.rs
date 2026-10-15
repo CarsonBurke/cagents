@@ -349,7 +349,7 @@ fn start_worktree_setup(
     }
     // Publish ownership before starting the child, so completed-unattached
     // retirement cannot race a short setup command's durable pane membership.
-    let terminal=super::state::spawn_pending_terminal(host,0,pane,session.id,crate::terminal::TerminalSpawnOptions::default())?;
+    let terminal=super::state::spawn_reviewed_worktree_setup(host,0,pane,session.id,run_id,crate::terminal::TerminalSpawnOptions::default())?;
     host.lock().unwrap_or_else(|poison|poison.into_inner()).detach(0,terminal.session.id)?;
     Ok(terminal.session)
 }
@@ -473,6 +473,7 @@ pub(super) fn process_request(
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
+    let reviewed_setup_run=match &request {ClientRequest::StartWorktreeSetup {run_id,..}=>Some(*run_id),_=>None};
     match request {
         ClientRequest::DeviceOperation { operation: crate::device_service::Operation::Worktree { operation } } => {
             let repository=operation.repository().map(std::path::Path::to_path_buf);
@@ -868,13 +869,11 @@ pub(super) fn process_request(
             });
             Ok((ServerResponse::Spawned { terminal }, extras, false))
         }
-        ClientRequest::CompletePendingTerminal {
-            pane,
-            terminal_id,
-            options,
-        } => {
-            let terminal =
-                super::state::spawn_pending_terminal(host, client_id, pane, terminal_id, options)?;
+        ClientRequest::CompletePendingTerminal {pane,terminal_id,options}
+        | ClientRequest::StartWorktreeSetup {pane,terminal_id,options,..} => {
+            let terminal=if let Some(run_id)=reviewed_setup_run {
+                super::state::spawn_reviewed_worktree_setup(host,client_id,pane,terminal_id,run_id,options)?
+            } else {super::state::spawn_pending_terminal(host,client_id,pane,terminal_id,options)?};
             {
                 let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 // Every other observer learns that this terminal exists here,

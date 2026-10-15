@@ -3264,11 +3264,26 @@ fn pending_terminal_session(
 }
 
 pub(super) fn spawn_pending_terminal(
+    shared: &SharedHost, client_id: ClientId, pane: crate::model::CardId,
+    terminal_id: TerminalId, options: TerminalSpawnOptions,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    spawn_pending_terminal_with_review(shared,client_id,pane,terminal_id,options,None)
+}
+
+pub(super) fn spawn_reviewed_worktree_setup(
+    shared: &SharedHost, client_id: ClientId, pane: crate::model::CardId,
+    terminal_id: TerminalId, run_id: crate::model::OperationId, options: TerminalSpawnOptions,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    spawn_pending_terminal_with_review(shared,client_id,pane,terminal_id,options,Some(run_id))
+}
+
+fn spawn_pending_terminal_with_review(
     shared: &SharedHost,
     client_id: ClientId,
     pane: crate::model::CardId,
     terminal_id: TerminalId,
     options: TerminalSpawnOptions,
+    reviewed_setup_run: Option<crate::model::OperationId>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
     let session = {
         let state = shared.lock().unwrap_or_else(|p| p.into_inner());
@@ -3284,6 +3299,7 @@ pub(super) fn spawn_pending_terminal(
         None,
         None,
         Some(pane),
+        reviewed_setup_run,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3345,6 +3361,7 @@ pub(super) fn spawn_terminal_view_owned(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -3370,6 +3387,7 @@ fn start_terminal_view(
         adoption,
         previous,
         None,
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3386,6 +3404,7 @@ fn start_terminal_view_owned(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
+    reviewed_setup_run: Option<crate::model::OperationId>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
@@ -3412,6 +3431,14 @@ fn start_terminal_view_owned(
             if accepted.launch != session.launch {
                 return Err(not_found(terminal_id));
             }
+        }
+        let setup=session.launch.environment.get("CAGENTS_WORKTREE_SETUP").is_some_and(|value|value=="1");
+        let reviewed=reviewed_setup_run.is_some_and(|run_id|session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID").is_some_and(|value|value==&run_id.to_string()));
+        if reviewed_setup_run.is_some()&&!setup {
+            return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,"The reserved pane is not a worktree setup recipe",false));
+        }
+        if setup&&adoption.is_none()&&!reviewed {
+            return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,"Worktree setup was interrupted; review and explicitly resume it instead of replaying its saved recipe",false));
         }
         state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
         if crate::account::login::is_codex_browser(&session.launch) {
@@ -4074,6 +4101,49 @@ mod tests {
                 .try_iter()
                 .any(|event| matches!(event, TerminalEvent::Completed { .. }))
         );
+    }
+
+    #[test]
+    fn saved_setup_recipes_require_reviewed_start_and_do_not_replay_on_restore() {
+        use crate::workspace_model::views::{Pane,Scope};
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let repository=directory.path().to_owned();
+        let run_id=crate::model::OperationId::new();
+        let launch=crate::model::LaunchRecipe {
+            program:"/bin/sh".into(),arguments:vec!["-c".into(),"printf once >> setup-count".into()],
+            working_directory:repository.clone(),
+            environment:BTreeMap::from([("CAGENTS_WORKTREE_SETUP".into(),"1".into()),("CAGENTS_WORKTREE_SETUP_ID".into(),run_id.to_string())]),unset_environment:Default::default(),
+        };
+        let session=TerminalSession {id:TerminalId::new(),launch:launch.clone(),transcript_path:None,resume_hint:None,owned_codex_listener:None,recovery_origin:None,predecessor:None,continuity:TerminalContinuity::RelaunchAvailable {recipe:launch,last_exit:None}};
+        let pane=Pane {id:crate::model::CardId::new(),title:"Worktree setup".into(),user_title:None,pending_terminal_start:true,width_fraction:1.0,scope:Some(repository.clone()),kind:crate::model::CardKind::Terminal(session.clone())};
+        let make_host=|name:&str| {
+            let mut registry=super::super::model::Registry::at(&directory.path().join(name)).unwrap();
+            registry.apply(&ModelEdit::OpenProject {repository:repository.clone(),name:"setup".into(),kind:Default::default()}).unwrap();
+            registry.apply(&ModelEdit::SeedView {scope:Scope::Worktree {repository:repository.clone(),path:repository.clone()},panes:vec![pane.clone()],closed:vec![]}).unwrap();
+            let mut state=test_host();state.install_model(registry);state.register_client(1);
+            Arc::new(HostLock::new(state))
+        };
+        let host=make_host("first.sqlite3");
+        let options=TerminalSpawnOptions::default();
+        assert!(spawn_pending_terminal(&host,1,pane.id,session.id,options.clone()).is_err());
+        assert!(spawn_terminal(&host,1,session.clone(),options.clone()).is_err());
+        assert!(spawn_reviewed_worktree_setup(&host,1,pane.id,session.id,crate::model::OperationId::new(),options.clone()).is_err());
+        assert!(!directory.path().join("setup-count").exists());
+        spawn_reviewed_worktree_setup(&host,1,pane.id,session.id,run_id,options.clone()).unwrap();
+        spawn_reviewed_worktree_setup(&host,1,pane.id,session.id,run_id,options.clone()).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(5);
+        loop {
+            let complete=host.lock().unwrap().terminals.get(&session.id).is_some_and(|record|record.handle.is_completed());
+            if complete {break;}
+            assert!(Instant::now()<deadline,"setup fixture did not exit");thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(fs::read_to_string(directory.path().join("setup-count")).unwrap(),"once");
+        // Reopen the saved pre-launch pane after a simulated daemon loss.
+        // Its marker and pending bit are evidence, not replay permission.
+        let restored=make_host("restored.sqlite3");
+        assert!(spawn_pending_terminal(&restored,1,pane.id,session.id,options.clone()).is_err());
+        assert!(spawn_terminal(&restored,1,session,options).is_err());
+        assert_eq!(fs::read_to_string(directory.path().join("setup-count")).unwrap(),"once");
     }
 
     #[test]

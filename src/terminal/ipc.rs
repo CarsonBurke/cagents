@@ -474,6 +474,14 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Explicit first launch or reviewed recovery of a marked setup recipe.
+    /// Generic restoration never grants permission to replay setup commands.
+    StartWorktreeSetup {
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        run_id: crate::model::OperationId,
+        options: TerminalSpawnOptions,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
