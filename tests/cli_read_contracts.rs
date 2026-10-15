@@ -184,6 +184,6 @@ fn no_start_daemon_start_still_requires_a_protocol_handshake() {
     assert_eq!(output.exit_code,Some(1),"{output:?}");
     assert!(output.stdout.is_empty());
     let error:Value=serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(error["error"]["kind"],"protocol","{error}");
+    assert_eq!(error["error"]["kind"],"connection","{error}");
     assert!(!fixture.root.path().join("spawned").exists());
 }
