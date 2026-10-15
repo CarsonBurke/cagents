@@ -1310,3 +1310,5 @@ fn failed_pre_discovery_startup_keeps_exact_owner_until_real_cleanup() {
     drop(release);
     drop(lease);
 }
+
+mod restart_identity;

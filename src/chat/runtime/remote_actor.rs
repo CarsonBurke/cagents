@@ -2695,6 +2695,10 @@ mod backend_binding_test;
 pub(super) fn isolated_backend_contract(exact: &str) -> bool {
     backend_binding_test::isolated(exact)
 }
+#[cfg(test)]
+pub(super) fn isolated_retained_actor_contract(exact: &str) -> bool {
+    backend_binding_test::isolated_with_environment(exact, &[("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")])
+}
 
 #[cfg(test)]
 mod tests {

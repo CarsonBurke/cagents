@@ -92,6 +92,9 @@ impl Drop for Original {
 /// Returns true in the parent after exactly one named contract actually passed.
 /// Failure/timeout preserves private evidence and original child ownership.
 pub(super) fn isolated(exact: &str) -> bool {
+    isolated_with_environment(exact, &[])
+}
+pub(super) fn isolated_with_environment(exact: &str, environment: &[(&str, &str)]) -> bool {
     if std::env::var(CHILD).as_deref() == Ok(exact) {
         return false;
     }
@@ -129,6 +132,7 @@ pub(super) fn isolated(exact: &str) -> bool {
         .stdin(Stdio::null())
         .stdout(Stdio::from(log("stdout.log")))
         .stderr(Stdio::from(log("stderr.log")));
+    command.envs(environment.iter().copied());
     // Only async-signal-safe scalar syscalls execute after fork.
     unsafe {
         command.pre_exec(|| {

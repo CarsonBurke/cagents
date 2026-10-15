@@ -40,6 +40,10 @@ pub(crate) use handle::{BackendIdentity, BackendSourceClaim};
 pub(crate) fn isolated_backend_contract(exact: &str) -> bool {
     remote_actor::isolated_backend_contract(exact)
 }
+#[cfg(test)]
+pub(crate) fn isolated_retained_actor_contract(exact: &str) -> bool {
+    remote_actor::isolated_retained_actor_contract(exact)
+}
 pub(crate) use remote_actor::RestartState as RetainedRestartState;
 pub(crate) use remote_actor::{
     ActorIdentity, ActorInspection, InputIdentity, InputReceipt, InputState, OutboxEntry,
