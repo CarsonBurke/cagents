@@ -471,6 +471,29 @@ impl Editor {
             } else if self.checkout_history.is_empty() {
                 rows.push(widget::text::body("No worktree operations yet.").into());
             }
+            if !self.checkout_owners.is_empty() {
+                rows.push(widget::text::title4("Retained creation ownership").into());
+                for (id, retained) in &self.checkout_owners {
+                    rows.push(widget::text::body(format!("Creation {id}")).into());
+                    if let Some(retained) = retained {
+                        rows.push(design::caption(&retained.report.detail).into());
+                        if let Some(owner) = retained.retention() {
+                            let pending = owner.recovery_summary();
+                            if !pending.is_clear() {
+                                rows.push(widget::text::body(format!("Private recovery pending: {} preparations, {} publications.", pending.pending_preparations, pending.pending_publications)).into());
+                                rows.push(widget::button::standard("Retry private recovery").on_press_maybe((!self.checkout_retry_pending.contains(id)).then_some(Message::Checkout(Action::RetryPrivate(*id)))).into());
+                            } else if retained.created.is_none() {
+                                rows.push(widget::text::body("Private steps are clear. The original creation still needs journal reconciliation; its ownership is retained.").into());
+                            }
+                        }
+                        if retained.created.is_some() {
+                            rows.push(widget::button::standard("Open retained worktree").on_press(Message::Checkout(Action::OpenRecorded(*id))).into());
+                        }
+                    } else {
+                        rows.push(widget::text::body("The original worker outcome is pending or requires reconciliation. Its admission remains retained.").into());
+                    }
+                }
+            }
             for report in &self.checkout_history {
                 if let Some(request) = &report.request {
                     rows.push(
@@ -483,13 +506,6 @@ impl Editor {
                     );
                 }
                 rows.push(design::caption(&report.detail).into());
-                if let Some(owner) = self.checkout_owners.get(&report.operation_id).and_then(Option::as_ref).and_then(|retained| retained.retention()) {
-                    let pending = owner.recovery_summary();
-                    if !pending.is_clear() {
-                        rows.push(widget::text::body(format!("Private recovery pending: {} preparations, {} publications.", pending.pending_preparations, pending.pending_publications)).into());
-                        rows.push(widget::button::standard("Retry private recovery").on_press_maybe((!self.checkout_retry_pending.contains(&report.operation_id)).then_some(Message::Checkout(Action::RetryPrivate(report.operation_id)))).into());
-                    }
-                }
                 if self.retained_created_checkout(report.operation_id).is_some() {
                     rows.push(
                         widget::button::standard("Open worktree")
@@ -614,6 +630,27 @@ mod tests {
     use super::super::tests::{editor, git, git_fixture, open_real_git, run_tasks, sidebar_action};
     use super::*;
 
+    fn click_retained_checkout(app: &Editor, label: &str) -> Message {
+        use iced::advanced::{Layout, Shell, layout, mouse, renderer::Headless, widget::Tree};
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let renderer = runtime.block_on(<cosmic::Renderer as Headless>::new(iced::Font::DEFAULT, iced::Pixels::from(16), Some("tiny-skia"))).unwrap();
+        let mut view = app.checkout_view().expect("actual checkout surface");
+        let mut tree = Tree::new(view.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(1000.0, 800.0));
+        let node = view.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(iced::Size::ZERO, viewport.size()));
+        let point = {
+            let accessible = view.as_widget().a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+            let button = accessible.root().iter().chain(accessible.children()).find(|entry| entry.node().label() == Some(label)).expect("retained owner control stays mounted after history eviction");
+            assert!(!button.node().is_disabled()); let bounds = button.node().bounds().unwrap();
+            iced::Point::new(((bounds.x0 + bounds.x1) / 2.0) as f32, ((bounds.y0 + bounds.y1) / 2.0) as f32)
+        };
+        let mut messages = Vec::new();
+        for event in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
+            view.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), mouse::Cursor::Available(point), &renderer, &mut iced::advanced::clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+        }
+        let message = messages.pop().expect("actual button emits its owner action"); assert!(messages.is_empty()); message
+    }
+
     #[test]
     fn actual_created_receipt_survives_dialog_loss_and_refuses_late_replacement_open() {
         use cosmic::iced::futures::StreamExt;
@@ -656,11 +693,23 @@ mod tests {
         drop(app.update(receipt));
         let retained = app.checkout_owners.get(&id).and_then(Option::as_ref).expect("late outcome retains original session before checking dialog");
         assert!(retained.retention().is_some()); assert!(retained.created.is_some(), "{:?}", retained.authority_error);
-        app.checkout_history.clear();
+        let original_report = app.checkout_owners[&id].as_ref().unwrap().report.clone();
+        for index in 0..20 {
+            let mut request = original_report.request.as_ref().unwrap().clone(); request.operation_id = OperationId::new();
+            let mut newer = RetainedWorktreeCreation::not_started(&request, 1, "actual typed preflight refusal fixture".into());
+            newer.report.created_at_unix_ms = original_report.created_at_unix_ms + index + 1;
+            drop(app.update(Message::Checkout(Action::Finished(request.operation_id, Ok(newer)))));
+        }
+        assert_eq!(app.checkout_history.len(), 20);
+        assert!(!app.checkout_history.iter().any(|report| report.operation_id == id), "serialized history evicts the old description");
+        assert!(app.checkout_owners.get(&id).and_then(Option::as_ref).is_some(), "live ownership is independent");
         drop(app.update(Message::CloseWindow));
         assert!(!app.exiting, "unresolved transfer/lifecycle proof cannot disappear on exit");
         let created = app.checkout_owners[&id].as_ref().unwrap().created.clone().unwrap();
-        let task = app.open_created_checkout(created.clone()); run_tasks(&mut app, task);
+        drop(app.update(Message::Checkout(Action::History)));
+        let emitted = click_retained_checkout(&app, "Open retained worktree");
+        assert!(matches!(emitted, Message::Checkout(Action::OpenRecorded(operation)) if operation == id), "actual mounted live-owner row names the evicted original");
+        let task = app.update(emitted); run_tasks(&mut app, task);
         assert!(app.tabs.iter().any(|tab| tab.created_worktree.as_ref().is_some_and(|cap| cap.operation() == id)));
         assert!(app.checkout_owners.is_empty(), "the SAME settled carrier is now owned by the mounted tab");
         app.tabs.clear(); app.active = None;
