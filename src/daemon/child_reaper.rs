@@ -73,6 +73,16 @@ pub(crate) fn has_retained_ownership() -> bool {
 
 pub(crate) type RetainError = (io::Error, Child, File, Reservation);
 impl Reservation {
+    /// Final cleanup may hold the original Child outside this service's map.
+    /// Mark that ownership before publishing the handoff or cancelling the
+    /// spawn reservation. Its preallocated slot stays fenced through rollback.
+    pub(crate) fn quarantine(&self) {
+        let slot = self.slot.expect("a live reservation owns one credit");
+        let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
+        debug_assert!(state.quarantined[slot].is_none_or(|ticket| ticket == self.ticket));
+        state.quarantined[slot] = Some(self.ticket);
+    }
+
     /// Failure returns every ownership object intact. Insertion and wakeup are
     /// atomic to the worker: it cannot observe a transfer that is rolled back.
     pub(crate) fn retain(mut self, child: Child, pidfd: File) -> Result<(), RetainError> {
@@ -125,6 +135,7 @@ impl Drop for Reservation {
         if let Some(slot) = self.slot.take() {
             let empty = {
                 let mut state = self.service.state.lock().unwrap_or_else(|p| p.into_inner());
+                if state.quarantined[slot] == Some(self.ticket) { state.quarantined[slot] = None; }
                 state.free.push(slot);
                 state.free.len() == state.entries.len()
             };
@@ -138,6 +149,7 @@ impl Drop for Reservation {
 struct Entry { child: Child, pidfd: Option<File>, ticket: u64, suspended: bool }
 struct State {
     entries: Vec<Option<Entry>>,
+    quarantined: Vec<Option<u64>>,
     free: Vec<usize>,
     next_ticket: u64,
     failure: Option<String>,
@@ -158,7 +170,8 @@ impl Service {
     }
 
     fn has_retained_ownership(&self) -> bool {
-        self.state.lock().unwrap_or_else(|p| p.into_inner()).entries.iter().any(Option::is_some)
+        let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.entries.iter().any(Option::is_some) || state.quarantined.iter().any(Option::is_some)
     }
 
     fn start(capacity: usize) -> io::Result<(Arc<Self>, JoinHandle<()>)> {
@@ -168,6 +181,9 @@ impl Service {
         let mut entries = Vec::new();
         entries.try_reserve_exact(capacity).map_err(io::Error::other)?;
         entries.resize_with(capacity, || None);
+        let mut quarantined = Vec::new();
+        quarantined.try_reserve_exact(capacity).map_err(io::Error::other)?;
+        quarantined.resize(capacity, None);
         let mut free = Vec::new();
         free.try_reserve_exact(capacity).map_err(io::Error::other)?;
         free.extend((0..capacity).rev());
@@ -175,7 +191,7 @@ impl Service {
         if fd < 0 { return Err(io::Error::last_os_error()); }
         let service = Arc::new(Self {
             event: unsafe { File::from_raw_fd(fd) },
-            state: Mutex::new(State { entries, free, next_ticket: 1, failure: None, fatal: false, worker_alive: true, stopping: false }),
+            state: Mutex::new(State { entries, quarantined, free, next_ticket: 1, failure: None, fatal: false, worker_alive: true, stopping: false }),
             #[cfg(test)] fail_wake: std::sync::atomic::AtomicBool::new(false),
         });
         let owner = service.clone();
@@ -191,6 +207,7 @@ impl Service {
         let capacity = state.entries.len();
         let slot = state.free.pop().ok_or_else(|| io::Error::new(io::ErrorKind::WouldBlock,
             format!("Helper child ownership capacity is full ({capacity}/{capacity}); existing helpers were retained")))?;
+        debug_assert!(state.quarantined[slot].is_none());
         state.next_ticket = next;
         Ok(Reservation { service: self.clone(), slot: Some(slot), ticket })
     }
@@ -308,7 +325,12 @@ impl Service {
                 // Only this original Child is queried after its pinned pidfd
                 // became ready. No process-wide wait or numeric PID signal.
                 let reaped = match entry.child.try_wait() {
-                    Ok(Some(_)) => { state.entries[*slot].take(); state.free.push(*slot); true }
+                    Ok(Some(_)) => {
+                        state.entries[*slot].take();
+                        if state.quarantined[*slot] == Some(*ticket) { state.quarantined[*slot] = None; }
+                        state.free.push(*slot);
+                        true
+                    }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                     result => {
                         entry.suspended = true;
@@ -460,6 +482,49 @@ mod tests {
     }
 
     #[test]
+    fn quarantined_original_child_stays_visible_through_rollback_handoff_and_slot_reuse() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.service.reserve().unwrap();
+        let ticket = reservation.ticket;
+        let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        assert!(!reaper.service.has_retained_ownership());
+        reservation.quarantine();
+        reservation.quarantine();
+        assert!(reaper.service.has_retained_ownership(), "the final-cleanup queue must not hide this original child");
+        reaper.service.fail_wake.store(true, Ordering::Release);
+        let (error, child, pidfd, reservation) = reservation.retain(owned.child.take().unwrap(), owned.pidfd.try_clone().unwrap()).unwrap_err();
+        owned.child = Some(child);
+        assert!(error.to_string().contains("injected"));
+        assert!(reaper.service.has_retained_ownership(), "a rolled-back transfer still belongs to final cleanup");
+        assert_eq!(reaper.service.state.lock().unwrap().quarantined[0], Some(ticket));
+        drop(pidfd);
+        reaper.service.fail_wake.store(false, Ordering::Release);
+        owned.handoff(reservation);
+        assert!(reaper.service.has_retained_ownership());
+        owned.signal(libc::SIGKILL);
+        reaper.await_free(1);
+        assert!(!reaper.service.has_retained_ownership());
+        let next = reaper.service.reserve().unwrap();
+        assert_ne!(next.ticket, ticket);
+        assert!(!reaper.service.has_retained_ownership(), "a recycled slot must not inherit the previous owner's quarantine");
+    }
+
+    #[test]
+    fn direct_original_child_wait_then_reservation_drop_releases_quarantined_ownership() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.service.reserve().unwrap();
+        let mut owned = Probe::spawn(&["-c", "exit 23"]);
+        reservation.quarantine();
+        assert!(reaper.service.has_retained_ownership());
+        assert_eq!(owned.child.as_mut().unwrap().wait().unwrap().code(), Some(23));
+        assert!(reaper.service.has_retained_ownership(), "the caller must publish its completed ownership release");
+        drop(reservation);
+        assert!(!reaper.service.has_retained_ownership());
+        assert!(!reaper.service.has_outstanding_ownership());
+        assert_eq!(reaper.free(), 1);
+    }
+
+    #[test]
     fn failed_spawn_and_unused_reservation_drop_return_their_credit() {
         let reaper = TestService::new(1);
         let reservation = reaper.service.reserve().unwrap();
@@ -555,6 +620,7 @@ mod tests {
         let reservation = reaper.service.reserve().unwrap();
         let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
         let child = owned.child.take().unwrap();
+        reservation.quarantine();
         reservation.preserve_suspended(child, Some(owned.pidfd.try_clone().unwrap()), "fixture transfer failure");
         reaper.service.fail_wake.store(true, Ordering::Release);
         assert!(reaper.service.retry_preserved().is_err());
@@ -565,6 +631,7 @@ mod tests {
         assert_eq!(reaper.service.reserve().unwrap_err().kind(), io::ErrorKind::WouldBlock);
         owned.signal(libc::SIGKILL);
         reaper.await_free(1);
+        assert!(!reaper.service.has_retained_ownership());
         assert!(reaper.service.reserve().is_ok());
     }
 
