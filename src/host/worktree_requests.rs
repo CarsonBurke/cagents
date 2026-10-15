@@ -89,7 +89,7 @@ pub(super) fn process(
             worktree_inspections::remove(host, client, operation)
         }
         operation @ Operation::DeleteBranch { .. } => {
-            worktree_inspections::delete_branch(host, client, operation)
+            Ok(worktree_inspections::delete_branch(host, client, operation))
         }
         Operation::InspectForSessionStop { repository, path } => {
             worktree_inspections::inspect(host, client, &repository, &path)

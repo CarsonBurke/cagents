@@ -2094,7 +2094,7 @@ impl Worker {
         let mut terminal = Terminal::new(TerminalOptions {
             cols: current_size.columns,
             rows: current_size.rows,
-            max_scrollback: config.max_scrollback_bytes,
+            max_scrollback: config.max_scrollback,
         })
         .map_err(|error| format!("create Ghostty terminal: {error}"))?;
         apply_theme(&mut terminal, config.theme)

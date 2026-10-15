@@ -25,7 +25,14 @@ fn queue_provider_for_test(
     handle
         .0
         .commands
-        .try_send((ActorCommand::Provider { run: None, command, decline_only: false }, reply))
+        .try_send((
+            ActorCommand::Provider {
+                run: None,
+                command,
+                decline_only: false,
+            },
+            reply,
+        ))
         .unwrap();
     handle.wake();
     response
@@ -123,6 +130,7 @@ fn whole_session_stop_preempts_saturated_commands_and_blocked_provider_stdin() {
             .try_send((
                 ActorCommand::Provider {
                     run: None,
+                    decline_only: false,
                     command: Command::Prompt {
                         text: "queued work".into(),
                         attachments: Vec::new(),
