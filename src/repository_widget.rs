@@ -17,7 +17,7 @@ mod diff_actions;
 pub use diff_actions::DiffPresentationCommand;
 mod diff_layout;
 mod diff_mutations;
-pub use diff_mutations::Request as DiffMutationRequest;
+pub use diff_mutations::{Capture as DiffMutationCapture, Prepared as PreparedDiffMutation, Request as DiffMutationRequest};
 mod preview;
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
 
@@ -5384,24 +5384,6 @@ impl RepositoryRuntime {
                 self.lsp_edits_exact = false;
             }
         }
-    }
-
-    /// History belongs to the mounted native editor or its live working diff;
-    /// immutable commit, staged and pull-request comparisons cannot replay it.
-    pub fn can_step_editor_history(&self, redo: bool) -> bool {
-        let available = match &self.document {
-            DocumentState::Editable(document) => {
-                if redo {
-                    document.history.can_redo()
-                } else {
-                    document.history.can_undo()
-                }
-            }
-            _ => false,
-        };
-        available
-            && !self.search_mode
-            && (self.source_surface == SourceSurface::Editor || self.editable_working_diff())
     }
 
     /// Undoes or redoes one step in the open buffer.

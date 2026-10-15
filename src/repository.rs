@@ -4495,7 +4495,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cache.invalidate(true);
             cache.options = Some(options);
         }
-        let git_dir = local_git_dir(worktree);
+        let git_dir = if let Some(authority) = &self.authority {
+            authority.validate()?;
+            Some(authority.private_metadata_path())
+        } else { local_git_dir(worktree) };
         if !cache.fsmonitor_checked {
             let mut command = self.git_read(
                 worktree,
@@ -4685,7 +4688,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<Option<GitOperationState>, RepositoryError> {
-        let directory = self.git_dir(worktree, cancellation)?;
+        let directory = self.git_dir_for_io(worktree, cancellation)?;
         Ok(Self::operation_state_from_git_dir(&directory))
     }
 
@@ -13337,6 +13340,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         repository: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != repository { return Err(ValidationError::InvalidWorktree(repository.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.stable_common_metadata_path().to_owned());
+        }
         let output = self.run_checked(
             &self.git_read(
                 repository,
@@ -13357,6 +13365,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         worktree: &Path,
         cancellation: &CancellationToken,
     ) -> Result<PathBuf, RepositoryError> {
+        if let Some(authority) = &self.authority {
+            if authority.path() != worktree { return Err(ValidationError::InvalidWorktree(worktree.display().to_string()).into()); }
+            authority.validate()?;
+            return Ok(authority.stable_private_metadata_path().to_owned());
+        }
         let output = self.run_checked(
             &self.git_read(
                 worktree,
