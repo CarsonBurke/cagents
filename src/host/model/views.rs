@@ -855,6 +855,16 @@ mod tests {
         let before=registry.model().unwrap();assert!(registry.apply(&guessed).is_err());assert_eq!(registry.model().unwrap(),before);
         assert_eq!(registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap().state,super::super::created_start::CreatedStartState::Started);
         let accepted=edit(&mut registry,a,Change::RemoveSource{registry:identity,repository:"/repo".into(),before:original,execution_instance:Some(receipt.terminal.execution_instance),handoff:Some(receipt)});
+        let mut replacement=current.clone();
+        let CardKind::Terminal(session)=&mut replacement.kind else {panic!()};session.launch.working_directory="/replacement".into();
+        let replace=edit(&mut registry,a,Change::Update{before:current.clone(),pane:replacement.clone()});registry.apply(&replace).unwrap();
+        let mut stale=accepted.clone();
+        if let ModelEdit::ChangeView{expected_revision,..}=&mut stale {*expected_revision=registry.view_revision(&Scope::Channel(a)).unwrap();}
+        assert!(registry.apply(&stale).is_err(),"revision refresh cannot change original source consent");
+        assert_eq!(registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap().state,super::super::created_start::CreatedStartState::Started);
+        let restore=edit(&mut registry,a,Change::Update{before:replacement,pane:current});registry.apply(&restore).unwrap();
+        let mut accepted=accepted;
+        if let ModelEdit::ChangeView{expected_revision,..}=&mut accepted {*expected_revision=registry.view_revision(&Scope::Channel(a)).unwrap();}
         registry.apply(&accepted).unwrap();
         let retired=registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap();
         assert_eq!(retired.requirement,requirement,"never rewrite native tuple to current console kind/ID");
@@ -869,7 +879,10 @@ mod tests {
         let identity=registry.model().unwrap().identity;
         registry.db.execute_batch("CREATE TRIGGER fixture_refuse_membership_delete BEFORE DELETE ON shared_view_panes BEGIN SELECT RAISE(ABORT,'fixture membership delete refused'); END;").unwrap();
         let accepted=edit(&mut registry,a,Change::RemoveSource{registry:identity,repository:"/repo".into(),before:original,execution_instance:Some(receipt.terminal.execution_instance),handoff:Some(receipt)});
-        let before=registry.model().unwrap();assert!(registry.apply(&accepted).is_err());assert_eq!(registry.model().unwrap(),before);
+        let before=registry.model().unwrap();
+        let refusal=registry.apply(&accepted).unwrap_err();
+        assert!(refusal.contains("fixture membership delete refused"),"the owning trigger must be reached after retirement, not an earlier source/schema refusal: {refusal}");
+        assert_eq!(registry.model().unwrap(),before);
         let operation=match &accepted {ModelEdit::ChangeView{operation,..}=>*operation,_=>panic!()};
         assert!(!registry.view_operation_seen(operation).unwrap());
         assert_eq!(registry.created_start_requirement(requirement.card,requirement.session).unwrap().unwrap().state,super::super::created_start::CreatedStartState::Started,"failed membership write rolls back retirement in same TX");
