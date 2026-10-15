@@ -134,7 +134,7 @@ impl std::fmt::Debug for Cli {
             .finish()
     }
 }
-enum CliFailure {
+pub(crate) enum CliFailure {
     Unavailable(String),
     Invalid(String),
 }
@@ -151,7 +151,7 @@ impl Cli {
             crate::settings::agents::provider_settings(provider).map_err(CliFailure::Invalid)?;
         Self::configured(provider, search_path, configuration)
     }
-    fn configured(
+    pub(crate) fn configured(
         provider: Provider,
         search_path: Option<&OsStr>,
         configuration: crate::settings::AgentLaunchSettings,

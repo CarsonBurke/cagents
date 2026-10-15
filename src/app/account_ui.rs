@@ -1058,15 +1058,11 @@ fn restore(
 }
 
 fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Provider, bool> {
-    Provider::ALL
-        .into_iter()
-        .map(|provider| {
-            (
-                provider,
-                probe::Cli::discover(provider, search_path).is_ok(),
-            )
-        })
-        .collect()
+    provider_installations_with(|provider| probe::Cli::discover(provider, search_path).is_ok())
+}
+
+fn provider_installations_with(mut discover: impl FnMut(Provider) -> bool) -> BTreeMap<Provider, bool> {
+    Provider::ALL.into_iter().map(|provider| (provider, discover(provider))).collect()
 }
 
 /// Whether figures observed at `observed_at` still describe the account at
@@ -5279,7 +5275,9 @@ mod tests {
         let path = directory.path().join(Provider::Omp.executable());
         std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let installations = provider_installations(Some(directory.path().as_os_str()));
+        let installations = provider_installations_with(|provider| {
+            probe::Cli::configured(provider, Some(directory.path().as_os_str()), Default::default()).is_ok()
+        });
         assert_eq!(installations.len(), Provider::ALL.len());
         assert_eq!(installations.get(&Provider::Omp), Some(&true));
         assert_eq!(installations.get(&Provider::Claude), Some(&false));
