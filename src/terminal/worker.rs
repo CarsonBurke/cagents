@@ -142,10 +142,8 @@ enum Command {
         reply: Sender<Option<crate::agent::Activity>>,
         deadline: std::time::Instant,
     },
-    ObserveClose { deadline: std::time::Instant, reply: Sender<Result<(u64, bool), String>> },
     CloseIfRevision {
         revision: u64,
-        deadline: std::time::Instant,
         reply: Sender<Result<(), String>>,
     },
     CloseChecked {
@@ -424,6 +422,19 @@ struct PublishedState {
 }
 
 impl PublishedState {
+    fn close_observation(&self) -> Result<(u64, bool), String> {
+        let order=self.input_order.lock().unwrap_or_else(|p|p.into_inner());
+        let revision=order.close_revision;
+        if self.completed.load(Ordering::Acquire) { return Ok((revision,false)); }
+        if order.closing || order.handoff { return Err("Terminal ownership is changing; refresh its census after it settles".into()); }
+        drop(order);
+        // Unknown activity needs explicit attention, including a shell builtin
+        // with no child process. This advisory sample is never an idle proof:
+        // conditional close independently refuses every unproved live owner.
+        let busy=self.agent_activity.lock().unwrap_or_else(|p|p.into_inner())
+            .is_none_or(|activity|activity.state!=crate::agent::ActivityState::Idle);
+        Ok((revision,busy))
+    }
     fn new(visible: bool, wake: Arc<WakeCallback>) -> Self {
         let (capture_tx, capture_rx) = crossbeam_channel::bounded(1);
         Self {
@@ -1254,15 +1265,10 @@ impl TerminalHandle {
         Ok(carried)
     }
 
-    /// A bounded owner-side census; it never materializes terminal history.
+    /// Resident advisory activity only; never freeze processes, materialize
+    /// history, enqueue worker commands or authorize closing a live shell.
     pub(crate) fn close_observation(&self) -> Result<(u64, bool), String> {
-        if self.is_completed() {
-            let order = self.inner.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
-            return Ok((order.close_revision, false));
-        }
-        let (reply, result) = crossbeam_channel::bounded(1);
-        self.try_command(Command::ObserveClose { deadline: std::time::Instant::now() + Duration::from_secs(3), reply }).map_err(|error| error.to_string())?;
-        result.recv_timeout(Duration::from_secs(3)).map_err(|error| error.to_string())?
+        self.inner.published.close_observation()
     }
 
     /// Terminal providers currently expose no authoritative turn revision or
@@ -1274,7 +1280,6 @@ impl TerminalHandle {
         let (reply, result) = crossbeam_channel::bounded(1);
         self.try_command(Command::CloseIfRevision {
             revision,
-            deadline: std::time::Instant::now() + Duration::from_secs(3),
             reply,
         }).map_err(|error| error.to_string())?;
         result.recv_timeout(Duration::from_secs(3)).map_err(|_| "Terminal close outcome is unconfirmed; refresh its census before retrying".to_owned())??;
@@ -2530,33 +2535,17 @@ impl Worker {
                         .unwrap_or_else(|error| error.into_inner()),
                 );
             }
-            Command::ObserveClose { deadline, reply } => {
-                let published = Arc::clone(&self.published);
-                let order = published.input_order.lock().unwrap_or_else(|p| p.into_inner());
-                let observation = if order.closing {
-                    Err("Terminal is already closing".into())
-                } else {
-                    self.inspect_close(deadline)
-                        .map(|(active, _family)| (order.close_revision, active))
-                };
-                let _ = reply.send(observation);
-            }
-            Command::CloseIfRevision { revision, deadline, reply } => {
-                let published = Arc::clone(&self.published);
-                let order = published.input_order.lock().unwrap_or_else(|p| p.into_inner());
-                let outcome = if order.closing || order.close_revision != revision {
+            Command::CloseIfRevision { revision, reply } => {
+                let order = self.published.input_order.lock().unwrap_or_else(|p| p.into_inner());
+                let outcome = if order.closing || order.handoff || order.close_revision != revision {
                     Err("Terminal input changed after close consent; refresh the worktree census".into())
                 } else {
-                    self.inspect_close(deadline).and_then(|(active, _family)| {
-                        if active { return Err("This terminal owns active work without an authoritative turn revision; close it explicitly, then refresh the worktree census".into()); }
-                        // An original shell with no child can still be running
-                        // a builtin. Process idleness is not prompt ownership.
-                        Err("This live shell has no authoritative prompt ownership proof; close it explicitly, then refresh the worktree census".into())
-                    })
+                    // No live terminal path currently has the authoritative
+                    // proof needed to accept this close. Do not freeze or
+                    // inspect a process family merely to refuse it anyway.
+                    Err("This terminal has no authoritative turn revision or authoritative prompt ownership proof; close it explicitly, then refresh the worktree census".into())
                 };
-                let close = outcome.is_ok();
                 let _ = reply.send(outcome);
-                return close;
             }
             Command::CloseChecked {
                 allow_active,
@@ -6552,6 +6541,19 @@ mod tests {
         assert_eq!(handle.input(vec![3]), Err(TerminalSendError::Closed));
         assert_eq!(handle.input(b"new-work".to_vec()), Err(TerminalSendError::Closed));
         handle.shutdown().unwrap();
+    }
+
+    #[test]
+    fn worktree_census_reads_resident_state_without_a_worker_or_process_probe() {
+        let published=PublishedState::new(false,Arc::new(|_|panic!("a readonly census must not wake a worker")));
+        assert_eq!(published.close_observation().unwrap(),(0,true),"an unknown builtin shell is never proven idle");
+        published.input_order.lock().unwrap().close_revision=7;
+        *published.agent_activity.lock().unwrap()=Some(crate::agent::Activity {provider:crate::agent::Provider::Codex,state:crate::agent::ActivityState::Idle});
+        assert_eq!(published.close_observation().unwrap(),(7,false));
+        published.input_order.lock().unwrap().handoff=true;
+        assert!(published.close_observation().is_err(),"a transfer cannot supply stable consent");
+        published.completed.store(true,Ordering::Release);
+        assert_eq!(published.close_observation().unwrap(),(7,false),"completed cleanup remains census-visible and retryable");
     }
 
     #[test]
