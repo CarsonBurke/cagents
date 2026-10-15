@@ -1227,15 +1227,21 @@ where
         let anchor = cursor.selection.unwrap_or(cursor.position);
         let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { anchor } else { cursor.position };
         let indentation = self.0.get_mut().indentation;
-        let prefix = self.with_line(start.line, |line, _| {
+        let (prefix, paired) = self.with_line(start.line, |line, _| {
             let before = &line[..start.column.min(line.len())];
             let leading: String = before.chars().take_while(|character| matches!(character, ' ' | '\t')).collect();
-            let mut result = leading;
-            if before.trim_end().ends_with(['{', '(', '[']) { result.push_str(&indentation.unit()); }
-            result
+            let opener = before.trim_end().chars().next_back();
+            let closer = match opener { Some('{') => Some('}'), Some('(') => Some(')'), Some('[') => Some(']'), _ => None };
+            let mut result = leading.clone();
+            if closer.is_some() { result.push_str(&indentation.unit()); }
+            let paired = cursor.selection.is_none() && closer.is_some() && line.get(start.column..).and_then(|rest| rest.chars().next()) == closer;
+            (result, paired.then_some(leading))
         }).unwrap_or_default();
-        let ending = self.line_ending().unwrap_or(LineEnding::Lf);
-        self.perform(Action::Edit(Edit::Paste(Arc::new(format!("{}{prefix}", ending.as_str())))));
+        let ending = self.line_ending().unwrap_or(LineEnding::Lf).as_str();
+        let mut inserted = format!("{ending}{prefix}");
+        if let Some(leading) = &paired { inserted.push_str(ending); inserted.push_str(leading); }
+        self.perform(Action::Edit(Edit::Paste(Arc::new(inserted))));
+        if paired.is_some() { self.set_cursor(Cursor { position: Position { line: start.line + 1, column: prefix.len() }, selection: None }); }
     }
 
     fn dedent_closer(&mut self, closer: char) -> bool {
@@ -5413,6 +5419,15 @@ mod tests {
         }
         let mut content: Content = Content::new(); content.set_auto_close(false);
         content.perform_edit(Edit::Insert('(')).unwrap(); assert_eq!(content.text(), "(");
+    }
+
+    #[test]
+    fn enter_between_paired_brackets_places_the_caret_in_an_indented_blank_line() {
+        let mut content: Content = Content::new();
+        content.perform_edit(Edit::Insert('{')).unwrap();
+        content.perform_edit(Edit::Enter).unwrap();
+        assert_eq!(content.text(), "{\n    \n}");
+        assert_eq!(content.cursor().position, Position { line: 1, column: 4 });
     }
 
     #[test]
