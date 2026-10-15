@@ -21,6 +21,7 @@ enum Operation {
         #[command(flatten)]
         target: IssueTarget,
         #[arg(long)]
+        #[arg(help = "Include the complete issue, comments, attachments and relations.")]
         full: bool,
     },
     /// Read a page of comments, including Markdown image URLs.
@@ -51,10 +52,12 @@ enum Operation {
         #[command(flatten)]
         page: Page,
         #[arg(long)]
+        #[arg(help = "List incoming relations instead of outgoing ones.")]
         inverse: bool,
     },
     /// Search issues in the selected workspace.
     Search {
+        #[arg(help = "Search text for matching issues.")]
         query: String,
         #[command(flatten)]
         page: Page,
@@ -65,12 +68,16 @@ enum Operation {
         #[command(flatten)]
         page: Page,
         #[arg(long)]
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: Option<String>,
         #[arg(long)]
+        #[arg(help = "Workflow state ID or unique name.")]
         state: Option<String>,
         #[arg(long)]
+        #[arg(help = "Assignee ID, email, or unique name; use none to clear.")]
         assignee: Option<String>,
         #[arg(long, value_parser=clap::value_parser!(u8).range(0..=4))]
+        #[arg(help = "Priority: 0 none, 1 urgent, 2 high, 3 normal, 4 low.")]
         priority: Option<u8>,
     },
     /// Discover teams, workflow states, labels, and members.
@@ -91,7 +98,9 @@ enum Operation {
         #[command(flatten)]
         target: Target,
         #[arg(value_enum)]
+        #[arg(help = "Issue field to change.")]
         field: Field,
+        #[arg(help = "New field value; use none to clear an optional field.")]
         value: String,
     },
     /// Change an issue's workflow state.
@@ -109,8 +118,10 @@ enum Operation {
         #[command(flatten)]
         target: Target,
         #[arg(long)]
+        #[arg(help = "HTTP(S) URL to attach.")]
         url: String,
         #[arg(long)]
+        #[arg(help = "Title of the issue or attached link.")]
         title: String,
     },
     /// Add, remove, or replace issue labels.
@@ -124,7 +135,10 @@ enum Operation {
         command: RelationCommand,
     },
     /// Save a validated issue UUID and credential alias for this checkout.
-    Link { id: String },
+    Link {
+        #[arg(help = "The stable resource ID.")]
+        id: String,
+    },
     /// Remove this worktree's ticket link without contacting Linear.
     Unlink,
 }
@@ -140,8 +154,10 @@ struct Target {
 #[derive(Debug, Args)]
 struct IssueTarget {
     #[arg(required_unless_present = "current", conflicts_with = "current")]
+    #[arg(help = "The stable resource ID.")]
     id: Option<String>,
     #[arg(long)]
+    #[arg(help = "Use the issue linked to this Git worktree.")]
     current: bool,
 }
 impl From<IssueTarget> for Target {
@@ -163,21 +179,28 @@ struct Page {
 }
 #[derive(Debug, Subcommand)]
 enum TeamCommand {
+    /// List teams in the selected workspace.
     List {
         #[command(flatten)]
         page: Page,
     },
+    /// List workflow states for a team.
     States {
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: String,
         #[command(flatten)]
         page: Page,
     },
+    /// List labels for a team.
     Labels {
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: String,
         #[command(flatten)]
         page: Page,
     },
+    /// List members of a team.
     Members {
+        #[arg(help = "Team ID, key, or unique team name.")]
         team: String,
         #[command(flatten)]
         page: Page,
@@ -185,6 +208,7 @@ enum TeamCommand {
 }
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
+    /// List projects in the selected workspace.
     List {
         #[command(flatten)]
         page: Page,
@@ -193,33 +217,46 @@ enum ProjectCommand {
 #[derive(Debug, Args)]
 struct Save {
     #[arg(long, conflicts_with = "current")]
+    #[arg(help = "The stable resource ID.")]
     id: Option<String>,
     #[arg(long)]
+    #[arg(help = "Use the issue linked to this Git worktree.")]
     current: bool,
     #[arg(long)]
+    #[arg(help = "Team ID, key, or unique team name.")]
     team: Option<String>,
     #[arg(long)]
+    #[arg(help = "Title of the issue or attached link.")]
     title: Option<String>,
     /// Markdown file, or - to read stdin (maximum 2 MiB).
     #[arg(long)]
     body_file: Option<PathBuf>,
     #[arg(long, conflicts_with = "parent_current")]
+    #[arg(help = "Parent issue identifier or UUID; use none to clear.")]
     parent: Option<String>,
     #[arg(long)]
+    #[arg(help = "Use this worktree’s linked issue as the parent.")]
     parent_current: bool,
     #[arg(long)]
+    #[arg(help = "Workflow state ID or unique name.")]
     status: Option<String>,
     #[arg(long)]
+    #[arg(help = "Assignee ID, email, or unique name; use none to clear.")]
     assignee: Option<String>,
     #[arg(long)]
+    #[arg(help = "Project ID or unique name; use none to clear.")]
     project: Option<String>,
     #[arg(long, value_delimiter = ',')]
+    #[arg(help = "Label names or IDs; comma-separate option values.")]
     labels: Option<Vec<String>>,
     #[arg(long, value_parser=clap::value_parser!(u8).range(0..=4))]
+    #[arg(help = "Priority: 0 none, 1 urgent, 2 high, 3 normal, 4 low.")]
     priority: Option<u8>,
     #[arg(long, value_parser=clap::value_parser!(u32).range(0..=2147483647))]
+    #[arg(help = "Nonnegative issue estimate.")]
     estimate: Option<u32>,
     #[arg(long)]
+    #[arg(help = "Due date in YYYY-MM-DD format; use none to clear.")]
     due_date: Option<String>,
     /// UUID for reconciling an uncertain create result. No automatic write retries.
     #[arg(long)]
@@ -239,14 +276,17 @@ enum Field {
 }
 #[derive(Debug, Subcommand)]
 enum StatusCommand {
+    /// Set an issue workflow state.
     Set {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Workflow state ID or unique name.")]
         state: String,
     },
 }
 #[derive(Debug, Subcommand)]
 enum CommentCommand {
+    /// Add a Markdown comment to an issue.
     Add {
         #[command(flatten)]
         target: Target,
@@ -255,28 +295,37 @@ enum CommentCommand {
             conflicts_with = "body_file",
             required_unless_present = "body_file"
         )]
+        #[arg(help = "Markdown comment text.")]
         body: Option<String>,
         #[arg(long)]
+        #[arg(help = "Markdown file; use - to read standard input (maximum 2 MiB).")]
         body_file: Option<PathBuf>,
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Option<uuid::Uuid>,
     },
 }
 #[derive(Debug, Subcommand)]
 enum LabelCommand {
+    /// Add labels without removing current labels.
     Add {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
+    /// Remove the named labels from an issue.
     Remove {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
+    /// Replace the complete issue label set.
     Set {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Label names or IDs as separate arguments; quote names with spaces.")]
         labels: Vec<String>,
     },
 }
@@ -289,17 +338,24 @@ enum RelationType {
 }
 #[derive(Debug, Subcommand)]
 enum RelationCommand {
+    /// Create a typed relation between two issues.
     Add {
         #[command(flatten)]
         target: Target,
+        #[arg(help = "Related issue identifier, UUID or URL.")]
         related: String,
         #[arg(long, value_enum)]
+        #[arg(help = "Relation type to create.")]
         kind: RelationType,
         #[arg(long)]
+        #[arg(help = "Stable retry UUID; reuse it when retrying the same request.")]
         request_id: Option<uuid::Uuid>,
     },
     /// Remove by the relation UUID shown by issue --full.
-    Remove { id: uuid::Uuid },
+    Remove {
+        /// The stable resource ID.
+        id: uuid::Uuid,
+    },
 }
 
 #[cfg(feature = "ui")]
@@ -326,9 +382,13 @@ impl LinearCommand {
                 ("Updated ticket", ticket(&save.id))
             }
             Operation::Create(save) => ("Created ticket", save.title.clone().unwrap_or_default()),
-            Operation::Set { target, .. } | Operation::Label { command: LabelCommand::Add { target, .. } | LabelCommand::Remove { target, .. } | LabelCommand::Set { target, .. } } => {
-                ("Updated ticket", issue(target))
-            }
+            Operation::Set { target, .. }
+            | Operation::Label {
+                command:
+                    LabelCommand::Add { target, .. }
+                    | LabelCommand::Remove { target, .. }
+                    | LabelCommand::Set { target, .. },
+            } => ("Updated ticket", issue(target)),
             Operation::Status {
                 command: StatusCommand::Set { target, state },
             } => ("Moved ticket", format!("{} to {state}", issue(target))),
@@ -337,7 +397,10 @@ impl LinearCommand {
             } => ("Commented on", issue(target)),
             Operation::Attach { target, .. } => ("Attached a link to", issue(target)),
             Operation::Relation {
-                command: RelationCommand::Add { target, related, .. },
+                command:
+                    RelationCommand::Add {
+                        target, related, ..
+                    },
             } => ("Related", format!("{} to {related}", issue(target))),
             Operation::Relation {
                 command: RelationCommand::Remove { .. },
