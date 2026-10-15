@@ -34,7 +34,7 @@ impl Language {
 
 pub(super) struct ToolText {
     key: u64,
-    reader_source: reader_source::Source,
+    pub(super) reader_source: reader_source::Source,
     pub(super) flow_cache: flow_layout::Cache,
     language: Language,
     pub(super) text: Arc<str>,

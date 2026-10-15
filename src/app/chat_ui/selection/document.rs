@@ -18,7 +18,7 @@ pub(in crate::app::chat_ui) struct Catalog {
     read: Read,
     positions: HashMap<u64, usize>,
     plain_bytes: usize,
-    prefix_hashes: HashMap<u64, Arc<[[u8; 32]]>>,
+    prefix_hashes: HashMap<u64, Arc<Vec<[u8; 32]>>>,
 }
 impl Catalog {
     pub fn retained_plain_bytes(&self) -> usize { self.plain_bytes }
@@ -40,7 +40,7 @@ impl Catalog {
         hash.update(&block.plain.as_bytes()[chunk * STRIDE..point.byte]);
         Some(*hash.finalize().as_bytes())
     }
-    pub fn builder() -> Builder { Builder { read: Read::new(None) } }
+    pub fn builder() -> Builder { Builder { read: Read::new(None),prefixes:HashMap::new() } }
     pub fn endpoints(&self) -> Option<(Endpoint, Endpoint)> {
         Some((Endpoint { identity: self.read.blocks.first()?.identity, byte: 0 },
             Endpoint { identity: self.read.blocks.last()?.identity, byte: self.read.blocks.last()?.plain.len() }))
@@ -75,7 +75,7 @@ pub(in crate::app::chat_ui) fn identity(item: &str, path: &[u32]) -> u64 {
     hash.finish()
 }
 
-pub(in crate::app::chat_ui) struct Builder { read: Read }
+pub(in crate::app::chat_ui) struct Builder { read: Read, prefixes:HashMap<u64,Arc<Vec<[u8;32]>>> }
 impl Builder {
     pub fn logical(&mut self, identity: u64, text: Arc<str>) {
         let mut logical = LogicalText { identity, plain: text };
@@ -83,6 +83,9 @@ impl Builder {
     }
     pub fn plain(&mut self, item: &str, path: &[u32], text: Arc<str>) {
         self.logical(identity(item, path), text);
+    }
+    pub fn indexed(&mut self,item:&str,path:&[u32],text:Arc<str>,prefixes:Arc<Vec<[u8;32]>>) {
+        let key=identity(item,path);self.logical(key,text);self.prefixes.insert(key,prefixes);
     }
     fn enter(&mut self, item: &str, path: &[u32], kind: Kind) {
         self.read.custom(None, Rectangle::default(), &mut boundary::Enter { identity: identity(item, path), kind });
@@ -92,8 +95,8 @@ impl Builder {
         for (index, node) in items.iter().enumerate() {
             let mut key = path.to_vec(); key.push(index as u32);
             match node {
-                markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => self.plain(item, &key, text.plain()),
-                markdown::Item::CodeBlock { source, .. } => self.plain(item, &key, source.clone()),
+                markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => self.indexed(item, &key, text.plain(),text.plain_prefixes()),
+                markdown::Item::CodeBlock { source, reader_source,.. } => self.indexed(item, &key, source.clone(),reader_source.prefixes()),
                 markdown::Item::Quote(items) => self.markdown(item, &key, items),
                 markdown::Item::List { start, bullets } => {
                     for (index, bullet) in bullets.iter().enumerate() {
@@ -126,7 +129,7 @@ impl Builder {
                 }
                 markdown::Item::Image { title, alt, .. } => {
                     let mut part = key.clone(); part.push(0);
-                    if !alt.plain().is_empty() { self.plain(item, &part, alt.plain()); }
+                    if !alt.plain().is_empty() { self.indexed(item, &part, alt.plain(),alt.plain_prefixes()); }
                     if !title.is_empty() { part.pop(); part.push(1); self.plain(item, &part, Arc::from(title.as_str())); }
                 }
                 markdown::Item::Rule => {}
@@ -138,6 +141,7 @@ impl Builder {
         let positions = self.read.blocks.iter().enumerate().map(|(index, block)| (block.identity, index)).collect();
         let plain_bytes = self.read.blocks.iter().map(|block| block.plain.len()).sum();
         let prefix_hashes = self.read.blocks.iter().map(|block| {
+            if let Some(prefixes)=self.prefixes.get(&block.identity) {return (block.identity,prefixes.clone());}
             if let Some(previous) = previous
                 && previous.text(block.identity).is_some_and(|plain| Arc::ptr_eq(&plain, &block.plain))
                 && let Some(prefixes) = previous.prefix_hashes.get(&block.identity) {
@@ -148,7 +152,7 @@ impl Builder {
             for chunk in block.plain.as_bytes().chunks_exact(4096) {
                 hash.update(chunk); prefixes.push(*hash.finalize().as_bytes());
             }
-            (block.identity, Arc::from(prefixes))
+            (block.identity, Arc::new(prefixes))
         }).collect();
         Arc::new(Catalog { read: self.read, positions, plain_bytes, prefix_hashes })
     }
@@ -157,6 +161,19 @@ impl Builder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn worker_prepared_prefix_checkpoints_are_adopted_without_body_hashing() {
+        let plain:Arc<str>="prepared λ paragraph ".repeat(100_000).into();
+        let source=super::super::super::reader_source::Source::new(&plain);
+        let prefixes=source.prefixes();
+        let mut builder=Catalog::builder();builder.indexed("source",&[0],plain.clone(),prefixes.clone());
+        let catalog=builder.finish();let identity=identity("source",&[0]);
+        assert!(Arc::ptr_eq(&catalog.prefix_hashes[&identity],&prefixes));
+        let mut reference=Catalog::builder();reference.plain("source",&[0],plain.clone());let reference=reference.finish();
+        for byte in [0,4095,8192,plain.len()] {
+            if plain.is_char_boundary(byte) {let point=Endpoint{identity,byte};assert_eq!(catalog.fingerprint(point),reference.fingerprint(point));}
+        }
+    }
     #[test]
     fn unchanged_logical_blocks_reuse_validation_hashes_but_rewrites_do_not() {
         let first: Arc<str> = "historical source ".repeat(100000).into();

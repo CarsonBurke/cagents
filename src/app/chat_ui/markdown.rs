@@ -322,6 +322,7 @@ pub struct Text {
     spans: Arc<Vec<Span>>,
     starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
+    plain_source: std::cell::OnceCell<super::reader_source::Source>,
     last_style: Cell<Option<Style>>,
     last_styled_spans: RefCell<Arc<[text::Span<'static, Uri>]>>,
     lineage: Arc<std::sync::Mutex<StyledLineage>>,
@@ -340,6 +341,7 @@ impl Text {
             spans: spans.into(),
             starts: starts.into(),
             plain: std::cell::OnceCell::new(),
+            plain_source: std::cell::OnceCell::new(),
             last_style: Cell::default(),
             last_styled_spans: RefCell::default(),
             lineage: Default::default(),
@@ -352,6 +354,12 @@ impl Text {
     }
     fn append_plain(&mut self, suffix: &str) {
         let previous = Arc::downgrade(&self.spans);
+        if let Some(source)=self.plain_source.get_mut() {
+            // Primed parser outputs share the old plain backing; update only
+            // the suffix hash state before invalidating that display string.
+            let [Span::Standard {text,..}]=self.spans.as_slice() else {unreachable!("plain append has one source span")};
+            source.append(text,suffix);
+        }
         let [Span::Standard { text, .. }] = Arc::make_mut(&mut self.spans).as_mut_slice() else { unreachable!("plain append requires one plain span") };
         text.push_str(suffix);
         let length = self.starts.last().copied().unwrap_or_default() + suffix.len();
@@ -402,6 +410,9 @@ impl Text {
             MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
             self.spans.iter().map(Span::text).collect::<String>().into()
         }).clone()
+    }
+    pub fn plain_prefixes(&self)->Arc<Vec<[u8;32]>> {
+        self.plain_source.get_or_init(||super::reader_source::Source::new(&self.plain())).prefixes()
     }
     pub fn len(&self) -> usize { self.starts.last().copied().unwrap_or_default() }
 

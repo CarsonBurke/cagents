@@ -8,11 +8,18 @@ pub(super) struct Source {
     // Allocate incremental state only once this source actually grows.
     hasher: Option<Arc<blake3::Hasher>>,
     ancestors: Arc<VecDeque<blake3::Hash>>,
+    prefixes: Arc<Vec<[u8;32]>>,
 }
 impl Source {
     pub fn new(text: &str) -> Self {
-        Self { digest: blake3::hash(text.as_bytes()), hasher: None, ancestors: Arc::default() }
+        let mut hasher=blake3::Hasher::new();
+        let mut prefixes=vec![*hasher.finalize().as_bytes()];
+        let mut chunks=text.as_bytes().chunks_exact(4096);
+        for chunk in &mut chunks {hasher.update(chunk);prefixes.push(*hasher.finalize().as_bytes());}
+        hasher.update(chunks.remainder());
+        Self {digest:hasher.finalize(),hasher:None,ancestors:Arc::default(),prefixes:Arc::new(prefixes)}
     }
+    pub fn prefixes(&self)->Arc<Vec<[u8;32]>> {self.prefixes.clone()}
     pub fn digest(&self) -> blake3::Hash { self.digest }
     pub fn accepts(&self, previous: blake3::Hash) -> bool {
         self.digest == previous || self.ancestors.contains(&previous)
@@ -28,7 +35,13 @@ impl Source {
             hasher.update(previous.as_bytes()); Arc::new(hasher)
         });
         let hasher = Arc::make_mut(hasher);
-        hasher.update(suffix.as_bytes()); self.digest = hasher.finalize();
+        let mut suffix=suffix.as_bytes();let mut seen=previous.len();
+        while !suffix.is_empty() {
+            let take=(4096-seen%4096).min(suffix.len());
+            hasher.update(&suffix[..take]);seen+=take;suffix=&suffix[take..];
+            if seen%4096==0 {Arc::make_mut(&mut self.prefixes).push(*hasher.finalize().as_bytes());}
+        }
+        self.digest=hasher.finalize();
     }
     pub fn updated(previous: &Self, old: &str, new: &str) -> Self {
         if let Some(suffix) = new.strip_prefix(old) {
@@ -51,6 +64,17 @@ mod tests {
         for _ in 0..300 { source.append(&body, "x"); body.push('x'); }
         assert_eq!(source.ancestors.len(), 256);
         assert!(!source.accepts(original));
+    }
+    #[test]
+    fn incremental_prefix_checkpoints_equal_full_source_across_utf8_seams() {
+        let mut body="λx".repeat(1365);let mut source=Source::new(&body);
+        for suffix in ["a","β","word ","x".repeat(8193).as_str()] {
+            let before=source.prefixes();
+            source.append(&body,suffix);body.push_str(suffix);
+            let fresh=Source::new(&body);
+            assert_eq!(source.digest(),fresh.digest());assert_eq!(source.prefixes(),fresh.prefixes());
+            if before.len()==source.prefixes.len() {assert!(Arc::ptr_eq(&before,&source.prefixes()));}
+        }
     }
     #[test]
     fn line_descriptors_share_incremental_hash_state_and_append_uses_copy_on_write() {

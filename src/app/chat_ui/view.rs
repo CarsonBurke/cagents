@@ -1248,9 +1248,9 @@ impl Runtime {
             for (index, content) in coordinated.contents().enumerate() { builder.markdown(&item.id, &[1, index as u32], content.items()); }
         }
         if detail && self.expanded.contains(&item.id) {
-            if let Some(input) = &cached.tool_input { builder.plain(&item.id, &[4], input.text.clone()); }
-            if let Some(output) = &cached.tool_output { if !output.text.is_empty() { builder.plain(&item.id, &[5], output.text.clone()); } }
-            for (index, patch) in cached.patches.iter().enumerate() { if !patch.text.is_empty() { builder.plain(&item.id, &[6, index as u32], patch.text.clone()); } }
+            if let Some(input) = &cached.tool_input { builder.indexed(&item.id, &[4], input.text.clone(),input.reader_source.prefixes()); }
+            if let Some(output) = &cached.tool_output { if !output.text.is_empty() { builder.indexed(&item.id, &[5], output.text.clone(),output.reader_source.prefixes()); } }
+            for (index, patch) in cached.patches.iter().enumerate() { if !patch.text.is_empty() { builder.indexed(&item.id, &[6, index as u32], patch.text.clone(),patch.reader_source.prefixes()); } }
         }
     }
 

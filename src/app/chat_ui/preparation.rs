@@ -291,8 +291,8 @@ fn prime_plain(items:&[markdown::Item],cancelled:&AtomicBool)->Result<(),String>
     for item in items {
         if cancelled.load(Ordering::Relaxed) {return Err("Message loading was cancelled.".into());}
         match item {
-            markdown::Item::Paragraph(text)|markdown::Item::Heading(_,text)=>{text.plain();}
-            markdown::Item::Image {alt,..}=>{alt.plain();}
+            markdown::Item::Paragraph(text)|markdown::Item::Heading(_,text)=>{text.plain_prefixes();}
+            markdown::Item::Image {alt,..}=>{alt.plain_prefixes();}
             markdown::Item::Quote(items)=>prime_plain(items,cancelled)?,
             markdown::Item::List {bullets,..}=>for bullet in bullets {
                 let (markdown::Bullet::Point {items}|markdown::Bullet::Task {items,..})=bullet;
