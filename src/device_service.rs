@@ -943,7 +943,7 @@ mod tests {
         )) {
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::repository::retained_managed_fixture_directory();
         let root = directory.path().to_owned();
         let run = |arguments: &[&str]| {
             let output = std::process::Command::new("git")
@@ -1020,7 +1020,7 @@ mod tests {
         assert!(!root.join(".worktrees/dev").exists());
         // The remote project can itself be an external linked checkout.
         // Remove the prior rule so this exercises its real policy write.
-        let linked_directory = tempfile::tempdir().unwrap();
+        let linked_directory = crate::repository::retained_managed_fixture_directory();
         let linked = linked_directory.path().join("checkout");
         run(&[
             "worktree",

@@ -7,7 +7,7 @@
 
 mod managed_worktrees;
 #[cfg(test)]
-pub(crate) use managed_worktrees::isolated_git_test;
+pub(crate) use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
