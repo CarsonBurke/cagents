@@ -660,6 +660,9 @@ impl Store {
                 _ => {}
             }
         }
+        if self.revoked_child_tool_event(&event)? {
+            return Ok(vec![nonfatal("Delegated tool source was removed; a late update was discarded without recreating its private body".into())]);
+        }
         let mut out = self.cache_child_tool(&event)?.into_iter().map(nonfatal).collect::<Vec<_>>();
         self.index_child_event(&event)?;
         let earlier = matches!(&event, Event::History { .. });

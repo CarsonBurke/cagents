@@ -48,6 +48,15 @@ impl Store {
         self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tool_revoked WHERE agent=?1 AND id=?2)",params![agent,id],|row|row.get(0)).map_err(|e|e.to_string())
     }
 
+    pub(super) fn revoked_child_tool_event(&self,event:&Event)->Result<bool,String> {
+        let key=match event {
+            Event::SubagentItem{id,item}=>Some((id,&item.id)),
+            Event::SubagentInputDelta{id,item_id,..}|Event::SubagentOutputDelta{id,item_id,..}|Event::SubagentTextDelta{id,item_id,..}=>Some((id,item_id)),
+            _=>None,
+        };
+        match key {Some((agent,id))=>self.child_tool_revoked(agent,id),None=>Ok(false)}
+    }
+
     fn revoke_child_tool(&mut self,agent:&str,id:&str)->Result<(),String> {
         let tx=self.db.transaction().map_err(|e|e.to_string())?;
         let cost:Option<usize>=tx.query_row("SELECT cost FROM child_tools WHERE agent=?1 AND id=?2",params![agent,id],|row|row.get(0)).optional().map_err(|e|e.to_string())?;
@@ -124,7 +133,7 @@ impl Store {
                 (ItemContent::Command {label:label.clone(),command:command.clone(),working_directory:working_directory.clone(),action:*action,status:*status,exit_code:*exit_code,duration_ms:*duration_ms,output:String::new()},[vec![output.as_str()],Vec::new()],Vec::new())
             }
             ItemContent::Changes {changes,status} => {
-                for change in changes {identity=identity.saturating_add(change.path.len()).saturating_add(32);if let crate::chat::ChangeKind::Renamed{from}=&change.kind {identity=identity.saturating_add(from.len());}if identity>METADATA_LIMIT {return Ok(self.child_source_refused(BUDGET_ERROR));}}
+                for change in changes {identity=identity.saturating_add(change.path.len()).saturating_add(128);if let crate::chat::ChangeKind::Renamed{from}=&change.kind {identity=identity.saturating_add(from.len());if from.is_empty() || from.contains('\0') {return Ok(self.child_source_refused(SOURCE_ERROR));}}if change.path.is_empty() || change.path.contains('\0') {return Ok(self.child_source_refused(SOURCE_ERROR));}if identity>METADATA_LIMIT {return Ok(self.child_source_refused(BUDGET_ERROR));}}
                 (ItemContent::Changes {changes:changes.iter().map(|change|crate::chat::FileChange {path:change.path.clone(),kind:change.kind.clone(),diff:String::new()}).collect(),status:*status},[changes.iter().map(|change|change.diff.as_str()).collect(),Vec::new()],changes.iter().map(|change|change.diff.len()).collect())
             }
             _ => {self.remove_child_tool(agent,id)?;return Ok(None);}
@@ -145,7 +154,8 @@ impl Store {
         let preserve_input=matches!(&original.content,ItemContent::Tool{input,..} if input.is_empty()) && previous.as_ref().is_some_and(|(_,_,bytes)|postcard::from_bytes::<Item>(bytes).is_ok_and(|old|matches!(old.content,ItemContent::Tool{..})));
         if preserve_input {lengths[0]=previous.as_ref().unwrap().1;}
         let old_chunks:usize=self.db.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2",params![agent,id],|row|row.get(0)).map_err(|e|e.to_string())?;
-        let input_chunks=if preserve_input {self.db.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2 AND field=0",params![agent,id],|row|row.get::<_,usize>(0)).map_err(|e|e.to_string())?} else {fragment_chunks(&bodies[0])};
+        let changes=matches!(item.content,ItemContent::Changes{..});
+        let input_chunks=if changes {0}else if preserve_input {self.db.query_row("SELECT count(*) FROM child_tool_chunks WHERE agent=?1 AND id=?2 AND field=0",params![agent,id],|row|row.get::<_,usize>(0)).map_err(|e|e.to_string())?} else {fragment_chunks(&bodies[0])};
         let chunks=input_chunks.saturating_add(fragment_chunks(&bodies[1]));
         let cost=identity.saturating_add(metadata.len()).saturating_add(spans.len()).saturating_add(lengths[0]).saturating_add(lengths[1]).saturating_add(chunks.saturating_mul(chunk_cost(agent,id)));
         let (total,count,total_chunks):(usize,usize,usize)=self.db.query_row("SELECT bytes,items,chunks FROM child_tool_budget WHERE singleton=1",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).map_err(|e|e.to_string())?;
@@ -153,7 +163,9 @@ impl Store {
         let tx=self.db.transaction().map_err(|e|e.to_string())?;
         tx.execute("INSERT INTO child_tools VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(agent,id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,spans=excluded.spans,cost=excluded.cost",params![agent,id,metadata,lengths[0],lengths[1],spans,cost]).map_err(|e|e.to_string())?;
         tx.execute("DELETE FROM child_tool_chunks WHERE agent=?1 AND id=?2 AND (?3=0 OR field=1)",params![agent,id,preserve_input]).map_err(|e|e.to_string())?;
-        if !preserve_input {insert_fragments(&tx,agent,id,0,0,&bodies[0])?;}
+        // The existing file index already owns full delegated Changes patches.
+        // Retain identity/spans here, never a second copy of those bodies.
+        if !preserve_input && !changes {insert_fragments(&tx,agent,id,0,0,&bodies[0])?;}
         insert_fragments(&tx,agent,id,1,0,&bodies[1])?;
         tx.execute("UPDATE child_tool_budget SET bytes=bytes-?1+?2,items=items+?3,chunks=chunks-?4+?5 WHERE singleton=1",params![previous.as_ref().map_or(0,|row|row.0),cost,usize::from(previous.is_none()),old_chunks,chunks]).map_err(|e|e.to_string())?;
         tx.commit().map_err(|e|e.to_string())?;
@@ -206,21 +218,46 @@ impl Store {
         if item.id!=key.item_id {return Err("Delegated tool canonical identity changed".into());}
         let extra:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tool_chunks WHERE agent=?1 AND id=?2 AND field NOT IN (0,1))",params![agent,key.item_id],|row|row.get(0)).map_err(|e|e.to_string())?;
         if extra {return Err("Delegated tool canonical layout has an unknown body field".into());}
+        if let ItemContent::Changes{changes,status}=&mut item.content {
+            self.child_patch_items(agent,&key.item_id,changes,*status,&spans,len0,len1)?;
+            return Ok(Some(item));
+        }
         let body0=String::from_utf8(self.child_tool_field(agent,&key.item_id,0,len0)?).map_err(|e|e.to_string())?;
         let body1=String::from_utf8(self.child_tool_field(agent,&key.item_id,1,len1)?).map_err(|e|e.to_string())?;
         match &mut item.content {
             ItemContent::Tool{input,output,..}=>{*input=body0;*output=body1;}
             ItemContent::Command{output,..} if body1.is_empty()=>{*output=body0;}
-            ItemContent::Changes{changes,..} if body1.is_empty()=>{
-                let spans:Vec<usize>=postcard::from_bytes(&spans).map_err(|e|e.to_string())?;
-                if spans.len()!=changes.len() {return Err("Delegated patch identity or layout changed".into());}
-                let mut offset=0usize;
-                for (change,len) in changes.iter_mut().zip(spans) {let end=offset.checked_add(len).ok_or("Delegated patch offset overflow")?;change.diff=body0.get(offset..end).ok_or("Delegated patch source is incomplete")?.into();offset=end;}
-                if offset!=body0.len() {return Err("Delegated patch source has unclaimed bytes".into());}
-            }
             _=>return Err("Delegated source is not an exact canonical tool".into()),
         }
         Ok(Some(item))
+    }
+
+    fn child_patch_items(&self,agent:&str,id:&str,changes:&mut [crate::chat::FileChange],status:crate::chat::ToolStatus,spans:&[u8],len0:usize,len1:usize)->Result<(),String> {
+        let spans:Vec<usize>=postcard::from_bytes(spans).map_err(|e|e.to_string())?;
+        if len1!=0 || spans.len()!=changes.len() {return Err("Delegated patch identity or layout changed".into());}
+        let duplicate:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM child_tool_chunks WHERE agent=?1 AND id=?2)",params![agent,id],|row|row.get(0)).map_err(|e|e.to_string())?;
+        if duplicate {return Err("Delegated patch has an unexpected duplicate canonical body".into());}
+        let source=format!("c:{agent}");
+        let count:usize=self.db.query_row("SELECT count(*) FROM file_edits WHERE source=?1 AND item_id=?2",params![source,id],|row|row.get(0)).map_err(|e|e.to_string())?;
+        if count!=changes.len() {return Err("Delegated patch manifest is missing or was shortened".into());}
+        let mut offset=0usize;
+        for (index,(change,len)) in changes.iter_mut().zip(spans).enumerate() {
+            let manifest=self.db.query_row("SELECT CASE WHEN length(CAST(path AS BLOB))<=?4 THEN path ELSE NULL END,CASE WHEN length(kind)<=?4 THEN kind ELSE NULL END,CASE WHEN length(status)<=?4 THEN status ELSE NULL END,start,len FROM file_edits WHERE source=?1 AND item_id=?2 AND file_index=?3",params![source,id,index,METADATA_LIMIT],|row|Ok((row.get::<_,Option<String>>(0)?,row.get::<_,Option<Vec<u8>>>(1)?,row.get::<_,Option<Vec<u8>>>(2)?,row.get::<_,i64>(3)?,row.get::<_,i64>(4)?))).optional().map_err(|e|e.to_string())?.ok_or("Delegated patch manifest has an invalid file index")?;
+            let kind:crate::chat::ChangeKind=postcard::from_bytes(&manifest.1.ok_or("Delegated patch kind exceeds its identity limit")?).map_err(|e|e.to_string())?;
+            let actual_status:crate::chat::ToolStatus=postcard::from_bytes(&manifest.2.ok_or("Delegated patch status exceeds its identity limit")?).map_err(|e|e.to_string())?;
+            if manifest.0.as_ref()!=Some(&change.path) || kind!=change.kind || actual_status!=status || usize::try_from(manifest.3).ok()!=Some(offset) || usize::try_from(manifest.4).ok()!=Some(len) {return Err("Delegated patch manifest changed its exact identity or outcome".into());}
+            offset=offset.checked_add(len).filter(|end|*end<=len0).ok_or("Delegated patch length overflow")?;
+            let mut statement=self.db.prepare_cached("SELECT position,length(data),CASE WHEN length(data)<=?4 THEN data ELSE NULL END FROM file_patch_chunks WHERE source=?1 AND item_id=?2 AND file_index=?3 ORDER BY position").map_err(|e|e.to_string())?;
+            let rows=statement.query_map(params![source,id,index,PART_BYTES],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,Option<Vec<u8>>>(2)?))).map_err(|e|e.to_string())?;
+            let mut bytes=Vec::with_capacity(len);
+            for row in rows {let (position,length,data)=row.map_err(|e|e.to_string())?;let data=data.ok_or("Delegated patch has an oversized canonical chunk")?;
+                if usize::try_from(position).ok()!=Some(bytes.len()) || data.is_empty() || length!=data.len() as i64 || data.len()>len.saturating_sub(bytes.len()) {return Err("Delegated patch has a missing, overlapping or invalid chunk".into());}bytes.extend(data);
+            }
+            if bytes.len()!=len {return Err("Delegated patch source is incomplete".into());}
+            change.diff=String::from_utf8(bytes).map_err(|e|e.to_string())?;
+        }
+        if offset!=len0 {return Err("Delegated patch source has unclaimed bytes".into());}
+        Ok(())
     }
 
     fn child_tool_field(&self,agent:&str,id:&str,field:i64,expected:usize)->Result<Vec<u8>,String> {
@@ -292,6 +329,8 @@ mod tests {
             FileChange {path:"renamed.rs".into(),kind:ChangeKind::Renamed{from:"old.rs".into()},diff:"-old\n+new\n".repeat(20_000)},
         ]}};
         put(&mut store,"child",original.clone());
+        assert_eq!(store.db.query_row("SELECT count(*) FROM child_tool_chunks WHERE id='write'",[],|r|r.get::<_,usize>(0)).unwrap(),0,"patch bytes must not be duplicated");
+        assert!(store.db.query_row("SELECT count(*) FROM file_patch_chunks WHERE item_id='write'",[],|r|r.get::<_,usize>(0)).unwrap()>0);
         if let ItemContent::Changes{status,..}=&mut original.content {*status=ToolStatus::Succeeded;}
         put(&mut store,"child",original.clone());
         assert_eq!(read(&mut store,"child","write"),Some(original));
@@ -361,7 +400,11 @@ mod tests {
         assert!(store.pending_child_tool.is_none());assert!(store.child_adapter_item(&CanonicalItemKey::new(Some("one"),"same")).is_err());
         let late=store.apply(Event::SubagentItem{id:"one".into(),item:tool("same","must not revive","")}).unwrap();
         assert!(late.iter().any(|event|matches!(event,Event::Error{fatal:false,..})));
+        assert!(!late.iter().any(|event|matches!(event,Event::SubagentItem{..})));
         assert_eq!(store.db.query_row("SELECT count(*) FROM child_tools WHERE agent='one' AND id='same'",[],|r|r.get::<_,usize>(0)).unwrap(),0);
+        let patch=Item{id:"same".into(),role:Role::Assistant,at:None,started_at:None,content:ItemContent::Changes{status:ToolStatus::Succeeded,changes:vec![FileChange{path:"private.rs".into(),kind:ChangeKind::Added,diff:"private patch must not reappear".into()}]}};
+        store.apply(Event::SubagentItem{id:"one".into(),item:patch}).unwrap();
+        assert_eq!(store.db.query_row("SELECT count(*) FROM file_edits WHERE source='c:one' AND item_id='same'",[],|r|r.get::<_,usize>(0)).unwrap(),0);
         assert!(read(&mut store,"two","same").is_some());
         let prose=Item {id:"same".into(),content:ItemContent::Text{text:"prose".into(),thinking:false,phase:Phase::Final},..tool("same","","")};
         put(&mut store,"two",prose);assert!(read(&mut store,"two","same").is_none());
@@ -388,6 +431,25 @@ mod tests {
                 _=>{store.db.execute("INSERT INTO child_tool_chunks VALUES('child','tool',2,0,X'61')",[]).unwrap();},
             }
             assert!(store.child_adapter_item(&CanonicalItemKey::new(Some("child"),"tool")).is_err(),"corruption {kind}");
+        }
+    }
+
+    #[test]
+    fn delegated_patch_reader_reauthenticates_the_complete_shared_file_manifest() {
+        for corruption in 0..7 {
+            let mut store=Store::new().unwrap();
+            let item=Item{id:"write".into(),role:Role::Assistant,at:None,started_at:None,content:ItemContent::Changes {status:ToolStatus::Succeeded,changes:vec![FileChange {path:"exact.rs".into(),kind:ChangeKind::Added,diff:"+é\n".repeat(PART_BYTES)}]}};
+            put(&mut store,"child",item);
+            match corruption {
+                0=>{store.db.execute("UPDATE file_edits SET path='other.rs'",[]).unwrap();},
+                1=>{store.db.execute("UPDATE file_edits SET status=?1",[postcard::to_stdvec(&ToolStatus::Failed).unwrap()]).unwrap();},
+                2=>{store.db.execute_batch("DELETE FROM file_patch_chunks; UPDATE file_edits SET file_index=1;").unwrap();},
+                3=>{store.db.execute("UPDATE file_edits SET start=1",[]).unwrap();},
+                4=>{store.db.execute("DELETE FROM file_patch_chunks WHERE position=0",[]).unwrap();},
+                5=>{store.db.execute("UPDATE file_patch_chunks SET data=zeroblob(?1) WHERE position=0",[PART_BYTES+1]).unwrap();},
+                _=>{store.db.execute("INSERT INTO file_edits SELECT source,item_id,file_index+1,ordinal,path||'.other',kind,status,imported,additions,deletions,start,len FROM file_edits",[]).unwrap();},
+            }
+            assert!(store.child_adapter_item(&CanonicalItemKey::new(Some("child"),"write")).is_err(),"shared manifest corruption {corruption}");
         }
     }
 
