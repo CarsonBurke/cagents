@@ -1,7 +1,9 @@
 //! Layout-time anchoring around iced's native scrollable. Its own state remains
 //! authoritative for wheel, thumb, keyboard and touch input.
 mod block;
+mod viewport;
 pub(super) use block::block;
+pub(super) use viewport::viewport;
 
 use super::view::Scroll;
 use super::*;
@@ -182,6 +184,14 @@ pub(super) fn item<'a>(id: &str, content: impl Into<Element<'a, Message>>) -> El
 
 pub(super) fn item_id(id: &str) -> Id {
     Id::new(format!("chat-scroll-item-{id}"))
+}
+#[derive(Clone, Copy, Hash)]
+pub(super) enum ReaderAxis { Horizontal, Vertical }
+pub(super) fn reader_key(logical: u64, axis: ReaderAxis) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut key = std::hash::DefaultHasher::new();
+    ("reader-axis", logical, axis).hash(&mut key);
+    key.finish()
 }
 pub(super) fn block_id(target: Target, context: Option<&str>, logical: u64) -> Id {
     use std::hash::{Hash, Hasher};
