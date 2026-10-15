@@ -432,6 +432,19 @@ pub(super) fn continuation(
     })
 }
 
+/// Pure retained capability check for a fresh authenticated control client.
+/// No attachment, fresh binding, new operation or absence can satisfy it.
+pub(super) fn authorizes_pending_replay(state: &HostState, expected: &ChatSourceBinding, record: &Record) -> bool {
+    state.native_sources.entries.get(&expected.source.id).is_some_and(|entry| {
+        entry.instance == expected.execution_instance && record.execution_instance == entry.instance
+            && entry.pending_handoff.as_ref().is_some_and(|pending| {
+                let pair = record.paired_terminal.as_ref().map(|worker| worker.execution_instance());
+                pending.intent == *expected && record.handle.same_actor(&pending.owner)
+                    && (pair == pending.original_pair || (pending.created_pair.is_some() && pair == pending.created_pair))
+            })
+    })
+}
+
 /// Retry only a privately retained original operation. An intervening native
 /// owner or unrelated pair refuses; absence/eviction never reconstructs proof.
 pub(super) fn pending_admitted(
@@ -447,7 +460,7 @@ pub(super) fn pending_admitted(
         return Ok(None);
     };
     validate_proof(expected.source.proof.as_ref(), state.proof())?;
-    let record = attached(&state, client, expected.source.id)?;
+    let record = attached_for_return(&state, client, expected.source.id, expected)?;
     let pair = record
         .paired_terminal
         .as_ref()
@@ -487,7 +500,7 @@ pub(super) fn restore_created_pair(
     let Some(created) = pending.created_pair else {
         return Ok(());
     };
-    let record = attached(&state, client, expected.source.id)?;
+    let record = attached_for_return(&state, client, expected.source.id, expected)?;
     if !record.handle.same_actor(&pending.owner)
         || record.execution_instance != pending.admitted.execution_instance
     {

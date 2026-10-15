@@ -451,6 +451,33 @@ fn attached(state: &HostState, client: ClientId, id: TerminalId) -> Result<&Reco
     }
     Ok(record)
 }
+/// One-off Return replay never subscribes a new connection. Only an already
+/// retained exact operation may use this path; all ordinary commands still
+/// require attached(). The enclosing Return owns the lifecycle transition.
+fn attached_for_return<'a>(state: &'a HostState, client: ClientId, id: TerminalId, expected: &crate::terminal_ipc::ChatSourceBinding) -> Result<&'a Record, ProtocolError> {
+    let record = state.chats.get(&id).ok_or_else(|| unavailable("The original Return actor is unavailable"))?;
+    if record.subscribers.contains_key(&client) { return Ok(record); }
+    validate_proof(expected.source.proof.as_ref(), state.proof())?;
+    if expected.source.id != id || !state.clients.contains_key(&client)
+        || record.execution_instance != expected.execution_instance {
+        return Err(unavailable("This connection has no exact retained Return operation"));
+    }
+    let pending = source_binding::authorizes_pending_replay(state, expected, record);
+    let issued = record.handoff_receipt.as_ref().is_some_and(|receipt| receipt.source_binding == *expected
+        && state.validate_terminal_handoff_receipt(receipt).is_ok());
+    if !pending && !issued {
+        return Err(unavailable("This connection may replay only an existing exact Return operation; no provider was changed"));
+    }
+    Ok(record)
+}
+
+#[cfg(test)]
+pub(super) fn return_subscriber_for_test(host: &SharedHost, id: TerminalId, client: ClientId) -> bool {
+    let state=host.lock().unwrap_or_else(|p|p.into_inner());
+    state.chats.get(&id).is_some_and(|record|record.subscribers.contains_key(&client))
+        || state.chat_handoffs.get(&id).is_some_and(|receipt|receipt.subscribers.contains_key(&client))
+}
+
 fn attached_mut(
     state: &mut HostState,
     client: ClientId,
@@ -1971,7 +1998,10 @@ fn codex_terminal_view_captured(
     }
     let (issued_source, source_instance, source_binding) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = attached(&state, client, chat_id)?;
+        let record = match captured_intent.as_ref() {
+            Some(expected) => attached_for_return(&state, client, chat_id, expected)?,
+            None => attached(&state, client, chat_id)?,
+        };
         if !record.handle.same_actor(handle) {
             return Err(unavailable(
                 "The original chat actor changed before terminal handoff",
@@ -1990,7 +2020,7 @@ fn codex_terminal_view_captured(
     handoff_budget::recipe(&recipe)?;
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = attached(&state, client, chat_id)?;
+        let record = attached_for_return(&state, client, chat_id, &original_intent)?;
         if !record.handle.same_actor(handle) || record.execution_instance != source_instance {
             return Err(unavailable(
                 "The thread changed while opening its CLI view.",
@@ -3708,7 +3738,7 @@ fn process_inner_claimed(
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 state.validate_terminal_handoff_receipt(receipt)?;
                 if let Some(record) = state.chats.get(&chat_id) {
-                    let handle = attached(&state, client, chat_id)?.handle.clone();
+                    let handle = attached_for_return(&state, client, chat_id, &expected)?.handle.clone();
                     if record.handoff_receipt.as_ref() != Some(receipt) {
                         return Err(unavailable("The exact retained pairing changed"));
                     }
@@ -3738,7 +3768,10 @@ fn process_inner_claimed(
                     return Err(unavailable("Daemon is shutting down"));
                 }
                 if let Some(receipt) = state.chat_handoffs.get_mut(&chat_id) {
-                    receipt.require_attached(client)?;
+                    if !receipt.subscribers.contains_key(&client)
+                        && receipt.issued.as_ref().is_none_or(|issued| issued.source_binding != expected) {
+                        return Err(unavailable("This connection has no exact issued Return receipt"));
+                    }
                     receipt.reissue(Instant::now());
                     return Ok(ServerResponse::ChatTerminal {
                         chat_id,
@@ -3752,7 +3785,7 @@ fn process_inner_claimed(
                         "Too many unacknowledged terminal handoffs; save existing replacements before converting another chat",
                     ));
                 }
-                let record = attached(&state, client, chat_id)?;
+                let record = attached_for_return(&state, client, chat_id, &expected)?;
                 (
                     record.handle.clone(),
                     record.session.clone(),

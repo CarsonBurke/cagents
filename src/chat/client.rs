@@ -1569,9 +1569,6 @@ impl ClientHandle {
             Err(std::sync::TryLockError::Poisoned(poison)) => poison.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => return Err("The original Return retry is already in progress".into()),
         };
-        if self.source_binding().as_ref().is_some_and(|current| current != expected) {
-            return Err("The original Return owner changed before its retry; no retry was sent".into());
-        }
         let endpoint = self.inner.return_endpoint.as_ref().ok_or("The original authenticated Return endpoint is unavailable; no retry was sent")?;
         let deadline = Instant::now() + Duration::from_secs(40);
         let stream = crate::control::connect_control_socket(endpoint, Duration::from_secs(5)).map_err(|error| error.to_string())?;
