@@ -54,8 +54,9 @@ impl ReviewInputBarrier {
             if key.orphaned || key.released || key.failed || !key.surface.same_attachment(surface) || surface.host_proof().as_ref() != Some(&key.proof) {
                 return Err(TerminalSendError::Full);
             }
-            surface.key(input.clone())?;
-            key.input = input;
+            // Repeats may change layout text, but cleanup keeps the original
+            // admitted key and unshifted identity. Current modifiers are global.
+            surface.key(input)?;
             return Ok(());
         }
         // An intercepted or refused down cannot be revived as a raw repeat.
