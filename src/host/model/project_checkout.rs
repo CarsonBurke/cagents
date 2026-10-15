@@ -53,6 +53,57 @@ mod tests {
     }
 
     #[test]
+    fn visits_keep_the_latest_name_while_atomically_recording_checkout_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        let repository = "/primary/.git";
+        let mut registry = Registry::at(&path).unwrap();
+        registry.apply(&open(repository)).unwrap();
+        // Constructed before another window's rename: the client must not
+        // re-send an observed name and overwrite the later committed value.
+        let visit = ModelEdit::VisitProject {
+            repository: repository.into(),
+            checkout: Some("/linked".into()),
+            primary_checkout: Some("/primary".into()),
+            name: "linked-directory-name".into(),
+            kind: ProjectKind::Folder,
+            reopen: false,
+        };
+        let mut rename = open(repository);
+        if let ModelEdit::OpenProject { name, .. } = &mut rename {
+            *name = "Latest custom name".into();
+        }
+        registry.apply(&rename).unwrap();
+        let before = registry.model().unwrap();
+        let applied = registry.apply(&visit).unwrap();
+        assert!(applied.changed);
+        let mut observed = before.clone();
+        observed.fold(applied.model.sequence, &visit);
+        assert_eq!(observed.projects, applied.model.projects);
+        let project = &applied.model.projects[0];
+        assert_eq!(project.name, "Latest custom name");
+        assert_eq!(project.kind, ProjectKind::Git);
+        assert_eq!(project.ordinal, before.projects[0].ordinal);
+        assert_eq!(project.checkout.as_deref(), Some(Path::new("/linked")));
+        assert_eq!(project.primary_checkout.as_deref(), Some(Path::new("/primary")));
+        assert!(!registry.apply(&visit).unwrap().changed);
+        drop(registry);
+        let mut restored = Registry::at(&path).unwrap();
+        assert_eq!(restored.model().unwrap().projects, applied.model.projects);
+        restored.apply(&ModelEdit::CloseProject { repository: repository.into() }).unwrap();
+        assert!(!restored.apply(&visit).unwrap().changed);
+        assert!(restored.model().unwrap().projects.is_empty());
+        let mut reopen = visit;
+        if let ModelEdit::VisitProject { reopen, .. } = &mut reopen {
+            *reopen = true;
+        }
+        assert!(restored.apply(&reopen).unwrap().changed);
+        let reopened = restored.model().unwrap();
+        assert!(reopened.closed_projects.is_empty());
+        assert_eq!(reopened.projects[0].name, "linked-directory-name");
+    }
+
+    #[test]
     fn version_twelve_rows_migrate_without_guessing_a_checkout() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("registry.sqlite3");

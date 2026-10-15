@@ -230,7 +230,21 @@ impl WorkspaceModel {
                 primary_checkout,
                 name,
                 kind,
+            }
+            | ModelEdit::VisitProject {
+                repository,
+                checkout,
+                primary_checkout,
+                name,
+                kind,
+                ..
             } => {
+                let visiting = matches!(edit, ModelEdit::VisitProject { .. });
+                if matches!(edit, ModelEdit::VisitProject { reopen: false, .. })
+                    && self.closed_projects.contains(repository)
+                {
+                    return;
+                }
                 self.closed_projects.retain(|closed| closed != repository);
                 match self
                     .projects
@@ -238,7 +252,9 @@ impl WorkspaceModel {
                     .find(|project| project.repository == *repository)
                 {
                     Some(project) => {
-                        project.name = name.clone();
+                        if !visiting {
+                            project.name = name.clone();
+                        }
                         if let Some(checkout) = checkout {
                             project.checkout = Some(checkout.clone());
                         }
@@ -410,6 +426,20 @@ pub enum ModelEdit {
         operation: Uuid,
         change: views::Change,
     },
+    /// Record a visit without renaming an existing project. The name is only
+    /// a creation hint; checkout metadata still updates atomically. Routine
+    /// visits respect explicit removal, while a deliberate open can reopen it.
+    VisitProject {
+        repository: PathBuf,
+        #[serde(default)]
+        checkout: Option<PathBuf>,
+        #[serde(default)]
+        primary_checkout: Option<PathBuf>,
+        name: String,
+        #[serde(default)]
+        kind: ProjectKind,
+        reopen: bool,
+    },
 }
 
 fn verified_primary_checkout(
@@ -474,6 +504,27 @@ impl ModelEdit {
                     .transpose()?,
                 name,
                 kind,
+            },
+            Self::VisitProject {
+                repository,
+                checkout,
+                primary_checkout,
+                name,
+                kind,
+                reopen,
+            } => Self::VisitProject {
+                repository: canonical_repository(&repository)?,
+                primary_checkout: verified_primary_checkout(
+                    &repository,
+                    primary_checkout,
+                    checkout.as_deref(),
+                )?,
+                checkout: checkout
+                    .map(|path| std::fs::canonicalize(&path).map_err(|error| error.to_string()))
+                    .transpose()?,
+                name,
+                kind,
+                reopen,
             },
             Self::ResetNavigation { repository } => Self::ResetNavigation {
                 repository: canonical_repository(&repository)?,
@@ -640,6 +691,41 @@ mod tests {
         );
         assert_eq!(model.projects[0].ordinal, 7);
         assert_eq!(model.projects[0].name, "renamed");
+    }
+
+    #[test]
+    fn project_visits_preserve_names_and_only_explicit_visits_reopen() {
+        let repository = PathBuf::from("/primary/.git");
+        let mut model = WorkspaceModel::default();
+        let visit = |checkout: &str, reopen| ModelEdit::VisitProject {
+            repository: repository.clone(),
+            checkout: Some(checkout.into()),
+            primary_checkout: None,
+            name: "linked-name-hint".into(),
+            kind: ProjectKind::Git,
+            reopen,
+        };
+        model.fold(1, &visit("/primary", true));
+        model.fold(2, &ModelEdit::OpenProject {
+            repository: repository.clone(),
+            checkout: None,
+            primary_checkout: Some("/primary".into()),
+            name: "Custom project".into(),
+            kind: ProjectKind::Git,
+        });
+        model.projects[0].ordinal = 7;
+        model.fold(3, &visit("/linked", false));
+        assert_eq!(model.projects[0].name, "Custom project");
+        assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/linked")));
+        assert_eq!(model.projects[0].primary_checkout.as_deref(), Some(Path::new("/primary")));
+        assert_eq!(model.projects[0].ordinal, 7);
+        model.fold(4, &ModelEdit::CloseProject { repository: repository.clone() });
+        model.fold(5, &visit("/linked", false));
+        assert!(model.projects.is_empty());
+        assert_eq!(model.closed_projects, vec![repository.clone()]);
+        model.fold(6, &visit("/linked", true));
+        assert!(model.closed_projects.is_empty());
+        assert_eq!(model.projects[0].name, "linked-name-hint");
     }
 
     #[test]
