@@ -525,7 +525,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let mut paths = Vec::new();
         let mut failures = Vec::new();
-        let mut created_directories = RecoveryDirectoryFrontier::new(&root);
+        let mut created_directories = RecoveryDirectoryFrontier::new_with_recovery(&recovery.live_recovery);
         // Component order keeps each subtree contiguous. Release restored
         // siblings before entering the next one; descriptor use scales with
         // active ancestor depth, not the number of files/directories in Undo.
@@ -650,35 +650,82 @@ fn parent_modes<'a>(
 /// been restored. The ordered caller flushes completed subtrees, so siblings
 /// do not accumulate Root descriptors for a large recovery selection.
 struct RecoveryDirectoryFrontier {
-    owned: BTreeMap<RepoPath, (fs_safety::DirectoryPublication, u32)>,
+    owned: BTreeMap<RepoPath, OwnedRecoveryDirectory>,
     warnings: BTreeMap<RepoPath, MutationFailure>,
+    live: LiveDiscardRecovery,
 }
+
+struct OwnedRecoveryDirectory {
+    publication: fs_safety::DirectoryPublication,
+    mode: u32,
+    slot: Option<crate::recovery_authority::RecoverySlot>,
+    mode_installed: bool,
+    sync_file: Option<fs::File>,
+}
+impl OwnedRecoveryDirectory {
+    fn finish(&mut self) -> Result<(), String> {
+        // Cleanup only the producer's private staging, never the restored
+        // nonempty public directory. Its original inode stays pinned here.
+        if self.publication.publication_error().is_some() {
+            self.publication.resolve_recovery().map_err(|error|error.to_string())?;
+        }
+        let metadata = self.publication.directory().metadata().map_err(|error|error.to_string())?;
+        let initial = self.publication.initial_metadata();
+        let expected = if self.mode_installed { self.mode } else { 0o700 | (self.mode & 0o2000) };
+        if metadata.mode() & 0o7777 != expected & 0o7777
+            || (metadata.uid(),metadata.gid()) != (initial.uid(),initial.gid())
+        { return Err("The created directory's permissions or ownership changed; newer metadata was preserved".into()); }
+        if self.sync_file.is_none() {
+            self.sync_file = Some(open_directory_sync_handle(self.publication.directory()).map_err(|error|error.to_string())?);
+        }
+        if !self.mode_installed {
+            set_exact_directory_mode(self.publication.directory(), self.mode).map_err(|error|error.to_string())?;
+            self.mode_installed = true;
+        }
+        // The readable directory FD predates chmod, so even archived000 mode
+        // can be synced without reopening an inaccessible pathname.
+        self.sync_file.as_ref().unwrap().sync_all().map_err(|error|format!("Archived permissions are restored, but durability is unconfirmed: {error}"))
+    }
+    fn retain(mut self, live: &LiveDiscardRecovery) {
+        let description = format!("Created recovery directory originally named {}", self.publication.directory().path().display());
+        let slot = self.slot.take().expect("directory recovery was reserved before creation");
+        live.retain(slot.retain(description, move || self.finish()));
+    }
+}
+
+fn open_directory_sync_handle(root: &fs_safety::Root) -> io::Result<fs::File> {
+    use std::os::fd::FromRawFd;
+    // SAFETY: the retained directory owns its FD; openat(".") resolves that
+    // exact inode and returns a fresh CLOEXEC File, before restrictive chmod.
+    let descriptor = unsafe { libc::openat(root.descriptor(), c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if descriptor < 0 { return Err(io::Error::last_os_error()); }
+    Ok(unsafe { fs::File::from_raw_fd(descriptor) })
+}
+
 impl RecoveryDirectoryFrontier {
-    fn new(_root: &fs_safety::Root) -> Self {
-        Self { owned: BTreeMap::new(), warnings: BTreeMap::new() }
+    #[cfg(test)]
+    fn new(_root: &fs_safety::Root) -> Self { Self::new_with_recovery(&LiveDiscardRecovery::default()) }
+    fn new_with_recovery(live: &LiveDiscardRecovery) -> Self {
+        Self { owned: BTreeMap::new(), warnings: BTreeMap::new(), live: live.clone() }
     }
     fn flush_before(&mut self, next: Option<&RepoPath>, failures: &mut Vec<MutationFailure>) {
         let mut done = self.owned.keys().filter(|path| next.is_none_or(|next| !next.as_path().starts_with(path.as_path()))).cloned().collect::<Vec<_>>();
         done.sort_by(|a, b| b.as_path().components().count().cmp(&a.as_path().components().count()).then_with(|| a.cmp(b)));
         for path in done {
-            let (publication, mode) = self.owned.remove(&path).expect("selected owned frontier entry");
-            // This is the prepublication held inode, including after the public
-            // spelling is replaced. No naked dev/ino reopen can authorize chmod.
-            match set_exact_directory_mode(publication.directory(), mode) {
-                Err(error) => failures.push(MutationFailure::Path { path, reason: format!("Could not restore the created directory's previous permissions: {error}") }),
-                Ok(()) => if let Err(error) = fs_safety::sync_directory(publication.directory()) {
-                    failures.push(MutationFailure::Reconciliation { reason: format!("{} archived directory permissions were restored, but durability is unconfirmed: {error}", path) });
-                },
+            let mut owned = self.owned.remove(&path).expect("selected owned frontier entry");
+            if let Err(error) = owned.finish() {
+                failures.push(MutationFailure::Path { path, reason: format!("The created directory's permission restoration/recovery remains unresolved: {error}") });
+                owned.retain(&self.live);
             }
         }
     }
     fn held_parent(&self, root: &fs_safety::Root, key: &RepoPath) -> Result<Option<fs_safety::Root>, String> {
-        let Some((publication, _)) = self.owned.get(key) else { return Ok(None); };
+        let Some(owned) = self.owned.get(key) else { return Ok(None); };
         let named = fs_safety::metadata_beneath(root, key.as_path()).map_err(|error| error.to_string())?;
-        if !named.is_dir() || (named.dev(), named.ino()) != publication.identity() {
+        if !named.is_dir() || (named.dev(), named.ino()) != owned.publication.identity() {
             return Err("the created parent directory was moved or replaced; its replacement was preserved".into());
         }
-        publication.directory().try_clone().map(Some).map_err(|error| error.to_string())
+        owned.publication.directory().try_clone().map(Some).map_err(|error| error.to_string())
     }
 }
 
@@ -719,12 +766,28 @@ fn recovery_parent(
         // directory. Published parents stay private while descendants need it;
         // their archived mode is restored by the component-ordered frontier.
         let temporary_mode = 0o700 | (mode & 0o2000);
+        let slot = crate::recovery_authority::RecoverySlot::reserve()?;
         let result = fs_safety::create_directory_beneath(
             &parent, Path::new(component.as_os_str()), temporary_mode,
         ).map_err(|error| error.to_string())?;
         parent = match result {
             fs_safety::DirectoryCreation::Existing(directory) => directory,
             fs_safety::DirectoryCreation::Unverified { directory, reason } => {
+                let description = format!("Unverified recovery directory originally named {}", directory.path().display());
+                let retained = match directory.try_clone() {
+                    Ok(retained) => retained,
+                    Err(error) => {
+                        created.live.retain(slot.retain(description, move || {
+                            if directory.metadata().map_err(|error|error.to_string())?.nlink() == 0 { Ok(()) }
+                            else { Err("The unverified directory is still retained; its entry was not modified".into()) }
+                        }));
+                        return Err(error.to_string());
+                    }
+                };
+                created.live.retain(slot.retain(description, move || {
+                    if retained.metadata().map_err(|error|error.to_string())?.nlink() == 0 { Ok(()) }
+                    else { Err("Creation ownership is unverified; the retained directory was left unchanged".into()) }
+                }));
                 created.warnings.insert(key.clone(), MutationFailure::Path { path: key, reason: format!("The directory's creation ownership is unverified; its permissions were preserved and exact archived-mode restoration is unconfirmed: {reason}") });
                 directory
             }
@@ -736,8 +799,8 @@ fn recovery_parent(
                 }
                 // Retain BEFORE fallible chmod/clone so even partial setup keeps
                 // the exact created inode for final mode restoration.
-                created.owned.insert(key.clone(), (publication, mode));
-                let publication = &created.owned[&key].0;
+                created.owned.insert(key.clone(), OwnedRecoveryDirectory { publication, mode, slot: Some(slot), mode_installed: false, sync_file: None });
+                let publication = &created.owned[&key].publication;
                 set_exact_directory_mode(publication.directory(), temporary_mode).map_err(|error| error.to_string())?;
                 created.held_parent(root, &key)?.ok_or("the created parent authority is unavailable")?
             }
@@ -1396,6 +1459,48 @@ mod directory_frontier_tests {
         assert!(error.to_string().contains("2700"));
         assert!(error.to_string().contains("0700"));
         verify_directory_mode(&root, 0o700).unwrap();
+    }
+
+    #[test]
+    fn recovery_directory_frontier_retains_failed_permissions_until_exact_original_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(dir.path()).unwrap();
+        let mut state = RecoveryDirectoryFrontier::new(&root);
+        let modes = BTreeMap::from([(path("parent"), 0o500)]);
+        let (held, _) = recovery_parent(&root, &path("parent/file"), &modes, &mut state).unwrap();
+        fs_safety::set_directory_permissions(&held, 0o711).unwrap();
+        let mut failures = vec![];
+        state.flush_before(None, &mut failures);
+        assert!(!failures.is_empty());
+        assert_eq!(held.metadata().unwrap().mode() & 0o7777, 0o711, "newer permissions must not be overwritten");
+        let authority = state.live.authority().unwrap();
+        assert!(!authority.is_resolved());
+        assert!(authority.retry().is_err());
+        fs::rename(dir.path().join("parent"), dir.path().join("original")).unwrap();
+        fs::create_dir(dir.path().join("parent")).unwrap();
+        fs::set_permissions(dir.path().join("parent"), fs::Permissions::from_mode(0o751)).unwrap();
+        // Explicitly resolve the unexpected metadata on the original inode.
+        fs_safety::set_directory_permissions(&held, 0o700).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        assert_eq!(fs::metadata(dir.path().join("original")).unwrap().mode() & 0o7777, 0o500);
+        assert_eq!(fs::metadata(dir.path().join("parent")).unwrap().mode() & 0o7777, 0o751);
+        fs_safety::set_directory_permissions(&held, 0o700).unwrap();
+    }
+
+    #[test]
+    fn recovery_directory_frontier_syncs_restrictive_archived_mode_using_preopened_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = fs_safety::Root::open(dir.path()).unwrap();
+        let mut state = RecoveryDirectoryFrontier::new(&root);
+        let modes = BTreeMap::from([(path("parent"), 0)]);
+        let (held, _) = recovery_parent(&root, &path("parent/file"), &modes, &mut state).unwrap();
+        let mut failures = vec![];
+        state.flush_before(None, &mut failures);
+        assert!(failures.is_empty(), "{failures:?}");
+        assert!(!state.live.is_pending());
+        assert_eq!(held.metadata().unwrap().mode() & 0o7777, 0);
+        fs_safety::set_directory_permissions(&held, 0o700).unwrap();
     }
 
     #[test]
