@@ -437,6 +437,14 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
     acquire(&crate::instance::runtime_directory()?, directory, false).map(Some)
 }
 
+/// Holds exclusive directory identity protection through an explicit removal.
+/// The caller must release its own confirmed target's displaying leases first;
+/// every other window, editor and setup preparation continues to veto deletion.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub fn removal_protection(directory: &Path) -> io::Result<Protection> {
+    acquire(&crate::instance::runtime_directory()?, directory, true)
+}
+
 /// Selected scopes and restored editor descriptors remain protected even
 /// when their actual widgets are parked or have not mounted yet.
 #[derive(Default)]
