@@ -3226,21 +3226,31 @@ impl ProjectCommand {
     }
 }
 
+/// A label for a newly discovered project; the registry preserves existing
+/// names under the same transaction as the visit.
+fn project_name_hint(repository: &Path, checkout: Option<&Path>, primary: Option<&Path>) -> String {
+    let root = primary.or_else(|| {
+        (repository.file_name().is_some_and(|name| name == ".git"))
+            .then(|| repository.parent()).flatten()
+    }).or(checkout).unwrap_or(repository);
+    repository_display_name(root)
+}
+
 fn project_output(
     client: &mut ControlClient,
     command: ResolvedProject,
 ) -> Result<CommandOutput, AppError> {
     match command {
         ResolvedProject::Open { repository, kind, checkout, primary_checkout } => {
-            // The same upsert a window publishes when it opens a repository,
-            // carrying the name derived from the same key, so a project opened
-            // from a shell and one opened in a window are one row that no
-            // sidebar can tell apart.
+            // A visit preserves the latest stored name atomically, including
+            // a rename made after this command resolved its checkout. Only a
+            // newly inserted project uses the discovery-derived name hint.
             let model = client
-                .edit_workspace_model(ModelEdit::ReopenProject {
+                .edit_workspace_model(ModelEdit::VisitProject {
+                    reopen: true,
                     kind,
                     repository: repository.clone(),
-                    name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
+                    name: project_name_hint(&repository, checkout.as_deref(), primary_checkout.as_deref()),
                     checkout,
                     primary_checkout,
                 })
@@ -3465,14 +3475,14 @@ fn channel_output(
             checkout,
             primary_checkout,
         } => {
-            // The project comes first: a channel in a repository no project owns
-            // is reachable from no window's sidebar. `OpenProject` is an upsert,
-            // so this is a no-op when a window already has the project open.
+            // Record checkout metadata without renaming an existing project
+            // or reopening a project deliberately closed in another window.
             client
-                .edit_workspace_model(ModelEdit::OpenProject {
+                .edit_workspace_model(ModelEdit::VisitProject {
+                    reopen: false,
                     kind,
                     repository: repository.clone(),
-                    name: repository_display_name(checkout.as_deref().unwrap_or(&repository)),
+                    name: project_name_hint(&repository, checkout.as_deref(), primary_checkout.as_deref()),
                     checkout,
                     primary_checkout,
                 })
@@ -4226,7 +4236,8 @@ mod tests {
             assert_eq!(
                 opened.request,
                 ClientRequest::EditWorkspaceModel {
-                    edit: ModelEdit::OpenProject {
+                    edit: ModelEdit::VisitProject {
+                        reopen: false,
                         kind: Default::default(),
                         repository: server_repository.clone(),
                         checkout: server_repository.parent().map(Path::to_path_buf),
@@ -4381,7 +4392,7 @@ mod tests {
             let _:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(&mut server_stream,&connected_envelope(1,peer_proof.clone(),peer_proof.clone())).unwrap();
             let opened:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
-            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::ReopenProject{repository:served.repository.clone(),checkout:served.checkout.clone(),primary_checkout:served.primary_checkout.clone(),kind:served.kind,name:served.name.clone()}});
+            assert_eq!(opened.request,ClientRequest::EditWorkspaceModel{edit:ModelEdit::VisitProject{reopen:true,repository:served.repository.clone(),checkout:served.checkout.clone(),primary_checkout:served.primary_checkout.clone(),kind:served.kind,name:served.name.clone()}});
             let mut model=WorkspaceModel::default();model.projects.push(served);
             write_frame(&mut server_stream,&model_envelope(opened.request_id,peer_proof.clone(),model.clone())).unwrap();
             let listed:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
@@ -4526,12 +4537,15 @@ mod tests {
         assert_eq!(repository, directory.path().canonicalize().unwrap());
     }
 
-    /// `project open` is the upsert a window publishes, with the key `git`
-    /// resolves and the name the checkout carries, and it reports the project
-    /// the registry ended up holding - including the rank, which only the
-    /// registry knows.
     #[test]
-    fn project_open_publishes_the_upsert_a_window_would_and_reports_the_row() {
+    fn project_visit_name_hint_uses_primary_identity_before_linked_checkout() {
+        assert_eq!(project_name_hint(Path::new("/work/primary/.git"), Some(Path::new("/work/linked")), None), "primary");
+        assert_eq!(project_name_hint(Path::new("/metadata"), Some(Path::new("/work/linked")), Some(Path::new("/work/primary"))), "primary");
+        assert_eq!(project_name_hint(Path::new("/metadata"), Some(Path::new("/work/linked")), None), "linked");
+    }
+
+    #[test]
+    fn project_open_visits_without_overwriting_the_registry_name() {
         let Some(checkout) = git_checkout() else {
             return;
         };
@@ -4545,7 +4559,7 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let served = expected.clone();
-        let served_name = name.clone();
+        let served_name = "Custom project label".to_owned();
         let server = thread::spawn(move || {
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(
@@ -4557,17 +4571,18 @@ mod tests {
             assert_eq!(
                 opened.request,
                 ClientRequest::EditWorkspaceModel {
-                    edit: ModelEdit::ReopenProject {
+                    edit: ModelEdit::VisitProject {
+                        reopen: true,
                         kind: Default::default(),
                         repository: served.clone(),
                         checkout: served.parent().map(Path::to_path_buf),
                         primary_checkout: served.parent().map(Path::to_path_buf),
                         // The checkout's name, never the key's own last
                         // component, which is `.git` and names nothing.
-                        name: served_name.clone(),
+                        name: name.clone(),
                     },
                 },
-                "the CLI opens a project exactly as a window publishes one"
+                "the CLI supplies only an insert-time name hint"
             );
             let model = WorkspaceModel {
                 navigation_orders: Vec::new(),
@@ -4602,10 +4617,11 @@ mod tests {
         server.join().unwrap();
         assert_eq!(output.command, "project.open");
         assert_eq!(output.data["project"]["ordinal"], json!(2));
+        assert_eq!(output.data["project"]["name"], "Custom project label");
         assert_eq!(output.data["sequence"], json!(4));
         assert_eq!(
             output.human,
-            format!("{}\t{name}", checkout.path().canonicalize().unwrap().display()),
+            format!("{}\tCustom project label", checkout.path().canonicalize().unwrap().display()),
             "one tab-separated line: checkout path, name"
         );
     }
