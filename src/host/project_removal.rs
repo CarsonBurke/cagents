@@ -686,8 +686,18 @@ mod tests {
         assert_eq!(registry.lock().unwrap().project_operation(a.operation).unwrap().unwrap().phase,super::super::model::project_operations::Phase::Resolved,"this is a real committed receipt, not a simulated server outcome");
         assert!(ensure_available(&fixture.host,Some(&fixture.root),None,None).is_err());
         assert!(ensure_available(&fixture.host,Some(&other),None,None).is_err());
+        // A fresh UI client discovers A despite SQL already being Resolved.
+        // It must not need the lost original request body to release custody.
+        fixture.host.lock().unwrap().register_client(2);
+        let statuses=pending_status(&fixture.host,2,a.project.registry);
+        assert_eq!(statuses.len(),2);
+        let status=statuses.iter().find(|status|status.operation==a.operation).unwrap();
+        assert_eq!(status.project,a.project);assert!(status.resumable);assert!(!status.running);
+        assert_eq!(status.phase,ProjectOperationPhase::ModelCommitted);
+        assert!(status.reason.contains("durable outcome is settled"));
         fixture.host.lock().unwrap().project_operation_after_settlement=None;
-        assert!(matches!(operation_reply(&fixture.host,a),ProjectOperationOutcome::Committed{..}));
+        assert!(matches!(resume_original(&fixture.host,2,a.project.registry,a.operation),ProjectOperationOutcome::Committed{..}));
+        assert_eq!(pending_status(&fixture.host,2,a.project.registry).iter().map(|row|row.operation).collect::<Vec<_>>(),vec![b.operation]);
         assert!(original_a.is_settled());assert!(!original_a.retains_prepared(),"positive replay releases the retained owner roster/FD phase");
         assert!(reservation::retained_operation(&fixture.host,operation).is_none());
         let (_,still_b)=reservation::retained_operation(&fixture.host,b.operation).unwrap();

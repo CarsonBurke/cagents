@@ -215,6 +215,14 @@ pub(super) fn live_operation_count(host:&SharedHost)->usize {
         scope.operation.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_some_and(|owner|owner.request.is_some()&&!owner.is_settled())).count()
 }
 
+/// Metadata-only clones of server-retained original operations. A positive
+/// journal receipt may still await release of its exact original heavy custody.
+pub(super) fn retained_operation_owners(host:&SharedHost)->Vec<Arc<super::custody::Operation>> {
+    entries(host).lock().unwrap_or_else(|p|p.into_inner()).values().filter_map(|scope|
+        scope.operation.lock().unwrap_or_else(|p|p.into_inner()).as_ref()
+            .filter(|owner|owner.request.is_some()&&!owner.is_settled()).cloned()).collect()
+}
+
 pub(super) fn retained_operation(host:&SharedHost,operation:uuid::Uuid)->Option<(Reservation,Arc<super::custody::Operation>)> {
     let entries=entries(host);
     let found={

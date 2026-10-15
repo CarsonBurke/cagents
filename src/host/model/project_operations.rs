@@ -192,8 +192,20 @@ impl Registry {
         let result=read(&tx)?;tx.commit().map_err(|error|error.to_string())?;Ok(result)
     }
     pub(crate) fn project_operations_for_registry(&self,expected:Uuid)->Result<Vec<Obligation>,String> {
+        self.project_operations_for_registry_with_retained(expected,&[])
+    }
+    /// Original daemon operation IDs only, never a client-supplied status scope.
+    /// Include positive receipts whose exact heavy custody is still retained.
+    pub(crate) fn project_operations_for_registry_with_retained(&self,expected:Uuid,retained:&[Uuid])->Result<Vec<Obligation>,String> {
+        if retained.len()>MAX_PENDING {return Err("Retained operation status capture exceeds its bound".into());}
         self.operation_snapshot(expected,|tx| {
-            let rows=pending_in(tx)?;
+            let mut rows=pending_in(tx)?;
+            for operation in retained {
+                if rows.iter().any(|row|row.operation==*operation) {continue;}
+                let row=load_in(tx,*operation)?.ok_or("A retained original operation lost its journal receipt")?;
+                rows.push(row);
+                if rows.len()>MAX_PENDING {return Err("Combined pending and retained operation status exceeds its bound; custody was preserved".into());}
+            }
             if rows.iter().any(|row|row.project.registry!=expected) {return Err("The retained operation journal contains a different registry's scope".into());}
             Ok(rows)
         })
@@ -319,6 +331,10 @@ mod tests {
         let tx=registry.db.transaction().unwrap();model_committed(&tx,operation,&request,&edit).unwrap();tx.commit().unwrap();
         registry.advance_project_operation(operation,&request,Phase::ModelCommitted,Phase::Resolved).unwrap();
         assert!(registry.project_operations_for_registry(scope.project.registry).unwrap().is_empty());
+        let retained=registry.project_operations_for_registry_with_retained(scope.project.registry,&[operation,operation]).unwrap();
+        assert_eq!(retained.len(),1);assert_eq!(retained[0].phase,Phase::Resolved);assert!(retained[0].scope.is_none());
+        assert!(registry.project_operations_for_registry_with_retained(scope.project.registry,&[Uuid::nil()]).is_err());
+        assert!(registry.project_operations_for_registry_with_retained(Uuid::new_v4(),&[operation]).is_err());
         let settled=registry.project_operation_for_registry(scope.project.registry,operation).unwrap().unwrap();
         assert_eq!(settled.project,scope.project);assert_eq!(settled.phase,Phase::Resolved);assert!(settled.scope.is_none());
         assert!(registry.project_operation_for_registry(Uuid::new_v4(),operation).is_err());

@@ -131,23 +131,36 @@ pub(in crate::host) fn statuses(host:&SharedHost,client:ClientId,identity:uuid::
     super::super::client::ensure_control_open(host)?;
     super::super::agent_execution::terminals::admit(host,client,&ClientRequest::ProjectOperations{registry:identity})?;
     let registry=super::super::agent_execution::registry(host).map_err(error)?;
-    let rows=registry.lock().unwrap_or_else(|p|p.into_inner()).project_operations_for_registry(identity).map_err(error)?;
-    let operations=rows.into_iter().map(|row| {
-        let scope=row.scope.as_ref().ok_or_else(||error("A pending operation lost its original negative scope"))?;
-        let kind=if scope.relocation.is_some(){ProjectOperationKind::Locate}else{ProjectOperationKind::Remove};
-        let retained=super::reservation::retained_operation(host,row.operation);
-        let (running,resumable)=retained.as_ref().map(|(_,owner)| {
-            let original=owner.request.as_ref().is_some_and(|request|request.project==row.project)
-                && owner.request_digest==row.request_digest && owner.commit_digest==row.commit_digest && !owner.is_settled();
-            let running=original&&owner.claimed.load(Ordering::Acquire);
-            (running,original&&!running)
-        }).unwrap_or((false,false));
-        let phase=if running||resumable {public_phase(row.phase)}else{PublicPhase::UnavailableAfterRestart};
-        let reason=if running {"The original project operation is still running. Its exact owners and directory pins remain retained."}
+    let owners=super::reservation::retained_operation_owners(host);
+    if owners.len()>MAX_LIVE_OPERATIONS {return Err(error("Original live operation status exceeds its capacity; custody was preserved"));}
+    let retained=owners.iter().map(|owner|owner.operation).collect::<Vec<_>>();
+    let rows=registry.lock().unwrap_or_else(|p|p.into_inner()).project_operations_for_registry_with_retained(identity,&retained).map_err(error)?;
+    let mut operations=Vec::new();
+    for row in rows {
+        let owner=owners.iter().find(|owner|owner.operation==row.operation);
+        let original=owner.filter(|owner|owner.request.as_ref().is_some_and(|request|request.project==row.project)
+            &&owner.request_digest==row.request_digest&&owner.commit_digest==row.commit_digest&&!owner.is_settled());
+        let settled=matches!(row.phase,Phase::Resolved|Phase::Aborted);
+        // The owner can finish between immutable capture and this read. Its
+        // settled receipt needs no pending row once original custody released.
+        if settled&&original.is_none() {continue;}
+        let kind=if let Some(scope)=&row.scope {
+            if scope.relocation.is_some(){ProjectOperationKind::Locate}else{ProjectOperationKind::Remove}
+        }else {
+            match &original.and_then(|owner|owner.request.as_ref()).ok_or_else(||error("A retained operation lost its original request"))?.action {
+                Action::Locate{..}=>ProjectOperationKind::Locate,Action::Remove{..}=>ProjectOperationKind::Remove,
+            }
+        };
+        let running=original.is_some_and(|owner|owner.claimed.load(Ordering::Acquire));
+        let resumable=original.is_some()&&!running;
+        let phase=if settled {if row.phase==Phase::Resolved {PublicPhase::ModelCommitted}else{PublicPhase::Preparing}}
+            else if running||resumable {public_phase(row.phase)}else{PublicPhase::UnavailableAfterRestart};
+        let reason=if settled {"The original durable outcome is settled, but its exact retained custody still needs release. Retry this same operation; no effects will repeat."}
+            else if running {"The original project operation is still running. Its exact owners and directory pins remain retained."}
             else if resumable {"Retry this original operation to continue its retained progress; no new sources or paths will be selected."}
             else {"The original prepared custody is unavailable. Its negative reservation remains; path-based replay is refused."};
-        Ok(ProjectOperationStatus{operation:row.operation,project:row.project,kind,phase,running,resumable,reason:reason.into()})
-    }).collect::<Result<Vec<_>,ProtocolError>>()?;
+        operations.push(ProjectOperationStatus{operation:row.operation,project:row.project,kind,phase,running,resumable,reason:reason.into()});
+    }
     Ok((ServerResponse::ProjectOperations{operations},Vec::new(),false))
 }
 
