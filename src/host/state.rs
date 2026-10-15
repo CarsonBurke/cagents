@@ -629,7 +629,12 @@ impl HostState {
             // Model mutations serialize under this HostLock. Read only resident
             // metadata, not Store, snapshot/history or files. A later B edit
             // cannot overtake this A admission; a delayed A sees B's current name.
-            let (session, current_title) = actual.handle.conversation_title();
+            let (session, current_title) = actual.handle.conversation_title().map_err(|reason| {
+                let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
+                ProtocolError::new(if busy { ProtocolErrorCode::QueueFull } else { ProtocolErrorCode::Internal },
+                    if busy { "Conversation metadata is busy; retry the original title suggestion" }
+                    else { "Conversation metadata is unavailable" }, busy)
+            })?;
             if session.is_none() || session != expected.launch.session_id { return Err(invalid()); }
             let current_title = current_title.as_deref().and_then(crate::workspace_model::channel_title);
             match source {
@@ -4128,7 +4133,7 @@ mod tests {
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let handle = chat::runtime::Handle::start(spec, Box::new(adapter), initial, store, None, |_| {}).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.conversation_title().0.as_deref() != Some(SESSION) {
+        while handle.conversation_title().ok().and_then(|(session, _)| session).as_deref() != Some(SESSION) {
             assert!(Instant::now() < deadline, "history worker did not publish its exact session");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -4148,13 +4153,23 @@ mod tests {
         let revision = model.views[0].revision;
         let suggest = |name: &str| ModelEdit::SuggestConversationTitle { id, card, expected_revision: revision,
             title: name.into(), source: ChannelTitleSource::Provider };
-        state.edit_model(1, suggest("Initial bundle audit")).unwrap();
+        let apply = |state: &mut HostState, origin, edit: ModelEdit| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop { match state.edit_model(origin, edit.clone()) {
+                Err(error) if error.retryable && error.code == ProtocolErrorCode::QueueFull => {
+                    assert!(Instant::now() < deadline, "resident metadata remained busy");
+                    std::thread::yield_now();
+                }
+                result => break result,
+            } }
+        };
+        apply(&mut state, 1, suggest("Initial bundle audit")).unwrap();
         handle.command(Command::Compact).unwrap();
-        state.edit_model(2, suggest("Encryption performance review")).unwrap();
-        assert!(state.edit_model(1, suggest("Initial bundle audit")).is_err(), "delayed A must not replace accepted B at the same view revision");
+        apply(&mut state, 2, suggest("Encryption performance review")).unwrap();
+        assert!(apply(&mut state, 1, suggest("Initial bundle audit")).is_err(), "delayed A must not replace accepted B at the same view revision");
         assert_eq!(state.read_model().unwrap().channels[0].title, "Encryption performance review");
         handle.command(Command::Compact).unwrap();
-        state.edit_model(1, suggest("Final encryption audit")).unwrap();
+        apply(&mut state, 1, suggest("Final encryption audit")).unwrap();
         assert_eq!(state.read_model().unwrap().channels[0].title, "Final encryption audit");
         handle.close().unwrap();
     }

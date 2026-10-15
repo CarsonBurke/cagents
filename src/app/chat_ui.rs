@@ -5365,10 +5365,25 @@ impl Cagents {
         // A refused original revision is never rewritten in the publisher.
         // A newly accepted projection can make a fresh suggestion from the
         // current runtime; unchanged proofs do not create a retry loop.
-        for (target, observation) in &mut self.chat_ui.channel_names {
-            if let Some(proof) = proofs.get(&target.card)
-                && observation.last_view != Some(*proof) {
-                observation.pending = true;
+        for (card, proof) in &proofs {
+            if !self.channel_needs_name(*card) { continue; }
+            let runtime = match self.cards.get(card) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime),
+                _ => self.chat_ui.parked.get(card).map(Box::as_ref),
+            };
+            let Some(runtime) = runtime else { continue; };
+            let target = runtime.target;
+            if self.chat_ui.channel_names.get(&target).is_some_and(|observation| observation.last_view == Some(*proof)) {
+                continue;
+            }
+            // A secondary conversation may have received its name while no
+            // channel was eligible. Sample the current cached client snapshot
+            // once at this new proof; do not wait for another provider wake.
+            let Some(snapshot) = runtime.handle().map(|handle| handle.snapshot()) else { continue; };
+            self.observe_channel_name(target, &snapshot);
+            if let Some(observation) = self.chat_ui.channel_names.get_mut(&target) {
+                observation.pending = observation.title.is_some();
+                observation.last_view = Some(*proof);
             }
         }
         let candidates = self
@@ -12729,6 +12744,40 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn a_secondary_title_wake_is_used_when_it_becomes_primary_without_another_wake() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::workspace_model::views::{Pane, Scope, View};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let a = live_chat(&mut app, Some(KNOWN_THREAD));
+        let b = live_chat(&mut app, Some("0299a2b4-5c6d-7e8f-9a0b-1c2d3e4f5a6b"));
+        let target = chat_runtime(&app, b).target;
+        let original = app.card_state(b).unwrap().kind.clone();
+        let id = ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels = vec![ProjectChannel { id, project_id: ProjectId::new(),
+            title: "First conversation".into(), title_source: ChannelTitleSource::Provider, ordinal: 0,
+            shared: true, cards: vec![a, b], focused: Some(b) }];
+        app.workspace_model.views = vec![View { scope: Scope::Channel(id), revision: 1, retired: Vec::new(),
+            panes: [a,b].into_iter().map(|card| Pane::from_card(app.card_state(card).unwrap(), Some(FIXTURE_DIRECTORY.into())).unwrap()).collect() }];
+        let handle = chat_runtime(&app, b).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone(); snapshot.generation += 1;
+        snapshot.title = Some("Secondary encryption review".into());
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(app.durable.channels[0].title, "First conversation");
+        assert!(app.chat_ui.channel_names.get(&target).is_none_or(|observation| observation.title.is_none()),
+            "the secondary wake deliberately did not cache a channel candidate");
+        // These are the accepted host projection values after its primary
+        // changed and its automatic old name was cleared in the same TX.
+        app.workspace_model.views[0].panes.swap(0, 1); app.workspace_model.views[0].revision += 1;
+        let channel = &mut Arc::make_mut(&mut app.durable).channels[0];
+        channel.cards = vec![b, a]; channel.title.clear(); channel.title_source = ChannelTitleSource::Prompt;
+        app.refresh_channel_title_suggestions();
+        assert_eq!(app.durable.channels[0].title, "Secondary encryption review");
+        assert_eq!(app.durable.channels[0].title_source, ChannelTitleSource::Provider);
+        assert_eq!(app.card_state(b).unwrap().kind, original, "naming does not change launch or conversation identity");
     }
 
     #[test]
