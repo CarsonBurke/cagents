@@ -7468,21 +7468,15 @@ mod tests {
             };
             // Keep the real desktop effect lazy: ordinary tests verify actual
             // dispatcher admission without launching a user's file manager.
-            assert!(
-                iced::runtime::task::into_stream(app.update(Message::Repository(action(card))))
-                    .is_some()
-            );
+            assert!(app.update(Message::Repository(action(card))).units() > 0);
             app.settings_open = true;
-            assert!(
-                iced::runtime::task::into_stream(app.update(Message::Repository(action(card))))
-                    .is_none()
-            );
+            // iced batch/map may retain a stream even for zero scheduled work.
+            assert_eq!(app.update(Message::Repository(action(card))).units(), 0);
             app.settings_open = false;
-            assert!(
-                iced::runtime::task::into_stream(
-                    app.update(Message::Repository(action(CardId::new())))
-                )
-                .is_none()
+            assert_eq!(
+                app.update(Message::Repository(action(CardId::new())))
+                    .units(),
+                0
             );
         }
     }
