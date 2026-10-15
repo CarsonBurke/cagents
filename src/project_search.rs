@@ -175,6 +175,9 @@ pub fn search(
         let mut line = 0;
         let mut finished = false;
         while !finished {
+            if cancellation.is_cancelled() {
+                return;
+            }
             // Read the common case in one bulk operation instead of wrapping
             // Read::take, validating UTF-8 and extending the buffer per line.
             // Complete the final line only, with the same strict line bound.
@@ -182,6 +185,7 @@ pub fn search(
             let read = match reader.read(&mut bytes) {
                 Ok(0) => break,
                 Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
                     skipped += 1;
                     break;
