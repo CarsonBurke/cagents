@@ -60,11 +60,22 @@ impl State {
             && self.target.as_ref().is_some_and(|review| {
                 review.worktree == target.repository
                     && review.pull_request.number == target.number
+                    && review.pull_request.head_ref_name == target.head_ref_name
+                    && review.pull_request.head_ref_oid == target.head.as_str()
                     && target.pull_request.as_ref()
                         == PullRequestKey::new(review.repository.clone(), target.number)
                             .ok()
                             .as_ref()
             })
+    }
+
+    fn existing_checkout_plan_is_current(&self, target: &CheckoutTarget, plan: &ExistingPrCheckoutPlan) -> bool {
+        self.existing_checkout_target_is_current(target)
+            && plan.request().expected_head == target.head
+            && plan.request().repository == target.repository
+            && plan.request().head_branch.as_str() == target.head_ref_name
+            && self.target.as_ref().and_then(|review| review.pull_request.head_repository_key())
+                .is_some_and(|source| source.same_repository(&plan.request().head_repository))
     }
 
     pub fn offer_existing_checkout(
@@ -73,10 +84,11 @@ impl State {
         plan: ExistingPrCheckoutPlan,
         notice: String,
     ) {
-        if self.existing_checkout.busy()
-            || !self.existing_checkout_target_is_current(&target)
-            || plan.request().expected_head != target.head
-        {
+        if self.existing_checkout.busy() {
+            return;
+        }
+        if !self.existing_checkout_plan_is_current(&target, &plan) {
+            self.notice = Some("The PR branch, source or head changed. Refresh the review before checking it out.".into());
             return;
         }
         self.existing_checkout.reset();
@@ -110,6 +122,9 @@ impl State {
                 let Some(plan) = self.existing_checkout.plan.clone() else {
                     return ActionTask::none();
                 };
+                if !self.existing_checkout_plan_is_current(target, &plan) {
+                    return ActionTask::none();
+                }
                 let cancellation = CancellationToken::new();
                 self.existing_checkout.cancellation = Some(cancellation.clone());
                 self.existing_checkout.completed = None;
@@ -166,7 +181,7 @@ impl State {
                 ) else {
                     return ActionTask::none();
                 };
-                if self.refreshing || !self.existing_checkout_target_is_current(target) {
+                if self.refreshing || !self.existing_checkout_plan_is_current(target, plan) {
                     self.existing_checkout.error = Some(
                         "The checkout no longer matches this review. Prepare checkout again."
                             .into(),
@@ -197,7 +212,7 @@ impl State {
             .existing_checkout
             .target
             .as_ref()
-            .is_some_and(|target| self.existing_checkout_target_is_current(target));
+            .is_some_and(|target| self.existing_checkout_plan_is_current(target, plan));
         let action = |action| self.fenced(super::Action::ExistingCheckout(action));
         let mut rows = vec![
             design::caption(
@@ -209,7 +224,7 @@ impl State {
             .into(),
         ];
         if !current {
-            rows.push(design::caption("The PR head changed. Prepare checkout again.").into());
+            rows.push(design::caption("The PR branch, source or head changed. Prepare checkout again.").into());
         }
         if let Some(error) = &self.existing_checkout.error {
             rows.push(design::caption(error).into());
@@ -383,7 +398,7 @@ mod tests {
         };
         let pr:PullRequest=serde_json::from_value(serde_json::json!({
             "number":7,"title":"Fixture","state":"OPEN","headRefName":"feature","headRefOid":head.as_str(),
-            "baseRefName":"main","updatedAt":"2026-10-15T00:00:00Z","url":"https://fixture.invalid/owner/repo/pull/7"
+            "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"2026-10-15T00:00:00Z","url":"https://fixture.invalid/owner/repo/pull/7"
         })).unwrap();
         let mut state = State::new(
             Arc::new(crate::github::GitHubService::system("gh")),
@@ -528,7 +543,7 @@ mod tests {
             pull_request: Some(PullRequestKey::new(key.clone(), 7).unwrap()), head_ref_name: "feature".into() };
         let pr: PullRequest = serde_json::from_value(serde_json::json!({
             "number":7,"title":"Fixture","state":"OPEN","headRefName":"feature","headRefOid":reviewed.as_str(),
-            "baseRefName":"main","updatedAt":"2026-10-15T00:00:00Z","url":"https://fixture.invalid/owner/repo/pull/7"
+            "headRepository":{"name":"repo"},"headRepositoryOwner":{"login":"owner"},"baseRefName":"main","updatedAt":"2026-10-15T00:00:00Z","url":"https://fixture.invalid/owner/repo/pull/7"
         })).unwrap();
         let mut state = State::new(Arc::new(crate::github::GitHubService::system("gh")), RepositoryService::system("git"));
         state.target = Some(ReviewTarget { repository:key, worktree:repository.clone(), pull_request:Arc::new(pr) });
@@ -542,6 +557,18 @@ mod tests {
         state.offer_existing_checkout(target.clone(), plan.clone(), plan.notice().into());
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
         assert!(state.take_effects().is_empty(), "preparing or opening before confirmation grants no navigation");
+        let original_pr = Arc::clone(&state.target.as_ref().unwrap().pull_request);
+        for source_change in [false, true] {
+            let current = Arc::make_mut(&mut state.target.as_mut().unwrap().pull_request);
+            if source_change {
+                current.head_repository_owner.as_mut().unwrap().login = "different-owner".into();
+            } else {
+                current.head_ref_name = "renamed-branch".into();
+            }
+            drop(state.update(super::super::Action::ExistingCheckout(Action::Confirm)));
+            assert!(!state.existing_checkout.busy(), "known branch/source changes cannot authorize an old plan at the same OID");
+            state.target.as_mut().unwrap().pull_request = Arc::clone(&original_pr);
+        }
         let task = state.update(super::super::Action::ExistingCheckout(Action::Confirm));
         let reply = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             let mut stream = iced::runtime::task::into_stream(task).unwrap();
@@ -562,6 +589,10 @@ mod tests {
         assert!(checkout::verified_existing_path(&writer_target, &writer_plan, receipt).is_err(),
             "a preserve-local receipt cannot masquerade as a strict writer receipt even with the same head");
         assert!(state.take_effects().is_empty());
+        Arc::make_mut(&mut state.target.as_mut().unwrap().pull_request).head_ref_name = "renamed-branch".into();
+        drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
+        assert!(state.take_effects().is_empty(), "a verified receipt cannot override a newly observed PR branch identity");
+        state.target.as_mut().unwrap().pull_request = original_pr;
         drop(state.update(super::super::Action::ExistingCheckout(Action::Open)));
         assert_eq!(state.take_effects(), vec![Effect::OpenCheckout(repository.canonicalize().unwrap())]);
         assert_eq!(git(&repository, &["rev-parse", "HEAD"]), local.as_str());

@@ -71,6 +71,7 @@ pub fn verified_existing_path(
     };
     if request.repository != target.repository
         || request.expected_head != target.head
+        || request.head_branch.as_str() != target.head_ref_name
         || receipt.path() != plan.path()
         || receipt.disposition() != plan.disposition()
         || receipt.head() != expected_local_head
