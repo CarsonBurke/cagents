@@ -195,3 +195,8 @@ deadline has `timed_out`. Waiting commands now return the nonzero exit codes
 above while retaining their normal JSON success envelope and last known results.
 The envelope's `ok` means the command was processed; use the exit code or
 `data.outcome` to determine whether the work completed successfully.
+
+If the deadline expires before a run’s first status arrives, `agent wait` keeps
+any statuses already received and reports the unread IDs in `data.unresolved_runs`.
+Spawn/send retain their durable acceptance when that first status is unavailable.
+No run outcome is invented from missing status evidence.

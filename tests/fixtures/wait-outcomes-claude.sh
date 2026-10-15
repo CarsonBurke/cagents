@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --session-id|--resume) shift; session=$1 ;;
+    --session-id=*|--resume=*) session=${1#*=} ;;
+  esac
+  shift
+done
 n=0
 while IFS= read -r frame; do
   case "$frame" in

@@ -500,5 +500,29 @@ fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
         "10",
     ]);
     assert_eq!(success["outcome"], "succeeded");
+    let succeeded_run = success["run"]["id"].as_str().unwrap();
+    let failed_run = follow["data"]["run"]["id"].as_str().unwrap();
+    let first_success = fixture.output(&[
+        "agent",
+        "wait",
+        succeeded_run,
+        failed_run,
+        "--any",
+        "--timeout",
+        "1",
+    ]);
+    assert_eq!(first_success.status.code(), Some(0), "{first_success:?}");
+    let first_failure = fixture.output(&[
+        "agent",
+        "wait",
+        failed_run,
+        succeeded_run,
+        "--any",
+        "--timeout",
+        "1",
+    ]);
+    assert_eq!(first_failure.status.code(), Some(4), "{first_failure:?}");
+    let all = fixture.output(&["agent", "wait", succeeded_run, failed_run, "--timeout", "1"]);
+    assert_eq!(all.status.code(), Some(4), "{all:?}");
     fixture.cli(&["agent", "close", agent]);
 }
