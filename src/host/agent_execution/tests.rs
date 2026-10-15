@@ -2852,6 +2852,36 @@ fn interrupted_cleanup_batches_progress_without_repeating_or_crossing_scope() {
 }
 
 #[test]
+fn daemon_capacity_refusals_keep_retryable_wire_details_for_both_scopes() {
+    if isolated("daemon_capacity_refusals_keep_retryable_wire_details_for_both_scopes").is_some() {
+        return;
+    }
+    use crate::{agent_execution::{CapacityScope, ConcurrencyLimits}, terminal::ipc::{ClientRequest, ProtocolErrorCode, ProtocolErrorDetails}};
+    let (host, mut request, _) = fixture();
+    host.lock().unwrap().register_client(1);
+    let first = registry(&host).unwrap().lock().unwrap().submit_agent(&Origin::User, &request, 1).unwrap();
+    for (limits, scope) in [
+        (ConcurrencyLimits { caller: 1, global: 2 }, CapacityScope::Caller),
+        (ConcurrencyLimits { caller: 2, global: 1 }, CapacityScope::Global),
+    ] {
+        crate::settings::save(&crate::settings::default_path().unwrap(), &crate::settings::AppSettings { agent_concurrency: limits, ..Default::default() }).unwrap();
+        request.idempotency_key = format!("wire-refusal-{scope:?}");
+        let error = super::super::client::process_request(&host, 1, ClientRequest::Agent {
+            authority: Authority::default(), operation: Operation::Submit(request.clone()),
+        }).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::LimitReached);
+        assert!(error.retryable);
+        assert!(error.message.contains(&first.agent.id.to_string()));
+        let Some(ProtocolErrorDetails::AgentLimitReached(details)) = error.details else { panic!("missing capacity metadata") };
+        assert_eq!(details.capacity.scope, scope);
+        assert_eq!((details.capacity.running, details.capacity.limit), (1, 1));
+        assert_eq!(details.capacity.holders[0].id, first.agent.id);
+        assert!(details.retryable);
+    }
+    close(&host, &Authority::default(), first.agent.id).unwrap();
+}
+
+#[test]
 fn saved_concurrency_settings_change_admission_without_a_daemon_restart() {
     if isolated("saved_concurrency_settings_change_admission_without_a_daemon_restart").is_some() {
         return;
