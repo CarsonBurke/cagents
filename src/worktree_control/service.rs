@@ -72,6 +72,13 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
                 managed_directory:settings.managed_worktree_directory,destination:String::new(),operation_id:OperationId::new(),
             },&cancellation).map_err(|error|error.to_string())?;
             request.linear_issue=linear.map(|issue|crate::linear::context::LinkedIssue { issue_id:issue, workspace:None });
+            if setup_plan.is_some()||no_setup {
+                request.setup_intent=Some(crate::repository::WorktreeSetupIntent {
+                    primary:Some(primary.clone()),plan:setup_plan.clone(),skip:no_setup,
+                    run_id:Some(OperationId::new()),copy_done:no_setup,
+                });
+            }
+            let run_id=request.setup_intent.as_ref().and_then(|intent|intent.run_id);
             let report=service.create_worktree_journaled_sync(&store,&request,0,&cancellation, |_|{});
             match report.outcome {
                 Some(WorktreeCreationOutcome::Created {worktree,warnings}) if report.state==crate::repository::WorktreeOperationState::Created => {
@@ -81,9 +88,18 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
                             Ok(prepared)=> {
                                 for missing in prepared.missing_patterns { warnings.push(format!("No setup source matched {missing}")); }
                                 for skipped in prepared.skipped_paths { warnings.push(format!("Skipped copying {}: {}",skipped.path.display(),skipped.reason)); }
-                                prepared.command.map(|command|Setup {command,terminal:None,error:None})
+                                let mut copied=request.setup_intent.clone().expect("setup plan has retained intent");
+                                copied.copy_done=true;
+                                match service.update_worktree_setup_intent(&store,request.operation_id,request.setup_intent.as_ref(),copied) {
+                                    Ok(_)=>prepared.command.map(|command|Setup {command,run_id,terminal:None,error:None}),
+                                    Err(error)=> {
+                                        let error=format!("Setup copied files, but its progress could not be retained; no command was started: {error}");
+                                        warnings.push(error.clone());
+                                        Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)})
+                                    }
+                                }
                             }
-                            Err(error)=> { let error=error.to_string(); warnings.push(format!("Worktree was created, but setup failed: {error}")); Some(Setup {command:String::new(),terminal:None,error:Some(error)}) }
+                            Err(error)=> { let error=error.to_string(); warnings.push(format!("Worktree was created, but setup failed: {error}")); Some(Setup {command:String::new(),run_id,terminal:None,error:Some(error)}) }
                         }
                     } else {None};
                     Ok(Reply::Created { worktree:entry(&service,&worktree,false,&cancellation)?,warnings,setup })

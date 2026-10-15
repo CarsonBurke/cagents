@@ -75,6 +75,7 @@ pub enum Reply {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Setup {
     pub command: String,
+    pub run_id: Option<crate::model::OperationId>,
     pub terminal: Option<crate::model::TerminalSession>,
     pub error: Option<String>,
 }

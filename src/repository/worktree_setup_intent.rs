@@ -83,6 +83,7 @@ mod tests {
 
     fn request(root: &Path) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
+            linear_issue: None,
             repository: root.join("repo"),
             managed_root: root.join("managed"),
             destination: root.join("managed/topic"),
