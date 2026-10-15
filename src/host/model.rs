@@ -37,6 +37,7 @@ mod mailbox;
 mod navigation;
 mod project_checkout;
 mod project_instances;
+pub(crate) mod project_operations;
 mod relocation;
 mod terminal_owners;
 mod views;
