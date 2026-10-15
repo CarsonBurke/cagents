@@ -521,6 +521,7 @@ pub enum RepositoryAction {
     CompareDisk { card: CardId },
     DiskComparisonLoaded { identity: AsyncIdentity, revision: u64, disk_hash: blake3::Hash, model: Option<DiffModel> },
     KeepMine { card: CardId },
+    BranchBasisRefreshed { identity: AsyncIdentity, request: u64, previous: DiffBasis, result: Result<ResolvedBasis, String> },
     Reload {
         card: CardId,
     },
@@ -759,6 +760,7 @@ impl RepositoryAction {
             | Self::FileLoaded { identity, .. }
             | Self::DiskMetadata { identity, .. }
             | Self::DiskLoaded { identity, .. }
+            | Self::BranchBasisRefreshed { identity, .. }
             | Self::DiskComparisonLoaded { identity, .. }
             | Self::BinaryPageLoaded { identity, .. }
             | Self::DiagramsRendered { identity, .. }
@@ -1883,6 +1885,7 @@ pub struct RepositoryRuntime {
     disk_stamp: Option<Option<crate::editor_reload::Stamp>>,
     disk_poll: Option<(u64, Instant)>,
     next_disk_poll: u64,
+    next_branch_refresh: u64,
     disk_comparison: Option<DiffState>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
@@ -2109,6 +2112,7 @@ impl RepositoryRuntime {
             disk_stamp: None,
             disk_poll: None,
             next_disk_poll: 0,
+            next_branch_refresh: 0,
             disk_comparison: None,
             generation: 0,
             file_list_generation: 0,
@@ -2899,6 +2903,20 @@ impl RepositoryRuntime {
     /// Called by the shared Git watcher after index/ref changes. Immutable
     /// history comparisons retain their object identities and mounted model.
     pub fn refresh_open_comparison(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if let DiffBasis::MergeBaseToHead { base_ref, .. } = &self.diff_basis {
+            if matches!(self.basis_resolution, Some(BasisResolution::Resolving(_))) { return Task::none(); }
+            let Some(path) = self.selected_path().map(Path::to_path_buf) else { return Task::none(); };
+            let identity = self.current_identity(card, path);
+            let base_ref = base_ref.clone();
+            let previous = self.diff_basis.clone();
+            self.next_branch_refresh = self.next_branch_refresh.wrapping_add(1);
+            let request = self.next_branch_refresh;
+            return cosmic::task::future(async move {
+                let worktree = identity.worktree.clone();
+                let result = tokio::task::spawn_blocking(move || resolved_branch_basis(&worktree, base_ref)).await.map_err(|error| error.to_string()).and_then(|result| result);
+                RepositoryAction::BranchBasisRefreshed { identity, request, previous, result }
+            });
+        }
         if self.diff_basis.is_immutable() { return Task::none(); }
         self.diffs.retain(|(basis, _)| basis.is_immutable());
         self.working_diff.applied = None;
@@ -4819,6 +4837,22 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::BranchBasisRefreshed { identity, request, previous, result } => {
+                if !self.accepts_selected(&identity) || request != self.next_branch_refresh || self.diff_basis != previous || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_))) { return Task::none(); }
+                match result {
+                    Ok(ResolvedBasis::Ready(basis)) => {
+                        self.basis_resolution = None;
+                        if basis == previous { return Task::none(); }
+                        self.capture_diff_viewport();
+                        self.diffs.retain(|(cached, _)| *cached != previous);
+                        if let Some((selected, _)) = &mut self.committed_selection && *selected == previous { *selected = basis.clone(); }
+                        self.diff_basis = basis;
+                        self.ensure_current_diff(identity.card)
+                    },
+                    Err(error) => { self.basis_resolution = Some(BasisResolution::Unavailable(error)); Task::none() },
+                    _ => Task::none(),
+                }
+            }
             RepositoryAction::DiskMetadata { identity, ticket, result } => {
                 if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
                 let DocumentState::Editable(document) = &mut self.document else { self.disk_poll = None; return Task::none(); };
@@ -12283,6 +12317,24 @@ mod tests {
             text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
             mapping: crate::editor_reload::LineMap::between(before, after),
         }) }));
+    }
+
+    #[test]
+    fn branch_ref_refresh_keeps_the_newest_result_and_commit_history_stays_fixed() {
+        let card = CardId::new();
+        let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.rs", "body");
+        let basis = |seed| DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: fixture_oid(seed), merge_base: fixture_oid(1) };
+        runtime.diff_basis = basis(2);
+        runtime.next_branch_refresh = 2;
+        drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity: identity.clone(), request: 1, previous: basis(2), result: Ok(ResolvedBasis::Ready(basis(3))) }));
+        assert_eq!(runtime.diff_basis, basis(2));
+        drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity, request: 2, previous: basis(2), result: Ok(ResolvedBasis::Ready(basis(4))) }));
+        assert_eq!(runtime.diff_basis, basis(4));
+        let commit = DiffBasis::CommitToParent { oid: fixture_oid(4), parent: Some(fixture_oid(3)) };
+        runtime.diff_basis = commit.clone();
+        drop(runtime.refresh_open_comparison(card));
+        assert_eq!(runtime.diff_basis, commit);
+        assert_eq!(runtime.next_branch_refresh, 2);
     }
 
     #[test]
