@@ -1378,9 +1378,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn actual_history_menu_uses_displayed_linked_source_and_retains_its_authority() {
+        const TEST: &str = "app::worktree_dialog::tests::actual_history_menu_uses_displayed_linked_source_and_retains_its_authority";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("displayed");
-        super::super::git_binding::tests::init(&root, "original\n");
+        let primary = temporary.path().join("primary");
+        super::super::git_binding::tests::init(&primary, "original\n");
+        isolated_git(&primary, &["worktree", "add", "-b", "displayed", root.to_str().unwrap()]);
         let (mut app, key) = super::super::git_binding::tests::app_for(&root);
         let identity = crate::repository::CommitIdentity {
             name: "Fixture".into(), email: "fixture@example.invalid".into(),
@@ -1397,11 +1401,13 @@ mod tests {
             SidebarAction::HistoryCommand { key: key.clone(), oid, mainline: row.mainline,
                 message: row.message.clone(), command: sidebar::HistoryCommand::NewWorktree }));
         app.sidebar_state.apply(&SidebarAction::SetChangesTab {
-            key: key.clone(),
-            tab: sidebar::ChangesTab::History,
+            key: key.clone(), tab: sidebar::ChangesTab::History,
         });
+        let loaded = super::super::load_repository(&primary, Some(key.project_id), CancellationToken::new()).unwrap();
         app.sidebar_model.projects.iter_mut().find(|project| project.id == key.project_id).unwrap()
-            .repository = temporary.path().join("different-primary");
+            .repository = loaded.project.repository.clone();
+        app.repository_generations.insert(key.project_id, 1);
+        app.publish_project_creation_source(key.project_id, 1, loaded.creation_source, false);
         drop(app.update(Message::Sidebar(action)));
         let dialog = app.worktree_dialog.as_ref().expect("registered History menu opens bound dialog");
         assert_eq!(dialog.repository, root);
@@ -1425,11 +1431,54 @@ mod tests {
         isolated_git(&root, &["commit", "-m", "Original"]);
         let oid = crate::repository::Oid::parse_object(isolated_git(&root, &["rev-parse", "HEAD"])).unwrap();
         fixture.app.settings.managed_worktree_directory = ".worktrees".into();
-        fixture.app.sidebar_model.projects[0].repository = root.clone();
+        publish_real_project(&mut fixture.app, fixture.project, &root, 1, None);
         let authority = crate::repository::WorktreeAuthority::capture(&root).unwrap();
         drop(fixture.app.open_worktree_dialog_bound(fixture.project, authority,
             WorktreeDraft { branch: "history-topic".into(), base: oid.as_str().into(), destination: String::new() }, None));
         (fixture, files, root, oid)
+    }
+
+    /// Use the actual loader and accepted RepositoryLoaded reducer. Returned
+    /// watcher/refresh/navigation tasks are outside this publication fixture.
+    #[cfg(target_os = "linux")]
+    fn publish_real_project(app: &mut Cagents, project: ProjectId, root: &Path, generation: u64,
+        retained: Option<WorktreeCreationSource>) {
+        let loaded = super::super::load_project_with_source(root, Some(project), CancellationToken::new(),
+            Some(ProjectKind::Git), retained).unwrap();
+        app.repository_load_sequence = app.repository_load_sequence.max(generation);
+        app.repository_generations.insert(project, generation);
+        drop(app.update(Message::RepositoryLoaded { open_cards: false, project_id: project,
+            generation, result: Ok(Box::new(loaded)) }));
+        assert!(app.project_creation_source(project).is_some(), "actual accepted read publishes a ready capability");
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn creation_final_message(app: &mut Cagents, task: Task<Message>) -> (crate::repository::WorktreeOperationReport, Message) {
+        use cosmic::iced::futures::StreamExt;
+        let mut pending = vec![task];
+        let mut report = None;
+        let mut remaining = 32;
+        while let Some(task) = pending.pop() {
+            assert!(remaining > 0, "the finite creation chain must settle"); remaining -= 1;
+            if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                        match message {
+                            Message::WorktreeInputResolved { project_id, operation_id, result } =>
+                                pending.push(app.finish_worktree_input(project_id, operation_id, result)),
+                            Message::WorktreeOperationFinished { operation, generation, result } => {
+                                report = Some(result.as_ref().expect("journal worker completed").clone());
+                                pending.push(app.finish_worktree_operation(operation, generation, result));
+                            },
+                            final_message @ Message::ProjectWorktreeCreated { .. } =>
+                                return (report.expect("actual settled report precedes final publication"), final_message),
+                            _ => {},
+                        }
+                    }
+                }
+            }
+        }
+        panic!("actual creation must emit the guarded final publication");
     }
 
     #[cfg(target_os = "linux")]
@@ -1488,6 +1537,142 @@ mod tests {
         isolated_git(root, &["init", "--template=", "-b", "replacement"]);
         std::fs::write(root.join("replacement-only"), b"preserve replacement\n").unwrap();
         parked
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn first_creation_message(task: Task<Message>) -> Message {
+        use cosmic::iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("production worker task exists");
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action { return message; }
+        }
+        panic!("production worker must return its result");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_generic_fixture(fixture: &mut Fixture, oid: &crate::repository::Oid) -> WorktreeCreationSource {
+        if let Some(dialog) = fixture.app.worktree_dialog.take() { dialog.cancel(); }
+        let repository = fixture.app.sidebar_model.project(fixture.project).unwrap().repository.clone();
+        drop(fixture.app.open_worktree_dialog(fixture.project, repository,
+            WorktreeDraft { branch: "generic-topic".into(), base: oid.as_str().into(), destination: String::new() }, None));
+        let opened = dialog(&fixture.app);
+        let source = opened.source.clone().expect("ordinary generic dialog consumes published source");
+        assert_eq!(opened.project_creation_id, Some(source.id()));
+        source
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn generic_creation_admission_survives_unchanged_refresh_and_publishes_exact_receipt() {
+        const TEST: &str = "app::worktree_dialog::tests::generic_creation_admission_survives_unchanged_refresh_and_publishes_exact_receipt";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let (mut fixture, _files, root, oid) = real_history_source();
+        let source = open_generic_fixture(&mut fixture, &oid);
+        let original_generation = fixture.app.project_creation_generation(fixture.project).unwrap();
+        let resolution = fixture.app.submit_worktree_dialog();
+        let (project, operation, request) = resolve_history_input(resolution).await;
+        let destination = request.destination.clone();
+        let creation = fixture.app.finish_worktree_input(project, operation, Ok(request));
+        assert_eq!(fixture.app.worktree_operations[&operation].source().unwrap().id(), source.id());
+        // The operation is admitted but its returned blocking worker has not
+        // been driven yet. Exercise the real automatic-read task/reducer gap.
+        let refresh = fixture.app.repository_load_task(root.clone(), Some(project), false);
+        assert!(fixture.app.project_creation_source(project).is_none(), "new intents wait while a read is in flight");
+        assert!(fixture.app.current_project_creation_source(project, source.id()), "already admitted work keeps its original actor");
+        let loaded = first_creation_message(refresh).await;
+        assert!(matches!(loaded, Message::RepositoryLoaded { .. }));
+        drop(fixture.app.update(loaded));
+        assert_eq!(fixture.app.project_creation_generation(project), Some(original_generation));
+        assert_eq!(fixture.app.project_creation_source(project).unwrap().id(), source.id());
+        let (report, final_message) = creation_final_message(&mut fixture.app, creation).await;
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        let Message::ProjectWorktreeCreated { source_id, project_generation, operation: emitted, result: Ok(outcome), .. } = &final_message else { panic!("guarded publication required"); };
+        assert_eq!((*source_id, *project_generation, *emitted), (source.id(), original_generation, operation));
+        assert!(fixture.app.completed_project_creation_matches(operation, project, source.id(), original_generation, &root, outcome));
+        let WorktreeCreationOutcome::Created { worktree, .. } = outcome else { panic!("Created receipt required"); };
+        let created_id = worktree.id;
+        drop(fixture.app.update(final_message));
+        assert!(fixture.app.sidebar_model.project(project).unwrap().worktrees.iter().any(|row| row.id == created_id && row.path == destination));
+        fixture.app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
+        assert_eq!(fixture.app.session.as_ref().unwrap().operation_store().load_worktree(created_id).unwrap().unwrap().path, destination);
+        assert_eq!(isolated_git(&destination, &["rev-parse", "HEAD"]), oid.as_str());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn queued_project_publication_refuses_changed_generation_for_generic_and_history() {
+        const TEST: &str = "app::worktree_dialog::tests::queued_project_publication_refuses_changed_generation_for_generic_and_history";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for (generic, deferred) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (mut fixture, _files, root, oid) = real_history_source();
+            if generic { open_generic_fixture(&mut fixture, &oid); }
+            let task = fixture.app.submit_worktree_dialog();
+            let (report, final_message) = creation_final_message(&mut fixture.app, task).await;
+            assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+            let Message::ProjectWorktreeCreated { operation, source_id, project_generation, result: Ok(outcome), .. } = &final_message else { panic!("both History and generic must carry logical publication proof"); };
+            let (operation, source_id, generation, outcome) = (*operation, *source_id, *project_generation, outcome.clone());
+            let WorktreeCreationOutcome::Created { worktree, .. } = &outcome else { panic!("Created receipt required"); };
+            let created_id = worktree.id;
+            let original_destination = report.request.as_ref().unwrap().destination.strip_prefix(&root).unwrap().to_owned();
+            let final_message = if deferred {
+                fixture.app.settings_reset_confirm = true;
+                drop(fixture.app.update(final_message));
+                assert_eq!(fixture.app.deferred_navigation.len(), 1);
+                assert!(matches!(fixture.app.deferred_navigation.front(), Some(Message::ProjectWorktreeCreated { source_id: carried, project_generation: carried_generation, .. }) if *carried == source_id && *carried_generation == generation));
+                None
+            } else { Some(final_message) };
+            fixture.app.retire_project_creation_source(fixture.project);
+            let parked = replace_history_source(&root);
+            publish_real_project(&mut fixture.app, fixture.project, &root, generation + 1, None);
+            assert!(!fixture.app.completed_project_creation_matches(operation, fixture.project, source_id, generation, &root, &outcome));
+            let sequence = fixture.app.repository_load_sequence;
+            let active = fixture.app.active_workspace.clone();
+            let final_message = match final_message {
+                Some(message) => message,
+                None => {
+                    fixture.app.settings_reset_confirm = false;
+                    let released = fixture.app.release_deferred_navigation_if_unblocked();
+                    first_creation_message(released).await
+                },
+            };
+            let returned = fixture.app.update(final_message);
+            assert!(iced::runtime::task::into_stream(returned).is_none(), "stale final ingress starts no refresh/navigation worker");
+            assert_eq!(fixture.app.repository_load_sequence, sequence);
+            assert_eq!(fixture.app.active_workspace, active);
+            assert!(!fixture.app.sidebar_model.project(fixture.project).unwrap().worktrees.iter().any(|row| row.id == created_id));
+            fixture.app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
+            assert!(fixture.app.session.as_ref().unwrap().operation_store().load_worktree(created_id).unwrap().is_none(), "stale final ingress must not persist the created row into replacement project");
+            assert!(fixture.app.worktree_operations.contains_key(&operation), "original settled operation remains inspectable");
+            assert!(fixture.app.session.as_ref().unwrap().operation_store().journaled_worktree_operations().unwrap().iter().any(|entry| entry.id == operation));
+            assert_eq!(std::fs::read(root.join("replacement-only")).unwrap(), b"preserve replacement\n");
+            assert_eq!(std::fs::read(parked.join(original_destination).join("tracked")).unwrap(), b"original source\n");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn generic_creation_refuses_replacement_before_submit_and_after_resolution() {
+        const TEST: &str = "app::worktree_dialog::tests::generic_creation_refuses_replacement_before_submit_and_after_resolution";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for after_resolution in [false, true] {
+            let (mut fixture, _files, root, oid) = real_history_source();
+            let original = open_generic_fixture(&mut fixture, &oid);
+            let resolved = if after_resolution { let task = fixture.app.submit_worktree_dialog(); Some(resolve_history_input(task).await) } else { None };
+            let parked = replace_history_source(&root);
+            if let Some((project, operation, request)) = resolved {
+                let task = fixture.app.finish_worktree_input(project, operation, Ok(request));
+                let reports = finish_creation_tasks(&mut fixture.app, task).await;
+                assert_eq!(reports.len(), 1);
+                assert_eq!(reports[0].state, WorktreeOperationState::NotCreated, "{reports:?}");
+                assert_eq!(fixture.app.worktree_operations[&operation].source().unwrap().id(), original.id());
+            } else {
+                let task = fixture.app.submit_worktree_dialog();
+                assert!(finish_creation_tasks(&mut fixture.app, task).await.is_empty());
+                assert!(dialog(&fixture.app).error.is_some());
+            }
+            assert!(!root.join(".worktrees").exists()); assert!(!parked.join(".worktrees").exists());
+            assert_eq!(std::fs::read(root.join("replacement-only")).unwrap(), b"preserve replacement\n");
+        }
     }
 
     #[cfg(target_os = "linux")]
