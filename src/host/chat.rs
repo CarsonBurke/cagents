@@ -2598,8 +2598,15 @@ fn process_inner(
 /// Cleanup never attaches or restarts a stopped provider. The caller holds
 /// source-specific removal admission and retains this exact actor throughout.
 pub(super) fn close_project_session(host: &SharedHost, client: ClientId, source: &Session, instance: uuid::Uuid, actor: &Handle, provider: &crate::project_recovery::ProviderIncarnation, deadline: Instant) -> Result<(),ProtocolError> {
-    // Final retained-actor composition holds the per-chat transition gate
-    // across this refresh, exact process check and selected actor teardown.
+    // Serialize the captured backend incarnation check with the entire
+    // restart/pair publication, including a retained logical actor whose
+    // backend process can change without changing its UUID or Handle.
+    let transition=restart::transition_gate(host,source.id);
+    let _transition=match transition.try_lock(){
+        Ok(guard)=>guard,
+        Err(std::sync::TryLockError::Poisoned(poison))=>poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock)=>return Err(unavailable("The selected conversation has a lifecycle transition in progress; retry removal after it finishes")),
+    };
     actor.refresh_retained_state().map_err(unavailable)?;
     if actor.provider_process().map(crate::project_recovery::ProviderIncarnation::from_process).as_ref() != Some(provider) {
         return Err(unavailable("The selected provider process changed; its successor was preserved. Refresh Projects and retry."));
