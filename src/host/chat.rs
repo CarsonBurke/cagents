@@ -759,6 +759,30 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    super::account_lifecycle::ensure_launch(
+        host,
+        &session.launch.recipe.working_directory,
+        &session.launch.recipe.environment,
+        &crate::account::launch_credential_overrides(&session.launch.recipe),
+        true,
+    )?;
+    // Main has no immutable captured-home authority for legacy/native
+    // reattachment. Refuse that path during mutation rather than infer it.
+    let already_hosted = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .contains_key(&session.id);
+    if already_hosted
+        || source.is_some()
+        || session.terminal.is_some()
+        || !matches!(
+            session.native_continuity,
+            chat::NativeContinuity::ReconnectOnly
+        )
+    {
+        super::account_lifecycle::ensure_idle(host)?;
+    }
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
     // the account-wide list of conversations.
@@ -972,6 +996,33 @@ fn start_with_execution(
         ));
     }
     let process_launch = restart_launch.unwrap_or(&session.launch);
+    // Existing main adapters inspect raw recorded selectors while constructing
+    // history. Guard those operands as well as the effective/unset spawn roots;
+    // this admission cut does not reinterpret an earlier history source.
+    super::account_lifecycle::ensure_launch(
+        host,
+        &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment,
+        &Default::default(),
+        true,
+    )?;
+    super::account_lifecycle::ensure_launch_at_directory(
+        host,
+        &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment,
+        &crate::account::launch_credential_overrides(&process_launch.recipe),
+        true,
+        execution
+            .as_ref()
+            .and_then(|context| context.directory.as_deref()),
+    )?;
+    super::account_lifecycle::ensure_launch(
+        host,
+        &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment,
+        &crate::account::launch_credential_overrides(&process_launch.recipe),
+        true,
+    )?;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1045,6 +1096,13 @@ fn start_with_execution(
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .clone();
+    super::account_lifecycle::ensure_launch(
+        host,
+        &spec.working_directory,
+        &spec.environment,
+        &spec.unset_environment,
+        false,
+    )?;
     let mut initial = adapter.initialize().map_err(error)?;
     let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
     if terminate_source && source.is_none() {
@@ -2283,6 +2341,7 @@ fn process_inner(
             Ok(response)
         }
         ClientRequest::ChatReturnTerminal { chat_id } => {
+            super::account_lifecycle::ensure_idle(host)?;
             let (handle, mut session) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.shutting_down {
