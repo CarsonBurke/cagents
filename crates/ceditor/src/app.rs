@@ -2314,9 +2314,15 @@ impl Editor {
     /// Hands a link to the desktop's opener. The exit status comes back as a
     /// notice because the shell has no browser of its own.
     fn open_external_link(uri: String) -> Task<Message> {
+        Self::open_external_target(uri.into())
+    }
+
+    fn open_external_target(target: std::ffi::OsString) -> Task<Message> {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let status = std::process::Command::new("xdg-open").arg(uri).status()?;
+                let status = std::process::Command::new("xdg-open")
+                    .arg(target)
+                    .status()?;
                 if status.success() {
                     Ok(())
                 } else {
@@ -3415,6 +3421,25 @@ impl Application for Editor {
                         && !repository_action_allowed_while_modal(&action)
                     {
                         return Task::none();
+                    }
+                    if matches!(
+                        &action,
+                        RepositoryAction::OpenSystem { .. } | RepositoryAction::RevealFile { .. }
+                    ) {
+                        let Some(path) = self.tab(id).and_then(|tab| {
+                            tab.runtime
+                                .selected_path()
+                                .map(|path| tab.runtime.descriptor.worktree.join(path))
+                        }) else {
+                            return Task::none();
+                        };
+                        return if matches!(action, RepositoryAction::RevealFile { .. }) {
+                            cosmic::task::future(async move {
+                                Message::FileRevealed(cagents::file_manager::reveal(&path).await)
+                            })
+                        } else {
+                            Self::open_external_target(path.into_os_string())
+                        };
                     }
                     if let RepositoryAction::Save { card, .. } = &action {
                         if self.tab(*card).is_some_and(|tab| self.tab_is_untitled(tab)) {
@@ -7416,6 +7441,50 @@ mod tests {
                 ),
             })),
         );
+    }
+
+    #[test]
+    fn binary_desktop_actions_schedule_shell_work_and_refuse_modal_or_missing_targets() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("bytes.bin"), [0_u8; 16]).unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(
+            Opened {
+                root: directory.path().into(),
+                file: Some("bytes.bin".into()),
+                snapshot: None,
+            },
+            true,
+        );
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        for reveal in [false, true] {
+            let action = |card| {
+                if reveal {
+                    RepositoryAction::RevealFile { card }
+                } else {
+                    RepositoryAction::OpenSystem { card }
+                }
+            };
+            // Keep the real desktop effect lazy: ordinary tests verify actual
+            // dispatcher admission without launching a user's file manager.
+            assert!(
+                iced::runtime::task::into_stream(app.update(Message::Repository(action(card))))
+                    .is_some()
+            );
+            app.settings_open = true;
+            assert!(
+                iced::runtime::task::into_stream(app.update(Message::Repository(action(card))))
+                    .is_none()
+            );
+            app.settings_open = false;
+            assert!(
+                iced::runtime::task::into_stream(
+                    app.update(Message::Repository(action(CardId::new())))
+                )
+                .is_none()
+            );
+        }
     }
 
     #[test]
