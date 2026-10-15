@@ -702,6 +702,7 @@ pub struct SidebarWorktree {
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
+    pub creation_basis: Option<crate::worktree_basis::CreationBasis>,
     pub pull_request_state: Option<WorktreePullRequestState>,
     /// Held by the application rather than read from the checkout, and
     /// reapplied whenever a read replaces the row.
@@ -761,6 +762,7 @@ impl SidebarWorktree {
             ahead,
             behind,
             created_at_unix_ms: None,
+            creation_basis: None,
             head_repository: None,
             pull_request_state: None,
             deletion: None,
@@ -804,6 +806,7 @@ impl SidebarWorktree {
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
+        row.creation_basis.clone_from(&record.creation_basis);
         row
     }
 
@@ -11339,6 +11342,7 @@ pub(crate) mod tests {
             &WorktreeRecord {
                 id: WorktreeId::from_uuid(Uuid::from_u128(id)),
                 path: PathBuf::from(format!("/repo/{branch}")),
+                creation_basis: None,
                 created_at_unix_ms: None,
                 head_oid: None,
                 branch: Some(format!("refs/heads/{branch}")),
@@ -15918,6 +15922,7 @@ pub(crate) mod tests {
             &WorktreeRecord {
                 id: key.worktree_id,
                 path: key.canonical_path.clone(),
+                creation_basis: None,
                 created_at_unix_ms: None,
                 head_oid: None,
                 branch: Some(format!("refs/heads/{branch}")),

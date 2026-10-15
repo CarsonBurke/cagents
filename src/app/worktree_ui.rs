@@ -2270,6 +2270,7 @@ mod tests {
                     bare: false,
                     lock: crate::repository::WorktreeLock::default(),
                     prunable_reason: None,
+                    creation_basis: None,
                     created_at_unix_ms: None,
                 },
                 warnings: Vec::new(),

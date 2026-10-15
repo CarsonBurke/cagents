@@ -17903,6 +17903,7 @@ mod tests {
         let record = WorktreeRecord {
             id: WorktreeId::new(),
             path: PathBuf::from("/repo/worktrees/old"),
+            creation_basis: None,
             created_at_unix_ms: None,
             head_oid: Some("abc".into()),
             branch: Some("refs/heads/old-feature".into()),
@@ -17966,6 +17967,7 @@ mod tests {
         let record = WorktreeRecord {
             id: WorktreeId::new(),
             path: "/repo/feature".into(),
+            creation_basis: None,
             created_at_unix_ms: None,
             head_oid: Some("old".into()),
             branch: Some("refs/heads/feature".into()),

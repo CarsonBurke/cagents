@@ -107,6 +107,8 @@ pub struct WorktreeRecord {
     /// Filesystem birth time when available, never commit time or mtime.
     #[serde(default)]
     pub created_at_unix_ms: Option<i64>,
+    #[serde(default)]
+    pub creation_basis: Option<crate::worktree_basis::CreationBasis>,
     pub head_oid: Option<String>,
     pub branch: Option<String>,
     pub detached: bool,
@@ -1616,6 +1618,7 @@ pub fn parse_worktree_list(output: &[u8]) -> Result<Vec<WorktreeRecord>, GitPars
                 current = Some(WorktreeRecord {
                     id: stable_worktree_id(&path),
                     path,
+                    creation_basis: None,
                     created_at_unix_ms: None,
                     head_oid: None,
                     branch: None,
@@ -3675,6 +3678,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         match parsed {
             Ok(mut worktrees) => {
                 for worktree in &mut worktrees {
+                    if !worktree.bare {
+                        worktree.creation_basis = crate::worktree_basis::read(&worktree.path)
+                            .map_err(|error| ValidationError::Io(format!("could not read worktree creation basis: {error}")))?;
+                    }
                     worktree.created_at_unix_ms = std::fs::metadata(&worktree.path)
                         .and_then(|metadata| metadata.created())
                         .ok()
@@ -3979,6 +3986,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             merge_base,
             entries,
         })
+    }
+
+    /// Compares to the immutable commit recorded when a worktree was created.
+    /// The display ref may have moved or been deleted since creation.
+    pub fn branch_comparison_at(
+        &self,
+        worktree: &Path,
+        base_ref: &ValidatedRefName,
+        base_oid: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<BranchComparison, RepositoryError> {
+        let head = self.resolve_head(worktree, cancellation)?.ok_or(RepositoryError::InvalidOutput {
+            field: "head", reason: "an unborn branch has nothing to compare".into(),
+        })?;
+        let command = self.git_read(worktree, ["merge-base", base_oid.as_str(), head.as_str()]).env("GIT_NO_LAZY_FETCH", "1");
+        let output = self.run_checked(&command, cancellation)?;
+        let merge_base = Oid::parse_object(parse_utf8_line(&output.stdout, "merge_base")?)
+            .map_err(|error| RepositoryError::InvalidOutput { field: "merge_base", reason: error.to_string() })?;
+        let entries = self.range_entries(worktree, Some(&merge_base), &head, cancellation)?;
+        Ok(BranchComparison { base_ref: base_ref.clone(), base_oid: base_oid.clone(), head, merge_base, entries })
     }
 
     /// Fetches one pull request's head and base branch into the private
@@ -11147,6 +11174,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     error.to_string(),
                 );
             }
+            if let (Some(admin), Some(oid)) = (&journal.admin_dir, &journal.base_oid) {
+                let receipt = crate::worktree_basis::CreationBasis::new(journal.request.base.revision_argument(), oid.clone())
+                    .and_then(|basis| crate::worktree_basis::record(admin, &basis).map(|()| basis));
+                match receipt {
+                    Ok(basis) => {
+                        if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome {
+                            worktree.creation_basis = Some(basis);
+                        }
+                    }
+                    Err(error) => {
+                        journal.detail = format!("{}; creation basis could not be recorded: {error}", journal.detail);
+                        journal.warnings.push(repository_warning(&self.git, RepositoryError::Validation(ValidationError::Io(error.to_string()))));
+                    }
+                }
+            }
             self.unlock_created_worktree(&mut journal);
         }
         finish_worktree_journal(store, &journal, &payload, created_at, &emit)
@@ -11763,6 +11805,38 @@ mod worktree_journal_tests {
                 &sender,
             )
         }
+    }
+
+    #[test]
+    fn creation_basis_records_nondefault_base_and_pins_branch_changes() {
+        let mut fixture = Fixture::new();
+        fixture.git(&["switch", "-c", "release/1.2"]);
+        fs::write(fixture.request.repository.join("release.txt"), b"release-only\n").unwrap();
+        fixture.git(&["add", "release.txt"]);
+        fixture.git(&["commit", "-m", "release baseline"]);
+        let release = fixture.git(&["rev-parse", "HEAD"]);
+        fixture.git(&["switch", "main"]);
+        let mut input = fixture.input("feature/nondefault");
+        input.base = "release/1.2".into();
+        fixture.resolve(input);
+        let report = fixture.run(&CancellationToken::new());
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        let destination = &fixture.request.destination;
+        let basis = crate::worktree_basis::read(destination).unwrap().unwrap();
+        assert_eq!(basis.reference, "refs/heads/release/1.2");
+        assert_eq!(basis.oid, release);
+        let listed = fixture.service.list_worktrees(&fixture.request.repository, &CancellationToken::new()).unwrap();
+        assert_eq!(listed.iter().find(|record| record.path == *destination).unwrap().creation_basis.as_ref(), Some(&basis));
+        fs::write(destination.join("feature.txt"), b"feature-only\n").unwrap();
+        fixture.git(&["-C", destination.to_str().unwrap(), "add", "feature.txt"]);
+        fixture.git(&["-C", destination.to_str().unwrap(), "commit", "-m", "feature change"]);
+        // Moving the release ref after creation must not change the recorded basis.
+        fixture.git(&["update-ref", "refs/heads/release/1.2", "main"]);
+        let comparison = fixture.service.branch_comparison_at(destination, &basis.display_reference().unwrap(),
+            &Oid::parse_object(basis.oid.clone()).unwrap(), &CancellationToken::new()).unwrap();
+        assert_eq!(comparison.entries.len(), 1);
+        assert_eq!(comparison.entries[0].path.display(), "feature.txt");
+        assert_eq!(comparison.base_oid.as_str(), release);
     }
 
     /// Deleting a created worktree in the app frees its identity, so the same
