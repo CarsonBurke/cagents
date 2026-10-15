@@ -175,4 +175,18 @@ mod tests {
         handle.close().unwrap();
     }
 
+    #[test]
+    fn cold_latest_lookup_needs_current_provider_order_and_never_uses_an_older_original(){
+        use annotations::{OriginalPrompt,OriginalSettings,Setting};
+        let root=annotations::storage::test_directory();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let storage=root.path().join("annotations");let mut saved=annotations::storage::Store::for_test(&storage,&scope,"session").unwrap();
+        let original=OriginalPrompt{user_id:"older-accepted-user".into(),turn_id:"older-turn".into(),settings:OriginalSettings{model:Setting::Value("confirmed-model".into()),reasoning:Setting::Value("low".into()),fast:Setting::Value(false),permission:Setting::Value("ask".into())},attachments:vec![],text_bytes:4};
+        saved.accept(&original,"text",&[],&mut []).unwrap();saved.latest_user(&original.user_id).unwrap();drop(saved);
+        let mut authority=Authority::new(Ok(scope));authority.root=Some(storage);assert!(authority.apply(Some(&Some("session".into())),vec![],&mut vec![]).is_none());
+        assert!(matches!(authority.original(None,0,4),Err(OriginalError::Unavailable(_))));
+        assert_eq!(authority.original(Some(&original.user_id),0,4).unwrap().text,"text");
+        authority.latest_user(&original.user_id).unwrap();assert_eq!(authority.original(None,0,4).unwrap().text,"text");
+        authority.latest_user("newer-unannotated-provider-user").unwrap();assert!(matches!(authority.original(None,0,4),Err(OriginalError::Unavailable(_))));
+    }
+
 }
