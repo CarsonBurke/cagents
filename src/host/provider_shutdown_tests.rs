@@ -151,7 +151,7 @@ impl<R: io::Read + AsRawFd> Captured<R> {
         })
     }
     fn drain(&mut self) -> io::Result<()> {
-        use io::{Read, Write};
+        use io::Write;
         let mut chunk = [0u8; 8192];
         // Output cannot monopolize the parent deadline. Excess is consumed and
         // discarded without increasing disk or memory residency.
