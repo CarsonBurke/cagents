@@ -4246,6 +4246,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 self.worktree_root_of(selected_path, &git_dir, cancellation)?
             })
         };
+        let (common_dir, git_dir, worktree_root) = if let Some(authority) = &self.authority {
+            if selected_path != authority.path() {
+                return Err(ValidationError::InvalidWorktree(selected_path.display().to_string()).into());
+            }
+            authority.validate()?;
+            (authority.stable_common_metadata_path().to_owned(),
+                authority.stable_private_metadata_path().to_owned(),
+                worktree_root.map(|_| authority.path().to_owned()))
+        } else { (common_dir, git_dir, worktree_root) };
         Ok(RepositoryInfo {
             id: RepositoryId(stable_path_uuid(&common_dir)),
             selected_path: selected_path.to_path_buf(),

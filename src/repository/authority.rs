@@ -416,6 +416,36 @@ mod authority_tests {
     }
 
     #[test]
+    fn captured_discovery_publishes_stable_names_and_identity_across_retained_handles() {
+        struct Isolated;
+        impl ProcessExecutor for Isolated {
+            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                SystemProcessExecutor.execute(&isolated_spec(command.clone()), cancel)
+            }
+        }
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().join("primary");
+        let linked = files.path().join("linked");
+        actual_git(files.path(), &["init", "--template=", "-b", "main", "primary"]);
+        actual_git(&root, &["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "Initial"]);
+        actual_git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+        let service = RepositoryService::new("git", Arc::new(Isolated));
+        let cancel = CancellationToken::new();
+        let primary = service.discover(&root, &cancel).unwrap();
+        for directory in [&root, &linked] {
+            let expected = service.discover(directory, &cancel).unwrap();
+            for _ in 0..2 {
+                let scoped = service.with_worktree_authority(WorktreeAuthority::capture(directory).unwrap()).unwrap();
+                let discovered = scoped.discover(directory, &cancel).unwrap();
+                assert_eq!(discovered, expected);
+                assert_eq!(discovered.id, primary.id);
+                assert!(!discovered.common_dir.to_string_lossy().contains("/proc/"));
+                assert!(scoped.discover(files.path(), &cancel).is_err());
+            }
+        }
+    }
+
+    #[test]
     fn captured_authority_actual_git_reads_and_stages_literal_c_filename() {
         struct Isolated;
         impl ProcessExecutor for Isolated {
