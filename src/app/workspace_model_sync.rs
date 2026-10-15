@@ -2395,4 +2395,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lost_remove_ack_reconnect_probes_original_operation_and_reports_success() {
+        use crate::terminal::ipc::{ClientEnvelope,ClientRequest,ServerEnvelope,ServerMessage,ServerResponse,PROTOCOL_VERSION,read_frame,write_frame};
+        fn connection(model:WorkspaceModel,expected:ModelEdit,lose_reply:bool)->(ControlClient,std::thread::JoinHandle<()>) {
+            let (reader,mut server)=std::os::unix::net::UnixStream::pair().unwrap();
+            let handle=std::thread::spawn(move || {
+                server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let proof=HostSessionProof {host_session_id:crate::model::HostSessionId::new("lost-remove-ack"),boot_id:crate::model::BootId::new("boot"),host_incarnation:crate::model::HostIncarnation::new("daemon")};
+                let reply=|stream:&mut std::os::unix::net::UnixStream,id,response|write_frame(stream,&ServerEnvelope {version:PROTOCOL_VERSION,request_id:Some(id),proof:proof.clone(),message:ServerMessage::Response {response}}).unwrap();
+                let connect:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();assert!(matches!(connect.request,ClientRequest::Connect {..}));reply(&mut server,connect.request_id,ServerResponse::Connected {proof:proof.clone(),resumed:vec![]});
+                let read:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();assert!(matches!(read.request,ClientRequest::ReadWorkspaceModel));reply(&mut server,read.request_id,ServerResponse::WorkspaceModel {model:model.clone()});
+                let edit:ClientEnvelope=read_frame(&mut server).unwrap().unwrap();let ClientRequest::EditWorkspaceModel {edit:actual}=edit.request else{panic!()};
+                match (&expected,&actual) {
+                    (ModelEdit::ChangeView {operation:expected,change:expected_change,..},ModelEdit::ChangeView {operation:actual,change:actual_change,..})=>{assert_eq!(expected,actual);assert_eq!(expected_change,actual_change);},
+                    _=>panic!("a reconnect must retain the exact conditional operation and original source"),
+                }
+                if lose_reply {return;} // committed server-side, reply was lost
+                reply(&mut server,edit.request_id,ServerResponse::WorkspaceModel {model});
+                assert!(read_frame::<ClientEnvelope>(&mut server).unwrap().is_none());
+            });
+            (ControlClient::from_stream(reader).unwrap(),handle)
+        }
+        let (model,scope,before)=removal_wire_fixture();let operation=uuid::Uuid::new_v4();
+        let edit=ModelEdit::ChangeView {scope,expected_revision:0,operation,change:crate::workspace_model::views::Change::RemoveSource {registry:model.identity,repository:"/repo".into(),before,execution_instance:None}};
+        let (updates,rx)=async_channel::unbounded();
+        let (mut first,server)=connection(model.clone(),edit.clone(),true);
+        assert!(send(&mut first,edit.clone(),&updates).is_err());drop(first);server.join().unwrap();assert!(rx.is_empty());
+        let mut applied=model;applied.sequence+=1;applied.views[0].revision+=1;applied.views[0].panes.clear();
+        let (mut reconnected,server)=connection(applied,edit.clone(),false);
+        send(&mut reconnected,edit,&updates).unwrap();drop(reconnected);server.join().unwrap();
+        assert!(matches!(rx.try_recv().unwrap(),ModelUpdate::ViewApplied {operation:Some(id),..} if id==operation));assert!(rx.is_empty());
+    }
+
 }
