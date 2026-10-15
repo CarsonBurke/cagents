@@ -216,6 +216,93 @@ mod tests {
         }
     }
 
+    fn register_editor_for_close(app: &mut Cagents, card: CardId) {
+        let mut state = app.durable.cards[0].clone();
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else { panic!("editor"); };
+        state.id = card; state.kind = CardKind::Repository(runtime.descriptor.clone());
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        let index = app.workspace.cards().len();
+        app.workspace.add_card(WorkspaceCard::new(card, "participant".into(), CardWidth::Fraction(0.5)).unwrap(), index, true).unwrap();
+        Arc::make_mut(&mut app.durable).focused = Some(card);
+    }
+
+    #[test]
+    fn publication_intake_refuses_an_already_owned_participant_close() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        for name in ["participant.rs", "unopened.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "participant.rs", original);
+        register_editor_for_close(&mut app, card);
+        let plan = plan(&app, root.path(), &["participant.rs", "unopened.rs"]);
+        let operation = operation(&app, card);
+        // Hold the actual original typed focus handoff before delivery.
+        let _held = app.request_card_removal(card);
+        let target = app.pending_card_removal_target(card).unwrap();
+        drop(app.publish_editor_workspace_edit(94, operation, plan));
+        assert!(!app.editor_features.publishing());
+        assert_eq!(app.pending_card_removal_target(card), Some(target));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+        assert_eq!(text(&app, card), original);
+        assert_eq!(std::fs::read_to_string(root.path().join("unopened.rs")).unwrap(), original);
+        assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("already closing")));
+    }
+
+    #[tokio::test]
+    async fn hidden_real_publisher_releases_only_the_original_waiting_close_after_success_or_failure() {
+        for fail_write in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let original = "fn old() {}\n";
+            for name in ["participant.rs", "unopened.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+            let mut app = app();
+            let card = buffer(&mut app, root.path(), "participant.rs", original);
+            register_editor_for_close(&mut app, card);
+            let plan = plan(&app, root.path(), &["participant.rs", "unopened.rs"]);
+            let operation = operation(&app, card);
+            let publishing = app.publish_editor_workspace_edit(95, operation, plan);
+            drop(app.finish_modal_update(Task::none()));
+            let hide = dialog_key(&app, "editor-publication.hide", keyboard::key::Named::Enter,
+                |message| matches!(message, Message::EditorFeatures(Action::HidePublication(95))));
+            drop(app.update(hide));
+            // Existing internal close admission can finish after a publisher
+            // starts. Deliver its actual typed target through the real App.
+            let _held = app.request_card_removal(card);
+            let target = app.pending_card_removal_target(card).unwrap();
+            drop(app.update(Message::CommitCloseTarget(target)));
+            assert_eq!(app.pending_card_removal_target(card), Some(target));
+            assert!(app.card_removal_current(target));
+            assert!(app.workspace.order().any(|id| id == card));
+            assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending()));
+            if fail_write { std::fs::write(root.path().join("unopened.rs"), "external change\n").unwrap(); }
+            // Poll the original publisher, not a fabricated Published result.
+            let mut retry = None;
+            let mut stream = iced::runtime::task::into_stream(publishing).unwrap();
+            while let Some(action) = stream.next().await {
+                let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::EditorFeatures(Action::Published { .. }))) = action else { continue; };
+                let result = app.update(message);
+                if let Some(mut effects) = iced::runtime::task::into_stream(result) {
+                    while let Some(effect) = effects.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::CommitCloseTarget(current))) = effect {
+                            assert!(retry.replace(current).is_none());
+                        }
+                    }
+                }
+            }
+            assert!(!app.editor_features.publishing());
+            assert_eq!(retry, Some(target), "only the original nonce/source/origin may resume");
+            assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+            assert_eq!(text(&app, card), if fail_write { original } else { "fn renamed() {}\n" });
+            assert_eq!(std::fs::read_to_string(root.path().join("unopened.rs")).unwrap(), if fail_write { "external change\n" } else { "fn renamed() {}\n" });
+            drop(app.update(Message::CommitCloseTarget(retry.unwrap())));
+            if !fail_write {
+                assert!(app.card_state(card).unwrap().existence.is_open(), "publication changes need fresh save/discard consent");
+                assert!(app.workspace.order().any(|id| id == card));
+                assert_eq!(text(&app, card), "fn renamed() {}\n");
+                assert!(app.pending_card_removal_target(card).is_none());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn hidden_publication_keeps_real_autosave_and_save_close_intents() {
         let root = tempfile::tempdir().unwrap();
@@ -1397,7 +1484,7 @@ impl Cagents {
                         for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
                         if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.clone())); }
                         self.feature_failure(publication.operation.card, error);
-                        return Task::batch([self.save_after_feature(&publication.operation), self.finish_editor_publication_saves(), self.modal_restore_focus(self.modal_restore_fallback())]);
+                        return Task::batch([self.save_after_feature(&publication.operation), self.finish_editor_publication_saves(), self.resume_waiting_editor_closes(), self.modal_restore_focus(self.modal_restore_fallback())]);
                     }
                     Ok(report) => report,
                 };
@@ -1426,6 +1513,7 @@ impl Cagents {
                     }
                 }
                 tasks.push(self.finish_editor_publication_saves());
+                tasks.push(self.resume_waiting_editor_closes());
                 tasks.push(self.modal_restore_focus(self.modal_restore_fallback()));
                 Task::batch(tasks)
             }
@@ -1511,6 +1599,22 @@ impl Cagents {
         if operation.open_files != self.editor_open_files() {
             self.reject_server_edit(&operation, "The open file tabs changed; prepare the edit again");
             self.feature_failure(operation.card, "The open file tabs changed; prepare the edit again");
+            return Task::none();
+        }
+        // A captured Close may already own this exact target while its focus
+        // handoff is waiting. Do not freeze a disappearing participant. This
+        // preflight complements the final typed Close write barrier.
+        let closing = self.workspace.pending_close().map(|pending| pending.unmounting);
+        let target_is_closing = self.cards.iter().any(|(card, runtime)| {
+            let CardRuntime::Repository(runtime) = runtime else { return false; };
+            let Some(path) = runtime.workspace_edit_candidate_source() else { return false; };
+            plan.documents.iter().any(|document| document.open_paths.contains(&path) || document.path == path)
+                && (closing == Some(*card) || self.pending_card_removal_target(*card).is_some())
+        });
+        if target_is_closing {
+            let error = "An edited buffer is already closing; cancel Close and prepare this edit again";
+            self.reject_server_edit(&operation, error);
+            self.feature_failure(operation.card, error);
             return Task::none();
         }
         // Publication authority and the server response move together. An
