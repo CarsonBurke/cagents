@@ -10,7 +10,7 @@ use std::sync::{Arc,Mutex,atomic::{AtomicBool,Ordering}};
 
 // Prevent simultaneous retained repair plans from exhausting daemon FDs/RAM.
 // Durable restart-negative rows have their separate64-entry budget.
-const MAX_LIVE_OPERATIONS:usize=4;
+const MAX_LIVE_OPERATIONS:usize=crate::project_recovery::PROJECT_OPERATION_LIVE_LIMIT;
 const MAX_RETAINED_DIRECTORIES:usize=1024;
 const MAX_RETAINED_BYTES:usize=16*1024*1024;
 

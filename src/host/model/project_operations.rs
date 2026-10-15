@@ -9,7 +9,7 @@ use crate::model::{CardId, TerminalId};
 use crate::project_recovery::{ProjectInstance, Relocation};
 use serde::{Deserialize, Serialize};
 
-pub(crate) const MAX_PENDING: usize = 64;
+pub(crate) const MAX_PENDING: usize = crate::project_recovery::PROJECT_OPERATION_PENDING_LIMIT;
 pub(crate) const MAX_OPERATIONS: usize = 65_536;
 const MAX_SCOPE_BYTES: usize = 1024 * 1024;
 
@@ -197,14 +197,14 @@ impl Registry {
     /// Original daemon operation IDs only, never a client-supplied status scope.
     /// Include positive receipts whose exact heavy custody is still retained.
     pub(crate) fn project_operations_for_registry_with_retained(&self,expected:Uuid,retained:&[Uuid])->Result<Vec<Obligation>,String> {
-        if retained.len()>MAX_PENDING {return Err("Retained operation status capture exceeds its bound".into());}
+        if retained.len()>crate::project_recovery::PROJECT_OPERATION_LIVE_LIMIT {return Err("Retained operation status capture exceeds its bound".into());}
         self.operation_snapshot(expected,|tx| {
             let mut rows=pending_in(tx)?;
             for operation in retained {
                 if rows.iter().any(|row|row.operation==*operation) {continue;}
                 let row=load_in(tx,*operation)?.ok_or("A retained original operation lost its journal receipt")?;
                 rows.push(row);
-                if rows.len()>MAX_PENDING {return Err("Combined pending and retained operation status exceeds its bound; custody was preserved".into());}
+                if rows.len()>crate::project_recovery::PROJECT_OPERATION_STATUS_LIMIT {return Err("Combined pending and retained operation status exceeds its bound; custody was preserved".into());}
             }
             if rows.iter().any(|row|row.project.registry!=expected) {return Err("The retained operation journal contains a different registry's scope".into());}
             Ok(rows)
@@ -343,6 +343,26 @@ mod tests {
         registry.db.execute("UPDATE project_operation_obligations SET registry=?2 WHERE operation=?1",params![operation.to_string(),Uuid::new_v4().to_string()]).unwrap();
         assert!(registry.project_operation_for_registry(scope.project.registry,operation).is_err());
     }
+    #[test]
+    fn full_pending_budget_cannot_hide_a_retained_positive_settlement_receipt() {
+        let (mut registry,_,scope)=setup();let original=Uuid::new_v4();
+        let request=digest(&scope.project).unwrap();let edit=ModelEdit::CloseProjectInstance{project:scope.project.clone()};
+        let commit=digest(&edit).unwrap();
+        registry.begin_project_operation(original,&request,&commit,&scope).unwrap();
+        for _ in 1..MAX_PENDING {registry.begin_project_operation(Uuid::new_v4(),&request,&commit,&scope).unwrap();}
+        registry.advance_project_operation(original,&request,Phase::Admitted,Phase::PendingCommit).unwrap();
+        let tx=registry.db.transaction().unwrap();model_committed(&tx,original,&request,&edit).unwrap();tx.commit().unwrap();
+        registry.advance_project_operation(original,&request,Phase::ModelCommitted,Phase::Resolved).unwrap();
+        let refill=Uuid::new_v4();registry.begin_project_operation(refill,&request,&commit,&scope).unwrap();
+        let rows=registry.project_operations_for_registry_with_retained(scope.project.registry,&[original]).unwrap();
+        assert_eq!(rows.len(),MAX_PENDING+1);
+        assert_eq!(rows.iter().filter(|row|row.phase==Phase::Resolved).count(),1);
+        assert!(rows.iter().any(|row|row.operation==refill&&row.phase==Phase::Admitted));
+        assert!(rows.iter().any(|row|row.operation==original&&row.scope.is_none()));
+        assert_eq!(registry.pending_project_operations().unwrap().len(),MAX_PENDING);
+        assert!(registry.begin_project_operation(Uuid::new_v4(),&request,&commit,&scope).is_err());
+    }
+
     #[test]
     fn original_operation_cannot_be_rekeyed_or_advanced_by_a_different_request() {
         let (mut registry,_,scope)=setup();let operation=Uuid::new_v4();

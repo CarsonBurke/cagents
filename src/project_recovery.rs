@@ -1,5 +1,11 @@
 //! Exact path migration for a project the user explicitly located again.
 //! Runtime/session identities and relative editor paths are preserved.
+// Include both durable unfinished rows and separately bounded original
+// daemon operations awaiting positive receipt cleanup after SQL settlement.
+pub(crate) const PROJECT_OPERATION_PENDING_LIMIT: usize = 64;
+pub(crate) const PROJECT_OPERATION_LIVE_LIMIT: usize = 4;
+pub(crate) const PROJECT_OPERATION_STATUS_LIMIT: usize = PROJECT_OPERATION_PENDING_LIMIT + PROJECT_OPERATION_LIVE_LIMIT;
+
 use crate::{
     model::{CardKind, TerminalContinuity, TerminalSession},
     workspace_model::views::{Scope, View},

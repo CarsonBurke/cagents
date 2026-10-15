@@ -1044,7 +1044,7 @@ impl ControlClient {
     /// owns the selected daemon/registry scope; this never chooses a new host.
     pub fn pending_project_operations(&mut self,registry:Uuid)->Result<Vec<crate::project_recovery::ProjectOperationStatus>,ControlError> {
         match self.request_strict(ClientRequest::ProjectOperations{registry})? {
-            ServerResponse::ProjectOperations{operations} if !registry.is_nil() && operations.len()<=64 && operations.iter().all(|status|
+            ServerResponse::ProjectOperations{operations} if !registry.is_nil() && operations.len()<=crate::project_recovery::PROJECT_OPERATION_STATUS_LIMIT && operations.iter().all(|status|
                 !status.operation.is_nil() && status.project.registry==registry && status.project.validate().is_ok()
                     && !(status.running&&status.resumable) && status.reason.len()<=4096)=>Ok(operations),
             response=>Err(unexpected_response("pending project operations",&response)),
@@ -4140,6 +4140,27 @@ mod tests {
         assert_eq!(client.pending_project_operations(registry).unwrap(),vec![expected]);
         assert!(matches!(client.resume_project_operation(registry,operation).unwrap(),ProjectOperationOutcome::Committed{operation:received,..} if received==operation));server.join().unwrap();
     }
+    #[test]
+    fn framed_status_accepts_full_pending_plus_retained_budget_and_refuses_overflow() {
+        use crate::project_recovery::{ProjectInstance,ProjectOperationStatus,ProjectOperationKind,ProjectOperationPhase,PROJECT_OPERATION_STATUS_LIMIT};
+        for count in [PROJECT_OPERATION_STATUS_LIMIT,PROJECT_OPERATION_STATUS_LIMIT+1] {
+            let (client_stream,mut peer_stream)=UnixStream::pair().unwrap();
+            peer_stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();peer_stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+            let host_proof=proof("status-capacity","boot","incarnation");let registry=Uuid::new_v4();
+            let server=thread::spawn(move|| {
+                let connected:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();
+                write_frame(&mut peer_stream,&connected_envelope(connected.request_id,host_proof.clone(),host_proof.clone())).unwrap();
+                let request:ClientEnvelope=read_frame(&mut peer_stream).unwrap().unwrap();assert_eq!(request.request,ClientRequest::ProjectOperations{registry});
+                let operations=(0..count).map(|index|ProjectOperationStatus{operation:Uuid::new_v4(),project:ProjectInstance{registry,repository:format!("/original-{index}").into(),ordinal:1},kind:ProjectOperationKind::Remove,phase:ProjectOperationPhase::PendingCommit,running:false,resumable:true,reason:"Original custody retained".into()}).collect();
+                write_frame(&mut peer_stream,&ServerEnvelope{version:PROTOCOL_VERSION,request_id:Some(request.request_id),proof:host_proof,message:ServerMessage::Response{response:ServerResponse::ProjectOperations{operations}}}).unwrap();
+            });
+            let mut client=ControlClient::from_stream(client_stream).unwrap();
+            let result=client.pending_project_operations(registry);
+            if count==PROJECT_OPERATION_STATUS_LIMIT {assert_eq!(result.unwrap().len(),count);}else{assert!(result.is_err());}
+            server.join().unwrap();
+        }
+    }
+
     #[test]
     fn operation_metadata_and_resume_reject_substituted_registry_operation_or_running_grant() {
         use crate::project_recovery::{ProjectInstance,ProjectOperationStatus,ProjectOperationKind,ProjectOperationPhase,ProjectOperationOutcome};
