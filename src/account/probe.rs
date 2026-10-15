@@ -499,9 +499,7 @@ async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
         command.env_remove(variable);
     }
     if let Some(home) = std::env::var_os("HOME") {
-        command.env("HOME", &home).current_dir(home);
-    } else {
-        command.env_remove("HOME");
+        command.current_dir(home);
     }
     command
         .stdin(Stdio::null())
@@ -612,8 +610,12 @@ fn command(account: &Account, program: &Path, configuration: &crate::settings::A
     for variable in account.credential_overrides() {
         command.env_remove(variable);
     }
+    // Account identity is scoped before this command is built. Preserve the
+    // original reader HOME even when native launches have a HOME override.
     if let Some(home) = std::env::var_os("HOME") {
-        command.current_dir(home);
+        command.env("HOME", &home).current_dir(home);
+    } else {
+        command.env_remove("HOME");
     }
     command
         .stdin(Stdio::null())
