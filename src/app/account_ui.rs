@@ -1051,6 +1051,9 @@ pub enum Action {
     /// changed, and what went wrong, if anything.
     Removed {
         id: AccountId,
+        /// Preserve the explicit destructive intent for original-prompt query
+        /// lineage invalidation. Archive and Move deliberately retain it.
+        delete_requested: bool,
         registry: Option<Registry>,
         error: Option<String>,
     },
@@ -3045,6 +3048,7 @@ impl Cagents {
             }
             Action::Removed {
                 id,
+                delete_requested: _,
                 registry,
                 error,
             } => {
@@ -4235,6 +4239,7 @@ impl Cagents {
         {
             return Task::none();
         }
+        let delete_requested = matches!(&operation, account::remote::Operation::DeleteFiles { .. });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 remote_lifecycle::<(Registry, Option<String>)>(operation)
@@ -4248,6 +4253,7 @@ impl Cagents {
             };
             Message::AccountUi(Action::Removed {
                 id,
+                delete_requested,
                 registry,
                 error,
             })
@@ -8265,6 +8271,7 @@ mod app_tests {
         // table follows the registry, and the reader hears about the rest.
         let _ = app.update(Message::AccountUi(Action::Removed {
             id: managed.clone(),
+            delete_requested: false,
             registry: Some(remaining),
             error: Some("its files could not be deleted: busy".into()),
         }));
