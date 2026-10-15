@@ -986,6 +986,10 @@ pub(super) fn process(
             let origin = origin(host, &authority)?;
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let source = registry(host)?.lock().unwrap_or_else(|p| p.into_inner()).agent(id)?
+                .session.ok_or("The agent has no exact provider source")?;
+            let transition = super::chat::presentation_close::transition_gate(host, source.id());
+            let _transition = transition.try_lock().map_err(|_| "The provider is changing incarnation; retry inspection after it settles")?;
             let registry = registry(host)?;
             let observation = registry.lock().unwrap_or_else(|p| p.into_inner())
                 .inspect_presentation_close(&origin, id)?;
@@ -997,6 +1001,8 @@ pub(super) fn process(
             let id = observed.observation.agent.id;
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let transition = super::chat::presentation_close::transition_gate(host, observed.observation.source.id());
+            let _transition = transition.try_lock().map_err(|_| "The provider is changing incarnation; no close consent was applied")?;
             let registry = registry(host)?;
             registry.lock().unwrap_or_else(|p| p.into_inner())
                 .preflight_presentation_close(&origin, &observed.observation)?;

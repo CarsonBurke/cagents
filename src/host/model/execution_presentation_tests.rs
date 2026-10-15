@@ -203,7 +203,7 @@ fn combined_close_model_commits_exact_pane_and_agent_without_rewriting_completed
     assert!(!format!("{observed:?}").contains("Preserved review report"));
     // This is the model boundary only: real service tests must first prove
     // normal provider/paired teardown and retain its exact receipt on failure.
-    assert!(registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 10, &observed).unwrap());
+    assert!(registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 10, &observed, std::slice::from_ref(&observed.source)).unwrap());
     let closed = registry.agent(accepted.agent.id).unwrap();
     let mut expected = observed.agent.clone(); expected.closed = true;
     assert_eq!(closed, expected);
@@ -212,7 +212,7 @@ fn combined_close_model_commits_exact_pane_and_agent_without_rewriting_completed
     assert!(view.panes.is_empty()); assert!(view.retired.contains(&observed.pane.id));
     assert_eq!(view.revision, observed.view_revision + 1);
     assert_eq!(registry.model().unwrap().sequence, sequence + 1);
-    assert!(registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 11, &observed).is_err());
+    assert!(registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 11, &observed, std::slice::from_ref(&observed.source)).is_err());
     // Subsequent ordinary close is provider-free/idempotent at this boundary.
     assert_eq!(registry.close_agent(&Origin::User, closed.id).unwrap(), closed);
     drop(registry);
@@ -229,7 +229,7 @@ fn combined_close_model_cancels_only_unfinished_runs_and_preserves_their_result(
         destination: Destination::Existing(accepted.agent.id), prompt: "A queued turn".into(),
         idempotency_key: "queued-consented-close".into()}, 5).unwrap();
     let observed = registry.inspect_presentation_close(&Origin::User, observed.agent.id).unwrap().unwrap();
-    registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 10, &observed).unwrap();
+    registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 10, &observed, std::slice::from_ref(&observed.source)).unwrap();
     assert_eq!(registry.agent_run(historical.id).unwrap(), historical);
     let cancelled = registry.agent_run(next.run.id).unwrap();
     assert_eq!(cancelled.state, State::Cancelled);
@@ -262,12 +262,12 @@ fn combined_close_model_refuses_late_cas_and_fresh_observation_can_retry_without
         let before = registry.model().unwrap();
         let agent = registry.agent(accepted.agent.id).unwrap();
         let run = registry.agent_run(accepted.run.id).unwrap();
-        assert!(registry.retire_agent_process_with_presentation(&origin, &source, 10, &observed).is_err(), "{case}");
+        assert!(registry.retire_agent_process_with_presentation(&origin, &source, 10, &observed, std::slice::from_ref(&observed.source)).is_err(), "{case}");
         assert_eq!(registry.model().unwrap(), before, "{case}");
         assert_eq!(registry.agent(accepted.agent.id).unwrap(), agent);
         assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
         let fresh = registry.inspect_presentation_close(&Origin::User, accepted.agent.id).unwrap().unwrap();
-        registry.retire_agent_process_with_presentation(&Origin::User, &fresh.source, 11, &fresh).unwrap();
+        registry.retire_agent_process_with_presentation(&Origin::User, &fresh.source, 11, &fresh, std::slice::from_ref(&fresh.source)).unwrap();
         assert!(registry.agent(accepted.agent.id).unwrap().closed);
         assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
     }
@@ -280,14 +280,14 @@ fn combined_close_model_write_failure_rolls_back_pane_runs_authority_and_agent()
     let run = registry.agent_run(accepted.run.id).unwrap();
     registry.db.execute_batch("CREATE TRIGGER reject_combined_close BEFORE UPDATE ON agents
         BEGIN SELECT RAISE(FAIL, 'fixture close commit refused'); END;").unwrap();
-    assert!(registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 10, &observed)
+    assert!(registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 10, &observed, std::slice::from_ref(&observed.source))
         .unwrap_err().contains("fixture close commit refused"));
     assert_eq!(registry.model().unwrap(), before);
     assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
     assert_eq!(registry.agent(accepted.agent.id).unwrap(), observed.agent);
     registry.preflight_presentation_close(&Origin::User, &observed).unwrap();
     registry.db.execute_batch("DROP TRIGGER reject_combined_close;").unwrap();
-    registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 11, &observed).unwrap();
+    registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 11, &observed, std::slice::from_ref(&observed.source)).unwrap();
 }
 
 #[test]
@@ -312,7 +312,29 @@ fn combined_close_observation_refuses_closed_pending_live_recorded_and_wrong_own
         let before = registry.model().unwrap();
         assert!(registry.inspect_presentation_close(&origin, accepted.agent.id).is_err(), "{case}");
         assert!(registry.preflight_presentation_close(&origin, &observed).is_err(), "{case}");
-        assert!(registry.retire_agent_process_with_presentation(&origin, &observed.source, 10, &observed).is_err(), "{case}");
+        assert!(registry.retire_agent_process_with_presentation(&origin, &observed.source, 10, &observed, std::slice::from_ref(&observed.source)).is_err(), "{case}");
         assert_eq!(registry.model().unwrap(), before, "{case}");
     }
+}
+
+#[test]
+fn combined_close_retires_every_verified_authority_alias_in_its_single_commit() {
+    let (mut registry, _directory, accepted, observed) = presentation_close_fixture();
+    let mut alias = observed.source.clone();
+    let HostedSession::Chat(session) = &mut alias else {unreachable!()};
+    session.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("issued-before-adoption");
+    let authority = registry.register_agent_authority(&alias).unwrap();
+    let before = registry.model().unwrap();
+    let run = registry.agent_run(accepted.run.id).unwrap();
+    // The model is not allowed to revoke an alias whose exact cleanup proof
+    // was absent from the service's verified set, even at the same session ID.
+    assert!(registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 10,
+        &observed, std::slice::from_ref(&observed.source)).is_err());
+    assert_eq!(registry.model().unwrap(), before);
+    assert_eq!(registry.agent_authority_source(&authority).unwrap(), Some(alias.clone()));
+    registry.retire_agent_process_with_presentation(&Origin::User, &observed.source, 11,
+        &observed, &[observed.source.clone(), alias]).unwrap();
+    assert!(registry.agent_authority_source(&authority).is_err());
+    assert!(registry.agent(accepted.agent.id).unwrap().closed);
+    assert_eq!(registry.agent_run(run.id).unwrap(), run);
 }

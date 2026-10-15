@@ -360,6 +360,16 @@ impl RemoteActor {
                     .any(|capability| capability == CAPABILITY)
             })
     }
+    pub fn retirement_proved(record: &Record, proof: &HostSessionProof) -> Result<bool, String> {
+        if !Self::is_record(record)
+            || !registry::record_application_matches(record)
+            || !proof.is_complete()
+            || proof.boot_id != record.boot
+        {
+            return Err("Retained retirement request has incompatible actor or attachment authority".into());
+        }
+        final_snapshot::retirement_proved_for_record(record, proof)
+    }
     pub fn wake_outcomes(&self) {
         let state = self.state();
         if state.outbox_latest > state.outbox_ack

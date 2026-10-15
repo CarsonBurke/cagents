@@ -3,7 +3,7 @@
 
 mod cleanup;
 mod transport;
-pub(crate) use cleanup::{Detached, closed_pair_holder, closed_source, confirm_pair_closed};
+pub(crate) use cleanup::{Detached, closed_pair_holder, closed_source, closed_source_proof, confirm_pair_closed};
 pub(crate) use cleanup::{actor_close_proved, publish_actor_close};
 pub(crate) use transport::{Holder, adopt, inspect, spawn};
 
