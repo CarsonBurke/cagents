@@ -2227,7 +2227,11 @@ impl Actor {
         }
         let updates=self.adapter.take_approval_updates();
         let warning=self.annotations.lock().unwrap_or_else(|p|p.into_inner()).apply(confirmed.as_ref(),updates,&mut step.events);
-        if let Some(message)=warning{step.events.push(Event::Error{message,fatal:false});}
+        if let Some(message)=warning{
+            // Annotation infrastructure is not a provider failure. Keep it in
+            // diagnostics so it cannot replace the turn's actual root cause.
+            tracing::warn!(%message,"conversation annotation storage unavailable");
+        }
         for value in step.writes {
             let mut frame = BoundedFrame(Vec::new());
             serde_json::to_writer(&mut frame, &value)

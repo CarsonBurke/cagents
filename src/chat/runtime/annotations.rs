@@ -141,4 +141,29 @@ mod tests {
         assert!(authority.apply(Some(&confirmed),vec![],&mut vec![]).is_none());assert!(authority.store.is_some(),"same session must recover once storage is available");
     }
 
+    #[test]
+    fn annotation_failure_does_not_replace_provider_error_or_failed_run_diagnostic(){
+        use super::super::{Handle,Update};
+        use crate::agent_execution::ProviderEvent;
+        struct ProviderFailure(crate::model::RunId);
+        impl Adapter for ProviderFailure {
+            fn initialize(&mut self)->Result<Step,String>{Ok(Step::default())}
+            fn command(&mut self,_:Command)->Result<Step,String>{Ok(Step{writes:vec![json!({})],..Step::default()})}
+            fn receive(&mut self,_:Value)->Result<Step,String>{
+                let execution=|event|Event::Execution{run:self.0,event};
+                Ok(Step{events:vec![Event::Session{id:"confirmed-session".into(),title:None},execution(ProviderEvent::Started{key:"request".into()}),execution(ProviderEvent::Scope),Event::Error{message:"Provider overloaded: 529".into(),fatal:false},execution(ProviderEvent::Settled),execution(ProviderEvent::Finished{outcome:crate::notifications::Kind::Failed})],..Step::default()})
+            }
+        }
+        let root=tempfile::tempdir().unwrap();let home=root.path().join("codex-home");std::fs::create_dir(&home).unwrap();let scope=LaunchAccountScope::resolve(crate::agent::Provider::Codex,root.path(),|key|(key=="CODEX_HOME").then(||home.as_os_str().to_owned())).unwrap();
+        let spec=protocol::ProcessSpec{execution:None,messages:None,unset_environment:Default::default(),transport:protocol::TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:vec![],working_directory:root.path().to_owned(),environment:Default::default()};
+        let mut initial=Step::default();let cache=super::super::preflight(&spec,&mut initial).unwrap();let (send,receive)=crossbeam_channel::bounded(1);
+        let handle=Handle::start_inner(spec,Box::new(ProviderFailure(crate::model::RunId::new())),initial,cache,None,None,Ok(scope),move|update|{if let Update::Execution{update:crate::agent_execution::Update::Finished{result,..},..}=update{let _=send.try_send(result);}}).unwrap();
+        let blocked=root.path().join("blocked-annotations");std::fs::write(&blocked,b"not a directory").unwrap();handle.0.annotations.lock().unwrap().root=Some(blocked);
+        handle.command(Command::Compact).unwrap();let result=receive.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        assert_eq!(result.diagnostic.as_deref(),Some("Provider overloaded: 529"));
+        assert_eq!(handle.snapshot(None).unwrap().error.as_deref(),Some("Provider overloaded: 529"));
+        assert!(handle.0.annotations.lock().unwrap().notice.is_some(),"fixture must actually fail annotation initialization");
+        handle.close().unwrap();
+    }
+
 }
