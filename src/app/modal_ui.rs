@@ -7,6 +7,7 @@ use std::sync::atomic::Ordering;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Modal {
     PullRequest,
+    Clone,
     Resume,
     Worktree,
     Channel,
@@ -274,6 +275,8 @@ impl Stack {
 impl Cagents {
     fn modal_instance(&self, modal: Modal) -> Option<Instance> {
         match modal {
+            Modal::Clone => self.chrome_ui.clone_repository.as_ref()
+                .map(|dialog| Instance::Operation(dialog.request())),
             Modal::Project(role) => self
                 .project_ui
                 .modal_target(role)
@@ -344,6 +347,7 @@ impl Cagents {
         }
         active!(PullRequest, self.pull_request_dialog.is_some());
         active!(Resume, self.resume_ui.open);
+        active!(Clone, self.chrome_ui.clone_repository.is_some());
         active!(Worktree, self.worktree_dialog.is_some());
         active!(Channel, self.channel_ui.modal_open());
         result.extend(self.project_ui.modal_roles().map(Modal::Project));
@@ -453,6 +457,7 @@ impl Cagents {
         match modal {
             Modal::PullRequest => pull_request_dialog_focus_id(),
             Modal::Resume => resume_ui::focus_id(),
+            Modal::Clone => onboarding_ui::clone_focus_id(),
             Modal::Worktree => worktree_dialog_focus_id(),
             Modal::Channel => channel_ui::State::focus_target(),
             Modal::Project(role) => self.project_ui.focus_target_for(role),
@@ -487,6 +492,7 @@ impl Cagents {
         match self.top_modal() {
             None => return Task::none(),
             Some(top) => match top {
+                Modal::Clone => self.update_onboarding(onboarding_ui::Action::Cancel),
                 Modal::Channel => self.handle_channel_ui(channel_ui::Action::Dismiss),
                 Modal::Project(role) => self.dismiss_project_modal(role),
                 Modal::Selection => {

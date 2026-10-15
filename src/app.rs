@@ -21855,6 +21855,9 @@ impl Application for Cagents {
         let top = self.top_modal()?;
         #[rustfmt::skip]
         let dialog = (|| {
+        if top == modal_ui::Modal::Clone {
+            return self.clone_repository_dialog();
+        }
         if top == modal_ui::Modal::ChatClose {
             return self.chat_close_dialog();
         }

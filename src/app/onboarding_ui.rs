@@ -33,6 +33,12 @@ pub(super) struct CloneRepository {
     cancellation: CancellationToken,
 }
 
+impl CloneRepository {
+    pub(super) fn request(&self) -> crate::model::OperationId {
+        crate::model::OperationId::from_uuid(self.id)
+    }
+}
+
 impl Drop for CloneRepository {
     fn drop(&mut self) {
         self.cancellation.cancel();
@@ -384,7 +390,7 @@ impl Cagents {
         if matches!(
             &action,
             Action::Url(_) | Action::Destination(_) | Action::Submit | Action::Cancel
-        ) && (!self.form_dialog_on_top() || self.update_prepared)
+        ) && (self.top_modal() != Some(modal_ui::Modal::Clone) || self.update_prepared)
         {
             return Task::none();
         }
@@ -415,7 +421,7 @@ impl Cagents {
                     error: None,
                     cancellation: CancellationToken::new(),
                 });
-                iced::widget::operation::focus(clone_focus_id()).map(cosmic::Action::App)
+                self.modal_focus(clone_focus_id())
             }
             Action::Url(value) => {
                 if let Some(dialog) = self
@@ -454,9 +460,7 @@ impl Cagents {
                         .map(|card| self.card_keyboard_focus(card))
                         .or_else(|| Some(widget::Id::new(TOOLBAR_FOCUS_ID)))
                 };
-                target.map_or_else(Task::none, |target| {
-                    iced::widget::operation::focus(target).map(cosmic::Action::App)
-                })
+                target.map_or_else(Task::none, |target| self.modal_restore_focus(target))
             }
             Action::Submit => {
                 let Some(dialog) = self
@@ -521,6 +525,8 @@ impl Cagents {
 
     pub(super) fn clone_repository_dialog(&self) -> Option<Element<'_, Message>> {
         let dialog = self.chrome_ui.clone_repository.as_ref()?;
+        let can_submit = !dialog.running && !dialog.url.trim().is_empty()
+            && !dialog.destination.trim().is_empty();
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title("Clone repository").into(),
             design::caption("Use an HTTPS or SSH URL, or an absolute local repository path. Existing Git credentials are used.")
@@ -528,11 +534,13 @@ impl Cagents {
             design::caption("Repository URL").into(),
             crate::ui_controls::field::text("https://github.com/owner/repository.git", &dialog.url)
                 .id(clone_focus_id()).on_input_maybe((!dialog.running).then_some(|value| Message::Onboarding(Action::Url(value))))
+                .on_submit_maybe(can_submit.then_some(|_| Message::Onboarding(Action::Submit)))
                 .into(),
             design::caption("New folder (absolute path)").into(),
             crate::ui_controls::field::text("/home/you/projects/repository", &dialog.destination)
                 .id(widget::Id::new("onboarding.clone.destination"))
                 .on_input_maybe((!dialog.running).then_some(|value| Message::Onboarding(Action::Destination(value))))
+                .on_submit_maybe(can_submit.then_some(|_| Message::Onboarding(Action::Submit)))
                 .into(),
         ];
         if let Some(error) = &dialog.error {
@@ -541,27 +549,13 @@ impl Cagents {
         if dialog.running {
             rows.push(design::body("Cloning repository…").into());
         }
-        rows.push(
-            widget::row::with_children(vec![
-                crate::ui_controls::button::secondary(if dialog.running {
-                    "Stop clone"
-                } else {
-                    "Cancel"
-                })
-                .on_press(Message::Onboarding(Action::Cancel))
-                .into(),
-                crate::ui_controls::button::primary("Clone and open")
-                    .on_press_maybe(
-                        (!dialog.running
-                            && !dialog.url.trim().is_empty()
-                            && !dialog.destination.trim().is_empty())
-                        .then_some(Message::Onboarding(Action::Submit)),
-                    )
-                    .into(),
-            ])
-            .spacing(space::S)
-            .into(),
-        );
+        rows.push(dialog_ui::confirmation_actions(
+            crate::ui_controls::button::secondary(if dialog.running { "Stop clone" } else { "Cancel" })
+                .id(widget::Id::new("onboarding.clone.cancel"))
+                .on_press(Message::Onboarding(Action::Cancel)),
+            crate::ui_controls::button::primary("Clone and open")
+                .on_press_maybe(can_submit.then_some(Message::Onboarding(Action::Submit))),
+        ));
         Some(dialog_ui::overlay(
             dialog_ui::surface(widget::column::with_children(rows).spacing(space::S), 560.0),
             Some(Message::Onboarding(Action::Cancel)),
@@ -932,10 +926,10 @@ mod tests {
         let dialog = app.chrome_ui.clone_repository.as_ref().unwrap();
         let id = dialog.id;
         let cancellation = dialog.cancellation.clone();
-        assert!(app.form_dialog_is_open());
-        let _ = app.cancel_form_dialog();
+        assert!(app.modal_is_open());
+        let _ = app.cancel_top_modal();
         assert!(cancellation.is_cancelled());
-        assert!(!app.form_dialog_is_open());
+        assert!(!app.modal_is_open());
         let _ = app.update_onboarding(Action::Clone);
         let new_id = app.chrome_ui.clone_repository.as_ref().unwrap().id;
         let _ = app.update_onboarding(Action::Finished {
@@ -1031,5 +1025,115 @@ mod native_header_tests {
         docked.window_width = 640.0;
         assert!(docked.context_inspector_is_overlay());
         assert_eq!(close_messages(docked.view()), 1);
+    }
+
+    #[test]
+    fn clone_field_enter_matches_the_primary_buttons_enabled_state() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update_onboarding(Action::Clone));
+        let renderer = super::super::tests::headless_renderer();
+        for (running, filled, submits) in [(false, false, false), (false, true, true), (true, true, false)] {
+            let form = app.chrome_ui.clone_repository.as_mut().unwrap();
+            form.running = running;
+            form.url = if filled { "https://example.invalid/repo.git".into() } else { String::new() };
+            form.destination = if filled { "/fixture/clone".into() } else { String::new() };
+            for id in [clone_focus_id(), widget::Id::new("onboarding.clone.destination")] {
+                let mut element = app.clone_repository_dialog().unwrap();
+                let mut tree = Tree::new(&element);
+                let bounds = Rectangle::with_size(Size::new(800.0, 600.0));
+                let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                    &layout::Limits::new(Size::ZERO, bounds.size()));
+                element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+                    &mut iced::advanced::widget::operation::focusable::focus::<()>(id));
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(&mut tree, &Event::Keyboard(keyboard::Event::KeyPressed {
+                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Enter),
+                    location: keyboard::Location::Standard,
+                    modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+                }), Layout::new(&node), mouse::Cursor::Unavailable, &renderer,
+                    &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+                assert_eq!(messages.iter().any(|message| matches!(message, Message::Onboarding(Action::Submit))), submits,
+                    "running={running}, filled={filled}");
+            }
+        }
+    }
+
+    fn emitted_clone_form_message(app: &Cagents, focus: widget::Id, editing: bool) -> Message {
+        let renderer = super::super::tests::headless_renderer();
+        let mut element = app.dialog().expect("actual registered Clone surface");
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(Size::new(800.0, 600.0));
+        let node = element.as_widget_mut().layout(&mut tree, &renderer,
+            &layout::Limits::new(Size::ZERO, bounds.size()));
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(focus));
+        let mut messages = Vec::new();
+        let key = if editing { keyboard::Key::Character("x".into()) }
+            else { keyboard::Key::Named(keyboard::key::Named::Enter) };
+        element.as_widget_mut().update(&mut tree, &Event::Keyboard(keyboard::Event::KeyPressed {
+            modified_key: key.clone(), key,
+            physical_key: keyboard::key::Physical::Code(if editing { keyboard::key::Code::KeyX }
+                else { keyboard::key::Code::Enter }),
+            location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(),
+            text: editing.then(|| "x".into()), repeat: false,
+        }), Layout::new(&node), mouse::Cursor::Unavailable, &renderer,
+            &mut clipboard::Null, &mut Shell::new(&mut messages), &bounds);
+        messages.into_iter().find(|message| matches!(message,
+            Message::ModalSurface { message, .. } if matches!(&**message, Message::Onboarding(_))))
+            .expect("actual widget emits an owner-bound Clone action")
+    }
+
+    #[test]
+    fn replaced_clone_request_rejects_held_widget_input_submit_and_cancel() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_destination = directory.path().join("original").to_string_lossy().into_owned();
+        let replacement_destination = directory.path().join("replacement").to_string_lossy().into_owned();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.update_onboarding(Action::Clone));
+        {
+            let dialog = app.chrome_ui.clone_repository.as_mut().unwrap();
+            dialog.url = "https://example.invalid/original.git".into();
+            dialog.destination = original_destination.clone();
+        }
+        drop(app.finish_modal_update(Task::none()));
+        let original = app.modal_surface_target(modal_ui::Modal::Clone);
+        let held = [
+            emitted_clone_form_message(&app, clone_focus_id(), true),
+            emitted_clone_form_message(&app, clone_focus_id(), false),
+            emitted_clone_form_message(&app, widget::Id::new("onboarding.clone.cancel"), false),
+        ];
+        // No intermediate reconciliation: the instance must fence delivery
+        // before any prelude can discover the same-role replacement.
+        drop(app.update_onboarding(Action::Clone));
+        {
+            let dialog = app.chrome_ui.clone_repository.as_mut().unwrap();
+            dialog.url = "https://example.invalid/replacement.git".into();
+            dialog.destination = replacement_destination.clone();
+        }
+        let replacement = app.modal_surface_target(modal_ui::Modal::Clone);
+        assert_ne!(original, replacement);
+        for decision in held {
+            assert!(iced::runtime::task::into_stream(app.update(decision)).is_none());
+            assert_eq!(app.modal_surface_target(modal_ui::Modal::Clone), replacement);
+            let dialog = app.chrome_ui.clone_repository.as_ref().unwrap();
+            assert_eq!(dialog.url, "https://example.invalid/replacement.git");
+            assert_eq!(dialog.destination, replacement_destination);
+            assert!(!dialog.running);
+        }
+        drop(app.finish_modal_update(Task::none()));
+        let current = emitted_clone_form_message(&app, clone_focus_id(), true);
+        drop(app.update(current));
+        assert_ne!(app.chrome_ui.clone_repository.as_ref().unwrap().url,
+            "https://example.invalid/replacement.git");
+        let submit = emitted_clone_form_message(&app, clone_focus_id(), false);
+        // The worker is deliberately not polled: this is user-consent
+        // admission, not a live/network Git clone test.
+        drop(app.update(submit));
+        assert!(app.chrome_ui.clone_repository.as_ref().unwrap().running);
+        let cancel = emitted_clone_form_message(&app, widget::Id::new("onboarding.clone.cancel"), false);
+        drop(app.update(cancel));
+        assert!(app.chrome_ui.clone_repository.is_none());
     }
 }
