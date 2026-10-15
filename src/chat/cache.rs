@@ -9,6 +9,18 @@ pub struct SourceKey {
     pub agent_id: Option<String>,
     pub source_id: String,
 }
+/// Store-authored association between one visible item and original prose.
+/// Provider IDs remain opaque even when they resemble a native part suffix.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourcePart {
+    pub item_id: String,
+    pub source: SourceKey,
+    pub start: usize,
+    pub end: usize,
+    pub source_len: usize,
+    /// A bounded resident child placeholder represents no original bytes.
+    pub replacement: bool,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceQuery {
     pub source: SourceKey,
