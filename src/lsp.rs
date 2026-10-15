@@ -3598,8 +3598,35 @@ struct DocumentRef {
 /// distinguish it from the one it retired.
 static NEXT_MANAGER_GENERATION: AtomicU64 = AtomicU64::new(1);
 
+/// Shares an outgoing manager's bounded reap without letting cancellation of
+/// any one new session cancel that reap or release other sessions early.
+struct LaunchBarrier {
+    predecessor:Mutex<Option<std::pin::Pin<Box<dyn Future<Output=()>+Send+'static>>>>,
+    ready:AtomicBool,
+    changed:Notify,
+}
+impl LaunchBarrier {
+    async fn wait(self:Arc<Self>) {
+        let predecessor={self.predecessor.lock().unwrap_or_else(|p|p.into_inner()).take()};
+        if let Some(predecessor)=predecessor {
+            let barrier=Arc::clone(&self);
+            tokio::spawn(async move {
+                predecessor.await;
+                barrier.ready.store(true,Ordering::Release);
+                barrier.changed.notify_waiters();
+            });
+        }
+        loop {
+            let changed=self.changed.notified();
+            if self.ready.load(Ordering::Acquire){return;}
+            changed.await;
+        }
+    }
+}
+
 /// The application's single LSP client.
 pub struct LspManager {
+    launch_barrier:Option<Arc<LaunchBarrier>>,
     servers: Vec<LanguageServerSettings>,
     /// Lowercase extension to the first server and language that claims it.
     extensions: HashMap<String, LspLanguage>,
@@ -3675,6 +3702,7 @@ impl LspManager {
             transport: Arc::new(spawn_process_transport),
             retiring: Vec::new(),
             flusher: None,
+            launch_barrier:None,
             next_request: 1,
             generation: NEXT_MANAGER_GENERATION.fetch_add(1, Ordering::Relaxed),
             stopping: false,
@@ -4034,6 +4062,15 @@ impl LspManager {
         self
     }
 
+    /// Delays new processes until a replaced manager has reaped its servers.
+    /// Configuration changes remain asynchronous while preserving the cap
+    /// across the old and new managers' independent admission semaphores.
+    #[must_use]
+    pub fn after_shutdown(mut self,predecessor:impl Future<Output=()>+Send+'static)->Self {
+        self.launch_barrier=Some(Arc::new(LaunchBarrier{predecessor:Mutex::new(Some(Box::pin(predecessor))),ready:AtomicBool::new(false),changed:Notify::new()}));
+        self
+    }
+
     /// Cached server RSS; reading this performs no filesystem I/O.
     pub fn live_servers(&self) -> Vec<String> {
         let mut servers: Vec<_> = self
@@ -4274,6 +4311,7 @@ impl LspManager {
     ///
     /// Bounded by [`SESSION_REAP_TIMEOUT`]; see [`reap_sessions`].
     pub async fn wait_for_shutdown(&mut self) {
+        if let Some(barrier)=self.launch_barrier.clone(){barrier.wait().await;}
         self.collect_retired_sessions();
         reap_sessions(std::mem::take(&mut self.retiring)).await;
         if let Some(flusher) = self.flusher.take() {
@@ -4294,6 +4332,7 @@ impl LspManager {
     pub fn begin_shutdown(&mut self) -> impl Future<Output = ()> + Send + 'static {
         self.shutdown();
         let sessions = std::mem::take(&mut self.retiring);
+        let launch_barrier=self.launch_barrier.clone();
         if let Some(flusher) = self.flusher.take() {
             flusher.abort();
         }
@@ -4305,6 +4344,7 @@ impl LspManager {
             Err(_) => Err(sessions),
         };
         async move {
+            if let Some(barrier)=launch_barrier {barrier.wait().await;}
             match reaper {
                 Ok(reaper) => {
                     let _ = reaper.await;
@@ -4509,10 +4549,12 @@ impl LspManager {
             stderr: Arc::new(StderrTail::default()),
         };
         let process_slots = Arc::clone(&self.process_slots);
+        let launch_barrier=self.launch_barrier.clone();
         *handle
             .task
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(runtime.spawn(async move {
+            if let Some(barrier)=launch_barrier {barrier.wait().await;}
             // A replacement waits until an evicted process is fully reaped,
             // so graceful shutdown cannot temporarily exceed the cap.
             let Ok(_slot) = process_slots.acquire_owned().await else {
@@ -8801,4 +8843,28 @@ mod tests {
             "the refused item is omitted and the rest are still offered"
         );
     }
+
+    #[test]
+    fn reconfiguration_waits_for_prior_reap_even_across_an_empty_intermediate_manager(){block_on(async{
+        let (_guard,worktree,file)=workspace();let (release,waiting)=tokio::sync::oneshot::channel::<()>();
+        let mut intermediate=rust_manager().after_shutdown(async move{let _=waiting.await;});
+        // A second settings change before root discovery has opened any
+        // document must preserve the first manager's outstanding reap.
+        let predecessor=intermediate.begin_shutdown();
+        let mut manager=rust_manager().with_lifecycle(1,1).after_shutdown(predecessor);
+        let slot=install_fake(&mut manager,incremental_capabilities(), |_|Vec::new());let events=manager.events();let doc=LspDocumentId(1);
+        manager.open_for_test(doc,&file,&worktree,rust_language(),1,"fn f() {}\n");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(slot.lock().unwrap().is_none(),"replacement process started before old reap completed");
+        release.send(()).unwrap();let _handle=handle_of(&slot).await;await_ready(&events,doc).await;manager.begin_shutdown().await;
+    });}
+
+    #[test]
+    fn cancelling_one_launch_waiter_does_not_release_or_cancel_other_waiters(){block_on(async{
+        let (release,waiting)=tokio::sync::oneshot::channel::<()>();
+        let barrier=Arc::new(LaunchBarrier{predecessor:Mutex::new(Some(Box::pin(async move{let _=waiting.await;}))),ready:AtomicBool::new(false),changed:Notify::new()});
+        let first=tokio::spawn(Arc::clone(&barrier).wait());tokio::task::yield_now().await;first.abort();
+        let second=tokio::spawn(Arc::clone(&barrier).wait());tokio::task::yield_now().await;
+        assert!(!second.is_finished());release.send(()).unwrap();tokio::time::timeout(WAIT,second).await.unwrap().unwrap();assert!(barrier.ready.load(Ordering::Acquire));
+    });}
 }
