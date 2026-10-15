@@ -4207,7 +4207,9 @@ mod tests {
                 },
             );
             let attach: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-            assert!(matches!(attach.request, ClientRequest::Attach { .. }));
+            assert!(matches!(&attach.request, ClientRequest::AttachTerminalSource {
+                source: captured, execution_instance, ..
+            } if captured == &original.session && *execution_instance == original.execution_instance));
             write_frame(
                 &mut stream,
                 &ServerEnvelope {
