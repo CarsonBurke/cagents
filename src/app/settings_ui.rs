@@ -1572,11 +1572,21 @@ mod keyboard_table_tests {
         }));
         assert!(!app.palette.is_open());
         assert_eq!(app.settings_search, "Ctrl+Shift+1");
-        assert_eq!(keyboard_groups(&app.settings_draft, &app.settings_invalid,
-            app.palette.pressed_key_filter()).len(), 3,
-            "cancelling replacement capture preserves both previous match groups");
+        assert_eq!(
+            keyboard_groups(
+                &app.settings_draft,
+                &app.settings_invalid,
+                app.palette.pressed_key_filter()
+            )
+            .len(),
+            3,
+            "cancelling replacement capture preserves both previous match groups"
+        );
         for chord in ["Ctrl+Shift+1", "Ctrl+Shift+!"] {
-            assert!(shortcut_matches_pressed_key(chord, app.palette.pressed_key_filter()));
+            assert!(shortcut_matches_pressed_key(
+                chord,
+                app.palette.pressed_key_filter()
+            ));
         }
         drop(app.update_palette(palette_ui::Action::FilterKey));
         drop(app.palette_key_event(&press(
