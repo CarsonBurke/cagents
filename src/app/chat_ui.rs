@@ -284,6 +284,7 @@ pub enum Action {
     /// Where the completion list has been scrolled to.
     CompletionScrolled(Target, f32),
     HandoffFinished(Target, Result<crate::terminal::ipc::TerminalHandoffReceipt, String>),
+    HandoffAttached(CardId, uuid::Uuid, Arc<crate::terminal::ipc::TerminalHandoffReceipt>, Result<StartedTerminal, String>),
     CloseFinished(Target, Result<(), String>),
     RetainedCloseFinished(Target, chat::Session, Result<(), String>),
     /// Where the transcript's viewport has moved to, which is what asks for
@@ -327,6 +328,7 @@ impl Action {
                 | Self::ThumbnailLoaded(..)
                 | Self::RetryThumbnails(..)
                 | Self::HandoffFinished(..)
+                | Self::HandoffAttached(..)
                 | Self::ReturnedLocally(..)
                 | Self::CloseFinished(..)
                 | Self::RetainedCloseFinished(..)
@@ -427,11 +429,11 @@ struct LocalReturn {
 /// Detached actors have their own target-keyed retirement ledger, since an old
 /// actor can still be shutting down while this card starts another one.
 fn handoff_receipt_matches(expected: &crate::terminal::ipc::ChatSourceBinding, receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> bool {
-    !receipt.operation.is_nil() && !expected.backend.is_nil() && !expected.execution_instance.is_nil()
+    !receipt.operation.is_nil() && !receipt.terminal_native_epoch.is_nil() && !expected.backend.is_nil() && !expected.execution_instance.is_nil()
         && receipt.source_binding == *expected && receipt.source_execution_instance == expected.execution_instance
         && !receipt.terminal.execution_instance.is_nil()
         && receipt.source.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete)
-        && receipt.terminal.session.continuity.live_proof().as_ref() == expected.source.proof.as_ref()
+        && receipt.terminal.session.continuity.live_proof().as_ref().is_none_or(|proof| Some(proof) == expected.source.proof.as_ref())
         && crate::workspace_model::views::handoff_chat_source_matches(&expected.source, &receipt.source)
 }
 
@@ -465,6 +467,7 @@ pub(super) struct State {
     end_requests: HashMap<Target, closing::EndRequest>,
     /// Captured before Return IO; retained even if its presentation is evicted.
     pub(super) handoff_bindings: HashMap<Target, crate::terminal::ipc::ChatSourceBinding>,
+    handoff_closes: HashMap<CardId, HandoffClose>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -502,6 +505,11 @@ pub(super) struct State {
     /// conversation of that provider starts on.
     last_models: HashMap<Provider, (String, Option<String>)>,
 }
+struct HandoffClose {
+    receipt: Arc<crate::terminal::ipc::TerminalHandoffReceipt>,
+    request: closing::EndRequest,
+    attached: bool,
+}
 impl Default for State {
     fn default() -> Self {
         let (sender, receiver) = async_channel::unbounded();
@@ -511,6 +519,7 @@ impl Default for State {
             close_generation: 0,
             end_requests: HashMap::new(),
             handoff_bindings: HashMap::new(),
+            handoff_closes: HashMap::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -538,7 +547,7 @@ impl State {
 
 impl State {
     pub(super) fn transition_pending(&self) -> bool {
-        !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty() || !self.handoff_bindings.is_empty()
+        !self.phases.is_empty() || !self.abandoned.is_empty() || !self.retiring.is_empty() || !self.handoff_bindings.is_empty() || !self.handoff_closes.is_empty()
     }
 
     #[cfg(test)]
@@ -5073,6 +5082,30 @@ impl Cagents {
         Task::batch([retire, remove])
     }
 
+    pub(super) fn resume_attached_handoff_closes(&mut self) -> Task<Message> {
+        let ready = self.chat_ui.handoff_closes.iter().filter_map(|(card, pending)|
+            (pending.attached && !self.terminal_start_in_flight(*card)).then_some(*card)).collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for card in ready {
+            let pending = self.chat_ui.handoff_closes.remove(&card).unwrap();
+            let exact = self.cards.get(&card).is_some_and(|runtime| matches!(runtime,
+                CardRuntime::Terminal(surface) if surface.worker_binding().is_some_and(|binding|
+                    binding.execution_instance == pending.receipt.terminal.execution_instance
+                    && crate::workspace_model::views::same_card_source(&CardKind::Terminal(pending.receipt.terminal.session.clone()), &CardKind::Terminal(binding.source)))));
+            if !exact || !pending.request.current(self, card) {
+                self.stop_pane_close_batch(pending.request.batch);
+                self.status = Some(TransientNotice::warning("The original terminal or Close scope changed during attachment. Its pane was kept."));
+                continue;
+            }
+            if self.chat_has_parked_runtime(card) {
+                tasks.push(self.begin_chat_close_request(card, pending.request));
+            } else if let Some(queued) = pending.request.paired_terminal {
+                tasks.push(self.resume_captured_card_close(queued));
+            } else { self.stop_pane_close_batch(pending.request.batch); }
+        }
+        Task::batch(tasks)
+    }
+
     /// Gives up a conversation in the background; see [`retire_conversation`].
     fn retire_chat(
         &mut self,
@@ -8326,7 +8359,10 @@ impl Cagents {
                     self.stop_pane_close_batch(batch);
                     return Task::none();
                 };
-                if !phase_current || !retained || request.as_ref().is_some_and(|request| !request.source_current(self, target.card)) {
+                if !phase_current || !retained || request.as_ref().is_some_and(|request| !match &result {
+                    Ok(receipt) => request.source_matches_handoff(self, target.card, receipt),
+                    Err(_) => request.source_current(self, target.card),
+                }) {
                     self.stop_pane_close_batch(batch);
                     return Task::none();
                 }
@@ -8375,12 +8411,31 @@ impl Cagents {
                     self.status = Some(TransientNotice::warning("The original Close scope changed during Return. Its terminal was kept."));
                     return task;
                 };
-                let close = if self.chat_has_parked_runtime(target.card) {
-                    self.begin_chat_close_request(target.card, request)
-                } else if let Some(queued) = request.paired_terminal {
-                    self.resume_captured_card_close(queued)
-                } else { self.stop_pane_close_batch(batch); Task::none() };
-                return Task::batch([task, close]);
+                // Attachment owns a start slot. Even immediate actor cleanup
+                // must not deliver a queued Close into that outstanding slot.
+                self.chat_ui.handoff_closes.insert(target.card, HandoffClose {
+                    receipt: Arc::new(receipt), request, attached: false,
+                });
+                return task;
+            }
+            Action::HandoffAttached(card, operation, receipt, result) => {
+                let current = self.terminal_start_operation(card) == Some(operation)
+                    && self.card_state(card).is_some_and(|state| state.existence.is_open()
+                        && crate::workspace_model::views::same_card_source(&CardKind::Terminal(receipt.terminal.session.clone()), &state.kind));
+                let exact = result.as_ref().is_ok_and(|started| started.handle.worker_binding().is_some_and(|binding|
+                    binding.execution_instance == receipt.terminal.execution_instance
+                        && crate::workspace_model::views::same_card_source(&CardKind::Terminal(receipt.terminal.session.clone()), &CardKind::Terminal(binding.source))));
+                if let Some(pending) = self.chat_ui.handoff_closes.get_mut(&card)
+                    && pending.receipt.as_ref() == receipt.as_ref() {
+                    pending.attached = current && exact;
+                    if !pending.attached {
+                        let pending = self.chat_ui.handoff_closes.remove(&card).unwrap();
+                        self.stop_pane_close_batch(pending.request.batch);
+                    }
+                }
+                // The ordinary installer releases this exact start slot LAST;
+                // its finish hook then resumes only a fully attached Close.
+                return self.terminal_started_for_operation(card, receipt.terminal.session.id, result, current && exact);
             }
             Action::RetainedCloseFinished(target, session, result) => {
                 if self
@@ -14782,7 +14837,7 @@ mod tests {
         descriptor.execution_instance = uuid::Uuid::new_v4();
         let receipt = crate::terminal::ipc::TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(),
             source: expected.source.clone(), source_execution_instance: expected.execution_instance,
-            source_binding: expected, retained_binding: None, terminal: descriptor };
+            source_binding: expected, retained_binding: None, terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor };
         let _ = app.update(Message::ChatUi(Action::HandoffFinished(target, Ok(receipt))));
         // Drive every daemon request to success until nothing is left to do.
         for _ in 0..8 {

@@ -6284,7 +6284,7 @@ mod tests {
         learned.source.launch.session_id = Some("confirmed-return-thread".into());
         let first = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source,
             source_execution_instance: binding.execution_instance, source_binding: binding,
-            retained_binding: Some(learned), terminal: descriptor };
+            retained_binding: Some(learned), terminal_native_epoch: uuid::Uuid::new_v4(), terminal: descriptor };
         let mut next = first.clone();
         next.operation = uuid::Uuid::new_v4();
         next.terminal.execution_instance = uuid::Uuid::new_v4();

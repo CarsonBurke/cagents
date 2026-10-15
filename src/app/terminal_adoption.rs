@@ -281,16 +281,18 @@ impl Cagents {
             }
             starts.values().sum()
         };
-        if remaining > 0 {
-            return Task::none();
+        if !self.terminal_start_in_flight(card) {
+            self.terminal_start_operations.get_mut().expect("terminal start operations lock").remove(&card);
         }
+        let handoff = self.resume_attached_handoff_closes();
+        if remaining > 0 { return handoff; }
         let adopted = if self.pending_adoptions.is_empty() {
             Task::none()
         } else {
             let pending = std::mem::take(&mut self.pending_adoptions);
             self.observe_hosted_terminals(pending)
         };
-        Task::batch([adopted, self.attach_next_restored_agent()])
+        Task::batch([adopted, self.attach_next_restored_agent(), handoff])
     }
 
     pub(super) fn terminal_starts_in_flight(&self) -> usize {
@@ -310,12 +312,17 @@ impl Cagents {
 
     /// Counts a terminal start from the start path, which only holds `&self`.
     pub(super) fn begin_terminal_start(&self, card: CardId) {
+        self.terminal_start_operations.lock().expect("terminal start operations lock").insert(card, uuid::Uuid::new_v4());
         self.terminal_starts
             .lock()
             .expect("terminal starts lock")
             .entry(card)
             .and_modify(|count| *count += 1)
             .or_insert(1);
+    }
+
+    pub(super) fn terminal_start_operation(&self, card: CardId) -> Option<uuid::Uuid> {
+        self.terminal_start_operations.lock().expect("terminal start operations lock").get(&card).copied()
     }
 
     fn adoptable(&self, session: &TerminalSession) -> bool {

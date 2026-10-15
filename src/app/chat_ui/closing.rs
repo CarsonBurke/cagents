@@ -60,6 +60,16 @@ impl EndRequest {
         } else { None };
         Some(Self { registry: app.workspace_model.identity, batch, kind, session, shared_source, paired_terminal })
     }
+    /// Only the correlated receipt can explain this in-flight thread learning.
+    /// A previously known thread and every immutable source field remain pinned.
+    pub(super) fn source_matches_handoff(&self, app: &Cagents, card: CardId, receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> bool {
+        self.registry == app.workspace_model.identity && app.pane_close_decision_current(card, self.batch)
+            && matches!(&self.kind, CardKind::Chat(issued) if crate::workspace_model::views::handoff_chat_source_matches(issued, &receipt.source))
+            && app.card_state(card).is_some_and(|state| state.existence.is_open()
+                && matches!(&state.kind, CardKind::Chat(current) if crate::workspace_model::views::handoff_chat_source_matches(current, &receipt.source)))
+            && self.session.as_ref().is_some_and(|observed| crate::workspace_model::views::handoff_chat_source_matches(observed, &receipt.source))
+            && app.chat_return_session(card).as_ref().is_some_and(|observed| crate::workspace_model::views::handoff_chat_source_matches(observed, &receipt.source))
+    }
     /// Called only after the exact successful return installed its descriptor.
     /// The initial shared before-pane is never captured again from current state.
     pub(super) fn after_terminal_handoff(mut self, app: &mut Cagents, card: CardId, receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> Option<Self> {
@@ -142,6 +152,16 @@ pub(in crate::app) fn draft_key(session: &chat::Session) -> Option<String> {
 }
 
 impl Cagents {
+    /// A scope move cannot overtake an owned Return/End decision or cleanup.
+    pub(in crate::app) fn conversation_close_owns_pane(&self, card: CardId) -> bool {
+        self.chat_ui.close_dialog.as_ref().is_some_and(|dialog| dialog.card == card)
+            || self.chat_ui.end_requests.keys().any(|target| target.card == card)
+            || self.chat_ui.handoff_closes.contains_key(&card)
+            || matches!(self.chat_ui.phases.get(&card), Some(Phase::Returning { .. } | Phase::Closing { .. }))
+    }
+    pub(in crate::app) fn terminal_confirmation_owns_pane(&self, card: CardId) -> bool {
+        self.terminal_close.as_ref().is_some_and(|intent| intent.card == card)
+    }
     fn conversation_end_placement(&self, card: CardId) -> Option<(Option<crate::model::ChannelId>, Option<ProjectId>, Option<PathBuf>, Option<crate::workspace_model::views::Scope>, Option<PathBuf>, Option<PathBuf>)> {
         let mut channels = self.durable.channels.iter().filter(|channel| channel.cards.contains(&card));
         let (channel, channel_project) = channels.next().map_or((None, None), |channel| (Some(channel.id), Some(channel.project_id)));

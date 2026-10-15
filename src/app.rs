@@ -4832,6 +4832,7 @@ pub struct Cagents {
     /// interior mutability - the start path holds `&self` - and never for
     /// concurrency: every mutation happens on the update thread.
     terminal_starts: std::sync::Mutex<HashMap<CardId, usize>>,
+    terminal_start_operations: std::sync::Mutex<HashMap<CardId, uuid::Uuid>>,
     terminal_failure: terminal_failure::State,
     /// Observations held back while a start was outstanding.
     pending_adoptions: Vec<TerminalSession>,
@@ -7203,11 +7204,25 @@ impl Cagents {
         }
         let commit = self.commit_terminal_handoffs();
         // The immutable worker/source is seeded before the first socket write.
-        let attach = self.start_terminal_from_handoff(
+        let Some(proof) = receipt.source.proof.clone().filter(crate::model::HostSessionProof::is_complete) else {
+            return commit;
+        };
+        let attach = self.start_terminal_from_handoff_proved(
             card,
-            receipt.terminal,
+            receipt.terminal.clone(),
+            proof,
             state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
         );
+        // Read the nonce in the same UI turn that the producer minted it,
+        // before IO. Every later start invalidates this attachment owner.
+        let operation = self.terminal_start_operation(card).expect("handoff attachment started");
+        let receipt = Arc::new(receipt);
+        let attach = attach.map(move |action| match action {
+            cosmic::Action::App(Message::TerminalStarted { card: actual, terminal, result })
+                if actual == card && terminal == receipt.terminal.session.id =>
+                cosmic::Action::App(Message::ChatUi(chat_ui::Action::HandoffAttached(card, operation, receipt.clone(), result))),
+            other => other,
+        });
         Task::batch([commit, attach])
     }
 
@@ -12816,6 +12831,7 @@ impl Application for Cagents {
             terminal_wake_rx,
             hosted_terminals_rx,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
+            terminal_start_operations: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
@@ -25119,6 +25135,7 @@ mod tests {
             terminal_wake_rx,
             hosted_terminals_rx: async_channel::unbounded().1,
             terminal_starts: std::sync::Mutex::new(HashMap::new()),
+            terminal_start_operations: std::sync::Mutex::new(HashMap::new()),
             terminal_failure: terminal_failure::State::default(),
             pending_adoptions: Vec::new(),
             restored_agent_attaches: VecDeque::new(),
