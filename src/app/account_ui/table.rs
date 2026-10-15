@@ -1137,7 +1137,8 @@ fn menu<'a>(
                     .into(),
                 );
             }
-            content.push(design::caption("Delete files permanently removes this home's conversations and caches. This cannot be undone. Type the account name to enable deletion.").into());
+            content.push(design::caption("Delete files permanently removes this home's provider conversations and caches, plus original prompts and attachments saved for this account. This cannot be undone. Type the account name to enable deletion.").into());
+            content.push(design::caption("Cagents saved run reports may remain read-only. They cannot restore a resumable provider conversation.").into());
             content.push(
                 crate::ui_controls::field::text(
                     "Account name to confirm deletion",
@@ -1596,6 +1597,8 @@ mod tests {
             "All transcripts and files stay on disk",
             "Delete files permanently removes",
             "Type the account name",
+            "Cagents saved run reports may remain read-only",
+            "cannot restore a resumable provider conversation",
         ] {
             assert!(
                 rendered.0.iter().any(|(text, _)| text.contains(expected)),
