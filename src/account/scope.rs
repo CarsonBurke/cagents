@@ -14,6 +14,10 @@ pub(crate) struct LaunchAccountScope {
     pub inode: u64,
     /// Optional registry metadata for purge, never the annotation authority.
     pub registered_id: Option<AccountId>,
+    /// All registry aliases validated against this physical tuple at capture.
+    /// Used only to remember deletion associations, never for read/write access.
+    #[serde(default)]
+    pub purge_ids: Vec<AccountId>,
 }
 
 impl LaunchAccountScope {
@@ -57,22 +61,23 @@ impl LaunchAccountScope {
         if !metadata.is_dir() {
             return Err("The selected provider home is not a directory".into());
         }
-        let mut scope = Self { provider, canonical_home, device: metadata.dev(), inode: metadata.ino(), registered_id: None };
+        let mut scope = Self { provider, canonical_home, device: metadata.dev(), inode: metadata.ino(), registered_id: None, purge_ids: Vec::new() };
         if let Some(registry) = registry.filter(|registry| !registry.is_newer()) {
-            let mut matching = registry.registered().iter().filter(|entry| entry.provider == provider)
+            // Registry input is bounded by its validated 256 KiB document.
+            let mut matching: Vec<_> = registry.registered().iter().filter(|entry| entry.provider == provider)
                 .filter_map(|entry| {
                     let path = entry.linked_home.clone().or_else(|| homes.map(|homes| homes.path(provider, entry.key)))?;
                     let canonical = path.canonicalize().ok()?;
                     let metadata = std::fs::metadata(&canonical).ok()?;
                     (canonical == scope.canonical_home && metadata.dev() == scope.device && metadata.ino() == scope.inode)
                         .then(|| super::Account::linked(provider, entry.key, path).id())
-                });
-            let first = matching.next();
+                }).collect();
+            matching.sort();
+            matching.dedup();
             // Aliases share physical authority. Never arbitrarily name one as
             // the sole registered owner when several IDs resolve to this home.
-            if matching.next().is_none() {
-                scope.registered_id = first;
-            }
+            if matching.len() == 1 { scope.registered_id = matching.first().cloned(); }
+            scope.purge_ids = matching;
         }
         scope.revalidate()?;
         Ok(scope)
@@ -134,9 +139,18 @@ mod tests {
         let resolve = |registry: &Registry| LaunchAccountScope::resolve_with_registry(Provider::Codex, root.path(), |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned()), Some(registry), None).unwrap();
         let scope = resolve(&registry);
         assert_eq!(scope.registered_id, Some(super::super::Account::linked(Provider::Codex, first, home.clone()).id()));
-        registry.register(register(uuid::Uuid::new_v4()), &[]).unwrap();
+        let second = uuid::Uuid::new_v4();
+        registry.register(register(second), &[]).unwrap();
         let alias_scope = resolve(&registry);
         assert!(alias_scope.registered_id.is_none());
+        let mut expected = [first, second].into_iter().map(|key|
+            super::super::Account::linked(Provider::Codex, key, home.clone()).id()).collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(alias_scope.purge_ids, expected);
+        assert_eq!(scope.purge_ids, [scope.registered_id.clone().unwrap()]);
+        let mut legacy = serde_json::to_value(&alias_scope).unwrap();
+        legacy.as_object_mut().unwrap().remove("purge_ids");
+        assert!(serde_json::from_value::<LaunchAccountScope>(legacy).unwrap().purge_ids.is_empty());
         assert_eq!((alias_scope.device, alias_scope.inode), (scope.device, scope.inode));
         std::fs::rename(&home, root.path().join("old-home")).unwrap();
         std::fs::create_dir(&home).unwrap();
