@@ -3558,30 +3558,31 @@ fn process_inner(
                 recipe,
                 last_exit: None,
             };
-            // Teardown is proved, so the terminal takes over the chat's lineage
-            // and whatever agents it started, unless another of its sessions runs.
-            if let Ok(registry) = super::agent_execution::registry(host) {
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .succeed(
-                        terminal_id,
-                        chat_id,
-                        session
-                            .terminal
-                            .as_ref()
-                            .and_then(|terminal| terminal.recovery_origin),
-                        |members| {
-                            host.lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .any_other_live(members, chat_id)
-                        },
-                    )
-                    .map_err(unavailable)?;
-            }
             let (descriptor, _returned_worker) = match source_binding::prepare_return_attempt(host, chat_id, &continuation, terminal.clone())? {
                 Some(published) => published,
                 None => {
+                // Teardown is proved, so the terminal takes over the chat's lineage
+                // and whatever agents it started, unless another of its sessions runs.
+                if let Ok(registry) = super::agent_execution::registry(host) {
+                    registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .succeed(
+                            terminal_id,
+                            chat_id,
+                            session
+                                .terminal
+                                .as_ref()
+                                .and_then(|terminal| terminal.recovery_origin),
+                            |members| {
+                                host.lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .any_other_live(members, chat_id)
+                            },
+                        )
+                        .map_err(unavailable)?;
+                }
+                    source_binding::mark_return_attempt(host, chat_id, &continuation)?;
                     let published = super::state::spawn_terminal_view_owned_at_directory(
                         host, client, terminal,
                         crate::terminal_ipc::TerminalSpawnOptions { initially_visible: false, ..Default::default() },

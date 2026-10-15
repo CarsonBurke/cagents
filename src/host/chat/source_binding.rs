@@ -820,8 +820,17 @@ pub(super) fn prepare_return_attempt(
     if let Some(published) = &target.published { return Ok(Some(published.clone())); }
     if target.attempted { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
     target.source = source;
-    target.attempted = true;
     Ok(None)
+}
+pub(super) fn mark_return_attempt(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<(), ProtocolError> {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
+        .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+        .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
+    let target = pending.returned.as_mut().ok_or_else(|| unavailable("The exact return target was not reserved"))?;
+    if target.attempted { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
+    target.attempted = true;
+    Ok(())
 }
 pub(super) fn remember_return_worker(
     host: &SharedHost, id: TerminalId, continuation: &Continuation,
@@ -842,6 +851,7 @@ pub(super) fn remember_return_worker(
 pub(super) fn finish_closed_return(
     state: &mut HostState, id: TerminalId, continuation: &Continuation, receipt: &TerminalHandoffReceipt,
 ) -> Result<(), ProtocolError> {
+    state.validate_issued_terminal_handoff(receipt)?;
     let pending = state.native_sources.entries.get(&id).and_then(|entry| entry.pending_handoff.as_ref())
         .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
         .ok_or_else(|| unavailable("The exact closed return operation changed before publication"))?;
