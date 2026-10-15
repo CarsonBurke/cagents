@@ -4659,7 +4659,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // Older Git cannot expose the installation's attribute paths.
             // Retain its existing unchanged-digest contract, while declining
             // incremental reuse whenever a changed snapshot needs counts.
-            if !output.success { policy.reusable = false; continue; }
+            if !output.success {
+                policy.reusable = false;
+                if variable == "GIT_ATTR_GLOBAL" {
+                    let command = self.git_read(worktree, ["config", "--path", "--get", "core.attributesFile"]);
+                    let output = self.run(&command, cancellation)?;
+                    if output.success {
+                        let path = bytes_to_path(trim_one_line_ending(&output.stdout));
+                        if !path.as_os_str().is_empty() { policy.attributes.push(path); }
+                    } else if output.exit_code == Some(1) {
+                        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
+                            policy.attributes.push(PathBuf::from(xdg).join("git/attributes"));
+                        } else if let Some(home) = std::env::var_os("HOME") {
+                            policy.attributes.push(PathBuf::from(home).join(".config/git/attributes"));
+                        }
+                    } else { return Err(git_failure(&command, output).into()); }
+                }
+                // Legacy Git cannot report an installation-specific system
+                // attribute location. Its preexisting unchanged semantics stay
+                // intact; changed snapshots still use complete count reads.
+                continue;
+            }
             let path = bytes_to_path(trim_one_line_ending(&output.stdout));
             if !path.as_os_str().is_empty() {
                 policy.attributes.push(if path.is_absolute() { path } else { worktree.join(path) });
@@ -4760,7 +4780,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             if cache.numstats_ready && pending == 0 { continue; }
             let bytes = paths.iter().fold(0usize, |bytes, path| bytes.saturating_add(path.as_bytes().len() + 1));
-            let scoped = reusable && pending <= MAX_TARGETS && bytes <= MAX_TARGET_BYTES;
+            let scoped = reusable && pending <= MAX_TARGETS && bytes <= MAX_TARGET_BYTES
+                && paths.iter().all(|path| path.as_bytes().len() < BATCH_BYTES);
             let mut commands = Vec::new();
             if scoped {
                 let mut batch = Vec::new();
@@ -8895,11 +8916,14 @@ mod tests {
         }
 
         #[derive(Default)]
-        struct RecordingExecutor { commands: Mutex<Vec<CommandSpec>> }
+        struct RecordingExecutor { commands: Mutex<Vec<CommandSpec>>, legacy_attribute_vars: bool }
 
         impl ProcessExecutor for RecordingExecutor {
             fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
                 self.commands.lock().unwrap().push(command.clone());
+                if self.legacy_attribute_vars && command.arguments.windows(2).any(|pair| pair[0] == "var" && (pair[1] == "GIT_ATTR_SYSTEM" || pair[1] == "GIT_ATTR_GLOBAL")) {
+                    return Ok(exit(129, b""));
+                }
                 IsolatedExecutor.execute(command, cancellation)
             }
         }
@@ -9004,6 +9028,30 @@ mod tests {
             let counts: Vec<_> = commands.iter().filter(|command| command.arguments.iter().any(|arg| arg == "--numstat")).collect();
             assert_eq!(counts.len(), 2, "published index invalidates all measured comparisons");
             assert!(counts.iter().all(|command| !command.arguments.iter().any(|arg| arg == "--")));
+        }
+
+        #[test]
+        fn cached_numstat_legacy_git_observes_configured_external_attributes() {
+            let directory = tempfile::tempdir().unwrap(); let root = directory.path();
+            let outside = tempfile::tempdir().unwrap(); let attributes = outside.path().join("attributes");
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked"), "base\n").unwrap();
+            git(root, &["add", "-A"]); git(root, &["commit", "-m", "initial"]);
+            fs::write(root.join("tracked"), "changed\n").unwrap();
+            fs::write(&attributes, "tracked diff\n").unwrap();
+            git(root, &["config", "core.attributesFile", attributes.to_str().unwrap()]);
+            let executor = Arc::new(RecordingExecutor { legacy_attribute_vars: true, ..Default::default() });
+            let service = RepositoryService::new("git", executor.clone());
+            let cancel = CancellationToken::new(); let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
+            let initial = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&initial, "tracked", ChangeArea::Unstaged), (Some(1), Some(1)));
+            fs::write(&attributes, "tracked -diff\n").unwrap();
+            let changed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&changed, "tracked", ChangeArea::Unstaged), (None, None));
+            executor.commands.lock().unwrap().clear();
+            assert!(service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().is_none());
+            assert_eq!(executor.commands.lock().unwrap().len(), 1);
         }
 
         #[test]
@@ -12593,6 +12641,7 @@ mod tests {
         let executor = Arc::new(FakeExecutor::with_outputs(vec![
             exit(1, b""), success(&status),
             exit(129, b""), exit(129, b""), // older Git does not expose attribute paths
+            exit(1, b""), // no explicit legacy global attributes file
             exit(1, b""), success(b""),
             success(b"1\t1\ttracked\0"), success(b""), success(b"H tracked\0"),
             exit(1, b""), success(b""), success(b""),
