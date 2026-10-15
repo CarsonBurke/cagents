@@ -19,6 +19,7 @@ use thiserror::Error;
 
 mod worktrees;
 pub use worktrees::WorktreeCommand;
+pub(crate) mod format;
 mod accounts;
 pub use accounts::AccountCommand;
 mod agents;
@@ -2945,11 +2946,9 @@ fn execute_terminal(command: TerminalCommand) -> Result<CommandOutput, AppError>
     match command {
         TerminalCommand::List => {
             let terminals = client.list().map_err(protocol_error)?;
-            let human = terminals
-                .iter()
-                .map(descriptor_line)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let human = format::table(&["ID", "ATTACHMENT", "PROGRAM", "DIRECTORY"],
+                terminals.iter().map(|terminal| descriptor_line(terminal).split('\t').map(str::to_owned).collect()).collect(),
+                "No terminals");
             Ok(CommandOutput {
                 command: "terminal.list",
                 data: json!({ "terminals": terminals }),
