@@ -374,6 +374,20 @@ impl Registry {
         })
     }
 
+    /// Negative history only: an absent exact session lookup does not make a
+    /// previously registered card eligible for an ordinary path-based start.
+    /// The owning start gate still proves the exact current membership/source
+    /// or refuses. This flag never selects a past tuple or grants authority.
+    pub(crate) fn has_directory_start_history(&self, card: CardId) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM created_start_requirements WHERE card_id=?1 LIMIT 1)",
+                [card.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     /// Both lookups are necessary: replacing a descriptor's session ID must
     /// not evade an outstanding obligation on the same logical pane.
     pub(crate) fn created_start_requirement(
@@ -773,6 +787,46 @@ mod tests {
             registry.require_created_start(&required).is_err(),
             "retirement never renews the old attempt"
         );
+    }
+
+    #[test]
+    fn directory_start_history_remains_negative_for_required_started_and_retired_cards() {
+        let (mut registry, _directory, _, _) = setup();
+        let required = requirement();
+        assert!(!registry.has_directory_start_history(required.card).unwrap());
+        registry.require_created_start(&required).unwrap();
+        assert!(registry.has_directory_start_history(required.card).unwrap());
+        assert!(
+            registry
+                .created_start_requirement(required.card, TerminalId::new())
+                .is_err()
+        );
+        // Synthetic metadata only, never a worker/startup receipt. An ordinary
+        // session lookup can be absent after settlement; history must survive.
+        registry.db.execute(
+            "UPDATE created_start_requirements SET phase='started',started_receipt=?1 WHERE session_id=?2",
+            params!["x".repeat(1024 * 1024), required.session.to_string()],
+        ).unwrap();
+        assert!(
+            registry
+                .created_start_requirement(required.card, TerminalId::new())
+                .unwrap()
+                .is_none()
+        );
+        assert!(registry.has_directory_start_history(required.card).unwrap());
+        registry.db.execute(
+            "UPDATE created_start_requirements SET phase='retired' WHERE session_id=?1",
+            [required.session.to_string()],
+        ).unwrap();
+        assert!(registry.has_directory_start_history(required.card).unwrap());
+        assert!(!registry.has_directory_start_history(CardId::new()).unwrap());
+        // EXISTS must not decode even a malformed historical session or its
+        // large private receipt. The historical refusal remains conservative.
+        registry.db.execute(
+            "UPDATE created_start_requirements SET session_id=?1 WHERE card_id=?2",
+            params!["invalid-session".repeat(128), required.card.to_string()],
+        ).unwrap();
+        assert!(registry.has_directory_start_history(required.card).unwrap());
     }
 
     #[test]
