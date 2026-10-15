@@ -228,7 +228,11 @@ mod tests {
         for case_sensitive in [false, true] {
             for regex in [false, true] {
                 for whole_word in [false, true] {
-                    let options = FindOptions { case_sensitive, regex, whole_word };
+                    let options = FindOptions {
+                        case_sensitive,
+                        regex,
+                        whole_word,
+                    };
                     let query = if regex { "f[o]{2}" } else { "foo" };
                     let expected = match (case_sensitive, whole_word) {
                         (false, false) => 4,
@@ -236,7 +240,11 @@ mod tests {
                         (true, false) => 2,
                         (true, true) => 1,
                     };
-                    assert_eq!(count("foo Foo food FOO", query, options), expected, "{options:?}");
+                    assert_eq!(
+                        count("foo Foo food FOO", query, options),
+                        expected,
+                        "{options:?}"
+                    );
                 }
             }
         }

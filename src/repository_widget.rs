@@ -3358,9 +3358,7 @@ impl RepositoryRuntime {
         let DocumentState::Editable(document) = &mut self.document else {
             return;
         };
-        if wanted.selection.is_some()
-            && self.find_selection_revision != Some(document.revision)
-        {
+        if wanted.selection.is_some() && self.find_selection_revision != Some(document.revision) {
             // Native edits, Undo, completion and other transactions can all
             // move a captured span. Never reinterpret its old coordinates as
             // a different region or widen replacement to the whole file.
@@ -5942,12 +5940,11 @@ impl RepositoryRuntime {
                             .or_else(|| self.current_selection_scope())
                     })
                     .flatten();
-                self.find_selection_revision = self.find_selection.and_then(|_| {
-                    match &self.document {
+                self.find_selection_revision =
+                    self.find_selection.and_then(|_| match &self.document {
                         DocumentState::Editable(document) => Some(document.revision),
                         _ => None,
-                    }
-                });
+                    });
                 // Recapturing the same coordinates after a change must also
                 // replace a cached stale-scope refusal for this revision.
                 self.find_cache = None;
@@ -18257,33 +18254,73 @@ mod tests {
             });
         }
         drop(runtime.update(RepositoryAction::OpenFind { card }));
-        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 1);
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Move(text_editor::Motion::DocumentStart) }));
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("xxxx".into()))) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentStart),
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("xxxx".into()))),
+        }));
         assert_eq!(buffer_text(&runtime), "xxxxfoo foo foo");
         assert_eq!(runtime.find_total, 0);
-        assert!(runtime.find_error.as_deref().unwrap().contains("captured selection changed"));
-        drop(runtime.update(RepositoryAction::ReplaceQueryChanged { card, query: "bar".into() }));
+        assert!(
+            runtime
+                .find_error
+                .as_deref()
+                .unwrap()
+                .contains("captured selection changed")
+        );
+        drop(runtime.update(RepositoryAction::ReplaceQueryChanged {
+            card,
+            query: "bar".into(),
+        }));
         drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
-        assert_eq!(buffer_text(&runtime), "xxxxfoo foo foo", "stale scope must never replace a different occurrence");
+        assert_eq!(
+            buffer_text(&runtime),
+            "xxxxfoo foo foo",
+            "stale scope must never replace a different occurrence"
+        );
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(buffer_text(&runtime), "foo foo foo");
-        assert_eq!(runtime.find_total, 0, "Undo does not silently recapture coordinates");
+        assert_eq!(
+            runtime.find_total, 0,
+            "Undo does not silently recapture coordinates"
+        );
         drop(runtime.update(RepositoryAction::Redo { card }));
         assert_eq!(buffer_text(&runtime), "xxxxfoo foo foo");
         assert_eq!(runtime.find_total, 0);
         // Deliberate native selection and toggle recaptures the new middle
         // occurrence, even though a global query selection moves the caret.
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Move(text_editor::Motion::DocumentStart) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Move(text_editor::Motion::DocumentStart),
+        }));
         for _ in 0..8 {
-            drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Move(text_editor::Motion::Right) }));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Move(text_editor::Motion::Right),
+            }));
         }
         for _ in 0..3 {
-            drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Select(text_editor::Motion::Right) }));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Select(text_editor::Motion::Right),
+            }));
         }
-        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: false }));
-        drop(runtime.update(RepositoryAction::FindSelectionChanged { card, enabled: true }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: false,
+        }));
+        drop(runtime.update(RepositoryAction::FindSelectionChanged {
+            card,
+            enabled: true,
+        }));
         assert_eq!(runtime.find_total, 1);
         assert!(runtime.find_error.is_none());
         drop(runtime.update(RepositoryAction::ReplaceMatch { card, all: true }));
