@@ -620,6 +620,9 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
+const fn default_interface_font_size() -> f32 { 13.0 }
+const fn default_chat_font_size() -> f32 { 14.0 }
+
 const fn default_terminal_scrollback_lines() -> usize {
     10_000
 }
@@ -798,6 +801,16 @@ pub struct AppSettings {
     pub app_theme: AppTheme,
     #[serde(default = "default_ui_scale")]
     pub ui_scale: f32,
+    /// Empty uses the desktop interface font.
+    #[serde(default)]
+    pub interface_font_family: String,
+    #[serde(default = "default_interface_font_size")]
+    pub interface_font_size: f32,
+    /// Empty follows the interface family; code remains monospace.
+    #[serde(default)]
+    pub chat_font_family: String,
+    #[serde(default = "default_chat_font_size")]
+    pub chat_font_size: f32,
     #[serde(default = "default_terminal_line_height")]
     pub terminal_line_height: f32,
     #[serde(default = "default_terminal_scroll_speed")]
@@ -932,6 +945,10 @@ impl Default for AppSettings {
             app_theme: AppTheme::default(),
             terminal_scroll_speed: default_terminal_scroll_speed(),
             ui_scale: default_ui_scale(),
+            interface_font_family: String::new(),
+            interface_font_size: default_interface_font_size(),
+            chat_font_family: String::new(),
+            chat_font_size: default_chat_font_size(),
             terminal_line_height: default_terminal_line_height(),
             terminal_padding: default_terminal_padding(),
             terminal_scroll_size: default_terminal_scroll_size(),
@@ -1584,6 +1601,17 @@ impl AppSettings {
         }
     }
     pub fn validate(mut self) -> Result<Self, SettingsError> {
+        for (family, reason) in [(&self.interface_font_family, "interface_font_family must be a name of at most 128 bytes without control characters"), (&self.chat_font_family, "chat_font_family must be a name of at most 128 bytes without control characters")] {
+            if family.len() > MAX_TERMINAL_FONT_FAMILY_BYTES || family.chars().any(char::is_control) || (!family.is_empty() && family.trim().is_empty()) {
+                return Err(SettingsError::Invalid(reason));
+            }
+        }
+        if !(10.0..=24.0).contains(&self.interface_font_size) {
+            return Err(SettingsError::Invalid("Interface font size must be between 10 and 24"));
+        }
+        if !(8.0..=40.0).contains(&self.chat_font_size) {
+            return Err(SettingsError::Invalid("Chat font size must be between 8 and 40"));
+        }
         let search_url = url::Url::parse(&self.browser_search_url.replace("{query}", "test"));
         if !self.browser_search_url.contains("{query}")
             || !search_url
@@ -3124,6 +3152,10 @@ mod tests {
             hibernation_delay_ms: 1_234,
             app_theme: AppTheme::Light,
             ui_scale: 1.2,
+            interface_font_family: "DejaVu Sans".into(),
+            interface_font_size: 16.0,
+            chat_font_family: "DejaVu Serif".into(),
+            chat_font_size: 19.0,
             terminal_line_height: 1.5,
             terminal_padding: 12.0,
             terminal_scroll_size: 4,

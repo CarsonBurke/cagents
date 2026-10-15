@@ -1886,7 +1886,7 @@ impl Runtime {
             crate::ui_controls::field::editor("Message", &self.composer)
                 .id(card_control_id(target.card, "chat-composer"))
                 .placeholder(placeholder)
-                .size(design::TEXT_PROSE)
+                .size(design::chat_size()).font(design::chat_font())
                 .height(Length::Shrink)
                 .max_height(composer_ceiling)
                 // The editor scrolls once the draft passes the ceiling, and
@@ -3029,7 +3029,7 @@ impl Runtime {
     fn turn_fingerprint_at(&self, turn: &turn::Turn, dark: bool, now: Option<u64>) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::hash::DefaultHasher::new();
-        (self.target, dark, self.syntax_theme as u8).hash(&mut hasher);
+        (self.target, dark, self.syntax_theme as u8, design::typography_revision()).hash(&mut hasher);
         (
             &turn.key,
             &turn.summary,
@@ -3487,8 +3487,8 @@ impl Runtime {
         let mut rows: Vec<Element<'a, Message>> = vec![
             widget::container(selectable_prose::plain(
                 queued.text.trim_end(),
-                design::TEXT_PROSE,
-                iced::Font::default(),
+                design::chat_size(),
+                design::chat_font(),
                 self.target,
             ))
             .class(design::surface(
@@ -3588,8 +3588,8 @@ impl Runtime {
         } else {
             let text = selectable_prose::plain(
                 text,
-                design::TEXT_PROSE,
-                iced::Font::default(),
+                design::chat_size(),
+                design::chat_font(),
                 self.target,
             );
             if long {
