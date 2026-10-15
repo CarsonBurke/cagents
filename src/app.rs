@@ -20036,7 +20036,7 @@ mod tests {
         assert_eq!(app.workspace.order().count(), 2);
     }
 
-    fn agent_list_test_app() -> Cagents {
+    pub(super) fn agent_list_test_app() -> Cagents {
         let mut app = context_inspector_test_app(true);
         app.settings_path = None;
         app.settings_write_blocked = true;

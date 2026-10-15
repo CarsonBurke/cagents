@@ -56,14 +56,21 @@ fn argument_id(row: uuid::Uuid) -> widget::Id {
     widget::Id::new(format!("settings.agent.argument.{row}"))
 }
 
+fn row_id(kind: &str, row: uuid::Uuid) -> widget::Id {
+    widget::Id::new(format!("settings.agent.{kind}.row.{row}"))
+}
+
+fn environment_id(row: uuid::Uuid, value: bool) -> widget::Id {
+    widget::Id::new(format!("settings.agent.environment.{}.{row}", if value { "value" } else { "name" }))
+}
+
 fn argument_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a, Message> {
     let configuration = &entry.configuration;
-    let mut arguments: Vec<(uuid::Uuid, Element<'a, Message>)> = Vec::new();
+    let mut arguments: Vec<Element<'a, Message>> = Vec::new();
     let argument_owner = entry.argument_owner;
     for (index, argument) in configuration.arguments.iter().enumerate() {
         let row = entry.argument_rows[index];
-        arguments.push((
-            row,
+        arguments.push(widget::id_container(
             widget::row::with_children(vec![
                 crate::ui_controls::field::text("Argument", argument)
                     .id(argument_id(row))
@@ -83,34 +90,35 @@ fn argument_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a, M
                     .into(),
             ])
             .spacing(space::S)
-            .align_y(Alignment::Center)
-            .into(),
-        ));
+            .align_y(Alignment::Center),
+            row_id("arguments", row),
+        ).into());
     }
-    arguments.push((
-        argument_owner,
+    arguments.push(widget::id_container(
         crate::ui_controls::button::quiet("Add argument")
             .on_press(Message::AgentListEdited {
                 provider,
                 owner: argument_owner,
                 edit: AgentListEdit::AddArgument,
-            })
-            .into(),
-    ));
-    iced::widget::keyed_column(arguments)
+            }),
+        row_id("arguments.add", argument_owner),
+    ).into());
+    // Named children use the patched core's exact identity reconciliation,
+    // including a remove-plus-add batch with no change in list length.
+    widget::column::with_children(arguments)
         .spacing(space::XS)
         .into()
 }
 
 fn environment_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a, Message> {
-    let mut environment: Vec<(uuid::Uuid, Element<'a, Message>)> = Vec::new();
+    let mut environment: Vec<Element<'a, Message>> = Vec::new();
     let environment_owner = entry.environment_owner;
     for (index, (name, value)) in entry.environment.iter().enumerate() {
         let row = entry.environment_rows[index];
-        environment.push((
-            row,
+        environment.push(widget::id_container(
             widget::row::with_children(vec![
                 crate::ui_controls::field::text("NAME", name)
+                    .id(environment_id(row, false))
                     .on_input(move |value| Message::AgentListEdited {
                         provider,
                         owner: environment_owner,
@@ -119,6 +127,7 @@ fn environment_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a
                     .width(Length::FillPortion(2))
                     .into(),
                 crate::ui_controls::field::text("Value", value)
+                    .id(environment_id(row, true))
                     .secure(true)
                     .on_input(move |value| Message::AgentListEdited {
                         provider,
@@ -136,21 +145,20 @@ fn environment_rows<'a>(provider: Provider, entry: &'a AgentDraft) -> Element<'a
                     .into(),
             ])
             .spacing(space::S)
-            .align_y(Alignment::Center)
-            .into(),
-        ));
+            .align_y(Alignment::Center),
+            row_id("environment", row),
+        ).into());
     }
-    environment.push((
-        environment_owner,
+    environment.push(widget::id_container(
         crate::ui_controls::button::quiet("Add environment variable")
             .on_press(Message::AgentListEdited {
                 provider,
                 owner: environment_owner,
                 edit: AgentListEdit::AddEnvironment,
-            })
-            .into(),
-    ));
-    iced::widget::keyed_column(environment)
+            }),
+        row_id("environment.add", environment_owner),
+    ).into());
+    widget::column::with_children(environment)
         .spacing(space::XS)
         .into()
 }
@@ -260,94 +268,94 @@ pub(super) fn controls<'a>(
 mod tests {
     use super::*;
 
-    #[test]
-    fn settings_agent_keyed_rows_keep_focus_on_the_survivor_not_its_old_position() {
-        use cosmic::iced::advanced::{
-            Layout, layout, renderer::Headless, widget::Tree, widget::operation,
-        };
-        struct Focused(Vec<String>);
-        impl operation::Operation for Focused {
-            fn traverse(&mut self, operation: &mut dyn FnMut(&mut dyn operation::Operation)) {
-                operation(self);
+    fn input_states(tree: &iced::advanced::widget::Tree) -> std::collections::BTreeMap<String, (bool, widget::text_input::Cursor)> {
+        let mut states = std::collections::BTreeMap::new();
+        fn visit(tree: &iced::advanced::widget::Tree, states: &mut std::collections::BTreeMap<String, (bool, widget::text_input::Cursor)>) {
+            if tree.tag == iced::advanced::widget::tree::Tag::of::<widget::text_input::State>() {
+                let state = tree.state.downcast_ref::<widget::text_input::State>();
+                states.insert(tree.id.as_ref().expect("explicit input ID").to_string(), (state.is_focused(), state.cursor()));
             }
-            fn focusable(
-                &mut self,
-                id: Option<&widget::Id>,
-                _: iced::Rectangle,
-                state: &mut dyn operation::Focusable,
-            ) {
-                if state.is_focused()
-                    && let Some(id) = id
-                {
-                    self.0.push(id.to_string());
-                }
-            }
+            for child in &tree.children { visit(child, states); }
         }
-        let renderer = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(cosmic::Renderer::new(
-                cosmic::iced::Font::MONOSPACE,
-                iced::Pixels(14.0),
-                Some("tiny-skia"),
-            ))
+        visit(tree, &mut states);
+        states
+    }
+
+    #[test]
+    fn settings_agent_named_rows_preserve_native_state_across_actual_reducer_batches() {
+        use cosmic::iced::advanced::{Layout, layout, renderer::Headless, widget::Tree, widget::operation};
+        let renderer = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+            .block_on(cosmic::Renderer::new(cosmic::iced::Font::MONOSPACE, iced::Pixels(14.0), Some("tiny-skia")))
             .expect("headless renderer");
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(700.0, 500.0));
-        for remove_focused in [false, true] {
-            let draft = AgentDraft::new(
-                settings::AgentLaunchSettings {
-                    arguments: vec!["first".into(), "second".into()],
-                    ..Default::default()
-                },
-                None,
-            );
-            let (removed, survivor) = (draft.argument_rows[0], draft.argument_rows[1]);
-            let focused = if remove_focused { removed } else { survivor };
-            let mut before = argument_rows(Provider::Claude, &draft);
-            let mut tree = Tree::new(before.as_widget());
-            let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            before.as_widget_mut().operate(
-                &mut tree,
-                Layout::new(&node),
-                &renderer,
-                &mut operation::focusable::focus::<()>(argument_id(focused)),
-            );
-            let mut initial = Focused(Vec::new());
-            before
-                .as_widget_mut()
-                .operate(&mut tree, Layout::new(&node), &renderer, &mut initial);
-            assert_eq!(initial.0, [argument_id(focused).to_string()]);
-            drop(before);
-            let mut updated = draft.clone();
-            let (_, value) = updated
-                .edit_list(
-                    updated.argument_owner,
-                    AgentListEdit::RemoveArgument(removed),
-                )
-                .unwrap();
-            updated.set_arguments(serde_json::from_str(&value).unwrap());
-            let mut after = argument_rows(Provider::Claude, &updated);
-            after.as_widget_mut().diff(&mut tree);
-            let node = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            let mut final_focus = Focused(Vec::new());
-            after.as_widget_mut().operate(
-                &mut tree,
-                Layout::new(&node),
-                &renderer,
-                &mut final_focus,
-            );
-            if remove_focused {
-                assert!(
-                    final_focus.0.is_empty(),
-                    "removed field focus must not transfer to a different row"
-                );
-            } else {
-                assert_eq!(
-                    final_focus.0,
-                    [argument_id(survivor).to_string()],
-                    "survivor retains its own native state after moving"
-                );
+        // Cover each environment cell, with both focused-removal and focused-
+        // survival. Messages are reduced without an intermediate widget diff.
+        for mode in 0..3 {
+            for remove_focused in [false, true] {
+                for mutation in 0..3 {
+                    let mut app = crate::app::tests::agent_list_test_app();
+                    let provider = Provider::Claude;
+                    let draft = app.settings_draft.agents[&provider].clone();
+                    let (kind, rows, owner) = if mode == 0 {
+                        ("arguments", &draft.argument_rows, draft.argument_owner)
+                    } else {
+                        ("environment", &draft.environment_rows, draft.environment_owner)
+                    };
+                    let removed = rows[0];
+                    let survivor = rows[1];
+                    let input = |row| if mode == 0 { argument_id(row) } else { environment_id(row, mode == 2) };
+                    let focused = input(if remove_focused { removed } else { survivor });
+                    let mut before = if mode == 0 { argument_rows(provider, &draft) } else { environment_rows(provider, &draft) };
+                    let mut tree = Tree::new(before.as_widget());
+                    let node = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                    before.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+                        &mut operation::focusable::focus::<()>(focused.clone()));
+                    // Assign distinguishable native caret state to every cell,
+                    // not just the one whose focus survives a moved row.
+                    for (index, row) in rows.iter().enumerate() {
+                        for id in if mode == 0 { vec![argument_id(*row)] } else { vec![environment_id(*row, false), environment_id(*row, true)] } {
+                            before.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer,
+                                &mut operation::text_input::move_cursor_to::<()>(id, index));
+                        }
+                    }
+                    let original = input_states(&tree);
+                    assert!(original[&focused.to_string()].0);
+                    drop(before);
+                    if mutation == 2 {
+                        // The real external/reset adoption path replaces list
+                        // owners even when all displayed values are equal.
+                        app.settings_draft = SettingsDraft::from_settings(&app.settings);
+                    } else {
+                        let edit = if mode == 0 { AgentListEdit::RemoveArgument(removed) } else { AgentListEdit::RemoveEnvironment(removed) };
+                        drop(app.update(Message::AgentListEdited { provider, owner, edit }));
+                        if mutation == 1 {
+                            let edit = if mode == 0 { AgentListEdit::AddArgument } else { AgentListEdit::AddEnvironment };
+                            drop(app.update(Message::AgentListEdited { provider, owner, edit }));
+                        }
+                    }
+                    let updated = &app.settings_draft.agents[&provider];
+                    let (new_rows, new_owner) = if mode == 0 { (&updated.argument_rows, updated.argument_owner) } else { (&updated.environment_rows, updated.environment_owner) };
+                    assert_eq!(new_rows.len(), if mutation == 0 { 1 } else { 2 });
+                    let mut after = if mode == 0 { argument_rows(provider, updated) } else { environment_rows(provider, updated) };
+                    after.as_widget_mut().diff(&mut tree);
+                    let _ = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                    let expected_rows = new_rows.iter().map(|row| row_id(kind, *row).to_string())
+                        .chain(std::iter::once(row_id(&format!("{kind}.add"), new_owner).to_string())).collect::<Vec<_>>();
+                    assert_eq!(tree.children.iter().map(|child| child.id.as_ref().unwrap().to_string()).collect::<Vec<_>>(), expected_rows,
+                        "physical state order must equal current rendered row order");
+                    let actual = input_states(&tree);
+                    for (id, state) in &actual {
+                        if mutation != 2 && let Some(previous) = original.get(id) {
+                            assert_eq!(state, previous, "surviving input keeps its own focus AND caret: {id}");
+                        } else {
+                            assert!(!state.0, "new row/list cannot inherit removed focus: {id}");
+                            assert_eq!(state.1, widget::text_input::Cursor::default(), "new row/list cannot inherit removed caret: {id}");
+                        }
+                    }
+                    assert!(!actual.contains_key(&input(removed).to_string()));
+                    let focused_ids = actual.iter().filter(|(_, state)| state.0).map(|(id, _)| id.clone()).collect::<Vec<_>>();
+                    assert_eq!(focused_ids, if mutation != 2 && !remove_focused { vec![input(survivor).to_string()] } else { Vec::new() });
+                }
             }
         }
     }
