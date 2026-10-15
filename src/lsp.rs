@@ -3934,6 +3934,29 @@ async fn reap_sessions(sessions: Vec<RetiringSession>) {
     }
 }
 
+/// Pre-effect authority for one worktree removal. Reusing the same path or
+/// document ID does not transfer this authority to a later registration.
+#[derive(Clone, Debug)]
+pub struct LspWorktreeRemoval {
+    manager: u64,
+    registrations: Vec<(LspDocumentId, Arc<RegistrationOwner>)>,
+    sessions: Vec<CapturedSession>,
+}
+
+#[derive(Debug, Default)]
+struct RegistrationOwner {
+    // Discovery can create its first session after removal was captured. Only
+    // a session actually created by this registration belongs to that capture;
+    // joining an already existing successor does not grant authority over it.
+    created_session: Mutex<Option<CapturedSession>>,
+}
+
+#[derive(Clone, Debug)]
+struct CapturedSession {
+    key: SessionKey,
+    retired: Arc<AtomicBool>,
+}
+
 struct PendingOpen {
     path: PathBuf,
     worktree: PathBuf,
@@ -3942,6 +3965,7 @@ struct PendingOpen {
     text: Arc<Snapshot>,
     saved_text: Option<String>,
     ticket: u64,
+    owner: Arc<RegistrationOwner>,
 }
 
 #[derive(Clone)]
@@ -3951,6 +3975,7 @@ struct DocumentRef {
     path: PathBuf,
     worktree: Arc<Path>,
     language: LspLanguage,
+    owner: Arc<RegistrationOwner>,
 }
 
 /// Hands every manager its own event-channel identity.
@@ -4199,6 +4224,7 @@ impl LspManager {
             text: source,
             saved_text: None,
             ticket,
+            owner: Arc::default(),
         };
         let worker_path = pending.path.clone();
         let worker_worktree = pending.worktree.clone();
@@ -4244,6 +4270,7 @@ impl LspManager {
             pending.version,
             pending.text,
             root,
+            pending.owner,
         );
         if let Some(saved_text) = pending.saved_text {
             self.save(doc, &saved_text);
@@ -4269,6 +4296,7 @@ impl LspManager {
             version,
             Arc::new(Snapshot::new(version, Arc::from(text))),
             root,
+            Arc::default(),
         )
     }
 
@@ -4281,6 +4309,7 @@ impl LspManager {
         version: i32,
         source: Arc<Snapshot>,
         root: PathBuf,
+        owner: Arc<RegistrationOwner>,
     ) -> LspStatus {
         if self.servers.is_empty() {
             return LspStatus::Disabled;
@@ -4334,7 +4363,14 @@ impl LspManager {
         // after another workspace becomes idle, with its latest buffer text.
         // Ensure first: reopening previously blocked documents must not also
         // reopen this new registration.
+        let prior_session = self.sessions.get(&key).map(|handle| Arc::clone(&handle.retired));
         let handle = self.ensure_session(&key, &server, &root, worktree);
+        if let Ok(handle) = &handle {
+            if prior_session.as_ref().is_none_or(|prior| !Arc::ptr_eq(prior, &handle.retired)) {
+                *owner.created_session.lock().unwrap_or_else(|error| error.into_inner()) =
+                    Some(CapturedSession { key: key.clone(), retired: Arc::clone(&handle.retired) });
+            }
+        }
 
         let uri = Arc::new(uri);
         let worktree: Arc<Path> = Arc::from(worktree.to_path_buf());
@@ -4352,6 +4388,7 @@ impl LspManager {
                 path: path.to_path_buf(),
                 worktree,
                 language: language.clone(),
+                owner,
             },
         );
         let handle = match handle {
@@ -4595,31 +4632,62 @@ impl LspManager {
         (self.idle_timeout.as_secs(), self.session_cap)
     }
 
-    /// Retire every server and pending document owned by a removed worktree.
-    /// Shutdown/exit and bounded process-group termination run asynchronously.
-    pub fn remove_worktree(&mut self, worktree: &Path) {
-        self.pending_opens
-            .retain(|_, pending| pending.worktree != worktree);
-        let documents: Vec<_> = self
-            .documents
-            .iter()
+    /// Capture before starting removal, while the original registrations and
+    /// sessions still own the target. Retain this token until that operation's
+    /// known successful completion; dropping it has no effect.
+    pub fn capture_worktree_removal(&self, worktree: &Path) -> LspWorktreeRemoval {
+        let registrations = self.documents.iter()
             .filter(|(_, reference)| reference.worktree.as_ref() == worktree)
-            .map(|(doc, _)| *doc)
+            .map(|(doc, reference)| (*doc, Arc::clone(&reference.owner)))
+            .chain(self.pending_opens.iter()
+                .filter(|(_, pending)| pending.worktree == worktree)
+                .map(|(doc, pending)| (*doc, Arc::clone(&pending.owner))))
             .collect();
-        let keys: Vec<_> = self
-            .sessions
-            .iter()
+        let sessions = self.sessions.iter()
             .filter(|(_, handle)| handle.worktree.as_ref() == worktree)
-            .map(|(key, _)| key.clone())
-            .collect();
-        for doc in documents {
-            self.close(doc);
+            .map(|(key, handle)| CapturedSession {
+                key: key.clone(), retired: Arc::clone(&handle.retired),
+            }).collect();
+        LspWorktreeRemoval { manager: self.generation, registrations, sessions }
+    }
+
+    /// Retire only owners captured for the successful removal. An old result
+    /// cannot close a replacement manager, registration, or same-key session.
+    /// Surviving registrations that joined an original session are reopened
+    /// with their latest immutable buffer after that old session retires.
+    pub fn remove_captured_worktree(&mut self, removal: LspWorktreeRemoval) {
+        if removal.manager != self.generation { return; }
+        let mut sessions = removal.sessions;
+        for (doc, owner) in removal.registrations {
+            if let Some(created) = owner.created_session.lock()
+                .unwrap_or_else(|error| error.into_inner()).clone() {
+                sessions.push(created);
+            }
+            let matches = self.documents.get(&doc)
+                .is_some_and(|reference| Arc::ptr_eq(&reference.owner, &owner))
+                || self.pending_opens.get(&doc)
+                    .is_some_and(|pending| Arc::ptr_eq(&pending.owner, &owner));
+            if matches { self.close(doc); }
         }
-        for key in keys {
-            if let Some(handle) = self.sessions.remove(&key) {
-                self.retire_handle(handle);
+        let mut reopen = Vec::new();
+        for captured in sessions {
+            if self.sessions.get(&captured.key)
+                .is_some_and(|current| Arc::ptr_eq(&current.retired, &captured.retired)) {
+                if let Some(handle) = self.sessions.remove(&captured.key) {
+                    self.retire_handle(handle);
+                    reopen.push(captured.key);
+                }
             }
         }
+        for key in reopen { self.reopen_documents(&key); }
+    }
+
+    /// Immediate removal for callers that already hold current ownership.
+    /// Asynchronous operations must capture before their effect and complete
+    /// with `remove_captured_worktree`, rather than recapturing by path later.
+    pub fn remove_worktree(&mut self, worktree: &Path) {
+        let removal = self.capture_worktree_removal(worktree);
+        self.remove_captured_worktree(removal);
     }
 
     pub fn request_completion(&mut self, doc: LspDocumentId, at: LspPosition) -> LspRequestId {
@@ -5223,6 +5291,7 @@ impl LspManager {
                 version,
                 text,
                 key.root.to_path_buf(),
+                Arc::default(),
             );
         }
     }
@@ -6080,6 +6149,132 @@ mod tests {
             assert_eq!(manager.sessions.len(), 1);
             manager.shutdown();
             manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_removal_does_not_retire_restarted_same_path_session_or_reused_document() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let doc = LspDocumentId(1);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "original");
+            await_ready(&events, doc).await;
+            let old = manager.sessions.values().next().unwrap().clone();
+            let removal = manager.capture_worktree_removal(&worktree);
+            manager.restart(doc);
+            await_ready(&events, doc).await;
+            let successor = manager.sessions.values().next().unwrap().clone();
+            assert!(!Arc::ptr_eq(&old.retired, &successor.retired));
+            manager.remove_captured_worktree(removal.clone());
+            assert!(manager.documents.contains_key(&doc));
+            assert!(!successor.retired.load(Ordering::Acquire));
+            assert_eq!(manager.sessions.len(), 1);
+            manager.close(doc);
+            manager.open_for_test(doc, &file, &worktree, rust_language(), 1, "new registration");
+            manager.remove_captured_worktree(removal);
+            let uri = &manager.documents[&doc].uri;
+            assert_eq!(manager.snapshots.latest(uri).unwrap().full_text().as_ref(), "new registration");
+            assert!(!successor.retired.load(Ordering::Acquire));
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_pending_removal_tracks_created_session_and_preserves_newer_joined_buffer() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let old_doc = LspDocumentId(1);
+            manager.open(old_doc, &file, &worktree, rust_language(), 1, "original pending");
+            let removal = manager.capture_worktree_removal(&worktree);
+            assert!(removal.sessions.is_empty());
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == old_doc => Some((*ticket, root.clone())),
+                _ => None,
+            }).await;
+            manager.finish_discovery(old_doc, ticket, root);
+            await_ready(&events, old_doc).await;
+            let original = manager.sessions.values().next().unwrap().clone();
+            let new_doc = LspDocumentId(2);
+            manager.open_for_test(new_doc, &worktree.join("new.rs"), &worktree, rust_language(), 1, "new buffer");
+            manager.change(new_doc, 2, &[], "newer unsaved buffer");
+            manager.remove_captured_worktree(removal.clone());
+            assert!(!manager.documents.contains_key(&old_doc));
+            assert!(original.retired.load(Ordering::Acquire));
+            await_ready(&events, new_doc).await;
+            let successor = manager.sessions.values().next().unwrap().clone();
+            assert!(!Arc::ptr_eq(&original.retired, &successor.retired));
+            assert_eq!(manager.snapshots.latest(&manager.documents[&new_doc].uri).unwrap().full_text().as_ref(), "newer unsaved buffer");
+            manager.remove_captured_worktree(removal);
+            assert!(manager.documents.contains_key(&new_doc));
+            assert!(!successor.retired.load(Ordering::Acquire));
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_pending_removal_cannot_retire_a_session_created_by_a_newer_registration() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let slot = install_fake(&mut manager, incremental_capabilities(), |_| Vec::new());
+            let events = manager.events();
+            let old_doc = LspDocumentId(1);
+            manager.open(old_doc, &file, &worktree, rust_language(), 1, "pending A");
+            let removal = manager.capture_worktree_removal(&worktree);
+            let (ticket, root) = next_matching(&events, |event| match event {
+                LspEvent::RootDiscovered { doc, ticket, root } if *doc == old_doc => Some((*ticket, root.clone())),
+                _ => None,
+            }).await;
+            let new_doc = LspDocumentId(2);
+            manager.open_for_test(new_doc, &worktree.join("new.rs"), &worktree, rust_language(), 1, "B");
+            await_ready(&events, new_doc).await;
+            let successor = manager.sessions.values().next().unwrap().clone();
+            manager.finish_discovery(old_doc, ticket, root);
+            manager.remove_captured_worktree(removal);
+            assert!(!manager.documents.contains_key(&old_doc));
+            assert!(manager.documents.contains_key(&new_doc));
+            assert!(!successor.retired.load(Ordering::Acquire));
+            assert_eq!(handle_of(&slot).await.entries("initialize").len(), 1);
+            manager.shutdown();
+            manager.wait_for_shutdown().await;
+        });
+    }
+
+    #[test]
+    fn captured_removal_refuses_another_manager_and_drops_only_original_pending_discovery() {
+        block_on(async {
+            let (_root, worktree, file) = workspace();
+            let mut manager = rust_manager();
+            let doc = LspDocumentId(1);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "pending A");
+            let old_ticket = manager.pending_opens[&doc].ticket;
+            let removal = manager.capture_worktree_removal(&worktree);
+            manager.close(doc);
+            manager.open(doc, &file, &worktree, rust_language(), 1, "pending B");
+            let new_ticket = manager.pending_opens[&doc].ticket;
+            manager.remove_captured_worktree(removal.clone());
+            assert_eq!(manager.pending_opens[&doc].ticket, new_ticket);
+            assert!(manager.finish_discovery(doc, old_ticket, worktree.clone()).is_none());
+            let mut replacement = rust_manager();
+            replacement.open(doc, &file, &worktree, rust_language(), 1, "other manager");
+            replacement.remove_captured_worktree(removal);
+            assert_eq!(replacement.pending_opens[&doc].text.full_text().as_ref(), "other manager");
+            let current = manager.capture_worktree_removal(&worktree);
+            manager.remove_captured_worktree(current);
+            assert!(manager.pending_opens.is_empty());
+            assert!(manager.finish_discovery(doc, new_ticket, worktree).is_none());
+            manager.shutdown();
+            replacement.shutdown();
+            manager.wait_for_shutdown().await;
+            replacement.wait_for_shutdown().await;
         });
     }
 
