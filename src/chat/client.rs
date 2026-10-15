@@ -27,6 +27,37 @@ use std::{
 // and a busy desktop scheduler.
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 
+/// Stack ranges are virtual reservations, not committed memory. A profiler
+/// can intersect these ranges with smaps RSS/PSS rather than multiplying an
+/// assumed stack size by the number of chat workers.
+fn trace_worker_stack(role: &'static str) {
+    #[cfg(target_os = "linux")]
+    if tracing::enabled!(target: "cagents::memory", tracing::Level::TRACE) {
+        // SAFETY: pthread initializes attr on success; all output pointers are
+        // live local storage and the initialized attribute is destroyed once.
+        unsafe {
+            let mut attr = std::mem::MaybeUninit::<libc::pthread_attr_t>::uninit();
+            if libc::pthread_getattr_np(libc::pthread_self(), attr.as_mut_ptr()) != 0 {
+                return;
+            }
+            let mut attr = attr.assume_init();
+            let mut base = std::ptr::null_mut();
+            let mut bytes = 0;
+            let mut guard_bytes = 0;
+            let valid = libc::pthread_attr_getstack(&attr, &mut base, &mut bytes) == 0;
+            let _ = libc::pthread_attr_getguardsize(&attr, &mut guard_bytes);
+            let _ = libc::pthread_attr_destroy(&mut attr);
+            if valid {
+                tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "thread_stack", role,
+                    thread_id = libc::syscall(libc::SYS_gettid) as u64,
+                    stack_base = base as usize, reserved_stack_bytes = bytes, guard_bytes);
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = role;
+}
+
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -134,6 +165,13 @@ struct Inner {
     wire: Arc<Mutex<Wire>>,
     cancel: UnixStream,
     snapshot: Arc<Mutex<Arc<Snapshot>>>,
+    // A metadata-only generation cannot be a body-delta base. Hidden clients
+    // may still conditionally poll control metadata at that generation.
+    transcript_resident: Arc<AtomicBool>,
+    body_requested: Arc<AtomicBool>,
+    // First-prompt receipt evidence survives body eviction, without retaining
+    // user text. This is scoped to this exact authenticated connection.
+    user_item_seen: Arc<AtomicBool>,
     source_clock: Arc<Mutex<Option<SourceClock>>>,
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
@@ -231,6 +269,10 @@ fn transmit(
     id: u64,
     request: ClientRequest,
 ) -> Result<(), String> {
+    let hidden = matches!(
+        &request,
+        ClientRequest::ChatVisibility { visible: false, .. }
+    );
     let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
     let Wire { stream, codec } = &mut *wire;
     codec
@@ -243,7 +285,11 @@ fn transmit(
                 request,
             },
         )
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    if hidden {
+        codec.release_spare();
+    }
+    Ok(())
 }
 fn receive(
     stream: &mut UnixStream,
@@ -448,6 +494,10 @@ impl ClientHandle {
     /// handle does not look like a protocol failure to a test that only draws.
     #[cfg(test)]
     pub(crate) fn fixture(session: Session, snapshot: Snapshot) -> Self {
+        let user_item_seen = snapshot
+            .items
+            .iter()
+            .any(|item| item.role == super::Role::User);
         let (stream, peer) = UnixStream::pair().expect("socket pair");
         let (cancel, cancel_peer) = UnixStream::pair().expect("socket pair");
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
@@ -475,6 +525,9 @@ impl ClientHandle {
                     Instant::now(),
                 ))),
                 snapshot: Arc::new(Mutex::new(Arc::new(snapshot))),
+                transcript_resident: Arc::new(AtomicBool::new(true)),
+                body_requested: Arc::new(AtomicBool::new(true)),
+                user_item_seen: Arc::new(AtomicBool::new(user_item_seen)),
                 activity: Arc::new(Mutex::new(ActivityObservation {
                     generation: 0,
                     state: ActivityState::Idle,
@@ -928,7 +981,19 @@ impl ClientHandle {
             initial.sampled_at,
             Instant::now(),
         )));
+        // Attachment also serves non-UI callers that inspect the initial
+        // publication directly. The UI immediately sets its actual visibility;
+        // an unvisited hidden pane releases this body without preparing it.
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %session.id, resident_bytes = initial.transcript_bytes());
+        let user_item_seen = Arc::new(AtomicBool::new(
+            initial
+                .items
+                .iter()
+                .any(|item| item.role == super::Role::User),
+        ));
         let snapshot = Arc::new(Mutex::new(Arc::new(initial)));
+        let body_requested = Arc::new(AtomicBool::new(true));
+        let transcript_resident = Arc::new(AtomicBool::new(true));
         let next = Arc::new(AtomicU64::new(attach_request + 1));
         let alive = Arc::new(AtomicBool::new(true));
         let visible = Arc::new(AtomicBool::new(false));
@@ -943,6 +1008,9 @@ impl ClientHandle {
             wire: wire.clone(),
             cancel,
             snapshot: snapshot.clone(),
+            transcript_resident: transcript_resident.clone(),
+            body_requested: body_requested.clone(),
+            user_item_seen: user_item_seen.clone(),
             source_clock: source_clock.clone(),
             activity: activity.clone(),
             observed: observed.clone(),
@@ -960,11 +1028,13 @@ impl ClientHandle {
         let visibility_wire = wire.clone();
         let visibility_alive = alive.clone();
         let visibility_value = visible.clone();
+        let visibility_body_requested = body_requested.clone();
         let visibility_proof = proof.clone();
         let visibility_next = next.clone();
         let visibility_worker = thread::Builder::new()
             .name(format!("chat-visibility-{id}"))
             .spawn(move || {
+                trace_worker_stack("chat_visibility");
                 while visibility_rx.recv().is_ok() {
                     if !visibility_alive.load(Ordering::Acquire) {
                         break;
@@ -988,6 +1058,9 @@ impl ClientHandle {
                             .shutdown(Shutdown::Both);
                         break;
                     }
+                    if !visibility_body_requested.load(Ordering::Acquire) {
+                        visibility_wire.lock().unwrap_or_else(|p| p.into_inner()).codec.release_spare();
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
@@ -999,6 +1072,7 @@ impl ClientHandle {
         // Ready consumes any pre-attachment unread edge; do not publish a wake
         // before the UI has installed the matching runtime generation.
         let worker = thread::Builder::new().name(format!("chat-client-{id}")).spawn(move || {
+            trace_worker_stack("chat_reader");
             let mut read_pending = false;
             let mut read_again = false;
             let mut resync = false;
@@ -1008,6 +1082,7 @@ impl ClientHandle {
                     Ok(None) => break "Chat daemon disconnected; exact session retained for reattachment".into(),
                     Err(error) => break format!("Chat daemon frame failed: {error}"),
                 };
+                if !body_requested.load(Ordering::Acquire) { codec.release_spare(); }
                 if envelope.version != PROTOCOL_VERSION || envelope.proof != proof { break "Chat daemon identity/version changed; refusing replacement".into(); }
                 if matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::ChatClosed { .. } | ServerResponse::ChatTerminal { .. } }) {
                     let (chat_id, final_snapshot, terminal) = match envelope.message {
@@ -1019,14 +1094,28 @@ impl ClientHandle {
                     if terminal.is_some() && !final_snapshot.exited {
                         // A shared-server CLI is another view, not a closed
                         // native actor. Keep this connection and pending work.
-                        *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                        {
+                            let mut state = snapshot.lock().unwrap_or_else(|p|p.into_inner());
+                            let mut final_snapshot = final_snapshot;
+                            user_item_seen.fetch_or(final_snapshot.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                            let resident = body_requested.load(Ordering::Acquire);
+                            if !resident { final_snapshot.evict_transcript(); }
+                            *state = Arc::new(final_snapshot);
+                            transcript_resident.store(resident, Ordering::Release);
+                        }
                         if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
                             let _ = reply.try_send(Ok(terminal));
                         }
                         wake(Wake::Changed);
                         continue;
                     }
-                    *snapshot.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(final_snapshot);
+                    alive.store(false, Ordering::Release);
+                    {
+                        let mut state = snapshot.lock().unwrap_or_else(|p|p.into_inner());
+                        user_item_seen.fetch_or(final_snapshot.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                        *state = Arc::new(final_snapshot);
+                        transcript_resident.store(true, Ordering::Release);
+                    }
                     {
                         let mut activity = activity.lock().unwrap_or_else(|p| p.into_inner());
                         activity.state = ActivityState::Unknown;
@@ -1086,23 +1175,63 @@ impl ClientHandle {
                             resync = false;
                             let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                             SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), update.sampled_at, Instant::now());
+                            let mut update = update;
+                            user_item_seen.fetch_or(update.items.iter().any(|item| item.role == super::Role::User), Ordering::AcqRel);
+                            let resident = body_requested.load(Ordering::Acquire);
+                            if !resident { update.evict_transcript(); }
+                            transcript_resident.store(resident, Ordering::Release);
                             *state = Arc::new(update);
+                            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
+                                resident_bytes = state.transcript_bytes());
                             drop(state);
                             if visible.load(Ordering::Acquire) { wake(Wake::Changed); }
+                        } else if body_requested.load(Ordering::Acquire) && !transcript_resident.load(Ordering::Acquire) {
+                            // A conditional read was already in flight at hide.
+                            // Its unchanged response cannot hydrate an evicted base.
+                            resync = true;
+                            read_again = true;
                         }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatUpdate { chat_id, update } } if chat_id == id => {
                         read_pending = false;
                         let mut state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
                         let sampled_at = update.metadata.sampled_at;
-                        let applied = match update.apply(&state) {
-                            Ok(next) => {
-                                *state = Arc::new(next);
+                        user_item_seen.fetch_or(update.changes.iter().any(|change| {
+                            let (super::presentation::ItemChange::Replace(item) | super::presentation::ItemChange::Append { item, .. }) = change;
+                            item.role == super::Role::User
+                        }), Ordering::AcqRel);
+                        let retain_body = body_requested.load(Ordering::Acquire);
+                        let applied = if !retain_body || !transcript_resident.load(Ordering::Acquire) {
+                            // Preserve authenticated scalar state/late continuity
+                            // even when the body needed to apply a patch is gone.
+                            // A later reveal still requires an unconditional read.
+                            if update.metadata.generation >= state.generation {
+                                let mut metadata = update.metadata;
+                                if update.file_changes_unchanged {
+                                    metadata.file_changes = state.file_changes.clone();
+                                }
+                                metadata.evict_transcript();
+                                *state = Arc::new(metadata);
                                 SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
-                                true
-                            },
-                            Err(_) => false,
+                            }
+                            // Hidden control subscribers advance metadata
+                            // without immediately resyncing a discarded body.
+                            !retain_body
+                        } else {
+                            match update.apply(&state) {
+                                Ok(mut next) => {
+                                    let resident = body_requested.load(Ordering::Acquire);
+                                    if !resident { next.evict_transcript(); }
+                                    transcript_resident.store(resident, Ordering::Release);
+                                    *state = Arc::new(next);
+                                    SourceClock::observe(&mut source_clock.lock().unwrap_or_else(|p| p.into_inner()), sampled_at, Instant::now());
+                                    true
+                                },
+                                Err(_) => false,
+                            }
                         };
+                        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
+                            resident_bytes = state.transcript_bytes());
                         drop(state);
                         if !applied {
                             resync = true;
@@ -1121,8 +1250,11 @@ impl ClientHandle {
                 }
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
                     read_again = false;
-                    let generation = snapshot.lock().unwrap_or_else(|p| p.into_inner()).generation;
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: (!resync).then_some(generation) }) { break error; }
+                    let after_generation = {
+                        let state = snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                        (!resync && (transcript_resident.load(Ordering::Acquire) || !body_requested.load(Ordering::Acquire))).then_some(state.generation)
+                    };
+                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) { break error; }
                     read_pending = true;
                 }
             };
@@ -1191,6 +1323,45 @@ impl ClientHandle {
         (snapshot.clone(), *clock)
     }
 
+    /// Control metadata for a hidden runtime, without borrowing its body.
+    /// A disconnected client's final publication must remain readable instead.
+    pub(crate) fn hidden_snapshot_with_clock(
+        &self,
+    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+        let (mut snapshot, clock) = self.snapshot_with_clock();
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return None;
+        }
+        Arc::make_mut(&mut snapshot).evict_transcript();
+        Some((snapshot, clock))
+    }
+
+    pub(crate) fn has_observed_user_item(&self) -> bool {
+        self.inner.user_item_seen.load(Ordering::Acquire)
+    }
+
+    /// A renderable publication, absent until a hidden client's full history
+    /// has been rehydrated. Metadata-only generations must never clear a
+    /// runtime's scroll/disclosure state as if they were empty conversations.
+    pub(crate) fn resident_snapshot_with_clock(
+        &self,
+    ) -> Option<(Arc<Snapshot>, Option<SourceClock>)> {
+        let snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if !self.inner.transcript_resident.load(Ordering::Acquire) {
+            return None;
+        }
+        let clock = self
+            .inner
+            .source_clock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        Some((snapshot.clone(), *clock))
+    }
+
     #[cfg(test)]
     fn install_snapshot_for_test(&self, update: Snapshot) {
         let mut state = self
@@ -1207,7 +1378,22 @@ impl ClientHandle {
             update.sampled_at,
             Instant::now(),
         );
+        self.inner.user_item_seen.fetch_or(
+            update
+                .items
+                .iter()
+                .any(|item| item.role == super::Role::User),
+            Ordering::AcqRel,
+        );
+        let mut update = update;
+        let resident = self.inner.body_requested.load(Ordering::Acquire);
+        if !resident {
+            update.evict_transcript();
+        }
         *state = Arc::new(update);
+        self.inner
+            .transcript_resident
+            .store(resident, Ordering::Release);
     }
 
     /// Drains one coalesced activity edge without touching presentation state.
@@ -1340,14 +1526,42 @@ impl ClientHandle {
         })
     }
     pub fn set_visible(&self, visible: bool) -> Result<(), String> {
+        self.set_interest(visible, visible)
+    }
+
+    /// Keep control notifications flowing for queued commands without keeping
+    /// renderable history resident in an offscreen UI card.
+    pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }
-        let changed = self.inner.visible.swap(visible, Ordering::AcqRel) != visible;
-        if visible && changed {
-            // An idle daemon may have the same generation as our cached
-            // handshake. Present that cache now; a conditional read can
-            // legitimately return no update when a hidden pane reappears.
+        let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
+        let mut snapshot = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let body_changed = self
+            .inner
+            .body_requested
+            .swap(retain_body, Ordering::AcqRel)
+            != retain_body;
+        if !retain_body {
+            if !self.inner.alive.load(Ordering::Acquire) {
+                return Err("Chat is disconnected".into());
+            }
+            let bytes = snapshot.transcript_bytes();
+            Arc::make_mut(&mut snapshot).evict_transcript();
+            self.inner
+                .transcript_resident
+                .store(false, Ordering::Release);
+            tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %self.inner.id, resident_bytes = 0usize, evicted_bytes = bytes);
+        }
+        drop(snapshot);
+        if interested && (changed || body_changed) {
+            // Controls can use retained metadata immediately. The visibility
+            // notification triggers an unconditional read for evicted history,
+            // even if the idle daemon's generation has not changed.
             (self.inner.wake)(Wake::Changed);
         }
         // Visibility is replaceable state, not an ordered provider frame. Coalesce
@@ -1497,6 +1711,8 @@ impl Drop for Inner {
         {
             let _ = worker.join();
         }
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %self.id,
+            released = true, resident_bytes = 0usize);
     }
 }
 
@@ -2684,6 +2900,427 @@ mod tests {
             Some(CONVERSATION)
         );
     }
+    #[test]
+    fn hidden_wire_client_releases_history_and_reveals_at_the_same_generation() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (hidden_tx, hidden_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("live");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            let snapshot = || Snapshot {
+                generation: 41,
+                session_id: Some("exact-session".into()),
+                ready: true,
+                items: vec![Arc::new(super::super::Item {
+                    id: "history".into(),
+                    role: super::super::Role::Assistant,
+                    content: super::super::ItemContent::Text {
+                        text: "body".repeat(64 * 1024),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    started_at: None,
+                    at: None,
+                })],
+                ..Default::default()
+            };
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: snapshot(),
+                    },
+                },
+            );
+            let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                hidden.request,
+                ClientRequest::ChatVisibility { visible: false, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(hidden.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            hidden_tx.send(()).unwrap();
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(shown.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    read.request,
+                    ClientRequest::ChatRead {
+                        after_generation: None,
+                        ..
+                    }
+                ),
+                "the current generation is metadata only and cannot suppress hydration"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(snapshot()),
+                    },
+                },
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        let body = Arc::downgrade(&handle.snapshot().items[0]);
+        handle.set_visible(false).unwrap();
+        hidden_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(handle.snapshot().generation, 41);
+        assert_eq!(
+            handle.snapshot().session_id.as_deref(),
+            Some("exact-session")
+        );
+        assert!(body.upgrade().is_none());
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        handle.set_visible(true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(handle.snapshot().generation, 41);
+        assert_eq!(handle.snapshot().transcript_bytes(), 256 * 1024);
+        done_tx.send(()).unwrap();
+        worker.join().unwrap();
+        while !matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Disconnected(_)
+        ) {}
+        assert!(handle.set_visible(false).is_err());
+        assert_eq!(
+            handle.snapshot().transcript_bytes(),
+            256 * 1024,
+            "an unreachable daemon cannot rehydrate the last readable publication yet"
+        );
+    }
+
+    #[test]
+    fn hidden_control_subscribers_advance_metadata_without_rehydration_loops() {
+        use super::super::{
+            Item, ItemContent, Role,
+            presentation::{ItemChange, Presentation},
+        };
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (advance_tx, advance_rx) = std::sync::mpsc::channel();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("control-reader");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            let interested: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                interested.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(interested.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: Some(1),
+                    ..
+                }
+            ));
+            let prompt = Item {
+                id: "received-prompt".into(),
+                role: Role::User,
+                content: ItemContent::Text {
+                    text: "prompt".repeat(64 * 1024),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            };
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatUpdate {
+                        chat_id,
+                        update: Presentation {
+                            base_generation: 1,
+                            file_changes_unchanged: true,
+                            metadata: Snapshot {
+                                generation: 2,
+                                ready: true,
+                                ..Default::default()
+                            },
+                            order: vec![prompt.id.clone()],
+                            changes: vec![ItemChange::Replace(prompt.clone())],
+                            children: vec![],
+                        },
+                    },
+                },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let unchanged: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    unchanged.request,
+                    ClientRequest::ChatRead {
+                        after_generation: Some(2),
+                        ..
+                    }
+                ),
+                "discarded bodies must not cause hidden control resync loops"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(unchanged.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: None,
+                    },
+                },
+            );
+            // This ordered control edge lets the client prove it consumed the
+            // unchanged response while still hidden before requesting reveal.
+            respond(&mut codec, &mut server, None, ServerMessage::ChatActivity {
+                chat_id, state: ActivityState::Working, generation: 2,
+            });
+            stage_tx.send(()).unwrap();
+            // The next frame must be reveal, not another automatic full read.
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(shown.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Accepted,
+                },
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                read.request,
+                ClientRequest::ChatRead {
+                    after_generation: None,
+                    ..
+                }
+            ));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 2,
+                            ready: true,
+                            items: vec![Arc::new(prompt)],
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        {
+            let mut wire = handle.inner.wire.lock().unwrap();
+            wire.codec.write(&mut std::io::sink(), &"large prompt".repeat(128 * 1024)).unwrap();
+            assert!(wire.codec.buffer_capacities_for_test().1 > 1024 * 1024);
+        }
+        handle.set_interest(true, false).unwrap();
+        while handle.snapshot().generation != 2 {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.inner.wire.lock().unwrap().codec.buffer_capacities_for_test().1 > 256 * 1024 {
+            assert!(Instant::now() < deadline, "hidden interested transport retained its large prompt buffer");
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(handle.snapshot().ready);
+        assert_eq!(handle.snapshot().transcript_bytes(), 0);
+        assert!(handle.has_observed_user_item());
+        assert!(handle.resident_snapshot_with_clock().is_none());
+        advance_tx.send(()).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        while !matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Activity) {}
+        handle.set_visible(true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        assert_eq!(handle.snapshot().generation, 2);
+        assert_eq!(handle.snapshot().transcript_bytes(), 6 * 64 * 1024);
+        advance_tx.send(()).unwrap();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn wire_updates_share_retained_items_and_request_full_resync_on_invalid_patch() {
         use crate::chat::{
