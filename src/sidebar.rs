@@ -13267,16 +13267,43 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let mut state = SidebarState::default();
         state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
-        for activity in [crate::agent::ActivityState::Working, crate::agent::ActivityState::Waiting] {
-            state.set_agent_activity(CardId::new(), project, worktree, crate::agent::Activity { provider: crate::agent::Provider::Claude, state: activity });
+        for activity in [
+            crate::agent::ActivityState::Working,
+            crate::agent::ActivityState::Waiting,
+        ] {
+            state.set_agent_activity(
+                CardId::new(),
+                project,
+                worktree,
+                crate::agent::Activity {
+                    provider: crate::agent::Provider::Claude,
+                    state: activity,
+                },
+            );
         }
-        assert!(!state.has_agent_update(project, worktree), "this regression must not rely on an unread marker");
+        assert!(
+            !state.has_agent_update(project, worktree),
+            "this regression must not rely on an unread marker"
+        );
         let filtered = filtered_projects(&model, &state, false);
         assert_eq!(filtered.len(), 1);
-        assert_eq!(filtered[0].worktrees.iter().map(|row| row.id).collect::<Vec<_>>(), vec![worktree]);
-        assert_eq!(filtered[0].attention[&worktree].state, Some(AttentionState::Waiting));
+        assert_eq!(
+            filtered[0]
+                .worktrees
+                .iter()
+                .map(|row| row.id)
+                .collect::<Vec<_>>(),
+            vec![worktree]
+        );
+        assert_eq!(
+            filtered[0].attention[&worktree].state,
+            Some(AttentionState::Waiting)
+        );
         state.reveal_project(project);
-        assert!(visible_selection_rows(&model, &state, false).contains(&SelectionRow::Worktree(project, worktree)));
+        assert!(
+            visible_selection_rows(&model, &state, false)
+                .contains(&SelectionRow::Worktree(project, worktree))
+        );
     }
 
     #[test]

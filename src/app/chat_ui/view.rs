@@ -4876,7 +4876,13 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.push(state);
         app.chat_ui.parked.insert(card, Box::new(runtime));
         handle.observe_activity_for_test(crate::agent::ActivityState::Waiting);
-        app.sidebar_state.set_card_activity(card, crate::agent::Activity { provider: Provider::Claude, state: crate::agent::ActivityState::Waiting });
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
         // This is the ordinary close path's cleanup before chat_discard.
         app.sidebar_state.clear_agent_activity(card);
         app.sidebar_state.acknowledge_agent_update(card);

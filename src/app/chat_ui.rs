@@ -12599,25 +12599,56 @@ mod tests {
         let parent = runtime.session.id;
         let handle = runtime.handle().unwrap().clone();
         let mut snapshot = (*runtime.snapshot).clone();
-        snapshot.subagents.push(chat::Subagent { model: None, waiting: false, detail: String::new(), id: "child".into(), kind: "fixture".into(), description: "Child transcript".into(), status: chat::ToolStatus::Succeeded, background: false, items: vec![] });
+        snapshot.subagents.push(chat::Subagent {
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child transcript".into(),
+            status: chat::ToolStatus::Succeeded,
+            background: false,
+            items: vec![],
+        });
         show_chat_snapshot_for_test(&mut app, card, snapshot);
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
-        assert_eq!(chat_runtime(&app, card).selected_subagent.as_deref(), Some("child"));
+        assert_eq!(
+            chat_runtime(&app, card).selected_subagent.as_deref(),
+            Some("child")
+        );
         app.settings_reset_confirm = true;
-        drop(app.update(Message::NotificationUi(crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(parent)))));
-        assert_eq!(chat_runtime(&app, card).selected_subagent.as_deref(), Some("child"), "a deferred activation cannot mutate the transcript behind a modal");
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(
+                parent,
+            )),
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).selected_subagent.as_deref(),
+            Some("child"),
+            "a deferred activation cannot mutate the transcript behind a modal"
+        );
         app.settings_reset_confirm = false;
         drop(app.retry_notification_activation());
         assert_eq!(app.workspace.focused(), Some(card));
         assert!(chat_runtime(&app, card).selected_subagent.is_none());
-        assert!(Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle), "activation preserves the exact native actor attachment");
+        assert!(
+            Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle),
+            "activation preserves the exact native actor attachment"
+        );
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
         app.sidebar_state.observe_card_update(card);
-        drop(app.update(Message::NotificationUi(crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(parent)))));
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(
+                parent,
+            )),
+        )));
         assert!(chat_runtime(&app, card).selected_subagent.is_none());
         assert!(!app.sidebar_state.has_card_update(card));
         assert_eq!(chat_runtime(&app, card).session.id, parent);
-        assert!(Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle));
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
     }
 
     #[test]

@@ -9056,7 +9056,10 @@ mod tests {
             .expect("the workspace still exists");
         assert_eq!(restored.state.cards.len(), 1);
         assert_eq!(restored.state.cards[0].id, survivor);
-        assert_eq!(restored.state.agent_updates, BTreeMap::from([(survivor, None)]));
+        assert_eq!(
+            restored.state.agent_updates,
+            BTreeMap::from([(survivor, None)])
+        );
         assert_eq!(restored.warnings.len(), 1);
         assert!(
             restored.warnings[0].contains("launch recipe")
