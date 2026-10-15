@@ -34776,6 +34776,7 @@ mod tests {
             assert!(app.sidebar_model.source_control.as_ref().unwrap().error
                 .as_deref().unwrap().contains("Finish or abort"));
             assert_eq!(app.sidebar_state.commit_message(), "Kept draft");
+            app.sidebar_model.source_control.as_mut().unwrap().head_oid = None;
             drop(app.update(Message::Sidebar(SidebarAction::AmendChanged {
                 key: key.clone(),
                 amend: false,
