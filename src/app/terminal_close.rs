@@ -591,6 +591,19 @@ impl Cagents {
         }
     }
 
+    /// A local scope move must not overtake this pane's already captured
+    /// Close/End/Hide decision or asynchronous retirement. This is not a
+    /// daemon-wide lock and grants no execution or membership authority.
+    pub(super) fn pane_close_owned(&self,card:CardId)->bool {
+        self.pending_card_removal_target(card).is_some()
+            || self.workspace.pending_close().is_some_and(|pending|pending.unmounting==card)
+            || self.terminal_close_pending(card)
+            || self.pane_close_batch_for(card).is_some()
+            || self.conversation_close_owns_pane(card)
+            || self.terminal_confirmation_owns_pane(card)
+            || self.dirty_repository_close.as_ref().is_some_and(|close|close.card==card || close.remaining.contains(&card))
+    }
+
     pub(super) fn terminal_close_pending(&self, card: CardId) -> bool {
         self.terminal_close
             .as_ref()
@@ -1801,6 +1814,21 @@ mod tests {
             .bound
             .insert(card, captured.clone());
         (app, card, captured)
+    }
+
+    #[test]
+    fn move_busy_ownership_covers_held_removal_and_initial_batch_selection_only() {
+        let mut app=super::super::tests::context_inspector_test_app(true);
+        let card=app.workspace.focused().unwrap();let other=CardId::new();
+        let _held=app.request_card_removal(card);
+        let target=app.pending_card_removal_target(card).unwrap();
+        assert!(app.pane_close_owned(card));assert!(!app.pane_close_owned(other));
+        app.retire_card_removal(target);let _=app.workspace.cancel_close(card);
+        assert!(!app.pane_close_owned(card));
+        let _held=app.close_cards_in_order(vec![card]);
+        assert!(app.pane_close_owned(card));assert!(!app.pane_close_owned(other));
+        let batch=app.pane_close_batch_for(card);app.stop_pane_close_batch(batch);
+        assert!(!app.pane_close_owned(card));
     }
 
     #[test]
