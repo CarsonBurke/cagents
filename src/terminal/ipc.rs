@@ -912,7 +912,7 @@ pub struct TerminalDescriptor {
     #[serde(default)]
     pub upgrade_relaunches: Vec<UpgradeRelaunch>,
     /// Exact resident worker observed by this inventory result. Nil means no
-    /// live worker exists and cannot authorize a source-checked live close.
+    /// resident worker exists and cannot authorize a source-checked close.
     #[serde(default)]
     pub execution_instance: uuid::Uuid,
 }

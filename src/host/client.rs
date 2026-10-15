@@ -1269,11 +1269,18 @@ fn close_terminal_source_checked(
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let current = state.descriptor(client_id, source.id)?;
         if execution_instance.is_nil() || current.execution_instance != execution_instance
-            || current.session != source || source.continuity.live_proof().is_none() {
+            || current.session != source {
             return Err(changed());
         }
         let record = state.terminals.get(&source.id).ok_or_else(changed)?;
         let handle = record.handle.clone();
+        // Completion publication can precede its event callback updating
+        // last_exit. The exact inventory UUID still binds that retained owner;
+        // an unconfirmed exit status must not manufacture a live proof or make
+        // the completed worker impossible to close.
+        if source.continuity.live_proof().is_none() && !handle.is_completed() {
+            return Err(changed());
+        }
         let paired = state.chats.get(&source.id).map(|record| {
             if !record.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&handle))
                 || !record.session.terminal.as_ref().is_some_and(|terminal|
@@ -1517,6 +1524,44 @@ mod tests {
             request(current.session, current.execution_instance, true)).unwrap().0,
             ServerResponse::TerminalCloseChecked { outcome: crate::terminal_ipc::TerminalCloseResult::Closed, .. }));
         assert!(replacement.is_completed());
+        assert!(!host.lock().unwrap().terminals.contains_key(&session.id));
+    }
+
+    #[test]
+    fn source_checked_close_retires_completed_worker_before_exit_callback() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalContinuity, TerminalSession};
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("source-close-unknown-exit"),
+            boot_id: BootId::new("boot"), host_incarnation: HostIncarnation::new("incarnation"),
+        };
+        let host = Arc::new(super::super::state::HostLock::new(super::super::state::HostState::new(proof)));
+        let mut recipe = LaunchRecipe::shell("/".into()).unwrap();
+        recipe.program = "/bin/true".into(); recipe.arguments.clear();
+        let session = TerminalSession {
+            id: TerminalId::new(), launch: recipe.clone(), owned_codex_listener: None,
+            recovery_origin: None, predecessor: None, transcript_path: None, resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+        };
+        let handle = crate::terminal::TerminalHandle::spawn(session.clone(), Default::default(), |_| {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !handle.is_completed() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        // No host event monitor is installed, reproducing the interval before
+        // it acquires HostLock to record the already-completed owner's status.
+        let descriptor = {
+            let mut state = host.lock().unwrap(); state.register_client(1);
+            state.reserve_spawn(session.id).unwrap();
+            state.finish_spawn(1, session.clone(), handle, false).unwrap()
+        };
+        assert!(matches!(descriptor.session.continuity,
+            TerminalContinuity::RelaunchAvailable { last_exit: None, .. }));
+        assert!(matches!(process_request(&host, 1, ClientRequest::CloseTerminalSourceChecked {
+            source: descriptor.session, execution_instance: descriptor.execution_instance, allow_active: false,
+        }).unwrap().0, ServerResponse::TerminalCloseChecked {
+            outcome: crate::terminal_ipc::TerminalCloseResult::Closed, ..
+        }));
         assert!(!host.lock().unwrap().terminals.contains_key(&session.id));
     }
 
