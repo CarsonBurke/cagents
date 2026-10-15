@@ -85,18 +85,52 @@ pub fn resolve_targets(worktree: PathBuf, documents: Vec<DocumentEdits>, open_pa
     Ok(ResolvedTargets { worktree, root, documents, open_paths })
 }
 
-fn offset(text: &str, position: LspPosition, coordinates: LspCoordinates) -> Result<usize, String> {
-    let mut starts = std::iter::once(0).chain(text.match_indices('\n').map(|(index, _)| index + 1));
-    let start = starts.nth(position.line as usize).ok_or("The server edit names a missing line")?;
-    let end = text[start..].find('\n').map_or(text.len(), |offset| start + offset);
-    let end = if end > start && text.as_bytes()[end - 1] == b'\r' { end - 1 } else { end };
-    let mut units = 0u32;
-    for (index, character) in text[start..end].char_indices() {
-        if units == position.character { return Ok(start + index); }
-        units += match coordinates { LspCoordinates::Scalar => 1, LspCoordinates::Utf16 => character.len_utf16() as u32 };
-        if units > position.character { return Err("The server edit splits a Unicode character".into()); }
+/// Resolve sorted requests in one forward source pass. The callback counts
+/// source bytes traversed in the actual resolver for the long-line work test.
+fn offsets_with_scan(text: &str, positions: &[LspPosition], coordinates: LspCoordinates, mut scanned: impl FnMut(usize)) -> Result<Vec<usize>, String> {
+    let mut requests = positions.iter().copied().enumerate().collect::<Vec<_>>();
+    requests.sort_by_key(|(_, position)| (position.line, position.character));
+    let mut result = vec![0; positions.len()];
+    let mut line = 0;
+    let mut start = 0;
+    let mut loaded_line = None;
+    let mut next_line_start = None;
+    let mut characters = "".char_indices();
+    let mut units = 0;
+    let mut byte = 0;
+    for (output, position) in requests {
+        while line < position.line {
+            if loaded_line == Some(line) {
+                start = next_line_start.ok_or("The server edit names a missing line")?;
+            } else {
+                let length = text[start..].find('\n').ok_or("The server edit names a missing line")? + 1;
+                scanned(length);
+                start += length;
+            }
+            line += 1;
+        }
+        if loaded_line != Some(line) {
+            let ending = text[start..].find('\n');
+            let length = ending.unwrap_or(text.len() - start);
+            scanned(length + usize::from(ending.is_some()));
+            next_line_start = ending.map(|offset| start + offset + 1);
+            let mut end = start + length;
+            if end > start && text.as_bytes()[end - 1] == b'\r' { end -= 1; }
+            characters = text[start..end].char_indices();
+            units = 0;
+            byte = 0;
+            loaded_line = Some(line);
+        }
+        while units < position.character {
+            let (offset, character) = characters.next().ok_or("The server edit names a missing column")?;
+            scanned(character.len_utf8());
+            units += match coordinates { LspCoordinates::Scalar => 1, LspCoordinates::Utf16 => character.len_utf16() as u32 };
+            if units > position.character { return Err("The server edit splits a Unicode character".into()); }
+            byte = offset + character.len_utf8();
+        }
+        result[output] = start + byte;
     }
-    if units == position.character { Ok(end) } else { Err("The server edit names a missing column".into()) }
+    Ok(result)
 }
 
 fn verify_root(root: &fs_safety::Root) -> Result<(), String> {
@@ -153,10 +187,12 @@ fn prepare_at(root: Arc<fs_safety::Root>, documents: Vec<DocumentEdits>, open: &
         if before.len() as u64 > editor::MAX_EDITABLE_FILE_BYTES {
             return Err("An open target exceeds the editable file size limit".into());
         }
+        let positions = document.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]).collect::<Vec<_>>();
+        let offsets = offsets_with_scan(&before, &positions, document.coordinates, |_| {})?;
         let mut edits = Vec::with_capacity(document.edits.len());
-        for edit in document.edits {
-            let start = offset(&before, edit.range.start, document.coordinates)?;
-            let end = offset(&before, edit.range.end, document.coordinates)?;
+        for (index, edit) in document.edits.into_iter().enumerate() {
+            let start = offsets[index * 2];
+            let end = offsets[index * 2 + 1];
             if start > end { return Err("The server returned a reversed edit range".into()); }
             edits.push(ResolvedEdit { range: start..end, new_text: edit.new_text });
         }
@@ -200,6 +236,25 @@ pub fn validate_for_publication(plan: &Plan) -> Result<(), String> {
 mod tests {
     use super::*;
     use crate::lsp::LspRange;
+
+    #[test]
+    fn many_late_endpoints_scan_long_lines_and_prefixes_only_once() {
+        for text in ["a".repeat(8 * 1024 * 1024), "a\n".repeat(4 * 1024 * 1024)] {
+            let lines = text.bytes().filter(|byte| *byte == b'\n').count() as u32;
+            let positions = (0..2048).rev().map(|index| {
+                if lines == 0 { LspPosition::new(0, (text.len() - 2048 + index) as u32) }
+                else { LspPosition::new(lines - 2048 + index as u32, 1) }
+            }).collect::<Vec<_>>();
+            let mut visited = 0;
+            let offsets = offsets_with_scan(&text, &positions, LspCoordinates::Utf16, |bytes| visited += bytes).unwrap();
+            assert_eq!(offsets.len(), positions.len());
+            assert!(visited <= text.len() * 2, "endpoint conversion revisited {visited} source bytes");
+            for (position, offset) in positions.iter().zip(offsets) {
+                let expected = if lines == 0 { position.character as usize } else { position.line as usize * 2 + 1 };
+                assert_eq!(offset, expected);
+            }
+        }
+    }
 
     fn edit(path: &str, version: Option<i32>, start: u32, end: u32, text: &str) -> DocumentEdits {
         DocumentEdits {

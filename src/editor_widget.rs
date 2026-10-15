@@ -1837,7 +1837,36 @@ where
     /// Prepares an explicit range without widening distant edits into a
     /// whole-document history entry.
     pub fn range_change(&self, start: Position, end: Position, replacement: &str) -> Option<TextChange> {
-        self.excerpt(start.line, end.line).range_change(start, end, replacement)
+        self.range_change_with_copy(start, end, replacement, |_| {})
+    }
+
+    fn range_change_with_copy(&self, start: Position, end: Position, replacement: &str, mut copied: impl FnMut(&str)) -> Option<TextChange> {
+        use cosmic::iced::advanced::graphics::text::cosmic_text;
+        if (start.line, start.column) > (end.line, end.column) { return None; }
+        let internal = self.0.borrow();
+        let count = internal.editor.line_count();
+        let mut removed = String::new();
+        let mut removed_breaks = Vec::new();
+        for index in start.line..=end.line {
+            let line = internal.editor.line(index)?;
+            let from = if index == start.line { start.column } else { 0 };
+            let to = if index == end.line { end.column } else { line.text.len() };
+            let part = line.text.get(from..to)?;
+            copied(part);
+            removed.push_str(part);
+            if index < end.line {
+                let ending = terminator(line.ending, index + 1 == count);
+                if ending.is_empty() { return None; }
+                copied(ending);
+                removed.push_str(ending);
+                removed_breaks.push(removed.len());
+            }
+        }
+        let inserted_breaks = cosmic_text::LineIter::new(replacement)
+            .filter(|(_, ending)| !ending.as_str().is_empty())
+            .map(|(range, ending)| range.end + ending.as_str().len()).collect();
+        copied(replacement);
+        Some(TextChange { start, removed, inserted: replacement.to_owned(), removed_breaks, inserted_breaks })
     }
 
     pub fn replace_range_recorded(
@@ -3607,6 +3636,19 @@ impl ScrollGeometry {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_ranges_on_an_eight_mib_line_copy_only_the_replaced_bytes() {
+        let content: Content = Content::with_text(&"a".repeat(8 * 1024 * 1024));
+        let mut copied = 0;
+        for column in (0..8 * 1024 * 1024).step_by(4096) {
+            let change = content.range_change_with_copy(Position { line: 0, column }, Position { line: 0, column: column + 1 }, "b", |part| copied += part.len()).unwrap();
+            assert_eq!(change.removed, "a");
+            assert_eq!(change.inserted, "b");
+            assert!(change.removed_breaks.is_empty() && change.inserted_breaks.is_empty());
+        }
+        assert_eq!(copied, 4096, "staging must not copy the unchanged eight-MiB line per edit");
+    }
+
     #[test]
     fn workspace_offsets_preserve_order_and_refuse_unicode_or_native_ending_splits() {
         let content: Content = Content::with_text("é\r\n😀\n");
