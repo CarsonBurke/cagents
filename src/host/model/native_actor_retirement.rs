@@ -208,7 +208,8 @@ mod tests {
         let mut registry=Registry::at(&directory.path().join("registry")).unwrap();
         let (first,owner,source,scope)=fixture(directory.path());
         registry.register_native_actor_ownership(first,&owner,&source,Ok(&scope)).unwrap();
-        let (unknown,other,other_source,_)=fixture(directory.path());
+        let (unknown,other,mut other_source,_)=fixture(directory.path());
+        other_source.launch.session_id=Some("11111111-1111-4111-8111-111111111111".into());
         registry.register_native_actor_ownership(unknown,&other,&other_source,Err("original captured home unavailable")).unwrap();
         assert_eq!(registry.db.query_row("SELECT COUNT(*) FROM native_actor_cursors",[],|row|row.get::<_,i64>(0)).unwrap(),0,"census must not depend on any input/outcome having occurred");
         assert!(registry.native_actor_retirement(first).unwrap().is_none(),"registration is never semantic retirement");
@@ -228,6 +229,7 @@ mod tests {
         let retired=registry.native_actor_retirement(unknown).unwrap().unwrap();
         assert!(retired.scope().is_err(),"actor retirement does not invent a physical account");
         assert!(retired.confirmed_session().is_none(),"actor retirement does not invent a named conversation");
+        assert_eq!(retired.source().launch.session_id,other_source.launch.session_id,"a resume hint remains recorded without becoming provider-confirmed authority");
         assert_eq!(retired.owner(),&other);
         assert!(registry.commit_native_actor_retirement(unknown,&other,&other_source,Ok(&scope),None).is_err(),"a finally retired unknown owner cannot acquire a later caller's account identity");
     }
