@@ -3996,6 +3996,11 @@ impl SidebarState {
         }
     }
 
+    /// A submitted branch form must still own its exact commit and draft.
+    pub fn history_branch_matches(&self, oid: &Oid, name: &ValidatedBranchName) -> bool {
+        self.history_branch.as_ref().is_some_and(|(current, draft)| current == oid && draft == name.as_str())
+    }
+
     pub fn selected_file(&self) -> Option<&RepoPath> {
         match self.panel_selection.as_ref() {
             Some(PanelSelection::File(path)) => Some(path),

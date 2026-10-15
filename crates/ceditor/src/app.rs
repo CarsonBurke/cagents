@@ -45,6 +45,7 @@ const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
 mod checkout;
+mod git_review;
 mod notification_ui;
 
 #[derive(Clone)]
@@ -73,6 +74,7 @@ struct Tab {
     runtime: RepositoryRuntime,
     sidebar: SidebarModel,
     navigation: SidebarState,
+    git_review: git_review::State,
     pending_file: Option<PendingFile>,
     pending_fragment: Option<String>,
     owned_file: Option<PathBuf>,
@@ -122,6 +124,7 @@ struct FileOperationDialog {
 #[derive(Debug, Clone)]
 pub enum Message {
     Checkout(checkout::Action),
+    GitReview(git_review::Action),
     Choose(bool),
     Chosen(u64, Result<Option<PathBuf>, String>),
     Opened(u64, Result<Opened, String>),
@@ -166,7 +169,6 @@ pub enum Message {
     },
     Mutation(CardId, Result<MutationOutcome, String>),
     Discarded(CardId, Vec<RepoPath>, Result<MutationOutcome, String>),
-    Committed(CardId, String, Result<CommitOutcome, String>),
     Pushed(CardId, Result<PushOutcome, String>),
     FileNameChanged(String),
     SubmitFileOperation,
@@ -1517,6 +1519,7 @@ impl Editor {
             runtime,
             sidebar,
             navigation,
+            git_review: Default::default(),
             pending_file,
             pending_fragment: None,
             owned_file: None,
@@ -3173,6 +3176,7 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::Checkout(action) => self.checkout_action(action),
+                Message::GitReview(action) => self.git_review_action(action),
                 Message::WindowResized(size) => {
                     self.window_size = size;
                     Task::none()
@@ -3711,6 +3715,7 @@ impl Application for Editor {
                     {
                         return Task::none();
                     }
+                    if let Some(task) = self.git_review_sidebar(&action) { return task; }
                     if let Some(id) = self.active {
                         match &action {
                             SidebarAction::OpenChange { key, path, area }
@@ -3911,26 +3916,6 @@ impl Application for Editor {
                                 .map_err(|error| error.to_string())
                                 .and_then(|result| result.map_err(|error| error.to_string()));
                                 Message::Discarded(id, paths, result)
-                            })
-                        }
-                        SidebarAction::Commit { message, amend, .. } => {
-                            let Some(worktree) = self.begin_mutation(id, MutationKind::Commit)
-                            else {
-                                return Task::none();
-                            };
-                            cosmic::task::future(async move {
-                                let submitted = message.clone();
-                                let result = tokio::task::spawn_blocking(move || {
-                                    RepositoryService::system("git").commit_with_amend(
-                                        &CommitRequest { worktree, message },
-                                        amend,
-                                        &CancellationToken::default(),
-                                    )
-                                })
-                                .await
-                                .map_err(|error| error.to_string())
-                                .and_then(|result| result.map_err(|error| error.to_string()));
-                                Message::Committed(id, submitted, result)
                             })
                         }
                         SidebarAction::ToggleStashes { .. } => {
@@ -4273,7 +4258,7 @@ impl Application for Editor {
                                     .set_source(review_source(&root, Some(&snapshot)))
                                     .map(move |action| Message::PullRequestReview(id, action))
                                     .map(cosmic::Action::App);
-                                return Task::batch([sourced, self.apply_review_effects(id)]);
+                                return Task::batch([sourced, self.apply_review_effects(id), self.ensure_git_history(id)]);
                             }
                             Err(error) => self.notice = Some(error),
                         }
@@ -4324,35 +4309,6 @@ impl Application for Editor {
                                 .join("; ")
                         )),
                         Err(error) => Some(error),
-                    };
-                    self.finish_mutation(id, notice)
-                }
-                Message::Committed(id, submitted, result) => {
-                    let notice = match result {
-                        Ok(CommitOutcome::Created { warnings, .. }) => {
-                            if let Some(tab) = self.tab_mut(id)
-                                && tab.navigation.commit_message() == submitted
-                            {
-                                tab.navigation.clear_commit_message();
-                            }
-                            (!warnings.is_empty()).then(|| {
-                                format!(
-                                    "Commit created, but {}",
-                                    warnings
-                                        .iter()
-                                        .map(ToString::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join("; ")
-                                )
-                            })
-                        }
-                        Ok(CommitOutcome::NotCreated { failure }) => {
-                            Some(format!("Commit failed: {failure}"))
-                        }
-                        Ok(CommitOutcome::OutcomeUnknown { failure }) => Some(format!(
-                            "Commit may or may not have been created: {failure}. Refresh to see what Git holds."
-                        )),
-                        Err(error) => Some(format!("Commit could not run: {error}")),
                     };
                     self.finish_mutation(id, notice)
                 }
@@ -5656,12 +5612,13 @@ mod tests {
     use super::*;
     use cagents::repository_widget::AsyncIdentity;
 
-    fn git(root: &Path, args: &[&str]) -> String {
-        let output = std::process::Command::new("git")
-            .current_dir(root)
-            .args(args)
-            .output()
-            .unwrap();
+    pub(super) fn git(root: &Path, args: &[&str]) -> String {
+        let mut command = std::process::Command::new("git");
+        for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) { command.env_remove(name); }
+        let output = command.env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
+            .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
+            .current_dir(root).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "git {args:?}: {}",
@@ -5670,7 +5627,7 @@ mod tests {
         String::from_utf8(output.stdout).unwrap().trim().to_owned()
     }
 
-    fn git_fixture() -> tempfile::TempDir {
+    pub(super) fn git_fixture() -> tempfile::TempDir {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path();
         git(root, &["init", "-b", "main"]);
@@ -5783,7 +5740,7 @@ mod tests {
 
     /// Execute actual application tasks, including mutation completion and
     /// subsequent snapshot/file refreshes, without a window or network remote.
-    fn run_tasks(app: &mut Editor, task: Task<Message>) {
+    pub(super) fn run_tasks(app: &mut Editor, task: Task<Message>) {
         use cosmic::iced::futures::StreamExt;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5805,7 +5762,7 @@ mod tests {
             });
     }
 
-    fn open_real_git(app: &mut Editor, root: &Path, file: Option<&str>) -> CardId {
+    pub(super) fn open_real_git(app: &mut Editor, root: &Path, file: Option<&str>) -> CardId {
         let snapshot = RepositoryService::system("git")
             .snapshot(root, &CancellationToken::default())
             .unwrap();
@@ -5821,7 +5778,7 @@ mod tests {
         app.active.unwrap()
     }
 
-    fn sidebar_action(app: &mut Editor, action: SidebarAction) {
+    pub(super) fn sidebar_action(app: &mut Editor, action: SidebarAction) {
         let task = app.update(Message::Sidebar(action));
         run_tasks(app, task);
     }
@@ -5931,6 +5888,7 @@ mod tests {
                 selection: vec![PathSelection::new(RepoPath::parse("tracked.txt").unwrap())],
             },
         );
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: key.clone(), message: "Second".into() });
         sidebar_action(
             &mut app,
             SidebarAction::Commit {
@@ -5979,6 +5937,8 @@ mod tests {
             .active_worktree()
             .unwrap()
             .clone();
+        sidebar_action(&mut app, SidebarAction::AmendChanged { key: key.clone(), amend: true });
+        sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: key.clone(), message: "Amended through shared controls".into() });
         sidebar_action(
             &mut app,
             SidebarAction::Commit {
@@ -6335,7 +6295,7 @@ mod tests {
         );
     }
 
-    fn editor() -> Editor {
+    pub(super) fn editor() -> Editor {
         Editor {
             core: Core::default(),
             tabs: Vec::new(),

@@ -32,8 +32,27 @@ pub(crate) enum Action {
     Open(PathBuf),
 }
 
+#[derive(Clone)]
+enum Base {
+    PullRequest(CheckoutTarget),
+    Commit { repository: PathBuf, head: cagents::repository::Oid, root_identity: (u64, u64) },
+}
+impl Base {
+    fn validate(&self) -> Result<(), String> {
+        if let Self::Commit { repository, root_identity, .. } = self {
+            if git_review::root_identity(repository) != Some(*root_identity) {
+                return Err("The original worktree directory was replaced; reopen it before creating a worktree.".into());
+            }
+        }
+        Ok(())
+    }
+    fn repository(&self) -> &Path { match self { Self::PullRequest(target) => &target.repository, Self::Commit { repository, .. } => repository } }
+    fn head(&self) -> &cagents::repository::Oid { match self { Self::PullRequest(target) => &target.head, Self::Commit { head, .. } => head } }
+    fn branch(&self) -> String { match self { Self::PullRequest(target) => target.suggested_branch(), Self::Commit { head, .. } => format!("review/{}", &head.as_str()[..8]) } }
+}
+
 pub(super) struct Dialog {
-    target: CheckoutTarget,
+    target: Base,
     branch: String,
     destination: String,
     id: OperationId,
@@ -71,11 +90,22 @@ impl Editor {
     }
 
     pub(super) fn begin_checkout(&mut self, target: CheckoutTarget) {
+        self.begin_checkout_base(Base::PullRequest(target));
+    }
+
+    pub(super) fn begin_commit_checkout(&mut self, repository: PathBuf, head: cagents::repository::Oid) {
+        let Some(root_identity) = git_review::root_identity(&repository) else {
+            self.notice = Some("The original worktree is unavailable.".into()); return;
+        };
+        self.begin_checkout_base(Base::Commit { repository, head, root_identity });
+    }
+
+    fn begin_checkout_base(&mut self, target: Base) {
         if self.modal_open() {
             return;
         }
         self.checkout_dialog = Some(Dialog {
-            branch: target.suggested_branch(),
+            branch: target.branch(),
             target,
             destination: String::new(),
             id: OperationId::new(),
@@ -181,16 +211,18 @@ impl Editor {
                 dialog.cancellation = Some(cancellation.clone());
                 dialog.error = None;
                 let id = dialog.id;
+                let authority = dialog.target.clone();
                 let input = WorktreeInput {
-                    repository: dialog.target.repository.clone(),
+                    repository: dialog.target.repository().to_owned(),
                     input: dialog.branch.clone(),
-                    base: dialog.target.head.as_str().to_owned(),
+                    base: dialog.target.head().as_str().to_owned(),
                     managed_directory: self.settings.managed_worktree_directory.clone(),
                     destination: dialog.destination.clone(),
                     operation_id: id,
                 };
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
+                        authority.validate()?;
                         RepositoryService::system("git")
                             .resolve_worktree_request(&input, &cancellation)
                             .map_err(|e| e.to_string())
@@ -203,11 +235,13 @@ impl Editor {
             }
             Action::Resolved(id, result) => {
                 if let Some(dialog) = self.checkout_dialog.as_mut().filter(|d| d.id == id) {
+                    let root_changed = dialog.target.validate().err();
                     let cancelled = dialog
                         .cancellation
                         .take()
                         .is_some_and(|token| token.is_cancelled());
-                    if cancelled {
+                    if let Some(error) = root_changed { dialog.error = Some(error); }
+                    else if cancelled {
                         dialog.error = Some("Cancelled before creating a worktree.".into());
                     } else {
                         match result {
@@ -236,16 +270,18 @@ impl Editor {
                 dialog.cancellation = Some(cancellation.clone());
                 dialog.error = None;
                 let id = dialog.id;
+                let authority = dialog.target.clone();
                 return cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        cagents::pull_request_review::checkout::create(
+                        authority.validate()?;
+                        Ok(cagents::pull_request_review::checkout::create(
                             &journal.0,
                             &request,
                             &cancellation,
-                        )
+                        ))
                     })
                     .await
-                    .map_err(|e| e.to_string());
+                    .map_err(|e| e.to_string()).and_then(|result| result);
                     Message::Checkout(Action::Finished(id, result))
                 });
             }
@@ -357,12 +393,11 @@ impl Editor {
         let dialog = self.checkout_dialog.as_ref()?;
         let action = |a| Message::Checkout(a);
         let mut body = vec![
-            widget::text::title3("Create PR worktree").into(),
-            design::caption(format!(
-                "PR #{} · {}",
-                dialog.target.number,
-                dialog.target.head.as_str()
-            ))
+            widget::text::title3(match &dialog.target { Base::PullRequest(_) => "Create PR worktree", Base::Commit { .. } => "Create worktree from commit" }).into(),
+            design::caption(match &dialog.target {
+                Base::PullRequest(target) => format!("PR #{} · {}", target.number, target.head.as_str()),
+                Base::Commit { head, .. } => format!("Base commit {}", head.as_str()),
+            })
             .into(),
         ];
         if let Some(path) = &dialog.completed {
@@ -441,5 +476,42 @@ impl Editor {
             dialog_surface(widget::column::with_children(body).spacing(12), 560.0),
             action(Action::Cancel),
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::super::tests::{editor, git, git_fixture, open_real_git, run_tasks, sidebar_action};
+
+    #[test]
+    fn standalone_history_creates_real_worktree_from_captured_commit_dialog() {
+        let directory = git_fixture(); let root = directory.path();
+        let private_state = tempfile::tempdir().unwrap();
+        let destination = private_state.path().join("commit-checkout");
+        let mut app = editor();
+        app.settings_path = private_state.path().join("settings.toml");
+        app.settings.managed_worktree_directory = private_state.path().join("managed").to_string_lossy().into_owned();
+        let journal = app.load_checkout_journal(); run_tasks(&mut app, journal);
+        assert!(app.checkout_journal.is_some(), "{:?}", app.checkout_error);
+        let card = open_real_git(&mut app, root, None);
+        let key = app.tab(card).unwrap().navigation.active_worktree().unwrap().clone();
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: key.clone(), tab: sidebar::ChangesTab::History });
+        let row = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
+        sidebar_action(&mut app, SidebarAction::HistoryCommand { key, oid: row.oid.clone(), command: sidebar::HistoryCommand::NewWorktree, mainline: row.mainline, message: row.message });
+        let dialog = app.checkout_dialog.as_ref().expect("actual dialog mounted");
+        assert_eq!(dialog.target.repository(), root);
+        assert_eq!(dialog.target.head(), &row.oid);
+        assert!(matches!(dialog.target, Base::Commit { .. }));
+        assert!(app.checkout_view().is_some());
+        drop(app.update(Message::Checkout(Action::Branch("history-checkout".into()))));
+        drop(app.update(Message::Checkout(Action::Destination(destination.to_string_lossy().into_owned()))));
+        let task = app.update(Message::Checkout(Action::Resolve)); run_tasks(&mut app, task);
+        assert!(app.checkout_dialog.as_ref().unwrap().request.is_some(), "{:?}", app.checkout_dialog.as_ref().unwrap().error);
+        let task = app.update(Message::Checkout(Action::Create)); run_tasks(&mut app, task);
+        assert_eq!(app.checkout_dialog.as_ref().unwrap().completed.as_deref(), Some(destination.as_path()));
+        assert_eq!(git(&destination, &["rev-parse", "HEAD"]), row.oid.as_str());
+        assert_eq!(git(&destination, &["branch", "--show-current"]), "history-checkout");
+        assert!(app.checkout_history.iter().any(|report| report.state == WorktreeOperationState::Created));
     }
 }
