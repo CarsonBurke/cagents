@@ -561,7 +561,8 @@ impl Cagents {
     }
 
     fn pane_transfer_source(&self, card: CardId) -> Option<(&View, &Path)> {
-        if self.focused_repository_is_saving()
+        if self.pane_close_owned(card)
+            || self.focused_repository_is_saving()
             || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
         {
             return None;
@@ -695,6 +696,12 @@ impl Cagents {
         channel: crate::model::ChannelId,
     ) -> Task<Message> {
         if self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        if self.pane_close_owned(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is closing. Wait for Close to finish before moving it.",
+            ));
             return Task::none();
         }
         let Some((scope, expected_revision)) = self.pane_channel_transfer(card, channel) else {
@@ -2698,6 +2705,46 @@ mod tests {
                 .cards
                 .contains(&pane.id)
         );
+    }
+
+    #[test]
+    fn channel_move_cannot_overtake_an_owned_close_handoff() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        assert!(app.pane_has_move_destination(pane.id));
+        let handoff = app.workspace.request_close(pane.id).unwrap();
+        let before = app.workspace_model.clone();
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.pane_has_move_destination(pane.id));
+        assert!(!app.can_move_pane_to_channel(pane.id, destination));
+        assert!(app.pane_move_destinations(pane.id).is_empty());
+        drop(app.move_pane_to_channel(pane.id, destination));
+        drop(app.update(Message::MovePaneToChannel {
+            card: pane.id,
+            channel: destination,
+        }));
+        drop(app.update(Message::PaneDropToChannel {
+            generation: app.workspace_view_generation,
+            card: pane.id,
+            channel: destination,
+        }));
+        drop(app.update_palette(super::super::palette_ui::Action::MovePane(pane.id)));
+        assert!(!app.palette.is_open());
+        assert!(rx.try_recv().is_err());
+        assert!(!app.pane_transfer_pending(pane.id));
+        assert_eq!(app.workspace.pending_close(), Some(handoff));
+        assert_eq!(app.workspace_model, before);
+        assert_eq!(app.durable.active_channel, Some(source));
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        app.workspace.cancel_close(pane.id).unwrap();
+        assert!(app.pane_has_move_destination(pane.id));
+        drop(app.move_pane_to_channel(pane.id, destination));
+        assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView {
+            scope: Scope::Channel(from), change: Change::Transfer {
+                id, destination: Scope::Channel(to), ..
+            }, ..
+        } if from == source && id == pane.id && to == destination));
     }
 
     #[test]
