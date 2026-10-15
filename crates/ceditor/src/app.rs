@@ -66,6 +66,8 @@ struct PendingFile {
     path: PathBuf,
     request: u64,
     canonical: Option<PathBuf>,
+    location: Option<(usize, usize)>,
+    location_epoch: u64,
 }
 
 struct Tab {
@@ -78,6 +80,7 @@ struct Tab {
     pending_fragment: Option<String>,
     owned_file: Option<PathBuf>,
     next_open: u64,
+    location_epoch: u64,
     files_loaded: bool,
     git: bool,
     diagnostics: Vec<LspDiagnostic>,
@@ -1179,6 +1182,8 @@ impl Editor {
                     path,
                     canonical: Some(destination.clone()),
                     request: tab.next_open,
+                    location: None,
+                    location_epoch: 0,
                 });
                 tab.next_open = tab.next_open.wrapping_add(1);
                 tab.files_loaded = false;
@@ -1450,6 +1455,8 @@ impl Editor {
         if let Some(path) = &external { runtime.set_external_source(path.clone()); }
         runtime.set_standalone(true);
         runtime.set_auto_save(self.settings.editor_auto_save);
+        runtime.set_editor_auto_close(self.settings.editor_auto_close);
+        runtime.set_editor_tab_width(self.settings.editor_tab_width);
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
         runtime.set_line_height(self.settings.terminal_line_height);
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
@@ -1486,6 +1493,8 @@ impl Editor {
             canonical: Some(opened.root.join(&path)),
             path,
             request: 0,
+            location: None,
+            location_epoch: 0,
         });
         navigation.sync_active_worktree(
             &sidebar,
@@ -1524,6 +1533,7 @@ impl Editor {
             pending_fragment: None,
             owned_file: external.clone(),
             next_open: 1,
+            location_epoch: 0,
             files_loaded: external.is_some(),
             git,
             diagnostics: Vec::new(),
@@ -1747,7 +1757,12 @@ impl Editor {
     }
 
     fn request_file(&mut self, id: CardId, path: PathBuf) -> Task<Message> {
+        self.request_file_at(id, path, None)
+    }
+
+    fn request_file_at(&mut self, id: CardId, path: PathBuf, location: Option<(usize, usize)>) -> Task<Message> {
         self.selection_epoch = self.selection_epoch.wrapping_add(1);
+        let location_epoch = self.selection_epoch;
         let Some(tab) = self.tab_mut(id) else {
             return Task::none();
         };
@@ -1756,18 +1771,21 @@ impl Editor {
         if RepoPath::parse(&path).is_err() {
             return Task::none();
         }
-        if tab.runtime.blocks_navigation() {
+        if tab.runtime.blocks_navigation() && (location.is_none() || tab.runtime.selected_path() != Some(path.as_path())) {
             self.notice =
                 Some("Save or discard the current file before opening another file.".into());
             return Task::none();
         }
         let request = tab.next_open;
         tab.next_open = tab.next_open.wrapping_add(1);
+        tab.location_epoch = location_epoch;
         let absolute = tab.runtime.descriptor.worktree.join(&path);
         tab.pending_file = Some(PendingFile {
             path,
             request,
             canonical: None,
+            location,
+            location_epoch,
         });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -1869,7 +1887,7 @@ impl Editor {
             .iter()
             .filter_map(|tab| {
                 let pending = tab.pending_file.as_ref()?;
-                (tab.files_loaded && !tab.runtime.blocks_navigation())
+                (tab.files_loaded && (!tab.runtime.blocks_navigation() || (pending.location.is_some() && tab.runtime.selected_path() == Some(pending.path.as_path()))))
                     .then(|| {
                         pending
                             .canonical
@@ -1883,13 +1901,25 @@ impl Editor {
         let mut tasks = Vec::new();
         for (id, canonical) in pending {
             let owner = self.file_owner(&canonical);
-            if owner.is_some_and(|owner| owner != id) {
-                if let Some(tab) = self.tab_mut(id) {
-                    tab.pending_file = None;
-                }
+            if let Some(owner) = owner.filter(|owner| *owner != id) {
+                let location = self.tab_mut(id).and_then(|tab| tab.pending_file.take()).and_then(|pending| pending.location.map(|at| (at, pending.location_epoch)));
                 // A background initial open must not steal a later selection.
-                if self.active == Some(id) {
-                    self.active = owner;
+                if self.active == Some(id) { self.active = Some(owner); }
+                if let Some(((line, column), epoch)) = location {
+                    let foreground = self.active == Some(owner);
+                    if let Some(tab) = self.tab_mut(owner).filter(|tab| epoch >= tab.location_epoch) {
+                        tab.location_epoch = epoch;
+                        if let Some(pending) = tab.pending_file.as_mut().filter(|pending| pending.canonical.as_ref() == Some(&canonical)) {
+                            // A reservation can still belong to an earlier
+                            // buffer while its file list finishes loading.
+                            pending.location = Some((line, column));
+                            pending.location_epoch = epoch;
+                        } else if tab.owned_file.as_ref() == Some(&canonical)
+                            && let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) {
+                            let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: owner, path, line, column }));
+                            if foreground { tasks.push(task); }
+                        }
+                    }
                 }
                 continue;
             }
@@ -1900,6 +1930,11 @@ impl Editor {
                 continue;
             };
             if tab.owned_file.as_ref() == Some(&canonical) {
+                if let Some((line, column)) = pending.location.filter(|_| pending.location_epoch >= tab.location_epoch) {
+                    tab.location_epoch = pending.location_epoch;
+                    let task = repository_task(tab.runtime.update(RepositoryAction::OpenLocation { card: id, path: pending.path, line, column }));
+                    if self.active == Some(id) { tasks.push(task); }
+                }
                 continue;
             }
             let file_name = pending
@@ -1917,12 +1952,11 @@ impl Editor {
                 file_name
             };
             tab.owned_file = Some(canonical);
-            tasks.push(repository_task(tab.runtime.update(
-                RepositoryAction::OpenFile {
-                    card: id,
-                    path: pending.path,
-                },
-            )));
+            let action = match pending.location.filter(|_| pending.location_epoch >= tab.location_epoch) {
+                Some((line, column)) => RepositoryAction::OpenLocation { card: id, path: pending.path, line, column },
+                None => RepositoryAction::OpenFile { card: id, path: pending.path },
+            };
+            tasks.push(repository_task(tab.runtime.update(action)));
             tasks.push(self.drain(id));
         }
         Task::batch(tasks)
@@ -2560,7 +2594,8 @@ impl Editor {
 
     /// The rows the palette is showing, in display order.
     fn quick_open_results(&self) -> Vec<PathBuf> {
-        let query = self.quick_open_query.trim().to_ascii_lowercase();
+        let raw = self.quick_open_query.trim();
+        let query = repository_widget::parse_file_location(raw).map_or_else(|| raw.to_owned(), |(path, _, _)| path).to_ascii_lowercase();
         self.current()
             .map(|tab| {
                 let candidates = self.quick_open_files.clone().unwrap_or_else(|| {
@@ -2617,7 +2652,7 @@ impl Editor {
         let root = tab.runtime.descriptor.worktree.clone();
         let token = CancellationToken::new();
         self.quick_open_cancel = token.clone();
-        let search_query = query.clone();
+        let search_query = repository_widget::parse_file_location(query.trim()).map_or_else(|| query.clone(), |(path, _, _)| path);
         cosmic::task::future(async move {
             // A recursive walk per keystroke queued concurrent 50k-entry scans
             // on the pool that also carries auto-save and file loads.
@@ -4082,6 +4117,8 @@ impl Application for Editor {
                     self.shortcut_draft = self.shortcuts.clone();
                     for tab in &mut self.tabs {
                         tab.runtime.set_auto_save(self.settings.editor_auto_save);
+                        tab.runtime.set_editor_auto_close(self.settings.editor_auto_close);
+                        tab.runtime.set_editor_tab_width(self.settings.editor_tab_width);
                         tab.runtime.set_wrap_lines(self.settings.editor_wrap_lines);
                         tab.runtime
                             .set_line_height(self.settings.terminal_line_height);
@@ -4216,12 +4253,14 @@ impl Application for Editor {
                     }
                 }
                 Message::OpenQuickFile(path) => {
+                    if !self.quick_open || !self.quick_open_results().contains(&path) { return Task::none(); }
                     let Some(id) = self.active else {
                         return Task::none();
                     };
+                    let location = repository_widget::parse_file_location(self.quick_open_query.trim()).map(|(_, line, column)| (line - 1, column - 1));
                     self.close_quick_open();
                     self.quick_open_query.clear();
-                    self.request_file(id, path)
+                    self.request_file_at(id, path, location)
                 }
                 Message::CloseQuickOpen => {
                     self.close_quick_open();
@@ -5011,7 +5050,7 @@ impl Application for Editor {
                 dialog_surface(
                     widget::column::with_children(vec![
                         widget::text::title3("Quick open").into(),
-                        widget::text_input("Search files", &self.quick_open_query)
+                        widget::text_input("Search files or path:line:column", &self.quick_open_query)
                             .id(widget::Id::new("ceditor.quick-open.query"))
                             .on_input(Message::QuickOpenQueryChanged)
                             .into(),
@@ -6397,6 +6436,188 @@ mod tests {
                 .map(|pending| pending.path.clone()),
             Some(selected),
         );
+    }
+
+    #[test]
+    fn opening_a_file_honors_saved_auto_close_and_fallback_tab_width() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("empty.rs"), "").unwrap();
+        let mut app = configured(&directory);
+        app.settings.editor_auto_save = false;
+        app.settings.editor_auto_close = false;
+        app.settings.editor_tab_width = 8;
+        let task = app.add(Opened { root: root.into(), file: Some("empty.rs".into()), snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (8, true));
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('(')) })));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("("));
+        drop(app.update(Message::ResetSettings));
+        drop(app.update(Message::ResetSettings));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (4, true));
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('[')) })));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some("([]"));
+    }
+
+    #[test]
+    fn quick_open_compiler_locations_survive_search_loading_and_existing_tab_deduplication() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::create_dir(root.join("src")).unwrap();
+        std::fs::write(root.join("src/app.rs"), "a😀ébcde\n".repeat(30_001)).unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let file = app.active.unwrap();
+        drop(app.update(Message::QuickOpen));
+        let search = app.update(Message::QuickOpenQueryChanged("src/app.rs:30000:5".into()));
+        run_tasks(&mut app, search);
+        assert_eq!(app.quick_open_results(), [PathBuf::from("src/app.rs")]);
+        let open = app.update(Message::QuickOpenActivate);
+        run_tasks(&mut app, open);
+        assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29_999, character: 4 }));
+        assert!(!app.quick_open);
+        assert!(app.tab(file).unwrap().pending_file.is_none());
+
+        // A second jump to the owned file still applies its coordinates.
+        drop(app.update(Message::QuickOpen));
+        let search = app.update(Message::QuickOpenQueryChanged("src/app.rs:120:8".into()));
+        run_tasks(&mut app, search);
+        let open = app.update(Message::QuickOpenActivate);
+        run_tasks(&mut app, open);
+        assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 119, character: 7 }));
+
+        // Selecting the same canonical file from another folder tab focuses
+        // the existing owner and forwards the location rather than losing it.
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let folder = app.active.unwrap();
+        assert_ne!(folder, file);
+        drop(app.update(Message::QuickOpen));
+        let search = app.update(Message::QuickOpenQueryChanged("src/app.rs:42:3".into()));
+        run_tasks(&mut app, search);
+        let open = app.update(Message::QuickOpenActivate);
+        run_tasks(&mut app, open);
+        assert_eq!(app.active, Some(file));
+        assert_eq!(app.tab(file).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 41, character: 2 }));
+        assert!(app.tab(folder).unwrap().pending_file.is_none());
+    }
+
+    #[test]
+    fn quick_open_locations_follow_pending_canonical_reservations_without_touching_old_buffers() {
+        for old_buffer in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::write(root.join("foo.rs"), "a😀bcdef\n".repeat(30_001)).unwrap();
+            std::fs::write(root.join("bar.rs"), "previous buffer\n").unwrap();
+            let mut app = configured(&directory);
+            let task = app.add(Opened { root: root.into(), file: old_buffer.then(|| "bar.rs".into()), snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let owner = app.active.unwrap();
+            app.tab_mut(owner).unwrap().files_loaded = false;
+            let reserve = app.request_file(owner, "foo.rs".into());
+            run_tasks(&mut app, reserve);
+            assert_eq!(app.tab(owner).unwrap().pending_file.as_ref().unwrap().canonical.as_deref(), Some(root.join("foo.rs").as_path()));
+            let request = app.tab(owner).unwrap().pending_file.as_ref().unwrap().request;
+            let before = app.tab(owner).unwrap().runtime.cursor_position();
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let folder = app.active.unwrap();
+            assert_ne!(folder, owner);
+            drop(app.update(Message::QuickOpen));
+            let search = app.update(Message::QuickOpenQueryChanged("foo.rs:30000:5".into()));
+            run_tasks(&mut app, search);
+            let open = app.update(Message::QuickOpenActivate);
+            run_tasks(&mut app, open);
+            assert_eq!(app.active, Some(owner));
+            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), before, "the previous buffer must not receive the new file's location");
+            let pending = app.tab(owner).unwrap().pending_file.as_ref().unwrap();
+            assert_eq!(pending.request, request);
+            assert_eq!(pending.location, Some((29_999, 4)));
+            app.tab_mut(owner).unwrap().files_loaded = true;
+            let open = app.resume_pending_files();
+            run_tasks(&mut app, open);
+            assert_eq!(app.tab(owner).unwrap().runtime.selected_path(), Some(Path::new("foo.rs")));
+            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29_999, character: 4 }));
+        }
+    }
+
+    #[test]
+    fn newer_cross_tab_location_wins_when_an_older_canonical_lookup_finishes_later() {
+        for older_first in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::write(root.join("foo.rs"), "abcdefgh\n".repeat(40)).unwrap();
+            let mut app = configured(&directory);
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let old_card = app.active.unwrap();
+            let old = app.request_file_at(old_card, "foo.rs".into(), Some((9, 1)));
+            let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+            run_tasks(&mut app, task);
+            let new_card = app.active.unwrap();
+            let new = app.request_file_at(new_card, "foo.rs".into(), Some((29, 4)));
+            if older_first { run_tasks(&mut app, old); run_tasks(&mut app, new); }
+            else { run_tasks(&mut app, new); run_tasks(&mut app, old); }
+            let owner = app.file_owner(&root.join("foo.rs")).unwrap();
+            assert_eq!(app.tab(owner).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 29, character: 4 }));
+            assert_eq!(app.active, Some(owner));
+        }
+    }
+
+    #[test]
+    fn obsolete_quick_open_rows_cannot_consume_a_new_querys_location() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "first\n").unwrap();
+        std::fs::write(root.join("b.rs"), "second\n").unwrap();
+        let mut app = configured(&directory);
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        drop(app.update(Message::QuickOpen));
+        let query = app.update(Message::QuickOpenQueryChanged("b.rs:1:2".into()));
+        run_tasks(&mut app, query);
+        let stale = app.update(Message::OpenQuickFile("a.rs".into()));
+        run_tasks(&mut app, stale);
+        assert!(app.quick_open);
+        assert!(app.tab(card).unwrap().pending_file.is_none());
+        assert!(app.tab(card).unwrap().runtime.selected_path().is_none());
+        drop(app.update(Message::CloseQuickOpen));
+        let dismissed = app.update(Message::OpenQuickFile("b.rs".into()));
+        run_tasks(&mut app, dismissed);
+        assert!(app.tab(card).unwrap().pending_file.is_none());
+    }
+
+    #[test]
+    fn pending_quick_open_locations_are_request_fenced_and_preserve_dirty_buffers() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        std::fs::write(root.join("a.rs"), "😀abcdef\nsecond line\nthird line\n").unwrap();
+        std::fs::write(root.join("b.rs"), "other file\n").unwrap();
+        let mut app = configured(&directory);
+        app.settings.editor_auto_save = false;
+        let task = app.add(Opened { root: root.into(), file: None, snapshot: None }, true);
+        run_tasks(&mut app, task);
+        let card = app.active.unwrap();
+        let old = app.request_file_at(card, "a.rs".into(), Some((0, 5)));
+        let latest = app.request_file_at(card, "a.rs".into(), Some((2, 1)));
+        run_tasks(&mut app, old);
+        assert_eq!(app.tab(card).unwrap().pending_file.as_ref().unwrap().location, Some((2, 1)));
+        run_tasks(&mut app, latest);
+        assert_eq!(app.tab(card).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 2, character: 1 }));
+        drop(app.update(Message::Repository(RepositoryAction::EditorAction { card, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('x')) })));
+        let dirty = app.tab(card).unwrap().runtime.editor_text().unwrap();
+        let same = app.request_file_at(card, "a.rs".into(), Some((1, 2)));
+        run_tasks(&mut app, same);
+        assert_eq!(app.tab(card).unwrap().runtime.cursor_position(), Some(cagents::lsp::LspPosition { line: 1, character: 2 }));
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
+        let other = app.request_file_at(card, "b.rs".into(), Some((0, 0)));
+        run_tasks(&mut app, other);
+        assert!(app.tab(card).unwrap().pending_file.is_none());
+        assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some(dirty.as_str()));
+        assert!(app.notice.as_deref().unwrap().contains("Save or discard"));
     }
 
     #[test]
