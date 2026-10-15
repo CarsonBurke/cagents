@@ -666,7 +666,10 @@ mod tests {
         let result = fixture.prepare(&plan);
         fs::set_permissions(&fixture.primary, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap().copied, [PathBuf::from(".env")]);
-        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"secret");
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"secret"
+        );
     }
 
     #[test]
@@ -866,7 +869,11 @@ mod tests {
         let other_plan = other.config(config);
         trust(&other.primary, &other_plan, &CancellationToken::new()).unwrap();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
-        fs::write(fixture.primary.join("tracked"), "must not restore deleted tracked file").unwrap();
+        fs::write(
+            fixture.primary.join("tracked"),
+            "must not restore deleted tracked file",
+        )
+        .unwrap();
         fs::remove_file(fixture.destination.join("tracked")).unwrap();
         // Isolate environment mutation in a subprocess so other parallel tests
         // never inherit these intentionally hostile redirections.
@@ -881,7 +888,10 @@ mod tests {
             .env("GIT_DIR", other.primary.join(".git"))
             .env("GIT_WORK_TREE", &other.primary)
             .env("GIT_COMMON_DIR", other.primary.join(".git"))
-            .env("GIT_INDEX_FILE", fixture._directory.path().join("missing-index"))
+            .env(
+                "GIT_INDEX_FILE",
+                fixture._directory.path().join("missing-index"),
+            )
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
