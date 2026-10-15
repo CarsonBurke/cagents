@@ -22,12 +22,14 @@ pub enum Operation {
         expected_fingerprint: Option<String>,
     },
     Inspect { repository:PathBuf, path:PathBuf },
-    BusySessions { repository:PathBuf, path:PathBuf },
-    CloseSessions { repository:PathBuf, path:PathBuf, agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
     SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
     GetDisposableIgnoredDirectories {repository:PathBuf,path:PathBuf},
     DeleteBranch { repository:PathBuf, branch:String, force:bool, expected_oid:Option<String> },
+    SetupIntent {repository:PathBuf,path:PathBuf},
+    ResumeSetup {repository:PathBuf,path:PathBuf,expected_run_id:Option<crate::model::OperationId>,expected_plan_fingerprint:Option<String>,trust:bool,skip:bool},
+    BusySessions { repository:PathBuf, path:PathBuf },
+    CloseSessions { repository:PathBuf, path:PathBuf, agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
 }
 
 impl Operation {
@@ -37,21 +39,22 @@ impl Operation {
             Self::Create { repository, .. }
             | Self::List { repository }
             | Self::Remove { repository, .. }
-            | Self::BusySessions { repository, .. }
-            | Self::CloseSessions { repository, .. }
             | Self::Inspect { repository, .. }
             | Self::StaleLock { repository, .. }
             | Self::SetDisposableIgnoredDirectories { repository, .. }
             | Self::GetDisposableIgnoredDirectories {repository,..}
+            | Self::BusySessions {repository,..}
+            | Self::CloseSessions {repository,..}
+            | Self::SetupIntent {repository,..}
+            | Self::ResumeSetup {repository,..}
             | Self::DeleteBranch {repository,..} => Some(repository),
         }
     }
-    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::BusySessions { .. } | Self::GetDisposableIgnoredDirectories { .. } | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..}) }
+    pub fn mutates(&self) -> bool { !matches!(self, Self::List { .. } | Self::BusySessions {..} | Self::Inspect { .. } | Self::ResolveProject { .. } | Self::StaleLock {unlock:false,..} | Self::GetDisposableIgnoredDirectories {..} | Self::SetupIntent {..}) }
 }
 
-/// A daemon-observed active agent, including detached and hidden sessions.
-/// Native turn identity prevents consent for an earlier turn authorizing a
-/// different observed turn in the same session.
+/// Daemon-observed actor identity and close revision; the full census includes
+/// idle actors while `agents` identifies the subset requiring interruption.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BusyAgent {
     pub session: crate::model::TerminalId,
@@ -82,19 +85,22 @@ pub enum Reply {
     Listed { worktrees: Vec<Entry> },
     Removed { path: PathBuf, branch_deleted: Option<String>, warnings:Vec<String>, branch_error:Option<String> },
     StaleLock {unlocked:bool},
-    BusySessions { agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
-    SessionsClosed { path:PathBuf },
     /// Repository snapshots keep their byte-exact path schema without pulling
     /// the daemon's Git/SQLite implementation into the control CLI.
     Inspected { snapshot:String, disposable_ignored_directories:Vec<String> },
     DisposableIgnoredDirectories {directories:Vec<String>},
     BranchDeleted {branch:String},
     BranchDeleteRefused {failure:BranchDeleteFailure},
+    SetupIntent {creation_id:crate::model::OperationId,primary:PathBuf,intent:String,current_plan:Option<String>,plan_error:Option<String>,trusted:bool,active:bool},
+    SetupPrepared {path:PathBuf,setup:Option<Setup>,warnings:Vec<String>,run_id:crate::model::OperationId},
+    BusySessions { agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
+    SessionsClosed { path:PathBuf },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Setup {
     pub command: String,
+    pub run_id: Option<crate::model::OperationId>,
     pub terminal: Option<crate::model::TerminalSession>,
     pub error: Option<String>,
 }
