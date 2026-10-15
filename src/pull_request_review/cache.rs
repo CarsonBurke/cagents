@@ -92,6 +92,23 @@ pub struct File {
     pub unverified: bool,
 }
 
+/// Local text is recovery data, never permission to mutate the remote review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Draft {
+    pub context: crate::github::ReviewContext,
+    pub range: Option<PullRequestRange>,
+    pub destination: super::discussion_ui::Destination,
+    pub body: String,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Drafts {
+    pub composer: Option<Draft>,
+    pub summary: String,
+    pub event: crate::github::ReviewEvent,
+    #[serde(default)]
+    pub unknown: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub key: PullRequestKey,
@@ -102,12 +119,58 @@ pub struct Snapshot {
     #[serde(default)]
     pub unknown_paths: BTreeSet<RepoPath>,
     pub selected: Option<RepoPath>,
+    #[serde(default)]
+    pub drafts: Option<Drafts>,
+    /// Explicit local edits replace drafts; ordinary cache refreshes preserve them.
+    #[serde(default)]
+    pub drafts_changed: bool,
+    #[serde(default)]
+    pub drafts_owner: Option<String>,
+    #[serde(default)]
+    pub drafts_version: Option<String>,
+    /// Version this window last loaded or successfully saved.
+    #[serde(skip)]
+    pub drafts_basis: Option<String>,
     pub saved_ms: u64,
 }
 
 impl Snapshot {
+    pub(crate) fn merge_drafts(&mut self, previous: &Self) -> Result<(), String> {
+        if self.drafts_changed
+            && self.drafts_owner != previous.drafts_owner
+            && (previous.drafts.is_some() || previous.drafts_version.is_some())
+            && self.drafts_basis != previous.drafts_version
+        {
+            if self.drafts.is_some() {
+                return Err("Draft changed in another window. Your text is still here; copy it, then cancel and reopen this review to load the saved draft.".into());
+            }
+            // Cancelling local input must not erase another window's saved draft.
+            self.drafts_changed = false;
+        }
+        if !self.drafts_changed {
+            self.drafts = previous.drafts.clone();
+            self.drafts_owner = previous.drafts_owner.clone();
+            self.drafts_version = previous.drafts_version.clone();
+        }
+        self.drafts_basis = None;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.key.validate().map_err(|error| error.to_string())?;
+        if self.drafts.as_ref().is_some_and(|drafts| {
+            drafts.summary.len() > 65536
+                || drafts
+                    .unknown
+                    .as_ref()
+                    .is_some_and(|receipt| receipt.len() > 65536)
+                || drafts
+                    .composer
+                    .as_ref()
+                    .is_some_and(|draft| draft.body.len() > 65536)
+        }) {
+            return Err("Cached review draft exceeds its text limit".into());
+        }
         if self.viewer.is_empty()
             || self.viewer.len() > 256
             || self.pull_request.number != self.key.number
@@ -153,6 +216,11 @@ pub(crate) fn fixture() -> Snapshot {
         pull_request: pull_request(1),
         range: loaded(Vec::new(), Vec::new()).range,
         unknown_paths: BTreeSet::new(),
+        drafts: None,
+        drafts_changed: false,
+        drafts_owner: None,
+        drafts_version: None,
+        drafts_basis: None,
         selected: Some(entry.path.clone()),
         files: vec![File {
             entry,
@@ -508,33 +576,45 @@ impl Store for JsonStore {
                     .repository
                     .same_repository(&snapshot.key.repository)
         };
-        if document
-            .reviews
-            .iter()
-            .any(|record| same_key(record) && order.superseded_by(&record.epoch, record.order))
-        {
-            return Ok(());
+        let previous = document.reviews.iter().find(|record| same_key(record));
+        if previous.is_some_and(|record| order.superseded_by(&record.epoch, record.order)) {
+            return if snapshot.drafts_changed {
+                Err("A newer local review save finished first. Your draft is not saved yet; retry saving it.".into())
+            } else {
+                Ok(())
+            };
         }
+        let mut effective = snapshot.clone();
+        if let Some(previous) = previous {
+            effective.merge_drafts(&previous.snapshot)?;
+        }
+        effective.drafts_basis = None;
         document.version = 2;
         document.reviews.retain(|record| !same_key(record));
         document.reviews.insert(
             0,
             Record {
-                snapshot: snapshot.clone(),
+                snapshot: effective,
                 epoch: order.epoch.clone(),
                 order: order.tick,
             },
         );
-        document.reviews.truncate(MAX_CACHED_REVIEWS);
+        while document.reviews.len() > MAX_CACHED_REVIEWS {
+            let index = document.reviews.iter().rposition(|record| record.snapshot.drafts.is_none())
+                .ok_or("Local review storage is full of saved drafts. Finish or cancel a saved draft before saving another.")?;
+            document.reviews.remove(index);
+        }
         let bytes = loop {
             let bytes = serde_json::to_vec(&document).map_err(|e| e.to_string())?;
             if bytes.len() as u64 <= MAX_CACHE_BYTES {
                 break bytes;
             }
             if document.reviews.len() <= 1 {
-                return Err("Review cache exceeds the size limit".into());
+                return Err("Review cache exceeds the size limit; saved drafts were kept and this write was not saved".into());
             }
-            document.reviews.pop();
+            let index = document.reviews.iter().rposition(|record| record.snapshot.drafts.is_none())
+                .ok_or("Local review storage is full. Saved drafts were kept; this draft has not been saved.")?;
+            document.reviews.remove(index);
         };
         let temporary = parent.join(format!(".review-{}.tmp", uuid::Uuid::new_v4()));
         let result = (|| -> std::io::Result<()> {
@@ -553,5 +633,145 @@ impl Store for JsonStore {
             let _ = std::fs::remove_file(&temporary);
         }
         result.map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod draft_durability_tests {
+    use super as cache;
+    use super::*;
+    #[test]
+    fn json_recovery_text_has_order_conflict_and_eviction_protection() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(directory.path().join("review.json"));
+        assert_draft_protection(&store);
+    }
+
+    #[test]
+    fn unrelated_snapshot_preserves_draft_but_explicit_local_cancel_clears_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JsonStore::new(directory.path().join("review.json"));
+        let mut draft = cache::fixture();
+        draft.drafts = Some(cache::Drafts {
+            composer: None,
+            summary: "Keep my draft".into(),
+            event: crate::github::ReviewEvent::Comment,
+            unknown: Some("unresolved receipt".into()),
+        });
+        draft.drafts_changed = true;
+        store.save(&draft, &cache::WriteOrder::fixture(1)).unwrap();
+        let mut background = cache::fixture();
+        background.files[0].viewed = false;
+        store
+            .save(&background, &cache::WriteOrder::fixture(2))
+            .unwrap();
+        let restored = store.load(&background.key).unwrap().unwrap();
+        assert_eq!(restored.drafts, draft.drafts);
+        assert!(!restored.files[0].viewed);
+        background.drafts_changed = true;
+        store
+            .save(&background, &cache::WriteOrder::fixture(3))
+            .unwrap();
+        assert!(
+            store
+                .load(&background.key)
+                .unwrap()
+                .unwrap()
+                .drafts
+                .is_none()
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_draft_protection(store: &dyn Store) {
+    fn local(snapshot: &mut Snapshot, owner: &str, version: &str, basis: Option<&str>, body: &str) {
+        snapshot.drafts = Some(Drafts {
+            composer: None,
+            summary: body.into(),
+            event: crate::github::ReviewEvent::Comment,
+            unknown: Some("unresolved receipt".into()),
+        });
+        snapshot.drafts_changed = true;
+        snapshot.drafts_owner = Some(owner.into());
+        snapshot.drafts_version = Some(version.into());
+        snapshot.drafts_basis = basis.map(str::to_owned);
+    }
+    let mut original = fixture();
+    store.save(&original, &WriteOrder::fixture(11)).unwrap();
+    local(&mut original, "window-a", "v1", None, "Unacknowledged text");
+    assert!(
+        store.save(&original, &WriteOrder::fixture(10)).is_err(),
+        "superseded draft must never receive a false successful receipt"
+    );
+    assert!(store.load(&original.key).unwrap().unwrap().drafts.is_none());
+    store.save(&original, &WriteOrder::fixture(12)).unwrap();
+    let mut other = original.clone();
+    local(&mut other, "window-b", "v2", Some("v1"), "New saved text");
+    store.save(&other, &WriteOrder::fixture(13)).unwrap();
+    local(
+        &mut original,
+        "window-a",
+        "v3",
+        Some("v1"),
+        "Concurrent unsaved text",
+    );
+    assert!(
+        store.save(&original, &WriteOrder::fixture(14)).is_err(),
+        "another window's changed draft requires a visible conflict"
+    );
+    assert_eq!(
+        store.load(&original.key).unwrap().unwrap().drafts,
+        other.drafts
+    );
+    original.drafts = None;
+    store.save(&original, &WriteOrder::fixture(15)).unwrap();
+    assert_eq!(
+        store.load(&original.key).unwrap().unwrap().drafts,
+        other.drafts,
+        "cancelling local input preserves the other window's draft"
+    );
+    // Put an acknowledged draft/unknown receipt beyond ordinary LRU rank32.
+    for number in 2..=34 {
+        let mut snapshot = fixture();
+        snapshot.key.number = number;
+        snapshot.range.number = number;
+        snapshot.pull_request = super::tests::pull_request(number);
+        store
+            .save(&snapshot, &WriteOrder::fixture(100 + number))
+            .unwrap();
+    }
+    assert_eq!(
+        store.load(&original.key).unwrap().unwrap().drafts,
+        other.drafts
+    );
+    // Fill every available record with recovery text. Further draft writes
+    // fail atomically rather than evicting somebody's acknowledged input.
+    for number in 2..=32 {
+        let mut snapshot = fixture();
+        snapshot.key.number = number;
+        snapshot.range.number = number;
+        snapshot.pull_request = super::tests::pull_request(number);
+        local(
+            &mut snapshot,
+            "window-unit",
+            &format!("v-{number}"),
+            None,
+            "Keep saved text",
+        );
+        store
+            .save(&snapshot, &WriteOrder::fixture(200 + number))
+            .unwrap();
+    }
+    let mut extra = fixture();
+    extra.key.number = 99;
+    extra.range.number = 99;
+    extra.pull_request = super::tests::pull_request(99);
+    local(&mut extra, "window-extra", "extra-v", None, "Not saved yet");
+    assert!(store.save(&extra, &WriteOrder::fixture(400)).is_err());
+    assert!(store.load(&extra.key).unwrap().is_none());
+    for number in 1..=32 {
+        let key = PullRequestKey::new(extra.key.repository.clone(), number).unwrap();
+        assert!(store.load(&key).unwrap().unwrap().drafts.is_some());
     }
 }

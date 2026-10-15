@@ -9,7 +9,7 @@ use crate::github::{
     ReviewDiffSide, ReviewEvent, ReviewThreadSubject, SubmitReviewRequest,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Anchor {
     pub path: String,
     pub side: ReviewDiffSide,
@@ -22,15 +22,21 @@ pub enum Mutation {
     Comment {
         anchor: Anchor,
         body: String,
+        single: bool,
     },
     /// A thread on the file as a whole rather than any line of its diff.
     FileComment {
         path: String,
         body: String,
+        single: bool,
     },
     Reply {
         thread: String,
         body: String,
+        add_to_review: bool,
+    },
+    Discard {
+        review_id: String,
     },
     Edit {
         comment: String,
@@ -67,11 +73,8 @@ pub fn pending_snapshot(
     if expected == 0 {
         return Ok(Vec::new());
     }
-    if conversation.truncated || conversation.threads.iter().any(|thread| thread.truncated) {
-        return Err(Outcome::Refused(
-            "The pending discussion is incomplete. Review and submit it on GitHub.".into(),
-        ));
-    }
+    // The exact pending-review count and unique IDs below prove whether its
+    // comments are complete, independent of unrelated conversation page caps.
     let mut comments = Vec::new();
     for thread in &conversation.threads {
         for comment in &thread.comments {
@@ -107,6 +110,7 @@ pub fn pending_snapshot(
 pub struct Authority {
     pub target: ReviewTarget,
     pub context: ReviewContext,
+    pub merge_base: Option<Oid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,17 +137,39 @@ fn outcome<T>(
     }
 }
 
-fn same_authority(expected: &ReviewContext, current: &ReviewContext) -> Result<(), Outcome> {
-    if expected.pull_request_id != current.pull_request_id
-        || expected.head_oid != current.head_oid
-        || expected.base_oid != current.base_oid
-        || expected.viewer != current.viewer
-    {
+pub(super) fn same_identity(
+    expected: &ReviewContext,
+    current: &ReviewContext,
+) -> Result<(), Outcome> {
+    if expected.pull_request_id != current.pull_request_id || expected.viewer != current.viewer {
         return Err(Outcome::Refused(
-            "The pull request, diff head, base, or signed-in account changed. Refresh before reviewing.".into(),
+            "The pull request or signed-in account changed. Refresh before reviewing.".into(),
         ));
     }
     Ok(())
+}
+fn same_authority(expected: &ReviewContext, current: &ReviewContext) -> Result<(), Outcome> {
+    same_identity(expected, current)?;
+    if expected.head_oid != current.head_oid || expected.base_oid != current.base_oid {
+        return Err(Outcome::Refused(
+            "The diff revision changed. Refresh before reviewing.".into(),
+        ));
+    }
+    Ok(())
+}
+fn mutation_authority(
+    expected: &ReviewContext,
+    current: &ReviewContext,
+    mutation: &Mutation,
+) -> Result<(), Outcome> {
+    same_identity(expected, current)?;
+    match mutation {
+        Mutation::Submit { .. } => same_authority(expected, current),
+        Mutation::Comment { .. } | Mutation::FileComment { .. } if expected.head_oid != current.head_oid => {
+            Err(Outcome::Refused("The pull request head changed. Your draft is kept; re-anchor it to the current head before posting.".into()))
+        }
+        _ => Ok(()),
+    }
 }
 
 fn pending_review(
@@ -163,7 +189,7 @@ fn pending_review(
     };
     if pending.commit_oid.as_deref() != Some(context.head_oid.as_str()) {
         return Err(Outcome::Refused(
-            "Your pending review belongs to another commit. Review or discard that draft on GitHub before adding comments to this head.".into(),
+            "Your pending review belongs to another commit. Use Discard pending review before adding comments to this head.".into(),
         ));
     }
     Ok(pending)
@@ -179,7 +205,9 @@ pub fn execute(
     cancellation: &CancellationToken,
 ) -> Outcome {
     let run = || -> Result<(), Outcome> {
-        let (key, current) = verify_authority(api, git, authority, cancellation)?;
+        let (key, current) = verify_identity(api, git, authority, cancellation)?;
+        mutation_authority(&authority.context, &current, mutation)?;
+        verify_anchor_base(api, &key, authority, &current, mutation, cancellation)?;
         let target = &authority.target;
         execute_current(
             api,
@@ -197,7 +225,51 @@ pub fn execute(
     }
 }
 
+fn verify_anchor_base(
+    api: &dyn GitHubReviewApi,
+    key: &PullRequestKey,
+    authority: &Authority,
+    current: &ReviewContext,
+    mutation: &Mutation,
+    cancellation: &CancellationToken,
+) -> Result<(), Outcome> {
+    if matches!(
+        mutation,
+        Mutation::Comment {
+            anchor: Anchor {
+                side: ReviewDiffSide::Left,
+                ..
+            },
+            ..
+        }
+    ) && authority.context.base_oid != current.base_oid
+    {
+        let merge_base = api
+            .review_merge_base(key, &current.base_oid, &current.head_oid, cancellation)
+            .map_err(|error| Outcome::Refused(error.to_string()))?;
+        if authority
+            .merge_base
+            .as_ref()
+            .is_none_or(|expected| expected.as_str() != merge_base)
+        {
+            return Err(Outcome::Refused("The diff's merge base changed. Your draft is kept; refresh and re-anchor it before posting.".into()));
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn verify_authority(
+    api: &dyn GitHubReviewApi,
+    git: &RepositoryService,
+    authority: &Authority,
+    cancellation: &CancellationToken,
+) -> Result<(PullRequestKey, ReviewContext), Outcome> {
+    let (key, current) = verify_identity(api, git, authority, cancellation)?;
+    same_authority(&authority.context, &current)?;
+    Ok((key, current))
+}
+
+fn verify_identity(
     api: &dyn GitHubReviewApi,
     git: &RepositoryService,
     authority: &Authority,
@@ -222,7 +294,7 @@ pub(super) fn verify_authority(
     let current = api
         .review_context(&key, cancellation)
         .map_err(|error| Outcome::Refused(error.to_string()))?;
-    same_authority(&authority.context, &current)?;
+    same_identity(&authority.context, &current)?;
     Ok((key, current))
 }
 
@@ -240,7 +312,22 @@ fn execute_current(
             "The review was closed before sending.".into(),
         ));
     }
+    mutation_authority(expected, current, mutation)?;
+    if let Mutation::Discard { review_id } = mutation {
+        if current.pending.as_ref().map(|p| &p.id) != Some(review_id) {
+            return Err(Outcome::Refused(
+                "The pending review changed. Refresh before discarding it.".into(),
+            ));
+        }
+        return outcome(api.discard_review(repository, review_id, cancellation));
+    }
     if let Mutation::Submit { request, comments } = mutation {
+        if request.event == ReviewEvent::Comment
+            && request.body.trim().is_empty()
+            && comments.is_empty()
+        {
+            return Err(Outcome::Refused("Write a review summary or add a pending comment before submitting a Comment review.".into()));
+        }
         if request.pull_request_id != current.pull_request_id
             || request.commit_oid != current.head_oid
             || request.review_id.as_deref()
@@ -260,7 +347,7 @@ fn execute_current(
             .as_ref()
             .is_some_and(|pending| pending.commit_oid.as_deref() != Some(current.head_oid.as_str()))
         {
-            return Err(Outcome::Refused("The pending review belongs to another commit. Refresh its review on GitHub before submitting.".into()));
+            return Err(Outcome::Refused("The pending review belongs to another commit. Use Discard pending review, then start a review on the current head.".into()));
         }
         if current
             .pending
@@ -281,7 +368,7 @@ fn execute_current(
         return outcome(api.submit_review(repository, request, cancellation)).map(drop);
     }
     let thread = match mutation {
-        Mutation::Comment { anchor, body } => Some(AddReviewThreadRequest {
+        Mutation::Comment { anchor, body, .. } => Some(AddReviewThreadRequest {
             review_id: "pending".into(),
             path: anchor.path.clone(),
             subject: ReviewThreadSubject::Lines {
@@ -292,7 +379,7 @@ fn execute_current(
             },
             body: body.clone(),
         }),
-        Mutation::FileComment { path, body } => Some(AddReviewThreadRequest {
+        Mutation::FileComment { path, body, .. } => Some(AddReviewThreadRequest {
             review_id: "pending".into(),
             path: path.clone(),
             subject: ReviewThreadSubject::File,
@@ -306,6 +393,19 @@ fn execute_current(
         request
             .validate()
             .map_err(|error| Outcome::Refused(error.to_string()))?;
+        let single = matches!(
+            mutation,
+            Mutation::Comment { single: true, .. } | Mutation::FileComment { single: true, .. }
+        );
+        if single {
+            return outcome(api.add_single_review_thread(
+                key,
+                &current.head_oid,
+                &request,
+                cancellation,
+            ))
+            .map(drop);
+        }
         request.review_id = pending_review(api, repository, current, cancellation)?.id;
         return outcome(api.add_review_thread(repository, &request, cancellation)).map(drop);
     }
@@ -313,7 +413,11 @@ fn execute_current(
         .conversation(key, cancellation)
         .map_err(|error| Outcome::Refused(error.to_string()))?;
     match mutation {
-        Mutation::Reply { thread, body } => {
+        Mutation::Reply {
+            thread,
+            body,
+            add_to_review,
+        } => {
             if !conversation
                 .threads
                 .iter()
@@ -331,7 +435,10 @@ fn execute_current(
             request
                 .validate()
                 .map_err(|error| Outcome::Refused(error.to_string()))?;
-            request.review_id = Some(pending_review(api, repository, current, cancellation)?.id);
+            if *add_to_review {
+                request.review_id =
+                    Some(pending_review(api, repository, current, cancellation)?.id);
+            }
             outcome(api.reply_to_thread(repository, &request, cancellation)).map(drop)
         }
         Mutation::Edit { comment, body } => {
@@ -369,7 +476,10 @@ fn execute_current(
             }
             outcome(api.set_thread_resolved(repository, thread, *resolved, cancellation))
         }
-        Mutation::Comment { .. } | Mutation::FileComment { .. } | Mutation::Submit { .. } => {
+        Mutation::Comment { .. }
+        | Mutation::FileComment { .. }
+        | Mutation::Submit { .. }
+        | Mutation::Discard { .. } => {
             unreachable!()
         }
     }
@@ -424,6 +534,178 @@ mod tests {
             owner: "owner".into(),
             name: "repo".into(),
         }
+    }
+
+    #[test]
+    fn left_anchor_accepts_unrelated_base_move_but_refuses_a_new_merge_base() {
+        let api = ScriptedApi::new();
+        let expected = context();
+        let mut current = expected.clone();
+        current.base_oid = "c".repeat(40);
+        let base = "b".repeat(40);
+        *api.merge_base.lock().unwrap() = Some(base.clone());
+        let target = super::super::tests::target(1);
+        let key = PullRequestKey::new(target.repository.clone(), 1).unwrap();
+        let authority = Authority {
+            target,
+            context: expected,
+            merge_base: Some(Oid::parse(&base).unwrap()),
+        };
+        let mutation = Mutation::Comment {
+            anchor: Anchor {
+                path: "file.rs".into(),
+                side: ReviewDiffSide::Left,
+                start_line: 1,
+                line: 1,
+            },
+            body: "Anchored".into(),
+            single: false,
+        };
+        assert_eq!(
+            verify_anchor_base(
+                &api,
+                &key,
+                &authority,
+                &current,
+                &mutation,
+                &CancellationToken::new()
+            ),
+            Ok(())
+        );
+        *api.merge_base.lock().unwrap() = Some("d".repeat(40));
+        assert!(matches!(
+            verify_anchor_base(
+                &api,
+                &key,
+                &authority,
+                &current,
+                &mutation,
+                &CancellationToken::new()
+            ),
+            Err(Outcome::Refused(_))
+        ));
+    }
+
+    #[test]
+    fn mutation_authority_uses_identity_for_existing_comments_and_head_for_new_anchors() {
+        let expected = context();
+        let mutations = [
+            Mutation::Reply {
+                thread: "thread".into(),
+                body: "reply".into(),
+                add_to_review: false,
+            },
+            Mutation::Resolve {
+                thread: "thread".into(),
+                resolved: true,
+            },
+            Mutation::Edit {
+                comment: "comment".into(),
+                body: "edit".into(),
+            },
+            Mutation::Delete {
+                comment: "comment".into(),
+            },
+        ];
+        let line = Mutation::Comment {
+            anchor: Anchor {
+                path: "file.rs".into(),
+                side: ReviewDiffSide::Right,
+                start_line: 1,
+                line: 1,
+            },
+            body: "comment".into(),
+            single: false,
+        };
+        for changed in ["base", "head", "viewer", "pr"] {
+            let mut current = expected.clone();
+            match changed {
+                "base" => current.base_oid = "c".repeat(40),
+                "head" => current.head_oid = "c".repeat(40),
+                "viewer" => current.viewer = "other".into(),
+                _ => current.pull_request_id = "PR_other".into(),
+            }
+            for mutation in &mutations {
+                assert_eq!(
+                    mutation_authority(&expected, &current, mutation).is_ok(),
+                    matches!(changed, "base" | "head"),
+                    "{changed}: {mutation:?}"
+                );
+            }
+            assert_eq!(
+                mutation_authority(&expected, &current, &line).is_ok(),
+                changed == "base"
+            );
+        }
+    }
+    #[test]
+    fn immediate_reply_sends_no_review_id_after_head_and_base_move() {
+        let api = ScriptedApi::new();
+        let expected = context();
+        let mut current = expected.clone();
+        current.base_oid = "c".repeat(40);
+        current.head_oid = "d".repeat(40);
+        api.conversation
+            .lock()
+            .unwrap()
+            .threads
+            .push(crate::github::PullRequestReviewThread {
+                id: "thread".into(),
+                path: "file.rs".into(),
+                line: Some(1),
+                start_line: None,
+                side: ReviewDiffSide::Right,
+                start_side: None,
+                outdated: true,
+                resolved: false,
+                collapsed: false,
+                viewer_can_resolve: true,
+                viewer_can_unresolve: false,
+                comments: vec![],
+                truncated: false,
+            });
+        let repo = repository();
+        assert_eq!(
+            execute_current(
+                &api,
+                &repo,
+                &PullRequestKey::new(repo.clone(), 1).unwrap(),
+                &current,
+                &expected,
+                &Mutation::Reply {
+                    thread: "thread".into(),
+                    body: "Visible immediately".into(),
+                    add_to_review: false
+                },
+                &CancellationToken::new()
+            ),
+            Ok(())
+        );
+        let replies = api.replies.lock().unwrap();
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].review_id.is_none());
+    }
+    #[test]
+    fn stale_review_can_be_discarded_without_current_head_match() {
+        let api = ScriptedApi::new();
+        let mut current = context();
+        current.head_oid = "c".repeat(40);
+        let repo = repository();
+        assert_eq!(
+            execute_current(
+                &api,
+                &repo,
+                &PullRequestKey::new(repo.clone(), 1).unwrap(),
+                &current,
+                &current,
+                &Mutation::Discard {
+                    review_id: "REVIEW_1".into()
+                },
+                &CancellationToken::new()
+            ),
+            Ok(())
+        );
+        assert_eq!(&*api.discarded.lock().unwrap(), &["REVIEW_1"]);
     }
 
     #[test]
@@ -554,7 +836,8 @@ mod tests {
         ));
         assert!(api.submitted.lock().unwrap().is_empty());
         conversation.threads[0].comments[0].body = "Confirmed text".into();
-        conversation.truncated = true;
+        conversation.threads_truncated = true;
+        let saved_comment = conversation.threads[0].comments.pop().unwrap();
         *api.conversation.lock().unwrap() = conversation.clone();
         assert!(matches!(
             execute_current(
@@ -569,7 +852,11 @@ mod tests {
             Err(Outcome::Refused(_))
         ));
         assert!(api.submitted.lock().unwrap().is_empty());
-        conversation.truncated = false;
+        conversation.threads[0].comments.push(saved_comment);
+        // Unrelated threads and issue comments may truncate while every
+        // confirmed pending comment is still present and uniquely identified.
+        conversation.threads_truncated = true;
+        conversation.truncated = true; // Only issue comments/reviews hit their page cap.
         *api.conversation.lock().unwrap() = conversation;
         assert_eq!(
             execute_current(
@@ -600,6 +887,7 @@ mod tests {
                 line: 1,
             },
             body: "  \n".into(),
+            single: false,
         };
         assert!(matches!(
             execute_current(
@@ -625,6 +913,7 @@ mod tests {
             let mutation = Mutation::FileComment {
                 path: path.into(),
                 body: body.into(),
+                single: false,
             };
             assert!(matches!(
                 execute_current(
@@ -639,5 +928,100 @@ mod tests {
                 Err(Outcome::Refused(_))
             ));
         }
+    }
+}
+
+/// Map an anchored range only when its surrounding text is unique and unchanged.
+/// Ambiguous or changed content stays a draft until the reader chooses a line.
+fn map_range(old: &str, new: &str, start: u64, end: u64) -> Result<(u64, u64), String> {
+    let old_lines: Vec<_> = old.lines().collect();
+    let new_lines: Vec<_> = new.lines().collect();
+    let first = usize::try_from(start.saturating_sub(1)).map_err(|_| "Invalid draft range")?;
+    let last = usize::try_from(end).map_err(|_| "Invalid draft range")?;
+    if start == 0 || first >= last || last > old_lines.len() {
+        return Err("The original anchor is unavailable. Pick its new line in the gutter; your draft text is kept.".into());
+    }
+    let from = first.saturating_sub(3);
+    let to = last.saturating_add(3).min(old_lines.len());
+    let context = &old_lines[from..to];
+    let matches: Vec<_> = new_lines
+        .windows(context.len())
+        .enumerate()
+        .filter(|(_, lines)| *lines == context)
+        .map(|(i, _)| i)
+        .take(2)
+        .collect();
+    if matches.len() != 1 {
+        return Err("The anchor changed or is ambiguous. Pick its new line in the gutter; your draft text is kept.".into());
+    }
+    let mapped = matches[0] + first - from + 1;
+    Ok((mapped as u64, (mapped + last - first - 1) as u64))
+}
+
+pub(super) fn reanchor(
+    git: &RepositoryService,
+    worktree: &Path,
+    old_range: &PullRequestRange,
+    new_range: &PullRequestRange,
+    anchor: &Anchor,
+    cancellation: &CancellationToken,
+) -> Result<Anchor, String> {
+    let read = |range: &PullRequestRange| {
+        let diff = git
+            .diff(
+                &crate::repository::DiffRequest {
+                    worktree: worktree.to_path_buf(),
+                    basis: range.basis(),
+                    path: RepoPath::parse(&anchor.path).map_err(|error| error.to_string())?,
+                    old_path: None,
+                },
+                cancellation,
+            )
+            .map_err(|error| error.to_string())?;
+        match diff {
+            crate::repository::DiffContent::Comparison { old, new, .. } => {
+                let side = if anchor.side == ReviewDiffSide::Left {
+                    old
+                } else {
+                    new
+                };
+                side.text().map(str::to_owned).ok_or_else(|| {
+                    "The anchor is not a text file. Pick its new line in the gutter.".into()
+                })
+            }
+            _ => Err(
+                "The anchor cannot be mapped in this diff. Pick its new line in the gutter.".into(),
+            ),
+        }
+    };
+    let (start_line, line) = map_range(
+        &read(old_range)?,
+        &read(new_range)?,
+        anchor.start_line,
+        anchor.line,
+    )?;
+    Ok(Anchor {
+        start_line,
+        line,
+        ..anchor.clone()
+    })
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::*;
+    #[test]
+    fn reanchor_maps_unchanged_surroundings_and_refuses_ambiguous_text() {
+        assert_eq!(
+            map_range(
+                "a\nb\nc\nd\ne\nf\ng\nh\n",
+                "new\na\nb\nc\nd\ne\nf\ng\nh\n",
+                4,
+                5
+            ),
+            Ok((5, 6))
+        );
+        assert!(map_range("a\nb\nc\n", "a\nb\nc\na\nb\nc\n", 2, 2).is_err());
+        assert!(map_range("a\nb\nc\n", "a\nchanged\nc\n", 2, 2).is_err());
     }
 }
