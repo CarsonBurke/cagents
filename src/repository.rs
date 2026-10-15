@@ -4741,7 +4741,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         // Only configuration names and the dependency-bearing values are
         // requested; unrelated values (tokens, remote credentials) stay unread.
-        let command = self.git_read(worktree, ["config", "-z", "--show-origin", "--get-regexp", r"^(include(if\..*)?\.path|diff\..*\.(textconv|command)|diff\.external)$"]);
+        let command = self.git_read(worktree, ["config", "-z", "--show-origin", "--get-regexp", r"^(include(if\..*)?\.path|diff\..*\.(textconv|command)|diff\.external|filter\..*\.(clean|process))$"]);
         let output = self.run(&command, cancellation)?;
         if output.success {
             let fields: Vec<_> = output.stdout.split(|byte| *byte == 0).collect();
@@ -4750,7 +4750,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 let mut record = pair[1].splitn(2, |byte| *byte == b'\n');
                 let key = record.next().unwrap_or_default();
                 let Some(value) = record.next() else { policy.reusable = false; policy.reconcile_unchanged = true; continue; };
-                if key.starts_with(b"diff.") { policy.reusable = false; policy.reconcile_unchanged = true; continue; }
+                if key.starts_with(b"diff.") || key.starts_with(b"filter.") { policy.reusable = false; policy.reconcile_unchanged = true; continue; }
                 let Some(origin) = pair[0].strip_prefix(b"file:") else { policy.reusable = false; policy.reconcile_unchanged = true; continue; };
                 let origin = worktree.join(bytes_to_path(origin));
                 let include = bytes_to_path(value);
@@ -9176,6 +9176,31 @@ mod tests {
             git(root, &["replace", "-d", &original]);
             let removed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
             assert_eq!(measured(&removed, "tracked", ChangeArea::Unstaged), (Some(1), Some(1)));
+        }
+
+        #[test]
+        fn cached_numstat_reconciles_external_clean_filter_inputs() {
+            let directory = tempfile::tempdir().unwrap(); let root = directory.path();
+            let outside = tempfile::tempdir().unwrap(); let state = outside.path().join("filter-state");
+            git(root, &["init", "-b", "main"]);
+            fs::write(&state, "base\n").unwrap();
+            let quoted = state.to_string_lossy().replace('\'', "'\\''");
+            let clean = format!("cat >/dev/null; cat '{quoted}'");
+            git(root, &["config", "filter.fixture.clean", &clean]);
+            fs::write(root.join(".gitattributes"), "tracked filter=fixture\n").unwrap();
+            fs::write(root.join("tracked"), "initial-input\n").unwrap();
+            git(root, &["add", "-A"]); git(root, &["commit", "-m", "initial"]);
+            fs::write(root.join("tracked"), "working-input\n").unwrap();
+            fs::write(&state, "first\n").unwrap();
+            let service = service(); let cancel = CancellationToken::new(); let mut cache = SnapshotCache::default();
+            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
+            let initial = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(measured(&initial, "tracked", ChangeArea::Unstaged), (Some(1), Some(1)));
+            let before = fs::metadata(root.join("tracked")).unwrap();
+            fs::write(&state, "one\ntwo\n").unwrap();
+            let changed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
+            assert_eq!(file_identity(&before), file_identity(&fs::metadata(root.join("tracked")).unwrap()));
+            assert_eq!(measured(&changed, "tracked", ChangeArea::Unstaged), (Some(2), Some(1)));
         }
 
         #[test]
