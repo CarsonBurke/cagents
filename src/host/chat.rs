@@ -2185,6 +2185,12 @@ fn process_inner(
             if let chat::Command::LoadSource { query } = command {
                 return Ok(ServerResponse::ChatSource { chat_id, result: handle.source_query(query) });
             }
+            if let chat::Command::LoadChangesManifest { query } = command {
+                return Ok(ServerResponse::ChatChangesManifest { chat_id, result: handle.changes_manifest(query) });
+            }
+            if let chat::Command::LoadChangePatch { query } = command {
+                return Ok(ServerResponse::ChatChangePatch { chat_id, result: handle.change_patch(query) });
+            }
             if let Some(reply) = handle.file_query(&command).map_err(unavailable)? {
                 return Ok(match reply {
                     crate::chat::FileChangeReply::Files(summary) => {

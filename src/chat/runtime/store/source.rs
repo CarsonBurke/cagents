@@ -15,7 +15,7 @@ pub(super) struct PendingChildSource {
 // Revisions distinguish rewrites within this process. SourceEpoch also binds
 // them to the Store incarnation, including across execed actor replacements.
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
-fn epoch() -> Result<u64, String> {
+pub(super) fn epoch() -> Result<u64, String> {
     NEXT_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1).filter(|n| *n <= i64::MAX as u64)).map_err(|_| "Source epoch capacity exhausted".into())
 }
 pub(super) fn rewrite_epoch(transaction: &rusqlite::Transaction<'_>, id: &str) -> Result<(), String> {

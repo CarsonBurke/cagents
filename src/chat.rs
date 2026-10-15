@@ -950,6 +950,10 @@ pub struct Snapshot {
     pub source_revision: u64,
     #[serde(default)]
     pub source_parts: Vec<cache::SourcePart>,
+    #[serde(default)]
+    pub changes_revision: u64,
+    #[serde(default)]
+    pub changes_parts: Vec<cache::changes::Part>,
 }
 
 /// When a provider takes a message it is holding.
@@ -1219,6 +1223,8 @@ pub enum Command {
     },
     /// Read original prose without hydrating or changing the presentation window.
     LoadSource { query: cache::SourceQuery },
+    LoadChangesManifest { query: cache::changes::ManifestQuery },
+    LoadChangePatch { query: cache::changes::PatchQuery },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {

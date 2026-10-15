@@ -108,6 +108,9 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatSource { .. }
+                | ServerResponse::ChatChangesManifest { .. }
+                | ServerResponse::ChatChangePatch { .. }
         }
     )
 }
@@ -399,6 +402,32 @@ mod tests {
             delivered.message,
             ServerMessage::Redraw { generation: 11, .. }
         ));
+    }
+
+    #[test]
+    fn original_source_replies_share_the_bounded_chat_page_backlog() {
+        use crate::chat::cache::SourceError;
+        let chat_id=TerminalId::new();
+        for response in [
+            ServerResponse::ChatSource {chat_id,result:Err(SourceError::NotFound)},
+            ServerResponse::ChatChangesManifest {chat_id,result:Err(SourceError::NotFound)},
+            ServerResponse::ChatChangePatch {chat_id,result:Err(SourceError::NotFound)},
+        ] {
+            let queue=DeliveryQueue::new(1,128);
+            for request in 0..MAX_QUEUED_CHAT_PAGES {
+                let mut envelope=redraw(chat_id,1);
+                envelope.request_id=Some(request as u64);
+                envelope.message=ServerMessage::Response {response:response.clone()};
+                queue.push(envelope).unwrap();
+            }
+            let mut overflow=redraw(chat_id,1);
+            overflow.request_id=Some(100);
+            overflow.message=ServerMessage::Response {response};
+            assert!(queue.push(overflow).is_err());
+            let closed=queue.pop().unwrap();
+            assert!(matches!(closed.message,ServerMessage::Error(ProtocolError {code:ProtocolErrorCode::QueueFull,..})),"overflow replaces cached bodies with one terminal failure");
+            assert!(queue.pop().is_none());
+        }
     }
 
     #[test]

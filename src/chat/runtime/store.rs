@@ -1,6 +1,7 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod file_changes;
+mod changes_source;
 mod source;
 use super::observed_at;
 use crate::chat::{Event, Item, ItemContent, Phase, Role};
@@ -47,11 +48,13 @@ pub(super) struct Window {
     pub items: Vec<std::sync::Arc<Item>>,
     pub changes: Vec<crate::chat::presentation::ItemChange>,
     pub source_parts: Vec<crate::chat::cache::SourcePart>,
+    pub changes_parts: Vec<crate::chat::cache::changes::Part>,
     pub has_earlier: bool,
     pub has_later: bool,
 }
 pub(crate) struct Store {
     db: Connection,
+    changes_revision: u64,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -148,9 +151,11 @@ impl Store {
                 CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(source::SCHEMA).map_err(|e| e.to_string())?;
+            db.execute_batch(changes_source::SCHEMA).map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
             Ok(Self {
+                changes_revision: 0,
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -271,6 +276,7 @@ impl Store {
                 preserve_input = input.is_empty();
             }
         }
+        let changes_source = self.prepare_changes_source(&item, "")?;
         let mut warning = None;
         if let ItemContent::Image { path, description } = &mut item.content
             && path.starts_with("data:")
@@ -368,6 +374,7 @@ impl Store {
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
         transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
         source::rewrite_epoch(&transaction, &item.id)?;
+        let changes_changed = changes_source::record(&transaction, "", &item.id, changes_source.as_ref())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -381,6 +388,7 @@ impl Store {
         insert_body(&transaction, &item.id, 1, 0, &body1)?;
         insert_body(&transaction, &item.id, 2, 0, &body2)?;
         transaction.commit().map_err(|e| e.to_string())?;
+        if changes_changed { self.changes_revision = self.changes_revision.wrapping_add(1); }
         if is_text || previous.as_ref().is_some_and(|(_,metadata,_)|postcard::from_bytes::<Item>(metadata).is_ok_and(|old|matches!(old.content,ItemContent::Text{..}))) {self.source_changed()?;}
         if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
             self.file_index_incomplete = true;
@@ -801,6 +809,7 @@ impl Store {
                 self.files_removed(&ids)?;
                 let transaction = self.db.transaction().map_err(|e| e.to_string())?;
                 for id in ids {
+                    if transaction.execute("DELETE FROM changes_sources WHERE source='' AND item_id=?1", [&id]).map_err(|e|e.to_string())? > 0 { self.changes_revision = self.changes_revision.wrapping_add(1); }
                     transaction
                         .execute("DELETE FROM items WHERE id=?1", [id])
                         .map_err(|e| e.to_string())?;
@@ -1077,6 +1086,7 @@ impl Store {
         };
         let mut items = Vec::new();
         let mut source_parts = Vec::new();
+        let mut changes_parts = Vec::new();
         let mut bytes = 0;
         let mut first = None;
         let mut newest = None;
@@ -1135,7 +1145,9 @@ impl Store {
                 } else {
                     std::borrow::Cow::Borrowed(base.id.as_str())
                 };
-                let source_bytes = if kind=="text" {item_id.len()+id.len()+64} else {0};
+                let changes_part = if kind=="changes" { self.changes_part(item_id.as_ref(),crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},Some(start0..end0))? } else { None };
+                let source_bytes = if kind=="text" {item_id.len()+id.len()+64} else {0}
+                    + changes_part.as_ref().map(|part|postcard::to_stdvec(part).map(|bytes|bytes.len())).transpose().map_err(|e|e.to_string())?.unwrap_or(0);
                 let attached =
                     if len2 > 0 && metadata.len() + end - start + len2 + 128 <= WINDOW_BYTES {
                         len2
@@ -1150,6 +1162,7 @@ impl Store {
                 if kind=="text" {
                     source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,epoch:crate::chat::cache::SourceEpoch{incarnation:self.source_incarnation,revision:source_epoch},metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
                 }
+                if let Some(part)=changes_part { changes_parts.push(part); }
                 if self
                     .changed
                     .as_ref()
@@ -1361,6 +1374,7 @@ impl Store {
             items,
             changes,
             source_parts,
+            changes_parts,
             has_earlier: self.cached_earlier || self.provider_earlier,
             has_later,
         })
