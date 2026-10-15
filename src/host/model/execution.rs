@@ -11,11 +11,10 @@ use crate::{
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     // Version zero is the existing unversioned project/channel registry.
-    db.execute_batch(
-        "BEGIN IMMEDIATE;
-         CREATE TABLE IF NOT EXISTS agents (
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS agents (
              id TEXT PRIMARY KEY,
              origin TEXT NOT NULL,
              record TEXT NOT NULL,
@@ -55,25 +54,20 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
              directory TEXT,
              interactive INTEGER NOT NULL DEFAULT 0 CHECK(interactive IN (0, 1)),
              interactive_run TEXT
-         ) STRICT;
-         PRAGMA user_version = 1;
-         COMMIT;",
+         ) STRICT;",
     )
     .map_err(|error| error.to_string())
 }
 
 /// Legacy records omit the name, so SQLite's NULL uniqueness semantics allow
 /// them all. The index also fences writes outside the acceptance helper.
-pub(super) fn migrate_names(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
         "CREATE UNIQUE INDEX IF NOT EXISTS agents_by_name
-        ON agents(origin, json_extract(record, '$.name')) WHERE closed = 0;
-        PRAGMA user_version = 10;",
+        ON agents(origin, json_extract(record, '$.name')) WHERE closed = 0;",
     )
     .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 
 impl Registry {
@@ -1228,25 +1222,46 @@ impl Registry {
 
     /// Refuse known unavailable presentation authority before stopping a
     /// provider. The commit repeats the same predicate under its write TX.
-    pub(crate) fn preflight_agent_close(&mut self, origin: &Origin, id: AgentId) -> Result<Agent, String> {
+    pub(crate) fn preflight_agent_close(
+        &mut self,
+        origin: &Origin,
+        id: AgentId,
+    ) -> Result<Agent, String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         let agent = read_agent(&tx, id)?;
-        if &agent.origin != origin { return Err("This caller does not own the agent".into()); }
+        if &agent.origin != origin {
+            return Err("This caller does not own the agent".into());
+        }
         super::views::preflight_retire_agent(&tx, &agent)?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(agent)
     }
 
-    pub(crate) fn preflight_agent_retirement(&mut self, source: &HostedSession) -> Result<(), String> {
+    pub(crate) fn preflight_agent_retirement(
+        &mut self,
+        source: &HostedSession,
+    ) -> Result<(), String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        let row: Option<(String, Option<String>)> = tx.query_row(
-            "SELECT a.record,p.source FROM agents a LEFT JOIN agent_launches p ON p.agent=a.id
-             WHERE (a.session_id=?1 OR p.session_id=?1) AND a.closed=0", [source.id().to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?))).optional().map_err(|error| error.to_string())?;
+        let row: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT a.record,p.source FROM agents a LEFT JOIN agent_launches p ON p.agent=a.id
+             WHERE (a.session_id=?1 OR p.session_id=?1) AND a.closed=0",
+                [source.id().to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
         if let Some((record, pending)) = row {
             let agent: Agent = decode(&record)?;
-            let pending = pending.map(|record| decode::<HostedSession>(&record)).transpose()?;
-            if agent.session.as_ref().or(pending.as_ref()).is_some_and(|expected| expected.same_process(source)) {
+            let pending = pending
+                .map(|record| decode::<HostedSession>(&record))
+                .transpose()?;
+            if agent
+                .session
+                .as_ref()
+                .or(pending.as_ref())
+                .is_some_and(|expected| expected.same_process(source))
+            {
                 super::views::preflight_retire_agent(&tx, &agent)?;
             }
         }
@@ -1494,26 +1509,55 @@ mod tests {
         })
     }
 
-
-#[test]
-fn legacy_open_presentation_close_preflight_is_read_only_and_repeats_commit_predicate() {
-    let (mut registry, _directory, accepted, pane) = console_pane_fixture();
-    let scope = crate::workspace_model::views::Scope::Channel(accepted.agent.channel().unwrap());
-    registry.apply(&ModelEdit::SeedView {scope: scope.clone(), panes: vec![ended_console(&pane)], closed: vec![]}).unwrap();
-    let agent = registry.agent(accepted.agent.id).unwrap();
-    assert!(!agent.closed);
-    let before = registry.model().unwrap();
-    let run = registry.agent_run(accepted.run.id).unwrap();
-    assert!(registry.preflight_agent_close(&Origin::User, agent.id).unwrap_err().contains("historical generation proof"));
-    assert!(registry.preflight_agent_retirement(agent.session.as_ref().unwrap()).unwrap_err().contains("historical generation proof"));
-    assert_eq!(registry.model().unwrap(), before);
-    assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
-    assert_eq!(registry.agent(agent.id).unwrap(), agent);
-    registry.apply(&ModelEdit::ChangeView {scope: scope.clone(), expected_revision: registry.view_revision(&scope).unwrap(),
-        operation: uuid::Uuid::new_v4(), change: crate::workspace_model::views::Change::Remove {id: pane.id}}).unwrap();
-    assert_eq!(registry.preflight_agent_close(&Origin::User, agent.id).unwrap(), agent);
-    registry.preflight_agent_retirement(agent.session.as_ref().unwrap()).unwrap();
-}
+    #[test]
+    fn legacy_open_presentation_close_preflight_is_read_only_and_repeats_commit_predicate() {
+        let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+        let scope =
+            crate::workspace_model::views::Scope::Channel(accepted.agent.channel().unwrap());
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![ended_console(&pane)],
+                closed: vec![],
+            })
+            .unwrap();
+        let agent = registry.agent(accepted.agent.id).unwrap();
+        assert!(!agent.closed);
+        let before = registry.model().unwrap();
+        let run = registry.agent_run(accepted.run.id).unwrap();
+        assert!(
+            registry
+                .preflight_agent_close(&Origin::User, agent.id)
+                .unwrap_err()
+                .contains("historical generation proof")
+        );
+        assert!(
+            registry
+                .preflight_agent_retirement(agent.session.as_ref().unwrap())
+                .unwrap_err()
+                .contains("historical generation proof")
+        );
+        assert_eq!(registry.model().unwrap(), before);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+        assert_eq!(registry.agent(agent.id).unwrap(), agent);
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: registry.view_revision(&scope).unwrap(),
+                operation: uuid::Uuid::new_v4(),
+                change: crate::workspace_model::views::Change::Remove { id: pane.id },
+            })
+            .unwrap();
+        assert_eq!(
+            registry
+                .preflight_agent_close(&Origin::User, agent.id)
+                .unwrap(),
+            agent
+        );
+        registry
+            .preflight_agent_retirement(agent.session.as_ref().unwrap())
+            .unwrap();
+    }
 
     fn closed_pane_fixture() -> (
         Registry,

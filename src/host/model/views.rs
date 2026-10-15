@@ -1,14 +1,22 @@
 use super::*;
 use crate::workspace_model::views::{Change, Scope, View};
 
-pub(super) fn migrate(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
+pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     let current: u32 = tx
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .map_err(|error| error.to_string())?;
     if current >= 8 {
-        return tx.commit().map_err(|error| error.to_string());
+        return Ok(());
+    }
+    let legacy: bool = tx
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='workspace_views')",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
+    if legacy {
+        schema::require_legacy_views(tx)?;
     }
     tx.execute_batch(
         "CREATE TABLE IF NOT EXISTS shared_view_scopes(
@@ -31,13 +39,6 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
         ) STRICT;",
     )
     .map_err(|error| error.to_string())?;
-    let legacy: bool = tx
-        .query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='workspace_views')",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(|error| error.to_string())?;
     if legacy {
         tx.execute_batch("INSERT INTO shared_view_scopes(scope,channel) SELECT json_object('Channel',channel), channel FROM workspace_views;
             INSERT INTO shared_views SELECT json_object('Channel',channel),revision,panes,retired FROM workspace_views;
@@ -45,29 +46,20 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
             INSERT INTO shared_view_edits SELECT operation,json_object('Channel',channel) FROM workspace_view_edits;
             DROP TABLE workspace_view_edits; DROP TABLE workspace_view_panes; DROP TABLE workspace_views;") .map_err(|error| error.to_string())?;
     }
-    tx.execute_batch("PRAGMA user_version=8;")
-        .map_err(|error| error.to_string())?;
-    tx.commit().map_err(|error| error.to_string())
+    Ok(())
 }
 /// Private durable provenance for a managed terminal pane whose ended
 /// presentation intentionally no longer contains a live attachment proof.
 /// Older ended panes are never backfilled from a terminal ID or launch recipe.
-pub(super) fn migrate_terminal_sources(db: &Connection) -> Result<(), String> {
-    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)
-        .map_err(|error| error.to_string())?;
-    let current: u32 = tx
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(|error| error.to_string())?;
-    if current < 13 {
-        tx.execute_batch(
-            "CREATE TABLE IF NOT EXISTS shared_view_terminal_sources(
+pub(super) fn migrate_terminal_sources(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS shared_view_terminal_sources(
             pane TEXT PRIMARY KEY REFERENCES shared_view_panes(id) ON DELETE CASCADE,
             source TEXT NOT NULL, ended TEXT NOT NULL
-        ) STRICT; PRAGMA user_version=13;",
-        )
-        .map_err(|error| error.to_string())?;
-    }
-    tx.commit().map_err(|error| error.to_string())
+        ) STRICT;",
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 fn ended_terminal(session: &crate::model::TerminalSession) -> bool {
@@ -308,12 +300,20 @@ fn agent_retirement_view(
     Ok(Some(view))
 }
 
-pub(super) fn preflight_retire_agent(db: &Connection, agent: &crate::agent_execution::Agent) -> Result<(), String> {
+pub(super) fn preflight_retire_agent(
+    db: &Connection,
+    agent: &crate::agent_execution::Agent,
+) -> Result<(), String> {
     agent_retirement_view(db, agent).map(|_| ())
 }
 
-pub(super) fn retire_agent(db: &Connection, agent: &crate::agent_execution::Agent) -> Result<bool, String> {
-    let Some(mut view) = agent_retirement_view(db, agent)? else { return Ok(false); };
+pub(super) fn retire_agent(
+    db: &Connection,
+    agent: &crate::agent_execution::Agent,
+) -> Result<bool, String> {
+    let Some(mut view) = agent_retirement_view(db, agent)? else {
+        return Ok(false);
+    };
     let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
     view.apply(&Change::Remove { id })?;
     view.revision = view

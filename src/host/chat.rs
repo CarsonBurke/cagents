@@ -2928,20 +2928,42 @@ pub(super) fn owns_codex_listener(session: &Session) -> bool {
 
 /// Check a paired managed presentation before the terminal worker itself can
 /// stop. This is read-only; the actor path repeats its checks after teardown.
-pub(super) fn preflight_for_terminal_close(host: &SharedHost, terminal_id: TerminalId,
-    expected: &crate::terminal::TerminalHandle) -> Result<(), ProtocolError> {
+pub(super) fn preflight_for_terminal_close(
+    host: &SharedHost,
+    terminal_id: TerminalId,
+    expected: &crate::terminal::TerminalHandle,
+) -> Result<(), ProtocolError> {
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.chats.get(&terminal_id).filter(|record| {
-            (record.session.launch.provider == Provider::Codex || record.owns_execution_console())
-                && record.session.terminal.as_ref().is_some_and(|source| source.id == terminal_id)
-        }).map(|record| {
-            if !record.paired_terminal.as_ref().is_some_and(|handle| handle.same_worker(expected))
-                || !state.terminals.get(&terminal_id).is_some_and(|current| current.handle.same_worker(expected)) {
-                return Err(unavailable("The terminal worker no longer belongs to this provider pairing"));
-            }
-            Ok(record.session.clone())
-        }).transpose()?
+        state
+            .chats
+            .get(&terminal_id)
+            .filter(|record| {
+                (record.session.launch.provider == Provider::Codex
+                    || record.owns_execution_console())
+                    && record
+                        .session
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal_id)
+            })
+            .map(|record| {
+                if !record
+                    .paired_terminal
+                    .as_ref()
+                    .is_some_and(|handle| handle.same_worker(expected))
+                    || !state
+                        .terminals
+                        .get(&terminal_id)
+                        .is_some_and(|current| current.handle.same_worker(expected))
+                {
+                    return Err(unavailable(
+                        "The terminal worker no longer belongs to this provider pairing",
+                    ));
+                }
+                Ok(record.session.clone())
+            })
+            .transpose()?
     };
     if let Some(source) = source {
         super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
@@ -2998,8 +3020,13 @@ pub(super) fn close_terminal_actor(
     terminal_id: TerminalId,
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
-    let source = host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&terminal_id)
-        .filter(|record| record.handle.same_actor(handle)).map(|record| record.session.clone());
+    let source = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&terminal_id)
+        .filter(|record| record.handle.same_actor(handle))
+        .map(|record| record.session.clone());
     if let Some(source) = source {
         super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     }

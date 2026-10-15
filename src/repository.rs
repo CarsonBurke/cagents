@@ -5,6 +5,9 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod worktree_setup_intent;
+pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
+
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -3117,6 +3120,9 @@ pub struct CreateWorktreeRequest {
     pub base: BaseRevision,
     pub track: bool,
     pub operation_id: OperationId,
+    /// Exact setup choice retained through uncertain creation and restart.
+    #[serde(default)]
+    pub setup_intent: Option<WorktreeSetupIntent>,
 }
 
 /// User intent, resolved without creating directories or changing Git refs.
@@ -5708,6 +5714,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::DestinationOccupied.into());
         }
         Ok(CreateWorktreeRequest {
+            setup_intent: None,
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
@@ -6162,10 +6169,39 @@ impl GitFileLock {
         }
         let parent = index.parent().ok_or("Git reported no index parent")?;
         let parent = fs_safety::Root::open(parent).map_err(|error| error.to_string())?;
-        let mut name = index
-            .file_name()
-            .ok_or("Git reported no index name")?
-            .to_owned();
+        let name = index.file_name().ok_or("Git reported no index name")?;
+        Self::acquire_in(parent, name)
+    }
+
+    /// Lock an actual registered administrative directory already retained by
+    /// its common namespace, without reopening a mutable checkout locator.
+    pub(crate) fn acquire_beneath(parent: &fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        if !matches!(
+            (
+                Path::new(name).components().next(),
+                Path::new(name).components().count()
+            ),
+            (Some(std::path::Component::Normal(_)), 1)
+        ) {
+            return Err("Git lock name must be one ordinary component".into());
+        }
+        Self::acquire_in(parent.try_clone().map_err(|error| error.to_string())?, name)
+    }
+
+    /// Acquire through the same retained admin directory as the Git reader.
+    /// Share the canonical one-component guard and retained-root writer.
+    pub(crate) fn acquire_at(
+        parent: &fs_safety::Root,
+        index: &std::ffi::OsStr,
+    ) -> Result<Self, String> {
+        if Path::new(index).components().count() != 1 || index == "." || index == ".." {
+            return Err("Git reported an invalid index name".into());
+        }
+        Self::acquire_beneath(parent, index)
+    }
+
+    fn acquire_in(parent: fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        let mut name = name.to_owned();
         name.push(".lock");
         let (file, temporary) =
             fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;
@@ -6193,6 +6229,13 @@ impl GitFileLock {
             file,
             active: true,
         })
+    }
+
+    pub(crate) fn retained_identity(&self) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt;
+        self.owns_lock()?;
+        let metadata = self.file.metadata().map_err(|error| error.to_string())?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn version(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
@@ -7380,6 +7423,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: destination.clone(),
@@ -7410,6 +7454,7 @@ mod tests {
     fn tracking_is_configured_after_creation_from_the_validated_ref() {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: root.path().join("feature"),
@@ -9169,6 +9214,7 @@ mod tests {
         let managed = tempfile::tempdir().unwrap();
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
+                setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
                 destination: managed.path().join("feature"),
@@ -10781,6 +10827,54 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Resolve only the currently authorized invocation's checkout. Callers
+    /// still bind its physical marker to retained metadata before using it.
+    pub(crate) fn invocation_worktree(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let command = self.worktree_root_command(repository);
+        let output = self.run_checked(&command, cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout, "worktree_root"), &output)
+    }
+
+    /// A separate primary Git directory has no portable checkout backlink.
+    /// Read its explicit common-local worktree setting through this service's
+    /// existing executor; a linked-worktree invocation must not rediscover or
+    /// grant command authority to a foreign checkout just to resolve it.
+    pub(crate) fn configured_primary_worktree(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--path", "--get", "core.worktree"],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout, "primary_worktree"), &output)
+    }
+
+    pub(crate) fn uses_files_ref_storage(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--get", "extensions.refStorage"],
+        );
+        let output = self.run(&command, cancellation)?;
+        if output.exit_code == Some(1) {
+            return Ok(true);
+        }
+        if output.success {
+            return Ok(trim_one_line_ending(&output.stdout) == b"files");
+        }
+        Err(git_failure(&command, output).into())
+    }
+
     /// The canonical common directory of `repository`, the one a creation
     /// journal records and its identity is keyed by.
     pub fn common_dir(
@@ -11650,6 +11744,7 @@ mod worktree_journal_tests {
             .unwrap();
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
+                setup_intent: None,
                 repository,
                 managed_root: root.clone(),
                 destination: root.join("feature"),

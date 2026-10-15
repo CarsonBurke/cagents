@@ -75,10 +75,18 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
-        let owner = pending.as_ref().map(|pending| pending.owner.record.clone())
+        let owner = pending
+            .as_ref()
+            .map(|pending| pending.owner.record.clone())
             .or_else(|| receipt.as_ref().map(|(record, _)| record.clone()))
-            .map(Ok).unwrap_or_else(|| registry::evidence(&socket, Kind::Native)
-                .and_then(|record| record.ok_or_else(|| "No exact native holder or confirmed close receipt is available".to_owned())))?;
+            .map(Ok)
+            .unwrap_or_else(|| {
+                registry::evidence(&socket, Kind::Native).and_then(|record| {
+                    record.ok_or_else(|| {
+                        "No exact native holder or confirmed close receipt is available".to_owned()
+                    })
+                })
+            })?;
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
             retire_closed_execution(host, source, record, &proof)?;
@@ -233,9 +241,16 @@ fn preflight_current_retirements(
     owner: &registry::Record,
     proof: &HostSessionProof,
 ) -> Result<(), String> {
-    let Ok(store) = super::super::agent_execution::registry(host) else { return Ok(()); };
-    let sources = store.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_sources(caller.id)?;
-    if sources.is_empty() { return Ok(()); }
+    let Ok(store) = super::super::agent_execution::registry(host) else {
+        return Ok(());
+    };
+    let sources = store
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_sources(caller.id)?;
+    if sources.is_empty() {
+        return Ok(());
+    }
     let mut lineage = None;
     for retained in sources {
         let crate::agent_execution::HostedSession::Chat(current) = &retained else {
@@ -247,7 +262,9 @@ fn preflight_current_retirements(
             if lineage.is_none() {
                 let (recovery, _) = chat::native_holder::inspect(owner, proof)?;
                 if recovery.source != *caller && !recovery.previous_sources.contains(caller) {
-                    return Err("Native holder does not recognize this exact issued descriptor".into());
+                    return Err(
+                        "Native holder does not recognize this exact issued descriptor".into(),
+                    );
                 }
                 lineage = Some(recovery);
             }
@@ -256,7 +273,10 @@ fn preflight_current_retirements(
                 return Err("The current execution descriptor is not covered by this exact native holder lineage; no teardown was requested".into());
             }
         }
-        store.lock().unwrap_or_else(|p| p.into_inner()).preflight_agent_retirement(&retained)?;
+        store
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .preflight_agent_retirement(&retained)?;
     }
     Ok(())
 }
