@@ -161,7 +161,7 @@ impl Root {
         ))
     }
 
-    fn descriptor(&self) -> RawFd {
+    pub(crate) fn descriptor(&self) -> RawFd {
         self.directory.as_raw_fd()
     }
 }
@@ -393,6 +393,11 @@ pub fn open_parent_beneath(root: &Root, relative: &Path) -> Result<(Root, OsStri
     let parent: PathBuf = leading.iter().collect();
     let directory = resolve_directory(root, &parent)?;
     Ok((directory, name))
+}
+
+/// Opens one directory beneath the held root without following symlinks.
+pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, ResolveError> {
+    resolve_directory(root, relative)
 }
 
 /// Creates missing directory components without following symbolic links.

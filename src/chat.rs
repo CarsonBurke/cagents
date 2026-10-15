@@ -23,6 +23,12 @@ pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod skills;
 
+/// Whether answering a request with `action` turns its work down rather than
+/// authorizing it.
+pub(crate) fn declines(action: &str) -> bool {
+    matches!(action, "deny" | "decline" | "reject" | "cancel" | "abort")
+}
+
 /// Whether a provider-level failure requires the reader to renew the login.
 /// Only explicit authentication failures qualify: a bare HTTP 401 can describe
 /// a tool or service unrelated to the conversation's provider account.

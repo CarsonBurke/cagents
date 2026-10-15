@@ -6169,13 +6169,27 @@ impl GitFileLock {
         }
         let parent = index.parent().ok_or("Git reported no index parent")?;
         let parent = fs_safety::Root::open(parent).map_err(|error| error.to_string())?;
-        Self::acquire_at(
-            &parent,
-            index.file_name().ok_or("Git reported no index name")?,
-        )
+        let name = index.file_name().ok_or("Git reported no index name")?;
+        Self::acquire_in(parent, name)
+    }
+
+    /// Lock an actual registered administrative directory already retained by
+    /// its common namespace, without reopening a mutable checkout locator.
+    pub(crate) fn acquire_beneath(parent: &fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        if !matches!(
+            (
+                Path::new(name).components().next(),
+                Path::new(name).components().count()
+            ),
+            (Some(std::path::Component::Normal(_)), 1)
+        ) {
+            return Err("Git lock name must be one ordinary component".into());
+        }
+        Self::acquire_in(parent.try_clone().map_err(|error| error.to_string())?, name)
     }
 
     /// Acquire through the same retained admin directory as the Git reader.
+    /// Share the canonical one-component guard and retained-root writer.
     pub(crate) fn acquire_at(
         parent: &fs_safety::Root,
         index: &std::ffi::OsStr,
@@ -6183,8 +6197,11 @@ impl GitFileLock {
         if Path::new(index).components().count() != 1 || index == "." || index == ".." {
             return Err("Git reported an invalid index name".into());
         }
-        let parent = parent.try_clone().map_err(|error| error.to_string())?;
-        let mut name = index.to_owned();
+        Self::acquire_beneath(parent, index)
+    }
+
+    fn acquire_in(parent: fs_safety::Root, name: &OsStr) -> Result<Self, String> {
+        let mut name = name.to_owned();
         name.push(".lock");
         let (file, temporary) =
             fs_safety::create_temporary_in(&parent, 0o600).map_err(|error| error.to_string())?;
@@ -6212,6 +6229,13 @@ impl GitFileLock {
             file,
             active: true,
         })
+    }
+
+    pub(crate) fn retained_identity(&self) -> Result<(u64, u64), String> {
+        use std::os::unix::fs::MetadataExt;
+        self.owns_lock()?;
+        let metadata = self.file.metadata().map_err(|error| error.to_string())?;
+        Ok((metadata.dev(), metadata.ino()))
     }
 
     fn version(metadata: &fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
@@ -10803,6 +10827,54 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Resolve only the currently authorized invocation's checkout. Callers
+    /// still bind its physical marker to retained metadata before using it.
+    pub(crate) fn invocation_worktree(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let command = self.worktree_root_command(repository);
+        let output = self.run_checked(&command, cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout, "worktree_root"), &output)
+    }
+
+    /// A separate primary Git directory has no portable checkout backlink.
+    /// Read its explicit common-local worktree setting through this service's
+    /// existing executor; a linked-worktree invocation must not rediscover or
+    /// grant command authority to a foreign checkout just to resolve it.
+    pub(crate) fn configured_primary_worktree(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<PathBuf, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--path", "--get", "core.worktree"],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        attach_repository_process(parse_path_line(&output.stdout, "primary_worktree"), &output)
+    }
+
+    pub(crate) fn uses_files_ref_storage(
+        &self,
+        repository: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let command = self.git_read(
+            repository,
+            ["config", "--local", "--get", "extensions.refStorage"],
+        );
+        let output = self.run(&command, cancellation)?;
+        if output.exit_code == Some(1) {
+            return Ok(true);
+        }
+        if output.success {
+            return Ok(trim_one_line_ending(&output.stdout) == b"files");
+        }
+        Err(git_failure(&command, output).into())
+    }
+
     /// The canonical common directory of `repository`, the one a creation
     /// journal records and its identity is keyed by.
     pub fn common_dir(

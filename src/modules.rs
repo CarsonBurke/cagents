@@ -69,6 +69,7 @@ pub mod instance;
 pub mod interaction;
 #[cfg(feature = "latency-harness")]
 pub mod latency_fixture;
+pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
 pub mod linear;
@@ -97,7 +98,6 @@ mod selected_file_path;
 mod separator;
 #[cfg(feature = "ui")]
 pub mod session;
-#[cfg(feature = "ui")]
 pub mod settings;
 #[cfg(feature = "ui")]
 pub mod settings_widgets;
@@ -120,6 +120,7 @@ pub mod tray;
 pub mod ui_controls;
 pub mod update;
 pub mod upgrade;
+pub mod worktree_branch;
 pub mod worktree_cleanup;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod worktree_setup;

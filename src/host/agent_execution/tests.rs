@@ -78,7 +78,17 @@ while IFS= read -r frame; do
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
       ;;
     *'"type":"control_response"'*)
-      # The answer to a permission request raised below finishes its turn.
+      # The answer to a permission request raised below finishes its turn;
+      # a background one is only recorded, since its turn already ended.
+      case "$frame" in
+        *'"background-'*)
+          case "$frame" in
+            *'"behavior":"allow"'*) printf 'allow\n' >> "$HOME/../decisions" ;;
+            *) printf 'deny\n' >> "$HOME/../decisions" ;;
+          esac
+          continue
+          ;;
+      esac
       case "$frame" in
         *'"behavior":"allow"'*) printf 'allow\n' >> "$HOME/../decisions" ;;
         *) printf 'deny\n' >> "$HOME/../decisions" ;;
@@ -89,6 +99,12 @@ while IFS= read -r frame; do
     *'"type":"user"'*)
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
+      case "$frame" in
+        *BACKGROUND_PERMISSION*)
+          # A background subagent asks, then the main turn ends without it.
+          printf '{"type":"control_request","request_id":"background-%s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-%s","input":{"command":"true"}}}\n' "$n" "$n"
+          ;;
+      esac
       case "$frame" in
         *ASK_PERMISSION*)
           printf '{"type":"control_request","request_id":"permission-%s","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-%s","input":{"command":"true"}}}\n' "$n" "$n"
@@ -1922,6 +1938,265 @@ fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+#[test]
+fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it() {
+    if isolated("an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approve_it")
+        .is_some()
+    {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let owner = Authority::default();
+    request.prompt = "BACKGROUND_PERMISSION while the turn ends".into();
+    let accepted = submit(&host, &owner, request).unwrap();
+    let agent = accepted.agent.id;
+    let control = |command| -> Result<Vec<chat::Request>, String> {
+        match process(&host, owner.clone(), Operation::Control { agent, command })? {
+            Reply::Requests(requests) => Ok(requests),
+            reply => panic!("{reply:?}"),
+        }
+    };
+    let answer = |request_id: &str, action: &str| Control::Answer {
+        request_id: request_id.into(),
+        action: action.into(),
+        answers: Vec::new(),
+    };
+    let asked = pending_requests(&host, agent);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}")
+    };
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    assert_eq!(
+        pending_requests(&host, agent).len(),
+        1,
+        "the decision outlives the turn"
+    );
+
+    for refused in [
+        answer(&asked.id, "allow"),
+        Control::Interrupt {
+            including_subagents: true,
+        },
+    ] {
+        let error = control(refused).unwrap_err();
+        assert!(error.contains("no active run"), "{error}");
+    }
+    let root = path.parent().unwrap();
+    assert!(!root.join("decisions").exists(), "nothing was approved");
+
+    assert!(control(answer(&asked.id, "deny")).unwrap().is_empty());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while std::fs::read_to_string(root.join("decisions")).unwrap_or_default() != "deny\n" {
+        assert!(
+            Instant::now() < deadline,
+            "the denial never reached the provider"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    // Resolved, the session is idle again and takes its owner's next prompt.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(
+        process(&host, owner.clone(), Operation::Requests(agent)),
+        Ok(Reply::Requests(requests)) if requests.is_empty()
+    ) {
+        assert!(Instant::now() < deadline, "the request was never resolved");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let followup = submit(
+        &host,
+        &owner,
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent),
+            prompt: "after the denial".into(),
+            idempotency_key: "after-denial".into(),
+        },
+    )
+    .unwrap();
+    let after = settled(&host, followup.run.id);
+    assert_eq!(after.state, State::Succeeded, "{after:?}");
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap(),
+        "the owner keeps the agent"
+    );
+}
+
+#[test]
+fn a_late_between_turn_interrupt_ack_cannot_cancel_the_next_owned_run() {
+    if isolated("a_late_between_turn_interrupt_ack_cannot_cancel_the_next_owned_run").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    // A real private provider process withholds the idle interrupt response
+    // until the next prompt has returned its result and awaits its own ACK.
+    std::fs::write(root.join("bin/claude"), r#"#!/bin/sh
+set -eu
+printf 'spawn\n' >> "$HOME/../spawns"
+n=0
+old=
+current=
+while IFS= read -r frame; do
+  case "$frame" in
+    *'"type":"control_request"'*)
+      id=${frame#*'"request_id":"'}; id=${id%%'"'*}
+      case "$frame" in
+        *'"subtype":"interrupt"'*)
+          if [ -z "$old" ]; then
+            old=$id
+            printf 'received\n' > "$HOME/../idle-interrupt"
+          else
+            current=$id
+            printf '{"type":"result","uuid":"next-result","is_error":false}\n'
+            printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$old"
+            # Observing this request proves the reader consumed the preceding
+            # result and stale ACK; a filesystem marker alone would not.
+            printf '{"type":"control_request","request_id":"ack-barrier","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"barrier","input":{"command":"true"}}}\n'
+          fi
+          ;;
+        *) printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id" ;;
+      esac
+      ;;
+    *'"type":"control_response"'*)
+      case "$frame" in
+        *'"ack-barrier"'*)
+          printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"already settled"}}\n' "$current"
+          ;;
+      esac
+      ;;
+    *'"type":"user"'*)
+      n=$((n + 1))
+      if [ "$n" -eq 1 ]; then
+        printf '{"type":"control_request","request_id":"background-first","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"first","input":{"command":"true"}}}\n'
+        printf '{"type":"result","uuid":"first-result","is_error":false}\n'
+      else
+        printf 'started\n' > "$HOME/../next-prompt"
+      fi
+      ;;
+  esac
+done
+"#).unwrap();
+    let owner = Authority::default();
+    let accepted = submit(&host, &owner, request).unwrap();
+    let agent = accepted.agent.id;
+    assert_eq!(pending_requests(&host, agent)[0].id, "background-first");
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let (record, _) = status(&host, &owner, agent).unwrap();
+    let original_session = record.session.clone();
+    let handle = host
+        .lock()
+        .unwrap()
+        .chats
+        .get(&record.session.as_ref().unwrap().id())
+        .unwrap()
+        .handle
+        .clone();
+    // The native provider controls can interrupt background work between
+    // managed turns. The owner API correctly refuses general idle interrupts.
+    handle.command(Command::Interrupt).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.join("idle-interrupt").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the provider never received the idle interrupt"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let answer = |request_id: &str| Control::Answer {
+        request_id: request_id.into(),
+        action: "deny".into(),
+        answers: vec![],
+    };
+    process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: answer("background-first"),
+        },
+    )
+    .unwrap();
+    assert!(
+        handle.requests().is_empty(),
+        "the settled decision must retire before the next prompt"
+    );
+    let followup = submit(
+        &host,
+        &owner,
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent),
+            prompt: "next owned prompt".into(),
+            idempotency_key: "next-after-idle-interrupt".into(),
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.join("next-prompt").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the provider never received the next prompt"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: Control::Interrupt {
+                including_subagents: false,
+            },
+        },
+    )
+    .unwrap();
+    let barrier = pending_requests(&host, agent);
+    assert_eq!(barrier[0].id, "ack-barrier");
+    let (_, waiting) = status(&host, &owner, agent).unwrap();
+    assert_eq!(waiting.id, followup.run.id);
+    assert!(
+        !waiting.state.is_terminal(),
+        "the stale ACK settled the next run: {waiting:?}"
+    );
+    process(
+        &host,
+        owner.clone(),
+        Operation::Control {
+            agent,
+            command: answer("ack-barrier"),
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let record = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(agent)
+        .unwrap();
+    assert_eq!(record.session, original_session);
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(agent)
+            .unwrap()
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("spawns")).unwrap(),
+        "spawn\n"
+    );
+    assert!(close(&host, &owner, agent).unwrap().closed);
 }
 
 #[test]
