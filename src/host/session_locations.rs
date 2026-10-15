@@ -321,7 +321,7 @@ pub(super) fn relocate(
     }
     {
         let gate=super::client::control_gate(host);
-        let _exclusive=gate.write().unwrap_or_else(|p|p.into_inner());
+        let _exclusive=super::client::try_scoped_control_write(&gate)?;
         super::client::ensure_control_open(host)?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         for item in &prepared {

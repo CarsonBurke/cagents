@@ -2,7 +2,7 @@ use std::{
     io::{self, Read},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockWriteGuard, TryLockError},
     thread,
     time::{Duration, Instant},
 };
@@ -309,6 +309,21 @@ pub(super) fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
 }
 
+/// A scoped mutation must never enqueue a writer behind slow admitted work:
+/// writer-preferring RwLocks would then also block unrelated Input readers.
+/// Keep global upgrade/shutdown on their intentional blocking barrier.
+pub(super) fn try_scoped_control_write(gate: &RwLock<()>) -> Result<RwLockWriteGuard<'_, ()>, ProtocolError> {
+    match gate.try_write() {
+        Ok(guard) => Ok(guard),
+        Err(TryLockError::Poisoned(poisoned)) => Ok(poisoned.into_inner()),
+        Err(TryLockError::WouldBlock) => Err(ProtocolError::new(
+            ProtocolErrorCode::Internal,
+            "The daemon is busy finishing another operation. Try this operation again after it settles.",
+            true,
+        )),
+    }
+}
+
 pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
     if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
         return Err(ProtocolError::new(
@@ -351,7 +366,7 @@ pub(super) fn process_request(
     let gate = control_gate(host);
     if let ClientRequest::CloseProjectGuarded { project, sessions } = &request {
         let reservation = {
-            let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+            let _admission = try_scoped_control_write(&gate)?;
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
             super::project_removal::reserve(host, project, sessions)?
@@ -370,7 +385,7 @@ pub(super) fn process_request(
         edit: crate::workspace_model::ModelEdit::RelocateProject { project, relocation },
     } = &request {
         let reservation = {
-            let _exclusive=gate.write().unwrap_or_else(|p|p.into_inner());
+            let _exclusive=try_scoped_control_write(&gate)?;
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
             super::project_removal::admit(host, &request)?;
@@ -402,7 +417,7 @@ pub(super) fn process_request(
         };
         let removed = match prepared {
             Ok(prepared) => {
-                let _exclusive = gate.write().unwrap_or_else(|p| p.into_inner());
+                let _exclusive = try_scoped_control_write(&gate)?;
                 ensure_control_open(host)?;
                 super::project_removal::ensure_available(
                     host,
@@ -428,15 +443,18 @@ pub(super) fn process_request(
             false,
         ));
     }
-    // Inventory decisions and commit must wait for all previously admitted
-    // effects, including provider closes that finish outside HostState.
-    let exclusive = matches!(
+    // Only explicit global upgrade/shutdown may wait behind every admitted
+    // effect. Scoped transitions refuse instead of blocking later Input.
+    let global_exclusive = matches!(
         &request,
         ClientRequest::PrepareUpgrade { .. }
             | ClientRequest::PrepareConfirmedUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
-            | ClientRequest::ChatReturnTerminal { .. }
+    );
+    let scoped_exclusive = matches!(
+        &request,
+        ClientRequest::ChatReturnTerminal { .. }
             | ClientRequest::ChatRecoverAccount {
                 idle_generation: Some(_),
                 ..
@@ -445,8 +463,14 @@ pub(super) fn process_request(
                 operation: crate::device_service::Operation::AccountLifecycle { .. }
             }
     );
-    let _exclusive = exclusive.then(|| gate.write().unwrap_or_else(|p| p.into_inner()));
-    let _shared = (!exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
+    let _exclusive = if global_exclusive {
+        Some(gate.write().unwrap_or_else(|p| p.into_inner()))
+    } else if scoped_exclusive {
+        Some(try_scoped_control_write(&gate)?)
+    } else {
+        None
+    };
+    let _shared = (!global_exclusive && !scoped_exclusive).then(|| gate.read().unwrap_or_else(|p| p.into_inner()));
     ensure_control_open(host)?;
     super::agent_execution::terminals::admit(host, client_id, &request)?;
     super::project_removal::admit(host, &request)?;

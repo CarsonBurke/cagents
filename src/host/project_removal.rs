@@ -275,7 +275,7 @@ pub(super) fn remove(
             _ => unreachable!("preflight retained the selected source kind"),
         }
     }
-    let _commit = gate.write().unwrap_or_else(|p| p.into_inner());
+    let _commit = super::client::try_scoped_control_write(&gate)?;
     super::client::ensure_control_open(host)?;
     // No related work can pass admission until this guarded atomic edit ends.
     // Remove only our exact lease; all other active reservations still apply.
@@ -487,6 +487,18 @@ mod tests {
 
     #[test]
     fn slow_project_teardown_keeps_unrelated_input_responsive_and_releases_reservation() {
+        const STAGE: &str="CAGENTS_SCOPED_WRITER_INPUT_CHILD";
+        if std::env::var_os(STAGE).is_none() {
+            let runtime=tempfile::tempdir().unwrap();
+            for name in ["data","config"] {std::fs::create_dir(runtime.path().join(name)).unwrap();}
+            let output=std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","host::project_removal::tests::slow_project_teardown_keeps_unrelated_input_responsive_and_releases_reservation","--nocapture","--test-threads=1"])
+                .env(STAGE,"1").env("XDG_RUNTIME_DIR",runtime.path())
+                .env("XDG_DATA_HOME",runtime.path().join("data")).env("XDG_CONFIG_HOME",runtime.path().join("config"))
+                .output().unwrap();
+            assert!(output.status.success(),"isolated scoped-writer fixture failed: {}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{
@@ -507,7 +519,7 @@ mod tests {
             fn command(&mut self, _: Command) -> Result<Step, String> {
                 self.entered.send(()).unwrap();
                 self.release
-                    .recv_timeout(Duration::from_secs(5))
+                    .recv_timeout(Duration::from_secs(10))
                     .map_err(|error| error.to_string())?;
                 Ok(Step::default())
             }
@@ -525,6 +537,67 @@ mod tests {
         let unrelated_dir = fixture._directory.path().join("unrelated");
         std::fs::create_dir(&unrelated_dir).unwrap();
         let unrelated = fixture.spawn_at(crate::model::TerminalId::new(), &unrelated_dir);
+        let unrelated_project={
+            let mut state=fixture.host.lock().unwrap();
+            let model=state.edit_model(1,ModelEdit::OpenProject{repository:unrelated_dir.clone(),checkout:None,primary_checkout:None,name:"Other".into(),kind:ProjectKind::Folder}).unwrap();
+            ProjectInstance{registry:model.identity,repository:unrelated_dir.clone(),ordinal:model.project(&unrelated_dir).unwrap().ordinal}
+        };
+        // Use actual framed connections, not a direct helper call, for both
+        // the scoped writer attempt and the subsequent unrelated Input.
+        struct Framed {
+            stream: std::os::unix::net::UnixStream,
+            server: Option<thread::JoinHandle<()>>,
+            proof: HostSessionProof,
+            next: u64,
+        }
+        impl Drop for Framed {
+            fn drop(&mut self) {
+                let _=self.stream.shutdown(std::net::Shutdown::Both);
+                if let Some(server)=self.server.take() {let _=server.join();}
+            }
+        }
+        impl Framed {
+            fn new(host: &SharedHost, id: u64) -> Self {
+                let proof=host.lock().unwrap().proof().clone();
+                let (stream,peer)=std::os::unix::net::UnixStream::pair().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+                let host=host.clone();let server=thread::spawn(move||super::super::client::serve(peer,id,host));
+                let mut client=Self{stream,server:Some(server),proof:proof.clone(),next:1};
+                assert!(matches!(client.exchange(ClientRequest::Connect{expected_host:Some(proof),resume:Vec::new()}),ServerMessage::Response{response:ServerResponse::Connected{..}}));
+                client
+            }
+            fn exchange(&mut self, request: ClientRequest) -> ServerMessage {
+                use crate::terminal_ipc::{ClientEnvelope,FrameCodec,ServerEnvelope,MAX_CLIENT_FRAME_BYTES,MAX_FRAME_BYTES,PROTOCOL_VERSION};
+                let request_id=self.next;self.next+=1;
+                FrameCodec::new(MAX_CLIENT_FRAME_BYTES).write(&mut self.stream,&ClientEnvelope{version:PROTOCOL_VERSION,request_id,proof:Some(self.proof.clone()),request}).unwrap();
+                let mut codec=FrameCodec::new(MAX_FRAME_BYTES);
+                loop {
+                    let envelope:ServerEnvelope=codec.read(&mut self.stream).expect("framed request must finish before held provider is released").unwrap();
+                    assert_eq!(envelope.proof,self.proof);
+                    if envelope.request_id==Some(request_id) {return envelope.message;}
+                }
+            }
+        }
+        let mut writer=Framed::new(&fixture.host,2);
+        let mut framed_input=Framed::new(&fixture.host,3);
+        assert!(matches!(framed_input.exchange(ClientRequest::Attach{terminal_id:unrelated.source.id(),after_generation:0,after_event_sequence:0}),ServerMessage::Response{response:ServerResponse::Attached{..}}));
+        let (locate_project,remove_project)={
+            let mut state=fixture.host.lock().unwrap();
+            let mut projects=Vec::new();
+            for name in ["locate-final","remove-final"] {
+                let root=fixture._directory.path().join(name);std::fs::create_dir(&root).unwrap();
+                let model=state.edit_model(1,ModelEdit::OpenProject{repository:root.clone(),checkout:None,primary_checkout:None,name:name.into(),kind:ProjectKind::Folder}).unwrap();
+                projects.push(ProjectInstance{registry:model.identity,repository:root.clone(),ordinal:model.project(&root).unwrap().ordinal});
+            }
+            (projects.remove(0),projects.remove(0))
+        };
+        let same_location=crate::project_recovery::Relocation{repository:locate_project.repository.clone(),destination:locate_project.repository.clone(),old_root:locate_project.repository.clone(),new_root:locate_project.repository.clone()};
+        let (locate_lease,remove_lease)={
+            let gate=super::super::client::control_gate(&fixture.host);
+            let _admission=super::super::client::try_scoped_control_write(&gate).unwrap();
+            (reserve_relocation(&fixture.host,&locate_project,&same_location).unwrap(),reserve(&fixture.host,&remove_project,&[]).unwrap())
+        };
         let mut recipe = LaunchRecipe::shell(fixture.root.clone()).unwrap();
         recipe.program = "/bin/cat".into();
         recipe.arguments.clear();
@@ -579,6 +652,7 @@ mod tests {
             );
             session
         };
+        let admitted_session = session.clone();
         let actor = handle.clone();
         let command = thread::spawn(move || actor.command(Command::Interrupt));
         pending.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -611,7 +685,7 @@ mod tests {
             .project_removals
             .lock()
             .unwrap()
-            .is_empty()
+            .len() < 3
         {
             assert!(Instant::now() < deadline, "scoped removal was not admitted");
             thread::yield_now();
@@ -620,6 +694,45 @@ mod tests {
             closing.recv_timeout(Duration::from_millis(50)).is_err(),
             "provider remains blocked until explicitly released"
         );
+        // The reservation is published before census. Wait for its actual
+        // teardown reader, so the attempted writer cannot slip in beforehand.
+        let gate=super::super::client::control_gate(&fixture.host);
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop {
+            match gate.try_write() {
+                Ok(guard)=>drop(guard),
+                Err(std::sync::TryLockError::WouldBlock)=>break,
+                Err(std::sync::TryLockError::Poisoned(_))=>panic!("fixture admission gate poisoned"),
+            }
+            assert!(Instant::now()<deadline,"actual teardown never held shared admission");
+            thread::yield_now();
+        }
+        for request in [
+            ClientRequest::CloseProjectGuarded{project:unrelated_project.clone(),sessions:vec![unrelated.clone()]},
+            ClientRequest::EditWorkspaceModel{edit:ModelEdit::RelocateProject{project:unrelated_project.clone(),relocation:crate::project_recovery::Relocation{repository:unrelated_dir.clone(),destination:unrelated_dir.clone(),old_root:unrelated_dir.clone(),new_root:unrelated_dir.clone()}}},
+            ClientRequest::ChatReturnTerminal{chat_id:admitted_session.id},
+            ClientRequest::ChatRecoverAccount{source:admitted_session.clone(),replacement:admitted_session.clone(),idle_generation:Some(1),execution_environment:Default::default()},
+            ClientRequest::DeviceOperation{operation:crate::device_service::Operation::AccountLifecycle{operation:crate::account::remote::Operation::Create{provider:Provider::Claude,copy_codex_config:false}}},
+        ] {
+            let ServerMessage::Error(error)=writer.exchange(request) else {panic!("scoped writer must refuse before effects while teardown is held");};
+            assert!(error.retryable && error.message.contains("busy"),"{error:?}");
+        }
+        // Both final scoped writer phases also refuse without enqueuing a
+        // writer. Their exact reservations were acquired before teardown began.
+        let error=super::super::session_locations::relocate(&fixture.host,2,locate_project.clone(),same_location).unwrap_err();
+        assert!(error.retryable && error.message.contains("busy"),"{error:?}");
+        let error=remove(&fixture.host,2,remove_project.clone(),Vec::new(),&remove_lease).unwrap_err();
+        assert!(error.retryable && error.message.contains("busy"),"{error:?}");
+        drop(locate_lease);drop(remove_lease);
+        assert!(matches!(framed_input.exchange(ClientRequest::Input{terminal_id:unrelated.source.id(),bytes:b"after writer attempt\n".to_vec()}),ServerMessage::Response{response:ServerResponse::Accepted}));
+        assert!(closing.try_recv().is_err(),"Input must complete while original provider is still held");
+        assert!(!fixture.handles[0].is_completed(),"busy writer cannot close the unrelated selected worker");
+        {
+            let mut state=fixture.host.lock().unwrap();
+            assert_eq!(state.project_removals.lock().unwrap().len(),1,"refused writer cannot leave another reservation");
+            let model=state.read_model().unwrap();
+            for project in [&unrelated_project,&locate_project,&remove_project] {assert!(model.project(&project.repository).is_some(),"busy final phase must preserve original project row");}
+        }
         let host = fixture.host.clone();
         let unrelated_id = unrelated.source.id();
         let (answered, answering) = crossbeam_channel::bounded(1);
