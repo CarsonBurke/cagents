@@ -561,3 +561,19 @@ mod cache_fence_tests {
         assert!(store.lock().unwrap().window().unwrap().raw_source_parts.is_empty(),"ambiguous original must not be advertised");
     }
 }
+
+#[cfg(test)]
+mod descriptor_budget_tests {
+    use super::*;
+    #[test]
+    fn every_normal_command_in_a_full_window_has_both_original_descriptors(){
+        let mut store=Store::new().unwrap();
+        for index in 0..WINDOW_ITEMS{
+            let id=format!("command-{index}");let command=RawCommandCall{label:String::new(),command:"echo actual".into(),working_directory:"/tmp".into(),action:crate::chat::CommandAction::Run};
+            store.apply(Event::RawToolCapture(RawToolCapture::Full{source:key("",&id),name:"Bash".into(),input:"{\"command\":\"echo actual\"}".into(),command:Some(command.clone())})).unwrap();
+            store.apply(Event::Item(Item{id,role:Role::Assistant,started_at:None,at:None,content:ItemContent::Command{label:command.label,command:command.command,working_directory:command.working_directory,action:command.action,status:crate::chat::ToolStatus::Succeeded,exit_code:Some(0),duration_ms:Some(1),output:String::new()}})).unwrap();
+        }
+        let window=store.window().unwrap();assert_eq!(window.items.len(),WINDOW_ITEMS);assert_eq!(window.raw_source_parts.len(),WINDOW_ITEMS*2);
+        for item in &window.items{for field in [RawSourceField::ToolInput,RawSourceField::CommandCall]{assert!(window.raw_source_parts.iter().any(|part|part.item_id==item.id&&part.field==field));}}
+    }
+}

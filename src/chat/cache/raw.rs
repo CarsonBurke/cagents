@@ -5,7 +5,8 @@ use super::{SourceEpoch, SourceKey};
 use serde::{Deserialize, Serialize};
 
 pub const RAW_SOURCE_BYTES: usize = 64 * 1024 * 1024;
-pub const RAW_PARTS: usize = 128;
+/// Two independently readable fields for each of the128 resident parent items.
+pub const RAW_PARTS: usize = 256;
 pub const RAW_PART_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
