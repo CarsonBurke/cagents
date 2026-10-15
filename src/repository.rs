@@ -4958,6 +4958,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Ok(None);
         }
         let Some(oid) = self.resolve_optional_revision(&request.worktree, query, cancellation)? else { return Ok(None); };
+        if !oid.as_str().starts_with(query) { return Ok(None); }
         let pinned = HistoryRequest { revision: HistoryRevision::Object { oid }, page: 0, ..request.clone() };
         Ok(self.history(&pinned, cancellation)?.into_iter().next().filter(|commit| history_matches(commit, query)))
     }
@@ -8695,6 +8696,9 @@ mod tests {
             let service = service();
             let cancel = CancellationToken::new();
             let source = service.resolve_head(&root, &cancel).unwrap().unwrap();
+            let source_request = HistoryRequest { worktree: root.clone(), revision: HistoryRevision::Head, page: 0, path: None };
+            assert_eq!(service.filtered_history(&source_request, source.as_str(), &cancel).unwrap().len(), 1,
+                "a direct SHA lookup must not duplicate its normal HEAD-history match");
             git(&root, &["worktree", "add", target.to_str().unwrap(), "target"]);
             fs::write(target.join("target-only.txt"), "preserve target\n").unwrap();
             git(&target, &["add", "."]);
