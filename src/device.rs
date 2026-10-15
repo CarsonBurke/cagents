@@ -1179,9 +1179,12 @@ mod tests {
             let forwarding=Forwarding::start(child,server,Some(transport.clone())).unwrap();
             let device=transport.device.clone();
             let worker=thread::spawn(move ||forwarding.finish(&device));
-            let mut output=Vec::new();client.read_to_end(&mut output).unwrap();
-            assert_eq!(transport.daemon_missing.load(std::sync::atomic::Ordering::Acquire),missing,"EOF must observe the settled remote receipt");
-            worker.join().unwrap().unwrap();
+            let mut output=Vec::new();let read=client.read_to_end(&mut output);
+            let observed=transport.daemon_missing.load(std::sync::atomic::Ordering::Acquire);
+            let settled=worker.join();
+            read.unwrap();
+            settled.unwrap().unwrap();
+            assert_eq!(observed,missing,"EOF must observe the settled remote receipt");
         }
     }
 
