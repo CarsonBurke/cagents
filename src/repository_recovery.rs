@@ -13,6 +13,12 @@ use std::{
 #[path = "repository/recovery_publication.rs"]
 mod publication;
 
+// Original preimage proofs only. Native Trash transport, move authorization
+// and publication remain separate; this module enables no desktop effects.
+#[cfg(target_os = "linux")]
+#[path = "repository/native_trash_preimage.rs"]
+mod native_preimage;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SavedEntry {
     Absent,

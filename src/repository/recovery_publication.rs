@@ -266,7 +266,7 @@ impl Holding {
     }
 }
 
-fn full_version(metadata: &fs::Metadata) -> ((u64, u64, u64, i64, i64, i64, i64), u32, u32, u32) {
+pub(super) fn full_version(metadata: &fs::Metadata) -> ((u64, u64, u64, i64, i64, i64, i64), u32, u32, u32) {
     (
         metadata_version(metadata),
         metadata.mode(),
@@ -275,7 +275,7 @@ fn full_version(metadata: &fs::Metadata) -> ((u64, u64, u64, i64, i64, i64, i64)
     )
 }
 
-fn digest_file(
+pub(super) fn digest_file(
     file: &fs::File,
     length: u64,
     cancellation: &CancellationToken,
@@ -309,7 +309,7 @@ fn digest_file(
 }
 
 #[cfg(target_os = "linux")]
-fn pin_symlink(root: &fs_safety::Root, name: &Path) -> Result<fs::File, String> {
+pub(super) fn pin_symlink(root: &fs_safety::Root, name: &Path) -> Result<fs::File, String> {
     use std::os::fd::FromRawFd;
     if name.components().count() != 1 || name.file_name() != Some(name.as_os_str()) {
         return Err("Undo metadata pin requires one private leaf".into());
