@@ -9400,6 +9400,7 @@ mod tests {
             Some('x'),
         ));
         assert_eq!(worker.terminal.scrollbar().unwrap().offset, 0);
+        assert!(worker.unacknowledged_input, "failed user writes protect close without falsely following input");
         worker.published.request_shutdown();
         worker.run();
     }
