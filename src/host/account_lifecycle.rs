@@ -229,6 +229,7 @@ pub(crate) struct Reservation {
     map: Reservations,
     token: uuid::Uuid,
     homes: Vec<Home>,
+    accounts: Vec<Account>,
     /// Only relevant registrations, not the global revision: unrelated edits
     /// must be preserved while a provider is taking time to sign out.
     registered: Vec<(
@@ -349,6 +350,7 @@ impl Reservation {
             map,
             token,
             homes,
+            accounts: accounts.to_vec(),
             registered,
         };
         // No effects have happened. Refuse any filesystem/registration change
@@ -357,6 +359,18 @@ impl Reservation {
         reservation.verify().map_err(refusal)?;
         for home in &project_homes { home.verify().map_err(refusal)?; }
         Ok(reservation)
+    }
+
+    /// Match the exact request operand/provider/key captured by this host
+    /// reservation. The original alias must still name its pinned directory;
+    /// return the captured canonical operand, never resolve a new request path.
+    pub(crate) fn link_home(&self, provider: crate::agent::Provider, key: uuid::Uuid, operand: &Path) -> Result<PathBuf, String> {
+        let home = self.accounts.iter().zip(&self.homes).find_map(|(account, home)| {
+            (account.provider == provider && matches!(&account.home,
+                crate::account::AccountHome::Linked { key: captured, path } if *captured == key && path == operand)).then_some(home)
+        }).ok_or("The linked account operand does not match its physical reservation")?;
+        home.verify()?;
+        Ok(home.canonical.clone())
     }
 
     /// The immutable physical token outlives validation and registry effects.
@@ -1013,6 +1027,76 @@ exit 0
         let unrelated = Reservation::install(&host, &[Account::linked(Provider::Claude, uuid::Uuid::new_v4(), foreign)]).unwrap();
         drop(unrelated); drop(project_reservation);
         Reservation::install(&host, &[related]).unwrap();
+    }
+
+    #[test]
+    fn account_admission_link_keeps_original_alias_and_never_registers_replacement_home() {
+        let Some(root) = isolated("account_admission_link_keeps_original_alias_and_never_registers_replacement_home") else { return; };
+        let a = root.join("home-a"); let b = root.join("home-b");
+        std::fs::create_dir(&a).unwrap(); std::fs::create_dir(&b).unwrap();
+        std::fs::write(b.join("keep"), b"foreign-home").unwrap();
+        let alias = root.join("link-operand"); std::os::unix::fs::symlink(&a, &alias).unwrap();
+        let host = host(); let key = uuid::Uuid::new_v4();
+        let operation = crate::account::remote::Operation::Link { provider: Provider::Claude, key, path: alias.display().to_string() };
+        let accounts = crate::account::remote::affected_accounts(&operation).unwrap();
+        assert_eq!(accounts[0].resolved_home().unwrap(), alias, "preflight retains the original spelling");
+        let reservation = Reservation::install(&host, &accounts).unwrap();
+        let foreign = Reservation::install(&host, &[Account::linked(Provider::Claude, uuid::Uuid::new_v4(), b.clone())]).unwrap();
+        let next_alias = root.join("redirect"); std::os::unix::fs::symlink(&b, &next_alias).unwrap();
+        std::fs::rename(&next_alias, &alias).unwrap();
+        let error = crate::account::remote::execute_reserved(operation.clone(), &reservation).unwrap_err();
+        assert!(error.contains("account home changed"), "{error}");
+        assert!(Store::installation().unwrap().load().unwrap().find(key).is_none());
+        assert_eq!(std::fs::read(b.join("keep")).unwrap(), b"foreign-home");
+        assert!(ensure_paths(&host, [b]).is_err(), "foreign reservation survives refusal");
+        std::os::unix::fs::symlink(&a, &next_alias).unwrap(); std::fs::rename(&next_alias, &alias).unwrap();
+        assert!(reservation.link_home(Provider::Codex, key, &alias).is_err());
+        assert!(reservation.link_home(Provider::Claude, uuid::Uuid::new_v4(), &alias).is_err());
+        crate::account::remote::execute_reserved(operation, &reservation).unwrap();
+        assert_eq!(Store::installation().unwrap().load().unwrap().find(key).unwrap().linked_home.as_ref(), Some(&a.canonicalize().unwrap()));
+        drop(foreign); drop(reservation);
+    }
+
+    #[test]
+    fn account_admission_register_rechecks_original_system_home_before_secondary_probe() {
+        let Some(root) = isolated("account_admission_register_rechecks_original_system_home_before_secondary_probe") else { return; };
+        let system = root.join("home/.claude"); std::fs::create_dir(&system).unwrap();
+        let cli = root.join("bin/claude");
+        std::fs::write(&cli, r#"#!/bin/sh
+if [ "$CLAUDE_CONFIG_DIR" = "$HOME/.claude" ]; then : > "$HOME/system-probe-started"; fi
+if [ "$1" = auth ]; then
+ : > "$CLAUDE_CONFIG_DIR/probe-started"
+ while [ -f "$CLAUDE_CONFIG_DIR/probe-hold" ]; do /bin/sleep 0.01; done
+ printf '%s\n' '{"loggedIn":true,"email":"pending@fixture.invalid","subscriptionType":"max"}'
+ exit 0
+fi
+IFS= read -r init
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"cagents-usage-initialize","response":{"models":[]}}}'
+IFS= read -r usage
+printf '%s\n' '{"type":"control_response","response":{"subtype":"success","request_id":"cagents-usage","response":{"subscription_type":"max","rate_limits":{"limits":[{"kind":"session","group":"session","percent":25,"resets_at":null,"is_active":true}]}}}}'
+"#).unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let shell_path = format!("export PATH='{}:/usr/bin:/bin'\n", root.join("bin").display());
+        for name in [".bashrc", ".zshrc"] { std::fs::write(root.join("home").join(name), &shell_path).unwrap(); }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let search = runtime.block_on(crate::account::probe::search_path());
+        assert_eq!(crate::account::probe::find_executable("claude", search.as_deref()), Some(cli), "Never invoke an installed provider");
+        let homes = crate::account::home::Homes::installation().unwrap(); let store = Store::installation().unwrap();
+        let (key, home) = store.create_pending(&homes, Provider::Claude, 1, || homes.create(Provider::Claude, None)).unwrap();
+        let hold = home.join("probe-hold"); std::fs::write(&hold, "").unwrap();
+        struct Release(PathBuf); impl Drop for Release { fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); } }
+        let release = Release(hold); let host = host(); let worker_host = host.clone();
+        let worker = std::thread::spawn(move || lifecycle(&worker_host, crate::account::remote::Operation::Register { provider: Provider::Claude, key }));
+        wait_file(&home.join("probe-started"));
+        let original = root.join("original-system"); std::fs::rename(&system, &original).unwrap(); std::fs::create_dir(&system).unwrap();
+        std::fs::write(system.join("keep"), b"replacement").unwrap();
+        drop(release);
+        let error = worker.join().unwrap().unwrap_err().message;
+        assert!(error.contains("replaced"), "{error}");
+        assert!(!root.join("home/system-probe-started").exists(), "replacement System home must never reach either secondary provider read");
+        assert!(store.load().unwrap().pending().iter().any(|pending| pending.key == key));
+        assert_eq!(std::fs::read(system.join("keep")).unwrap(), b"replacement");
+        assert!(original.is_dir());
     }
 
 }

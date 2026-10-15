@@ -63,7 +63,9 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
                 std::path::PathBuf::from(std::env::var_os("HOME").ok_or("HOME unavailable")?).join(relative)
             } else { std::path::PathBuf::from(path.trim()) };
             if !chosen.is_absolute() { return Err("Enter an absolute account home path".into()); }
-            Ok(Some(Account::linked(*provider, *key, chosen.canonicalize().map_err(|error| error.to_string())?)))
+            // Keep the user's ORIGINAL operand. Home capture resolves and pins
+            // it while retaining this spelling for every later revalidation.
+            Ok(Some(Account::linked(*provider, *key, chosen)))
         }
         Operation::Create { provider, .. } => Ok(Some(Account::system(*provider))),
         Operation::Remove { id } => registry
@@ -190,7 +192,7 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
             if !chosen.is_absolute() {
                 return Err("Enter an absolute device path or one starting with ~/".into());
             }
-            let path = chosen.canonicalize().map_err(|error| error.to_string())?;
+            let path = reservation.link_home(provider, key, &chosen)?;
             crate::secure_file::validate_owned_directory(&path)
                 .map_err(|error| error.to_string())?;
             let system = Account::system(provider).resolved_home();
@@ -243,6 +245,10 @@ pub(crate) fn execute_reserved(operation: Operation, reservation: &crate::host::
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| error.to_string());
             }
+            // The pending-home probe may have taken a long time. The live
+            // token fences daemon ingress, but an external rename/replacement
+            // must not redirect this second provider read to a different home.
+            reservation.verify()?;
             let system_identity = match runtime.block_on(probe::run(
                 Account::system(provider),
                 super::cache::Cache::installation(),
