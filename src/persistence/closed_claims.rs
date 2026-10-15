@@ -194,7 +194,8 @@ impl StateStore {
             .closed_authority
             .write()
             .map_err(|_| StoreError::MutexPoisoned)?;
-        if stamp.sequence != authority.stamp.sequence || stamp.unknown != authority.stamp.unknown {
+        if stamp.sequence != authority.stamp.sequence || (stamp.unknown && !authority.stamp.unknown)
+        {
             authority.answers.clear();
             // Never publish an uncommitted sequence: a rolled-back sequence
             // may later be reused by the actual next closure.
@@ -256,7 +257,7 @@ impl StateStore {
             .map_err(|_| StoreError::MutexPoisoned)?;
         if let Some(stamp) = actual_stamp {
             if stamp.sequence != authority.stamp.sequence
-                || stamp.unknown != authority.stamp.unknown
+                || (stamp.unknown && !authority.stamp.unknown)
             {
                 authority.answers.clear();
             }

@@ -9957,6 +9957,20 @@ mod tests {
             store.terminal_was_closed(&hosted),
             "a failed canonical read cannot heal through another request"
         );
+        let cards = [
+            ClosureQuery::Card(CardId::new()),
+            ClosureQuery::Card(CardId::new()),
+        ];
+        for query in &cards {
+            assert!(!store.resolve_closure(query.clone()).unwrap());
+        }
+        for query in &cards {
+            assert_eq!(
+                store.cached_closure(query),
+                Some(false),
+                "sticky terminal quarantine cannot evict unrelated card answers repeatedly"
+            );
+        }
     }
 
     #[test]
