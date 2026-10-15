@@ -1486,6 +1486,7 @@ mod tests {
 
     fn request(id: OperationId) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
+            base_reference: None,
             linear_issue: None,
             setup_intent: None,
             repository: "/repo".into(),

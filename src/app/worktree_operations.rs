@@ -638,6 +638,7 @@ mod tests {
                 ..Default::default()
             };
             let request = CreateWorktreeRequest {
+                base_reference: None,
                 setup_intent: Some(intent.clone()),
                 linear_issue: Some(crate::linear::context::LinkedIssue {
                     issue_id: "ENG-123".into(),
@@ -742,6 +743,7 @@ mod tests {
                 ..Default::default()
             };
             let request = CreateWorktreeRequest {
+                base_reference: None,
                 setup_intent: Some(intent.clone()),
                 linear_issue: None,
                 repository,

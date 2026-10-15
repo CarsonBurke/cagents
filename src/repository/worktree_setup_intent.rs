@@ -184,7 +184,7 @@ fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal
             .is_some_and(|oid| !is_hex_oid(oid))
         || !journal.effects_started
         || ValidatedBranchName::parse(journal.request.branch.as_str()).is_err()
-        || journal.request.base.validate().is_err()
+        || journal.request.resolved_base_reference().is_err()
     {
         return Err(invalid());
     }
@@ -313,6 +313,7 @@ mod tests {
 
     fn request(root: &Path) -> CreateWorktreeRequest {
         CreateWorktreeRequest {
+            base_reference: None,
             repository: root.join("repo"),
             managed_root: root.join("managed"),
             destination: root.join("managed/topic"),
@@ -479,6 +480,8 @@ mod tests {
     fn old_requests_and_intents_deserialize_without_setup_fields() {
         let mut value = serde_json::to_value(request(Path::new("/fixture"))).unwrap();
         value.as_object_mut().unwrap().remove("setup_intent");
+        assert!(!value.as_object().unwrap().contains_key("base_reference"));
+        assert!(serde_json::from_value::<CreateWorktreeRequest>(value.clone()).unwrap().base_reference.is_none());
         assert!(
             serde_json::from_value::<CreateWorktreeRequest>(value)
                 .unwrap()

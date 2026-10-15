@@ -12,7 +12,7 @@ const MAX_BYTES: u64 = 16 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreationBasis {
-    /// The resolved local/remote ref, or a literal object ID.
+    /// The resolved local, remote or tag ref, or a literal object ID.
     pub reference: String,
     /// The commit selected when creation was authorized, independent of later ref movement.
     pub oid: String,

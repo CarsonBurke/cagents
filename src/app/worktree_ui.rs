@@ -2343,6 +2343,7 @@ mod tests {
         .unwrap();
         let destination = repository.join("worktrees/zulu-new");
         let request = CreateWorktreeRequest {
+            base_reference: None,
             linear_issue: None,
             setup_intent: None,
             repository: repository.clone(),
