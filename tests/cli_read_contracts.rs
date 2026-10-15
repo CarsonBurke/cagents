@@ -4,14 +4,30 @@ use cagents::process::{
     CancellationToken, CommandSpec, ProcessExecutor, ProcessOutput, SystemProcessExecutor,
 };
 use serde_json::Value;
-use std::{ffi::OsStr, fs, os::unix::fs::PermissionsExt, path::PathBuf, time::Duration};
+use std::{
+    ffi::OsStr,
+    fs,
+    os::unix::fs::PermissionsExt,
+    path::PathBuf,
+    sync::{Mutex, MutexGuard},
+    time::Duration,
+};
+
+// A concurrent child spawn can inherit another fixture's still-writable
+// executable copy until exec closes it. Keep creation and child execution in
+// one fixture lane so private binaries never race that writable descriptor.
+static FIXTURE_EXECUTION: Mutex<()> = Mutex::new(());
 
 struct Fixture {
     root: tempfile::TempDir,
     cli: PathBuf,
+    _execution: MutexGuard<'static, ()>,
 }
 impl Fixture {
     fn new() -> Self {
+        let execution = FIXTURE_EXECUTION
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let root = tempfile::tempdir().unwrap();
         for path in ["bin", "home", "run", "data", "config", "cache"] {
             fs::create_dir(root.path().join(path)).unwrap();
@@ -28,7 +44,11 @@ impl Fixture {
         )
         .unwrap();
         fs::set_permissions(daemon, fs::Permissions::from_mode(0o700)).unwrap();
-        Self { root, cli }
+        Self {
+            root,
+            cli,
+            _execution: execution,
+        }
     }
     fn command(&self, args: &[&str]) -> CommandSpec {
         let mut command = CommandSpec::new(&self.cli);
@@ -195,6 +215,9 @@ fn unresolved_runtime_is_an_error_rather_than_an_already_stopped_daemon() {
         let mut command = fixture
             .command(&["daemon", "stop"])
             .env_remove("XDG_RUNTIME_DIR");
+        // CommandSpec removes inherited variables before applying its explicit
+        // environment map. Remove the fixture override as well for this case.
+        command.environment.remove(OsStr::new("XDG_RUNTIME_DIR"));
         if let Some(runtime) = runtime {
             command = command.env("XDG_RUNTIME_DIR", runtime);
         }
