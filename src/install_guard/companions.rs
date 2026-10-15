@@ -6,6 +6,7 @@ use std::os::unix::ffi::OsStrExt;
 struct CompanionIdentity {
     protocol: u16,
     instance: String,
+    daemon_qualified: bool,
 }
 #[cfg(test)]
 impl From<u16> for CompanionIdentity {
@@ -13,6 +14,7 @@ impl From<u16> for CompanionIdentity {
         Self {
             protocol,
             instance: crate::instance::NAME.into(),
+            daemon_qualified: true,
         }
     }
 }
@@ -26,7 +28,14 @@ pub(crate) fn preflight_editor_companions(candidate_protocol: Option<u16>) -> io
         } else {
             0
         };
-        Ok(CompanionIdentity { instance, protocol })
+        let daemon_qualified = instance == crate::instance::NAME
+            && candidate_protocol == Some(crate::terminal_ipc::PROTOCOL_VERSION)
+            && candidate_protocol == Some(protocol)
+            && same_daemon_binary(
+                &crate::companion::Product::Daemon.beside(cli)?,
+                &crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?,
+            )?;
+        Ok(CompanionIdentity { instance, protocol, daemon_qualified })
     })
 }
 
@@ -133,8 +142,58 @@ fn preflight_in(
                 actual.protocol
             )));
         }
+        if !actual.daemon_qualified {
+            return Err(io::Error::other(format!(
+                "Ceditor process {pid}'s private daemon cannot be qualified as the matched destination build. Close or update Ceditor before upgrading; application windows and conversations were kept open"
+            )));
+        }
     }
     Ok(())
+}
+
+/// Never execute an unknown older daemon to ask its version: historical
+/// entrypoints may ignore informational flags and start a service. Only exact
+/// bytes from the coordinator's already trusted matched daemon qualify.
+fn same_daemon_binary(candidate: &Path, expected: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fn open(path: &Path) -> io::Result<(File, std::fs::Metadata)> {
+        let file = std::fs::OpenOptions::new().read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.mode() & 0o022 != 0 || metadata.mode() & 0o111 == 0
+            || metadata.len() == 0 || metadata.len() > 512 * 1024 * 1024
+        {
+            return Err(io::Error::other("The editor daemon is not an owned bounded executable"));
+        }
+        Ok((file, metadata))
+    }
+    let (mut candidate_file, before_candidate) = open(candidate)?;
+    let (mut expected_file, before_expected) = open(expected)?;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut equal = before_candidate.len() == before_expected.len();
+    if equal {
+        let mut left = [0; 64 * 1024];
+        let mut right = [0; 64 * 1024];
+        loop {
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(io::ErrorKind::TimedOut, "Editor daemon qualification exceeded its bound"));
+            }
+            let count = candidate_file.read(&mut left)?;
+            expected_file.read_exact(&mut right[..count])?;
+            if left[..count] != right[..count] {equal = false; break;}
+            if count == 0 {break;}
+        }
+    }
+    for (path, file, before) in [(candidate, &candidate_file, &before_candidate), (expected, &expected_file, &before_expected)] {
+        if companion_stamp(before) != companion_stamp(&file.metadata()?)
+            || companion_stamp(before) != companion_stamp(&std::fs::symlink_metadata(path)?)
+        {
+            return Err(io::Error::other("The matched daemon changed during qualification"));
+        }
+    }
+    Ok(equal)
 }
 
 fn companion_stamp(metadata: &std::fs::Metadata) -> (u64, u64, u64, i64, i64, i64, i64, u32, u32) {
@@ -253,6 +312,36 @@ mod tests {
     }
 
     #[test]
+    fn matching_cli_does_not_qualify_a_mixed_generation_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let proc_root = root.path().join("proc");
+        let runtime = root.path().join("runtime");
+        editor(&proc_root, &root.path().join("editor/bin"), &runtime);
+        let error = preflight_in(&proc_root, &runtime, Some(77), |_| Ok(CompanionIdentity {
+            instance: crate::instance::NAME.into(), protocol: 77, daemon_qualified: false,
+        })).unwrap_err();
+        assert!(error.to_string().contains("private daemon cannot be qualified"));
+        assert!(error.to_string().contains("kept open"));
+    }
+
+    #[test]
+    fn exact_daemon_bytes_qualify_without_executing_either_file() {
+        let root = tempfile::tempdir().unwrap();
+        let expected = root.path().join("matched-daemon");
+        let candidate = root.path().join("editor-daemon");
+        for path in [&expected, &candidate] {
+            std::fs::write(path, b"same native daemon bytes").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(same_daemon_binary(&candidate, &expected).unwrap());
+        std::fs::write(&candidate, b"different daemon build!").unwrap();
+        assert!(!same_daemon_binary(&candidate, &expected).unwrap());
+        let alias = root.path().join("daemon-alias");
+        symlink(&expected, &alias).unwrap();
+        assert!(same_daemon_binary(&alias, &expected).is_err());
+    }
+
+    #[test]
     fn another_compiled_instance_sharing_the_xdg_root_cannot_block_this_upgrade() {
         let root = tempfile::tempdir().unwrap();
         let proc_root = root.path().join("proc");
@@ -266,14 +355,16 @@ mod tests {
         assert!(
             preflight_in(&proc_root, &runtime, Some(77), |_| Ok(CompanionIdentity {
                 protocol: 56,
-                instance: different.into()
+                instance: different.into(),
+                daemon_qualified: false
             }))
             .is_ok()
         );
         assert!(
             preflight_in(&proc_root, &runtime, None, |_| Ok(CompanionIdentity {
                 protocol: 56,
-                instance: different.into()
+                instance: different.into(),
+                daemon_qualified: false
             }))
             .is_ok()
         );
