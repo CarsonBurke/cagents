@@ -491,6 +491,8 @@ impl ClientHandle {
             inner: Arc::new(Inner {
                 id: session.id,
                 session,
+                execution_instance: uuid::Uuid::new_v4(),
+                source_binding: Arc::new(Mutex::new(None)),
                 upgrade_recovery: None,
                 proof,
                 wire: Arc::new(Mutex::new(Wire {
@@ -517,6 +519,25 @@ impl ClientHandle {
                 visibility_worker: Mutex::new(None),
             }),
         }
+    }
+
+    /// Explicit positive authority for isolated UI fixtures. Ordinary display
+    /// fixtures stay unbound and exercise the real unknown-authority refusal.
+    /// No running backend, server acknowledgement or native test is implied.
+    #[cfg(test)]
+    pub(crate) fn fixture_with_source_binding(session: Session, snapshot: Snapshot) -> Self {
+        let handle = Self::fixture(session, snapshot);
+        let mut source = handle.inner.session.clone();
+        source.proof = Some(handle.inner.proof.clone());
+        source.launch.session_id = handle.snapshot().session_id.clone();
+        let binding = crate::terminal_ipc::ChatSourceBinding {
+            source, execution_instance: handle.inner.execution_instance,
+            backend: uuid::Uuid::new_v4(),
+        };
+        assert!(valid_source_binding(&binding, &handle.inner.session,
+            handle.inner.execution_instance, &handle.inner.proof));
+        *handle.inner.source_binding.lock().unwrap() = Some(binding);
+        handle
     }
 
     #[cfg(test)]
