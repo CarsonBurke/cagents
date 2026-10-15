@@ -89,6 +89,7 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         (record.handle.clone(), record.session.clone(), identity, state.notifications.clone())
     };
     let registry = super::super::agent_execution::registry(host)?;
+    handle.refresh_retained_state()?;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
         let changed = registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_loss(
@@ -265,6 +266,7 @@ pub(in crate::host) fn reconcile_startup_losses(host: &SharedHost) -> Result<(),
     };
     let registry = super::super::agent_execution::registry(host)?;
     for (handle, source, identity) in actors {
+        handle.refresh_retained_state()?;
         if let Some(loss) = handle.continuity_loss() {
             let changed = registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_loss(
                 identity.instance, &identity.record, &source, &loss.affected_runs, &loss.reason, chat::now_ms().unwrap_or(0))?;
@@ -295,6 +297,7 @@ pub(in crate::host) fn finish_close(host: &SharedHost, handle: &Handle, requeste
     if !chat::native_holder::closed_source(&source, &proof)?.is_some_and(|(owner, _)| owner == identity.record) {
         return Err("The final actor publication does not prove this exact execution descriptor closed".into());
     }
+    handle.refresh_retained_state()?;
     let loss = handle.continuity_loss();
     if let Some(loss) = &loss {
         let changed = registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_loss(identity.instance, &identity.record, &source, &loss.affected_runs, &loss.reason, chat::now_ms().unwrap_or(0))?;

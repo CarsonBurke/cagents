@@ -50,7 +50,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
             let proof = self.proof.lock().unwrap().clone();
             if let Ok(inspection) = Handle::inspect_remote(&self.owner, proof.clone())
                 && let Ok(handle) = Handle::adopt_remote(&self.owner, inspection.source, proof, |_| {})
-                && handle.close().is_ok() { return; }
+                && handle.close().is_ok() && handle.finish_retained_close().is_ok() { return; }
             // Only this fixture's exact process incarnations; no name/group sweep.
             for process in [&self.owner.root, &self.owner.holder] { if process.is_current() { unsafe { libc::kill(process.pid, libc::SIGKILL); } } }
         }

@@ -96,6 +96,16 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
         if let Some((record, true)) = &receipt {
+            if Handle::is_remote_record(record) && record.holder.is_current() {
+                let handle = match pending.as_ref().map(|pending| &pending.owner) {
+                    Some(NativeOwner::Actor { handle, .. }) => handle.clone(),
+                    _ => Handle::adopt_remote(record, source.clone(), proof.clone(), |_| {})?,
+                };
+                host.lock().unwrap_or_else(|p| p.into_inner()).native_closing.insert(source.id, NativeClose {
+                    source: source.clone(), owner: NativeOwner::Actor { record: record.clone(), handle: handle.clone() }, closed: true, paired: None,
+                });
+                retained_actor::finish_close(host, &handle, source)?;
+            }
             retire_closed_execution(host, source, record, &proof)?;
             return Ok(());
         }
