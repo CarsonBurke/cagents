@@ -189,6 +189,20 @@ impl AgentLaunchSettings {
         Ok(())
     }
 
+    /// Validate the recorded policy's syntax without probing a filesystem.
+    /// Availability is checked by save/launch workers on the owning device.
+    pub fn validate_syntax(&self, provider: Provider) -> Result<(), String> {
+        let mut syntax = self.clone();
+        syntax.executable = None;
+        syntax.validate_fields(provider)?;
+        if self.executable.as_deref().is_some_and(|path| {
+            !Path::new(path).is_absolute() || path.contains('\0')
+        }) {
+            return Err(format!("{} executable must be an absolute path to an executable file.", provider.label()));
+        }
+        self.validate_provider_path()
+    }
+
     pub fn validate(&self, provider: Provider) -> Result<(), String> {
         self.validate_fields(provider)?;
         self.validate_provider_path()
@@ -799,6 +813,23 @@ mod tests {
             Some("readOnly")
         );
         loaded.validate().unwrap();
+    }
+
+    #[test]
+    fn recorded_policy_syntax_is_independent_of_executable_availability() {
+        let root = tempfile::tempdir().unwrap();
+        let mut configuration = AgentLaunchSettings {
+            executable: Some(root.path().join("missing-wrapper").to_str().unwrap().into()),
+            environment: BTreeMap::from([("PATH".into(), "relative-tools".into())]),
+            ..Default::default()
+        };
+        assert!(configuration.validate_syntax(Provider::Claude).is_ok());
+        assert!(configuration.validate(Provider::Claude).is_err());
+        configuration.executable = Some("relative-wrapper".into());
+        assert!(configuration.validate_syntax(Provider::Claude).is_err());
+        configuration.executable = Some(root.path().join("missing-wrapper").to_str().unwrap().into());
+        configuration.permission_mode = Some("unknown-mode".into());
+        assert!(configuration.validate_syntax(Provider::Claude).is_err());
     }
 
     #[test]
