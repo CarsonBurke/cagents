@@ -2011,9 +2011,9 @@ impl Adapter for Claude {
                         // another accepted prompt has begun. Keep its exact
                         // execution result without replacing that prompt's
                         // current notification context.
-                        step.suppress_current_notification =
-                            generation != self.attention_generation
-                                && self.started_generation == Some(self.attention_generation);
+                        step.suppress_current_notification = generation
+                            != self.attention_generation
+                            && self.started_generation == Some(self.attention_generation);
                         let outcome = if accepted {
                             crate::notifications::Kind::Cancelled
                         } else {
@@ -8435,26 +8435,45 @@ mod tests {
     #[test]
     fn notification_old_interrupt_ack_preserves_the_new_question_and_topic() {
         for accepted in [false, true] {
-            let mut adapter = Claude { ready: true, ..Default::default() };
-            adapter.send_prompt("Old A".into(), Vec::new(), PromptMode::Send).unwrap();
+            let mut adapter = Claude {
+                ready: true,
+                ..Default::default()
+            };
+            adapter
+                .send_prompt("Old A".into(), Vec::new(), PromptMode::Send)
+                .unwrap();
             let interrupt = adapter.command(Command::Interrupt).unwrap();
             let id = interrupt.writes[0]["request_id"].as_str().unwrap();
-            adapter.receive(json!({"type":"result","uuid":"old-a","is_error":false})).unwrap();
-            adapter.send_prompt("Review B migration".into(), Vec::new(), PromptMode::Send).unwrap();
-            let ack = if accepted { reply(id, json!({})) } else {
+            adapter
+                .receive(json!({"type":"result","uuid":"old-a","is_error":false}))
+                .unwrap();
+            adapter
+                .send_prompt("Review B migration".into(), Vec::new(), PromptMode::Send)
+                .unwrap();
+            let ack = if accepted {
+                reply(id, json!({}))
+            } else {
                 json!({"type":"control_response","response":{"request_id":id,"subtype":"error","error":"already settled"}})
             };
-            let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
-                Box::new(adapter), vec![
-                    json!({"type":"user","uuid":"new-b-user","session_id":"44444444-4444-4444-8444-444444444444",
+            let (callbacks, state) =
+                crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                    Box::new(adapter),
+                    vec![
+                        json!({"type":"user","uuid":"new-b-user","session_id":"44444444-4444-4444-8444-444444444444",
                         "message":{"role":"user","content":[{"type":"text","text":"Review B migration"}]}}),
-                    json!({"type":"control_request","request_id":"question-b","request":{
+                        json!({"type":"control_request","request_id":"question-b","request":{
                         "subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{
                             "question":"Which B migration should I prepare?","header":"Migration",
                             "options":[{"label":"Keep","description":"Preserve existing"}],"multiSelect":false}]}}}),
-                    ack,
-                ], false);
-            assert_eq!(callbacks.len(), 1, "old acknowledgement cannot publish a current outcome");
+                        ack,
+                    ],
+                    false,
+                );
+            assert_eq!(
+                callbacks.len(),
+                1,
+                "old acknowledgement cannot publish a current outcome"
+            );
             assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Waiting);
             assert_eq!(callbacks[0].1.conversation, "Review B migration");
             assert!(callbacks[0].1.preview.contains("Which B migration"));

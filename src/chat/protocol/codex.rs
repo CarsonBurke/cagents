@@ -1007,8 +1007,9 @@ impl Codex {
             return Err("Codex history is already loading".into());
         }
         let earlier = cursor.is_some();
-        let initial_notification_binding = (!self.history_initialized && self.notification_turn.is_none())
-            .then_some((self.lifecycle_revision, self.notification_revision));
+        let initial_notification_binding = (!self.history_initialized
+            && self.notification_turn.is_none())
+        .then_some((self.lifecycle_revision, self.notification_revision));
         self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding })?;
         self.history_loading = true;
         step.events.push(if earlier {
@@ -1820,7 +1821,10 @@ impl Adapter for Codex {
                 // notification to release that optimistic state. Only repair
                 // the lifecycle this request observed: a newer genuine turn
                 // must retain its own activity and waiting state.
-                if let Pending::Turn { notification_revision, .. } = &pending
+                if let Pending::Turn {
+                    notification_revision,
+                    ..
+                } = &pending
                     && *notification_revision != self.notification_revision
                 {
                     // A rejected old start cannot replace a newer turn's
@@ -1987,7 +1991,10 @@ impl Adapter for Codex {
                         self.page(&result["initialTurnsPage"], &mut step, false)?;
                         // Only the initial coherent attach response may bind
                         // an active history turn. Later pages are display data.
-                        if self.lifecycle_revision == 0 && self.notification_revision == 0 && self.notification_turn.is_none() {
+                        if self.lifecycle_revision == 0
+                            && self.notification_revision == 0
+                            && self.notification_turn.is_none()
+                        {
                             self.notification_turn = self.turn.clone();
                         }
                     } else {
@@ -2192,10 +2199,15 @@ impl Adapter for Codex {
                         self.skills(&mut step)?;
                     }
                 }
-                Pending::History { earlier, initial_notification_binding } => {
+                Pending::History {
+                    earlier,
+                    initial_notification_binding,
+                } => {
                     self.page(result, &mut step, earlier)?;
-                    if initial_notification_binding == Some((self.lifecycle_revision, self.notification_revision))
-                        && self.notification_turn.is_none() && self.busy
+                    if initial_notification_binding
+                        == Some((self.lifecycle_revision, self.notification_revision))
+                        && self.notification_turn.is_none()
+                        && self.busy
                     {
                         self.notification_turn = self.turn.clone();
                     }
@@ -2272,14 +2284,14 @@ impl Adapter for Codex {
                             step.notification_preview = Some(early.preview);
                         }
                         if let Some(completed) = early.completed {
-                        // Preserve the original final frame's context, rather
-                        // than sampling whatever the actor currently shows.
-                        self.turn = Some(id.to_owned());
-                        self.notification_turn = Some(id.to_owned());
-                        let completion = self.receive(json!({"method":"turn/completed",
+                            // Preserve the original final frame's context, rather
+                            // than sampling whatever the actor currently shows.
+                            self.turn = Some(id.to_owned());
+                            self.notification_turn = Some(id.to_owned());
+                            let completion = self.receive(json!({"method":"turn/completed",
                             "params":{"threadId":self.thread,"turn":completed}}))?;
-                        step.events.extend(completion.events);
-                        step.writes.extend(completion.writes);
+                            step.events.extend(completion.events);
+                            step.writes.extend(completion.writes);
                         }
                     } else if !owns_current {
                         step.suppress_current_notification = true;
@@ -2511,10 +2523,14 @@ impl Adapter for Codex {
             }
             return Ok(step);
         }
-        let notification_frame_turn = params["turnId"].as_str()
-            .or_else(|| params["turn"]["id"].as_str()).map(str::to_owned);
-        if method != "turn/started" && notification_frame_turn.as_deref()
-            .is_some_and(|turn| self.notification_turn.as_deref() != Some(turn))
+        let notification_frame_turn = params["turnId"]
+            .as_str()
+            .or_else(|| params["turn"]["id"].as_str())
+            .map(str::to_owned);
+        if method != "turn/started"
+            && notification_frame_turn
+                .as_deref()
+                .is_some_and(|turn| self.notification_turn.as_deref() != Some(turn))
         {
             step.suppress_current_notification = true;
         }
@@ -2590,8 +2606,8 @@ impl Adapter for Codex {
                 let turn_id = string(turn, "id")?;
                 // A completed ID is current only when a start, active attach,
                 // or exact accepted request reply has established ownership.
-                let current = method == "turn/started"
-                    || self.notification_turn.as_deref() == Some(turn_id);
+                let current =
+                    method == "turn/started" || self.notification_turn.as_deref() == Some(turn_id);
                 if !current {
                     step.suppress_current_notification = true;
                     if let Some(Pending::Turn { early, early_bytes, .. }) =
@@ -4099,9 +4115,11 @@ mod tests {
             "turn":{"id":"new-b","status":"inProgress","items":[]}}});
         let user = json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"new-b",
             "item":{"id":"user-b","type":"userMessage","content":[{"type":"text","text":"Review the new B migration"}]}}});
-        let question = |text| json!({"id":71,"method":"item/tool/requestUserInput",
+        let question = |text| {
+            json!({"id":71,"method":"item/tool/requestUserInput",
             "params":{"threadId":"thread-exact","turnId":"new-b",
-                "questions":[{"id":"migration","header":"Migration","question":text,"options":[]}]}});
+                "questions":[{"id":"migration","header":"Migration","question":text,"options":[]}]}})
+        };
         let old = json!({"method":"turn/completed","params":{"threadId":"thread-exact",
             "turn":{"id":"old-a","status":"failed","error":{"message":"Old A failure must not become B's error"},
                 "items":[{"id":"old-user","type":"userMessage","content":[{"type":"text","text":"Old A private topic"}]},
@@ -4110,19 +4128,50 @@ mod tests {
             "item":{"id":"late-old-user","type":"userMessage","content":[{"type":"text","text":"Late old A topic"}]}}});
         let old_delta = json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"old-a","itemId":"late-old-answer","delta":"Old A delta"}});
         let mut adapter = adapter();
-        let submitted = adapter.command(Command::Prompt { text: "Old A".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
-        let old_request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "Old A".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let old_request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
         let old_rejection = json!({"id":old_request,"error":{"code":-32000,"message":"Old A rejected after B started"}});
         let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
-            Box::new(adapter), vec![start, user, question("Choose B migration"), old_user, old_delta, old, old_rejection,
-                question("Updated B migration question")], false);
-        assert_eq!(callbacks.len(), 2, "old A must not publish current completion or another waiting revision");
+            Box::new(adapter),
+            vec![
+                start,
+                user,
+                question("Choose B migration"),
+                old_user,
+                old_delta,
+                old,
+                old_rejection,
+                question("Updated B migration question"),
+            ],
+            false,
+        );
+        assert_eq!(
+            callbacks.len(),
+            2,
+            "old A must not publish current completion or another waiting revision"
+        );
         for (evidence, content) in &callbacks {
             assert_eq!(evidence.kind, crate::notifications::Kind::Waiting);
             assert_eq!(content.conversation, "Review the new B migration");
             assert!(!content.preview.contains("Old A"));
         }
-        assert!(callbacks[1].1.preview.contains("Updated B migration question"));
+        assert!(
+            callbacks[1]
+                .1
+                .preview
+                .contains("Updated B migration question")
+        );
         assert_eq!(state.requests.len(), 1);
         assert_eq!(state.requests[0].id, "71");
         assert!(state.error.is_none());
@@ -4132,59 +4181,114 @@ mod tests {
     #[test]
     fn notification_exact_early_ack_restores_streamed_context_without_reappending_deltas() {
         let mut adapter = adapter();
-        let submitted = adapter.command(Command::Prompt { text: "B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
-        let request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
-        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(Box::new(adapter), vec![
-            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
                 "item":{"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]}}}),
-            json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":"Exact streamed B response."}}),
-            json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
-            json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}}),
-            json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
-        ], false);
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":"Exact streamed B response."}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
+                json!({"method":"thread/status/changed","params":{"threadId":"thread-exact","status":{"type":"idle"}}}),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+            ],
+            false,
+        );
         assert_eq!(callbacks.len(), 1);
         assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
         assert_eq!(callbacks[0].1.conversation, "Review B migration");
         assert_eq!(callbacks[0].1.preview, "Exact streamed B response.");
-        assert_eq!(state.notification_content(crate::notifications::Kind::Succeeded).preview, "Exact streamed B response.");
+        assert_eq!(
+            state
+                .notification_content(crate::notifications::Kind::Succeeded)
+                .preview,
+            "Exact streamed B response."
+        );
     }
 
     #[test]
     fn notification_observed_start_transfers_early_context_before_live_deltas_and_ack() {
         let mut adapter = adapter();
-        let submitted = adapter.command(Command::Prompt { text: "B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
-        let request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
         let delta = |text| json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":text}});
-        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(Box::new(adapter), vec![
-            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
                 "item":{"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]}}}),
-            delta("First part. "),
-            json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
-            delta("Second part."),
-            json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
-            json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
-        ], false);
+                delta("First part. "),
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+                delta("Second part."),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
+            ],
+            false,
+        );
         assert_eq!(callbacks.len(), 1);
         assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
         assert_eq!(callbacks[0].1.conversation, "Review B migration");
         assert_eq!(callbacks[0].1.preview, "First part. Second part.");
-        assert_eq!(state.notification_content(crate::notifications::Kind::Succeeded).preview, "First part. Second part.");
+        assert_eq!(
+            state
+                .notification_content(crate::notifications::Kind::Succeeded)
+                .preview,
+            "First part. Second part."
+        );
     }
 
     #[test]
     fn notification_observed_start_keeps_already_decoded_completion_for_exact_ack() {
         let mut adapter = adapter();
-        let submitted = adapter.command(Command::Prompt { text: "B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
-        let request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
         // A conservative decoder-order control, not a claim that a supported
         // provider emits start after completion on one ordered connection.
-        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(Box::new(adapter), vec![
-            json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(
+            Box::new(adapter),
+            vec![
+                json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[
                 {"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]},
                 {"id":"b-answer","type":"agentMessage","text":"Already completed B response."}]}}}),
-            json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
-            json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
-        ], false);
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+                json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+            ],
+            false,
+        );
         assert_eq!(callbacks.len(), 1);
         assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
         assert_eq!(callbacks[0].1.conversation, "Review B migration");
@@ -4194,8 +4298,10 @@ mod tests {
 
     #[test]
     fn notification_history_and_scalar_idle_cannot_replace_exact_live_turn_proof() {
-        let start = |id| json!({"method":"turn/started","params":{"threadId":"thread-exact",
-            "turn":{"id":id,"status":"inProgress","items":[]}}});
+        let start = |id| {
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+        };
         let mut adapter = adapter();
         adapter.receive(start("old-a")).unwrap();
         let mut request = Step::default();
@@ -4216,29 +4322,72 @@ mod tests {
 
     #[test]
     fn notification_pending_request_promotes_only_its_exact_early_completion() {
-        let start = |id| json!({"method":"turn/started","params":{"threadId":"thread-exact",
-            "turn":{"id":id,"status":"inProgress","items":[]}}});
-        let finish = |id, text| json!({"method":"turn/completed","params":{"threadId":"thread-exact",
-            "turn":{"id":id,"status":"completed","items":[{"id":format!("answer-{id}"),"type":"agentMessage","text":text}]}}});
+        let start = |id| {
+            json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"inProgress","items":[]}}})
+        };
+        let finish = |id, text| {
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[{"id":format!("answer-{id}"),"type":"agentMessage","text":text}]}}})
+        };
         let mut adapter = adapter();
         adapter.receive(start("old-a")).unwrap();
         adapter.receive(finish("old-a", "Old A completed")).unwrap();
-        let submitted = adapter.command(Command::Prompt { text: "New B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
-        let request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
+        let submitted = adapter
+            .command(Command::Prompt {
+                text: "New B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
         let a = adapter.receive(finish("old-a", "Replayed A")).unwrap();
-        let b = adapter.receive(finish("new-b", "Exact B final response")).unwrap();
+        let b = adapter
+            .receive(finish("new-b", "Exact B final response"))
+            .unwrap();
         for pending in [&a, &b] {
             assert!(pending.suppress_current_notification);
-            assert!(!pending.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
-            assert!(pending.events.iter().any(|event| matches!(event, Event::Item(_))), "history still receives completed items");
+            assert!(
+                !pending
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::TurnFinished { .. }))
+            );
+            assert!(
+                pending
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, Event::Item(_))),
+                "history still receives completed items"
+            );
         }
-        let accepted = adapter.receive(json!({"id":request,"result":{"turn":{"id":"new-b"}}})).unwrap();
+        let accepted = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"new-b"}}}))
+            .unwrap();
         assert!(!accepted.suppress_current_notification);
-        let outcomes = accepted.events.iter().filter_map(|event| match event {
-            Event::TurnFinished { key, outcome } => Some((key.as_deref(), *outcome)), _ => None,
-        }).collect::<Vec<_>>();
-        assert_eq!(outcomes, vec![(Some("codex:thread-exact:new-b"), crate::notifications::Kind::Succeeded)]);
-        let projected = crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default()).project(&accepted.events);
+        let outcomes = accepted
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                Event::TurnFinished { key, outcome } => Some((key.as_deref(), *outcome)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outcomes,
+            vec![(
+                Some("codex:thread-exact:new-b"),
+                crate::notifications::Kind::Succeeded
+            )]
+        );
+        let projected =
+            crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default())
+                .project(&accepted.events);
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].preview, "Exact B final response");
         assert!(!adapter.busy);
@@ -4247,20 +4396,49 @@ mod tests {
     #[test]
     fn notification_early_completion_buffer_is_bounded_and_replay_replaces_in_place() {
         let mut adapter = adapter();
-        adapter.command(Command::Prompt { text: "B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
-        let frame = |id| json!({"method":"turn/completed","params":{"threadId":"thread-exact",
-            "turn":{"id":id,"status":"completed","items":[]}}});
-        for _ in 0..32 { adapter.receive(frame("same-old-turn")).unwrap(); }
-        let (count, bytes) = adapter.pending.values().find_map(|pending| match pending {
-            Pending::Turn { early, early_bytes, .. } => Some((early.len(), *early_bytes)), _ => None,
-        }).unwrap();
+        adapter
+            .command(Command::Prompt {
+                text: "B".into(),
+                attachments: vec![],
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        let frame = |id| {
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact",
+            "turn":{"id":id,"status":"completed","items":[]}}})
+        };
+        for _ in 0..32 {
+            adapter.receive(frame("same-old-turn")).unwrap();
+        }
+        let (count, bytes) = adapter
+            .pending
+            .values()
+            .find_map(|pending| match pending {
+                Pending::Turn {
+                    early, early_bytes, ..
+                } => Some((early.len(), *early_bytes)),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(count, 1);
         let raw = frame("same-old-turn");
-        assert_eq!(bytes, serde_json::to_vec(&raw["params"]["turn"]).unwrap().len());
-        for index in 0..7 { adapter.receive(frame(&format!("unrelated-{index}"))).unwrap(); }
+        assert_eq!(
+            bytes,
+            serde_json::to_vec(&raw["params"]["turn"]).unwrap().len()
+        );
+        for index in 0..7 {
+            adapter
+                .receive(frame(&format!("unrelated-{index}")))
+                .unwrap();
+        }
         let refused = adapter.receive(frame("ninth-unrelated-turn")).unwrap_err();
         assert!(refused.contains("correlation capacity"));
-        assert!(adapter.pending.values().any(|pending| matches!(pending, Pending::Turn { early, .. } if early.len() == 8)));
+        assert!(
+            adapter
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Turn { early, .. } if early.len() == 8))
+        );
     }
 
     #[test]
@@ -4268,17 +4446,40 @@ mod tests {
         use crate::agent_execution::ProviderEvent;
         let mut adapter = adapter();
         let run = crate::model::RunId::new();
-        let submitted = adapter.command_for_run(run, Command::Prompt { text: "B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
-        let request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
+        let submitted = adapter
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "B".into(),
+                    attachments: vec![],
+                    mode: PromptMode::Send,
+                },
+            )
+            .unwrap();
+        let request = submitted
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "turn/start")
+            .unwrap()["id"]
+            .clone();
         adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact",
             "turn":{"id":"early-b","status":"completed","items":[{"id":"b-answer","type":"agentMessage","text":"B result retained"}]}}})).unwrap();
-        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact",
-            "turn":{"id":"new-c","status":"inProgress","items":[]}}})).unwrap();
-        let accepted = adapter.receive(json!({"id":request,"result":{"turn":{"id":"early-b"}}})).unwrap();
+        adapter
+            .receive(
+                json!({"method":"turn/started","params":{"threadId":"thread-exact",
+            "turn":{"id":"new-c","status":"inProgress","items":[]}}}),
+            )
+            .unwrap();
+        let accepted = adapter
+            .receive(json!({"id":request,"result":{"turn":{"id":"early-b"}}}))
+            .unwrap();
         assert!(accepted.suppress_current_notification);
         assert_eq!(adapter.turn.as_deref(), Some("new-c"));
         assert!(adapter.busy);
-        assert!(!accepted.events.iter().any(|event| matches!(event, Event::TurnFinished { .. } | Event::Status { busy: false, .. })));
+        assert!(!accepted.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished { .. } | Event::Status { busy: false, .. }
+        )));
         assert!(accepted.events.iter().any(|event| matches!(event, Event::Execution { run: current, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *current == run)));
         assert!(accepted.events.iter().any(|event| matches!(event, Event::Item(item) if matches!(&item.content, ItemContent::Text { text, .. } if text == "B result retained"))));
     }
@@ -4304,8 +4505,11 @@ mod tests {
             for fail_store in [false, true] {
                 let mut callbacks = crate::chat::runtime::notification_frames_for_test(
                     Box::new(adapter()),
-                    vec![json!({"method":"turn/started","params":{"threadId":"thread-exact",
-                        "turn":{"id":"notification-turn","status":"inProgress","items":[]}}}), frame.clone()],
+                    vec![
+                        json!({"method":"turn/started","params":{"threadId":"thread-exact",
+                        "turn":{"id":"notification-turn","status":"inProgress","items":[]}}}),
+                        frame.clone(),
+                    ],
                     fail_store,
                 );
                 assert_eq!(callbacks.len(), 1);

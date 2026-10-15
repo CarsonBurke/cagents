@@ -2200,7 +2200,10 @@ impl Actor {
         let suppress_current_notification = step.suppress_current_notification;
         if !suppress_current_notification {
             if let Some(preview) = &step.notification_preview {
-                self.state.lock().unwrap_or_else(|p| p.into_inner()).notification_preview = Arc::new(preview.clone());
+                self.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .notification_preview = Arc::new(preview.clone());
             }
         }
         // A new Codex thread is created asynchronously after initialize; check
@@ -2283,10 +2286,15 @@ impl Actor {
             // The disk-backed transcript store consumes text/tool items. Keep
             // their bounded live excerpt before that boundary, without ever
             // hydrating the page a window happens to be reading.
-            if !suppress_current_notification && matches!(
-                &event,
-                Event::Item(_) | Event::TextDelta { .. } | Event::TurnStarted | Event::Reset { .. }
-            ) {
+            if !suppress_current_notification
+                && matches!(
+                    &event,
+                    Event::Item(_)
+                        | Event::TextDelta { .. }
+                        | Event::TurnStarted
+                        | Event::Reset { .. }
+                )
+            {
                 let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 Arc::make_mut(&mut state.notification_preview).observe(&event);
             }
@@ -2324,10 +2332,19 @@ impl Actor {
                     // Preserve history and independently identified children
                     // and requests. Old parent-turn scalar metadata cannot
                     // replace the current turn's state or notification input.
-                    if suppress_current_notification && matches!(&event,
-                        Event::Error { .. } | Event::Usage(_) | Event::Plan { .. }
-                        | Event::Status { .. } | Event::Waiting(_)
-                        | Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }) {
+                    if suppress_current_notification
+                        && matches!(
+                            &event,
+                            Event::Error { .. }
+                                | Event::Usage(_)
+                                | Event::Plan { .. }
+                                | Event::Status { .. }
+                                | Event::Waiting(_)
+                                | Event::TurnStarted
+                                | Event::TurnSettled
+                                | Event::TurnFinished { .. }
+                        )
+                    {
                         continue;
                     }
                     let content = matches!(&event, Event::TurnFinished { .. })
@@ -2336,7 +2353,9 @@ impl Actor {
                     self.apply_with_attention(event, content, true);
                 }
             } else if let Some(event) = authority {
-                if suppress_current_notification { continue; }
+                if suppress_current_notification {
+                    continue;
+                }
                 let content = matches!(&event, Event::TurnFinished { .. })
                     .then(|| frame_contents.pop_front())
                     .flatten();
@@ -2621,7 +2640,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
     apply_projected_event(state, indices, event, false);
 }
 
-fn apply_projected_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, event: Event, preview_observed: bool) {
+fn apply_projected_event(
+    state: &mut Snapshot,
+    indices: &mut BTreeMap<String, usize>,
+    event: Event,
+    preview_observed: bool,
+) {
     // Frame events have already reached the resident preview before Store.
     // Do not consume a restored start boundary or append a delta twice.
     if !preview_observed {
@@ -3180,7 +3204,13 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     adapter: Box<dyn Adapter>,
     frames: Vec<serde_json::Value>,
     fail_store: bool,
-) -> (Vec<(crate::notifications::Evidence, crate::notifications::Content)>, Snapshot) {
+) -> (
+    Vec<(
+        crate::notifications::Evidence,
+        crate::notifications::Content,
+    )>,
+    Snapshot,
+) {
     assert!(!frames.is_empty() && frames.len() <= 32);
     let count = frames.len();
     struct Frame {
@@ -3244,7 +3274,8 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
     let closed = handle.close();
     for (index, command) in commands.into_iter().enumerate() {
         if fail_store && index + 1 == count {
-            let error = command.expect_err("readonly SQLite must reject the final write-bearing item");
+            let error =
+                command.expect_err("readonly SQLite must reject the final write-bearing item");
             assert!(
                 error.contains("readonly") || error.contains("read-only"),
                 "unexpected injected store failure: {error}"
@@ -3266,7 +3297,8 @@ pub(crate) fn notification_frames_with_snapshot_for_test(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_provider_failure() {
+    fn notification_local_worker_loss_is_unconfirmed_without_reclassifying_known_provider_failure()
+    {
         struct LostTransport {
             emit_terminal: bool,
         }
@@ -3287,8 +3319,14 @@ mod tests {
                         writes: vec![serde_json::json!({"fixture":"disconnect-after-proof"})],
                         events: vec![
                             Event::TurnSettled,
-                            Event::Error { message: "Provider reported migration failure".into(), fatal: false },
-                            Event::TurnFinished { key: Some("confirmed-failed-turn".into()), outcome: crate::notifications::Kind::Failed },
+                            Event::Error {
+                                message: "Provider reported migration failure".into(),
+                                fatal: false,
+                            },
+                            Event::TurnFinished {
+                                key: Some("confirmed-failed-turn".into()),
+                                outcome: crate::notifications::Kind::Failed,
+                            },
                         ],
                         ..Default::default()
                     });
@@ -3308,7 +3346,9 @@ mod tests {
                 working_directory: directory.path().into(),
                 environment: BTreeMap::new(),
             };
-            let mut adapter: Box<dyn Adapter> = Box::new(LostTransport { emit_terminal: known_failure });
+            let mut adapter: Box<dyn Adapter> = Box::new(LostTransport {
+                emit_terminal: known_failure,
+            });
             let mut initial = adapter.initialize().unwrap();
             let store = preflight(&spec, &mut initial).unwrap();
             let (send, receive) = crossbeam_channel::bounded(8);
@@ -3316,7 +3356,8 @@ mod tests {
                 if let Update::AttentionContext { evidence, content } = update {
                     let _ = send.try_send((evidence, content));
                 }
-            }).unwrap();
+            })
+            .unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
             while !handle.is_completed() && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(5));
@@ -3327,17 +3368,33 @@ mod tests {
             // Original process/worker retirement precedes every assertion.
             closed.unwrap();
             assert!(handle.is_completed());
-            assert!(finished_before_close, "fixture must actually reach its failing receive before close");
-            assert!(failure.as_deref().is_some_and(|error| error.contains("Fixture local transport failed")));
+            assert!(
+                finished_before_close,
+                "fixture must actually reach its failing receive before close"
+            );
+            assert!(
+                failure
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Fixture local transport failed"))
+            );
             let notices = receive.try_iter().collect::<Vec<_>>();
             assert_eq!(notices.len(), 1);
             let (evidence, content) = &notices[0];
             if known_failure {
                 assert_eq!(evidence.kind, crate::notifications::Kind::Failed);
-                assert_eq!(content.as_ref().unwrap().preview, "Provider reported migration failure");
+                assert_eq!(
+                    content.as_ref().unwrap().preview,
+                    "Provider reported migration failure"
+                );
             } else {
                 assert_eq!(evidence.kind, crate::notifications::Kind::Interrupted);
-                assert!(content.as_ref().unwrap().preview.contains("Fixture local transport failed"));
+                assert!(
+                    content
+                        .as_ref()
+                        .unwrap()
+                        .preview
+                        .contains("Fixture local transport failed")
+                );
             }
         }
     }
