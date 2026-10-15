@@ -852,11 +852,17 @@ impl ControlClient {
             // stop the notifications of a chat it did not close.
             Err(ControlError::Remote { .. } | ControlError::UnexpectedResponse { .. }) => matches!(
                 self.request_strict(ClientRequest::ChatDetach { chat_id }),
-                Ok(ServerResponse::Detached)
+                Ok(ServerResponse::Detached) | Err(ControlError::Remote {
+                    code: ProtocolErrorCode::PermissionDenied | ProtocolErrorCode::TerminalNotFound | ProtocolErrorCode::TerminalUnavailable,
+                    ..
+                })
             ),
             Err(_) => false,
         };
         if detached {
+            // A source refusal can precede subscription; its detach then
+            // reports no attached actor instead of Detached. Do not retain a
+            // provisional allowance for that conversation's notifications.
             self.attached_chats.remove(&chat_id);
         }
         closed
@@ -4940,8 +4946,12 @@ mod tests {
                 send(&mut server_stream,Some(close.request_id),ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,"Exact source could not be closed",false)));
                 let detach:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
                 assert_eq!(detach.request,ClientRequest::ChatDetach{chat_id:id});
-                if subscribed {send(&mut server_stream,None,activity(id,ActivityState::Idle));}
-                respond(&mut server_stream,detach.request_id,ServerResponse::Detached);
+                if subscribed {
+                    send(&mut server_stream,None,activity(id,ActivityState::Idle));
+                    respond(&mut server_stream,detach.request_id,ServerResponse::Detached);
+                } else {
+                    send(&mut server_stream,Some(detach.request_id),ServerMessage::Error(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,"No attached actor exists",true)));
+                }
             }
 
             // The connection stays in step for the next request, and a chat it
