@@ -161,7 +161,7 @@ mod tests {
         Terminal::new(TerminalOptions {
             cols: COLS,
             rows: ROWS,
-            max_scrollback: 10_000,
+            max_scrollback: crate::terminal::TerminalConfig::default().max_scrollback_bytes,
         })
         .unwrap()
     }
