@@ -443,6 +443,33 @@ mod tests {
     }
 
     #[test]
+    fn reconnect_follows_primary_move_with_stable_external_metadata_and_keeps_linked_checkout() {
+        let metadata = Path::new("/metadata/project.git");
+        let old = PathBuf::from("/old/primary");
+        let new = PathBuf::from("/new/primary");
+        let linked = PathBuf::from("/other/linked");
+        let (mut app, id) = app(metadata);
+        app.sidebar_model.projects.iter_mut().find(|project| project.id == id).unwrap().kind = ProjectKind::Git;
+        let identity = uuid::Uuid::new_v4();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.workspace_model_identity = Some(identity);
+        durable.shared_project_bindings.insert(id, crate::model::SharedProjectBinding { ordinal: 7, root: Some(old.clone()) });
+        app.workspace_model = crate::workspace_model::WorkspaceModel { identity, projects: vec![crate::workspace_model::ModelProject { repository: metadata.into(), name: "Project".into(), kind: ProjectKind::Git, ordinal: 7, checkout: Some(linked.clone()), primary_checkout: Some(new.clone()) }], ..Default::default() };
+        app.project_ui.checkout_roots.insert(metadata.into(), linked.clone());
+        app.project_ui.primary_checkout_roots.insert(metadata.into(), old.clone());
+        drop(app.recover_shared_project_relocations());
+        assert_eq!(app.sidebar_model.project(id).unwrap().repository, metadata);
+        assert_eq!(app.project_root(app.sidebar_model.project(id).unwrap()), new);
+        assert_eq!(app.project_ui.checkout_roots[metadata], linked);
+        assert_eq!(app.project_ui.primary_checkout_roots[metadata], new);
+        // Merely selecting another linked checkout cannot move the primary.
+        app.workspace_model.projects[0].checkout = Some("/another/linked".into());
+        app.workspace_model.projects[0].primary_checkout = None;
+        drop(app.recover_shared_project_relocations());
+        assert_eq!(app.project_root(app.sidebar_model.project(id).unwrap()), new);
+    }
+
+    #[test]
     fn reconnect_does_not_interpret_a_replacement_registry_rank_as_the_old_project() {
         let old = Path::new("/old/project");
         let (mut app,id) = app(old);
