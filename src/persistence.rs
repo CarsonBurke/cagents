@@ -2343,6 +2343,13 @@ pub(crate) fn read_open_migration_sessions_with_budget(
     )?;
     connection.busy_timeout(Duration::from_millis(100))?;
     let transaction = connection.transaction()?;
+    let version: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version > CURRENT_SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema {
+            found: version,
+            supported: CURRENT_SCHEMA_VERSION,
+        });
+    }
     let mut statement = transaction.prepare(
         "SELECT CASE WHEN length(CAST(c.card_id AS BLOB)) <= 128 THEN c.card_id ELSE NULL END, c.kind_tag,
          CASE WHEN length(CAST(c.content_json AS BLOB)) <= 4194304 THEN c.content_json ELSE NULL END,
@@ -6498,6 +6505,24 @@ mod tests {
         assert!(read_open_migration_sessions_with_budget(&missing, &mut expired)
             .unwrap_err().to_string().contains("bounded budget"));
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn migration_session_inspection_refuses_future_window_schema_without_writing() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("future-source.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let workspace = workspace_with_terminal(&boot("chat-boot"));
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let connection = Connection::open(&path).unwrap();
+        connection.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION + 1).unwrap();
+        drop(connection);
+        let before = std::fs::read(&path).unwrap();
+        let error = read_open_migration_sessions(&path).unwrap_err();
+        assert!(matches!(error, StoreError::UnsupportedSchema { found, supported }
+            if found == CURRENT_SCHEMA_VERSION + 1 && supported == CURRENT_SCHEMA_VERSION));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 
     #[test]
