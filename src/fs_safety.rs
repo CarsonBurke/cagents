@@ -755,7 +755,28 @@ pub fn copy_ownership(source: &File, destination: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Preserves the source's POSIX access ACL on a new file after its mode is set.
+/// Preserve the source group on a new copy without changing its owning user.
+/// A setgid destination can otherwise assign existing group permissions to a
+/// different group. Failure prevents publication rather than broadening access.
+pub fn copy_group(source: &File, destination: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let group = source.metadata()?.gid();
+    if destination.metadata()?.gid() == group {
+        return Ok(());
+    }
+    // SAFETY: destination remains owned for this call; the all-ones uid keeps
+    // its current owner and the group comes from the retained source descriptor.
+    if unsafe { libc::fchown(destination.as_raw_fd(), libc::uid_t::MAX, group) } < 0 {
+        let error = io::Error::last_os_error();
+        return Err(io::Error::new(error.kind(), format!("cannot preserve source file group: {error}")));
+    }
+    if destination.metadata()?.gid() != group {
+        return Err(io::Error::other("the filesystem did not preserve the source file group"));
+    }
+    Ok(())
+}
+
+/// Preserves the source's POSIX access ACL on a new file.
 /// Unlike optional content attributes, losing an ACL can grant unintended
 /// access, so every failure prevents publication. An absent source ACL removes
 /// any access ACL inherited by the destination from its parent.
