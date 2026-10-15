@@ -880,6 +880,14 @@ fn start(
     )
 }
 
+#[cfg(test)]
+static OWNING_ADAPTER_INITIALIZATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+pub(in crate::host) fn adapter_initializations_for_test() -> usize {
+    OWNING_ADAPTER_INITIALIZATIONS.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub(super) fn start_execution(
     host: &SharedHost,
     client: ClientId,
@@ -1341,6 +1349,8 @@ fn start_with_execution(
     // initialize. Only this typed preparation may certify fresh provider scope;
     // an FD-only legacy Locate remains unknown for guarded close.
     prepared_directory.authorize(&mut spec, adapter.as_mut())?;
+    #[cfg(test)]
+    OWNING_ADAPTER_INITIALIZATIONS.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
     let mut initial = adapter.initialize().map_err(error)?;
     if terminate_source && source.is_none() {
         return Err(error("Source termination requires an exact host proof"));

@@ -128,6 +128,7 @@ fn owning_close_isolated(name: &str) -> Option<()> {
         std::fs::create_dir_all(root.join(name)).unwrap();
         std::fs::set_permissions(root.join(name), std::fs::Permissions::from_mode(0o700)).unwrap();
     }
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
     install_claude(&root.join("bin/claude"));
     let open_log = |name| {
         std::fs::OpenOptions::new()
@@ -162,6 +163,7 @@ fn owning_close_isolated(name: &str) -> Option<()> {
         .stderr(Stdio::from(stderr));
     if name == "combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict"
         || name.starts_with("combined_close_retained_lifecycle_")
+        || name.starts_with("native_capacity_")
     {
         command.env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1");
     }

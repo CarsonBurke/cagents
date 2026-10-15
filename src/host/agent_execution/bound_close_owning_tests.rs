@@ -7,6 +7,8 @@
 static BOUND_CLOSE_OWNER: Mutex<Option<Arc<Mutex<BoundCloseOwner>>>> = Mutex::new(None);
 struct BoundCloseOwner {
     host: SharedHost,
+    // A lease-adoption fixture keeps the original Host strongly owned too.
+    previous_host: Option<SharedHost>,
     notifications: Option<crate::host::notifications::Broker>,
     lease: Option<crate::daemon::HostLease>,
     remote: Option<(chat::runtime::Handle, chat::runtime::ActorIdentity, HostSessionProof)>,
@@ -20,7 +22,7 @@ impl BoundCloseCleanup {
         let mut retained = BOUND_CLOSE_OWNER.lock().unwrap_or_else(|p| p.into_inner());
         assert!(retained.is_none(), "a prior exact bound-close owner remains unconfirmed; no new owner may start");
         let owner = Arc::new(Mutex::new(BoundCloseOwner {
-            host: host.clone(), notifications: None, lease: None, remote: None,
+            host: host.clone(), previous_host: None, notifications: None, lease: None, remote: None,
         }));
         *retained = Some(owner.clone());
         Self { owner, outcome: None }

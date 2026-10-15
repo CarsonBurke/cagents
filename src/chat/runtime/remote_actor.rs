@@ -111,6 +111,8 @@ pub(crate) struct Resident {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ActorInspection {
+    #[cfg(test)]
+    pub attachment_epoch: uuid::Uuid,
     pub identity: ActorIdentity,
     pub source: chat::Session,
     pub previous_sources: Vec<chat::Session>,
@@ -1869,6 +1871,8 @@ impl Server {
     fn invoke(&mut self, request: Invocation) -> Result<Value, String> {
         if request.method == "inspect" {
             return serde_json::to_value(ActorInspection {
+                #[cfg(test)]
+                attachment_epoch: self.epoch,
                 identity: self.identity.clone(),
                 source: self.source.clone(),
                 previous_sources: self.published_sources(),

@@ -3879,3 +3879,5 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
 include!("presentation_acceptance_tests.rs");
 
 include!("bound_close_owning_tests.rs");
+
+include!("capacity_owning_tests.rs");

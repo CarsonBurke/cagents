@@ -181,6 +181,12 @@ impl History {
         self.entries.get(&id).map(|entry| entry.resource_epoch)
     }
     #[cfg(test)]
+    pub(in crate::host) fn capacity_usage_for_test(&self) -> (usize, usize) {
+        (self.entries.len(), self.entries.values().filter(|entry|
+            entry.pending_handoff.is_some() || Arc::strong_count(&entry.pin) > 1
+        ).count())
+    }
+    #[cfg(test)]
     pub(in crate::host) fn pin_capacity_for_test(&mut self) -> Vec<Reservation> {
         let mut reservations = self
             .entries
