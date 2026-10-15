@@ -19,8 +19,11 @@ impl Cagents {
     pub(super) fn publication_recovery_blocks(&self, worktree: &Path) -> bool {
         self.editor_features.recovery.as_ref().is_some_and(|state| !state.authority.is_resolved()
             && (state.unknown_scope || state.scopes.contains(worktree)))
-            || self.cards.values().any(|runtime| matches!(runtime, CardRuntime::Repository(runtime)
-                if runtime.descriptor.worktree == worktree && runtime.has_editor_recovery()))
+            || self.cards.values().any(|runtime| match runtime {
+                CardRuntime::Repository(runtime) => runtime.descriptor.worktree == worktree && runtime.has_editor_recovery(),
+                CardRuntime::PullRequests(pane) => pane.runtime.descriptor.worktree == worktree && pane.runtime.has_editor_recovery(),
+                _ => false,
+            })
     }
     pub(super) fn retain_publication_result_recovery(&mut self, ticket: u64, result: &Result<crate::editor_workspace_edit::PublicationReport, crate::editor_workspace_edit::PublicationFailure>) {
         let (authority, scope, message) = match result {

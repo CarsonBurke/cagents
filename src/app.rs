@@ -18494,6 +18494,21 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                if matches!(&action, RepositoryAction::Save { .. } | RepositoryAction::StageSelected { .. } | RepositoryAction::AutoSaveDue { .. }) {
+                    let worktree = match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => Some(runtime.descriptor.worktree.as_path()),
+                        Some(CardRuntime::PullRequests(pane)) => Some(pane.runtime.descriptor.worktree.as_path()),
+                        _ => None,
+                    };
+                    if worktree.is_some_and(|worktree| self.publication_recovery_blocks(worktree)) {
+                        if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = &action
+                            && let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
+                            runtime.take_auto_save_due(identity, *revision, *ticket);
+                        }
+                        self.status = Some(TransientNotice::warning("File recovery is pending in this worktree. Resolve it before saving or staging another file."));
+                        return Task::none();
+                    }
+                }
                 if matches!(&action, RepositoryAction::Save { overwrite: false, .. }) {
                     if let Some(task) = self.maybe_format_before_save(card) { return task; }
                 }
