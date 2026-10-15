@@ -18,6 +18,9 @@ pub fn selected_content(
     selected: Range<usize>,
     undo: bool,
 ) -> Option<String> {
+    if after != model.after.as_ref() || selected.is_empty() || selected.end > model.row_count(mode) {
+        return None;
+    }
     let mut deleted = BTreeSet::new();
     let mut added = BTreeSet::new();
     match mode {
@@ -290,6 +293,19 @@ mod tests {
                     expected.as_bytes()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn partial_selection_refuses_stale_source_bytes_and_coordinates() {
+        let model = crate::diff_view::build_diff("old\nkeep\n", "new\nkeep\n");
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let all = 0..model.row_count(mode);
+            assert!(selected_content(&model, "new\nkeep\n", mode, all.clone(), false).is_some());
+            // Same row count cannot authorize coordinates against later bytes.
+            assert!(selected_content(&model, "LATER\nkeep\n", mode, all.clone(), false).is_none());
+            assert!(selected_content(&model, "new\nkeep\n", mode, 0..all.end + 1, false).is_none());
+            assert!(selected_content(&model, "new\nkeep\n", mode, 1..1, false).is_none());
         }
     }
 
