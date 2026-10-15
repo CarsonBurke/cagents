@@ -61,12 +61,19 @@ impl RemoteActor {
         if let Some(authority) = authority { self.notify_source_authority(authority); }
     }
     fn notify_source_authority(&self, (authority, conflict): (Option<SourceAuthority>, Option<SourceAuthority>)) {
-        // Replay original then conflicting exact token; fresh receivers must
-        // observe the same contradiction, never merely its last half.
-        for authority in authority.into_iter().chain(conflict) {
+        if let Some(authority) = authority {
             (self.0.notify)(Update::SourceAuthority {
                 incarnation: authority.incarnation, generation: authority.generation,
             });
+            if let Some(conflict) = conflict {
+                // Explicit contradiction survives a receiver's higher
+                // watermark and scalar coalescing. Never fabricate a token.
+                (self.0.notify)(Update::SourceAuthorityConflict {
+                    generation: authority.generation,
+                    original: authority.incarnation,
+                    conflicting: conflict.incarnation,
+                });
+            }
         }
     }
     pub(super) fn accepts_body(&self, snapshot: &Snapshot) -> bool {
@@ -126,7 +133,7 @@ mod tests {
         assert_eq!(actor.state().source_authority, Some(first));
         assert_eq!(actor.state().source_authority_conflict, Some(conflict));
         assert!(!actor.accepts_body(&Snapshot {generation:20,source_incarnation:Some(first.incarnation),..Default::default()}));
-        assert!(matches!(observed.lock().unwrap().as_slice(), [Update::SourceAuthority {incarnation:a,generation:10},Update::SourceAuthority {incarnation:b,generation:10}] if *a==first.incarnation && *b==conflict.incarnation));
+        assert!(matches!(observed.lock().unwrap().as_slice(), [Update::SourceAuthority {incarnation:a,generation:10},Update::SourceAuthorityConflict {original,conflicting,generation:10}] if *a==first.incarnation && *original==first.incarnation && *conflicting==conflict.incarnation));
         let fresh = RemoteActor::fixture();
         fresh.publish_source_authority(Some(SourceAuthority {incarnation:uuid::Uuid::new_v4(),generation:20}),None);
         assert!(fresh.replace_resident(actor.state().as_ref().clone(), false));
