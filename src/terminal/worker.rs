@@ -4,6 +4,7 @@ mod close_processes;
 #[cfg(test)]
 mod close_tests;
 pub(crate) mod holder;
+mod joins;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
@@ -17,7 +18,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Condvar, Mutex, OnceLock, Weak,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -384,6 +385,8 @@ struct PublishedState {
     archive_ready: Condvar,
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     completed: AtomicBool,
+    /// 0 unadmitted, 1 retained by the join service, 2 joined, 3 panicked.
+    worker_join: AtomicU8,
     shutdown_requested: AtomicBool,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
@@ -432,6 +435,7 @@ impl PublishedState {
             archive_ready: Condvar::new(),
             archive_observer: OnceLock::new(),
             completed: AtomicBool::new(false),
+            worker_join: AtomicU8::new(0),
             shutdown_requested: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
@@ -696,49 +700,22 @@ struct HandleInner {
     commands: Sender<Command>,
     events: Receiver<TerminalEvent>,
     published: Arc<PublishedState>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl Drop for HandleInner {
     fn drop(&mut self) {
         self.published.request_shutdown();
-        if let Ok(worker) = self.worker.get_mut()
-            && let Some(worker) = worker.take()
-            && worker.thread().id() != thread::current().id()
-        {
-            join_worker_bounded(worker, &self.published);
-        }
+        // Final destruction only admits cleanup; a TLS destructor or callback
+        // must never make the dropping thread wait on its own lifetime.
+        let _ = joins::join_until(
+            &self.worker,
+            &self.published,
+            std::time::Instant::now() + WORKER_JOIN_TIMEOUT,
+            true,
+            false,
+        );
     }
-}
-
-/// A stalled worker cannot indefinitely hold daemon shutdown or a last-handle
-/// drop. Escalation uses the original root pidfd; detaching never claims exit.
-fn join_worker_bounded(worker: JoinHandle<()>, published: &PublishedState) -> bool {
-    join_worker_until(
-        worker,
-        published,
-        std::time::Instant::now() + WORKER_JOIN_TIMEOUT,
-        true,
-    )
-}
-
-fn join_worker_until(
-    worker: JoinHandle<()>,
-    published: &PublishedState,
-    deadline: std::time::Instant,
-    escalate: bool,
-) -> bool {
-    while !worker.is_finished() && std::time::Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(5));
-    }
-    if !worker.is_finished() {
-        if escalate && let Some(pidfd) = published.shutdown_pidfd.get() {
-            let _ = close_processes::signal(pidfd, libc::SIGKILL);
-        }
-        tracing::error!(escalate, "terminal worker exceeded lifecycle join deadline");
-        return false;
-    }
-    worker.join().is_ok()
 }
 
 #[derive(Clone)]
@@ -756,6 +733,9 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
+    /// Warm fixed join resources before measuring the host's idle baseline.
+    pub(crate) fn initialize_worker_joins() -> Result<(), String> { joins::initialize() }
+
     /// Captured from the authenticated original holder before worker startup;
     /// never rediscovered by a reusable terminal ID.
     pub(crate) fn holder_identity(&self) -> Option<&super::holder::Record> {
@@ -809,15 +789,17 @@ impl TerminalHandle {
                     commands: command_tx,
                     events: event_rx,
                     published,
-                    worker: Mutex::new(Some(worker)),
+                    worker: Arc::new(Mutex::new(Some(worker))),
                 }),
             }),
             Ok(Err(error)) => {
-                let _ = worker.join();
+                let slot = Arc::new(Mutex::new(Some(worker)));
+                let _ = joins::join_until(&slot, &published, std::time::Instant::now() + WORKER_JOIN_TIMEOUT, true, true);
                 Err(TerminalStartError::Worker(error))
             }
             Err(_) => {
-                let _ = worker.join();
+                let slot = Arc::new(Mutex::new(Some(worker)));
+                let _ = joins::join_until(&slot, &published, std::time::Instant::now() + WORKER_JOIN_TIMEOUT, true, true);
                 Err(TerminalStartError::WorkerExited)
             }
         }
@@ -968,7 +950,7 @@ impl TerminalHandle {
                 commands,
                 events: event_receiver,
                 published,
-                worker: Mutex::new(Some(worker)),
+                worker: Arc::new(Mutex::new(Some(worker))),
             }),
         }
     }
@@ -1218,15 +1200,8 @@ impl TerminalHandle {
             Err(_) => return Err("terminal carry outcome is unknown after its deadline".into()),
         };
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
-        if let Some(worker) = self
-            .take_worker_until(deadline)
-            .map_err(|error| error.to_string())?
-        {
-            if !join_worker_until(worker, &self.inner.published, deadline, false) {
-                return Err("terminal carry cleanup exceeded its deadline".into());
-            }
-        } else if !self.is_completed() {
-            return Err("terminal carry cleanup is already being joined".into());
+        if !self.join_worker_until(deadline, false) {
+            return Err("terminal carry cleanup is pending or exceeded its deadline".into());
         }
         Ok(carried)
     }
@@ -1285,21 +1260,10 @@ impl TerminalHandle {
         if outcome == TerminalCloseResult::Closed {
             // Completion is not reported until the owner has released its PTY.
             let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
-            match self.take_worker_until(deadline) {
-                Ok(Some(worker)) => {
-                    if !join_worker_until(worker, &self.inner.published, deadline, true) {
-                        return TerminalCloseResult::Unknown(
-                            "Terminal worker did not finish close within its deadline".into(),
-                        );
-                    }
-                }
-                Ok(None) if self.is_completed() => {}
-                Ok(None) => {
-                    return TerminalCloseResult::Unknown(
-                        "Terminal worker is already closing".into(),
-                    );
-                }
-                Err(error) => return TerminalCloseResult::Unknown(error.to_string()),
+            if !self.join_worker_until(deadline, true) {
+                return TerminalCloseResult::Unknown(
+                    "Terminal worker close is still pending; its exact join owner is retained".into(),
+                );
             }
         }
         outcome
@@ -1314,10 +1278,7 @@ impl TerminalHandle {
     pub fn shutdown(&self) -> Result<(), TerminalSendError> {
         self.request_shutdown();
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
-        if let Some(worker) = self.take_worker_until(deadline)?
-            && worker.thread().id() != thread::current().id()
-            && !join_worker_until(worker, &self.inner.published, deadline, true)
-        {
+        if !self.join_worker_until(deadline, true) {
             return Err(TerminalSendError::Closed);
         }
         if self.is_completed() {
@@ -1400,37 +1361,15 @@ impl TerminalHandle {
             result?;
         }
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
-        if let Some(worker) = self
-            .take_worker_until(deadline)
-            .map_err(|error| error.to_string())?
-        {
-            if !join_worker_until(worker, &self.inner.published, deadline, false) {
-                return Err("terminal worker exceeded its preserve deadline".into());
-            }
-        } else if !self.is_completed() {
-            return Err("terminal preservation is already being joined".into());
+        if !self.join_worker_until(deadline, false) {
+            return Err("terminal preservation join is pending or exceeded its deadline".into());
         }
         self.preserve_completed_for_restart();
         Ok(())
     }
 
-    fn take_worker_until(
-        &self,
-        deadline: std::time::Instant,
-    ) -> Result<Option<JoinHandle<()>>, TerminalSendError> {
-        loop {
-            match self.inner.worker.try_lock() {
-                Ok(mut worker) => return Ok(worker.take()),
-                Err(std::sync::TryLockError::Poisoned(error)) => {
-                    return Ok(error.into_inner().take());
-                }
-                Err(std::sync::TryLockError::WouldBlock) => {}
-            }
-            if std::time::Instant::now() >= deadline {
-                return Err(TerminalSendError::Closed);
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
+    fn join_worker_until(&self, deadline: std::time::Instant, escalate: bool) -> bool {
+        joins::join_until(&self.inner.worker, &self.inner.published, deadline, escalate, true)
     }
 
     fn try_command(&self, command: Command) -> Result<(), TerminalSendError> {
@@ -6287,7 +6226,7 @@ mod tests {
                 commands,
                 events: crossbeam_channel::unbounded().1,
                 published,
-                worker: Mutex::new(None),
+                worker: Arc::new(Mutex::new(None)),
             }),
         };
         handle.paste("canceled", PasteOrigin::Clipboard).unwrap();
@@ -6407,7 +6346,7 @@ mod tests {
         let (commands, receiver) = command_channel(4);
         worker.commands = receiver;
         let handle = TerminalHandle { inner: Arc::new(HandleInner {
-            commands, events, published: worker.published.clone(), worker: Mutex::new(None),
+            commands, events, published: worker.published.clone(), worker: Arc::new(Mutex::new(None)),
         }) };
         worker.published.input_order.lock().unwrap().handoff = true;
         assert_eq!(handle.input(b"later".to_vec()), Err(TerminalSendError::Closed));
@@ -6521,7 +6460,7 @@ mod tests {
                 commands,
                 events: crossbeam_channel::unbounded().1,
                 published,
-                worker: Mutex::new(Some(thread)),
+                worker: Arc::new(Mutex::new(Some(thread))),
             }),
         };
         let closing = handle.clone();
@@ -6622,7 +6561,7 @@ mod tests {
                 commands,
                 events: event_receiver,
                 published,
-                worker: Mutex::new(Some(worker)),
+                worker: Arc::new(Mutex::new(Some(worker))),
             }),
         };
         let closing = handle.clone();
@@ -6664,6 +6603,58 @@ mod tests {
         handle.shutdown().unwrap();
     }
 
+    fn latched_tls_worker() -> (JoinHandle<()>, crossbeam_channel::Sender<()>) {
+        struct Cleanup { entered: Sender<()>, release: Receiver<()> }
+        impl Drop for Cleanup { fn drop(&mut self) { self.entered.send(()).unwrap(); let _ = self.release.recv(); } }
+        thread_local! { static CLEANUP: RefCell<Option<Cleanup>> = const { RefCell::new(None) }; }
+        let (entered, observed) = crossbeam_channel::bounded(1);
+        let (release, blocked) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || CLEANUP.with(|slot| *slot.borrow_mut() = Some(Cleanup { entered, release: blocked })));
+        observed.recv_timeout(Duration::from_secs(2)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.is_finished() { assert!(Instant::now() < deadline); thread::yield_now(); }
+        (worker, release)
+    }
+
+    #[test]
+    fn worker_join_deadline_includes_blocked_tls_destruction() {
+        struct Release(Sender<()>);
+        impl Drop for Release { fn drop(&mut self) { let _ = self.0.try_send(()); } }
+        let (worker, release) = latched_tls_worker();
+        let release = Release(release);
+        let slot = Arc::new(Mutex::new(Some(worker)));
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let started = Instant::now();
+        assert!(!joins::join_until(&slot, &published, started + Duration::from_millis(40), false, true));
+        assert!(started.elapsed() < Duration::from_millis(250), "is_finished must not authorize caller-side pthread join");
+        assert_eq!(published.worker_join.load(Ordering::Acquire), 1);
+        assert!(Arc::strong_count(&slot) > 1, "the exact join slot remains owned by the shared service");
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while published.worker_join.load(Ordering::Acquire) == 1 { assert!(Instant::now() < deadline); thread::yield_now(); }
+        assert!(joins::join_until(&slot, &published, deadline, false, true));
+    }
+
+    #[test]
+    fn final_handle_drop_does_not_join_a_blocked_tls_destructor() {
+        struct Release(Sender<()>);
+        impl Drop for Release { fn drop(&mut self) { let _ = self.0.try_send(()); } }
+        let (worker, release) = latched_tls_worker(); let release = Release(release);
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        let slot = Arc::new(Mutex::new(Some(worker)));
+        let handle = TerminalHandle { inner: Arc::new(HandleInner {
+            commands: command_channel(1).0, events: crossbeam_channel::unbounded().1,
+            published: Arc::clone(&published), worker: Arc::clone(&slot),
+        }) };
+        let started = Instant::now(); drop(handle);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(published.worker_join.load(Ordering::Acquire), 1);
+        drop(release);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while published.worker_join.load(Ordering::Acquire) == 1 { assert!(Instant::now() < deadline); thread::yield_now(); }
+        assert_eq!(published.worker_join.load(Ordering::Acquire), 2);
+    }
+
     #[test]
     fn shutdown_deadline_releases_a_wedged_worker_without_claiming_completion() {
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
@@ -6678,7 +6669,7 @@ mod tests {
                 commands,
                 events: event_receiver,
                 published,
-                worker: Mutex::new(Some(worker)),
+                worker: Arc::new(Mutex::new(Some(worker))),
             }),
         };
         let started = std::time::Instant::now();
@@ -6735,7 +6726,7 @@ mod tests {
                 commands,
                 events,
                 published: Arc::clone(&worker.published),
-                worker: Mutex::new(None),
+                worker: Arc::new(Mutex::new(None)),
             }),
         };
         assert!(handle.inner.commands.is_full());
