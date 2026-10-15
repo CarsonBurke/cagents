@@ -252,7 +252,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         }
         let cross = match self.axis {
             Axis::Vertical if limits.max().width.is_finite() => width,
-            _ => nodes.iter().map(|node| self.axis.cross(node.size())).fold(width, f32::max),
+            Axis::Vertical => nodes.iter().map(|node| node.size().width).fold(0.0, f32::max),
+            Axis::Horizontal => nodes.iter().map(|node| node.size().height).fold(width, f32::max),
         };
         layout::Node::with_children(self.axis.size(total, cross), nodes)
     }
