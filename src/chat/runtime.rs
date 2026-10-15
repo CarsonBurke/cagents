@@ -686,8 +686,8 @@ impl Handle {
             return Err(Rejection::Refused("Chat is closing".into()));
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        self.0
-            .commands
+        let sender=if matches!(&command,Command::Interrupt) {&self.0.urgent_commands} else {&self.0.commands};
+        sender
             .try_send((ActorCommand::Provider { run, command }, reply))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
         self.wake();
@@ -708,8 +708,8 @@ impl Handle {
             return Err("The provider actor is no longer accepting ownership commands".into());
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        self.0
-            .commands
+        let sender=if matches!(&command,ActorCommand::Interrupt{..}) {&self.0.urgent_commands} else {&self.0.commands};
+        sender
             .try_send((command, reply))
             .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
         self.wake();
