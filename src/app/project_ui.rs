@@ -34,7 +34,7 @@ pub struct State {
     pending_delete: VecDeque<Target>,
     next_safety_request: u64,
     deletion_authorizations: HashMap<WorktreeId, WorktreeSafetySnapshot>,
-    deletion_busy_agents: HashMap<WorktreeId, Vec<BusyAgent>>,
+    deletion_busy_agents: HashMap<WorktreeId, AgentCensus>,
     branch_deletions: HashMap<WorktreeId, BranchDeletion>,
     released_delete_protections: HashSet<WorktreeId>,
     deletion_warnings: HashMap<WorktreeId, Vec<String>>,
@@ -187,6 +187,7 @@ struct Dialog {
     delete_branch: bool,
     branch_choice_edited: bool,
     busy_agents: Vec<BusyAgent>,
+    session_census: Vec<BusyAgent>,
     busy_confirmed: Option<Vec<BusyAgent>>,
     stale_lock: bool,
 }
@@ -241,7 +242,7 @@ pub enum Action {
     SafetyRead {
         request: u64,
         confirming: bool,
-        result: Result<(WorktreeSafetySnapshot, Vec<BusyAgent>), String>,
+        result: Result<(WorktreeSafetySnapshot, AgentCensus), String>,
     },
     OpenCleanupPolicy(ProjectId),
     CleanupPolicyRead {
@@ -501,6 +502,7 @@ impl Cagents {
             delete_branch: false,
             branch_choice_edited: false,
             busy_agents: Vec::new(),
+            session_census: Vec::new(),
             busy_confirmed: None,
             stale_lock: false,
         });
@@ -1610,8 +1612,8 @@ impl Cagents {
                         ));
                     }
                     Ok((snapshot, agents)) => {
-                        let agents_changed = dialog.busy_agents != agents;
-                        dialog.busy_agents = agents;
+                        let agents_changed = dialog.busy_agents != agents.agents || dialog.session_census != agents.census;
+                        dialog.busy_agents = agents.agents; dialog.session_census = agents.census;
                         let busy = dialog.busy_agents.len();
                         if confirming && !on_top {
                             dialog.safety = Some(snapshot); dialog.busy_confirmed = None;
@@ -1629,7 +1631,7 @@ impl Cagents {
                         if confirming && unchanged {
                             let target = dialog.target.clone();
                             let branch = dialog.delete_branch.then(|| snapshot.branch.clone().zip(snapshot.head_oid.clone())).flatten();
-                            let consented_agents = dialog.busy_agents.clone();
+                            let consented_agents = AgentCensus { agents: dialog.busy_agents.clone(), census: dialog.session_census.clone() };
                             if let Some(blocker) = self.worktree_deletion_blocker(&target) {
                                 self.project_ui.dialog.as_mut().unwrap().blocker = Some(blocker);
                                 return Task::none();
@@ -1936,7 +1938,7 @@ impl Cagents {
                 // closes conditionally at the actors. A separate census then
                 // unconditional close could interrupt an unconfirmed new turn.
                 let reply = worktree_control_request(crate::worktree_control::Operation::CloseSessions {
-                    repository: request.repository.clone(), path: request.path.clone(), agents: consented_agents,
+                    repository: request.repository.clone(), path: request.path.clone(), agents: consented_agents.agents, census: consented_agents.census,
                 })?;
                 match reply {
                     crate::worktree_control::Reply::SessionsClosed { path } if path == request.path => Ok(()),
@@ -3029,36 +3031,22 @@ fn inspected_worktree(reply: crate::device_service::Reply) -> Result<(WorktreeSa
 
 }
 
-fn busy_worktree_agents(repository: &Path, path: &Path) -> Result<Vec<BusyAgent>, String> {
+#[derive(Debug, Clone, Default)]
+pub struct AgentCensus { agents: Vec<BusyAgent>, census: Vec<BusyAgent> }
+
+fn busy_worktree_agents(repository: &Path, path: &Path) -> Result<AgentCensus, String> {
     let reply = worktree_control_request(crate::worktree_control::Operation::BusySessions { repository: repository.to_owned(), path: path.to_owned() })?;
     checked_busy_worktree_agents(reply)
 }
 
-fn checked_busy_worktree_agents(reply: crate::worktree_control::Reply) -> Result<Vec<BusyAgent>, String> {
-    let crate::worktree_control::Reply::BusySessions { mut agents } = reply else { return Err("Unexpected worktree agent census response".into()); };
-    agents.sort();
-    if agents.windows(2).any(|pair| pair[0].session == pair[1].session) {
+fn checked_busy_worktree_agents(reply: crate::worktree_control::Reply) -> Result<AgentCensus, String> {
+    let crate::worktree_control::Reply::BusySessions { mut agents, mut census } = reply else { return Err("Unexpected worktree agent census response".into()); };
+    agents.sort(); census.sort();
+    if [&agents, &census].into_iter().any(|rows| rows.windows(2).any(|pair| pair[0].session == pair[1].session))
+        || agents.iter().any(|agent| census.binary_search(agent).is_err()) {
         return Err("The daemon returned ambiguous active agent identities".into());
     }
-    Ok(agents)
-}
-
-// Policy controls must stay usable even when deletion safety cannot inventory a
-// protected directory. A save reply reports the policy readback, not a later census.
-fn read_cleanup_policy(repository: &Path) -> Result<Vec<String>, String> {
-    let reply = crate::device_service::request(crate::device_service::Operation::Worktree {
-        operation: crate::worktree_control::Operation::GetDisposableIgnoredDirectories {
-            repository: repository.to_owned(), path: repository.to_owned(),
-        },
-    })?;
-    disposable_ignored_directories(reply)
-}
-
-fn disposable_ignored_directories(reply: crate::device_service::Reply) -> Result<Vec<String>, String> {
-    match reply {
-        crate::device_service::Reply::Worktree(crate::worktree_control::Reply::DisposableIgnoredDirectories { directories }) => Ok(directories),
-        _ => Err("The selected device returned an unexpected project cleanup policy reply.".into()),
-    }
+    Ok(AgentCensus { agents, census })
 }
 
 fn safety_read_task(target: Target, request: u64, confirming: bool) -> Task<Message> {
@@ -3218,7 +3206,7 @@ mod tests {
             return;
         };
         let request = dialog.request;
-        let agents = dialog.busy_agents.clone();
+        let agents = AgentCensus { agents: dialog.busy_agents.clone(), census: dialog.session_census.clone() };
         drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
         let snapshot = clean_snapshot();
         drop(app.handle_project_action(Action::SafetyRead {
@@ -3363,7 +3351,9 @@ mod tests {
         drop(app.open_worktree_delete_dialog(target));
         // No current-window card exists for this detached daemon agent.
         assert!(app.durable.cards.is_empty());
-        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(3) }];
+        let agent = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(3) };
+        app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![agent.clone()];
+        app.project_ui.dialog.as_mut().unwrap().session_census = vec![agent];
         confirm_deletion_fixture(&mut app);
         assert!(!app.project_ui.is_deleting(linked.id));
         drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
@@ -3383,11 +3373,12 @@ mod tests {
             let request = app.project_ui.dialog.as_ref().unwrap().request;
             let original = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(3) };
             app.project_ui.dialog.as_mut().unwrap().busy_agents = vec![original.clone()];
+            app.project_ui.dialog.as_mut().unwrap().session_census = vec![original.clone()];
             confirm_deletion_fixture(&mut app);
             drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
             drop(app.handle_project_action(Action::ConfirmDelete));
             let changed = BusyAgent { session: if replacement { TerminalId::new() } else { original.session }, instance: original.instance, close_revision: Some(2), turn_generation: Some(4) };
-            drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), vec![changed])) }));
+            drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus { agents: vec![changed.clone()], census: vec![changed] })) }));
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
         }
@@ -3397,7 +3388,7 @@ mod tests {
     fn malformed_or_duplicate_busy_census_is_never_treated_as_idle() {
         assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::StaleLock { unlocked: false }).is_err());
         let agent = BusyAgent { session: TerminalId::new(), instance: uuid::Uuid::new_v4(), close_revision: Some(1), turn_generation: Some(1) };
-        assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone(), agent] }).is_err());
+        assert!(checked_busy_worktree_agents(crate::worktree_control::Reply::BusySessions { agents: vec![agent.clone(), agent.clone()], census: vec![agent] }).is_err());
     }
 
     #[test]
@@ -3411,14 +3402,14 @@ mod tests {
             drop(app.open_worktree_delete_dialog(target));
             let request = app.project_ui.dialog.as_ref().unwrap().request;
             drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
-            drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), vec![])) }));
+            drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), AgentCensus::default())) }));
             app.update_prepared = update; app.settings_reset_confirm = !update;
             drop(app.handle_project_action(Action::DeleteBranchChanged(true)));
             assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
             drop(app.handle_project_action(Action::BusyAgentsConfirmed(true)));
             assert!(app.project_ui.dialog.as_ref().unwrap().busy_confirmed.is_none());
             drop(app.handle_project_action(Action::ConfirmDelete));
-            drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), vec![])) }));
+            drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus::default())) }));
             assert!(!app.project_ui.is_deleting(linked.id));
             assert!(app.project_ui.dialog.is_some());
         }
@@ -4569,7 +4560,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: false,
-            result: Ok((observed.clone(), Vec::new())),
+            result: Ok((observed.clone(), AgentCensus::default())),
         }));
         assert_eq!(
             app.project_ui.focus_target(),
@@ -4583,7 +4574,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
-            result: Ok((current.clone(), Vec::new())),
+            result: Ok((current.clone(), AgentCensus::default())),
         }));
         assert!(!app.project_ui.is_deleting(linked.id));
         let dialog = app.project_ui.dialog.as_ref().unwrap();
@@ -4593,7 +4584,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request,
             confirming: true,
-            result: Ok((current, Vec::new())),
+            result: Ok((current, AgentCensus::default())),
         }));
         assert!(app.project_ui.is_deleting(linked.id));
         assert!(app.project_ui.dialog.is_none());
@@ -4625,7 +4616,7 @@ mod tests {
         drop(app.handle_project_action(Action::SafetyRead {
             request: old_request,
             confirming: true,
-            result: Ok((clean_snapshot(), Vec::new())),
+            result: Ok((clean_snapshot(), AgentCensus::default())),
         }));
         assert!(app.project_ui.dialog.as_ref().unwrap().safety.is_none());
         assert!(app.project_ui.dialog.as_ref().unwrap().loading);

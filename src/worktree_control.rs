@@ -23,7 +23,7 @@ pub enum Operation {
     },
     Inspect { repository:PathBuf, path:PathBuf },
     BusySessions { repository:PathBuf, path:PathBuf },
-    CloseSessions { repository:PathBuf, path:PathBuf, agents:Vec<BusyAgent> },
+    CloseSessions { repository:PathBuf, path:PathBuf, agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
     StaleLock { repository:PathBuf, path:PathBuf, unlock:bool },
     SetDisposableIgnoredDirectories { repository:PathBuf, path:PathBuf, directories:Vec<String> },
     GetDisposableIgnoredDirectories {repository:PathBuf,path:PathBuf},
@@ -82,7 +82,7 @@ pub enum Reply {
     Listed { worktrees: Vec<Entry> },
     Removed { path: PathBuf, branch_deleted: Option<String>, warnings:Vec<String>, branch_error:Option<String> },
     StaleLock {unlocked:bool},
-    BusySessions { agents:Vec<BusyAgent> },
+    BusySessions { agents:Vec<BusyAgent>, census:Vec<BusyAgent> },
     SessionsClosed { path:PathBuf },
     /// Repository snapshots keep their byte-exact path schema without pulling
     /// the daemon's Git/SQLite implementation into the control CLI.
