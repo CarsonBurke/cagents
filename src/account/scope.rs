@@ -36,6 +36,9 @@ impl LaunchAccountScope {
         registry: Option<&Registry>,
         homes: Option<&Homes>,
     ) -> Result<Self, String> {
+        if !cwd.is_absolute() {
+            return Err("The provider launch needs an absolute working directory for account scope".into());
+        }
         let variable = super::home_variable(provider)
             .ok_or("This provider has no attested credential-directory scope")?;
         let selected = environment(variable).filter(|value| !value.is_empty());
@@ -116,6 +119,7 @@ mod tests {
         environment.remove("CLAUDE_CONFIG_DIR");
         assert_eq!(resolve(&environment).unwrap().canonical_home, system.canonicalize().unwrap());
         assert!(LaunchAccountScope::resolve_with_registry(Provider::Omp, root.path(), |_| None, None, None).is_err());
+        assert!(LaunchAccountScope::resolve_with_registry(Provider::Claude, Path::new("relative-cwd"), |name| environment.get(name).cloned(), None, None).is_err());
     }
 
     #[test]
