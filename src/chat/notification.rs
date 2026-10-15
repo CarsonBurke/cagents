@@ -11,11 +11,22 @@ pub struct Preview {
     text: String,
     final_response: bool,
     fallback: String,
+    keep_at_start: bool,
 }
 
 impl Preview {
+    /// A decoder has just proved this buffered context belongs to the start
+    /// in the same step. Consume exactly that reset, then resume normal turn
+    /// boundaries; a later acknowledgement must not restore this older copy.
+    #[cfg(feature = "host")]
+    pub(super) fn at_observed_start(mut self) -> Self {
+        self.keep_at_start = true;
+        self
+    }
+
     pub(super) fn observe(&mut self, event: &Event) {
         match event {
+            Event::TurnStarted if std::mem::take(&mut self.keep_at_start) => {}
             Event::TurnStarted => {
                 // Claude emits its actual user item before TurnStarted in the
                 // accepted Send step. Preserve that message label while the

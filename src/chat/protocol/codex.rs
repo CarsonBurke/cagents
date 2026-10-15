@@ -2609,6 +2609,20 @@ impl Adapter for Codex {
                     }
                 }
                 if method == "turn/started" {
+                    // The observed start now proves the early stream's exact
+                    // owner. Transfer it once, before later live deltas, and
+                    // remove the saved copy so the RPC ACK cannot rewind it.
+                    if let Some(Pending::Turn { early, early_bytes, .. }) = self.pending.values_mut().find(|pending|
+                        matches!(pending, Pending::Turn { notification_revision, .. } if *notification_revision == self.notification_revision))
+                    {
+                        if let Some(context) = early.remove(turn_id) {
+                            if let Some(completed) = &context.completed {
+                                let bytes = serde_json::to_vec(completed).map_err(|error| error.to_string())?.len();
+                                *early_bytes = early_bytes.saturating_sub(bytes);
+                            }
+                            step.notification_preview = Some(context.preview.at_observed_start());
+                        }
+                    }
                     self.notification_revision = self.notification_revision.wrapping_add(1);
                     self.notification_turn = Some(turn_id.to_owned());
                     self.suggestion_turn = None;
@@ -4132,6 +4146,28 @@ mod tests {
         assert_eq!(callbacks[0].1.conversation, "Review B migration");
         assert_eq!(callbacks[0].1.preview, "Exact streamed B response.");
         assert_eq!(state.notification_content(crate::notifications::Kind::Succeeded).preview, "Exact streamed B response.");
+    }
+
+    #[test]
+    fn notification_observed_start_transfers_early_context_before_live_deltas_and_ack() {
+        let mut adapter = adapter();
+        let submitted = adapter.command(Command::Prompt { text: "B".into(), attachments: vec![], mode: PromptMode::Send }).unwrap();
+        let request = submitted.writes.iter().find(|frame| frame["method"] == "turn/start").unwrap()["id"].clone();
+        let delta = |text| json!({"method":"item/agentMessage/delta","params":{"threadId":"thread-exact","turnId":"early-b","itemId":"b-answer","delta":text}});
+        let (callbacks, state) = crate::chat::runtime::notification_frames_with_snapshot_for_test(Box::new(adapter), vec![
+            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"early-b",
+                "item":{"id":"b-user","type":"userMessage","content":[{"type":"text","text":"Review B migration"}]}}}),
+            delta("First part. "),
+            json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"inProgress","items":[]}}}),
+            delta("Second part."),
+            json!({"id":request,"result":{"turn":{"id":"early-b"}}}),
+            json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"early-b","status":"completed","items":[]}}}),
+        ], false);
+        assert_eq!(callbacks.len(), 1);
+        assert_eq!(callbacks[0].0.kind, crate::notifications::Kind::Succeeded);
+        assert_eq!(callbacks[0].1.conversation, "Review B migration");
+        assert_eq!(callbacks[0].1.preview, "First part. Second part.");
+        assert_eq!(state.notification_content(crate::notifications::Kind::Succeeded).preview, "First part. Second part.");
     }
 
     #[test]
