@@ -64,7 +64,13 @@ impl Server {
     }
     fn replace_provider(&mut self,request:Request)->Result<Process,String> {
         let context=self.actor.pinned_execution_directory(&request.working_directory)?;
-        let (mut spec,mut adapter)=chat::protocol::create(&request.source.launch)?;
+        // Adapter-owned cwd/history and initial frames must be prepared from
+        // the same verified operational context as the new provider process.
+        // The issued source recipe remains immutable in self.source.
+        let mut operational=request.source.launch.clone();
+        operational.recipe.working_directory=request.working_directory.clone();
+        operational.recipe.environment=request.environment.clone();operational.recipe.unset_environment.clear();
+        let (mut spec,mut adapter)=chat::protocol::create(&operational)?;
         if !matches!(spec.transport,TransportSpec::JsonLines) {return Err("Restart requires the same Claude stream-json transport".into());}
         spec.program=request.program;spec.arguments=request.arguments;spec.environment=request.environment;spec.unset_environment.clear();spec.working_directory=request.working_directory;spec.execution=Some(context.clone());spec.messages=self.mailbox_seal.clone();
         let mut initial=adapter.initialize()?;

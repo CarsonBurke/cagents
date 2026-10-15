@@ -516,7 +516,10 @@ impl Server {
         let proof=startup.source.proof.clone().ok_or("Retained actor launch lacks daemon proof")?;
         let boot=crate::daemon::read_boot_id().map_err(|error|error.to_string())?;
         if proof.boot_id!=boot {return Err("Retained actor launch belongs to another boot".into());}
-        let mut spec_and_adapter=chat::protocol::create(&startup.source.launch)?;
+        let mut operational=startup.source.launch.clone();
+        operational.recipe.working_directory=startup.working_directory.clone();
+        operational.recipe.environment=startup.environment.clone();operational.recipe.unset_environment.clear();
+        let mut spec_and_adapter=chat::protocol::create(&operational)?;
         if !matches!(spec_and_adapter.0.transport,TransportSpec::JsonLines) {return Err("Retained actor requires stream-json transport".into());}
         let directory=startup.directory_fd.map(|fd|unsafe {Arc::new(File::from_raw_fd(fd))});
         let mut execution=match startup.directory_identity {Some(identity)=>ExecutionContext::restored(identity),None=>ExecutionContext::new(None)};
