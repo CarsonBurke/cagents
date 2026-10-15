@@ -544,17 +544,7 @@ impl Runtime {
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
         .on_press(action(Action::Toggle(target, item.id.clone())));
-        hover::view(
-            widget::row::with_children(vec![header.into(), widget::Space::new().width(24).into()])
-                .align_y(Alignment::Center)
-                .spacing(GAP_XS)
-                .width(Length::Fill),
-            widget::container(self.message_copy(item))
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .align_x(Alignment::End)
-                .align_y(Alignment::Center),
-        )
+        hover::view(header, self.message_copy(item), GAP_XS)
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it
