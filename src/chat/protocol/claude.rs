@@ -55,14 +55,30 @@ pub(crate) fn create_from_prepared_arguments(
     prepared_arguments: &[String],
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     if launch.session_id.is_some() { return create(launch); }
-    let id = prepared_arguments.last().and_then(|argument| argument.strip_prefix("--session-id="))
+    let id = prepared_fresh_session_id(launch, prepared_arguments)?;
+    create_inner(launch, Some(&id))
+}
+
+/// The fresh identity already issued in canonical prepared argv, not a
+/// provider confirmation and never permission to resume/open its history.
+/// Parent restart custody stores this separately until the actual decoder
+/// confirms it. This pure parser is shared with the helper adapter factory.
+pub(crate) fn prepared_fresh_session_id(
+    launch: &Launch, prepared_arguments: &[String],
+) -> Result<String, String> {
+    if launch.session_id.is_some() {
+        return Err("Prepared fresh identity requires a fresh Claude launch".into());
+    }
+    let id = prepared_arguments.last()
+        .and_then(|argument| argument.strip_prefix("--session-id="))
         .ok_or("Fresh retained Claude launch lacks its prepared session identity")?;
     validate_id(id)?;
-    let prepared = create_inner(launch, Some(id))?;
-    if prepared.0.arguments != prepared_arguments {
+    let mut expected = arguments(launch)?;
+    expected.push(format!("--session-id={id}"));
+    if expected != prepared_arguments {
         return Err("Fresh retained Claude arguments differ from their prepared session contract".into());
     }
-    Ok(prepared)
+    Ok(id.to_owned())
 }
 
 fn create_inner(launch: &Launch, prepared_fresh: Option<&str>) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {

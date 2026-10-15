@@ -11,7 +11,25 @@ pub(in crate::host) struct PreparedRestart {
     identity: chat::runtime::ActorIdentity,
     source: Session,
     spec: chat::protocol::ProcessSpec,
+    // Issued in the exact prepared argv; only the real provider decoder may
+    // confirm it. A fresh source remains session_id None in restart custody.
+    expected_session_id: String,
     recovery_environment: BTreeMap<String, String>,
+}
+
+impl PreparedRestart {
+    /// Allow only the host's normal projection of THIS retained request after
+    /// actual decoder confirmation. The issued recipe/account/console and the
+    /// original helper restart envelope remain byte-for-byte unchanged.
+    fn is_confirmed_projection(&self, candidate: &Session, handle: &Handle) -> bool {
+        if handle.confirmed_session_id().as_deref() != Some(self.expected_session_id.as_str()) {
+            return false;
+        }
+        let mut projected = self.source.clone();
+        projected.launch.session_id = Some(self.expected_session_id.clone());
+        projected.native_continuity = handle.native_continuity();
+        *candidate == projected
+    }
 }
 
 /// The caller holds the exact per-chat lifecycle claim and retains `request`
@@ -43,7 +61,12 @@ pub(in crate::host) fn restart_completed(
         let ServerResponse::ChatAttached { session, .. } = session_snapshot(record) else {
             unreachable!()
         };
-        if session != *source {
+        let same_prepared_projection = cached.as_ref().is_some_and(|pending| {
+            pending.request == request && pending.identity == identity
+                && pending.source == *source
+                && pending.is_confirmed_projection(&session, &record.handle)
+        });
+        if session != *source && !same_prepared_projection {
             return Err(error(
                 "The retained restart changed the exact issued conversation or console",
             ));
@@ -59,7 +82,8 @@ pub(in crate::host) fn restart_completed(
         ));
     }
     let prepared = if let Some(cached) = cached.filter(|cached| cached.request == request) {
-        if cached.identity != identity || cached.source != *source {
+        if cached.identity != identity || (cached.source != *source
+            && !cached.is_confirmed_projection(source, &handle)) {
             return Err(error(
                 "The restart receipt belongs to another exact retained owner",
             ));
@@ -75,6 +99,11 @@ pub(in crate::host) fn restart_completed(
         let mut launch = source.launch.clone();
         chat::protocol::align_resume_identity(&mut launch).map_err(error)?;
         let (mut spec, _) = chat::protocol::create(&launch).map_err(unavailable)?;
+        let expected_session_id = match &launch.session_id {
+            Some(id) => id.clone(),
+            None => chat::protocol::claude::prepared_fresh_session_id(&launch, &spec.arguments)
+                .map_err(unavailable)?,
+        };
         if !matches!(spec.transport, chat::protocol::TransportSpec::JsonLines) {
             return Err(unavailable(
                 "Retained restart requires the same Claude stream transport",
@@ -103,6 +132,7 @@ pub(in crate::host) fn restart_completed(
             identity: identity.clone(),
             source: source.clone(),
             spec,
+            expected_session_id,
             recovery_environment: handle.restart_environment().0,
         };
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -198,7 +228,7 @@ pub(in crate::host) fn restart_completed(
     // to resolve Unknown. Lost/Accepted/error replies leave it fenced.
     super::super::source_binding::refresh(host, source.id, true)?;
     if handle.is_completed()
-        || handle.confirmed_session_id() != source.launch.session_id
+        || handle.confirmed_session_id().as_deref() != Some(prepared.expected_session_id.as_str())
         || !handle.update_activity().1
     {
         return Err(unavailable(
