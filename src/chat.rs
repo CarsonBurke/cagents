@@ -4,6 +4,7 @@ use crate::agent::{ActivityState, Provider};
 use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 pub mod annotations;
+pub mod directory_source;
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod original;
