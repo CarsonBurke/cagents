@@ -35,16 +35,44 @@ pub(crate) enum Action {
 #[derive(Clone)]
 enum Base {
     PullRequest(CheckoutTarget),
-    Commit { authority: WorktreeAuthority, head: cagents::repository::Oid },
+    Commit {
+        authority: WorktreeAuthority,
+        head: cagents::repository::Oid,
+    },
 }
 impl Base {
     fn validate(&self) -> Result<(), String> {
-        match self { Self::Commit { authority, .. } => authority.validate().map_err(|error| error.to_string()), Self::PullRequest(_) => Ok(()) }
+        match self {
+            Self::Commit { authority, .. } => {
+                authority.validate().map_err(|error| error.to_string())
+            }
+            Self::PullRequest(_) => Ok(()),
+        }
     }
-    fn authority(&self) -> Option<WorktreeAuthority> { match self { Self::Commit { authority, .. } => Some(authority.clone()), Self::PullRequest(_) => None } }
-    fn repository(&self) -> &Path { match self { Self::PullRequest(target) => &target.repository, Self::Commit { authority, .. } => authority.path() } }
-    fn head(&self) -> &cagents::repository::Oid { match self { Self::PullRequest(target) => &target.head, Self::Commit { head, .. } => head } }
-    fn branch(&self) -> String { match self { Self::PullRequest(target) => target.suggested_branch(), Self::Commit { head, .. } => format!("review/{}", &head.as_str()[..8]) } }
+    fn authority(&self) -> Option<WorktreeAuthority> {
+        match self {
+            Self::Commit { authority, .. } => Some(authority.clone()),
+            Self::PullRequest(_) => None,
+        }
+    }
+    fn repository(&self) -> &Path {
+        match self {
+            Self::PullRequest(target) => &target.repository,
+            Self::Commit { authority, .. } => authority.path(),
+        }
+    }
+    fn head(&self) -> &cagents::repository::Oid {
+        match self {
+            Self::PullRequest(target) => &target.head,
+            Self::Commit { head, .. } => head,
+        }
+    }
+    fn branch(&self) -> String {
+        match self {
+            Self::PullRequest(target) => target.suggested_branch(),
+            Self::Commit { head, .. } => format!("review/{}", &head.as_str()[..8]),
+        }
+    }
 }
 
 pub(super) struct Dialog {
@@ -89,7 +117,11 @@ impl Editor {
         self.begin_checkout_base(Base::PullRequest(target));
     }
 
-    pub(super) fn begin_commit_checkout(&mut self, authority: WorktreeAuthority, head: cagents::repository::Oid) {
+    pub(super) fn begin_commit_checkout(
+        &mut self,
+        authority: WorktreeAuthority,
+        head: cagents::repository::Oid,
+    ) {
         self.begin_checkout_base(Base::Commit { authority, head });
     }
 
@@ -154,7 +186,11 @@ impl Editor {
                     {
                         self.checkout_history_open = false;
                         self.selection_epoch = self.selection_epoch.wrapping_add(1);
-                        return Self::open(path, self.selection_epoch, self.settings.git_status_limit);
+                        return Self::open(
+                            path,
+                            self.selection_epoch,
+                            self.settings.git_status_limit,
+                        );
                     }
                 }
             }
@@ -217,9 +253,17 @@ impl Editor {
                     let result = tokio::task::spawn_blocking(move || {
                         authority.validate()?;
                         if let Some(authority) = authority.authority() {
-                            RepositoryService::system("git").with_worktree_authority(authority)
-                                .and_then(|service| service.resolve_worktree_request(&input, &cancellation)).map_err(|error| error.to_string())
-                        } else { RepositoryService::system("git").resolve_worktree_request(&input, &cancellation).map_err(|error| error.to_string()) }
+                            RepositoryService::system("git")
+                                .with_worktree_authority(authority)
+                                .and_then(|service| {
+                                    service.resolve_worktree_request(&input, &cancellation)
+                                })
+                                .map_err(|error| error.to_string())
+                        } else {
+                            RepositoryService::system("git")
+                                .resolve_worktree_request(&input, &cancellation)
+                                .map_err(|error| error.to_string())
+                        }
                     })
                     .await
                     .map_err(|e| e.to_string())
@@ -270,12 +314,26 @@ impl Editor {
                     let result = tokio::task::spawn_blocking(move || {
                         authority.validate()?;
                         if let Some(authority) = authority.authority() {
-                            let service = RepositoryService::system("git").with_worktree_authority(authority).map_err(|error| error.to_string())?;
-                            Ok(cagents::pull_request_review::checkout::create_with_service(&service, &journal.0, &request, &cancellation))
-                        } else { Ok(cagents::pull_request_review::checkout::create(&journal.0, &request, &cancellation)) }
+                            let service = RepositoryService::system("git")
+                                .with_worktree_authority(authority)
+                                .map_err(|error| error.to_string())?;
+                            Ok(cagents::pull_request_review::checkout::create_with_service(
+                                &service,
+                                &journal.0,
+                                &request,
+                                &cancellation,
+                            ))
+                        } else {
+                            Ok(cagents::pull_request_review::checkout::create(
+                                &journal.0,
+                                &request,
+                                &cancellation,
+                            ))
+                        }
                     })
                     .await
-                    .map_err(|e| e.to_string()).and_then(|result| result);
+                    .map_err(|e| e.to_string())
+                    .and_then(|result| result);
                     Message::Checkout(Action::Finished(id, result))
                 });
             }
@@ -387,9 +445,15 @@ impl Editor {
         let dialog = self.checkout_dialog.as_ref()?;
         let action = |a| Message::Checkout(a);
         let mut body = vec![
-            widget::text::title3(match &dialog.target { Base::PullRequest(_) => "Create PR worktree", Base::Commit { .. } => "Create worktree from commit" }).into(),
+            widget::text::title3(match &dialog.target {
+                Base::PullRequest(_) => "Create PR worktree",
+                Base::Commit { .. } => "Create worktree from commit",
+            })
+            .into(),
             design::caption(match &dialog.target {
-                Base::PullRequest(target) => format!("PR #{} · {}", target.number, target.head.as_str()),
+                Base::PullRequest(target) => {
+                    format!("PR #{} · {}", target.number, target.head.as_str())
+                }
                 Base::Commit { head, .. } => format!("Base commit {}", head.as_str()),
             })
             .into(),
@@ -475,37 +539,90 @@ impl Editor {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tests::{editor, git, git_fixture, open_real_git, run_tasks, sidebar_action};
+    use super::*;
 
     #[test]
     fn standalone_history_creates_real_worktree_from_captured_commit_dialog() {
-        let directory = git_fixture(); let root = directory.path();
+        let directory = git_fixture();
+        let root = directory.path();
         let private_state = tempfile::tempdir().unwrap();
         let destination = private_state.path().join("commit-checkout");
         let mut app = editor();
         app.settings_path = private_state.path().join("settings.toml");
-        app.settings.managed_worktree_directory = private_state.path().join("managed").to_string_lossy().into_owned();
-        let journal = app.load_checkout_journal(); run_tasks(&mut app, journal);
+        app.settings.managed_worktree_directory = private_state
+            .path()
+            .join("managed")
+            .to_string_lossy()
+            .into_owned();
+        let journal = app.load_checkout_journal();
+        run_tasks(&mut app, journal);
         assert!(app.checkout_journal.is_some(), "{:?}", app.checkout_error);
         let card = open_real_git(&mut app, root, None);
-        let key = app.tab(card).unwrap().navigation.active_worktree().unwrap().clone();
-        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: key.clone(), tab: sidebar::ChangesTab::History });
-        let row = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
-        sidebar_action(&mut app, SidebarAction::HistoryCommand { key, oid: row.oid.clone(), command: sidebar::HistoryCommand::NewWorktree, mainline: row.mainline, message: row.message });
+        let key = app
+            .tab(card)
+            .unwrap()
+            .navigation
+            .active_worktree()
+            .unwrap()
+            .clone();
+        sidebar_action(
+            &mut app,
+            SidebarAction::SetChangesTab {
+                key: key.clone(),
+                tab: sidebar::ChangesTab::History,
+            },
+        );
+        let row = app
+            .tab(card)
+            .unwrap()
+            .sidebar
+            .source_control
+            .as_ref()
+            .unwrap()
+            .history[0]
+            .clone();
+        sidebar_action(
+            &mut app,
+            SidebarAction::HistoryCommand {
+                key,
+                oid: row.oid.clone(),
+                command: sidebar::HistoryCommand::NewWorktree,
+                mainline: row.mainline,
+                message: row.message,
+            },
+        );
         let dialog = app.checkout_dialog.as_ref().expect("actual dialog mounted");
         assert_eq!(dialog.target.repository(), root);
         assert_eq!(dialog.target.head(), &row.oid);
         assert!(matches!(dialog.target, Base::Commit { .. }));
         assert!(app.checkout_view().is_some());
         drop(app.update(Message::Checkout(Action::Branch("history-checkout".into()))));
-        drop(app.update(Message::Checkout(Action::Destination(destination.to_string_lossy().into_owned()))));
-        let task = app.update(Message::Checkout(Action::Resolve)); run_tasks(&mut app, task);
-        assert!(app.checkout_dialog.as_ref().unwrap().request.is_some(), "{:?}", app.checkout_dialog.as_ref().unwrap().error);
-        let task = app.update(Message::Checkout(Action::Create)); run_tasks(&mut app, task);
-        assert_eq!(app.checkout_dialog.as_ref().unwrap().completed.as_deref(), Some(destination.as_path()));
+        drop(app.update(Message::Checkout(Action::Destination(
+            destination.to_string_lossy().into_owned(),
+        ))));
+        let task = app.update(Message::Checkout(Action::Resolve));
+        run_tasks(&mut app, task);
+        assert!(
+            app.checkout_dialog.as_ref().unwrap().request.is_some(),
+            "{:?}",
+            app.checkout_dialog.as_ref().unwrap().error
+        );
+        let task = app.update(Message::Checkout(Action::Create));
+        run_tasks(&mut app, task);
+        assert_eq!(
+            app.checkout_dialog.as_ref().unwrap().completed.as_deref(),
+            Some(destination.as_path())
+        );
         assert_eq!(git(&destination, &["rev-parse", "HEAD"]), row.oid.as_str());
-        assert_eq!(git(&destination, &["branch", "--show-current"]), "history-checkout");
-        assert!(app.checkout_history.iter().any(|report| report.state == WorktreeOperationState::Created));
+        assert_eq!(
+            git(&destination, &["branch", "--show-current"]),
+            "history-checkout"
+        );
+        assert!(
+            app.checkout_history
+                .iter()
+                .any(|report| report.state == WorktreeOperationState::Created)
+        );
     }
 }
