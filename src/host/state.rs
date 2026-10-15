@@ -4136,7 +4136,7 @@ mod tests {
             super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
         registry
             .apply(&ModelEdit::OpenProject {
-                checkout: None,
+                checkout: None, primary_checkout: None,
                 repository: repository.clone(),
                 name: "test".into(),
                 kind: Default::default(),

@@ -1553,7 +1553,7 @@ mod tests {
         let repository = directory.path().to_owned();
         registry
             .apply(&ModelEdit::OpenProject {
-                checkout: None,
+                checkout: None, primary_checkout: None,
                 repository: repository.clone(),
                 name: "Automation fixture".into(),
                 kind: ProjectKind::Folder,
@@ -2310,7 +2310,7 @@ mod tests {
         assert_eq!(paused.active_firing, Some(claim.firing.id));
         registry
             .apply(&ModelEdit::ReopenProject {
-                checkout: None,
+                checkout: None, primary_checkout: None,
                 repository,
                 name: "Reopened".into(),
                 kind: ProjectKind::Folder,
