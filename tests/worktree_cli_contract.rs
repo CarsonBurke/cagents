@@ -1069,8 +1069,17 @@ fn daemon_setup_recovery_requires_fresh_review_and_retains_each_explicit_run() {
         "retained setup holder must be explicitly cleaned up before retrying"
     );
     assert_eq!(fixture.setup_intent(&path)["run_id"], run.to_string());
+    let completed = client
+        .list()
+        .unwrap()
+        .into_iter()
+        .find(|terminal| terminal.session.id == session.id)
+        .expect("the completed setup terminal remains visible until explicit close");
+    assert_eq!(completed.session.launch, session.launch);
     assert_eq!(
-        client.close_terminal_checked(session.id, false).unwrap(),
+        client
+            .release_completed_terminal(completed.session, false)
+            .unwrap(),
         cagents::terminal_ipc::TerminalCloseResult::Closed
     );
     let device_service::Reply::Worktree(Reply::SetupPrepared {
