@@ -70,6 +70,109 @@ pub(super) fn migrate_names(tx: &rusqlite::Transaction<'_>) -> Result<(), String
     Ok(())
 }
 
+/// The caller has authenticated the exact live observer instance/publication
+/// stamp and owns its Immediate transaction. This is thread metadata only:
+/// preserve each latest durable pair/listener/continuity and the same token,
+/// never replace a whole source from an older HostState snapshot.
+pub(super) fn observe_owned_thread_in(
+    tx: &Transaction<'_>, before: &HostedSession, after: &HostedSession,
+) -> Result<bool, String> {
+    let (HostedSession::Chat(previous), HostedSession::Chat(current)) = (before, after) else {
+        return Err("Only the exact native actor may confirm its conversation thread".into());
+    };
+    let mut expected = previous.clone();
+    expected.launch.session_id = current.launch.session_id.clone();
+    let valid_thread = current.launch.session_id.as_ref().is_some_and(|thread|
+        !thread.trim().is_empty() && thread.len() <= 4096 && !thread.chars().any(char::is_control));
+    if &expected != current || !valid_thread
+        || !previous.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete) {
+        return Err("A thread observation cannot replace native source authority".into());
+    }
+    let patch = |source: &HostedSession| -> Result<HostedSession, String> {
+        let HostedSession::Chat(known) = source else {
+            return Err("The accepted execution no longer belongs to this native actor".into());
+        };
+        if known.id != previous.id || known.proof != previous.proof
+            || known.launch.provider != previous.launch.provider
+            || known.launch.recipe != previous.launch.recipe
+            || (known.launch.session_id != previous.launch.session_id
+                && known.launch.session_id != current.launch.session_id) {
+            return Err("The accepted native source changed before its confirmed thread observation".into());
+        }
+        let mut patched = known.clone();
+        patched.launch.session_id = current.launch.session_id.clone();
+        Ok(HostedSession::Chat(patched))
+    };
+    let id = current.id.to_string();
+    let agents = {
+        let mut query = tx.prepare("SELECT id,record,closed FROM agents WHERE session_id=?1
+            OR id IN (SELECT agent FROM agent_launches WHERE session_id=?1) LIMIT 2")
+            .map_err(|error| error.to_string())?;
+        let records = query.query_map([&id], |row| Ok((row.get::<_,String>(0)?,
+            row.get::<_,String>(1)?,row.get::<_,bool>(2)?)))
+            .map_err(|error| error.to_string())?
+            .collect::<rusqlite::Result<Vec<_>>>().map_err(|error| error.to_string())?;
+        records
+    };
+    if agents.len() > 1 { return Err("Multiple accepted owners claim this exact native session".into()); }
+    let authority: Option<String> = tx.query_row("SELECT source FROM agent_authorities WHERE session_id=?1",
+        [&id], |row| row.get(0)).optional().map_err(|error| error.to_string())?;
+    let launch: Option<(String,String)> = tx.query_row("SELECT agent,source FROM agent_launches WHERE session_id=?1",
+        [&id], |row| Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error| error.to_string())?;
+    // Validate every current tuple before updating any. A caller must still
+    // propagate every SQL error so its enclosing transaction rolls back.
+    let authority_patch = authority.as_ref().map(|encoded|
+        patch(&decode::<HostedSession>(encoded)?).and_then(|source| encode(&source))).transpose()?;
+    let launch_patch = launch.as_ref().map(|(_,encoded)|
+        patch(&decode::<HostedSession>(encoded)?).and_then(|source| encode(&source))).transpose()?;
+    let mut public_changed = false;
+    let mut agent_patch = None;
+    if let Some((agent_id,encoded,closed)) = agents.first() {
+        let mut agent: Agent = decode(encoded)?;
+        if agent.id.to_string() != *agent_id || *closed || agent.closed {
+            return Err("A retired or replaced agent cannot regain native authority".into());
+        }
+        if launch.as_ref().is_some_and(|(owner,_)| owner != agent_id) {
+            return Err("The private native launch belongs to another accepted owner".into());
+        }
+        if let Some(source) = &agent.session {
+            let patched = patch(source)?;
+            public_changed = &patched != source;
+            if public_changed {
+                agent.session = Some(patched);
+                agent_patch = Some((agent_id.clone(),encoded.clone(),encode(&agent)?));
+            }
+        } else if launch.is_none() {
+            return Err("The accepted native owner has neither its issued session nor private launch".into());
+        }
+    } else if launch.is_some() {
+        return Err("The private native launch has no accepted owner".into());
+    }
+    if let Some((agent_id,original,patched)) = agent_patch
+        && original != patched {
+        let changed = tx.execute("UPDATE agents SET record=?2 WHERE id=?1 AND record=?3 AND closed=0",
+            params![agent_id,patched,original]).map_err(|error| error.to_string())?;
+        if changed != 1 { return Err("The accepted agent changed during native thread observation".into()); }
+    }
+    if let (Some(original),Some(patched)) = (&authority,&authority_patch)
+        && original != patched {
+        let changed = tx.execute("UPDATE agent_authorities SET source=?2 WHERE session_id=?1 AND source=?3",
+            params![id,patched,original]).map_err(|error| error.to_string())?;
+        if changed != 1 { return Err("The issuing capability changed during native thread observation".into()); }
+    }
+    if let (Some((owner,original)),Some(patched)) = (&launch,&launch_patch)
+        && original != patched {
+        let changed = tx.execute("UPDATE agent_launches SET source=?3 WHERE session_id=?1 AND agent=?2 AND source=?4",
+            params![id,owner,patched,original]).map_err(|error| error.to_string())?;
+        if changed != 1 { return Err("The private launch changed during native thread observation".into()); }
+    }
+    if public_changed {
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(public_changed)
+}
+
 impl Registry {
     /// Automatic removal must also wait for durable work not yet represented
     /// by an actor, including unconfirmed launch ownership after a restart.
@@ -2507,6 +2610,141 @@ mod tests {
             accepted.run,
             "adoption never resends or settles the accepted prompt"
         );
+    }
+
+    fn confirmed_thread(source: &HostedSession) -> HostedSession {
+        let mut next = source.clone();
+        let HostedSession::Chat(chat) = &mut next else { unreachable!() };
+        chat.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        next
+    }
+
+    #[test]
+    fn owned_thread_observation_keeps_pending_launch_private_and_capability_stable() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let mut before = source();
+        let HostedSession::Chat(chat) = &mut before else { unreachable!() };
+        chat.launch.session_id = None;
+        registry.reserve_agent_launch(accepted.agent.id, &before).unwrap();
+        let token = registry.register_agent_authority(&before).unwrap();
+        let after = confirmed_thread(&before);
+        let sequence = registry.execution_sequence().unwrap();
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(!observe_owned_thread_in(&tx, &before, &after).unwrap());
+        tx.commit().unwrap();
+        assert!(registry.agent(accepted.agent.id).unwrap().session.is_none());
+        assert_eq!(registry.pending_agent_launch(accepted.agent.id).unwrap(), Some(after.clone()));
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(after.clone()));
+        assert_eq!(registry.register_agent_authority(&after).unwrap(), token);
+        assert_eq!(registry.execution_sequence().unwrap(), sequence);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+    }
+
+    #[test]
+    fn owned_thread_observation_preserves_latest_pair_and_is_idempotent() {
+        let (mut registry, _directory, accepted, pane) = console_pane_fixture();
+        let before = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+        let token = registry.register_agent_authority(&before).unwrap();
+        let crate::model::CardKind::Terminal(console) = pane.kind else { unreachable!() };
+        let mut latest = before.clone();
+        let HostedSession::Chat(chat) = &mut latest else { unreachable!() };
+        chat.terminal = Some(console);
+        chat.native_continuity = crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+        registry.adopt_authenticated_agent_session(std::slice::from_ref(&before), &latest).unwrap();
+        let old_agent = registry.agent(accepted.agent.id).unwrap();
+        let old_run = registry.agent_run(accepted.run.id).unwrap();
+        let after = confirmed_thread(&before);
+        let mut expected = latest.clone();
+        let (HostedSession::Chat(chat), HostedSession::Chat(observed)) = (&mut expected, &after) else { unreachable!() };
+        chat.launch.session_id = observed.launch.session_id.clone();
+        let sequence = registry.execution_sequence().unwrap();
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(observe_owned_thread_in(&tx, &before, &after).unwrap());
+        tx.commit().unwrap();
+        let mut expected_agent = old_agent;
+        expected_agent.session = Some(expected.clone());
+        assert_eq!(registry.agent(accepted.agent.id).unwrap(), expected_agent);
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(expected.clone()));
+        assert_eq!(registry.execution_sequence().unwrap(), sequence + 1);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), old_run);
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(!observe_owned_thread_in(&tx, &before, &after).unwrap());
+        tx.commit().unwrap();
+        assert_eq!(registry.execution_sequence().unwrap(), sequence + 1);
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn owned_thread_observation_refuses_conflicting_authority_before_any_write() {
+        for conflict in ["thread", "account", "proof", "recipe"] {
+            let (mut registry, _directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let before = source();
+            registry.bind_agent(accepted.agent.id, None, before.clone()).unwrap();
+            let token = registry.register_agent_authority(&before).unwrap();
+            let after = confirmed_thread(&before);
+            let mut unrelated = before.clone();
+            let HostedSession::Chat(chat) = &mut unrelated else { unreachable!() };
+            match conflict {
+                "thread" => chat.launch.session_id = Some("another-confirmed-thread".into()),
+                "account" => { chat.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), "/different-account".into()); }
+                "proof" => chat.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("other"),
+                "recipe" => chat.launch.recipe.arguments.push("--other-launch".into()),
+                _ => unreachable!(),
+            }
+            registry.db.execute("UPDATE agent_authorities SET source=?2 WHERE session_id=?1",
+                params![before.id().to_string(), encode(&unrelated).unwrap()]).unwrap();
+            let old_agent = registry.agent(accepted.agent.id).unwrap();
+            let sequence = registry.execution_sequence().unwrap();
+            let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+            assert!(observe_owned_thread_in(&tx, &before, &after).is_err(), "{conflict}");
+            drop(tx);
+            assert_eq!(registry.agent(accepted.agent.id).unwrap(), old_agent);
+            assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(unrelated));
+            assert_eq!(registry.execution_sequence().unwrap(), sequence);
+            assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+        }
+    }
+
+    #[test]
+    fn owned_thread_observation_rolls_back_with_its_callers_transaction() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let before = source();
+        registry.bind_agent(accepted.agent.id, None, before.clone()).unwrap();
+        let token = registry.register_agent_authority(&before).unwrap();
+        let after = confirmed_thread(&before);
+        registry.db.execute_batch("CREATE TABLE observer_fixture(thread TEXT NOT NULL) STRICT;
+            INSERT INTO observer_fixture VALUES ('old');
+            CREATE TRIGGER reject_observed_authority BEFORE UPDATE ON agent_authorities
+            BEGIN SELECT RAISE(ABORT, 'fixture rejects authority write after agent write'); END;").unwrap();
+        let old_agent = registry.agent(accepted.agent.id).unwrap();
+        let sequence = registry.execution_sequence().unwrap();
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        tx.execute("UPDATE observer_fixture SET thread='new'", []).unwrap();
+        assert!(observe_owned_thread_in(&tx, &before, &after).is_err());
+        drop(tx);
+        assert_eq!(registry.db.query_row("SELECT thread FROM observer_fixture", [], |row| row.get::<_,String>(0)).unwrap(), "old");
+        assert_eq!(registry.agent(accepted.agent.id).unwrap(), old_agent);
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(before));
+        assert_eq!(registry.execution_sequence().unwrap(), sequence);
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
+    }
+
+    #[test]
+    fn owned_thread_observation_cannot_reopen_a_retired_agent() {
+        let (mut registry, _directory, request) = fixture();
+        let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+        let before = source();
+        registry.bind_agent(accepted.agent.id, None, before.clone()).unwrap();
+        let token = registry.register_agent_authority(&before).unwrap();
+        registry.db.execute("UPDATE agents SET closed=1 WHERE id=?1", [accepted.agent.id.to_string()]).unwrap();
+        let tx = registry.db.transaction_with_behavior(TransactionBehavior::Immediate).unwrap();
+        assert!(observe_owned_thread_in(&tx, &before, &confirmed_thread(&before)).is_err());
+        drop(tx);
+        assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(before));
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), accepted.run);
     }
 
     #[test]
