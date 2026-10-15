@@ -11,6 +11,11 @@ use iced::{Event, Point, Rectangle, Size, Vector};
 use std::{cell::Cell, rc::Rc};
 
 const OVERSCAN: f32 = 600.0;
+#[cfg(test)]
+thread_local! { static CONSTRUCTED: Cell<usize> = const { Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn constructed_rows() -> usize { CONSTRUCTED.with(Cell::get) }
+
 static NEXT_COLUMN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 #[derive(Clone, Copy)]
@@ -35,6 +40,7 @@ pub(super) struct Row<'a> {
     pub aliases: Vec<Id>,
     pub anchor: bool,
     pub logical: Option<LogicalRange>,
+    pub descendants: Vec<LogicalRange>,
     rebuild: Option<Box<dyn Fn() -> Element<'a, Message> + 'a>>,
     build: Option<Box<dyn FnOnce() -> Element<'a, Message> + 'a>>,
     content: Option<Element<'a, Message>>,
@@ -47,15 +53,17 @@ impl<'a> Row<'a> {
         id: Option<Id>,
         build: impl FnOnce() -> Element<'a, Message> + 'a,
     ) -> Self {
-        Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false, logical: None, rebuild: None, build: Some(Box::new(build)), content: None }
+        Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false, logical: None, descendants: vec![], rebuild: None, build: Some(Box::new(build)), content: None }
     }
     pub fn new(key: u64, revision: u64, estimate: f32, id: Option<Id>,
         build: impl Fn() -> Element<'a, Message> + 'a) -> Self {
         Self { key, revision, estimate, aliases: id.into_iter().collect(), anchor: false,
-            logical: None, rebuild: Some(Box::new(build)), build: None, content: None }
+            logical: None, descendants: vec![], rebuild: Some(Box::new(build)), build: None, content: None }
     }
     fn element(&mut self) -> &mut Element<'a, Message> {
         if self.content.is_none() {
+            #[cfg(test)]
+            CONSTRUCTED.with(|count| count.set(count.get() + 1));
             self.content = Some(match &self.rebuild { Some(build) => build(), None => self.build.take().expect("a static row is built once")() });
         }
         self.content.as_mut().unwrap()
@@ -159,7 +167,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         state.aliased = self.rows.iter().enumerate().filter_map(|(index, row)| (!row.aliases.is_empty()).then_some(index)).collect();
         state.logical.clear();
         for (index, row) in self.rows.iter().enumerate() {
-            if let Some(logical) = &row.logical {
+            for logical in row.logical.iter().chain(&row.descendants) {
                 state.logical.entry(logical.identity).or_default().push((logical.bytes.clone(), index, logical.chunk));
             }
         }

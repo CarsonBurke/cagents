@@ -1021,12 +1021,28 @@ mod tests {
         let byte = line.len() * 1500;
         let text = prose::code_text(source, Arc::from([]), design::TEXT_BODY.into(), iced::Font::MONOSPACE,
             target, None, Some(selectable_prose::Logical { identity, start: 0 }));
+        let mut cases = vec![(text, identity, byte)];
+        let list = format!("{}{}", "prefix\n\n".repeat(4), (0..10000).map(|index| format!("- bullet {index} target\n")).collect::<String>());
+        let table = format!("{}| First | Second |\n| --- | --- |\n{}", "prefix\n\n".repeat(4),
+            (0..10000).map(|index| format!("| row {index} | target {index} |\n")).collect::<String>());
+        for (source, path) in [(list, vec![0, 4, 9999, 0]), (table, vec![0, 4, 10000, 1, 0])] {
+            let cached = CachedItem::new(&ItemContent::Text { text: source, thinking: false,
+                phase: chat::Phase::Final }, crate::settings::EditorSyntaxTheme::Auto);
+            let identity = selection::logical_identity(&format!("unbound-{}", cached.revision), &path);
+            cases.push((prose::view(&cached,
+                design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_PROSE), target, None), identity, 0));
+        }
+        for (text, identity, byte) in cases {
+        let before = virtualized::constructed_rows();
         let mut element = transcript(widget::column::with_children(vec![
-            widget::Space::new().height(10000).into(), item("answer", text)]), target, None, vec![], true, vec![]);
+            widget::Space::new().height(10000).into(), item("answer", text),
+            widget::Space::new().height(10000).into()]), target, None, vec![], true, vec![]);
         let mut tree = Tree::new(&element);
         let viewport = Rectangle::with_size(Size::new(720.0, 400.0));
         let limits = layout::Limits::new(Size::ZERO, viewport.size());
         let mut node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut SetBottom(f32::MAX));
+        node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
         let mut exact = false;
         for _ in 0..6 {
             let found = Arc::new(std::sync::Mutex::new(None));
@@ -1064,6 +1080,9 @@ mod tests {
         assert!(glyph.y >= viewport.y && glyph.y +glyph.height <= viewport.y +viewport.height);
         assert!((glyph.y +glyph.height /2.0 -viewport.y -viewport.height /2.0).abs() <= glyph.height +1.0,
             "mounted match glyph is centered: {glyph:?}, {viewport:?}");
+        assert!(virtualized::constructed_rows() - before < 1500,
+            "staged navigation must not instantiate ten thousand hidden rows");
+        }
     }
 
     #[test]

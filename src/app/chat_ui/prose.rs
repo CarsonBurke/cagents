@@ -317,6 +317,42 @@ struct Renderer {
 }
 
 impl Renderer {
+    /// Describe logical leaves without plain-text extraction, styling, widget
+    /// creation or shaping. Composite ancestors expose these aliases so Find
+    /// can realize the correct nested row before measuring its exact glyph.
+    fn logical_descendants(&self, items: &[markdown::Item]) -> Vec<virtualized::LogicalRange> {
+        let mut leaves = Vec::new();
+        for (index, item) in items.iter().enumerate() { self.child(index as u32).describe(item, &mut leaves); }
+        leaves
+    }
+    fn describe(&self, item: &markdown::Item, leaves: &mut Vec<virtualized::LogicalRange>) {
+        let length = match item {
+            markdown::Item::Heading(_, text) | markdown::Item::Paragraph(text) => Some(text.len()),
+            markdown::Item::CodeBlock { code, .. } => Some(code.len()), _ => None,
+        };
+        if let Some(length) = length {
+            leaves.push(virtualized::LogicalRange { identity: selection::logical_identity(&self.item, &self.path), bytes: 0..length, chunk: false });
+            return;
+        }
+        match item {
+            markdown::Item::Quote(items) => leaves.extend(self.logical_descendants(items)),
+            markdown::Item::List { bullets, .. } => for (index, bullet) in bullets.iter().enumerate() {
+                let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) = bullet;
+                leaves.extend(self.child(index as u32).logical_descendants(items));
+            },
+            markdown::Item::Table { columns, rows } => {
+                for (column, header) in columns.iter().enumerate() { leaves.extend(self.child(0).child(column as u32).logical_descendants(&header.header)); }
+                for (row, cells) in rows.iter().enumerate() { for (column, cells) in cells.cells.iter().enumerate() {
+                    leaves.extend(self.child(row as u32 + 1).child(column as u32).logical_descendants(cells));
+                } }
+            }
+            markdown::Item::Image { alt, title, .. } => {
+                if alt.len() > 0 { leaves.push(virtualized::LogicalRange { identity: selection::logical_identity(&self.item, &self.child(0).path), bytes: 0..alt.len(), chunk: false }); }
+                if !title.is_empty() { leaves.push(virtualized::LogicalRange { identity: selection::logical_identity(&self.item, &self.child(1).path), bytes: 0..title.len(), chunk: false }); }
+            }
+            _ => {}
+        }
+    }
     fn child(&self, index: u32) -> Self {
         let mut path = self.path.clone(); path.push(index);
         Self { item: self.item.clone(), path, find: self.find.clone(), target: self.target,
@@ -352,6 +388,7 @@ impl Renderer {
                 markdown::Item::Paragraph(text) | markdown::Item::Heading(_, text) => Some(text.len()),
                 markdown::Item::CodeBlock { code, .. } => Some(code.len()), _ => None,
             };
+            let descendants = if logical_len.is_none() { let mut leaves = Vec::new(); renderer.describe(item, &mut leaves); leaves } else { vec![] };
             let item = item.clone();
             let mut row = virtualized::Row::new(key, revision, estimate, None, move || {
                 let renderer = renderer.clone(); let item = item.clone();
@@ -359,6 +396,7 @@ impl Renderer {
                     .padding(iced::Padding::ZERO.top(if index == 0 { 0.0 } else { settings.spacing.0 })).into())
             });
             row.anchor = true;
+            row.descendants = descendants;
             row.logical = logical_len.map(|len| virtualized::LogicalRange { identity: key, bytes: 0..len, chunk: false });
             row
         }).collect();
@@ -446,9 +484,11 @@ impl Renderer {
         });
         let rows = bullets.iter().enumerate().map(|(index, bullet)| {
             let renderer = self.clone();
+            let (markdown::Bullet::Point { items } | markdown::Bullet::Task { items, .. }) = bullet;
+            let descendants = self.child(index as u32).logical_descendants(items);
             let bullet = bullet.clone();
             let key = selection::logical_identity(&self.item, &self.child(index as u32).path);
-            virtualized::Row::new(key, self.revision, 64.0 + settings.spacing.0 * 0.75, None, move || {
+            let mut descriptor = virtualized::Row::new(key, self.revision, 64.0 + settings.spacing.0 * 0.75, None, move || {
                 let (marker, items): (Element<'static, Message>, _) = match (&bullet, start) {
                     (markdown::Bullet::Point { items }, Some(start))
                     | (markdown::Bullet::Task { items, .. }, Some(start)) => (
@@ -475,7 +515,10 @@ impl Renderer {
                     selection::wrap(renderer.child(index as u32).items(items, nested), selection::Kind::ListItem(prefix))
                 ].spacing(settings.spacing.0))
                     .padding(iced::Padding::ZERO.bottom(settings.spacing.0 * 0.75)).into()
-            })
+            });
+            descriptor.descendants = descendants;
+            descriptor.anchor = true;
+            descriptor
         }).collect();
         widget::container(virtualized::column(rows, Default::default()))
             .padding(if start.is_none() { iced::Padding::ZERO.left(settings.spacing.0).right(settings.spacing.0) } else { iced::Padding::ZERO })
@@ -497,8 +540,9 @@ impl Renderer {
             .enumerate().map(|(row, cells)| {
                 let renderer = self.child(row as u32);
                 let key = selection::logical_identity(&self.item, &renderer.path);
+                let descendants = cells.iter().enumerate().flat_map(|(column, cells)| renderer.child(column as u32).logical_descendants(cells)).collect();
                 let alignments = alignments.clone();
-                virtualized::Row::new(key, self.revision, 48.0 + settings.spacing.0, None, move || {
+                let mut descriptor = virtualized::Row::new(key, self.revision, 48.0 + settings.spacing.0, None, move || {
                     widget::row::with_children(alignments.iter().enumerate().map(|(column, alignment)| {
                         let content = renderer.child(column as u32).items(
                             cells.get(column).map_or(&[][..], Vec::as_slice), settings,
@@ -507,7 +551,10 @@ impl Renderer {
                             .width(width).align_x(*alignment)
                             .padding([settings.spacing.0 / 2.0, settings.spacing.0]).into()
                     }).collect::<Vec<Element<'static, Message>>>()).into()
-                })
+                });
+                descriptor.descendants = descendants;
+                descriptor.anchor = true;
+                descriptor
             }).collect();
         let table = widget::container(virtualized::column(descriptors, Default::default()))
             .width(width * columns.len().max(1) as f32);
