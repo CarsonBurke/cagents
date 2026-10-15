@@ -123,43 +123,16 @@ fn reconcile_watch_plan(
     snapshot: &Snapshot,
     preserved: &HashSet<WorktreeId>,
 ) -> BTreeSet<WorktreeId> {
-    let roots = snapshot
-        .worktrees
-        .iter()
-        .filter(|(record, _)| !record.bare)
-        .map(|(record, _)| (record.id, &record.path))
-        .collect::<HashMap<_, _>>();
-    let replacements = previous
-        .into_iter()
-        .flat_map(|project| &project.worktrees)
-        .filter(|worktree| {
-            preserved.contains(&worktree.id)
-                && roots
-                    .get(&worktree.id)
-                    .is_some_and(|root| **root == worktree.root)
-        })
-        .collect::<Vec<_>>();
-    let replacement_ids = replacements
-        .iter()
-        .map(|worktree| worktree.id)
-        .collect::<HashSet<_>>();
-    plan.worktrees.retain(|worktree| {
-        !replacement_ids.contains(&worktree.id)
-            && roots
-                .get(&worktree.id)
-                .is_some_and(|root| **root == worktree.root)
-    });
-    plan.worktrees.extend(replacements.into_iter().cloned());
-    let covered = plan
-        .worktrees
-        .iter()
-        .map(|worktree| worktree.id)
-        .collect::<HashSet<_>>();
-    preserved
-        .iter()
-        .copied()
-        .filter(|id| roots.contains_key(id) && !covered.contains(id))
-        .collect()
+    let upstreams = snapshot.worktrees.iter().filter_map(|(record, status)| {
+        let upstream = match &status.as_ref()?.tracking {
+            crate::repository::TrackingState::Compared { upstream, .. } => Some(upstream),
+            crate::repository::TrackingState::Unknown { upstream } => upstream.as_ref(),
+            crate::repository::TrackingState::NoUpstream => None,
+        }?;
+        Some((record.id, upstream.clone()))
+    }).collect();
+    plan.reconcile_coverage(previous, snapshot.worktrees.iter().map(|(record, _)| record),
+        &preserved.iter().copied().collect(), &upstreams)
 }
 
 struct Entry {
