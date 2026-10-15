@@ -112,10 +112,11 @@ fn safe_url(text: &str) -> Option<url::Url> {
                 {
                     return None;
                 }
-                // An explicit empty file host clears both the serialization
-                // and the parsed host kind. In pinned url 2.5.8, set_host(None)
-                // leaves the previous domain kind and to_file_path rejects it.
-                url.set_host(Some("")).ok()?;
+                // Pinned url 2.5.8 clears the serialized host here but retains
+                // its parsed domain kind. Reparse that normalized serialization
+                // so file conversion sees a local URL without decoding twice.
+                url.set_host(None).ok()?;
+                url = url::Url::parse(url.as_str()).ok()?;
             }
             url.to_file_path().ok()?;
             Some(url)
