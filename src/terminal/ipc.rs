@@ -143,8 +143,8 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-/// Version 78 carries terminal provider outcomes and readable exit diagnostics.
-/// Version 79 pages immutable retained provider output by opaque log identity.
+/// Version 79 carries terminal provider outcomes, readable exit diagnostics and
+/// pages immutable retained provider output by opaque log identity.
 pub const PROTOCOL_VERSION: u16 = 79;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
