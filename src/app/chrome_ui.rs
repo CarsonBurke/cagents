@@ -255,6 +255,21 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         drop(app.sync_chrome());
         assert_eq!(app.card_chrome[&survivor].title, before);
+        assert_eq!(
+            app.chrome_ui.terminal_ordinals.len(),
+            2,
+            "retired pane IDs must not accumulate in the ordinal cache"
+        );
+        let added = super::super::tests::terminal_card_state();
+        let added_id = added.id;
+        Arc::make_mut(&mut app.durable).cards.push(added);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert!(
+            app.card_chrome[&added_id].title.ends_with("(4)"),
+            "retiring an ID must preserve the worktree's next ordinal"
+        );
+        assert_eq!(app.card_chrome[&survivor].title, before);
     }
     use super::*;
 
