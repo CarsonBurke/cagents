@@ -193,7 +193,11 @@ fn consume(
     matches: impl FnOnce(&Receipt) -> bool,
 ) -> Result<bool, String> {
     let path = path(terminal, holder)?;
-    let file = match crate::secure_file::open_existing_private_file(&path) {
+    let file = match if retain {
+        crate::secure_file::open_existing_private_file_readonly(&path)
+    } else {
+        crate::secure_file::open_existing_private_file(&path)
+    } {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error.to_string()),
@@ -234,6 +238,15 @@ pub(crate) fn closed_source(
     proof: &HostSessionProof,
 ) -> Result<Option<(Record, bool)>, String> {
     Ok(find_source(source, proof)?.map(|receipt| (receipt.record, receipt.paired_closed)))
+}
+
+/// Return the exact historical receipt proof after authenticating the current
+/// daemon lease and the complete issued source digest. Never rotate/backfill it.
+pub(crate) fn closed_source_proof(
+    source: &crate::chat::Session,
+    current_proof: &HostSessionProof,
+) -> Result<Option<HostSessionProof>, String> {
+    Ok(find_source(source, current_proof)?.map(|receipt| receipt.proof))
 }
 
 pub(crate) fn closed_pair_holder(
