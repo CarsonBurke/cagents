@@ -1615,7 +1615,7 @@ pub(super) struct Runtime {
     image_pastes_saving: usize,
     routing_refresh: bool,
     account_switch_checking: bool,
-    account_switch_checked_idle: Option<u64>,
+    account_switch_checked_observation: Option<u64>,
     account_switch_recheck: bool,
     pending_account_switch: Option<(AccountId, String)>,
     account_switch_fallback: Option<(AccountId, String)>,
@@ -2207,7 +2207,7 @@ impl Runtime {
             image_pastes_saving: 0,
             routing_refresh: false,
             account_switch_checking: false,
-            account_switch_checked_idle: None,
+            account_switch_checked_observation: None,
             account_switch_recheck: false,
             pending_account_switch: None,
             account_switch_fallback: None,
@@ -2328,6 +2328,15 @@ impl Runtime {
         runtime.snapshot = Arc::new(snapshot);
         runtime
     }
+    /// Cancel only the unadmitted waiting intent. The explicit cache-loss
+    /// continuation and original source ownership stay available.
+    fn clear_account_switch_wait(&mut self) {
+        self.pending_account_switch = None;
+        self.account_switch_checking = false;
+        self.account_switch_recheck = false;
+        self.account_switch_checked_observation = None;
+    }
+
     /// The live connection, once the conversation has started.
     fn handle(&self) -> Option<&Arc<ClientHandle>> {
         match &self.connection {
@@ -4186,11 +4195,17 @@ impl Cagents {
             }) {
                 runtime.pending_account_switch = None;
                 runtime.account_switch_fallback = None;
-                runtime.account_switch_checked_idle = None;
+                runtime.account_switch_checked_observation = None;
                 runtime.account_switch_recheck = false;
                 return Task::none();
             }
             runtime.account_switch_fallback = Some((id.clone(), account_name.clone()));
+            if runtime.disconnected {
+                runtime.clear_account_switch_wait();
+                runtime.error.get_or_insert_with(||
+                    "The account connection is unavailable. Continue as a new conversation, or reconnect the original conversation.".into());
+                return Task::none();
+            }
             if runtime.snapshot.busy
                 || runtime.snapshot.waiting
                 || runtime.pending.is_some()
@@ -4264,18 +4279,18 @@ impl Cagents {
             runtime.account_switch_recheck = false;
             return Task::none();
         };
-        let observed_idle = runtime.handle().and_then(|handle| handle.account_switch_idle_observation());
+        let observation = runtime.handle().and_then(|handle| handle.account_switch_readiness_observation());
         if runtime.account_switch_checking {
-            // A successful old busy-read may arrive after this newer idle
-            // wake. Remember one fresh observation instead of losing it.
-            if observed_idle.is_some() && observed_idle != runtime.account_switch_checked_idle {
+            // A successful old busy-read may arrive after newer readiness
+            // metadata. Preserve one query hint, never close authority.
+            if observation.is_some() && observation != runtime.account_switch_checked_observation {
                 runtime.account_switch_recheck = true;
             }
             return Task::none();
         }
         let id = id.clone();
         let source = runtime.session.clone();
-        runtime.account_switch_checked_idle = observed_idle;
+        runtime.account_switch_checked_observation = observation;
         runtime.account_switch_recheck = false;
         runtime.account_switch_checking = true;
         cosmic::task::future(async move {
@@ -6545,7 +6560,7 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.pending_account_switch = None;
                     runtime.account_switch_fallback = None;
-                    runtime.account_switch_checked_idle = None;
+                    runtime.account_switch_checked_observation = None;
                     runtime.account_switch_recheck = false;
                 }
                 return Task::none();
@@ -7421,6 +7436,7 @@ impl Cagents {
                         _ => None,
                     };
                     if let Wake::Disconnected(error) = wake {
+                        runtime.clear_account_switch_wait();
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
@@ -7522,6 +7538,7 @@ impl Cagents {
                     // Taken above, for a parked conversation too.
                     Wake::AccountUsage => return Task::none(),
                     Wake::Disconnected(error) => {
+                        runtime.clear_account_switch_wait();
                         // A first message still waiting will not be taken
                         // now, and a conversation without it holds nothing.
                         if runtime.queued.is_some() {
@@ -12338,7 +12355,7 @@ mod tests {
                     "none" => {
                         assert!(runtime.account_switch_checking, "fresh idle wake schedules one new read");
                         assert!(!runtime.account_switch_recheck);
-                        assert_eq!(runtime.account_switch_checked_idle, Some(2));
+                        assert_eq!(runtime.account_switch_checked_observation, Some(2));
                         // No newer semantic idle observation: a second busy
                         // response must quiesce instead of spinning.
                         drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
@@ -12369,7 +12386,10 @@ mod tests {
         use crate::agent::ActivityState;
         use crate::terminal_ipc::{ClientEnvelope, ClientRequest, FrameCodec, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
         use std::{os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
-        for mode in ["hidden", "parked", "starting"] {
+        for (completed, mode) in [
+            (false, "hidden"), (false, "parked"), (false, "starting"),
+            (true, "hidden"), (true, "parked"), (true, "starting"),
+        ] {
             let parked = mode == "parked";
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 450);
@@ -12407,7 +12427,7 @@ mod tests {
                     request_id: Some(start.request_id), proof: proof.clone(),
                     message: ServerMessage::Response { response: ServerResponse::ChatAttached {
                         session, snapshot: attached_snapshot, account_home: None } } }).unwrap();
-                for _ in 0..3 {
+                for _ in 0..(if completed { 4 } else { 3 }) {
                     let (state, generation) = emit_rx.recv_timeout(Duration::from_secs(5)).unwrap();
                     codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: None, proof: proof.clone(),
                         message: ServerMessage::ChatActivity { chat_id, state, generation } }).unwrap();
@@ -12442,7 +12462,7 @@ mod tests {
             let waiting = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(matches!(waiting, Wake::Activity));
             drop(app.handle_chat_ui(Action::Wake(target, waiting)));
-            assert_eq!(handle.account_switch_idle_observation(), None);
+            assert_eq!(handle.account_switch_readiness_observation(), None);
             assert!(!app.chat_runtime_mut(target).unwrap().account_switch_recheck);
             if mode == "starting" {
                 // The admission window ends while preserving the old reader;
@@ -12455,22 +12475,24 @@ mod tests {
             assert!(handle.snapshot().busy, "hidden activity never refreshed the old body snapshot");
             assert_eq!(handle.snapshot().generation, 1);
             assert_eq!(handle.snapshot().transcript_bytes(), 0);
-            assert_eq!(handle.account_switch_idle_observation(), Some(3));
+            assert_eq!(handle.account_switch_readiness_observation(), Some(3));
             drop(app.handle_chat_ui(Action::Wake(target, wake)));
             drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(runtime.account_switch_checking, "one newer hidden idle edge schedules one new read");
             assert!(!runtime.account_switch_recheck);
-            assert_eq!(runtime.account_switch_checked_idle, Some(3));
+            assert_eq!(runtime.account_switch_checked_observation, Some(3));
             assert_eq!(runtime.session, source);
             assert_eq!(runtime.composer.text(), "Preserve hidden request");
             assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
             assert!(!app.chat_start_pending(card));
             assert!(app.chat_ui.retiring.is_empty());
             // A provider may finish applying a model/permission control while
-            // remaining Idle. Its newer body-free Activity generation must
-            // survive an older still-unready query, including while parked.
-            emit_tx.send((ActivityState::Idle, 4)).unwrap();
+            // remaining Idle, or end and report Unknown. Either newer small
+            // observation must survive an older still-unready query, including
+            // while parked. Neither observation authorizes an account switch.
+            let next = if completed { ActivityState::Unknown } else { ActivityState::Idle };
+            emit_tx.send((next, 4)).unwrap();
             let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             assert!(matches!(wake, Wake::Activity));
             drop(app.handle_chat_ui(Action::Wake(target, wake)));
@@ -12478,15 +12500,141 @@ mod tests {
             drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
             let runtime = app.chat_runtime_mut(target).unwrap();
             assert!(runtime.account_switch_checking);
-            assert_eq!(runtime.account_switch_checked_idle, Some(4));
+            assert_eq!(runtime.account_switch_checked_observation, Some(4));
             assert!(!runtime.account_switch_recheck);
-            // Without another activity edge, a further None must not spin.
-            drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate, Ok(None))));
+            if completed {
+                // Even Unknown→Unknown must wake: hidden exit/settlement has
+                // no fresh body and Observed may already be coalesced.
+                emit_tx.send((ActivityState::Unknown, 5)).unwrap();
+                let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(matches!(wake, Wake::Activity));
+                drop(app.handle_chat_ui(Action::Wake(target, wake)));
+                assert!(app.chat_runtime_mut(target).unwrap().account_switch_recheck);
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(None))));
+                assert_eq!(app.chat_runtime_mut(target).unwrap().account_switch_checked_observation, Some(5));
+                // The completed source's actual RPC can refuse ownership;
+                // Unknown itself never becomes a fabricated idle generation.
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate, Err("Completed source requires explicit continuation".into()))));
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                assert!(runtime.pending_account_switch.is_none());
+                assert!(runtime.account_switch_fallback.is_some());
+                assert_eq!(runtime.session, source);
+                assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+            } else {
+                // Without another activity edge, a further None must not spin.
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate, Ok(None))));
+            }
             assert!(!app.chat_runtime_mut(target).unwrap().account_switch_checking);
+            assert!(app.chat_ui.retiring.is_empty());
             assert!(handle.snapshot().busy);
             assert_eq!(handle.snapshot().generation, 1);
             done_tx.send(()).unwrap();
             worker.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn disconnected_account_wait_uses_real_eof_and_ignores_late_query_replies() {
+        use crate::terminal_ipc::{ClientEnvelope, ClientRequest, FrameCodec, ServerEnvelope, ServerMessage, ServerResponse, PROTOCOL_VERSION};
+        use std::{os::unix::net::UnixStream, sync::mpsc, thread, time::Duration};
+        for parked in [false, true] {
+            for late_ready in [false, true] {
+                for stale_wake in [false, true] {
+                    let mut app = crate::app::tests::context_inspector_test_app(false);
+                    let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 451);
+                    let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                    let target = chat_runtime(&app, card).target;
+                    let source = chat_runtime(&app, card).session.clone();
+                    let proof = source.proof.clone().unwrap();
+                    let mut snapshot = chat_runtime(&app, card).snapshot.as_ref().clone();
+                    snapshot.busy = true;
+                    snapshot.generation = 1;
+                    let attached = snapshot.clone();
+                    let (client, mut server) = UnixStream::pair().unwrap();
+                    let (close_tx, close_rx) = mpsc::channel();
+                    let worker = thread::spawn(move || {
+                        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                        server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+                        let mut codec = FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES);
+                        let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                        assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                        codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
+                            request_id: Some(connect.request_id), proof: proof.clone(),
+                            message: ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() } } }).unwrap();
+                        let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                        let ClientRequest::ChatStart { mut session, .. } = start.request else { panic!("native start") };
+                        session.proof = Some(proof.clone());
+                        codec.write(&mut server, &ServerEnvelope { version: PROTOCOL_VERSION,
+                            request_id: Some(start.request_id), proof: proof.clone(),
+                            message: ServerMessage::Response { response: ServerResponse::ChatAttached {
+                                session, snapshot: attached, account_home: None } } }).unwrap();
+                        close_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                        server.shutdown(std::net::Shutdown::Both).unwrap();
+                    });
+                    let (wake_tx, wake_rx) = mpsc::channel();
+                    let handle = Arc::new(ClientHandle::fixture_stream(client, source.clone(), move |wake| {
+                        let _ = wake_tx.send(wake);
+                    }).unwrap());
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    runtime.connection = Connection::Live(handle.clone());
+                    runtime.snapshot = Arc::new(snapshot);
+                    runtime.replace_draft(text_editor::Content::with_text("Preserve disconnected request"));
+                    runtime.set_visible(false).unwrap();
+                    drop(app.choose_chat_account(target, alternate.clone()));
+                    drop(app.probe_queued_account_switch(target));
+                    assert!(app.chat_runtime_mut(target).unwrap().account_switch_checking);
+                    if parked {
+                        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else { panic!("chat") };
+                        app.chat_ui.parked.insert(card, runtime);
+                    }
+                    close_tx.send(()).unwrap();
+                    let wake = wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    let Wake::Disconnected(error) = wake else { panic!("actual EOF wake") };
+                    worker.join().unwrap();
+                    if stale_wake {
+                        let stale = Target { generation: target.generation.wrapping_add(1), ..target };
+                        drop(app.handle_chat_ui(Action::Wake(stale, Wake::Disconnected(error.clone()))));
+                        let runtime = app.chat_runtime_mut(target).unwrap();
+                        assert!(runtime.pending_account_switch.is_some());
+                        assert!(runtime.account_switch_checking);
+                        assert!(!runtime.disconnected);
+                    }
+                    drop(app.handle_chat_ui(Action::Wake(target, Wake::Disconnected(error))));
+                    // A delayed old query, including an old positive idle
+                    // generation, cannot recreate an intent or retire source.
+                    drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target, alternate.clone(), Ok(late_ready.then_some(2)))));
+                    let runtime = app.chat_runtime_mut(target).unwrap();
+                    assert!(runtime.disconnected);
+                    assert!(runtime.pending_account_switch.is_none());
+                    assert!(!runtime.account_switch_checking);
+                    assert!(!runtime.account_switch_recheck);
+                    assert!(runtime.account_switch_checked_observation.is_none());
+                    assert!(runtime.account_switch_fallback.is_some());
+                    assert!(runtime.error.is_some());
+                    assert_eq!(runtime.session, source);
+                    assert_eq!(runtime.composer.text(), "Preserve disconnected request");
+                    assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
+                    assert!(runtime.snapshot.busy, "EOF is not provider idle authority");
+                    assert!(!app.chat_start_pending(card));
+                    assert!(app.chat_ui.retiring.is_empty());
+                    // A new picker selection on the already disconnected,
+                    // stale-busy source must not recreate the waiting chip.
+                    drop(app.choose_chat_account(target, alternate.clone()));
+                    assert!(app.chat_runtime_mut(target).unwrap().pending_account_switch.is_none());
+                    if parked {
+                        let runtime = app.chat_ui.parked.remove(&card).unwrap();
+                        app.cards.insert(card, CardRuntime::Chat(runtime));
+                    }
+                    let action = account_continuation_from_widget(&app, target, &alternate);
+                    drop(app.handle_chat_ui(action));
+                    let added = app.workspace.focused().unwrap();
+                    assert_ne!(added, card);
+                    assert_ne!(chat_runtime(&app, added).session.id, source.id);
+                    assert_eq!(chat_runtime(&app, card).session, source);
+                    assert!(Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle));
+                    assert!(app.chat_ui.retiring.is_empty());
+                }
+            }
         }
     }
 

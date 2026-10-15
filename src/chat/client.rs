@@ -282,9 +282,12 @@ impl ActivityObservation {
         if generation < self.generation {
             return false;
         }
-        let newer_idle = generation > self.generation && state == ActivityState::Idle;
+        // Newer Idle or Unknown may settle a previously unready account
+        // query without a body publication. Both remain scheduling hints.
+        let newer_readiness = generation > self.generation
+            && matches!(state, ActivityState::Idle | ActivityState::Unknown);
         self.generation = generation;
-        if self.state == state && !newer_idle {
+        if self.state == state && !newer_readiness {
             return false;
         }
         self.state = state;
@@ -1567,7 +1570,7 @@ impl ClientHandle {
     /// Scheduling hint for a read-only daemon readiness query. This cached
     /// generation never authorizes stopping, switching or writing a provider.
     /// Borrow only control metadata, without retaining/hydrating transcript.
-    pub(crate) fn account_switch_idle_observation(&self) -> Option<u64> {
+    pub(crate) fn account_switch_readiness_observation(&self) -> Option<u64> {
         let (generation, idle) = {
             let snapshot = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
             (snapshot.generation, (snapshot.ready || snapshot.exited)
@@ -1577,6 +1580,12 @@ impl ClientHandle {
         // Hidden subscriptions receive activity metadata without a new body
         // publication. Do not consume its pending edge or hydrate snapshot.
         let activity = self.inner.activity.lock().unwrap_or_else(|p| p.into_inner());
+        if activity.generation > generation && activity.state == ActivityState::Unknown {
+            // An ended or unavailable actor can publish Unknown while its
+            // hidden body remains busy. This newer metadata only schedules
+            // one authoritative read; it proves neither idle nor retirement.
+            return Some(activity.generation);
+        }
         if activity.generation >= generation && activity.state != ActivityState::Unknown {
             return (activity.state == ActivityState::Idle).then_some(activity.generation);
         }
