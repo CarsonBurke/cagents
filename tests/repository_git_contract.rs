@@ -6066,55 +6066,133 @@ fn recovery_refuses_late_writes_during_other_batches_and_destructive_prechecks()
 #[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
-    struct SubstituteUnpacked { changed: std::sync::atomic::AtomicBool }
+    struct SubstituteUnpacked {
+        changed: std::sync::atomic::AtomicBool,
+    }
     impl ProcessExecutor for SubstituteUnpacked {
-        fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancel: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
             let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancel)?;
-            if command.arguments.iter().any(|argument| argument == "cat-file") && output.success {
-                assert!(output.stdout.is_empty(), "blob bytes must stream directly into the retained FD");
-                let cwd = command.arguments.windows(2).find(|pair| pair[0] == "-C").expect("fixed recovery command has a held cwd");
+            if command
+                .arguments
+                .iter()
+                .any(|argument| argument == "cat-file")
+                && output.success
+            {
+                assert!(
+                    output.stdout.is_empty(),
+                    "blob bytes must stream directly into the retained FD"
+                );
+                let cwd = command
+                    .arguments
+                    .windows(2)
+                    .find(|pair| pair[0] == "-C")
+                    .expect("fixed recovery command has a held cwd");
                 let path = Path::new(&cwd[1]).join("restored-blob");
                 assert_eq!(fs::metadata(&path).unwrap().len(), 4);
                 fs::remove_file(&path).unwrap();
                 fs::write(&path, b"EVIL").unwrap();
-                self.changed.store(true, std::sync::atomic::Ordering::Release);
+                self.changed
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
             Ok(output)
         }
     }
-    let Some(fixture) = Fixture::new() else { return; };
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.write("tracked.txt", b"base");
     fixture.git_in_work(&["add", "."]);
     fixture.commit("base");
     fixture.write("tracked.txt", b"work");
     let cancel = CancellationToken::default();
-    let mut receipt = fixture.service().discard_recoverable(&DiscardRequest {
-        worktree: fixture.work(), tracked: vec![PathSelection::new(path("tracked.txt"))],
-        untracked: vec![], confirmed: true,
-    }, &cancel).unwrap().recovery;
-    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base");
-    let executor = Arc::new(SubstituteUnpacked { changed: std::sync::atomic::AtomicBool::new(false) });
-    let result = RepositoryService::new("git", executor.clone()).undo_discard(&receipt, &cancel).unwrap();
+    let mut receipt = fixture
+        .service()
+        .discard_recoverable(
+            &DiscardRequest {
+                worktree: fixture.work(),
+                tracked: vec![PathSelection::new(path("tracked.txt"))],
+                untracked: vec![],
+                confirmed: true,
+            },
+            &cancel,
+        )
+        .unwrap()
+        .recovery;
+    assert_eq!(
+        fs::read(fixture.work().join("tracked.txt")).unwrap(),
+        b"base"
+    );
+    let executor = Arc::new(SubstituteUnpacked {
+        changed: std::sync::atomic::AtomicBool::new(false),
+    });
+    let result = RepositoryService::new("git", executor.clone())
+        .undo_discard(&receipt, &cancel)
+        .unwrap();
     assert!(executor.changed.load(std::sync::atomic::Ordering::Acquire));
-    assert!(!matches!(result, MutationOutcome::Applied { .. }), "{result:?}");
-    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"base");
+    assert!(
+        !matches!(result, MutationOutcome::Applied { .. }),
+        "{result:?}"
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("tracked.txt")).unwrap(),
+        b"base"
+    );
     fn preserved_artifact(directory: &Path, depth: usize) -> bool {
-        if depth > 4 { return false; }
-        fs::read_dir(directory).unwrap().filter_map(Result::ok).any(|entry| {
-            let kind = entry.file_type().unwrap();
-            (kind.is_file() && fs::read(entry.path()).is_ok_and(|bytes| bytes == b"EVIL"))
-                || (kind.is_dir() && entry.file_name() != ".git" && preserved_artifact(&entry.path(), depth + 1))
-        })
+        if depth > 4 {
+            return false;
+        }
+        fs::read_dir(directory)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|entry| {
+                let kind = entry.file_type().unwrap();
+                (kind.is_file() && fs::read(entry.path()).is_ok_and(|bytes| bytes == b"EVIL"))
+                    || (kind.is_dir()
+                        && entry.file_name() != ".git"
+                        && preserved_artifact(&entry.path(), depth + 1))
+            })
     }
-    assert!(preserved_artifact(&fixture.work(), 0), "the unexpected generated entry must be retained rather than blindly unlinked");
-    let before = receipt.entries.iter().find(|entry| entry.path == path("tracked.txt")).unwrap();
-    let cagents::repository::SavedEntry::Blob { oid, .. } = &before.before else { panic!("tracked backup required") };
-    assert_eq!(fixture.git_in_work(&["cat-file", "blob", oid.as_str()]), b"work");
-    assert!(receipt.live_recovery.is_pending(), "the unresolved file must retain live authority");
+    assert!(
+        preserved_artifact(&fixture.work(), 0),
+        "the unexpected generated entry must be retained rather than blindly unlinked"
+    );
+    let before = receipt
+        .entries
+        .iter()
+        .find(|entry| entry.path == path("tracked.txt"))
+        .unwrap();
+    let cagents::repository::SavedEntry::Blob { oid, .. } = &before.before else {
+        panic!("tracked backup required")
+    };
+    assert_eq!(
+        fixture.git_in_work(&["cat-file", "blob", oid.as_str()]),
+        b"work"
+    );
+    assert!(
+        receipt.live_recovery.is_pending(),
+        "the unresolved file must retain live authority"
+    );
     receipt.expires_unix_ms = 0;
-    assert!(receipt.can_undo(), "a live recovery cannot expire while it owns unresolved filesystem state");
-    let holding = fs::read_dir(fixture.work()).unwrap().filter_map(Result::ok)
-        .find(|entry| entry.file_type().unwrap().is_dir() && entry.file_name().as_encoded_bytes().starts_with(b".cagents-undo-")).unwrap().file_name();
+    assert!(
+        receipt.can_undo(),
+        "a live recovery cannot expire while it owns unresolved filesystem state"
+    );
+    let holding = fs::read_dir(fixture.work())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry.file_type().unwrap().is_dir()
+                && entry
+                    .file_name()
+                    .as_encoded_bytes()
+                    .starts_with(b".cagents-undo-")
+        })
+        .unwrap()
+        .file_name();
     let parked = fixture.root.path().join("parked-original");
     fs::rename(fixture.work(), &parked).unwrap();
     fs::create_dir(fixture.work()).unwrap();
@@ -6122,7 +6200,10 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
     fixture.write("tracked.txt", b"replacement");
     fs::create_dir(fixture.work().join(&holding)).unwrap();
     fs::write(fixture.work().join(&holding).join("foreign"), b"preserve").unwrap();
-    assert!(!matches!(fixture.service().undo_discard(&receipt, &cancel).unwrap(), MutationOutcome::Applied { .. }));
+    assert!(!matches!(
+        fixture.service().undo_discard(&receipt, &cancel).unwrap(),
+        MutationOutcome::Applied { .. }
+    ));
     // Explicitly resolve the unexpected entry; retry may remove only the exact
     // empty original holding using retained descriptors, never the new B path.
     for entry in fs::read_dir(parked.join(&holding)).unwrap() {
@@ -6130,13 +6211,28 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
         assert_eq!(fs::read(entry.path()).unwrap(), b"EVIL");
         fs::remove_file(entry.path()).unwrap();
     }
-    let resolution = fixture.service().resolve_discard_recovery(&receipt, &cancel).unwrap();
-    assert_eq!(resolution.remaining_paths, 1, "cleanup cannot consume the unperformed file Undo");
-    assert!(receipt.can_undo(), "remaining Undo intent resumes after successful cleanup");
+    let resolution = fixture
+        .service()
+        .resolve_discard_recovery(&receipt, &cancel)
+        .unwrap();
+    assert_eq!(
+        resolution.remaining_paths, 1,
+        "cleanup cannot consume the unperformed file Undo"
+    );
+    assert!(
+        receipt.can_undo(),
+        "remaining Undo intent resumes after successful cleanup"
+    );
     assert!(!receipt.live_recovery.is_pending());
     assert!(!receipt.live_recovery.needs_resolution());
-    assert_eq!(fs::read(fixture.work().join("tracked.txt")).unwrap(), b"replacement");
-    assert_eq!(fs::read(fixture.work().join(&holding).join("foreign")).unwrap(), b"preserve");
+    assert_eq!(
+        fs::read(fixture.work().join("tracked.txt")).unwrap(),
+        b"replacement"
+    );
+    assert_eq!(
+        fs::read(fixture.work().join(&holding).join("foreign")).unwrap(),
+        b"preserve"
+    );
     assert_eq!(fs::read(parked.join("tracked.txt")).unwrap(), b"base");
 }
 
@@ -6145,39 +6241,75 @@ fn undo_discard_refuses_a_same_size_substituted_stream_sink_and_preserves_it() {
 fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_permission_recovery() {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicBool, Ordering};
-    struct ChangeParentMode { root: PathBuf, changed: AtomicBool }
+    struct ChangeParentMode {
+        root: PathBuf,
+        changed: AtomicBool,
+    }
     impl ProcessExecutor for ChangeParentMode {
-        fn execute(&self, command: &CommandSpec, cancellation: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
             let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
-            if output.success && command.arguments.iter().any(|argument| argument == "cat-file")
+            if output.success
+                && command
+                    .arguments
+                    .iter()
+                    .any(|argument| argument == "cat-file")
                 && !self.changed.swap(true, Ordering::AcqRel)
             {
-                fs::set_permissions(self.root.join("a"), fs::Permissions::from_mode(0o711)).unwrap();
+                fs::set_permissions(self.root.join("a"), fs::Permissions::from_mode(0o711))
+                    .unwrap();
             }
             Ok(output)
         }
     }
-    let Some(fixture) = Fixture::new() else { return; };
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
     fixture.write("seed", b"initial\n");
-    fixture.git_in_work(&["add", "."]); fixture.commit("initial");
+    fixture.git_in_work(&["add", "."]);
+    fixture.commit("initial");
     fixture.write("a/one", b"first work\n");
     fixture.write("b/two", b"second work\n");
-    for directory in ["a", "b"] { fs::set_permissions(fixture.work().join(directory), fs::Permissions::from_mode(0o750)).unwrap(); }
+    for directory in ["a", "b"] {
+        fs::set_permissions(
+            fixture.work().join(directory),
+            fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+    }
     fixture.git_in_work(&["add", "--", "a/one", "b/two"]);
     let patch = fixture.git_in_work(&["diff", "--cached", "--binary"]);
     fixture.git_in_work(&["reset", "HEAD", "--", "a/one", "b/two"]);
     let cancel = CancellationToken::new();
-    let mut receipt = fixture.service().apply_patch_recoverable(&fixture.work(), &patch, true, None, &cancel).unwrap().recovery;
+    let mut receipt = fixture
+        .service()
+        .apply_patch_recoverable(&fixture.work(), &patch, true, None, &cancel)
+        .unwrap()
+        .recovery;
     assert!(!fixture.work().join("a").exists());
     assert!(!fixture.work().join("b").exists());
-    let executor = Arc::new(ChangeParentMode { root: fixture.work(), changed: AtomicBool::new(false) });
+    let executor = Arc::new(ChangeParentMode {
+        root: fixture.work(),
+        changed: AtomicBool::new(false),
+    });
     let service = RepositoryService::new("git", executor.clone());
     let first = service.undo_discard(&receipt, &cancel).unwrap();
-    let MutationOutcome::PartiallyApplied { paths, failures } = first else { panic!("partial outcome required: {first:?}"); };
+    let MutationOutcome::PartiallyApplied { paths, failures } = first else {
+        panic!("partial outcome required: {first:?}");
+    };
     assert_eq!(paths, vec![path("a/one")]);
     assert!(!failures.is_empty());
-    assert_eq!(fs::read(fixture.work().join("a/one")).unwrap(), b"first work\n");
-    assert!(!fixture.work().join("b").exists(), "remaining paths stop at the unresolved permission boundary");
+    assert_eq!(
+        fs::read(fixture.work().join("a/one")).unwrap(),
+        b"first work\n"
+    );
+    assert!(
+        !fixture.work().join("b").exists(),
+        "remaining paths stop at the unresolved permission boundary"
+    );
     assert_eq!(receipt.remaining_paths(), 1);
     assert!(receipt.live_recovery.needs_resolution());
     assert!(receipt.undo_deadline_unix_ms().is_none());
@@ -6189,11 +6321,25 @@ fn undo_discard_resolution_keeps_unattempted_paths_after_partial_restore_and_per
     assert_eq!(resolved.remaining_paths, 1);
     assert!(!receipt.live_recovery.needs_resolution());
     assert!(receipt.can_undo());
-    assert_eq!(fs::metadata(fixture.work().join("a")).unwrap().mode() & 0o7777, 0o750);
-    assert!(!fixture.work().join("b").exists(), "cleanup alone must not pretend to perform the remaining Undo");
-    assert!(matches!(service.undo_discard(&receipt, &cancel).unwrap(), MutationOutcome::Applied { paths } if paths == vec![path("b/two")]));
-    assert_eq!(fs::read(fixture.work().join("a/one")).unwrap(), b"first work\n");
-    assert_eq!(fs::read(fixture.work().join("b/two")).unwrap(), b"second work\n");
+    assert_eq!(
+        fs::metadata(fixture.work().join("a")).unwrap().mode() & 0o7777,
+        0o750
+    );
+    assert!(
+        !fixture.work().join("b").exists(),
+        "cleanup alone must not pretend to perform the remaining Undo"
+    );
+    assert!(
+        matches!(service.undo_discard(&receipt, &cancel).unwrap(), MutationOutcome::Applied { paths } if paths == vec![path("b/two")])
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("a/one")).unwrap(),
+        b"first work\n"
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("b/two")).unwrap(),
+        b"second work\n"
+    );
     assert_eq!(receipt.remaining_paths(), 0);
     assert!(!receipt.can_undo());
 }
