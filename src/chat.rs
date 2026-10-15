@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod presentation;
+pub mod annotations;
 pub mod pricing;
 
 pub const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
