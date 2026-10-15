@@ -1,5 +1,5 @@
 //! Private, bounded original-child harness for the concrete-backend contract.
-use std::{fs::{File, OpenOptions}, io::{self, Read}, os::{fd::{AsRawFd, FromRawFd}, unix::{fs::OpenOptionsExt, process::CommandExt}}, process::{Child, Command, ExitStatus, Stdio}, time::{Duration, Instant}};
+use std::{fs::{File, OpenOptions}, io::{self, Read}, os::{fd::{AsRawFd, FromRawFd}, unix::{fs::{OpenOptionsExt, PermissionsExt}, process::CommandExt}}, process::{Child, Command, ExitStatus, Stdio}, time::{Duration, Instant}};
 const CHILD: &str = "CAGENTS_BACKEND_BINDING_RESTART_FIXTURE";
 const LOG_LIMIT: u64 = 4 * 1024 * 1024;
 struct Evidence(Option<tempfile::TempDir>);
