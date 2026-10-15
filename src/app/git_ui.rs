@@ -503,7 +503,7 @@ fn read_local_with_plan(
     let git = RepositoryService::system("git");
     if change.topology {
         snapshot.worktrees = git
-            .list_worktrees(&snapshot.repository.common_dir, &cancellation)
+            .list_worktrees_for_repository(&snapshot.repository, &cancellation)
             .map_err(|error| error.to_string())?
             .into_iter()
             .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
@@ -748,7 +748,7 @@ mod tests {
         let cancellation = CancellationToken::default();
         let repository = service.discover(directory, &cancellation).unwrap();
         let worktrees = service
-            .list_worktrees(&repository.common_dir, &cancellation)
+            .list_worktrees_for_repository(&repository, &cancellation)
             .unwrap()
             .into_iter()
             .map(|record| {

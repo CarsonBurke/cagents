@@ -360,9 +360,45 @@ impl Cagents {
                     .project(&canonical)
                     .map(|project| project.kind)
             });
+        let known_checkout = self.known_project_checkout(&canonical, project_id);
+        let expected_repository = known_checkout
+            .as_ref()
+            .map(|(_, repository)| repository.clone());
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(expected_repository.as_ref().unwrap_or(&canonical))
+            .cloned();
+        let path = known_checkout.map_or(path, |(checkout, _)| checkout);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                load_project(&path, Some(project_id), cancellation, kind)
+                let path = if kind != Some(ProjectKind::Folder) {
+                    expected_repository.as_ref().map_or_else(
+                        || path.clone(),
+                        |repository| {
+                            crate::project_location::read_checkout(
+                                repository,
+                                Some(&path),
+                                primary_checkout.as_deref(),
+                            )
+                            .unwrap_or_else(|| repository.clone())
+                        },
+                    )
+                } else {
+                    path
+                };
+                let loaded = load_project(&path, Some(project_id), cancellation, kind)?;
+                if let Some(expected) = expected_repository
+                    && loaded.project.repository != expected
+                {
+                    return Err(format!(
+                        "Checkout {} belongs to {}, expected {}",
+                        path.display(),
+                        loaded.project.repository.display(),
+                        expected.display()
+                    ));
+                }
+                Ok(loaded)
             })
             .await
             .map_err(|error| format!("repository loader join failed: {error}"))

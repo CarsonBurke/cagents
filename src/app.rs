@@ -11272,8 +11272,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13441,10 +13444,28 @@ impl Application for Cagents {
                 );
                 let mut task = Task::none();
                 match result {
-                    Ok(loaded) => {
+                    Ok(mut loaded) => {
                         if self.project_ui.closed.contains(&loaded.project.repository) {
                             self.repository_generations.remove(&project_id);
                             return Task::none();
+                        }
+                        // Filesystem discovery names a new project, but a
+                        // completed read cannot rename an existing one. Use
+                        // the latest shared name after the read, including a
+                        // rename observed while it was running.
+                        let known_name = self
+                            .workspace_model
+                            .project(&loaded.project.repository)
+                            .map(|project| project.name.clone())
+                            .or_else(|| {
+                                self.sidebar_model
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.repository == loaded.project.repository)
+                                    .map(|project| project.name.clone())
+                            });
+                        if let Some(name) = &known_name {
+                            loaded.project.name.clone_from(name);
                         }
                         let pr_request = if let GitHubAvailability::Ready {
                             repository_key,
@@ -13495,6 +13516,9 @@ impl Application for Cagents {
                                         }))
                             })
                         {
+                            if known_name.is_some() {
+                                existing.name.clone_from(&loaded.project.name);
+                            }
                             // A load of that project which began after this
                             // one lists the repository more recently, whether
                             // it has landed yet or not, and it is also how a
@@ -17522,7 +17546,7 @@ fn load_repository(
         .discover(&path, &cancellation)
         .map_err(|error| error.to_string())?;
     let worktrees = service
-        .list_worktrees(&repository.common_dir, &cancellation)
+        .list_worktrees_for_repository(&repository, &cancellation)
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
