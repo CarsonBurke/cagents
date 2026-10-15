@@ -33,6 +33,9 @@ pub struct TerminalConfig {
     /// Host-verified operational cwd. Kept out of recipes and spawn options.
     #[cfg(feature = "host")]
     pub execution_directory: Option<std::sync::Arc<std::fs::File>>,
+    /// Private setup authority, retained by the holder until family cleanup.
+    #[cfg(feature = "host")]
+    pub setup_execution_lease: Option<std::sync::Arc<std::fs::File>>,
     /// Daemon-issued identity for child-agent tools, never a durable recipe.
     pub agent_authority: crate::agent_execution::Authority,
     /// Take over the terminal a previous daemon left to its holder, which
@@ -59,6 +62,8 @@ impl Default for TerminalConfig {
             execution_environment: None,
             #[cfg(feature = "host")]
             execution_directory: None,
+            #[cfg(feature = "host")]
+            setup_execution_lease: None,
             agent_authority: Default::default(),
             adoption: None,
             #[cfg(feature = "host")]

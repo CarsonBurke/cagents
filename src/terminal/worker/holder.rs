@@ -95,6 +95,8 @@ enum Request {
         /// Exactly one SCM_RIGHTS directory descriptor accompanies this spawn.
         #[serde(default)]
         anchored_directory: bool,
+        #[serde(default)]
+        setup_lease_identity: Option<(u64,u64)>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -204,9 +206,28 @@ pub(super) fn spawn_recoverable_at_directory(
     recovery: Option<Recovery>,
     directory: Option<std::sync::Arc<File>>,
 ) -> Result<Held, String> {
+    spawn_recoverable_with_authority(command, size, exits, recovery, directory, None)
+}
+
+fn setup_lease_identity(file: &File) -> Result<(u64,u64), String> {
+    let metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !metadata.is_file() || metadata.uid() != unsafe {libc::geteuid()} || metadata.nlink() != 1 || metadata.mode() & 0o077 != 0 {
+        return Err("Invalid setup execution lease descriptor".into());
+    }
+    if unsafe {libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB)} != 0 {
+        return Err(format!("Setup execution lease is unavailable: {}", io::Error::last_os_error()));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+pub(super) fn spawn_recoverable_with_authority(
+    command: CommandBuilder, size: PtySize, exits: Sender<ChildExit>, recovery: Option<Recovery>,
+    directory: Option<std::sync::Arc<File>>, setup_lease: Option<std::sync::Arc<File>>,
+) -> Result<Held,String> {
     if let Some(directory) = &directory {
         validate_execution_directory(directory)?;
     }
+    let setup_lease_identity = setup_lease.as_ref().map(|file| setup_lease_identity(file)).transpose()?;
     // Every image that can start a holder has to be able to serve as one.
     // Referencing the entry here keeps the linker from discarding it.
     std::hint::black_box(&SERVE);
@@ -255,7 +276,8 @@ pub(super) fn spawn_recoverable_at_directory(
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
-    let directory_descriptors: Vec<RawFd> = directory.iter().map(|directory| directory.as_raw_fd()).collect();
+    // Typed wire order: directory first, setup lease second.
+    let directory_descriptors: Vec<RawFd> = directory.iter().chain(setup_lease.iter()).map(|file| file.as_raw_fd()).collect();
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -268,6 +290,7 @@ pub(super) fn spawn_recoverable_at_directory(
                     size,
                     recovery,
                     anchored_directory: directory.is_some(),
+                    setup_lease_identity,
                 },
                 &directory_descriptors,
             )
@@ -1093,22 +1116,36 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery, anchored_directory, mut descriptors) = match receive::<Request>(&control) {
+    let (command, size, mut recovery, anchored_directory, setup_identity, descriptors) = match receive::<Request>(&control) {
         Ok(Some((
             Request::Spawn {
                 command,
                 size,
                 recovery,
                 anchored_directory,
+                setup_lease_identity,
             },
             descriptors,
-        ))) => (command, size, recovery, anchored_directory, descriptors),
+        ))) => (command, size, recovery, anchored_directory, setup_lease_identity, descriptors),
         _ => return 1,
     };
-    let directory = match (anchored_directory, descriptors.len()) {
-        (true, 1) => Some(File::from(descriptors.pop().expect("checked directory descriptor"))),
-        (false, 0) => None,
-        _ => return fail("terminal spawn sent the wrong working-directory descriptors".into()),
+    let expected = usize::from(anchored_directory) + usize::from(setup_identity.is_some());
+    if descriptors.len() != expected {
+        return fail("terminal spawn sent the wrong authority descriptors".into());
+    }
+    let mut descriptors = descriptors.into_iter();
+    let directory = anchored_directory.then(|| File::from(descriptors.next().expect("checked directory slot")));
+    // This exact open-file description carries the original flock. Keep it
+    // through daemon loss, adoption and verified family cleanup.
+    let _setup_execution_lease = match setup_identity {
+        Some(expected) => {
+            let file = File::from(descriptors.next().expect("checked lease slot"));
+            match setup_lease_identity(&file) {
+                Ok(actual) if actual == expected => Some(file),
+                _ => return fail("Setup execution lease descriptor identity changed".into()),
+            }
+        }
+        None => None,
     };
     if let Some(directory) = &directory {
         if let Err(error) = validate_execution_directory(directory) {
