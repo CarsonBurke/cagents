@@ -306,6 +306,9 @@ impl Cagents {
         let prepared = match result {
             Ok(prepared) => prepared,
             Err(error) => {
+                // A delayed same-run terminal must not overwrite failure of
+                // the fresh generation/intent check with its old exit status.
+                self.setup_ui.uncertain_receipts.insert(worktree.clone());
                 self.setup_ui
                     .statuses
                     .insert(worktree, WorktreeSetupStatus::Interrupted(error.clone()));
@@ -452,14 +455,19 @@ impl Cagents {
             {
                 continue;
             }
+            // A saved terminal proves its own history, not that the current
+            // checkout inherited the same creation. Wait for a verified local
+            // journal or daemon receipt even on this window's first inventory.
+            let Some(run) = self.setup_ui.expected_runs.get(path) else {
+                self.setup_ui.statuses.insert(path.clone(), WorktreeSetupStatus::Interrupted(
+                    "The saved setup terminal has no verified creation receipt for this checkout. Review setup before continuing.".into(),
+                ));
+                continue;
+            };
             // A stale retained terminal from a previous run cannot stand in
             // for the run referenced by the durable creation intent.
-            if let Some(run) = self.setup_ui.expected_runs.get(path)
-                && session
-                    .launch
-                    .environment
-                    .get("CAGENTS_WORKTREE_SETUP_ID")
-                    .is_none_or(|value| value != &run.to_string())
+            if session.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID")
+                .is_none_or(|value| value != &run.to_string())
             {
                 continue;
             }
@@ -1456,7 +1464,9 @@ mod tests {
             )],
             Vec::new(),
         ));
-        let mut session = fresh_terminal_session(LaunchRecipe::shell(path).unwrap());
+        let run = OperationId::new();
+        let mut session = fresh_terminal_session(LaunchRecipe::shell(path.clone()).unwrap());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string());
         session
             .launch
             .environment
@@ -1470,10 +1480,20 @@ mod tests {
         };
         Arc::make_mut(&mut app.durable).cards[0].kind = CardKind::Terminal(session);
         app.refresh_worktree_setup_rows();
-        assert_eq!(
-            app.sidebar_model.projects[0].worktrees[0].setup_status,
-            Some(WorktreeSetupStatus::Succeeded)
-        );
+        assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status,
+            Some(WorktreeSetupStatus::Interrupted(_))), "a retained successful terminal alone cannot prove the current checkout generation");
+        let inventory = OperationId::new();
+        app.setup_ui.receipt_requests.insert(project, (inventory, "/repo".into(), Instant::now()));
+        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), inventory, Ok((vec![crate::worktree_control::SetupReceipt {
+            path: path.clone(), creation_id: OperationId::new(), run_id: Some(run),
+            skip: false, copy_done: true, has_commands: true,
+        }], Vec::new()))));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].setup_status,
+            Some(WorktreeSetupStatus::Succeeded), "the verified current receipt can promote its exact terminal result");
+        app.setup_ui.pending.insert(path.clone(), (run, CancellationToken::new()));
+        drop(app.finish_worktree_setup(run, path.clone(), Err("The checkout generation changed".into())));
+        assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status,
+            Some(WorktreeSetupStatus::Interrupted(_))), "old success must not overwrite a failed current preparation check");
         // Reusing a checkout path must not resurrect the retained old setup
         // result instead of showing the newly reserved terminal.
         let mut next = app.durable.cards[0].clone();
@@ -1489,12 +1509,18 @@ mod tests {
             .environment
             .insert("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), "10".into());
         next.kind = CardKind::Terminal(session);
+        let next_run = OperationId::new();
+        let CardKind::Terminal(session) = &mut next.kind else { unreachable!() };
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), next_run.to_string());
         Arc::make_mut(&mut app.durable).cards.push(next);
-        app.refresh_worktree_setup_rows();
-        assert!(matches!(
-            app.sidebar_model.projects[0].worktrees[0].setup_status,
-            Some(WorktreeSetupStatus::Interrupted(_))
-        ));
+        let inventory = OperationId::new();
+        app.setup_ui.receipt_requests.insert(project, (inventory, "/repo".into(), Instant::now()));
+        drop(app.finish_worktree_setup_receipts(project, "/repo".into(), inventory, Ok((vec![crate::worktree_control::SetupReceipt {
+            path, creation_id: OperationId::new(), run_id: Some(next_run),
+            skip: false, copy_done: true, has_commands: true,
+        }], Vec::new()))));
+        assert!(matches!(app.sidebar_model.projects[0].worktrees[0].setup_status,
+            Some(WorktreeSetupStatus::Interrupted(_))));
     }
 
     #[test]
