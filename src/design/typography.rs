@@ -336,6 +336,26 @@ mod settings_typography_tests {
         let small_label = text_height(widget::text("Rename pane").into());
         let small_menu = menu_height();
         let small_root = text_height(widget::menu::root::<(), Renderer>("Pane").into());
+        let small_checkbox = text_height(crate::ui_controls::field::checkbox(false).label("Choice").into());
+        let small_toggle = text_height(crate::ui_controls::field::toggle(false).label("Choice").into());
+        let small_button = text_height(crate::ui_controls::button::secondary("Action").into());
+        let toolkit_label_height = || {
+            use cosmic::iced::advanced::widget::Operation;
+            struct Label(Option<f32>);
+            impl Operation for Label {
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+                fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                    if text == "Toolkit action" { self.0 = Some(bounds.height); }
+                }
+            }
+            let mut element: cosmic::Element<'_, ()> = widget::button::text("Toolkit action").into();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()));
+            let mut label = Label(None);
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut label);
+            label.0.expect("actual toolkit button label mounted")
+        };
+        let small_toolkit_label = toolkit_label_height();
         let explicit = text_height(widget::text("Fixed caption").size(12.0).into());
         configure_typography("", 24.0, "", 14.0);
         let large_label = text_height(widget::text("Rename pane").into());
@@ -345,6 +365,11 @@ mod settings_typography_tests {
         assert!(large_root > small_root, "actual menu roots inherit interface size");
         assert!(large_menu > small_menu, "context-menu rows grow with their labels");
         assert!(large_menu >= large_label + 8.0, "menu padding must not clip the line box");
+        assert!(text_height(crate::ui_controls::field::checkbox(false).label("Choice").into()) > small_checkbox);
+        assert!(text_height(crate::ui_controls::field::toggle(false).label("Choice").into()) > small_toggle);
+        let large_button = text_height(crate::ui_controls::button::secondary("Action").into());
+        assert!(large_button > small_button && large_button >= interface_size() + 5.0);
+        assert!(toolkit_label_height() > small_toolkit_label * 1.5, "toolkit buttons inherit interface size");
         assert_eq!(text_height(widget::text("Fixed caption").size(12.0).into()), explicit);
         configure_typography("", 13.0, "", 14.0);
     }
