@@ -99,22 +99,6 @@ pub(crate) struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    /// Pin the selected directory before an ordinary native provider starts.
-    /// The descriptor remains authoritative after a same-filesystem move;
-    /// opening a replacement at the old spelling never changes its identity.
-    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
-        use std::os::unix::fs::OpenOptionsExt;
-        crate::secure_file::reject_symlink_components(path).map_err(|error| error.to_string())?;
-        let directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(path)
-            .map_err(|error| format!("Cannot pin the selected provider directory {}: {error}", path.display()))?;
-        let context = Self::new(Some(std::sync::Arc::new(directory)));
-        context.verify_directory(path)?;
-        Ok(context)
-    }
-
     pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
         Self {
             directory,
