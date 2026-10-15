@@ -9,6 +9,20 @@ pub struct SourceKey {
     pub agent_id: Option<String>,
     pub source_id: String,
 }
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SourceMetadata {
+    pub role: super::Role,
+    pub thinking: bool,
+    pub phase: super::Phase,
+    pub at: Option<u64>,
+    pub started_at: Option<u64>,
+}
+impl SourceMetadata {
+    pub(crate) fn from_item(item:&super::Item)->Option<Self>{
+        let super::ItemContent::Text{thinking,phase,..}=&item.content else {return None;};
+        Some(Self{role:item.role,thinking:*thinking,phase:*phase,at:item.at,started_at:item.started_at})
+    }
+}
 /// Store-authored association between one visible item and original prose.
 /// Provider IDs remain opaque even when they resemble a native part suffix.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +34,7 @@ pub struct SourcePart {
     pub source_len: usize,
     /// A bounded resident child placeholder represents no original bytes.
     pub replacement: bool,
+    pub metadata: SourceMetadata,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceQuery {
@@ -40,6 +55,8 @@ pub struct SourcePage {
     pub next_offset: usize,
     pub text: String,
     pub complete: bool,
+    /// Sampled with this page; the first page binds the frozen prefix metadata.
+    pub metadata: SourceMetadata,
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SourceError {
@@ -75,7 +92,7 @@ mod tests {
         let chat_id=TerminalId::new();
         let request=ClientRequest::ChatCommand{chat_id,command:Command::LoadSource{query}};
         assert_eq!(postcard::from_bytes::<ClientRequest>(&postcard::to_stdvec(&request).unwrap()).unwrap(),request);
-        let page=SourcePage{source,epoch:17,source_len:8,offset:4,next_offset:8,text:"text".into(),complete:true};
+        let page=SourcePage{source,epoch:17,source_len:8,offset:4,next_offset:8,text:"text".into(),complete:true,metadata:SourceMetadata{role:crate::chat::Role::Assistant,thinking:false,phase:crate::chat::Phase::Final,at:Some(1),started_at:Some(1)}};
         for result in [Ok(page),Err(SourceError::NotFound),Err(SourceError::Unsupported),Err(SourceError::Changed),Err(SourceError::InvalidRange),Err(SourceError::TooLarge{source_len:SOURCE_BYTES+1,limit:SOURCE_BYTES}),Err(SourceError::Transport("closed".into()))] {
             let reply=ServerResponse::ChatSource{chat_id,result};
             assert_eq!(postcard::from_bytes::<ServerResponse>(&postcard::to_stdvec(&reply).unwrap()).unwrap(),reply);

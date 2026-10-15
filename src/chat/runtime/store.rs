@@ -87,7 +87,7 @@ pub(crate) struct Store {
     pending_child_tool: Option<child_tools::Pending>,
     child_tools_unavailable: Option<&'static str>,
     child_tools_have_revocations: bool,
-    pending_child_source: Option<(String, String, String)>,
+    pending_child_source: Option<source::PendingChildSource>,
     pub(super) source_revision: u64,
     /// Recognizes delivered messages as they enter the transcript.
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Seal>>,
@@ -1309,7 +1309,7 @@ impl Store {
                     break 'records;
                 }
                 if kind=="text" {
-                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false});
+                    source_parts.push(crate::chat::cache::SourcePart{item_id:item_id.to_string(),source:crate::chat::cache::SourceKey{agent_id:None,source_id:id.clone()},start:start0,end:end0,source_len:len0,replacement:false,metadata:crate::chat::cache::SourceMetadata::from_item(&base).unwrap()});
                 }
                 if self
                     .changed

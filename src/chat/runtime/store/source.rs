@@ -1,11 +1,17 @@
 //! Original text reads share the ingestion cache, independently of UI paging.
 use super::*;
-use crate::chat::cache::{PAGE_BYTES, SOURCE_BYTES, SourceError, SourcePage, SourceQuery};
+use crate::chat::cache::{PAGE_BYTES, SOURCE_BYTES, SourceError, SourcePage, SourceQuery, SourceMetadata};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(super) const SCHEMA: &str = "CREATE TABLE source_epochs(id TEXT PRIMARY KEY REFERENCES items(id) ON DELETE CASCADE, epoch INTEGER NOT NULL);
-CREATE TABLE child_sources(agent TEXT NOT NULL,id TEXT NOT NULL,epoch INTEGER NOT NULL,len INTEGER NOT NULL,supported INTEGER NOT NULL,PRIMARY KEY(agent,id));
+CREATE TABLE child_sources(agent TEXT NOT NULL,id TEXT NOT NULL,epoch INTEGER NOT NULL,len INTEGER NOT NULL,supported INTEGER NOT NULL,metadata BLOB NOT NULL,PRIMARY KEY(agent,id));
 CREATE TABLE child_source_chunks(agent TEXT NOT NULL,id TEXT NOT NULL,position INTEGER NOT NULL,data BLOB NOT NULL,PRIMARY KEY(agent,id,position),FOREIGN KEY(agent,id) REFERENCES child_sources(agent,id) ON DELETE CASCADE);";
+pub(super) struct PendingChildSource {
+    agent:String,
+    id:String,
+    text:String,
+    metadata:SourceMetadata,
+}
 // Unique across every Store in this daemon; deleting/recreating an ID or replacing
 // an actor cannot accidentally validate an older read from another cache.
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
@@ -42,18 +48,18 @@ impl Store {
         let mut lengths=std::collections::HashMap::new();
         for batch in wanted.chunks(128){
             let placeholders=std::iter::repeat_n("(?,?)",batch.len()).collect::<Vec<_>>().join(",");
-            let sql=format!("SELECT agent,id,len FROM child_sources WHERE supported=1 AND (agent,id) IN (VALUES {placeholders})");
+            let sql=format!("SELECT agent,id,len,metadata FROM child_sources WHERE supported=1 AND (agent,id) IN (VALUES {placeholders})");
             let mut statement=self.db.prepare(&sql).map_err(|e|e.to_string())?;
             let parameters:Vec<&dyn rusqlite::ToSql>=batch.iter().flat_map(|key|[key.agent_id.as_ref().unwrap() as &dyn rusqlite::ToSql,&key.source_id as &dyn rusqlite::ToSql]).collect();
-            let rows=statement.query_map(parameters.as_slice(),|row|Ok((SourceKey{agent_id:Some(row.get(0)?),source_id:row.get(1)?},row.get::<_,usize>(2)?))).map_err(|e|e.to_string())?;
-            for row in rows {let (key,len)=row.map_err(|e|e.to_string())?;lengths.insert(key,len);}
+            let rows=statement.query_map(parameters.as_slice(),|row|Ok((SourceKey{agent_id:Some(row.get(0)?),source_id:row.get(1)?},row.get::<_,usize>(2)?,row.get::<_,Vec<u8>>(3)?))).map_err(|e|e.to_string())?;
+            for row in rows {let (key,len,bytes)=row.map_err(|e|e.to_string())?;let metadata=postcard::from_bytes::<Option<SourceMetadata>>(&bytes).map_err(|e|e.to_string())?.ok_or("Missing original prose metadata")?;lengths.insert(key,(len,metadata));}
         }
         let mut parts=Vec::with_capacity(visible.len());
         for (key,visible_len) in visible {
             if !changed && let Some(part)=cached.get(&key){parts.push((**part).clone());continue;}
-            let Some(source_len)=lengths.get(&key).copied() else {continue;};
+            let Some((source_len,metadata))=lengths.get(&key).cloned() else {continue;};
             let replacement=source_len!=visible_len;
-            parts.push(SourcePart{item_id:key.source_id.clone(),source:key,start:0,end:if replacement{0}else{source_len},source_len,replacement});
+            parts.push(SourcePart{item_id:key.source_id.clone(),source:key,start:0,end:if replacement{0}else{source_len},source_len,replacement,metadata});
         }
         drop(cached);
         state.source_parts.retain(|part|part.source.agent_id.is_none());
@@ -68,14 +74,15 @@ impl Store {
         }
         self.flush_child_source().map_err(storage)?;
         self.flush_text().map_err(storage)?;
-        let (epoch,length,supported) = if let Some(agent)=&query.source.agent_id {
-            self.db.query_row("SELECT epoch,len,supported FROM child_sources WHERE agent=?1 AND id=?2",params![agent,query.source.source_id],|r|Ok((r.get::<_,u64>(0)?,r.get::<_,usize>(1)?,r.get::<_,bool>(2)?))).optional().map_err(storage)?.ok_or(SourceError::NotFound)?
+        let (epoch,length,metadata) = if let Some(agent)=&query.source.agent_id {
+            let (epoch,length,bytes):(u64,usize,Vec<u8>)=self.db.query_row("SELECT epoch,len,metadata FROM child_sources WHERE agent=?1 AND id=?2",params![agent,query.source.source_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(storage)?.ok_or(SourceError::NotFound)?;
+            (epoch,length,postcard::from_bytes::<Option<SourceMetadata>>(&bytes).map_err(storage)?)
         } else {
             let (epoch,length,metadata): (u64,usize,Vec<u8>) = self.db.query_row("SELECT source_epochs.epoch,items.len0,items.metadata FROM items JOIN source_epochs USING(id) WHERE items.id=?1",[&query.source.source_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(storage)?.ok_or(SourceError::NotFound)?;
             let item: Item=postcard::from_bytes(&metadata).map_err(storage)?;
-            (epoch,length,matches!(item.content,ItemContent::Text{..}))
+            (epoch,length,SourceMetadata::from_item(&item))
         };
-        if !supported { return Err(SourceError::Unsupported); }
+        let metadata=metadata.ok_or(SourceError::Unsupported)?;
         if query.expected_epoch.is_some_and(|expected|expected!=epoch) { return Err(SourceError::Changed); }
         let until=query.until.unwrap_or(length);
         if until>length || query.offset>until { return Err(SourceError::InvalidRange); }
@@ -99,34 +106,38 @@ impl Store {
         if valid==0 && query.offset<until {return Err(SourceError::InvalidRange);}
         let next_offset=query.offset+valid;
         let text=String::from_utf8(bytes[..valid].to_vec()).map_err(storage)?;
-        Ok(SourcePage{source:query.source,epoch,source_len:until,offset:query.offset,next_offset,text,complete:next_offset==until})
+        Ok(SourcePage{source:query.source,epoch,source_len:until,offset:query.offset,next_offset,text,complete:next_offset==until,metadata})
     }
 
     fn flush_child_source(&mut self)->Result<(),String>{
-        if let Some((agent,id,delta))=self.pending_child_source.take(){
-            if let Err(error)=self.append_child_source(&agent,&id,&delta){
-                self.pending_child_source=Some((agent,id,delta));
-                return Err(error);
-            }
+        if let Some(pending)=self.pending_child_source.take(){
+            if let Err(error)=self.append_child_source(&pending){self.pending_child_source=Some(pending);return Err(error);}
         }
         Ok(())
     }
-    fn append_child_source(&mut self,id:&str,item_id:&str,delta:&str)->Result<(),String>{
-                let tx=self.db.transaction().map_err(|e|e.to_string())?;
-                let existing:Option<(usize,bool)>=tx.query_row("SELECT len,supported FROM child_sources WHERE agent=?1 AND id=?2",params![id,item_id],|r|Ok((r.get(0)?,r.get(1)?))).optional().map_err(|e|e.to_string())?;
-                let length=match existing {
-                    Some((_,false))=>return Ok(()),
-                    Some((length,true))=>length,
-                    None=>{tx.execute("INSERT INTO child_sources VALUES(?1,?2,?3,0,1)",params![id,item_id,epoch()?]).map_err(|e|e.to_string())?;0}
-                };
-                let end=length.checked_add(delta.len()).ok_or("Child source length overflow")?;
-                tx.execute("UPDATE child_sources SET len=?3 WHERE agent=?1 AND id=?2",params![id,item_id,end]).map_err(|e|e.to_string())?;
-                if length<SOURCE_BYTES {
-                    let mut keep=(SOURCE_BYTES-length).min(delta.len());
-                    while !delta.is_char_boundary(keep) {keep-=1;}
-                    child_chunks(&tx,id,item_id,length,&delta[..keep])?;
-                }
-                tx.commit().map_err(|e|e.to_string())?;
+    fn append_child_source(&mut self,pending:&PendingChildSource)->Result<(),String>{
+        let (id,item_id,delta)=(&pending.agent,&pending.id,pending.text.as_str());
+        let tx=self.db.transaction().map_err(|e|e.to_string())?;
+        let existing:Option<(usize,bool,Vec<u8>)>=tx.query_row("SELECT len,supported,metadata FROM child_sources WHERE agent=?1 AND id=?2",params![id,item_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(|e|e.to_string())?;
+        let (length,mut metadata)=match existing {
+            Some((_,false,_))=>return Ok(()),
+            Some((length,true,bytes))=>(length,postcard::from_bytes::<Option<SourceMetadata>>(&bytes).map_err(|e|e.to_string())?.ok_or("Missing original prose metadata")?),
+            None=>{
+                let metadata=postcard::to_stdvec(&Some(pending.metadata.clone())).map_err(|e|e.to_string())?;
+                tx.execute("INSERT INTO child_sources(agent,id,epoch,len,supported,metadata) VALUES(?1,?2,?3,0,1,?4)",params![id,item_id,epoch()?,metadata]).map_err(|e|e.to_string())?;
+                (0,pending.metadata.clone())
+            }
+        };
+        metadata.at=pending.metadata.at;
+        metadata.started_at=metadata.started_at.or(pending.metadata.started_at);
+        let metadata=postcard::to_stdvec(&Some(metadata)).map_err(|e|e.to_string())?;
+        let end=length.checked_add(delta.len()).ok_or("Child source length overflow")?;
+        tx.execute("UPDATE child_sources SET len=?3,metadata=?4 WHERE agent=?1 AND id=?2",params![id,item_id,end,metadata]).map_err(|e|e.to_string())?;
+        if length<SOURCE_BYTES {
+            let mut keep=(SOURCE_BYTES-length).min(delta.len());while !delta.is_char_boundary(keep) {keep-=1;}
+            child_chunks(&tx,id,item_id,length,&delta[..keep])?;
+        }
+        tx.commit().map_err(|e|e.to_string())?;
         Ok(())
     }
 
@@ -136,23 +147,27 @@ impl Store {
             Event::SubagentItem{id,item}=>{
                 if id.len()>METADATA_LIMIT || item.id.len()>METADATA_LIMIT {return Ok(());}
                 let text=match &item.content {ItemContent::Text{text,..}=>Some(text.as_str()),_=>None};
-                let was_text:bool=self.db.query_row("SELECT supported FROM child_sources WHERE agent=?1 AND id=?2",params![id,item.id],|row|row.get(0)).optional().map_err(|e|e.to_string())?.unwrap_or(false);
-                if text.is_some() || was_text {self.source_changed()?;}
+                let previous:Option<(bool,Vec<u8>)>=self.db.query_row("SELECT supported,metadata FROM child_sources WHERE agent=?1 AND id=?2",params![id,item.id],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|e|e.to_string())?;
+                let old_metadata=previous.as_ref().map(|(_,bytes)|postcard::from_bytes::<Option<SourceMetadata>>(bytes).map_err(|e|e.to_string())).transpose()?.flatten();
+                if text.is_some() || previous.as_ref().is_some_and(|(supported,_)|*supported) {self.source_changed()?;}
+                let metadata=SourceMetadata::from_item(item).map(|mut metadata|{let at=observed_at();metadata.at=at;metadata.started_at=old_metadata.and_then(|old|old.started_at.or(old.at)).or(at);metadata});
+                let metadata=postcard::to_stdvec(&metadata).map_err(|e|e.to_string())?;
                 let tx=self.db.transaction().map_err(|e|e.to_string())?;
-                tx.execute("INSERT INTO child_sources VALUES(?1,?2,?3,?4,?5) ON CONFLICT(agent,id) DO UPDATE SET epoch=excluded.epoch,len=excluded.len,supported=excluded.supported",params![id,item.id,epoch()?,text.map_or(0,str::len),text.is_some()]).map_err(|e|e.to_string())?;
+                tx.execute("INSERT INTO child_sources(agent,id,epoch,len,supported,metadata) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(agent,id) DO UPDATE SET epoch=excluded.epoch,len=excluded.len,supported=excluded.supported,metadata=excluded.metadata",params![id,item.id,epoch()?,text.map_or(0,str::len),text.is_some(),metadata]).map_err(|e|e.to_string())?;
                 tx.execute("DELETE FROM child_source_chunks WHERE agent=?1 AND id=?2",params![id,item.id]).map_err(|e|e.to_string())?;
                 if let Some(text)=text.filter(|text|text.len()<=SOURCE_BYTES){child_chunks(&tx,id,&item.id,0,text)?;}
                 tx.commit().map_err(|e|e.to_string())?;
             }
-            Event::SubagentTextDelta{id,item_id,delta,..}=>{
+            Event::SubagentTextDelta{id,item_id,role,thinking,delta}=>{
                 if id.len()>METADATA_LIMIT || item_id.len()>METADATA_LIMIT {return Ok(());}
                 if !delta.is_empty() {self.source_changed()?;}
-                if self.pending_child_source.as_ref().is_some_and(|pending|pending.0!=*id || pending.1!=*item_id || pending.2.len().saturating_add(delta.len())>64*1024) {
+                if self.pending_child_source.as_ref().is_some_and(|pending|pending.agent!=*id || pending.id!=*item_id || pending.metadata.role!=*role || pending.metadata.thinking!=*thinking || pending.text.len().saturating_add(delta.len())>64*1024) {
                     self.flush_child_source()?;
                 }
-                if delta.len()>64*1024 {self.append_child_source(id,item_id,delta)?;}
-                else if let Some(pending)=&mut self.pending_child_source {pending.2.push_str(delta);}
-                else {self.pending_child_source=Some((id.clone(),item_id.clone(),delta.clone()));}
+                let at=observed_at();
+                if delta.len()>64*1024 {self.append_child_source(&PendingChildSource{agent:id.clone(),id:item_id.clone(),text:delta.clone(),metadata:SourceMetadata{role:*role,thinking:*thinking,phase:Phase::Final,at,started_at:at}})?;}
+                else if let Some(pending)=&mut self.pending_child_source {pending.text.push_str(delta);pending.metadata.at=at;}
+                else {self.pending_child_source=Some(PendingChildSource{agent:id.clone(),id:item_id.clone(),text:delta.clone(),metadata:SourceMetadata{role:*role,thinking:*thinking,phase:Phase::Final,at,started_at:at}});}
             }
             Event::SubagentItemsRemoved{id,ids}=>{for source in ids {
                 let supported:bool=self.db.query_row("SELECT supported FROM child_sources WHERE agent=?1 AND id=?2",params![id,source],|row|row.get(0)).optional().map_err(|e|e.to_string())?.unwrap_or(false);
@@ -225,7 +240,9 @@ mod tests {
     fn child_placeholder_metadata_names_original_text_without_fake_byte_ranges() {
         let mut store=Store::new().unwrap();
         let text="original".repeat(20_000);
-        store.apply(Event::SubagentItem{id:"child".into(),item:item("opaque:native-part:1:text:0-3:0-0",&text)}).unwrap();
+        let mut original=item("opaque:native-part:1:text:0-3:0-0",&text);
+        if let ItemContent::Text{thinking,phase,..}=&mut original.content {*thinking=true;*phase=Phase::Commentary;}
+        store.apply(Event::SubagentItem{id:"child".into(),item:original}).unwrap();
         let mut state=crate::chat::Snapshot::default();
         state.subagents.push(crate::chat::Subagent{id:"child".into(),items:vec![std::sync::Arc::new(item("opaque:native-part:1:text:0-3:0-0","[placeholder]"))],kind:String::new(),description:String::new(),status:crate::chat::ToolStatus::Running,background:false,model:None,waiting:false,detail:String::new()});
         store.publish_source_parts(&mut state).unwrap();
@@ -234,6 +251,10 @@ mod tests {
         assert_eq!((part.start,part.end,part.source_len),(0,0,text.len()));
         assert_eq!(part.source.agent_id.as_deref(),Some("child"));
         assert_eq!(part.source.source_id,"opaque:native-part:1:text:0-3:0-0");
+        assert!(part.metadata.thinking);assert_eq!(part.metadata.phase,Phase::Commentary);
+        assert!(part.metadata.at.is_some());assert_eq!(part.metadata.at,part.metadata.started_at);
+        let page=store.source_page(query(Some("child"),&part.source.source_id)).unwrap();
+        assert_eq!(page.metadata,part.metadata);assert_eq!(page.text,text);
         let before=state.source_parts.clone();
         store.publish_source_parts(&mut state).unwrap();assert_eq!(state.source_parts,before);
     }
@@ -296,7 +317,7 @@ mod tests {
             store.apply(Event::SubagentTextDelta{id:"child".into(),item_id:"text".into(),role:Role::Assistant,thinking:false,delta:"é".into()}).unwrap();
         }
         assert_eq!(store.db.query_row("SELECT COUNT(*) FROM child_sources",[],|row|row.get::<_,usize>(0)).unwrap(),0);
-        assert_eq!(store.pending_child_source.as_ref().unwrap().2.len(),2048);
+        assert_eq!(store.pending_child_source.as_ref().unwrap().text.len(),2048);
         let page=store.source_page(query(Some("child"),"text")).unwrap();
         assert_eq!(page.text,"é".repeat(1024));
         assert!(store.pending_child_source.is_none());
