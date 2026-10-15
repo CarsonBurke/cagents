@@ -532,8 +532,11 @@ mod tests {
         fs::rename(&admin, &moved).unwrap();
         fs::create_dir(&admin).unwrap();
         let creation = OperationId::new();
-        record_creation_identity(&original, creation).unwrap();
+        assert!(record_creation_identity(&original, creation).is_err(),
+            "replacement of the named admin prevents initializing execution authority");
         assert!(worktree_setup_marker_matches(&moved, creation).unwrap());
+        assert!(!moved.join("cagents-setup-execution").exists());
+        assert!(!admin.join("cagents-setup-execution").exists());
         assert!(
             !worktree_setup_marker_matches(&admin, creation).unwrap(),
             "an asynchronous callback cannot initialize the replacement generation"
