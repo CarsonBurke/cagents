@@ -60,6 +60,9 @@ pub enum Operation {
         root: PathBuf,
         operation: GitOperation,
     },
+    Settings {
+        operation: crate::settings::commands::Operation,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -112,6 +115,7 @@ pub enum Reply {
     SavedUnconfirmed {
         error: String,
     },
+    Settings(#[serde(with = "wire_json")] serde_json::Value),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -169,6 +173,10 @@ pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::Settings { operation } => {
+            let path = crate::settings::default_path().map_err(|e| e.to_string())?;
+            crate::settings::commands::execute(&path, operation).map(Reply::Settings)
+        }
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
         }
@@ -1532,6 +1540,7 @@ mod wire_tests {
             Reply::AccountProbe(json.clone()),
             Reply::AccountRegistry(json.clone()),
             Reply::AccountLifecycle(json.clone()),
+            Reply::Settings(json.clone()),
         ] {
             roundtrip(&reply);
             let diagnostic = serde_json::to_value(&reply).unwrap();
@@ -1545,6 +1554,7 @@ mod wire_tests {
         }
         for request in [
             Operation::AccountsRead,
+            Operation::Settings { operation: crate::settings::commands::Operation::Set { key: "terminal_font_size".into(), value: "15".into() } },
             Operation::AccountsCache {
                 reports: json.clone(),
             },

@@ -1,3 +1,4 @@
+pub mod commands;
 use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
