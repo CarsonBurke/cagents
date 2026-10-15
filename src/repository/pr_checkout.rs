@@ -151,6 +151,10 @@ impl ExistingPrCheckoutPlan {
     }
 }
 
+/// Point-in-time branch, source and tracking evidence for opening a checkout.
+/// This is not a process-family exit certificate or cleanup authorization.
+/// Children closing inherited authority can remain untracked owned writers;
+/// their containment/protection is a separate lifecycle composition contract.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedPrCheckout {
     disposition: PrCheckoutDisposition,
