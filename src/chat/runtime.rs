@@ -455,18 +455,18 @@ impl Handle {
                 // EOF, parse failure and panic bypass the normal stop branch.
                 // Retire only inputs the adapter proves were held locally; a
                 // written prompt's missing reply is never non-execution proof.
-                match actor.adapter.discard_undispatched() {
-                    Ok(Some(mut discarded)) => {
+                let held_cleanup=std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    if let Some(mut discarded)=actor.adapter.discard_undispatched()? {
                         if !discarded.writes.is_empty() {
                             tracing::warn!("ignored provider writes during local held-input retirement");
                             discarded.writes.clear();
                         }
-                        if let Err(error)=actor.step(discarded) {
-                            tracing::warn!(%error,"held original retirement could not fully publish during teardown");
-                        }
+                        actor.step(discarded)?;
                     }
-                    Ok(None)=>{},
-                    Err(error)=>tracing::warn!(%error,"held original retirement unavailable during teardown"),
+                    Ok::<(),String>(())
+                })).unwrap_or_else(|_|Err("adapter panicked during held-input retirement".into()));
+                if let Err(error)=held_cleanup {
+                    tracing::warn!(%error,"held original retirement could not fully publish during teardown");
                 }
                 let unexpected_loss = result.is_err() && !actor.stop.load(Ordering::Acquire);
                 let preserve_holder = actor
