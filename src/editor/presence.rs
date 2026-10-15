@@ -212,53 +212,48 @@ fn version(metadata: &fs::Metadata) -> (u64, u32, u32, u32, i64, i64, i64, i64) 
     )
 }
 
-/// Private metadata staging requires ownership established before its public
-/// name is published. Existing/unverified roots never authorize chmod or cleanup.
-fn create_private_holding(namespace_root: &Root, parent: &Root) -> Result<fs_safety::DirectoryPublication, FileIoError> {
-    let namespace = fs_safety::DirectoryNamespace::acquire(namespace_root).map_err(io_error)?;
-    let name = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
-    let creation = fs_safety::create_directory_in_namespace(&namespace, parent, Path::new(&name), 0o700).map_err(resolve_error)?;
-    let mut publication = match creation {
-        fs_safety::DirectoryCreation::Published(publication) => publication,
-        fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io("The editor holding directory already exists; its permissions and contents were preserved.".into())),
-        fs_safety::DirectoryCreation::Unverified { reason, .. } => return Err(FileIoError::Io(format!("The editor holding directory could not be verified; its permissions and contents were preserved: {reason}"))),
+#[path = "presence_holding.rs"]
+mod presence_holding;
+use presence_holding::PresenceHolding;
+
+fn put_back_acquired_file(mut holding: PresenceHolding, error: FileIoError) -> FileIoError {
+    holding.restore_original = true;
+    holding.finish_error(error)
+}
+
+fn combine_recovery_errors(first: FileIoError, second: FileIoError) -> FileIoError {
+    let authority = match (first.recovery_authority(), second.recovery_authority()) {
+        (Some(a), Some(b)) => Some(a.clone().combine(b.clone())),
+        (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+        (None, None) => None,
     };
-    let checked = (|| {
-        if let Some(error) = publication.publication_error() {
-            let retained = publication.pending_staging_path().map(|path| format!(" Diagnostic retained staging spelling: {}.", path.display())).unwrap_or_default();
-            return Err(FileIoError::Io(format!("Could not finish private editor staging: {error}.{retained}")));
-        }
-        // Only Published carries the prepublication inode. Repairing a
-        // restrictive umask here never chmods an Existing/Unverified target.
-        fs_safety::set_directory_permissions(publication.directory(), 0o700).map_err(io_error)?;
-        if publication.directory().metadata().map_err(io_error)?.mode() & 0o777 != 0o700 {
-            return Err(FileIoError::Io("The editor metadata directory is not private.".into()));
-        }
-        Ok(())
-    })();
-    if let Err(error) = checked { return Err(with_holding_cleanup(error, &mut publication)); }
-    Ok(publication)
+    let message = format!("{first} {second}");
+    match authority { Some(authority) => FileIoError::Recovery { message, authority }, None => FileIoError::Io(message) }
 }
-
-fn cleanup_private_holding(publication: &mut fs_safety::DirectoryPublication) -> Result<(), FileIoError> {
-    publication.cleanup_empty().map_err(|error| {
-        let retained = publication.recovery_path().map(|path| format!(" Diagnostic retained recovery spelling: {}.", path.display())).unwrap_or_default();
-        FileIoError::Io(format!("{error}{retained}"))
-    })
-}
-
-fn with_holding_cleanup(error: FileIoError, publication: &mut fs_safety::DirectoryPublication) -> FileIoError {
-    match cleanup_private_holding(publication) {
-        Ok(()) => error,
-        Err(cleanup) => FileIoError::Io(format!("{error} Could not clean the editor holding directory: {cleanup}")),
+fn recovery_durability(error: FileIoError, prefix: &str) -> SaveDurability {
+    let message = format!("{prefix} {error}");
+    match error.recovery_authority() {
+        Some(authority) => SaveDurability::Recovery { error: message, authority: authority.clone() },
+        None => SaveDurability::Unconfirmed { error: message },
     }
 }
 
-fn put_back_acquired_file(holding: &Root, publication: &mut fs_safety::DirectoryPublication, parent: &Root, name: &std::ffi::OsStr, error: FileIoError) -> FileIoError {
-    match fs_safety::rename_new_between(holding, std::ffi::OsStr::new("file"), parent, name) {
-        Ok(()) => with_holding_cleanup(FileIoError::Io(format!("{error} The acquired file was put back without replacing newer work.")), publication),
-        Err(restore) => FileIoError::Io(format!("{error} The acquired file remains in the retained holding directory {}: {restore}; newer destination contents were left intact.", holding.path().display())),
-    }
+fn combine_durability(first: SaveDurability, second: SaveDurability) -> SaveDurability {
+    if matches!(first, SaveDurability::Durable) { return second; }
+    if matches!(second, SaveDurability::Durable) { return first; }
+    let message = |value: &SaveDurability| match value {
+        SaveDurability::Durable => "".to_owned(),
+        SaveDurability::Unconfirmed { error } | SaveDurability::Recovery { error, .. } => error.clone(),
+    };
+    let first_error = match first.recovery_authority() {
+        Some(authority) => FileIoError::Recovery { message: message(&first), authority: authority.clone() },
+        None => FileIoError::Io(message(&first)),
+    };
+    let second_error = match second.recovery_authority() {
+        Some(authority) => FileIoError::Recovery { message: message(&second), authority: authority.clone() },
+        None => FileIoError::Io(message(&second)),
+    };
+    recovery_durability(combine_recovery_errors(first_error, second_error), "")
 }
 
 fn remove_document_file(
@@ -281,7 +276,7 @@ fn remove_document_file(
 }
 
 fn replace_or_remove_document_file(
-    namespace_root: &Root,
+    _namespace_root: &Root,
     parent: &Root,
     name: &std::ffi::OsStr,
     expected_hash: blake3::Hash,
@@ -318,19 +313,18 @@ fn replace_or_remove_document_file(
             "The file changed while Revert checked its contents.".into(),
         ));
     }
-    let mut publication = create_private_holding(namespace_root, parent)?;
-    let holding = match publication.directory().try_clone() {
-        Ok(holding) => holding,
-        Err(error) => return Err(with_holding_cleanup(io_error(error), &mut publication)),
-    };
+    let mut holding = PresenceHolding::create(parent, name)?;
     let acquired_name = std::ffi::OsStr::new("file");
     if let Err(error) = before_acquire().map_err(io_error).and_then(|()| {
-        fs_safety::rename_new_between(parent, name, &holding, acquired_name).map_err(resolve_error)
+        fs_safety::rename_new_between(parent, name, holding.directory(), acquired_name).map_err(resolve_error)
     }) {
-        return Err(with_holding_cleanup(error, &mut publication));
+        return Err(holding.finish_error(error));
+    }
+    if let Err(error) = holding.capture_original() {
+        return Err(holding.finish_error(error));
     }
     let verify = (|| {
-        let acquired = fs_safety::metadata_beneath(&holding, Path::new(acquired_name))
+        let acquired = fs_safety::metadata_beneath(holding.directory(), Path::new(acquired_name))
             .map_err(resolve_error)?;
         if !same_inode(&original, &acquired)
             || original.mode() != acquired.mode()
@@ -345,7 +339,7 @@ fn replace_or_remove_document_file(
             ));
         }
         let mut held =
-            fs_safety::open_beneath(&holding, Path::new(acquired_name)).map_err(resolve_error)?;
+            fs_safety::open_beneath(holding.directory(), Path::new(acquired_name)).map_err(resolve_error)?;
         let before = held.metadata().map_err(io_error)?;
         let bytes =
             fs_safety::read_bounded(&mut held, MAX_EDITABLE_FILE_BYTES).map_err(io_error)?;
@@ -359,26 +353,15 @@ fn replace_or_remove_document_file(
                 "The file contents changed while Revert acquired it.".into(),
             ));
         }
-        immutable_metadata_template(&holding, &held, &before, &attributes)
+        immutable_metadata_template(holding.directory(), &held, &before, &attributes)
     })();
-    let template = verify.map_err(|error| put_back_acquired_file(&holding, &mut publication, parent, name, error))?;
+    let template = match verify { Ok(template) => template, Err(error) => return Err(put_back_acquired_file(holding, error)) };
     if let Some((restoration, text)) = replacement {
         // Keep the acquired original until the replacement is published. A
         // racing new destination is refused and the original is put back or
         // retained explicitly; no newer path is overwritten.
-        let outcome = restore_document_file(parent, name, text, restoration).map_err(|error| put_back_acquired_file(&holding, &mut publication, parent, name, error))?;
-        let cleanup = match fs_safety::unlink_within(&holding, acquired_name) {
-            Err(error) => Err(format!(
-                "The previous file remains at {}: {error}",
-                holding.path().join(acquired_name).display()
-            )),
-            Ok(()) => cleanup_private_holding(&mut publication).map_err(|error| {
-                format!(
-                    "The previous file was removed; the holding directory remains at {}: {error}",
-                    holding.path().display()
-                )
-            }),
-        };
+        let outcome = match restore_document_file(parent, name, text, restoration) { Ok(outcome) => outcome, Err(error) => return Err(put_back_acquired_file(holding, error)) };
+        let cleanup = holding.finish();
         return match (outcome, cleanup) {
             (
                 SaveOutcome::Saved {
@@ -394,26 +377,21 @@ fn replace_or_remove_document_file(
                     durability
                 },
             }),
-            (SaveOutcome::Saved { content_hash, .. }, Err(error)) => Ok(SaveOutcome::Saved {
-                content_hash,
-                durability: SaveDurability::Unconfirmed {
-                    error: format!("The older Undo metadata was published. {error}"),
-                },
-            }),
+            (SaveOutcome::Saved { content_hash, durability }, Err(error)) => {
+                let cleanup = recovery_durability(error, "The older Undo metadata was published.");
+                Ok(SaveOutcome::Saved { content_hash, durability: combine_durability(durability, cleanup) })
+            },
             _ => unreachable!("restoration publishes a present file"),
         };
     }
-    fs_safety::unlink_within(&holding, acquired_name)
-        .map_err(|error| put_back_acquired_file(&holding, &mut publication, parent, name, resolve_error(error)))?;
-    let cleanup = cleanup_private_holding(&mut publication);
-    let durability = match cleanup {
+    // Verify the acquired inode and immutable contents/access witness before
+    // deleting the original. Failed verification leaves its exact authority.
+    if let Err(error) = holding.remove_original() {
+        return Err(put_back_acquired_file(holding, error));
+    }
+    let durability = match holding.finish() {
         Ok(()) => sync_durability(parent),
-        Err(error) => SaveDurability::Unconfirmed {
-            error: format!(
-                "The file was removed; could not remove empty holding directory {}: {error}",
-                holding.path().display()
-            ),
-        },
+        Err(error) => recovery_durability(error, "The file was removed."),
     };
     Ok(SaveOutcome::Absent {
         restoration: Arc::new(FileRestoration {
@@ -449,17 +427,13 @@ fn capture_restoration_with_hook(root: &Root, path: &Path, expected_hash: blake3
     // The metadata can be world-readable/writable. Until its temporary name
     // is removed, it must live behind a private directory, just as removal's
     // metadata capture does. Never expose it in the ordinary worktree parent.
-    let mut publication = create_private_holding(root, &parent)?;
-    let holding = match publication.directory().try_clone() {
-        Ok(holding) => holding,
-        Err(error) => return Err(with_holding_cleanup(io_error(error), &mut publication)),
-    };
-    let capture = immutable_metadata_template_with_hook(&holding, &source, &before, &attributes, before_unlink);
-    let cleanup = cleanup_private_holding(&mut publication);
+    let holding = PresenceHolding::create(&parent, &name)?;
+    let capture = immutable_metadata_template_with_hook(holding.directory(), &source, &before, &attributes, before_unlink);
+    let cleanup = holding.finish();
     let template = match (capture, cleanup) {
         (Ok(template), Ok(())) => template,
         (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error),
-        (Err(error), Err(cleanup)) => return Err(FileIoError::Io(format!("{error} Could not clean the private metadata directory: {cleanup}"))),
+        (Err(error), Err(cleanup)) => return Err(combine_recovery_errors(error, cleanup)),
     };
     // Re-read the same descriptor after capture: chmod/xattrs and text races
     // cannot produce metadata for another revision of these displayed bytes.
@@ -508,6 +482,57 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn presence_recovery_retains_exact_parent_after_replacement_and_resolves_only_original() {
+        let directory = tempfile::tempdir().unwrap();
+        let named = directory.path().join("parent"); let moved = directory.path().join("moved");
+        fs::create_dir(&named).unwrap(); let parent = Root::open(&named).unwrap();
+        let holding = PresenceHolding::create(&parent, std::ffi::OsStr::new("file")).unwrap();
+        let original_holding = holding.directory().path().to_path_buf();
+        fs::write(original_holding.join("unknown"), "inspect first").unwrap();
+        let error = holding.finish().unwrap_err(); let authority = error.recovery_authority().unwrap().clone();
+        fs::rename(&named, &moved).unwrap(); fs::create_dir(&named).unwrap();
+        let foreign = named.join(original_holding.file_name().unwrap()); fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("foreign"), "preserve").unwrap();
+        assert!(authority.retry().is_err()); assert!(!authority.is_resolved());
+        fs::remove_file(moved.join(original_holding.file_name().unwrap()).join("unknown")).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+        assert_eq!(fs::read_to_string(foreign.join("foreign")).unwrap(), "preserve");
+        assert!(!moved.join(original_holding.file_name().unwrap()).exists());
+    }
+
+    #[test]
+    fn presence_acquired_file_refuses_modified_open_descriptor_and_foreign_leaf() {
+        let directory = tempfile::tempdir().unwrap(); let parent = Root::open(directory.path()).unwrap();
+        fs::write(directory.path().join("file"), "original").unwrap();
+        let mut writer = fs::OpenOptions::new().write(true).open(directory.path().join("file")).unwrap();
+        let mut holding = PresenceHolding::create(&parent, std::ffi::OsStr::new("file")).unwrap();
+        fs_safety::rename_new_between(&parent, std::ffi::OsStr::new("file"), holding.directory(), std::ffi::OsStr::new("file")).unwrap();
+        holding.capture_original().unwrap();
+        writer.write_all(b"changed!").unwrap(); writer.sync_all().unwrap();
+        assert!(holding.remove_original().is_err());
+        let held = holding.directory().path().join("file");
+        let error = put_back_acquired_file(holding, FileIoError::Io("verification refused".into()));
+        let authority = error.recovery_authority().unwrap();
+        assert!(authority.retry().is_err());
+        assert_eq!(fs::read_to_string(&held).unwrap(), "changed!");
+        assert!(!directory.path().join("file").exists());
+        fs::rename(&held, held.with_file_name("original-changed")).unwrap(); fs::write(&held, "foreign").unwrap();
+        assert!(authority.retry().is_err());
+        assert_eq!(fs::read_to_string(&held).unwrap(), "foreign");
+    }
+
+    #[test]
+    fn presence_shared_nested_parent_refuses_before_any_acquisition() {
+        let directory = tempfile::tempdir().unwrap(); fs::create_dir(directory.path().join("shared")).unwrap();
+        fs::set_permissions(directory.path().join("shared"), Permissions::from_mode(0o777)).unwrap();
+        fs::write(directory.path().join("shared/file"), "original").unwrap();
+        let root = Root::open(directory.path()).unwrap();
+        assert!(save_document_file_at(&root, Path::new("shared/file"), "", blake3::hash(b"original"), false, removal()).is_err());
+        assert_eq!(fs::read_to_string(directory.path().join("shared/file")).unwrap(), "original");
+        assert_eq!(fs::read_dir(directory.path().join("shared")).unwrap().count(), 1);
+    }
+
+    #[test]
     fn editor_file_presence_cleanup_preserves_a_replacement_holding_directory() {
         let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
         fs::write(directory.path().join("file"), "original").unwrap();
@@ -520,7 +545,7 @@ mod tests {
             fs::write(holding.join("foreign"), "preserve replacement")?;
             replaced = Some(holding); Ok(())
         }).unwrap();
-        assert!(matches!(result, SaveOutcome::Absent { durability: SaveDurability::Unconfirmed { .. }, .. }));
+        assert!(matches!(result, SaveOutcome::Absent { durability: SaveDurability::Recovery { .. }, .. }));
         let replaced = replaced.unwrap();
         assert_eq!(fs::read_to_string(replaced.join("foreign")).unwrap(), "preserve replacement");
         assert_eq!(fs::metadata(&replaced).unwrap().mode() & 0o777, 0o711);
@@ -548,10 +573,10 @@ mod tests {
     }
 
     #[test]
-    fn editor_file_presence_uses_protected_root_for_a_shared_nested_parent() {
+    fn editor_file_presence_uses_the_actual_protected_nested_parent() {
         let directory = tempfile::tempdir().unwrap(); let root = Root::open(directory.path()).unwrap();
         fs::create_dir(directory.path().join("shared")).unwrap();
-        fs::set_permissions(directory.path().join("shared"), Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(directory.path().join("shared"), Permissions::from_mode(0o755)).unwrap();
         let path = Path::new("shared/file"); fs::write(directory.path().join(path), "contents").unwrap();
         let saved = save_document_file_at(&root, path, "", blake3::hash(b"contents"), false, removal()).unwrap();
         let SaveOutcome::Absent { restoration, .. } = saved else { panic!("removed file"); };
@@ -837,14 +862,14 @@ mod tests {
         )
         .unwrap();
         let SaveOutcome::Saved {
-            durability: SaveDurability::Unconfirmed { error },
+            durability: SaveDurability::Recovery { error, authority },
             ..
         } = outcome
         else {
             panic!("publication remains a committed save despite cleanup failure");
         };
-        assert!(error.contains("previous file was removed"));
-        assert!(error.contains("holding directory remains"));
+        assert!(error.contains("recovery"));
+        assert!(!authority.is_resolved());
         assert_eq!(
             fs::read_to_string(root.join("new.txt")).unwrap(),
             "synthetic alpha"
