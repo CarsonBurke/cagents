@@ -5701,23 +5701,15 @@ fn project_identity(name: &str) -> (String, cosmic::iced::Color) {
     )
 }
 
-fn compact_project_attention(
-    project: &SidebarProject,
-    state: &SidebarState,
-) -> Option<AttentionState> {
-    project
-        .channels
-        .iter()
-        .filter_map(|channel| {
-            attention_state(channel.activity, channel.unread, channel.outcome.as_ref())
-        })
-        .chain(
-            project
-                .worktrees
-                .iter()
-                .filter_map(|row| state.worktree_attention(project.id, row.id)),
-        )
-        .max()
+#[cfg(test)]
+fn compact_project_attention(project: &SidebarProject, state: &SidebarState) -> Option<AttentionState> {
+    compact_project_attention_from_summaries(project, &state.worktree_attention_summaries(project.id))
+}
+
+fn compact_project_attention_from_summaries(project: &SidebarProject, summaries: &HashMap<WorktreeId, WorktreeAttention<'_>>) -> Option<AttentionState> {
+    project.channels.iter().filter_map(|channel| {
+        attention_state(channel.activity, channel.unread, channel.outcome.as_ref())
+    }).chain(project.worktrees.iter().filter_map(|row| summaries.get(&row.id).and_then(|summary| summary.state))).max()
 }
 
 fn attention_description(attention: AttentionState) -> &'static str {
@@ -5761,7 +5753,11 @@ fn compact_project_identity(
                 ..Default::default()
             }
         }));
-    let attention = compact_project_attention(project, state);
+    // The app's NavigationCache retains this entire widget and hint across
+    // unchanged terminal wakes. On an invalidation, scan pane ownership once,
+    // rather than again for every hidden worktree in the hover description.
+    let summaries = state.worktree_attention_summaries(project.id);
+    let attention = compact_project_attention_from_summaries(project, &summaries);
     let mut description = project.name.clone();
     for worktree in &project.worktrees {
         use std::fmt::Write as _;
@@ -5787,10 +5783,10 @@ fn compact_project_identity(
         if let Some(operation) = worktree.operation {
             let _ = write!(description, ", {} in progress", operation.label());
         }
-        if let Some(attention) = state.worktree_attention(project.id, worktree.id) {
+        if let Some(attention) = summaries.get(&worktree.id).and_then(|summary| summary.state) {
             let _ = write!(description, ", {}", attention_description(attention));
         }
-        if let Some(outcome) = state.worktree_outcome(project.id, worktree.id) {
+        if let Some(outcome) = summaries.get(&worktree.id).and_then(|summary| summary.outcome) {
             if let Some(reason) = outcome.reason() {
                 let _ = write!(description, ": {reason}");
             }
