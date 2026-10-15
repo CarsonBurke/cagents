@@ -1794,6 +1794,7 @@ mod tests {
     };
 
     include!("execution_presentation_tests.rs");
+    include!("execution_relocation_tests.rs");
 
     fn source() -> HostedSession {
         HostedSession::Chat(crate::chat::Session {
