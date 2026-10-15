@@ -623,16 +623,14 @@ mod tests {
                 Entry {
                     verification: None,
                     identity: None,
-                    snapshot: UsageSnapshot::state(
-                        UsageStatus::Ok,
-                        "replacement login",
-                        now + 2,
-                    ),
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "replacement login", now + 2),
                 },
             )
             .unwrap();
         assert_eq!(
-            cache.load(now + 2)[&account.cache_key().unwrap()].snapshot.status,
+            cache.load(now + 2)[&account.cache_key().unwrap()]
+                .snapshot
+                .status,
             UsageStatus::Ok,
             "the replacement-home assertion must begin with a newer positive reading",
         );
