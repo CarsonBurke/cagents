@@ -19,7 +19,7 @@ pub(crate) fn validate_query(
     offset: usize,
     limit: usize,
 ) -> Result<(), OriginalError> {
-    if limit == 0 || limit > ORIGINAL_PAGE_BYTES || offset > ORIGINAL_TEXT_BYTES {
+    if limit < 4 || limit > ORIGINAL_PAGE_BYTES || offset > ORIGINAL_TEXT_BYTES {
         return Err(OriginalError::InvalidRange);
     }
     if [user, session].into_iter().flatten().any(|id| id.is_empty() || id.len() > ID_BYTES) {
