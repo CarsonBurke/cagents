@@ -74,8 +74,9 @@ pub(crate) fn has_retained_ownership() -> bool {
 
 pub(crate) type RetainError = (io::Error, Child, File, Reservation);
 impl Reservation {
-    /// Move private spawn exclusion with the original child until a positive
-    /// root-spawn acknowledgement or actual original-child reaping.
+    /// Move private spawn exclusion with the original child. A requested
+    /// transition remains logically quarantined after helper reaping unless
+    /// successful root handoff or typed family cleanup was confirmed.
     pub(crate) fn hold_console_transition(&mut self, lease:super::console_transition::Lease) {
         debug_assert!(self.console_transition.is_none());
         self.console_transition=Some(lease);

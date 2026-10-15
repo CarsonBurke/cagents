@@ -970,6 +970,10 @@ impl Registry {
         expected: Option<&HostedSession>,
         session: HostedSession,
     ) -> Result<Agent, String> {
+        let mut ids=vec![session.id()];
+        if let Some(expected)=expected {ids.push(expected.id());}
+        ids.sort_unstable();ids.dedup();
+        let _console_transitions=ids.into_iter().map(crate::daemon::console_transition::acquire).collect::<Result<Vec<_>,_>>()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1025,6 +1029,7 @@ impl Registry {
         expected: &HostedSession,
         console: crate::model::TerminalSession,
     ) -> Result<Agent, String> {
+        let _console_transition=crate::daemon::console_transition::acquire(expected.id())?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1191,6 +1196,7 @@ impl Registry {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         let mut agent = read_agent(&tx, id)?;
+        let _console_transition=agent.session.as_ref().map(|source|crate::daemon::console_transition::acquire(source.id())).transpose()?;
         if &agent.origin != origin {
             return Err("This caller does not own the agent".into());
         }
@@ -1617,6 +1623,8 @@ mod tests {
         registry.bind_agent(accepted.agent.id, None, hosted.clone()).unwrap();
         registry.bind_agent_console(accepted.agent.id, &hosted, console.clone()).unwrap();
         let authority = registry.register_agent_authority(&hosted).unwrap();
+        let started = registry.update_agent_run(accepted.run.id, accepted.run.revision, Update::Started {provider_key:"fixture".into()}, 2).unwrap();
+        registry.update_agent_run(started.id, started.revision, Update::Finished {state:State::Succeeded,result:Default::default()},3).unwrap();
         let registry = std::sync::Arc::new(std::sync::Mutex::new(registry));
         let authorization = crate::host::ConsoleProgramAuthorization::capture(registry.clone(), &source, &console).unwrap();
         let program = crate::terminal::execution_program::AuthorizedCli::fixture_unexecuted(authorization.clone());
@@ -1631,6 +1639,8 @@ mod tests {
         assert!(crate::host::ConsoleProgramAuthorization::capture(registry.clone(), &unrelated, &console).is_err());
         let (_, lease) = program.prepare_spawn(&console, &authority).unwrap();
         assert!(registry.lock().unwrap().retire_agent_authority(&hosted).is_err(), "revocation cannot cross actual private-spawn admission");
+        assert!(registry.lock().unwrap().bind_agent(accepted.agent.id, Some(&hosted), hosted.clone()).unwrap_err().contains("transition in progress"));
+        assert!(registry.lock().unwrap().close_agent(&Origin::User, accepted.agent.id).unwrap_err().contains("transition in progress"),"settled agents cannot close across private-spawn admission");
         assert!(registry.lock().unwrap().agent_for_session(source.id).unwrap().is_some());
         drop(lease); // No helper or Spawn request existed in this fixture.
         registry.lock().unwrap().retire_agent_authority(&hosted).unwrap();
