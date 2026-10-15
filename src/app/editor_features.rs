@@ -127,6 +127,29 @@ mod tests {
         assert_eq!(text(&app, b), original);
     }
 
+    #[test]
+    fn retired_server_edit_preview_cannot_freeze_buffers_or_publish_files() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        for path in ["a.rs", "b.rs"] { std::fs::write(root.path().join(path), original).unwrap(); }
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "a.rs", original);
+        let plan = plan(&app, root.path(), &["a.rs", "b.rs"]);
+        let mut operation = operation(&app, card);
+        // Expiry removes the pending protocol entry. The backend lease tests
+        // exercise the deadline; this tests the actual retired-preview UI arm.
+        operation.server_request = Some(LspServerEditId(u64::MAX));
+        app.editor_features.preview = Some(Preview { ticket: 9, diff_ticket: 9, operation, plan, selected: 0, annotation_page: 0, card: CardId::new(), runtime: None, cancellation: crate::repository::CancellationToken::new(), error: None });
+        let task = app.update_editor_features(Action::ApplyPreview);
+        assert!(iced::runtime::task::into_stream(task).is_none());
+        assert!(app.editor_features.preview.is_none());
+        assert!(app.editor_features.publication.is_none());
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+        assert_eq!(text(&app, card), original);
+        for path in ["a.rs", "b.rs"] { assert_eq!(std::fs::read_to_string(root.path().join(path)).unwrap(), original); }
+        assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("expired")));
+    }
+
     #[tokio::test]
     async fn replacing_preview_root_preserves_open_buffers_and_releases_their_freeze() {
         let parent = tempfile::tempdir().unwrap();
@@ -522,6 +545,7 @@ struct Publication {
     ticket: u64,
     operation: Operation,
     cards: Vec<CardId>,
+    server_lease: Option<LspServerEditLease>,
 }
 
 #[derive(Default)]
@@ -1045,12 +1069,12 @@ impl Cagents {
                 Task::none()
             }
             Action::Published { ticket, result } => {
-                let Some(publication) = self.editor_features.publication.take() else { return Task::none(); };
+                let Some(mut publication) = self.editor_features.publication.take() else { return Task::none(); };
                 if publication.ticket != ticket { self.editor_features.publication = Some(publication); return Task::none(); }
                 let report = match result {
                     Err(error) => {
                         for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
-                        self.reject_server_edit(&publication.operation, &error);
+                        if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.clone())); }
                         self.feature_failure(publication.operation.card, error);
                         return self.save_after_feature(&publication.operation);
                     }
@@ -1066,10 +1090,10 @@ impl Cagents {
                     } else { failure = Some("An edited buffer was closed during publication".into()); }
                 }
                 if let Some(error) = failure {
-                    self.reject_server_edit(&publication.operation, &error);
+                    if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.clone())); }
                     self.feature_failure(publication.operation.card, error);
                 } else {
-                    if let Some(id) = publication.operation.server_request { self.lsp.respond_workspace_edit(id, true, None); }
+                    if let Some(lease) = publication.server_lease.take() { lease.respond(true, None); }
                     if let Some(command) = publication.operation.command.clone() { self.execute_editor_feature_command(&publication.operation, command); }
                     tasks.push(self.save_after_feature(&publication.operation));
                 }
@@ -1139,6 +1163,15 @@ impl Cagents {
             self.feature_failure(operation.card, "The open file tabs changed; prepare the edit again");
             return Task::none();
         }
+        // Publication authority and the server response move together. An
+        // expired/canceled preview must fail before any buffer freezes or I/O.
+        let server_lease = match operation.server_request {
+            Some(id) => match self.lsp.claim_workspace_edit(id) {
+                Ok(lease) => Some(lease),
+                Err(error) => { self.feature_failure(operation.card, error); return Task::none(); }
+            },
+            None => None,
+        };
         let protocol_versions: HashMap<CardId, Option<i32>> = self.cards.keys().map(|card| (*card, self.lsp_document(*card).and_then(|doc| self.lsp.document_version(doc)))).collect();
         let mut matched_documents = HashSet::new();
         let mut cards = Vec::new();
@@ -1162,11 +1195,11 @@ impl Cagents {
         if plan.documents.iter().enumerate().any(|(index, document)| document.open && !matched_documents.contains(&index)) { failure = Some("An edited buffer was closed after the preview was prepared".into()); }
         if let Some(error) = failure {
             for card in cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
-            self.reject_server_edit(&operation, &error);
+            if let Some(lease) = server_lease { lease.respond(false, Some(error.clone())); }
             self.feature_failure(operation.card, error);
             return Task::none();
         }
-        self.editor_features.publication = Some(Publication { ticket, operation, cards });
+        self.editor_features.publication = Some(Publication { ticket, operation, cards, server_lease });
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || workspace::publish_unopened(&plan)).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::EditorFeatures(Action::Published { ticket, result })
