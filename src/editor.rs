@@ -10,6 +10,8 @@ use thiserror::Error;
 
 use crate::fs_safety::{self, ResolveError, Root};
 
+pub mod retained_save;
+
 /// Rasterizing a page happens in a child process, so the reader's document
 /// lives behind the same module boundary either way: `load_file` opens one on
 /// its first page, and the view asks for the pages after that.
