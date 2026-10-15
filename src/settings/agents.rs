@@ -352,6 +352,28 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_first_provider_edits_merge_fields_without_losing_launch_policy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let base = super::super::AppSettings::default();
+        let mut launch_window = base.clone();
+        launch_window.agents.insert("claude".into(), AgentLaunchSettings {
+            executable: Some("/bin/sh".into()), arguments: vec!["--append-system-prompt".into(), "fixture".into()],
+            environment: BTreeMap::from([("PROVIDER_FIXTURE_VALUE".into(), "kept".into())]), ..Default::default()
+        });
+        super::super::save_merged(&path, &base, &launch_window).unwrap();
+        let mut model_window = base.clone();
+        model_window.agents.insert("claude".into(), AgentLaunchSettings { model: Some("chosen-model".into()), ..Default::default() });
+        super::super::save_merged(&path, &base, &model_window).unwrap();
+        let merged = super::super::load(&path).unwrap();
+        let expected = AgentLaunchSettings { model: Some("chosen-model".into()), ..launch_window.agents["claude"].clone() };
+        assert_eq!(merged.agents["claude"], expected);
+        let mut reset = merged.clone(); reset.agents.remove("claude");
+        super::super::save_merged(&path, &merged, &reset).unwrap();
+        assert!(!super::super::load(&path).unwrap().agents.contains_key("claude"), "explicit provider-table reset must still remove it");
+    }
+
+    #[test]
     fn account_execution_validation_ignores_conversation_defaults_only() {
         let configuration = AgentLaunchSettings { model: Some("future\nmodel".into()), permission_mode: Some("future-mode".into()), ..Default::default() };
         assert!(configuration.validate(Provider::Claude).is_err());

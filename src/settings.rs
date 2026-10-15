@@ -1927,12 +1927,27 @@ pub fn save_merged(
     let previous = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(&previous)?;
     merge_changed_fields(
-        &toml::Value::try_from(base)?,
+        &merge_base_value(base, desired)?,
         &toml::Value::try_from(desired)?,
         &mut current,
     );
     let settings = current.try_into::<AppSettings>()?.validate_transition(&previous)?;
     save_validated_unlocked(path, &settings)
+}
+
+/// A newly configured provider still has default-valued fields before its
+/// table first exists. Materialize those only in the merge baseline so two
+/// windows creating different fields do not overwrite each other's policy.
+/// Keep a removed provider absent in desired, preserving explicit table reset.
+pub(crate) fn merge_base_value(base: &AppSettings, desired: &AppSettings) -> Result<toml::Value, SettingsError> {
+    let mut value = toml::Value::try_from(base)?;
+    let defaults = toml::Value::try_from(&AgentLaunchSettings::default())?;
+    if let Some(agents) = value.get_mut("agents").and_then(toml::Value::as_table_mut) {
+        for provider in desired.agents.keys().filter(|provider| !base.agents.contains_key(*provider)) {
+            agents.insert(provider.clone(), defaults.clone());
+        }
+    }
+    Ok(value)
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
