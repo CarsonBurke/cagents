@@ -50,7 +50,9 @@ impl Runtime {
         );
         if self.provider_exit_expanded && !diagnostic.output.is_empty() {
             content.push(
-                design::caption("Recent provider output; complete output is in the debug log.")
+                design::caption(
+                    "Recent provider output. Enable debug logging to retain complete output.",
+                )
                     .class(cosmic::theme::Text::Custom(design::muted_text))
                     .into(),
             );
