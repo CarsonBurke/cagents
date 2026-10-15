@@ -223,7 +223,10 @@ mod tests {
         fs::write(root.join("new.txt"), "original").unwrap();
         let source = File::open(root.join("new.txt")).unwrap();
         if let Err(error) = install_acl(&source, &acl(4, 4)) {
-            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) { return; }
+            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) {
+                eprintln!("PRESENCE_ACL_TEMPLATE_UNSUPPORTED: {error}");
+                return;
+            }
             panic!("ACL fixture failed: {error}");
         }
         let original_mode = source.metadata().unwrap().mode();
@@ -238,6 +241,7 @@ mod tests {
         assert_eq!(restored.metadata().unwrap().mode(), original_mode);
         assert_eq!(fs_safety::content_attributes(&restored).unwrap(), original_attributes);
         assert_eq!(fs_safety::content_attributes(&source).unwrap(), newer_attributes, "Undo never changes the external hard link");
+        eprintln!("PRESENCE_ACL_TEMPLATE_VERIFIED");
     }
 
     #[test]
@@ -246,7 +250,10 @@ mod tests {
         fs::write(directory.path().join("new.txt"), "original").unwrap();
         let source = File::open(directory.path().join("new.txt")).unwrap();
         if let Err(error) = install_acl(&source, &acl(4, 4)) {
-            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) { return; }
+            if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) {
+                eprintln!("PRESENCE_ACL_ACQUIRE_UNSUPPORTED: {error}");
+                return;
+            }
             panic!("ACL fixture failed: {error}");
         }
         let before_mode = source.metadata().unwrap().mode();
@@ -256,6 +263,7 @@ mod tests {
         assert_eq!(source.metadata().unwrap().mode(), before_mode, "the ACL change deliberately keeps st_mode identical");
         assert_eq!(fs::read_to_string(directory.path().join("new.txt")).unwrap(), "original");
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+        eprintln!("PRESENCE_ACL_ACQUIRE_VERIFIED");
     }
 
     fn removal() -> PresenceSave {
