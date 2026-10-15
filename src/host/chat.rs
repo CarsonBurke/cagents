@@ -2768,7 +2768,7 @@ fn upgrade_environment(
 ) -> Result<BTreeMap<String, String>, String> {
     let process_launch = prepare_native_process_launch(
         launch,
-        (!hosted_source).then_some(daemon),
+        (!hosted_source && !launch.needs_read_only_history()).then_some(daemon),
         &BTreeMap::new(),
         None,
     ).map_err(|error| error.message)?;
@@ -3174,6 +3174,46 @@ mod tests {
             assert_eq!(watcher.read(&mut bytes).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "issued transcript must never be opened/indexed");
             assert_eq!(launch, issued);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn upgrade_history_validation_keeps_recorded_home_after_live_working_directory_disappears() {
+        use std::{io::Read, os::fd::{AsRawFd, FromRawFd}};
+        const ID: &str = "12345678-1234-4234-8234-123456789abc";
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("now-missing-project");
+        let project: String = cwd.to_str().unwrap().chars().map(|c| if c.is_ascii_alphanumeric() {c} else {'-'}).collect();
+        let home_a = root.path().join("recorded-home");
+        let home_b = root.path().join("daemon-home");
+        let mut watches = Vec::new();
+        for (home, body) in [(&home_a, "recorded-A"), (&home_b, "unrelated-B")] {
+            let file = home.join(".claude/projects").join(&project).join(format!("{ID}.jsonl"));
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, json!({"type":"user","uuid":"private-prompt","parentUuid":null,"sessionId":ID,"message":{"role":"user","content":body}}).to_string()+"\n").unwrap();
+            let fd = unsafe {libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC)};
+            assert!(fd >= 0);
+            let watcher = unsafe {std::fs::File::from_raw_fd(fd)};
+            let path = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+            assert!(unsafe {libc::inotify_add_watch(watcher.as_raw_fd(), path.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS)} >= 0);
+            watches.push(watcher);
+        }
+        let launch = chat::Launch {provider: Provider::Claude, session_id: Some(ID.into()), recipe: LaunchRecipe {
+            program: "private-provider-not-executed".into(), arguments: vec!["--resume".into(), ID.into()], working_directory: cwd,
+            environment: [("HOME".into(), home_a.to_str().unwrap().into())].into(), unset_environment: Default::default(),
+        }};
+        std::fs::create_dir(&launch.recipe.working_directory).unwrap();
+        assert!(!launch.needs_read_only_history());
+        std::fs::remove_dir(&launch.recipe.working_directory).unwrap();
+        assert!(launch.needs_read_only_history());
+        let issued = launch.clone();
+        let restored = upgrade_environment(&launch, false, [("HOME".into(), home_b.to_str().unwrap().into()),
+            ("CLAUDE_CONFIG_DIR".into(), home_b.join(".claude").to_str().unwrap().into())].into()).unwrap();
+        assert_eq!(restored, launch.recipe.environment);
+        let mut bytes = [0_u8; 256];
+        assert!(watches[0].read(&mut bytes).unwrap() > 0, "actual upgrade factory must read recorded A");
+        assert_eq!(watches[1].read(&mut bytes).unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "upgrade validation must not read daemon B");
+        assert_eq!(launch, issued);
     }
 
     #[test]
