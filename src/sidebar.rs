@@ -828,7 +828,7 @@ impl SidebarWorktree {
             self.chrome.folded_branch = self.branch.as_deref().map(fold);
         }
         self.locked = record.lock.locked;
-        self.head_oid = record.head_oid.clone();
+        self.head_oid.clone_from(&record.head_oid);
         self.created_at_unix_ms = record.created_at_unix_ms;
         if let Some(status) = status {
             self.apply_status(status);
@@ -838,11 +838,12 @@ impl SidebarWorktree {
 
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
-        self.head_oid = match &status.head {
-            HeadState::Branch { name, oid } if !self.detached && self.branch.as_ref()==Some(name) => Some(oid.clone()),
-            HeadState::Detached { oid } if self.detached => Some(oid.clone()),
+        let head_oid = match &status.head {
+            HeadState::Branch { name, oid } if !self.detached && self.branch.as_ref()==Some(name) => Some(oid.as_str()),
+            HeadState::Detached { oid } if self.detached => Some(oid.as_str()),
             _ => None,
         };
+        if self.head_oid.as_deref() != head_oid { self.head_oid = head_oid.map(str::to_owned); }
         let (ahead, behind) = match &status.tracking {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
