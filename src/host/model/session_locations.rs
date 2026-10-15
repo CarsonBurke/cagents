@@ -8,7 +8,7 @@ use crate::{
     model::TerminalId,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct Location {
     pub(crate) source: HostedSession,
     pub(crate) repository: Option<PathBuf>,
@@ -306,34 +306,234 @@ pub(super) fn pin_owned_agents(db: &Connection, moves: &[SessionMove]) -> Result
     Ok(())
 }
 
+fn bind_location(db:&Connection,source:&HostedSession,previous:Option<&HostedSession>,directory:&Path,approved:DirectoryIdentity)->Result<(),String> {
+        let old = read(db, source.id())?;
+        if old.as_ref().is_some_and(|location| {
+            !same_issued_launch(&location.source, source)
+                || !compatible_chat_metadata(&location.source, source)
+        }) {
+            return Err(
+                "A session directory binding cannot change its original issued launch".into(),
+            );
+        }
+        if old.as_ref().is_some_and(|location| {
+            !location.source.same_process(source)
+                && previous.is_none_or(|previous| !location.source.same_process(previous))
+        }) {
+            return Err("A different original session still owns this directory binding".into());
+        }
+        if old.as_ref().is_some_and(|location| {
+            location
+                .approved
+                .is_some_and(|identity| identity != approved)
+        }) {
+            return Err("The original session directory was replaced; start a new session for the replacement folder".into());
+        }
+        let mut previous_sources = old
+            .as_ref()
+            .map(|location| location.previous_sources.clone())
+            .unwrap_or_default();
+        if let Some(mut old) = old.clone()
+            && !old.source.same_process(source)
+        {
+            retain_source(&mut old)?;
+            previous_sources = old.previous_sources;
+        }
+        write(
+            db,
+            &Location {
+                source: source.clone(),
+                repository: old
+                    .as_ref()
+                    .and_then(|location| location.repository.clone()),
+                directory: directory.to_owned(),
+                approved: Some(approved),
+                process: None,
+                blocked_directory: None,
+                refusal: None,
+                previous_sources,
+            },
+        )?;
+        Ok(())
+}
+fn adopt_location(db:&Connection,retained:&[HostedSession],successor:&HostedSession)->Result<(),String> {
+        let Some(first) = retained.first() else {
+            return Ok(());
+        };
+        let Some(mut location) = read(db, first.id())? else {
+            return Ok(());
+        };
+        if !same_issued_launch(&location.source, successor)
+            || !compatible_chat_metadata(&location.source, successor)
+            || successor.id() != first.id()
+            || retained.iter().any(|source| source.id() != first.id())
+            || !retained
+                .iter()
+                .any(|source| same_source(&location.source, source))
+        {
+            return Err(
+                "Authenticated holder sources do not prove this session directory successor".into(),
+            );
+        }
+        // A process proof can change during authenticated adoption, while the
+        // original approved inode, refusal and operational spelling cannot.
+        retain_source(&mut location)?;
+        for source in retained {
+            if same_issued_launch(&location.source, source) {
+                retain_alias(&mut location, source)?;
+            }
+        }
+        location.source = successor.clone();
+        write(db, &location)?;
+        Ok(())
+}
+/// A known failed publication may restore only the exact observer registration
+/// it installed. A newer registration is never overwritten by old cleanup.
+#[derive(Clone, Debug)]
+pub(crate) struct ObserverRegistration {
+    session: TerminalId,
+    stamp: uuid::Uuid,
+    previous: Option<(String, String, String)>,
+    previous_location: Option<Location>,
+    installed_location: Option<Location>,
+}
+
+impl ObserverRegistration {
+    pub(crate) fn stamp(&self)->uuid::Uuid {self.stamp}
+}
+
+fn observer_schema(db: &Connection) -> Result<(), String> {
+    let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|error| error.to_string())?;
+    super::schema::check_readonly(db)?;
+    if version != super::SCHEMA_VERSION { return Err("The registry schema changed; reopen the current daemon before updating observer ownership".into()); }
+    Ok(())
+}
+fn observer_owner(db: &Connection, id: TerminalId) -> Result<Option<(String, String, String)>, String> {
+    db.query_row("SELECT instance,stamp,source FROM session_observer_owners WHERE session=?1",
+        [id.to_string()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)))
+        .optional().map_err(|error| error.to_string())
+}
+
 impl Registry {
-    /// Only an exact hosted actor callback may advance its confirmed thread.
-    /// This changes presentation metadata, never source proof, recipe or pin.
+    /// Actual normal/adopted actor installation calls this under the same
+    /// registry mutex as its binding publication, before publishing HostState.
+    /// It grants no directory authority and accepts no public descriptor.
+    pub(crate) fn install_session_observer(
+        &mut self, source:&HostedSession, instance:uuid::Uuid,
+        previous_source:Option<&HostedSession>,
+        directory:Option<(&Path,DirectoryIdentity)>,
+        retained:Option<&[HostedSession]>,
+    )->Result<ObserverRegistration,String> {
+        let HostedSession::Chat(chat)=source else {return Err("Only an authenticated native actor can install an observer".into());};
+        if instance.is_nil() || chat.proof.as_ref().is_none_or(|proof|!proof.is_complete()) {
+            return Err("A native observer requires its exact actor and host proof".into());
+        }
+        observer_schema(&self.db)?;
+        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error|error.to_string())?;
+        observer_schema(&tx)?;
+        let previous=observer_owner(&tx,source.id())?;
+        let previous_location=read(&tx,source.id())?;
+        if let Some(retained)=retained {adopt_location(&tx,retained,source)?;}
+        if let Some((directory,approved))=directory {bind_location(&tx,source,previous_source,directory,approved)?;}
+        let installed_location=read(&tx,source.id())?;
+        let stamp=uuid::Uuid::new_v4();
+        tx.execute("INSERT INTO session_observer_owners(session,instance,stamp,source) VALUES(?1,?2,?3,?4)
+            ON CONFLICT(session) DO UPDATE SET instance=excluded.instance,stamp=excluded.stamp,source=excluded.source",
+            params![source.id().to_string(),instance.to_string(),stamp.to_string(),encode(source)?])
+            .map_err(|error|error.to_string())?;
+        tx.commit().map_err(|error|error.to_string())?;
+        Ok(ObserverRegistration {session:source.id(),stamp,previous,previous_location,installed_location})
+    }
+
+    pub(crate) fn restore_session_observer(
+        &mut self, registration:&ObserverRegistration,
+    )->Result<bool,String> {
+        observer_schema(&self.db)?;
+        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error|error.to_string())?;
+        observer_schema(&tx)?;
+        if !observer_owner(&tx,registration.session)?.is_some_and(|(_,stamp,_)|stamp==registration.stamp.to_string())
+            || read(&tx,registration.session)?!=registration.installed_location
+        {return Ok(false);}
+        if let Some((instance,stamp,source))=&registration.previous {
+            tx.execute("UPDATE session_observer_owners SET instance=?2,stamp=?3,source=?4 WHERE session=?1",
+                params![registration.session.to_string(),instance,stamp,source])
+                .map_err(|error|error.to_string())?;
+        } else {
+            tx.execute("DELETE FROM session_observer_owners WHERE session=?1",
+                [registration.session.to_string()]).map_err(|error|error.to_string())?;
+        }
+        if let Some(location)=&registration.previous_location {write(&tx,location)?;}
+        else {tx.execute("DELETE FROM session_locations WHERE session=?1",
+            [registration.session.to_string()]).map_err(|error|error.to_string())?;}
+        tx.commit().map_err(|error|error.to_string())?;
+        Ok(true)
+    }
+
+    /// Persist an observation from a currently hosted exact actor. The prior
+    /// known UUID is never normalized away to authorize a stale update.
     pub(crate) fn observe_owned_session_thread(
-        &mut self,
-        source: &HostedSession,
-    ) -> Result<(), String> {
-        let HostedSession::Chat(current) = source else {
-            return Ok(());
+        &mut self, before: &HostedSession, source: &HostedSession,
+        instance: uuid::Uuid, expected_stamp:uuid::Uuid,
+    ) -> Result<bool, String> {
+        observer_schema(&self.db)?;
+        let (HostedSession::Chat(previous),HostedSession::Chat(current))=(before,source) else {
+            return Err("Only a native actor can update its confirmed thread".into());
         };
-        if current.launch.session_id.is_none() {
-            return Ok(());
+        let mut expected=previous.clone();
+        expected.launch.session_id=current.launch.session_id.clone();
+        if current.launch.session_id.is_none() || &expected!=current {
+            return Err("A thread observation cannot change other source authority".into());
         }
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        let Some(mut location) = read(&tx, source.id())? else {
-            return Ok(());
-        };
-        let mut comparison = location.source.clone();
-        let HostedSession::Chat(previous) = &mut comparison else {
-            return Err("A terminal binding cannot become a native conversation".into());
-        };
-        previous.launch.session_id = current.launch.session_id.clone();
-        if !same_source(&comparison, source) {
-            return Err("The confirmed thread update belongs to a different hosted source".into());
+        let tx=self.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error|error.to_string())?;
+        observer_schema(&tx)?;
+        let (owner,stamp,issued)=observer_owner(&tx,source.id())?
+            .ok_or("The hosted actor has no registered observer authority")?;
+        if owner != instance.to_string() || stamp!=expected_stamp.to_string() {
+            return Err("The hosted actor observer was replaced".into());
         }
-        location.source = source.clone();
-        write(&tx, &location)?;
-        tx.commit().map_err(|error| error.to_string())
+        let issued_source:HostedSession=decode(&issued)?;
+        // The installation generation authenticates the actor. Pair/listener
+        // fields belong to their own trusted writer: patch only the thread in
+        // the latest exact-read tuple, never copy an older pair back into SQL.
+        let compatible=|issued:&HostedSession|match issued {
+            HostedSession::Chat(issued)=>issued.id==previous.id
+                && issued.proof==previous.proof
+                && issued.launch.provider==previous.launch.provider
+                && issued.launch.recipe==previous.launch.recipe
+                && issued.launch.session_id==previous.launch.session_id,
+            _=>false,
+        };
+        if !compatible(&issued_source) {
+            return Err("The prior confirmed observer source changed; retry the current actor".into());
+        }
+        if let Some(mut location)=read(&tx,source.id())? {
+            if !compatible(&location.source) {
+                return Err("The prior directory binding changed before its thread observation".into());
+            }
+            let original:String=tx.query_row("SELECT source FROM session_locations WHERE session=?1",
+                [source.id().to_string()],|row|row.get(0)).map_err(|error|error.to_string())?;
+            let HostedSession::Chat(patched)=&mut location.source else {unreachable!()};
+            patched.launch.session_id=current.launch.session_id.clone();
+            let changed=tx.execute("UPDATE session_locations SET source=?2 WHERE session=?1 AND source=?3
+                AND EXISTS(SELECT 1 FROM session_observer_owners WHERE session=?1 AND instance=?4 AND stamp=?5)",
+                params![source.id().to_string(),encode(&location.source)?,original,instance.to_string(),stamp])
+                .map_err(|error|error.to_string())?;
+            if changed!=1 {return Err("The directory source changed before its observation was committed".into());}
+        }
+        let mut patched=issued_source;
+        let HostedSession::Chat(patched_chat)=&mut patched else {unreachable!()};
+        patched_chat.launch.session_id=current.launch.session_id.clone();
+        let changed=tx.execute("UPDATE session_observer_owners SET source=?3 WHERE session=?1 AND instance=?2 AND source=?4 AND stamp=?5",
+            params![source.id().to_string(),instance.to_string(),encode(&patched)?,issued,stamp])
+            .map_err(|error|error.to_string())?;
+        if changed!=1 {return Err("The actor observer changed before its observation was committed".into());}
+        let public_changed = super::execution::observe_owned_thread_in(&tx, before, source)?;
+        tx.commit().map_err(|error|error.to_string())?;
+        Ok(public_changed)
     }
 
     pub(crate) fn authenticated_session_alias(
@@ -384,41 +584,10 @@ impl Registry {
 
     /// Called only after holder authentication and installation proved this
     /// exact successor. A public UUID/recipe never establishes this lineage.
-    pub(crate) fn adopt_session_location(
-        &mut self,
-        retained: &[HostedSession],
-        successor: &HostedSession,
-    ) -> Result<(), String> {
-        let Some(first) = retained.first() else {
-            return Ok(());
-        };
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        let Some(mut location) = read(&tx, first.id())? else {
-            return Ok(());
-        };
-        if !same_issued_launch(&location.source, successor)
-            || !compatible_chat_metadata(&location.source, successor)
-            || successor.id() != first.id()
-            || retained.iter().any(|source| source.id() != first.id())
-            || !retained
-                .iter()
-                .any(|source| same_source(&location.source, source))
-        {
-            return Err(
-                "Authenticated holder sources do not prove this session directory successor".into(),
-            );
-        }
-        // A process proof can change during authenticated adoption, while the
-        // original approved inode, refusal and operational spelling cannot.
-        retain_source(&mut location)?;
-        for source in retained {
-            if same_issued_launch(&location.source, source) {
-                retain_alias(&mut location, source)?;
-            }
-        }
-        location.source = successor.clone();
-        write(&tx, &location)?;
-        tx.commit().map_err(|error| error.to_string())
+    pub(crate) fn adopt_session_location(&mut self,retained:&[HostedSession],successor:&HostedSession)->Result<(),String> {
+        let tx=self.db.transaction().map_err(|error|error.to_string())?;
+        adopt_location(&tx,retained,successor)?;
+        tx.commit().map_err(|error|error.to_string())
     }
 
     pub(crate) fn session_location(
@@ -438,61 +607,12 @@ impl Registry {
     }
 
     pub(crate) fn bind_session_location(
-        &mut self,
-        source: &HostedSession,
-        previous: Option<&HostedSession>,
-        directory: &Path,
-        approved: DirectoryIdentity,
-    ) -> Result<(), String> {
-        let tx = self.db.transaction().map_err(|error| error.to_string())?;
-        let old = read(&tx, source.id())?;
-        if old.as_ref().is_some_and(|location| {
-            !same_issued_launch(&location.source, source)
-                || !compatible_chat_metadata(&location.source, source)
-        }) {
-            return Err(
-                "A session directory binding cannot change its original issued launch".into(),
-            );
-        }
-        if old.as_ref().is_some_and(|location| {
-            !location.source.same_process(source)
-                && previous.is_none_or(|previous| !location.source.same_process(previous))
-        }) {
-            return Err("A different original session still owns this directory binding".into());
-        }
-        if old.as_ref().is_some_and(|location| {
-            location
-                .approved
-                .is_some_and(|identity| identity != approved)
-        }) {
-            return Err("The original session directory was replaced; start a new session for the replacement folder".into());
-        }
-        let mut previous_sources = old
-            .as_ref()
-            .map(|location| location.previous_sources.clone())
-            .unwrap_or_default();
-        if let Some(mut old) = old.clone()
-            && !old.source.same_process(source)
-        {
-            retain_source(&mut old)?;
-            previous_sources = old.previous_sources;
-        }
-        write(
-            &tx,
-            &Location {
-                source: source.clone(),
-                repository: old
-                    .as_ref()
-                    .and_then(|location| location.repository.clone()),
-                directory: directory.to_owned(),
-                approved: Some(approved),
-                process: None,
-                blocked_directory: None,
-                refusal: None,
-                previous_sources,
-            },
-        )?;
-        tx.commit().map_err(|error| error.to_string())
+        &mut self, source:&HostedSession, previous:Option<&HostedSession>,
+        directory:&Path, approved:DirectoryIdentity,
+    )->Result<(),String> {
+        let tx=self.db.transaction().map_err(|error|error.to_string())?;
+        bind_location(&tx,source,previous,directory,approved)?;
+        tx.commit().map_err(|error|error.to_string())
     }
 
     /// Holder authentication must supply the exact private retained sources.
@@ -559,6 +679,113 @@ mod tests {
             native_continuity: Default::default(),
             owned_codex_listener: None,
         })
+    }
+
+    fn with_thread(source:&HostedSession,thread:&str)->HostedSession {
+        let mut source=source.clone();
+        let HostedSession::Chat(chat)=&mut source else {unreachable!()};
+        chat.launch.session_id=Some(thread.into());
+        source
+    }
+
+    #[test]
+    fn observer_registration_fences_same_source_and_stable_instance_successors() {
+        let fixture=tempfile::tempdir().unwrap();
+        let mut registry=Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        let source=source(fixture.path());
+        let instance=uuid::Uuid::new_v4();
+        let first=registry.install_session_observer(&source,instance,None,None,None).unwrap();
+        let next=with_thread(&source,"thread-a");
+        // Same logical Remote actor identity can be reinstalled. Its fresh
+        // publication stamp must still fence the prior installation callback.
+        let second=registry.install_session_observer(&source,instance,None,None,None).unwrap();
+        assert_ne!(first.stamp(),second.stamp());
+        assert!(registry.observe_owned_session_thread(&source,&next,instance,first.stamp()).unwrap_err().contains("replaced"));
+        assert!(!registry.restore_session_observer(&first).unwrap());
+        registry.observe_owned_session_thread(&source,&next,instance,second.stamp()).unwrap();
+        let successor=uuid::Uuid::new_v4();
+        let third=registry.install_session_observer(&next,successor,None,None,None).unwrap();
+        assert!(registry.observe_owned_session_thread(&next,&with_thread(&next,"thread-b"),instance,second.stamp()).is_err());
+        registry.observe_owned_session_thread(&next,&with_thread(&next,"thread-b"),successor,third.stamp()).unwrap();
+    }
+
+    #[test]
+    fn observer_failed_publication_restores_only_exact_unchanged_registration() {
+        let fixture=tempfile::tempdir().unwrap();
+        let mut registry=Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        let source=source(fixture.path());
+        let identity=DirectoryIdentity::from_metadata(&std::fs::metadata(fixture.path()).unwrap());
+        let instance=uuid::Uuid::new_v4();
+        let initial=registry.install_session_observer(&source,instance,None,Some((fixture.path(),identity)),None).unwrap();
+        let before=read(&registry.db,source.id()).unwrap();
+        let replaced=registry.install_session_observer(&source,uuid::Uuid::new_v4(),None,Some((fixture.path(),identity)),None).unwrap();
+        assert!(registry.restore_session_observer(&replaced).unwrap());
+        assert_eq!(observer_owner(&registry.db,source.id()).unwrap().unwrap().1,initial.stamp().to_string());
+        assert_eq!(read(&registry.db,source.id()).unwrap(),before);
+        let replaced=registry.install_session_observer(&source,instance,None,None,None).unwrap();
+        registry.refuse_session_location(&source,&fixture.path().join("missing"),"Keep newer location refusal").unwrap();
+        assert!(!registry.restore_session_observer(&replaced).unwrap());
+        assert!(read(&registry.db,source.id()).unwrap().unwrap().refusal.is_some());
+        // A registration without a prior row rolls back its own row/binding.
+        let other=self::source(fixture.path());
+        let created=registry.install_session_observer(&other,uuid::Uuid::new_v4(),None,Some((fixture.path(),identity)),None).unwrap();
+        assert!(registry.restore_session_observer(&created).unwrap());
+        assert!(observer_owner(&registry.db,other.id()).unwrap().is_none());
+        assert!(read(&registry.db,other.id()).unwrap().is_none());
+    }
+
+    #[test]
+    fn observer_updates_only_thread_and_requires_exact_previous_thread() {
+        let fixture=tempfile::tempdir().unwrap();
+        let mut registry=Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        let source=source(fixture.path());
+        let identity=DirectoryIdentity::from_metadata(&std::fs::metadata(fixture.path()).unwrap());
+        let instance=uuid::Uuid::new_v4();
+        let registration=registry.install_session_observer(&source,instance,None,Some((fixture.path(),identity)),None).unwrap();
+        let mut location=read(&registry.db,source.id()).unwrap().unwrap();
+        let HostedSession::Chat(chat)=&mut location.source else {unreachable!()};
+        let HostedSession::Chat(original)=&source else {unreachable!()};
+        let terminal=crate::model::TerminalSession {
+            id:source.id(),owned_codex_listener:None,recovery_origin:None,predecessor:None,
+            launch:original.launch.recipe.clone(),transcript_path:None,resume_hint:Some("new pair metadata".into()),
+            continuity:crate::model::TerminalContinuity::RelaunchAvailable {recipe:original.launch.recipe.clone(),last_exit:None},
+        };
+        chat.terminal=Some(terminal.clone());
+        write(&registry.db,&location).unwrap();
+        let a=with_thread(&source,"thread-a");
+        registry.observe_owned_session_thread(&source,&a,instance,registration.stamp()).unwrap();
+        let saved=read(&registry.db,source.id()).unwrap().unwrap();
+        let HostedSession::Chat(chat)=&saved.source else {unreachable!()};
+        assert_eq!(chat.terminal.as_ref(),Some(&terminal));
+        assert_eq!(saved.approved,Some(identity));
+        assert!(registry.observe_owned_session_thread(&source,&with_thread(&source,"stale-thread"),instance,registration.stamp()).unwrap_err().contains("prior confirmed"));
+        registry.observe_owned_session_thread(&a,&with_thread(&a,"thread-b"),instance,registration.stamp()).unwrap();
+    }
+
+    #[test]
+    fn observer_writer_admission_rejects_a_concurrently_advanced_schema() {
+        let fixture=tempfile::tempdir().unwrap();
+        let path=fixture.path().join("workspace.sqlite3");
+        let mut registry=Registry::at(&path).unwrap();
+        let source=source(fixture.path());
+        let identity=DirectoryIdentity::from_metadata(&std::fs::metadata(fixture.path()).unwrap());
+        registry.bind_session_location(&source,None,fixture.path(),identity).unwrap();
+        let before=read(&registry.db,source.id()).unwrap();
+        let instance=uuid::Uuid::new_v4();
+        let registration=registry.install_session_observer(&source,instance,None,None,None).unwrap();
+        observer_schema(&registry.db).unwrap();
+        let other=Connection::open(&path).unwrap();
+        other.pragma_update(None,"user_version",super::super::SCHEMA_VERSION+1).unwrap();
+        {
+            let tx=registry.db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+            assert!(observer_schema(&tx).is_err());
+        }
+        assert!(registry.install_session_observer(&source,instance,None,None,None).is_err());
+        assert!(registry.observe_owned_session_thread(&source,&with_thread(&source,"new"),instance,registration.stamp()).is_err());
+        assert!(registry.restore_session_observer(&registration).is_err());
+        assert!(Registry::at(&path).is_err());
+        assert_eq!(observer_owner(&registry.db,source.id()).unwrap().unwrap().1,registration.stamp().to_string());
+        assert_eq!(read(&registry.db,source.id()).unwrap(),before);
     }
 
     #[test]

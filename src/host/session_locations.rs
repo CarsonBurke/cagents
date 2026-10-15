@@ -49,6 +49,114 @@ fn owned(scope: &Scope, model: &WorkspaceModel, relocation: &Relocation) -> bool
     }
 }
 
+/// A degraded installed registry is not an in-memory fixture. No callback or
+/// startup may silently publish authority without its durable observer owner.
+pub(super) fn observer_registry(host:&SharedHost)->Result<Option<std::sync::Arc<std::sync::Mutex<super::model::Registry>>>,String> {
+    let state=host.lock().unwrap_or_else(|p|p.into_inner());
+    if state.model.is_some() && state.execution_registry.is_none() {
+        return Err("Conversation metadata storage is unavailable; recover the registry before retrying its original actor".into());
+    }
+    Ok(state.execution_registry.clone())
+}
+
+/// Serialize only metadata observations, never actor transitions. The durable
+/// installer generation independently fences same-source successor actors.
+pub(super) fn observe_chat_directory_thread(
+    host: &SharedHost, id: TerminalId, instance: uuid::Uuid, force: bool,
+) -> Result<(), String> {
+    observe_chat_directory_thread_with(host,id,instance,force,||{})
+}
+
+fn observe_chat_directory_thread_with(
+    host:&SharedHost,id:TerminalId,instance:uuid::Uuid,force:bool,after_commit:impl FnOnce(),
+)->Result<(),String> {
+    let slot = {
+        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+        let Some(record)=state.chats.get(&id).filter(|record|record.execution_instance==instance) else {return Ok(());};
+        if !force && record.handle.confirmed_session_id().as_ref().is_none_or(|thread|record.session.launch.session_id.as_ref()==Some(thread)) {
+            return Ok(());
+        }
+        state.directory_thread_observers.retain(|_,slot|slot.strong_count()!=0);
+        if state.directory_thread_retry.is_some_and(|until|Instant::now()<until) {
+            return if force {Err("Conversation metadata storage is recovering; retry its current pane shortly".into())} else {Ok(())};
+        }
+        if let Some(slot)=state.directory_thread_observers.get(&id).and_then(std::sync::Weak::upgrade) {
+            slot
+        } else {
+            let slot=std::sync::Arc::new(std::sync::Mutex::new(()));
+            state.directory_thread_observers.insert(id,std::sync::Arc::downgrade(&slot));
+            slot
+        }
+    };
+    let _observation=match slot.try_lock() {
+        Ok(guard)=>guard,
+        Err(std::sync::TryLockError::Poisoned(poison))=>poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock)=>return if force {Err("Conversation metadata is being verified; retry its current pane".into())} else {Ok(())},
+    };
+    let result:Result<(),String>=(|| {
+        let registry=observer_registry(host)?;
+        // Capture AFTER acquiring observation ownership, not from a
+        // queued producer event which may describe an older confirmed UUID.
+        let (handle,before,source,stamp)={
+            let state=host.lock().unwrap_or_else(|p|p.into_inner());
+            let Some(record)=state.chats.get(&id).filter(|record|record.execution_instance==instance) else {return Ok(());};
+            let Some(thread)=record.handle.confirmed_session_id() else {return Ok(());};
+            if !force && record.session.launch.session_id.as_ref()==Some(&thread) {return Ok(());}
+            let before=record.session.clone();
+            let mut source=before.clone();source.launch.session_id=Some(thread);
+            let stamp=state.chat_observer_stamps.get(&id)
+                .filter(|(owner,_)|*owner==instance).map(|(_,stamp)|*stamp);
+            if registry.is_some() && stamp.is_none() {
+                return Err("The original actor observer registration is not published; recover its exact owner".into());
+            }
+            (record.handle.clone(),before,source,stamp)
+        };
+        // Capture Host first, then acquire the registry writer. No HostLock
+        // acquisition occurs while this guard or its SQL transaction exists.
+        // A successor registration racing capture is rejected by its new stamp.
+        let mut writer=match registry.as_ref().map(|registry|registry.try_lock()) {
+            Some(Ok(guard))=>Some(guard),
+            Some(Err(std::sync::TryLockError::Poisoned(poison)))=>Some(poison.into_inner()),
+            Some(Err(std::sync::TryLockError::WouldBlock))=>return Err("Conversation metadata storage is busy; retry its current pane".into()),
+            None=>None,
+        };
+        let public_changed = if let Some(writer)=writer.as_mut() {
+            writer.observe_owned_session_thread(
+                &HostedSession::Chat(before.clone()),&HostedSession::Chat(source.clone()),instance,stamp.expect("published observer stamp"),
+            )?
+        } else {false};
+        // No transaction OR registry mutex may be held while acquiring Host.
+        drop(writer);
+        after_commit();
+        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+        let publication_unchanged=stamp.is_none_or(|stamp|state.chat_observer_stamps.get(&id)==Some(&(instance,stamp)));
+        if let Some(record)=state.chats.get_mut(&id).filter(|record|publication_unchanged &&
+            record.execution_instance==instance && record.handle.same_actor(&handle)
+            && record.session.id==before.id && record.session.proof==before.proof
+            && record.session.launch==before.launch)
+        {
+            // A committed A observation remains the publication basis even if
+            // the actor already confirms B. The next observation captures A→B;
+            // actual-current checks still reject a stale known-A pane.
+            // Preserve concurrent private pair/listener/continuity metadata.
+            record.session.launch.session_id=source.launch.session_id;
+            state.directory_thread_retry=None;
+        }
+        drop(state);
+        if public_changed && let Some(registry) = &registry {
+            super::agent_execution::announce(host, registry);
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+        if state.chats.get(&id).is_some_and(|record|record.execution_instance==instance) {
+            state.directory_thread_retry=Some(Instant::now()+Duration::from_secs(1));
+        }
+    }
+    result
+}
+
 /// Capture before any destructive handoff or account switch. The returned
 /// context owns an independent FD pin, never the source actor's cleanup owner.
 pub(super) fn verified_chat_directory(
@@ -64,26 +172,23 @@ pub(super) fn verified_chat_directory(
 > {
     use crate::chat::protocol::ExecutionContext;
     use std::sync::Arc;
-    let current = {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = state
-            .chats
-            .get(&source.id)
-            .ok_or("The original native provider is no longer hosted")?;
+    let instance = {
+        let state=host.lock().unwrap_or_else(|p|p.into_inner());
+        let record=state.chats.get(&source.id).ok_or("The original native provider is no longer hosted")?;
         if !record.handle.same_actor(expected) {
-            return Err(
-                "The native provider changed before its directory could be captured".into(),
-            );
+            return Err("The native provider changed before its directory could be captured".into());
         }
-        let instance = record.execution_instance;
-        state.observe_chat_directory_thread(source.id, instance)
-            .map_err(|error| format!("Cannot retain this provider's confirmed conversation. Check available storage and retry: {error}"))?;
-        let record = &state.chats[&source.id];
-        let mut current = record.session.clone();
-        current.launch.session_id = record
-            .handle
-            .confirmed_session_id()
-            .or(current.launch.session_id);
+        record.execution_instance
+    };
+    observe_chat_directory_thread(host,source.id,instance,true)
+        .map_err(|error|format!("Cannot retain this provider's confirmed conversation. Check available storage and retry: {error}"))?;
+    let current={
+        let state=host.lock().unwrap_or_else(|p|p.into_inner());
+        let record=state.chats.get(&source.id).filter(|record|
+            record.execution_instance==instance && record.handle.same_actor(expected))
+            .ok_or("The native provider changed during directory verification")?;
+        let mut current=record.session.clone();
+        current.launch.session_id=record.handle.confirmed_session_id().or(current.launch.session_id);
         current
     };
     let registry = super::agent_execution::registry(host)?;
@@ -188,22 +293,23 @@ pub(super) fn relocate(
                 sources.insert(source.id(), source.clone());
             }
         }
-        // Explicit verification must also recover a metadata write that
-        // failed on the last provider event while the actor remained idle.
-        let instances = sources
-            .iter()
-            .filter_map(|(id, source)| match source {
-                HostedSession::Chat(_) => state
-                    .chats
-                    .get(id)
-                    .map(|record| (*id, record.execution_instance)),
-                HostedSession::Terminal(_) => None,
-            })
-            .collect::<Vec<_>>();
-        for (id, instance) in instances {
-            state.observe_chat_directory_thread(id, instance)
-                .map_err(|reason| error(format!("Cannot retain the provider's confirmed conversation. Check available storage and retry: {reason}")))?;
-        }
+        sources
+    };
+    // Explicit verification also repairs metadata after the last event failed
+    // persistence. Capture ownership under HostLock, then release it for SQL.
+    let instances={
+        let state=host.lock().unwrap_or_else(|p|p.into_inner());
+        sources.iter().filter_map(|(id,source)| match source {
+            HostedSession::Chat(_)=>state.chats.get(id).map(|record|(*id,record.execution_instance)),
+            HostedSession::Terminal(_)=>None,
+        }).collect::<Vec<_>>()
+    };
+    for (id,instance) in instances {
+        observe_chat_directory_thread(host,id,instance,true)
+            .map_err(|reason|error(format!("Cannot retain the provider's confirmed conversation. Check available storage and retry: {reason}")))?;
+    }
+    let sources={
+        let state=host.lock().unwrap_or_else(|p|p.into_inner());
         // A numeric ID locates a possible owner; exact source or authenticated
         // retained lineage must still prove the association outside this lock.
         sources
@@ -433,13 +539,16 @@ mod tests {
                     ..Default::default()
                 });
             }
-            if matches!(&command, chat::Command::Prompt { text, .. } if text == "__fixture_new_thread")
+            if let chat::Command::Prompt {text,..}=&command
+                && matches!(text.as_str(),"__fixture_new_thread"|"__fixture_next_thread")
             {
                 return Ok(Step {
                     // Conversation confirmation must originate from an actual
                     // provider frame, not a locally prepared command event.
                     writes: vec![
-                        serde_json::json!({"session":"44444444-0000-4000-8000-000000000004"}),
+                        serde_json::json!({"session":if text=="__fixture_next_thread" {
+                            "55555555-0000-4000-8000-000000000005"
+                        } else {"44444444-0000-4000-8000-000000000004"}}),
                     ],
                     ..Default::default()
                 });
@@ -478,13 +587,16 @@ mod tests {
         }
     }
     fn fixture(context_mode: u8) -> Fixture {
+        fixture_provider(context_mode,Provider::Omp)
+    }
+    fn fixture_provider(context_mode:u8,provider:Provider)->Fixture {
         let directory = tempfile::tempdir().unwrap();
         let old = directory.path().join("original");
         std::fs::create_dir(&old).unwrap();
         let moved = directory.path().join("located");
         // Fixture provider supports native stdin and an observable interactive
         // handoff without invoking any installed or paid agent.
-        let program = directory.path().join("omp");
+        let program = directory.path().join(if provider==Provider::Codex {"codex"} else {"omp"});
         std::fs::write(&program, "#!/bin/sh\nif [ \"$1\" = --fixture-native ]; then exec /bin/cat; fi\npwd -P > handoff.marker\nexec /bin/cat\n").unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
@@ -498,7 +610,7 @@ mod tests {
         let source = chat::Session {
             id: TerminalId::new(),
             launch: chat::Launch {
-                provider: Provider::Omp,
+                provider,
                 recipe: LaunchRecipe {
                     program: program.to_string_lossy().into_owned(),
                     arguments: Vec::new(),
@@ -605,12 +717,17 @@ mod tests {
                 .bind_session_location(&HostedSession::Chat(source.clone()), None, &old, identity)
                 .unwrap();
         }
+        let execution_instance=uuid::Uuid::new_v4();
+        let registration=registry.install_session_observer(
+            &HostedSession::Chat(source.clone()),execution_instance,None,None,None,
+        ).unwrap();
         let mut state = HostState::new(proof);
         state.install_model(registry);
+        state.publish_chat_observer(source.id,execution_instance,registration.stamp());
         state.chats.insert(
             source.id,
             Record {
-                execution_instance: uuid::Uuid::new_v4(),
+                execution_instance,
                 console_recipe: None,
                 paired_terminal: None,
                 session: source.clone(),
@@ -895,6 +1012,252 @@ mod tests {
         }
         assert!(locate(&fixture).session_location_refusals.is_empty());
         assert!(!fixture.handle.is_completed());
+    }
+
+    fn confirm_fixture_thread(fixture:&Fixture,command:&str,thread:&str) {
+        fixture.handle.command(chat::Command::Prompt {
+            text:command.into(),attachments:Vec::new(),mode:chat::PromptMode::Send,
+        }).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(2);
+        while fixture.handle.confirmed_session_id().as_deref()!=Some(thread) {
+            assert!(Instant::now()<deadline,"fixture provider did not confirm its actual frame");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn actual_thread_retention_commits_agent_capability_binding_and_host_together() {
+        use crate::agent_execution::{Destination, Origin, Spec, Submit, Surface, Target};
+        let fixture = fixture(0);
+        let source = HostedSession::Chat(fixture.source.clone());
+        let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+        let (agent, token) = {
+            let mut registry = registry.lock().unwrap();
+            let accepted = registry.submit_agent(&Origin::User, &Submit {
+                name: None,
+                destination: Destination::New(Spec {
+                    provider: Provider::Omp, account: None,
+                    target: Target {repository: fixture.old.clone(), directory: fixture.old.clone(), placement: None},
+                    surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None,
+                }),
+                prompt: "private framed provider metadata fixture".into(),
+                idempotency_key: "observer-thread-metadata".into(),
+            }, 1).unwrap();
+            registry.reserve_agent_launch(accepted.agent.id, &source).unwrap();
+            let agent = registry.bind_agent(accepted.agent.id, None, source.clone()).unwrap();
+            let token = registry.register_agent_authority(&source).unwrap();
+            (agent, token)
+        };
+        let db = rusqlite::Connection::open(fixture._directory.path().join("workspace.sqlite3")).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_observed_authority BEFORE UPDATE ON agent_authorities
+            BEGIN SELECT RAISE(FAIL,'injected capability persistence failure'); END;").unwrap();
+        let thread = "44444444-0000-4000-8000-000000000004";
+        confirm_fixture_thread(&fixture, "__fixture_new_thread", thread);
+        super::super::agent_execution::retain_chat_identity(&fixture.host, fixture.source.id);
+        assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
+        {
+            let registry = registry.lock().unwrap();
+            assert_eq!(registry.agent(agent.id).unwrap(), agent);
+            assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(source.clone()));
+            assert!(registry.session_location(&source).unwrap().is_some());
+        }
+        let stored: String = db.query_row("SELECT source FROM session_observer_owners WHERE session=?1",
+            [fixture.source.id.to_string()], |row| row.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<HostedSession>(&stored).unwrap(), source);
+        db.execute_batch("DROP TRIGGER reject_observed_authority").unwrap();
+        fixture.host.lock().unwrap().directory_thread_retry = None;
+        super::super::agent_execution::retain_chat_identity(&fixture.host, fixture.source.id);
+        let mut expected = fixture.source.clone();
+        expected.launch.session_id = Some(thread.into());
+        assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, expected);
+        let expected = HostedSession::Chat(expected);
+        {
+            let registry = registry.lock().unwrap();
+            assert_eq!(registry.agent(agent.id).unwrap().session, Some(expected.clone()));
+            assert_eq!(registry.agent_authority_source(&token).unwrap(), Some(expected.clone()));
+            assert!(registry.session_location(&expected).unwrap().is_some());
+        }
+        let stored: String = db.query_row("SELECT source FROM session_observer_owners WHERE session=?1",
+            [fixture.source.id.to_string()], |row| row.get(0)).unwrap();
+        assert_eq!(serde_json::from_str::<HostedSession>(&stored).unwrap(), expected);
+        let sequence = registry.lock().unwrap().execution_sequence().unwrap();
+        super::super::agent_execution::retain_chat_identity(&fixture.host, fixture.source.id);
+        assert_eq!(registry.lock().unwrap().execution_sequence().unwrap(), sequence);
+    }
+
+    #[test]
+    fn ordinary_unchanged_callback_needs_no_observation_slot() {
+        let fixture=fixture(0);
+        let id=fixture.source.id;
+        let instance=fixture.host.lock().unwrap().chats[&id].execution_instance;
+        for _ in 0..8 {
+            observe_chat_directory_thread(&fixture.host,id,instance,false).unwrap();
+        }
+        assert!(fixture.host.lock().unwrap().directory_thread_observers.is_empty());
+    }
+
+    #[test]
+    fn missing_execution_connection_refuses_authority_but_keeps_actor_delivery() {
+        let fixture=fixture(0);
+        let id=fixture.source.id;
+        let (instance,delivery,registry)={
+            let mut state=fixture.host.lock().unwrap();
+            let delivery=state.register_client(1);
+            let record=state.chats.get_mut(&id).unwrap();
+            record.subscribers.insert(1,true);
+            let instance=record.execution_instance;
+            let registry=state.execution_registry.take().unwrap();
+            (instance,delivery,registry)
+        };
+        assert!(observer_registry(&fixture.host).err().unwrap().contains("unavailable"));
+        let mut replacement=fixture.source.clone();
+        replacement.id=TerminalId::new();
+        replacement.proof=None;
+        replacement.launch.provider=Provider::Claude;
+        replacement.launch.session_id=Some("12345678-1234-4234-8234-123456789abc".into());
+        // No selected Claude transcript exists: unavailable execution storage
+        // must be classified before constructor history reads can mask it.
+        let failure=super::super::chat::start_at_execution_directory(
+            &fixture.host,1,replacement.clone(),Default::default(),
+            fixture.original_context.as_ref().unwrap().clone(),&fixture.old,
+        ).unwrap_err();
+        assert!(failure.message.contains("metadata storage is unavailable"),"{failure:?}");
+        assert!(!fixture.host.lock().unwrap().chats.contains_key(&replacement.id));
+        confirm_fixture_thread(&fixture,"__fixture_new_thread","44444444-0000-4000-8000-000000000004");
+        super::super::chat::changed_owned(&Arc::downgrade(&fixture.host),id,instance,runtime::Update::Presentation);
+        delivery.close_after_drain();
+        assert!(matches!(delivery.pop().map(|message|message.message),Some(crate::terminal_ipc::ServerMessage::ChatChanged {chat_id}) if chat_id==id));
+        assert_eq!(fixture.host.lock().unwrap().chats[&id].session,fixture.source);
+        {
+            let mut state=fixture.host.lock().unwrap();
+            state.directory_thread_retry=None;
+        }
+        assert!(observe_chat_directory_thread(&fixture.host,id,instance,true).unwrap_err().contains("unavailable"));
+        {
+            let mut state=fixture.host.lock().unwrap();
+            state.execution_registry=Some(registry);
+            state.directory_thread_retry=None;
+        }
+        observe_chat_directory_thread(&fixture.host,id,instance,true).unwrap();
+        assert_eq!(fixture.host.lock().unwrap().chats[&id].session.launch.session_id.as_deref(),Some("44444444-0000-4000-8000-000000000004"));
+    }
+
+    #[test]
+    fn console_pair_publication_cannot_regress_a_new_observed_thread() {
+        // Exercise the actual Codex pairing caller with a private framed cat
+        // backend; this does not claim installed Codex protocol acceptance.
+        let fixture=fixture_provider(0,Provider::Codex);
+        let id=fixture.source.id;
+        let instance=fixture.host.lock().unwrap().chats[&id].execution_instance;
+        fixture.host.lock().unwrap().register_client(1);
+        let first="44444444-0000-4000-8000-000000000004";
+        let second="55555555-0000-4000-8000-000000000005";
+        confirm_fixture_thread(&fixture,"__fixture_new_thread",first);
+        observe_chat_directory_thread(&fixture.host,id,instance,true).unwrap();
+        let before=fixture.host.lock().unwrap().chats[&id].session.clone();
+        struct TerminalCleanup(std::sync::Mutex<Option<TerminalHandle>>);
+        impl Drop for TerminalCleanup {
+            fn drop(&mut self) {
+                if let Some(handle)=self.0.get_mut().unwrap_or_else(|p|p.into_inner()).take() {let _=handle.shutdown();}
+            }
+        }
+        let cleanup=TerminalCleanup(std::sync::Mutex::new(None));
+        let response=super::super::chat::codex_terminal_view_with(
+            &fixture.host,1,id,&fixture.handle,before.clone(),before.launch.recipe.clone(),|| {
+                // Actual pair ownership is installed, but the caller captured
+                // A before its source RPC. Confirm/persist B in this exact gap.
+                *cleanup.0.lock().unwrap()=Some(fixture.host.lock().unwrap().chats[&id].paired_terminal.as_ref().unwrap().clone());
+                confirm_fixture_thread(&fixture,"__fixture_next_thread",second);
+                observe_chat_directory_thread(&fixture.host,id,instance,true).unwrap();
+            },
+        ).unwrap();
+        assert!(matches!(response,ServerResponse::ChatTerminal {chat_id,..} if chat_id==id));
+        let current=fixture.host.lock().unwrap().chats[&id].session.clone();
+        assert_eq!(current.launch.session_id.as_deref(),Some(second));
+        assert!(current.terminal.is_some());
+        let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+        assert!(registry.lock().unwrap().session_location(&HostedSession::Chat(current.clone())).unwrap().is_some());
+        // No manual callback/basis repair: the next explicit verified capture
+        // must accept the same exact provider and its current B source.
+        verified_chat_directory(&fixture.host,&current,&fixture.handle).unwrap();
+    }
+
+    #[test]
+    fn committed_thread_is_published_before_next_confirmation_and_preserves_pair_metadata() {
+        let fixture=fixture(0);
+        let id=fixture.source.id;
+        let instance=fixture.host.lock().unwrap().chats[&id].execution_instance;
+        let first="44444444-0000-4000-8000-000000000004";
+        let second="55555555-0000-4000-8000-000000000005";
+        confirm_fixture_thread(&fixture,"__fixture_new_thread",first);
+        let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+        observe_chat_directory_thread_with(&fixture.host,id,instance,true,|| {
+            // This is exactly after SQL commit, before Host publication. Both
+            // locks must be free, and an actual provider frame may advance B.
+            let guard=registry.try_lock().expect("registry held across publication");
+            assert!(guard.session_location(&HostedSession::Chat({
+                let mut source=fixture.source.clone();source.launch.session_id=Some(first.into());source
+            })).unwrap().is_some());
+            drop(guard);
+            {
+                let mut state=fixture.host.try_lock().expect("HostLock held across SQL commit");
+                let recipe=fixture.source.launch.recipe.clone();
+                state.chats.get_mut(&id).unwrap().session.terminal=Some(crate::model::TerminalSession {
+                    id,owned_codex_listener:None,recovery_origin:None,predecessor:None,
+                    launch:recipe.clone(),transcript_path:None,resume_hint:Some("concurrent pair".into()),
+                    continuity:crate::model::TerminalContinuity::RelaunchAvailable {recipe,last_exit:None},
+                });
+            }
+            confirm_fixture_thread(&fixture,"__fixture_next_thread",second);
+        }).unwrap();
+        {
+            let state=fixture.host.lock().unwrap();
+            let current=&state.chats[&id].session;
+            assert_eq!(current.launch.session_id.as_deref(),Some(first));
+            assert_eq!(current.terminal.as_ref().unwrap().resume_hint.as_deref(),Some("concurrent pair"));
+            assert_eq!(state.chats[&id].handle.confirmed_session_id().as_deref(),Some(second));
+        }
+        observe_chat_directory_thread(&fixture.host,id,instance,true).unwrap();
+        let current=fixture.host.lock().unwrap().chats[&id].session.clone();
+        assert_eq!(current.launch.session_id.as_deref(),Some(second));
+        assert!(current.terminal.is_some());
+        assert!(registry.lock().unwrap().session_location(&HostedSession::Chat(current)).unwrap().is_some());
+    }
+
+    #[test]
+    fn sqlite_writer_contention_does_not_hold_host_lock_and_explicit_retry_repairs() {
+        let fixture=fixture(0);
+        let id=fixture.source.id;
+        let instance=fixture.host.lock().unwrap().chats[&id].execution_instance;
+        let first="44444444-0000-4000-8000-000000000004";
+        confirm_fixture_thread(&fixture,"__fixture_new_thread",first);
+        let mut database=rusqlite::Connection::open(fixture._directory.path().join("workspace.sqlite3")).unwrap();
+        let transaction=database.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate).unwrap();
+        let registry=super::super::agent_execution::registry(&fixture.host).unwrap();
+        let (done_tx,done_rx)=std::sync::mpsc::sync_channel(1);
+        let host=fixture.host.clone();
+        let worker=std::thread::spawn(move|| {
+            let result=observe_chat_directory_thread(&host,id,instance,true);
+            let _=done_tx.send(result);
+        });
+        let deadline=Instant::now()+Duration::from_secs(2);
+        loop {
+            if matches!(registry.try_lock(),Err(std::sync::TryLockError::WouldBlock)) {break;}
+            assert!(Instant::now()<deadline,"observer did not enter its SQL writer");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The observer is blocked behind a real SQLite write transaction, but
+        // an unrelated host reader and callback do not wait for that writer.
+        assert!(fixture.host.try_lock().is_ok());
+        super::super::chat::changed_owned(&Arc::downgrade(&fixture.host),id,instance,runtime::Update::Presentation);
+        assert!(done_rx.try_recv().is_err());
+        transaction.rollback().unwrap();
+        done_rx.recv_timeout(Duration::from_secs(3)).expect("SQL observer did not finish after writer release").unwrap();
+        // A received completion precedes thread return; joining here has no
+        // provider/destructor ownership and follows that finite receipt.
+        worker.join().unwrap();
+        assert_eq!(fixture.host.lock().unwrap().chats[&id].session.launch.session_id.as_deref(),Some(first));
+        observe_chat_directory_thread(&fixture.host,id,instance,true).unwrap();
     }
 
     #[test]

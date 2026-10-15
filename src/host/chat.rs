@@ -456,6 +456,11 @@ fn changed_from(
             }
         }
     }
+    if let Some(instance)=instance {
+        if let Err(error)=super::session_locations::observe_chat_directory_thread(&host,id,instance,false) {
+            tracing::warn!(%error,"cannot retain the owned provider's confirmed thread");
+        }
+    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(instance) = instance {
         if !state
@@ -464,9 +469,6 @@ fn changed_from(
             .is_some_and(|record| record.execution_instance == instance)
         {
             return;
-        }
-        if let Err(error) = state.observe_chat_directory_thread(id, instance) {
-            tracing::warn!(%error, "cannot retain the owned provider's confirmed thread");
         }
     }
     let proof = state.proof().clone();
@@ -1035,11 +1037,8 @@ fn start_with_execution(
     // history. Codex also supports a live socket attachment, whose account is
     // deliberately not reauthorized; its transport is checked below instead.
     let binding_source = crate::agent_execution::HostedSession::Chat(session.clone());
-    let binding_registry = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .execution_registry
-        .clone();
+    let binding_registry = super::session_locations::observer_registry(host)
+        .map_err(unavailable)?;
     let operational_binding = binding_registry
         .as_ref()
         .map(|registry| {
@@ -1628,50 +1627,42 @@ fn start_with_execution(
             .actor_identity()
             .map_or(execution_instance, |identity| identity.instance);
         let _ = owner_instance.set(execution_instance);
-        if let Some(context) = &execution
-            && let Some(identity) = context.directory_identity().map_err(unavailable)?
-        {
-            let directory = context.directory_descriptor().ok_or_else(|| {
-                unavailable("Native startup requires the approved directory descriptor")
-            })?;
-            // Recheck the actual opened descriptor, not a path reopened after
-            // spawn. Agent contexts and ordinary contexts share this contract.
+        let approved=execution.as_ref().map(|context|context.directory_identity())
+            .transpose().map_err(unavailable)?.flatten();
+        if let Some(identity)=approved {
+            let directory=execution.as_ref().and_then(|context|context.directory_descriptor())
+                .ok_or_else(||unavailable("Native startup requires the approved directory descriptor"))?;
             if crate::agent_execution::DirectoryIdentity::from_metadata(
-                &directory
-                    .metadata()
-                    .map_err(|error| unavailable(error.to_string()))?,
-            ) != identity
-            {
-                let _ = handle.close();
-                return Err(unavailable(
-                    "The approved provider directory descriptor changed during startup",
-                ));
-            }
-            let registry = host
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .execution_registry
-                .clone();
-            if let Some(registry) = registry {
-                let result = registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .bind_session_location(
-                        &crate::agent_execution::HostedSession::Chat(session.clone()),
-                        Some(&previous_binding_source),
-                        &operational_directory,
-                        identity,
-                    );
-                if let Err(reason) = result {
-                    let _ = handle.close();
-                    return Err(unavailable(reason));
-                }
+                &directory.metadata().map_err(|error|unavailable(error.to_string()))?,
+            )!=identity {
+                let _=handle.close();
+                return Err(unavailable("The approved provider directory descriptor changed during startup"));
             }
         }
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let observer_registry=match super::session_locations::observer_registry(host) {
+            Ok(registry)=>registry,
+            Err(reason)=>{let _=handle.close();return Err(unavailable(reason));}
+        };
+        let observer_registration=if let Some(registry)=&observer_registry {
+            let result=registry.lock().unwrap_or_else(|p|p.into_inner()).install_session_observer(
+                &crate::agent_execution::HostedSession::Chat(session.clone()),
+                execution_instance,Some(&previous_binding_source),
+                approved.map(|identity|(operational_directory.as_path(),identity)),None,
+            );
+            match result {
+                Ok(registration)=>Some(registration),
+                Err(reason)=>{let _=handle.close();return Err(unavailable(reason));}
+            }
+        } else {None};
+        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
         if state.shutting_down {
             drop(state);
-            let _ = handle.close();
+            if let (Some(registry),Some(registration))=(&observer_registry,&observer_registration) {
+                if let Err(error)=registry.lock().unwrap_or_else(|p|p.into_inner()).restore_session_observer(registration) {
+                    tracing::warn!(%error,"cannot restore cancelled native observer ownership");
+                }
+            }
+            let _=handle.close();
             return Err(unavailable("Daemon shutdown cancelled chat start"));
         }
         let observation = Observation {
@@ -1715,6 +1706,9 @@ fn start_with_execution(
         let response = session_snapshot(&record);
         let installed_handle = record.handle.clone();
         state.issued_chat_ids.insert(id);
+        if let Some(registration)=&observer_registration {
+            state.publish_chat_observer(id,execution_instance,registration.stamp());
+        }
         state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
@@ -1744,12 +1738,20 @@ fn start_with_execution(
 /// Attach a CLI view without stopping the server-owned thread or its native
 /// connection. Both descriptors retain the same daemon-owned session ID.
 pub(super) fn codex_terminal_view(
+    host: &SharedHost, client: ClientId, chat_id: TerminalId,
+    handle: &Handle, session: Session, recipe: crate::model::LaunchRecipe,
+) -> Result<ServerResponse, ProtocolError> {
+    codex_terminal_view_with(host,client,chat_id,handle,session,recipe,||{})
+}
+
+pub(super) fn codex_terminal_view_with(
     host: &SharedHost,
     client: ClientId,
     chat_id: TerminalId,
     handle: &Handle,
     mut session: Session,
     recipe: crate::model::LaunchRecipe,
+    after_source:impl FnOnce(),
 ) -> Result<ServerResponse, ProtocolError> {
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1950,6 +1952,7 @@ pub(super) fn codex_terminal_view(
         handle
             .update_native_source(updated, None, paired_terminal.holder_identity().cloned())
             .map_err(unavailable)?;
+        after_source();
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !state
             .terminals
@@ -1963,7 +1966,8 @@ pub(super) fn codex_terminal_view(
             .get_mut(&chat_id)
             .filter(|record| record.handle.same_actor(handle))
             .ok_or_else(|| unavailable("The thread closed while publishing its CLI view."))?;
-        record.session.launch.session_id = before.launch.session_id.clone();
+        // Only the canonical observer publishes confirmed thread identity;
+        // pairing must preserve a newer observation made during its RPC.
         record.source_process = paired_terminal.observe_agent_process();
         record.returning_terminal = false;
         state.inventory_generation += 1;

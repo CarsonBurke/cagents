@@ -297,6 +297,8 @@ pub(crate) struct HostState {
     /// Retry a failed private metadata write at most once per second, while
     /// continuing to publish actor output. Directory authority stays unchanged.
     pub(super) directory_thread_retry: Option<Instant>,
+    pub(super) chat_observer_stamps: BTreeMap<TerminalId, (uuid::Uuid, uuid::Uuid)>,
+    pub(super) directory_thread_observers: BTreeMap<TerminalId, std::sync::Weak<Mutex<()>>>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
@@ -368,6 +370,8 @@ impl HostState {
             chat_restarts: BTreeMap::new(),
             issued_chat_ids: BTreeSet::new(),
             directory_thread_retry: None,
+            chat_observer_stamps: BTreeMap::new(),
+            directory_thread_observers: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
@@ -450,48 +454,11 @@ impl HostState {
         self.model = Some(registry);
     }
 
-    /// Called under HostLock with the callback's private actor incarnation.
-    /// A late callback cannot enrich a successor that reused its numeric ID.
-    pub(super) fn observe_chat_directory_thread(
-        &mut self,
-        id: TerminalId,
-        instance: uuid::Uuid,
-    ) -> Result<(), String> {
-        let Some(record) = self
-            .chats
-            .get(&id)
-            .filter(|record| record.execution_instance == instance)
-        else {
-            return Ok(());
-        };
-        let Some(thread) = record.handle.confirmed_session_id() else {
-            return Ok(());
-        };
-        if record.session.launch.session_id.as_ref() == Some(&thread) {
-            return Ok(());
-        }
-        if self
-            .directory_thread_retry
-            .is_some_and(|deadline| Instant::now() < deadline)
-        {
-            return Ok(());
-        }
-        let mut source = record.session.clone();
-        source.launch.session_id = Some(thread);
-        if let Some(registry) = self.model.as_mut() {
-            if let Err(error) = registry.observe_owned_session_thread(
-                &crate::agent_execution::HostedSession::Chat(source.clone()),
-            ) {
-                self.directory_thread_retry = Some(Instant::now() + Duration::from_secs(1));
-                return Err(error);
-            }
-        }
-        self.directory_thread_retry = None;
-        self.chats
-            .get_mut(&id)
-            .expect("actor held under HostLock")
-            .session = source;
-        Ok(())
+    /// In-memory publication of the exact durable observer registration. The
+    /// caller installs this under the same HostLock as the matching Record.
+    pub(super) fn publish_chat_observer(&mut self,id:TerminalId,instance:uuid::Uuid,stamp:uuid::Uuid) {
+        self.chat_observer_stamps.retain(|id,_|self.chats.contains_key(id));
+        self.chat_observer_stamps.insert(id,(instance,stamp));
     }
 
     /// How many hosted agents are working, and how many are waiting on the

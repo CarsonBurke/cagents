@@ -587,48 +587,13 @@ fn dispatch(
 /// Save provider-confirmed identity even when no window has opened the chat.
 /// Presentation descriptors may be issued before the first init frame arrives.
 pub(super) fn retain_chat_identity(host: &SharedHost, id: TerminalId) {
-    let retained = {
+    let instance = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(record) = state.chats.get(&id) else {
-            return;
-        };
-        let Some(identity) = record.handle.confirmed_session_id() else {
-            return;
-        };
-        if record.session.launch.session_id.as_ref() == Some(&identity) {
-            return;
-        }
-        let mut successor = record.session.clone();
-        successor.launch.session_id = Some(identity);
-        (record.session.clone(), successor, record.handle.clone())
+        state.chats.get(&id).map(|record| record.execution_instance)
     };
-    let Ok(registry) = registry(host) else {
-        return;
-    };
-    let changed = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .adopt_authenticated_agent_session(
-            &[HostedSession::Chat(retained.0.clone())],
-            &HostedSession::Chat(retained.1.clone()),
-        );
-    match changed {
-        Ok(changed) => {
-            {
-                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(record) = state.chats.get_mut(&id)
-                    && record.handle.same_actor(&retained.2)
-                    && record.session == retained.0
-                {
-                    record.session = retained.1;
-                }
-            }
-            if changed {
-                announce(host, &registry);
-            }
-        }
-        Err(error) => {
-            tracing::warn!(%error, %id, "cannot retain confirmed agent conversation identity")
+    if let Some(instance) = instance {
+        if let Err(error) = super::session_locations::observe_chat_directory_thread(host, id, instance, false) {
+            tracing::warn!(%error, %id, "cannot retain confirmed agent conversation identity");
         }
     }
 }
