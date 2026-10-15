@@ -82,6 +82,15 @@ const OBJECTS: &[(&str,&str,&str)] = &[
     ("trigger","automation_archive_channel_delete",r###"CREATE TRIGGER automation_archive_channel_delete AFTER DELETE ON channels  BEGIN UPDATE metadata SET automation_archive_sequence=automation_archive_sequence+1 WHERE key=0; END;"###),
     ("trigger","automation_archive_visibility",r###"CREATE TRIGGER automation_archive_visibility AFTER UPDATE OF record ON automations WHEN json_extract(OLD.record,'$.definition.visibility') IS NOT json_extract(NEW.record,'$.definition.visibility') BEGIN UPDATE metadata SET automation_archive_sequence=automation_archive_sequence+1 WHERE key=0; END;"###),
 ];
+const PROJECTS_BASE:&str=r###"CREATE TABLE projects(
+    repository TEXT PRIMARY KEY, name TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder'))
+) STRICT"###;
+const PROJECTS_TARGET:&str=r###"CREATE TABLE projects(
+    repository TEXT PRIMARY KEY, name TEXT NOT NULL, ordinal INTEGER NOT NULL,
+    kind TEXT NOT NULL DEFAULT 'git' CHECK(kind IN ('git', 'folder')),
+    checkout TEXT, primary_checkout TEXT
+) STRICT"###;
 const METADATA_BASE:&str=r###"CREATE TABLE metadata(
              key INTEGER PRIMARY KEY CHECK(key = 0),
              identity TEXT NOT NULL,
@@ -106,6 +115,18 @@ fn definition(db:&Connection,kind:&str,name:&str)->Result<Option<String>,String>
 /// writer transaction. A number never authorizes an ambiguous partial layout.
 pub(super) fn validate(db:&Connection,current:u32)->Result<(),String> {
     if current>19 {return Err("The automation registry requires a newer build".into());}
+    // Discovery paths are retained metadata, never inferred filesystem or
+    // execution authority. Published predecessors must not contain this fork.
+    let projects=definition(db,"table","projects")?;
+    if current<=12 {
+        let private_columns:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name IN ('checkout','primary_checkout'))",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        if private_columns {return Err("The published registry contains unpublished checkout discovery columns; refusing an ambiguous partial migration".into());}
+    } else {
+        let expected=if current==19{PROJECTS_TARGET}else{PROJECTS_BASE};
+        if projects.as_deref().map(super::schema::normalized)!=Some(super::schema::normalized(expected)) {
+            return Err("The project discovery layout does not match its admitted registry checkpoint".into());
+        }
+    }
     let metadata=definition(db,"table","metadata")?;
     let expected=if current==19 {METADATA_TARGET}else{METADATA_BASE};
     if !(current==0&&metadata.is_none()) && metadata.as_deref().map(super::schema::normalized)!=Some(super::schema::normalized(expected)) {
@@ -132,6 +153,12 @@ fn apply_with_hook(tx:&Transaction<'_>,mut after_step:impl FnMut(usize)->Result<
     let mut step=0;
     let mut completed=|| { let current=step;step+=1;after_step(current) };
     validate(tx,18)?;
+    // Old identities/names/filing survive exactly. No checkout is guessed from
+    // a repository key, path spelling, or former working directory.
+    tx.execute_batch("ALTER TABLE projects ADD COLUMN checkout TEXT;").map_err(|error|error.to_string())?;
+    completed()?;
+    tx.execute_batch("ALTER TABLE projects ADD COLUMN primary_checkout TEXT;").map_err(|error|error.to_string())?;
+    completed()?;
     tx.execute_batch(r###"ALTER TABLE metadata ADD COLUMN automation_proposal_sequence INTEGER NOT NULL DEFAULT 0 CHECK(automation_proposal_sequence>=0); ALTER TABLE metadata ADD COLUMN automation_archive_sequence INTEGER NOT NULL DEFAULT 0 CHECK(automation_archive_sequence>=0);"###).map_err(|error|error.to_string())?;
     completed()?;
     // Tables precede indexes/triggers; no observer can see a partial checkpoint.
@@ -160,6 +187,10 @@ pub(super) fn discard_for_legacy_fixture(db:&Connection) {
         for &(actual,name,_) in OBJECTS.iter().rev() {
             if actual==kind {db.execute_batch(&format!("DROP {kind} IF EXISTS {name}")).unwrap();}
         }
+    }
+    for name in ["primary_checkout","checkout"] {
+        let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('projects') WHERE name=?1)",[name],|row|row.get(0)).unwrap();
+        if exists {db.execute_batch(&format!("ALTER TABLE projects DROP COLUMN {name}")).unwrap();}
     }
     for name in ["automation_archive_sequence","automation_proposal_sequence"] {
         let exists:bool=db.query_row("SELECT EXISTS(SELECT 1 FROM pragma_table_info('metadata') WHERE name=?1)",[name],|row|row.get(0)).unwrap();
@@ -275,10 +306,40 @@ mod tests {
     }
 
     #[test]
+    fn registry19_checkout_discovery_preserves_original_values_and_never_guesses_legacy_paths() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("registry.sqlite3");
+        let registry=Registry::at(&path).unwrap();
+        registry.db.execute("INSERT INTO projects(repository,name,ordinal,kind,checkout,primary_checkout) VALUES('/metadata/project.git','preserved original name',1,'git','/known linked','/known primary')",[]).unwrap();
+        drop(registry);
+        for _ in 0..2 {
+            let registry=Registry::at(&path).unwrap();
+            let retained=registry.db.query_row("SELECT repository,name,ordinal,kind,checkout,primary_checkout FROM projects",[],|row|Ok((row.get::<_,String>(0)?,row.get::<_,String>(1)?,row.get::<_,u64>(2)?,row.get::<_,String>(3)?,row.get::<_,Option<String>>(4)?,row.get::<_,Option<String>>(5)?))).unwrap();
+            assert_eq!(retained,("/metadata/project.git".into(),"preserved original name".into(),1,"git".into(),Some("/known linked".into()),Some("/known primary".into())));
+        }
+    }
+
+    #[test]
+    fn registry19_partial_checkout_forks_refuse_before_any_schema_repair() {
+        for checkpoint in [12,17,18,19] {
+            let root=tempfile::tempdir().unwrap();let path=root.path().join("registry.sqlite3");
+            let registry=Registry::at(&path).unwrap();
+            if checkpoint<=12 {schema::discard_selected_for_legacy_fixture(&registry.db);}
+            else if checkpoint<19 {discard_for_legacy_fixture(&registry.db);}
+            else {registry.db.execute_batch("ALTER TABLE projects DROP COLUMN primary_checkout").unwrap();}
+            if checkpoint<19 {registry.db.execute_batch("ALTER TABLE projects ADD COLUMN checkout TEXT").unwrap();}
+            registry.db.pragma_update(None,"user_version",checkpoint).unwrap();
+            let before=schema::stored_contents(&registry.db);
+            assert!(schema::migrate(&registry.db).is_err(),"partial checkpoint {checkpoint}");
+            assert_eq!(schema::stored_contents(&registry.db),before);
+            assert_eq!(registry.db.pragma_query_value(None,"user_version",|row|row.get::<_,u32>(0)).unwrap(),checkpoint);
+        }
+    }
+
+    #[test]
     fn registry19_every_extension_step_rolls_back_metadata_rows_and_checkpoint_atomically() {
         // Metadata ALTERs, every table/index/trigger, usage seed and conservative
         // precheck ownership copy all run under the same cumulative writer.
-        for fail_at in 0..OBJECTS.len()+3 {
+        for fail_at in 0..OBJECTS.len()+5 {
             let root=tempfile::tempdir().unwrap();let path=root.path().join("registry.sqlite3");
             let registry=Registry::at(&path).unwrap();
             discard_for_legacy_fixture(&registry.db);
