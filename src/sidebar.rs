@@ -7312,9 +7312,10 @@ fn files_section<'a>(
             Some(candidate)
         };
         if let Some(path) = relative.and_then(|path| RepoPath::parse(path).ok()) {
-            filter = filter.on_submit(SidebarAction::OpenFile {
+            let key = key.clone();
+            filter = filter.on_submit(move |_| SidebarAction::OpenFile {
                 key: key.clone(),
-                path,
+                path: path.clone(),
             });
         }
     }

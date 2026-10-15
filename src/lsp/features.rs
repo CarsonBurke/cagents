@@ -1384,7 +1384,7 @@ impl Drop for ServerEditGuard {
 pub(super) fn apply_workspace_edit(
     state: &mut RouterState,
     params: lsp_types::ApplyWorkspaceEditParams,
-) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::Error>>
+) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>>
 + Send
 + 'static {
     apply_workspace_edit_with_timeout(state, params, Duration::from_secs(120))
@@ -1393,7 +1393,7 @@ fn apply_workspace_edit_with_timeout(
     state: &mut RouterState,
     params: lsp_types::ApplyWorkspaceEditParams,
     timeout: Duration,
-) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::Error>>
+) -> impl std::future::Future<Output = Result<lsp_types::ApplyWorkspaceEditResponse, async_lsp::ResponseError>>
 + Send
 + 'static {
     let deadline = std::time::Instant::now() + timeout;
