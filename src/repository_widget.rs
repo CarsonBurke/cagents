@@ -5556,6 +5556,17 @@ impl RepositoryRuntime {
                 if !self.can_discard_edits() {
                     return Task::none();
                 }
+                // The toolbar promises an immediately undoable discard. Reveal
+                // the backing editor, whose mounted key handler owns Ctrl+Z,
+                // instead of leaving the keyboard on an immutable comparison.
+                if self.source_surface == SourceSurface::Diff {
+                    self.capture_native_viewport();
+                    self.align_editor_to_diff();
+                    self.source_surface = SourceSurface::Editor;
+                    self.markdown_mode = MarkdownMode::Edit;
+                    self.clear_find();
+                    self.restore_native_viewport();
+                }
                 let DocumentState::Editable(document) = &mut self.document else {
                     return Task::none();
                 };
@@ -5570,7 +5581,7 @@ impl RepositoryRuntime {
                 }
                 // The toolbar button took the keyboard; give it back so the
                 // Ctrl+Z its tooltip promises reaches the buffer.
-                Task::batch([self.markdown_task(card), self.focus_editor(card)])
+                Task::batch([self.markdown_task(card), self.restore_visible_scroll(), self.focus_editor(card)])
             }
             RepositoryAction::Undo { card } => self.step_history(card, false),
             RepositoryAction::Redo { card } => self.step_history(card, true),
@@ -11196,6 +11207,26 @@ mod tests {
             !runtime.working_annotations_current(),
             "a tint drawn from a superseded comparison must go out with it"
         );
+    }
+
+    #[test]
+    fn discarding_from_diff_reveals_backing_editor_and_remains_undoable() {
+        let card = CardId::new();
+        let (mut runtime,_) = working_diff_runtime(card,"index\n", "saved\n");
+        runtime.source_surface = SourceSurface::Editor;
+        drop(runtime.update(RepositoryAction::EditorAction { card,action:text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let changed = runtime.editor_text().unwrap();
+        assert!(runtime.is_dirty());
+        runtime.source_surface = SourceSurface::Diff;
+        drop(runtime.update(RepositoryAction::DiscardEdits { card }));
+        assert!(runtime.editor_focus_target(card).is_some(),"Ctrl+Z must have a mounted native source editor");
+        assert_eq!(runtime.editor_text().as_deref(),Some("saved\n"));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(),Some(changed.as_str()));
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().as_deref(),Some("saved\n"));
+        assert!(!runtime.is_dirty());
     }
 
     /// The comparison surface mounts no buffer, so an editor action arriving
