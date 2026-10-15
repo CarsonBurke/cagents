@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Summarize opt-in cagents::memory traces and live private UI stack mappings.
+
+Owner body counts are references, not unique heap bytes. Exposed presentation
+counts omit opaque parser, shaping and renderer allocations. Stack reservations
+are virtual address ranges; RSS/PSS below come only from fully contained VMAs.
+No mapping paths, thread IDs, chat IDs or pointer addresses enter the report.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+
+ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+FIELD = re.compile(r'\b([a-z_]+)=("[^"\n]*"|[^\s,]+)')
+HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+)\s")
+METRICS = ("Rss", "Pss", "Anonymous", "Swap")
+
+
+def trace_owners(log):
+    owners = {"chat_runtime": {}, "chat_client": {}, "ipc": {}}
+    stacks = {}
+    for line in log.open(errors="replace"):
+        if "cagents::memory" not in line:
+            continue
+        fields = {key: value.strip('"') for key, value in FIELD.findall(ANSI.sub("", line))}
+        owner = fields.get("owner")
+        if owner == "thread_stack":
+            try:
+                thread = int(fields["thread_id"])
+                base = int(fields["stack_base"])
+                size = int(fields["reserved_stack_bytes"])
+                guard = int(fields["guard_bytes"])
+                role = fields["role"]
+            except (KeyError, ValueError):
+                continue
+            if role in ("chat_reader", "chat_visibility"):
+                stacks.pop((thread, base), None)
+                stacks[(thread, base)] = (size, guard, role)
+        elif owner in owners:
+            identity = fields.get("codec" if owner == "ipc" else "chat_id")
+            if identity is None:
+                continue
+            if fields.get("released") == "true":
+                owners[owner].pop(identity, None)
+            else:
+                # All current owner events contain complete exposed counters.
+                owners[owner][identity] = fields
+    return owners, stacks
+
+
+def owner_totals(owners):
+    result = {}
+    for owner, records in owners.items():
+        keys = ("read_capacity", "write_capacity") if owner == "ipc" else (
+            ("resident_bytes", "cache_entries", "exposed_presentation_bytes")
+            if owner == "chat_runtime" else ("resident_bytes",))
+        totals = {key: sum(int(fields.get(key, 0)) for fields in records.values()) for key in keys}
+        result[owner] = {"owners": len(records), **totals}
+    return result
+
+
+def read_smaps(path):
+    mappings = []
+    current = None
+    for line in path.open():
+        header = HEADER.match(line)
+        if header:
+            current = {"start": int(header[1], 16), "end": int(header[2], 16)}
+            mappings.append(current)
+        elif current is not None:
+            key, _, value = line.partition(":")
+            if key in METRICS:
+                current[key] = int(value.split()[0])
+    return mappings
+
+
+def stack_totals(ranges, mappings):
+    unique = []
+    for start, end in sorted({(base, base + size) for base, size in ranges}):
+        if unique and start <= unique[-1][1]:
+            unique[-1] = (unique[-1][0], max(unique[-1][1], end))
+        else:
+            unique.append((start, end))
+    total = {key.lower() + "_kib": 0 for key in METRICS}
+    covered = set()
+    partial = set()
+    for index, mapping in enumerate(mappings):
+        start, end = mapping["start"], mapping["end"]
+        if any(base <= start and end <= limit for base, limit in unique):
+            covered.add(index)
+            for key in METRICS:
+                total[key.lower() + "_kib"] += mapping.get(key, 0)
+        elif any(start < limit and base < end for base, limit in unique):
+            partial.add(index)
+    return {"ranges": len(unique), "reserved_bytes": sum(end - start for start, end in unique),
+            "fully_contained_vmas": len(covered), "partial_overlap_vmas_unattributed": len(partial), **total}
+
+
+def live_stacks(pid, root, stacks):
+    process = Path("/proc") / str(pid)
+    environment = dict(part.split(b"=", 1) for part in
+                       (process / "environ").read_bytes().split(b"\0") if b"=" in part)
+    if environment.get(b"XDG_DATA_HOME") != os.fsencode(root / "data"):
+        raise SystemExit("refusing a process outside the private fixture")
+    if (process / "exe").resolve().name != "cagents-ui":
+        raise SystemExit("supply the private native UI PID")
+    identity = (process / "stat").read_text().rsplit(")", 1)[1].split()[19]
+    latest = {}
+    for (thread, base), value in stacks.items():
+        latest[thread] = (base, *value)
+    active, retired, roles = [], [], {"chat_reader": 0, "chat_visibility": 0}
+    active_bases = set()
+    active_guard_bytes = 0
+    for thread, (base, size, guard, role) in latest.items():
+        try:
+            name = (process / "task" / str(thread) / "comm").read_text().strip()
+        except FileNotFoundError:
+            continue
+        prefix = "chat-client" if role == "chat_reader" else "chat-visibility"
+        if name.startswith(prefix):
+            active.append((base, size))
+            active_bases.add(base)
+            roles[role] += 1
+            active_guard_bytes += guard
+    for (_thread, base), (size, _guard, _role) in stacks.items():
+        if base not in active_bases:
+            retired.append((base, size))
+    mappings = read_smaps(process / "smaps")
+    if (process / "stat").read_text().rsplit(")", 1)[1].split()[19] != identity:
+        raise SystemExit("private UI PID was recycled")
+    return {"active_workers": roles, "active_guard_bytes": active_guard_bytes,
+            "active_chat_worker_stacks": stack_totals(active, mappings),
+            "retired_known_stack_ranges": stack_totals(retired, mappings),
+            "retired_range_note": "A retired address may be reused by an unrelated mapping; this is a bound, not proof of allocator stack retention."}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--log", type=Path, required=True)
+    parser.add_argument("--root", type=Path, help="private measure-chat-memory root for live stack attribution")
+    parser.add_argument("--pid", type=int)
+    parser.add_argument("--output", type=Path)
+    args = parser.parse_args()
+    owners, stacks = trace_owners(args.log)
+    report = {"schema_version": 1, "owner_totals": owner_totals(owners),
+              "body_bytes_are_arc_references_not_unique_heap": True,
+              "exposed_presentation_bytes_omit_opaque_parser_and_renderer": True}
+    if args.pid:
+        if not args.root or not (args.root / ".chat-memory-fixture-v1").is_file():
+            parser.error("live stack attribution needs --root from measure-chat-memory prepare")
+        report["stack_attribution"] = live_stacks(args.pid, args.root.resolve(), stacks)
+    text = json.dumps(report, indent=2) + "\n"
+    if args.output:
+        with args.output.open("x") as output:
+            output.write(text)
+    else:
+        print(text, end="")
+
+
+if __name__ == "__main__":
+    main()
