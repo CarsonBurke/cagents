@@ -4251,15 +4251,30 @@ mod tests {
         use keyboard::key::{Code, Named};
         let shortcuts = KeyboardShortcuts::default();
         let events = [
-            (key_press("j",Code::KeyJ,keyboard::Modifiers::ALT,false),GlobalShortcut::ReviewNextChange),
-            (key_press("k",Code::KeyK,keyboard::Modifiers::ALT,false),GlobalShortcut::ReviewPreviousChange),
-            (named_key_press(Named::F7,Code::F7,keyboard::Modifiers::empty(),false),GlobalShortcut::ReviewNextChange),
-            (named_key_press(Named::F7,Code::F7,keyboard::Modifiers::SHIFT,false),GlobalShortcut::ReviewPreviousChange),
+            (
+                key_press("j", Code::KeyJ, keyboard::Modifiers::ALT, false),
+                GlobalShortcut::ReviewNextChange,
+            ),
+            (
+                key_press("k", Code::KeyK, keyboard::Modifiers::ALT, false),
+                GlobalShortcut::ReviewPreviousChange,
+            ),
+            (
+                named_key_press(Named::F7, Code::F7, keyboard::Modifiers::empty(), false),
+                GlobalShortcut::ReviewNextChange,
+            ),
+            (
+                named_key_press(Named::F7, Code::F7, keyboard::Modifiers::SHIFT, false),
+                GlobalShortcut::ReviewPreviousChange,
+            ),
         ];
-        for (event,expected) in events {
-            assert_eq!(global_shortcut(&event,&shortcuts,FocusedPane::Review),Some(expected));
-            for focused in [FocusedPane::Terminal,FocusedPane::Chat,FocusedPane::Other] {
-                assert_eq!(global_shortcut(&event,&shortcuts,focused),None);
+        for (event, expected) in events {
+            assert_eq!(
+                global_shortcut(&event, &shortcuts, FocusedPane::Review),
+                Some(expected)
+            );
+            for focused in [FocusedPane::Terminal, FocusedPane::Chat, FocusedPane::Other] {
+                assert_eq!(global_shortcut(&event, &shortcuts, focused), None);
             }
         }
     }

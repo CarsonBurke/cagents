@@ -667,7 +667,9 @@ const fn default_show_status_bar() -> bool {
     true
 }
 
-const fn default_git_status_limit() -> usize { 10_000 }
+const fn default_git_status_limit() -> usize {
+    10_000
+}
 
 const fn default_show_worktree_changes_icons() -> bool {
     true

@@ -22,6 +22,8 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+#[cfg(feature = "ui")]
+pub(crate) mod change_list;
 pub mod chat;
 pub mod companion;
 pub mod control;
@@ -39,10 +41,6 @@ pub mod diff_interaction;
 pub mod diff_patch;
 #[cfg(feature = "ui")]
 pub mod diff_view;
-#[cfg(feature = "ui")]
-pub mod git_patch;
-#[cfg(feature = "ui")]
-pub(crate) mod change_list;
 #[cfg(feature = "ui")]
 pub mod document_link;
 #[cfg(feature = "ui")]
@@ -62,6 +60,8 @@ pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
 pub mod fs_safety;
+#[cfg(feature = "ui")]
+pub mod git_patch;
 #[cfg(feature = "ui")]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]

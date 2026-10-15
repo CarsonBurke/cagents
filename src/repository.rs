@@ -18,8 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod ignore_path;
 mod browse_reveal;
+mod ignore_path;
 pub(crate) use browse_reveal::include as include_revealed_path;
 mod status_limit;
 
@@ -56,7 +56,9 @@ mod stash_mutations;
 
 #[path = "repository_recovery.rs"]
 mod recovery;
-pub use recovery::{DiscardRecovery, DiscardRecoveryEntry, RecoverableDiscard, SavedEntry, TrashReceipt};
+pub use recovery::{
+    DiscardRecovery, DiscardRecoveryEntry, RecoverableDiscard, SavedEntry, TrashReceipt,
+};
 
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
@@ -1213,7 +1215,9 @@ pub enum GitOperation {
         oid: Oid,
         name: ValidatedBranchName,
     },
-    IgnorePath { path: RepoPath },
+    IgnorePath {
+        path: RepoPath,
+    },
 }
 
 impl GitOperation {
@@ -3137,9 +3141,14 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
 /// different objects.
 fn read_worktree_side(worktree: &Path, path: &RepoPath) -> (DiffSide, Option<u32>) {
     use std::os::unix::fs::PermissionsExt;
-    let unreadable = |error: &dyn fmt::Display| (DiffSide::Unreadable {
-        reason: error.to_string(),
-    }, None);
+    let unreadable = |error: &dyn fmt::Display| {
+        (
+            DiffSide::Unreadable {
+                reason: error.to_string(),
+            },
+            None,
+        )
+    };
     let root = match fs_safety::Root::open(worktree) {
         Ok(root) => root,
         Err(error) => return unreadable(&error),
@@ -3172,9 +3181,18 @@ fn read_worktree_side(worktree: &Path, path: &RepoPath) -> (DiffSide, Option<u32
     if !opened.is_file() {
         return (DiffSide::NotRegularFile, None);
     }
-    let mode = Some(if opened.permissions().mode() & 0o100 != 0 { 0o100755 } else { 0o100644 });
+    let mode = Some(if opened.permissions().mode() & 0o100 != 0 {
+        0o100755
+    } else {
+        0o100644
+    });
     if opened.len() > MAX_DIFF_SIDE_BYTES {
-        return (DiffSide::Oversize { bytes: opened.len() }, mode);
+        return (
+            DiffSide::Oversize {
+                bytes: opened.len(),
+            },
+            mode,
+        );
     }
     let side = match fs_safety::read_bounded(&mut file, MAX_DIFF_SIDE_BYTES) {
         // `read_bounded` reads one byte past the limit precisely so that "at the
@@ -3929,7 +3947,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         let parsed = (|| {
-            let mut files = WorkingFiles { listing_truncated: truncated, ..WorkingFiles::default() };
+            let mut files = WorkingFiles {
+                listing_truncated: truncated,
+                ..WorkingFiles::default()
+            };
             for (record, field) in nul_fields(&output.stdout, "git ls-files --ignored")?
                 .into_iter()
                 .enumerate()
@@ -4210,9 +4231,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
-    pub fn ignore_path(&self, worktree: &Path, path: &RepoPath, cancellation: &CancellationToken) -> Result<(), RepositoryError> {
-        let _protection = crate::worktree_cleanup::protect(worktree).map_err(|error| ValidationError::Io(error.to_string()))?;
-        if cancellation.is_cancelled() { return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled, "termination requested before updating .gitignore", false).into()); }
+    pub fn ignore_path(
+        &self,
+        worktree: &Path,
+        path: &RepoPath,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        if cancellation.is_cancelled() {
+            return Err(process_failure(
+                &CommandSpec::new(&self.git),
+                ProcessFailureKind::Cancelled,
+                "termination requested before updating .gitignore",
+                false,
+            )
+            .into());
+        }
         ignore_path::add(worktree, path).map_err(|error| ValidationError::Io(error).into())
     }
 
@@ -4245,21 +4280,40 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
-    fn listing_output(&self, command: &CommandSpec, limit: Option<usize>, format: status_limit::Format, cancellation: &CancellationToken) -> Result<(ProcessOutput, bool), RepositoryError> {
+    fn listing_output(
+        &self,
+        command: &CommandSpec,
+        limit: Option<usize>,
+        format: status_limit::Format,
+        cancellation: &CancellationToken,
+    ) -> Result<(ProcessOutput, bool), RepositoryError> {
         let command = if let Some(limit) = limit {
             let physical_records = match format {
                 status_limit::Format::Status => limit.saturating_mul(2).saturating_add(16),
                 status_limit::Format::Numstat => limit.saturating_mul(3),
                 status_limit::Format::Files => limit,
             };
-            command.clone().output_limits(64 * 1024 * 1024, command.stderr_limit).stdout_record_limit(physical_records)
-        } else { command.clone() };
-        let mut output = self.run_checked(&command, cancellation)?;
-        let Some(limit) = limit else { return Ok((output, false)); };
-        let (length, truncated) = match status_limit::prefix(&output.stdout, limit, output.stdout_truncated, format) {
-            Ok((prefix, truncated)) => (prefix.len(), truncated),
-            Err(error) => return Err(RepositoryError::InvalidGitOutput { error, process: output }),
+            command
+                .clone()
+                .output_limits(64 * 1024 * 1024, command.stderr_limit)
+                .stdout_record_limit(physical_records)
+        } else {
+            command.clone()
         };
+        let mut output = self.run_checked(&command, cancellation)?;
+        let Some(limit) = limit else {
+            return Ok((output, false));
+        };
+        let (length, truncated) =
+            match status_limit::prefix(&output.stdout, limit, output.stdout_truncated, format) {
+                Ok((prefix, truncated)) => (prefix.len(), truncated),
+                Err(error) => {
+                    return Err(RepositoryError::InvalidGitOutput {
+                        error,
+                        process: output,
+                    });
+                }
+            };
         output.stdout.truncate(length);
         output.stdout_truncated = truncated;
         Ok((output, truncated))
@@ -4276,12 +4330,24 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         limit: usize,
         cancellation: &CancellationToken,
     ) -> Result<StatusSnapshot, RepositoryError> {
-        self.status_listing(worktree, untracked, Some(limit.clamp(1, 100_000)), cancellation)
+        self.status_listing(
+            worktree,
+            untracked,
+            Some(limit.clamp(1, 100_000)),
+            cancellation,
+        )
     }
 
-    fn status_listing(&self, worktree: &Path, untracked: bool, limit: Option<usize>, cancellation: &CancellationToken) -> Result<StatusSnapshot, RepositoryError> {
+    fn status_listing(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        limit: Option<usize>,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
         let command = self.status_command_with_untracked(worktree, untracked);
-        let (output, truncated) = self.listing_output(&command, limit, status_limit::Format::Status, cancellation)?;
+        let (output, truncated) =
+            self.listing_output(&command, limit, status_limit::Format::Status, cancellation)?;
         let parsed = parse_status(&output.stdout);
         let mut status = invalid_output(parsed, output)?;
         status.untracked_omitted = !untracked;
@@ -4408,7 +4474,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if options.untracked_files
             && let Some((files, ..)) = cache.metadata.as_mut()
         {
-            let (output, truncated) = self.listing_output(&self.working_files_command(worktree), options.status_limit, status_limit::Format::Files, cancellation)?;
+            let (output, truncated) = self.listing_output(
+                &self.working_files_command(worktree),
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
             *files = invalid_output(parse_working_files(&output.stdout), output)?;
             files.listing_truncated = truncated;
         }
@@ -4418,7 +4489,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             } else {
                 self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
             };
-            let (output, truncated) = self.listing_output(&files_command, options.status_limit, status_limit::Format::Files, cancellation)?;
+            let (output, truncated) = self.listing_output(
+                &files_command,
+                options.status_limit,
+                status_limit::Format::Files,
+                cancellation,
+            )?;
             let mut files = invalid_output(parse_working_files(&output.stdout), output)?;
             files.listing_truncated = truncated;
             let remotes = self.remotes(worktree, cancellation)?;
@@ -4897,7 +4973,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             }
             GitOperation::IgnorePath { path } => {
                 self.ignore_path(worktree, path, cancellation)?;
-                return Ok(MutationOutcome::Applied { paths: vec![path.clone()] });
+                return Ok(MutationOutcome::Applied {
+                    paths: vec![path.clone()],
+                });
             }
         };
         command = command.without_timeout();
@@ -5395,9 +5473,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<DiffContent, RepositoryError> {
         let worktree = request.worktree.as_path();
         let old_path = request.old_path.as_ref().unwrap_or(&request.path);
-        let comparison = |old, new, old_label, new_label, source_head, modes| DiffContent::Comparison {
-            old, new, old_label, new_label, source_head, modes,
-        };
+        let comparison =
+            |old, new, old_label, new_label, source_head, modes| DiffContent::Comparison {
+                old,
+                new,
+                old_label,
+                new_label,
+                source_head,
+                modes,
+            };
         match &request.basis {
             DiffBasis::IndexToWorktree => {
                 let stages = self.index_entries(worktree, old_path, cancellation)?;
@@ -5412,8 +5496,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     });
                 }
                 Ok(comparison(
-                    self.entry_side(worktree, stage(0), cancellation)?, worktree_side,
-                    "Index".into(), "Working tree".into(), None,
+                    self.entry_side(worktree, stage(0), cancellation)?,
+                    worktree_side,
+                    "Index".into(),
+                    "Working tree".into(),
+                    None,
                     [stage(0).map(|entry| entry.mode), worktree_mode],
                 ))
             }
@@ -5425,18 +5512,38 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     Some(head) => self.tree_side(worktree, head, old_path, cancellation)?,
                     None => (DiffSide::Absent, None),
                 };
-                let source_head = Some(match head { Some(head) => GitHeadGuard::Commit(head), None => GitHeadGuard::Unborn });
+                let source_head = Some(match head {
+                    Some(head) => GitHeadGuard::Commit(head),
+                    None => GitHeadGuard::Unborn,
+                });
                 let stages = self.index_entries(worktree, &request.path, cancellation)?;
                 let staged = stages.iter().find(|entry| entry.stage == 0);
-                Ok(comparison(old, self.entry_side(worktree, staged, cancellation)?,
-                    "HEAD".into(), "Index".into(), source_head,
-                    [old_mode, staged.map(|entry| entry.mode)]))
+                Ok(comparison(
+                    old,
+                    self.entry_side(worktree, staged, cancellation)?,
+                    "HEAD".into(),
+                    "Index".into(),
+                    source_head,
+                    [old_mode, staged.map(|entry| entry.mode)],
+                ))
             }
-            DiffBasis::MergeBaseToHead { base_ref, head, merge_base } => {
-                let (old, old_mode) = self.tree_side(worktree, merge_base, old_path, cancellation)?;
-                let (new, new_mode) = self.tree_side(worktree, head, &request.path, cancellation)?;
-                Ok(comparison(old, new, format!("{} ({})", base_ref.short_name(), merge_base.short()),
-                    format!("HEAD ({})", head.short()), None, [old_mode, new_mode]))
+            DiffBasis::MergeBaseToHead {
+                base_ref,
+                head,
+                merge_base,
+            } => {
+                let (old, old_mode) =
+                    self.tree_side(worktree, merge_base, old_path, cancellation)?;
+                let (new, new_mode) =
+                    self.tree_side(worktree, head, &request.path, cancellation)?;
+                Ok(comparison(
+                    old,
+                    new,
+                    format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                    format!("HEAD ({})", head.short()),
+                    None,
+                    [old_mode, new_mode],
+                ))
             }
             DiffBasis::CommitToParent { oid, parent } => {
                 let (old, old_mode) = match parent {
@@ -5444,14 +5551,36 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     None => (DiffSide::Absent, None),
                 };
                 let (new, new_mode) = self.tree_side(worktree, oid, &request.path, cancellation)?;
-                Ok(comparison(old, new, match parent { Some(parent) => parent.short().to_owned(), None => "root commit".into() },
-                    oid.short().to_owned(), None, [old_mode, new_mode]))
+                Ok(comparison(
+                    old,
+                    new,
+                    match parent {
+                        Some(parent) => parent.short().to_owned(),
+                        None => "root commit".into(),
+                    },
+                    oid.short().to_owned(),
+                    None,
+                    [old_mode, new_mode],
+                ))
             }
-            DiffBasis::PullRequest { number, base_ref, head, merge_base } => {
-                let (old, old_mode) = self.tree_side(worktree, merge_base, old_path, cancellation)?;
-                let (new, new_mode) = self.tree_side(worktree, head, &request.path, cancellation)?;
-                Ok(comparison(old, new, format!("{} ({})", base_ref.short_name(), merge_base.short()),
-                    format!("#{number} ({})", head.short()), None, [old_mode, new_mode]))
+            DiffBasis::PullRequest {
+                number,
+                base_ref,
+                head,
+                merge_base,
+            } => {
+                let (old, old_mode) =
+                    self.tree_side(worktree, merge_base, old_path, cancellation)?;
+                let (new, new_mode) =
+                    self.tree_side(worktree, head, &request.path, cancellation)?;
+                Ok(comparison(
+                    old,
+                    new,
+                    format!("{} ({})", base_ref.short_name(), merge_base.short()),
+                    format!("#{number} ({})", head.short()),
+                    None,
+                    [old_mode, new_mode],
+                ))
             }
         }
     }
@@ -5517,7 +5646,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let parsed = parse_tree_entries(&output.stdout);
         let entries = invalid_output(parsed, output)?;
         match entries.into_iter().find(|entry| entry.path == *path) {
-            Some(entry) => self.object_side(worktree, entry.mode, &entry.oid, cancellation).map(|side| (side, Some(entry.mode))),
+            Some(entry) => self
+                .object_side(worktree, entry.mode, &entry.oid, cancellation)
+                .map(|side| (side, Some(entry.mode))),
             None => Ok((DiffSide::Absent, None)),
         }
     }
@@ -5878,8 +6009,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ///
     /// Confirmation is required. Selected directories are refused; directories
     /// emptied by removed files are pruned below the worktree root.
-    pub fn discard(&self, request: &DiscardRequest, cancellation: &CancellationToken) -> Result<MutationOutcome, RepositoryError> {
-        self.discard_recoverable(request, cancellation).map(|result| result.outcome)
+    pub fn discard(
+        &self,
+        request: &DiscardRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        self.discard_recoverable(request, cancellation)
+            .map(|result| result.outcome)
     }
 
     fn discard_mutation(
@@ -5914,8 +6050,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
 
-        if let Err(reason) = recovery::verify_captured_versions(captured_root, captured_versions, cancellation) {
-            return Ok(MutationOutcome::NotApplied { failure: MutationFailure::Rejected { reason } });
+        if let Err(reason) =
+            recovery::verify_captured_versions(captured_root, captured_versions, cancellation)
+        {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            });
         }
         let mut applied = Vec::new();
         if !tracked.is_empty() {
@@ -6003,11 +6143,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 match recovery::trash_untracked(&root, path) {
                     Ok(receipt) => {
                         if let Some(receipt) = receipt {
-                            if let Some(reason) = receipt.warning.as_ref() { failures.push(MutationFailure::Path { path: path.clone(), reason: reason.clone() }); }
+                            if let Some(reason) = receipt.warning.as_ref() {
+                                failures.push(MutationFailure::Path {
+                                    path: path.clone(),
+                                    reason: reason.clone(),
+                                });
+                            }
                             trashed.push(receipt);
                         }
                         applied.push(path.clone());
-                    },
+                    }
                     Err(failure) => failures.push(failure),
                 }
             }
@@ -7947,7 +8092,11 @@ mod tests {
             command: &CommandSpec,
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
-            if command.arguments.iter().any(|argument| argument == "hash-object") {
+            if command
+                .arguments
+                .iter()
+                .any(|argument| argument == "hash-object")
+            {
                 return SystemProcessExecutor.execute(command, _cancellation);
             }
             self.commands.lock().unwrap().push(command.clone());
@@ -7960,7 +8109,9 @@ mod tests {
         let listing = b"H first.txt\0H second.txt\0";
         let service = fake_service(vec![success(listing), success(listing)]);
         let cancel = CancellationToken::new();
-        let prefix = service.watch_files_projection(Path::new("/repo"), 1, &cancel).unwrap();
+        let prefix = service
+            .watch_files_projection(Path::new("/repo"), 1, &cancel)
+            .unwrap();
         assert_eq!(prefix.paths, vec![path("first.txt")]);
         assert_eq!(prefix.tracked_count, 1);
         assert!(prefix.listing_truncated);
@@ -7976,11 +8127,15 @@ mod tests {
     fn ui_listing_cap_preserves_a_snapshot_when_status_exceeds_sixteen_megabytes() {
         let mut stdout = b"# branch.head main\0# branch.oid (initial)\0".to_vec();
         let path = "x".repeat(200);
-        for index in 0..90_000 { stdout.extend_from_slice(format!("? {index}-{path}\0").as_bytes()); }
+        for index in 0..90_000 {
+            stdout.extend_from_slice(format!("? {index}-{path}\0").as_bytes());
+        }
         assert!(stdout.len() > 16 * 1024 * 1024);
         let executor = Arc::new(FakeExecutor::with_outputs(vec![success(&stdout)]));
         let service = RepositoryService::new("git", executor.clone());
-        let status = service.status_projection(Path::new("/repo"), true, 10_000, &CancellationToken::new()).unwrap();
+        let status = service
+            .status_projection(Path::new("/repo"), true, 10_000, &CancellationToken::new())
+            .unwrap();
         assert!(status.listing_truncated);
         assert_eq!(status.entries.len(), 10_000);
         let command = &executor.commands.lock().unwrap()[0];
@@ -8112,16 +8267,39 @@ mod tests {
     #[test]
     fn snapshot_cache_notices_truncation_even_when_the_retained_prefix_is_identical() {
         let mut outputs = cached_snapshot_outputs(b"? first.txt\0", b"");
-        outputs.extend([success(&snapshot_status(b"? first.txt\0? second.txt\0")), success(b""), success(b"")]);
+        outputs.extend([
+            success(&snapshot_status(b"? first.txt\0? second.txt\0")),
+            success(b""),
+            success(b""),
+        ]);
         let executor = Arc::new(FakeExecutor::with_outputs(outputs));
         let git = RepositoryService::new("git", executor);
         let mut cache = SnapshotCache::default();
         let cancel = CancellationToken::new();
-        let options = SnapshotOptions { status_limit: Some(1), untracked_changes: true, untracked_files: false };
-        let first = git.snapshot_cached(Path::new("/snapshot-limit-test"), options, &cancel, &mut cache).unwrap().unwrap();
+        let options = SnapshotOptions {
+            status_limit: Some(1),
+            untracked_changes: true,
+            untracked_files: false,
+        };
+        let first = git
+            .snapshot_cached(
+                Path::new("/snapshot-limit-test"),
+                options,
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
+            .unwrap();
         assert_eq!(first.status.entries.len(), 1);
         assert!(!first.status.listing_truncated);
-        let next = git.snapshot_cached(Path::new("/snapshot-limit-test"), options, &cancel, &mut cache).unwrap()
+        let next = git
+            .snapshot_cached(
+                Path::new("/snapshot-limit-test"),
+                options,
+                &cancel,
+                &mut cache,
+            )
+            .unwrap()
             .expect("a newly truncated snapshot must update its lower-bound notice");
         assert_eq!(next.status.entries, first.status.entries);
         assert!(next.status.listing_truncated);
@@ -10412,7 +10590,10 @@ mod tests {
             }
         );
         assert!(!worktree.path().join("keep/file.txt").exists());
-        assert!(!worktree.path().join("keep").exists(), "discard prunes the newly empty parent");
+        assert!(
+            !worktree.path().join("keep").exists(),
+            "discard prunes the newly empty parent"
+        );
     }
 
     #[cfg(unix)]
@@ -10519,8 +10700,11 @@ mod tests {
         // deletion the loop above was racing really happens, rather than being
         // refused every time.
         if let Ok(metadata) = fs::symlink_metadata(&active) {
-            if metadata.file_type().is_symlink() { fs::remove_file(&active).unwrap(); }
-            else { fs::remove_dir_all(&active).unwrap(); }
+            if metadata.file_type().is_symlink() {
+                fs::remove_file(&active).unwrap();
+            } else {
+                fs::remove_dir_all(&active).unwrap();
+            }
         }
         fs::create_dir_all(&parked_directory).unwrap();
         fs::rename(&parked_directory, &active).unwrap();
@@ -11840,10 +12024,25 @@ mod tests {
             success(format!("100755 {} 0\tnew.sh\0", oid(2)).as_bytes()),
             success(format!("{} blob 4\nnew\n\n", oid(2)).as_bytes()),
         ]);
-        let DiffContent::Comparison { source_head, modes, old, .. } = service.diff(
-            &DiffRequest { worktree: PathBuf::from("/repo"), basis: DiffBasis::HeadToIndex,
-                path: path("new.sh"), old_path: None }, &CancellationToken::new()).unwrap()
-        else { panic!("expected a text comparison"); };
+        let DiffContent::Comparison {
+            source_head,
+            modes,
+            old,
+            ..
+        } = service
+            .diff(
+                &DiffRequest {
+                    worktree: PathBuf::from("/repo"),
+                    basis: DiffBasis::HeadToIndex,
+                    path: path("new.sh"),
+                    old_path: None,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        else {
+            panic!("expected a text comparison");
+        };
         assert_eq!(source_head, Some(GitHeadGuard::Unborn));
         assert_eq!(modes, [None, Some(0o100755)]);
         assert_eq!(old, DiffSide::Absent);
@@ -11858,10 +12057,25 @@ mod tests {
         fs::write(&target, "script\n").unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
         let service = fake_service(vec![success(b"")]);
-        let DiffContent::Comparison { modes, source_head, new, .. } = service.diff(
-            &DiffRequest { worktree: root.path().into(), basis: DiffBasis::IndexToWorktree,
-                path: path("new.sh"), old_path: None }, &CancellationToken::new()).unwrap()
-        else { panic!("expected a text comparison"); };
+        let DiffContent::Comparison {
+            modes,
+            source_head,
+            new,
+            ..
+        } = service
+            .diff(
+                &DiffRequest {
+                    worktree: root.path().into(),
+                    basis: DiffBasis::IndexToWorktree,
+                    path: path("new.sh"),
+                    old_path: None,
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap()
+        else {
+            panic!("expected a text comparison");
+        };
         assert_eq!(modes, [None, Some(0o100755)]);
         assert_eq!(source_head, None);
         assert_eq!(new.text(), Some("script\n"));

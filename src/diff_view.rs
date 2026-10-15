@@ -2262,21 +2262,48 @@ fn display_line(line: &str) -> DisplayLine<'_> {
 
 #[cfg(test)]
 mod tests {
-#[test]
-fn rendered_comparison_retains_reader_revision_and_modes_for_text_and_nontext() {
-    let head = Some(crate::repository::GitHeadGuard::Unborn);
-    let modes = [None, Some(0o100755)];
-    for new in [DiffSide::Text { text: "script\n".into(), bytes: 7 }, DiffSide::Binary { bytes: 7 }] {
-        let rendered = RenderedDiff::from_content(DiffContent::Comparison {
-            old: DiffSide::Absent, new, old_label: "HEAD".into(), new_label: "Index".into(), source_head: head.clone(), modes,
-        }, Path::new("script.sh"), AUTO, &CancellationToken::new());
-        match rendered {
-            RenderedDiff::Text { model,.. } => { assert_eq!(model.source_head,head); assert_eq!(model.modes,modes); assert_eq!(model.present,[false,true]); }
-            RenderedDiff::NoText(DiffContent::Comparison { source_head, modes: actual,.. }) => { assert_eq!(source_head,head); assert_eq!(actual,modes); }
-            _ => panic!("comparison should preserve its reader metadata"),
+    #[test]
+    fn rendered_comparison_retains_reader_revision_and_modes_for_text_and_nontext() {
+        let head = Some(crate::repository::GitHeadGuard::Unborn);
+        let modes = [None, Some(0o100755)];
+        for new in [
+            DiffSide::Text {
+                text: "script\n".into(),
+                bytes: 7,
+            },
+            DiffSide::Binary { bytes: 7 },
+        ] {
+            let rendered = RenderedDiff::from_content(
+                DiffContent::Comparison {
+                    old: DiffSide::Absent,
+                    new,
+                    old_label: "HEAD".into(),
+                    new_label: "Index".into(),
+                    source_head: head.clone(),
+                    modes,
+                },
+                Path::new("script.sh"),
+                AUTO,
+                &CancellationToken::new(),
+            );
+            match rendered {
+                RenderedDiff::Text { model, .. } => {
+                    assert_eq!(model.source_head, head);
+                    assert_eq!(model.modes, modes);
+                    assert_eq!(model.present, [false, true]);
+                }
+                RenderedDiff::NoText(DiffContent::Comparison {
+                    source_head,
+                    modes: actual,
+                    ..
+                }) => {
+                    assert_eq!(source_head, head);
+                    assert_eq!(actual, modes);
+                }
+                _ => panic!("comparison should preserve its reader metadata"),
+            }
         }
     }
-}
 
     #[test]
     fn whitespace_normalization_keeps_source_text_and_real_changes() {
@@ -2474,12 +2501,24 @@ fn rendered_comparison_retains_reader_revision_and_modes_for_text_and_nontext() 
 
     #[test]
     fn immutable_rendered_diff_clones_share_all_model_rows() {
-        let original = RenderedDiff::Text { model: Arc::new(build_diff("old\nkept\n","new\nkept\n")), old_label:"Old".into(),new_label:"New".into() };
+        let original = RenderedDiff::Text {
+            model: Arc::new(build_diff("old\nkept\n", "new\nkept\n")),
+            old_label: "Old".into(),
+            new_label: "New".into(),
+        };
         let copied = original.clone();
-        let (RenderedDiff::Text { model: original,.. },RenderedDiff::Text { model: copied,.. }) = (&original,&copied) else { unreachable!() };
-        assert!(Arc::ptr_eq(original,copied));
-        assert_eq!(original.inline_rows.as_ptr(),copied.inline_rows.as_ptr());
-        assert_eq!(original.split_rows.as_ptr(),copied.split_rows.as_ptr());
+        let (
+            RenderedDiff::Text {
+                model: original, ..
+            },
+            RenderedDiff::Text { model: copied, .. },
+        ) = (&original, &copied)
+        else {
+            unreachable!()
+        };
+        assert!(Arc::ptr_eq(original, copied));
+        assert_eq!(original.inline_rows.as_ptr(), copied.inline_rows.as_ptr());
+        assert_eq!(original.split_rows.as_ptr(), copied.split_rows.as_ptr());
     }
 
     #[test]
@@ -3580,7 +3619,11 @@ fn rendered_comparison_retains_reader_revision_and_modes_for_text_and_nontext() 
         else {
             panic!("{path} on {basis:?} should produce a text diff, got {content:?}");
         };
-        (Arc::try_unwrap(model).expect("fixture owns its complete model"), old_label, new_label)
+        (
+            Arc::try_unwrap(model).expect("fixture owns its complete model"),
+            old_label,
+            new_label,
+        )
     }
 
     /// The working-tree side of an untracked or replaced path, which the

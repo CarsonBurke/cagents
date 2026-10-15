@@ -707,8 +707,7 @@ fn read_local_with_plan(
         // A membership edge replaces the cached full count in this same
         // coalesced status process. Tracked-only writes do not rescan untracked
         // trees; the bounded topology fallback repairs incomplete watch coverage.
-        let include_untracked =
-            change.topology || change.membership || change.untracked;
+        let include_untracked = change.topology || change.membership || change.untracked;
         let current = match git.status_projection(
             &record.path,
             include_untracked,

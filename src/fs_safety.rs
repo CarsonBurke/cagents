@@ -379,18 +379,27 @@ pub fn open_parent_beneath(root: &Root, relative: &Path) -> Result<(Root, OsStri
 
 /// Creates missing parent directories without following a symlink at any
 /// component, then returns the held parent and final leaf name.
-pub fn create_parent_beneath(root: &Root, relative: &Path) -> Result<(Root, OsString), ResolveError> {
+pub fn create_parent_beneath(
+    root: &Root,
+    relative: &Path,
+) -> Result<(Root, OsString), ResolveError> {
     let reported = root.path.join(relative);
     let parts = components(relative).ok_or_else(|| ResolveError::escaped(&reported))?;
-    let (name, parents) = parts.split_last().ok_or_else(|| ResolveError::escaped(&reported))?;
-    let mut directory = root.try_clone().map_err(|error| ResolveError::io(&reported, &error))?;
+    let (name, parents) = parts
+        .split_last()
+        .ok_or_else(|| ResolveError::escaped(&reported))?;
+    let mut directory = root
+        .try_clone()
+        .map_err(|error| ResolveError::io(&reported, &error))?;
     for component in parents {
         let name = c_component(component, &directory.path)?;
         // SAFETY: the held directory and NUL-terminated leaf outlive mkdirat.
         let result = unsafe { libc::mkdirat(directory.descriptor(), name.as_ptr(), 0o755) };
         if result < 0 {
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::AlreadyExists { return Err(ResolveError::io(&reported, &error)); }
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(ResolveError::io(&reported, &error));
+            }
         }
         directory = resolve_directory(&directory, Path::new(component))?;
     }
@@ -404,7 +413,11 @@ pub fn open_directory_beneath(root: &Root, relative: &Path) -> Result<Root, Reso
 
 /// Creates one directory while retaining whether this call created it. A
 /// recovery caller can preserve newer directories' permissions unchanged.
-pub fn create_directory_beneath(root: &Root, relative: &Path, mode: u32) -> Result<(Root, bool), ResolveError> {
+pub fn create_directory_beneath(
+    root: &Root,
+    relative: &Path,
+    mode: u32,
+) -> Result<(Root, bool), ResolveError> {
     let (parent, name) = open_parent_beneath(root, relative)?;
     let leaf = c_component(&name, &parent.path)?;
     // SAFETY: the held parent and C leaf remain live through mkdirat.
@@ -412,7 +425,9 @@ pub fn create_directory_beneath(root: &Root, relative: &Path, mode: u32) -> Resu
     let created = result == 0;
     if result < 0 {
         let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists { return Err(ResolveError::io(&parent.path.join(&name), &error)); }
+        if error.kind() != io::ErrorKind::AlreadyExists {
+            return Err(ResolveError::io(&parent.path.join(&name), &error));
+        }
     }
     Ok((resolve_directory(&parent, Path::new(&name))?, created))
 }
@@ -422,7 +437,10 @@ pub fn create_directory_beneath(root: &Root, relative: &Path, mode: u32) -> Resu
 /// its mutable worktree name.
 pub fn set_directory_permissions(directory: &Root, mode: u32) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(format!("/proc/self/fd/{}", directory.descriptor()), std::fs::Permissions::from_mode(mode))
+    std::fs::set_permissions(
+        format!("/proc/self/fd/{}", directory.descriptor()),
+        std::fs::Permissions::from_mode(mode),
+    )
 }
 
 /// Removes an empty directory beneath the held root. Nonempty directories are
@@ -432,9 +450,16 @@ pub fn remove_empty_directory_beneath(root: &Root, relative: &Path) -> Result<bo
     let leaf = c_component(&name, &parent.path)?;
     // SAFETY: both the held parent and leaf remain live through unlinkat.
     let result = unsafe { libc::unlinkat(parent.descriptor(), leaf.as_ptr(), libc::AT_REMOVEDIR) };
-    if result == 0 { return Ok(true); }
+    if result == 0 {
+        return Ok(true);
+    }
     let error = io::Error::last_os_error();
-    if matches!(error.raw_os_error(), Some(libc::ENOTEMPTY) | Some(libc::EEXIST)) { return Ok(false); }
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::ENOTEMPTY) | Some(libc::EEXIST)
+    ) {
+        return Ok(false);
+    }
     Err(ResolveError::io(&parent.path.join(name), &error))
 }
 
@@ -445,7 +470,14 @@ pub fn symlink_within(directory: &Root, target: &Path, name: &OsStr) -> Result<(
     let target = c_path(target).map_err(|error| ResolveError::io(&directory.path, &error))?;
     // SAFETY: both C strings and the held directory outlive symlinkat.
     let result = unsafe { libc::symlinkat(target.as_ptr(), directory.descriptor(), leaf.as_ptr()) };
-    if result == 0 { Ok(()) } else { Err(ResolveError::io(&directory.path.join(name), &io::Error::last_os_error())) }
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(ResolveError::io(
+            &directory.path.join(name),
+            &io::Error::last_os_error(),
+        ))
+    }
 }
 
 /// Creates a file inside `directory` with `mode`, for the atomic

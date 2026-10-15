@@ -12,7 +12,13 @@ pub(super) struct NulPrefix {
 
 impl NulPrefix {
     pub(super) fn new(record_limit: usize, byte_limit: usize) -> Self {
-        Self { bytes: Vec::new(), records: 0, record_limit, byte_limit, truncated: false }
+        Self {
+            bytes: Vec::new(),
+            records: 0,
+            record_limit,
+            byte_limit,
+            truncated: false,
+        }
     }
 
     pub(super) fn push(&mut self, mut chunk: &[u8]) {
@@ -22,15 +28,22 @@ impl NulPrefix {
                 return;
             }
             let available = self.byte_limit - self.bytes.len();
-            let end = chunk.iter().position(|byte| *byte == 0).map_or(chunk.len(), |index| index + 1);
+            let end = chunk
+                .iter()
+                .position(|byte| *byte == 0)
+                .map_or(chunk.len(), |index| index + 1);
             let take = end.min(available);
             self.bytes.extend_from_slice(&chunk[..take]);
-            if chunk[take - 1] == 0 { self.records += 1; }
+            if chunk[take - 1] == 0 {
+                self.records += 1;
+            }
             chunk = &chunk[take..];
         }
     }
 
-    pub(super) fn finish(self) -> (Vec<u8>, bool) { (self.bytes, self.truncated) }
+    pub(super) fn finish(self) -> (Vec<u8>, bool) {
+        (self.bytes, self.truncated)
+    }
 }
 
 #[cfg(test)]
@@ -67,7 +80,9 @@ mod tests {
     #[test]
     fn an_unterminated_record_cannot_allocate_beyond_the_byte_limit() {
         let mut capture = NulPrefix::new(10_000, 11);
-        for _ in 0..20_000 { capture.push(b"a very long path without a nul"); }
+        for _ in 0..20_000 {
+            capture.push(b"a very long path without a nul");
+        }
         let (bytes, truncated) = capture.finish();
         assert_eq!(bytes.len(), 11);
         assert!(truncated);
