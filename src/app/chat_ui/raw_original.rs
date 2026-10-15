@@ -8,6 +8,32 @@ use chat::source_owners::{ResidentRaw,ResidentRawCalls};
 struct Key {source:SourceKey,field:RawSourceField}
 impl Key {fn of(part:&RawSourcePart)->Self {Self {source:part.source.clone(),field:part.field}}}
 fn record(part:&RawSourcePart)->ResidentRaw {ResidentRaw {source:part.source.clone(),field:part.field,epoch:part.epoch,source_len:part.source_len,metadata:part.metadata.clone()}}
+/// Native aliases may share one source/field, but may not vote conflicting
+/// provenance into permission. This index owns only borrowed typed metadata.
+/// Namespace token validation is an additional current-authority predicate.
+pub(super) struct MetadataIndex<'a> {roots:HashMap<(&'a SourceKey,RawSourceField),Option<&'a RawSourcePart>>}
+pub(super) fn same_part(left:&RawSourcePart,right:&RawSourcePart)->bool {
+    left.source==right.source && left.field==right.field && left.epoch==right.epoch
+        && left.source_len==right.source_len && left.metadata==right.metadata
+}
+impl<'a> MetadataIndex<'a> {
+    pub(super) fn new(snapshot:&'a Snapshot,selected:Option<&str>)->Self {
+        let mut roots=HashMap::new();
+        for part in snapshot.raw_source_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected) {
+            let valid=!part.source.source_id.is_empty()
+                && snapshot.source_incarnation.is_none_or(|incarnation|part.epoch.incarnation==incarnation);
+            let current=roots.entry((&part.source,part.field)).or_insert(Some(part));
+            if !valid || current.is_some_and(|old|!same_part(old,part)) {*current=None;}
+        }
+        Self {roots}
+    }
+    pub(super) fn get(&self,source:&SourceKey,field:RawSourceField)->Option<&'a RawSourcePart> {
+        self.roots.get(&(source,field)).copied().flatten()
+    }
+    fn denied(&self,source:&SourceKey,field:RawSourceField)->bool {
+        self.roots.get(&(source,field)).is_some_and(Option::is_none)
+    }
+}
 fn eligible(part:&RawSourcePart)->Result<(),String> {
     if !part.metadata.complete_call {return Err("The provider is still capturing this original call.".into());}
     if part.source_len>chat::source_owners::SOURCE_BYTES {return Err("This original call exceeds the 32 MiB display limit.".into());}
@@ -95,9 +121,15 @@ impl State {
         let same_actor=match (&self.actor,actor) {(None,None)=>true,(Some(old),Some(new))=>old.as_ptr()==Arc::as_ptr(new),_=>false};
         if !same_actor || self.session!=snapshot.session_id || self.incarnation!=snapshot.source_incarnation || self.selected.as_deref()!=selected {self.clear();}
         self.actor=actor.map(Arc::downgrade);self.session=snapshot.session_id.clone();self.incarnation=snapshot.source_incarnation;self.selected=selected.map(str::to_owned);
+        let canonical=MetadataIndex::new(snapshot,selected);
+        // A contradictory present alias is a known refusal, not an omitted
+        // history page. Forget even cheap old intent for that exact field.
+        for part in snapshot.raw_source_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected) {
+            if canonical.denied(&part.source,part.field) {self.intents.take(&Key::of(part));}
+        }
         let mut present=HashSet::new();let mut aliases:HashMap<String,Vec<Key>>=HashMap::new();
         for part in snapshot.raw_source_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected
-            && snapshot.source_incarnation.is_none_or(|incarnation|part.epoch.incarnation==incarnation)) {
+            && canonical.get(&part.source,part.field).is_some()) {
             let key=Key::of(part);present.insert(key.clone());
             // Both aliases are Store-authored. No native-part grammar or path
             // spelling is used to infer a source identity.
@@ -122,7 +154,7 @@ impl State {
         for key in removed {if let Some(entry)=self.entries.remove(&key) {
             // A bounded page can omit a still-existing source. Retain no
             // descriptor/body/read permission, only a same-epoch open choice.
-            if entry.opened {
+            if entry.opened && !canonical.denied(&key.source,key.field) {
                 let bytes=key.source.source_id.len()+key.source.agent_id.as_ref().map_or(0,String::len)+std::mem::size_of::<Disclosure>()+std::mem::size_of::<Key>();
                 self.intents.remember(key,Disclosure {epoch:entry.part.epoch,rehydrating:entry.rehydrating || entry.loaded.is_some() || entry.restored.is_some()},bytes);
             }
@@ -393,6 +425,49 @@ mod tests {
         let mut end=(query.offset+query.limit).min(text.len());while !text.is_char_boundary(end) {end-=1;}
         RawSourcePage {source:query.source,field:query.field,epoch:part.epoch,source_len:text.len(),offset:query.offset,next_offset:end,
             text:text[query.offset..end].into(),complete:end==text.len(),metadata:part.metadata.clone()}
+    }
+    #[test]
+    fn contradictory_raw_aliases_deny_the_exact_field_regardless_of_publication_order() {
+        let original=part("exact complete call");
+        for mutation in 0..6 {for reverse in [false,true] {
+            let mut conflicting=original.clone();conflicting.item_id="second visible native alias".into();
+            match mutation {
+                0=>conflicting.epoch.revision+=1,
+                1=>conflicting.source_len+=1,
+                2=>conflicting.metadata.tool_name="different native call".into(),
+                3=>conflicting.metadata.representation=RawRepresentation::CanonicalJson,
+                4=>conflicting.metadata.complete_call=false,
+                _=>conflicting.epoch.incarnation=uuid::Uuid::from_u128(999),
+            }
+            let mut parts=vec![original.clone(),conflicting];if reverse {parts.reverse();}
+            let snapshot=Snapshot {source_incarnation:Some(original.epoch.incarnation),raw_source_parts:parts,..Default::default()};
+            let index=MetadataIndex::new(&snapshot,None);
+            assert!(index.get(&original.source,original.field).is_none());assert!(index.denied(&original.source,original.field));
+        }}
+        let mut alias=original.clone();alias.item_id="another display alias".into();
+        let mut other_field=original.clone();other_field.field=RawSourceField::CommandCall;other_field.metadata.representation=RawRepresentation::CommandMetadataJson;
+        let mut child=original.clone();child.source.agent_id=Some("actual child".into());
+        let snapshot=Snapshot {source_incarnation:Some(original.epoch.incarnation),raw_source_parts:vec![original.clone(),alias,other_field.clone(),child.clone()],..Default::default()};
+        let parent=MetadataIndex::new(&snapshot,None);
+        assert!(parent.get(&original.source,original.field).is_some());assert!(parent.get(&other_field.source,other_field.field).is_some());
+        assert!(parent.get(&child.source,child.field).is_none());
+        assert!(MetadataIndex::new(&snapshot,Some("actual child")).get(&child.source,child.field).is_some());
+    }
+    #[test]
+    fn contradictory_present_raw_alias_withdraws_restored_body_attempt_and_omission_intent() {
+        let text:Arc<str>=Arc::from("complete private original input");let part=part(&text);let proof=record(&part);
+        assert_eq!(chat::source_owners::admit_raw(&text,&proof,None),chat::source_owners::Admission::Ready);
+        let mut snapshot=Snapshot {source_incarnation:Some(part.epoch.incarnation),raw_source_parts:vec![part.clone()],..Default::default()};
+        let mut state=State::default();state.sync(&snapshot,None,None);
+        state.restore(ResidentRawCalls {calls:vec![(text.clone(),proof)]}).unwrap();
+        assert!(state.entries[&Key::of(&part)].opened);assert!(state.entries[&Key::of(&part)].attempt.is_some());
+        let weak=Arc::downgrade(&text);drop(text);
+        let mut conflicting=part.clone();conflicting.item_id="conflicting visible alias".into();conflicting.epoch.revision+=1;
+        snapshot.raw_source_parts.push(conflicting);state.sync(&snapshot,None,None);flush();
+        assert!(weak.upgrade().is_none());assert!(state.entries.is_empty());assert!(state.aliases.is_empty());
+        assert_eq!(state.intents.usage(),(0,0));assert!(state.pending_paths(&part.item_id).is_empty());
+        snapshot.raw_source_parts.truncate(1);state.sync(&snapshot,None,None);
+        let entry=&state.entries[&Key::of(&part)];assert!(!entry.opened && entry.attempt.is_none() && entry.restored.is_none() && entry.loaded.is_none());
     }
     #[tokio::test]
     async fn original_reader_preserves_exact_stream_whitespace_and_utf8_across_pages() {
