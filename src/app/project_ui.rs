@@ -270,6 +270,7 @@ pub enum Action {
     RetryDelete(WorktreeId),
     AwaitSessions(Target),
     DeletionSessionsClosed { target: Target, started_at: Instant, result: Result<(), String> },
+    DeletionProtectionsReleased { target: Target, started_at: Instant, result: Result<(), String> },
     RemovalCompleted { target: Target, result: Result<Vec<String>, String> },
     AutomaticallyDeleted {
         target: Target,
@@ -1705,6 +1706,13 @@ impl Cagents {
                 // the running deletion. Release only our own target leases so
                 // the owning daemon can acquire an exclusive removal guard.
                 self.sync_worktree_protections();
+                return self.handle_project_action(Action::DeletionProtectionsReleased { target, started_at, result: Ok(()) });
+            }
+            Action::DeletionProtectionsReleased { target, started_at, result } => {
+                let Some(id) = target.worktree else { return Task::none(); };
+                if !self.project_ui.released_delete_protections.contains(&id)
+                    || !self.project_ui.deletions.get(&id).is_some_and(|deletion| deletion.started_at == started_at && deletion.failure.is_none() && deletion.target.path == target.path) { return Task::none(); }
+                if let Err(failure) = result { return self.handle_project_action(Action::Deleted { target, result: Err(failure) }); }
                 return self.remove_worktree_after_sessions(target);
             }
             Action::AutomaticallyDeleted { target, result } => {
@@ -3533,6 +3541,21 @@ mod tests {
         drop(app.handle_project_action(Action::DeletionSessionsClosed { target, started_at: started_at - Duration::from_secs(1), result: Ok(()) }));
         assert!(app.project_ui.released_delete_protections.is_empty());
         assert!(app.project_ui.is_deleting(id));
+    }
+
+    #[test]
+    fn stale_protection_release_cannot_start_a_new_deletion() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let target = app.project_ui.begin_deleting("/repo/linked".into());
+        let id = target.worktree.unwrap();
+        let started_at = app.project_ui.deletions[&id].started_at;
+        app.project_ui.released_delete_protections.insert(id);
+        let stale = app.handle_project_action(Action::DeletionProtectionsReleased { target: target.clone(), started_at: started_at - Duration::from_secs(1), result: Ok(()) });
+        assert!(cosmic::iced::runtime::task::into_stream(stale).is_none());
+        assert!(app.project_ui.is_deleting(id));
+        app.project_ui.released_delete_protections.remove(&id);
+        let unreleased = app.handle_project_action(Action::DeletionProtectionsReleased { target, started_at, result: Ok(()) });
+        assert!(cosmic::iced::runtime::task::into_stream(unreleased).is_none());
     }
 
     #[test]
