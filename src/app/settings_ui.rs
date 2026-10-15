@@ -868,278 +868,7 @@ fn settings_category_controls<'a>(
                 ),
             ],
         )],
-        SettingsCategory::Keyboard => vec![settings_group(
-            "Keyboard shortcuts",
-            "",
-            vec![
-                shortcut_input(
-                    "Toggle Projects sidebar",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.toggle_projects,
-                    SettingsField::ShortcutToggleProjects,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Rename focused pane",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.rename_pane,
-                    SettingsField::ShortcutRenamePane,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Open command palette",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.command_palette,
-                    SettingsField::ShortcutCommandPalette,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Choose chat account",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.chat_account,
-                    SettingsField::ShortcutChatAccount,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Choose chat model",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.chat_model,
-                    SettingsField::ShortcutChatModel,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Choose chat permission mode",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.chat_permissions,
-                    SettingsField::ShortcutChatPermissions,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "New thread",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.new_native_thread,
-                    SettingsField::ShortcutNewThread,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Toggle inspector",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.toggle_inspector,
-                    SettingsField::ShortcutToggleInspector,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Open settings",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.open_settings,
-                    SettingsField::ShortcutOpenSettings,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Move pane left",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.move_pane_left,
-                    SettingsField::ShortcutMovePaneLeft,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Move pane right",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.move_pane_right,
-                    SettingsField::ShortcutMovePaneRight,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Reopen closed pane",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.reopen_pane,
-                    SettingsField::ShortcutReopenPane,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 1",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_1,
-                    SettingsField::ShortcutFocusPane1,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 2",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_2,
-                    SettingsField::ShortcutFocusPane2,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 3",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_3,
-                    SettingsField::ShortcutFocusPane3,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 4",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_4,
-                    SettingsField::ShortcutFocusPane4,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 5",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_5,
-                    SettingsField::ShortcutFocusPane5,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 6",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_6,
-                    SettingsField::ShortcutFocusPane6,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 7",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_7,
-                    SettingsField::ShortcutFocusPane7,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 8",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_8,
-                    SettingsField::ShortcutFocusPane8,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Focus pane 9",
-                    "Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.focus_pane_9,
-                    SettingsField::ShortcutFocusPane9,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "New terminal",
-                    "Creates a terminal column.",
-                    &draft.keyboard_shortcuts.new_terminal,
-                    SettingsField::ShortcutNewTerminal,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "New channel",
-                    "Creates an independent native conversation in the project's main worktree. Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.new_channel,
-                    SettingsField::ShortcutNewChannel,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Clone focused pane",
-                    "Opens an independent terminal or conversation, or the same browser or repository location. Leave blank to unbind.",
-                    &draft.keyboard_shortcuts.clone_pane,
-                    SettingsField::ShortcutClonePane,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Close focused column",
-                    "Closes the active workspace column. A terminal running a program asks first while close confirmation is on.",
-                    &draft.keyboard_shortcuts.close_focused_column,
-                    SettingsField::ShortcutCloseFocusedColumn,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Search projects",
-                    "Moves keyboard focus to project search from any pane.",
-                    &draft.keyboard_shortcuts.search_projects,
-                    SettingsField::ShortcutSearchProjects,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Find in pane",
-                    "Finds in the focused conversation, terminal, editor, or settings pane.",
-                    &draft.keyboard_shortcuts.find_in_pane,
-                    SettingsField::ShortcutFindInPane,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Previous column",
-                    "Moves focus left and may repeat while held.",
-                    &draft.keyboard_shortcuts.previous_column,
-                    SettingsField::ShortcutPreviousColumn,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Next column",
-                    "Moves focus right and may repeat while held.",
-                    &draft.keyboard_shortcuts.next_column,
-                    SettingsField::ShortcutNextColumn,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Cycle pane width",
-                    "Cycles the active pane through 1/3, 1/2, 2/3, and full viewport width; may repeat while held.",
-                    &draft.keyboard_shortcuts.cycle_pane_width,
-                    SettingsField::ShortcutCyclePaneWidth,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Previous workspace",
-                    "Opens the worktree or channel before this one in the sidebar; may repeat while held.",
-                    &draft.keyboard_shortcuts.previous_workspace,
-                    SettingsField::ShortcutPreviousWorkspace,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Next workspace",
-                    "Opens the worktree or channel after this one in the sidebar; may repeat while held.",
-                    &draft.keyboard_shortcuts.next_workspace,
-                    SettingsField::ShortcutNextWorkspace,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Mark reviewed file viewed",
-                    "Toggles the reviewed file's viewed mark in the focused pull request pane and moves to the next file.",
-                    &draft.keyboard_shortcuts.review_toggle_viewed,
-                    SettingsField::ShortcutReviewToggleViewed,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Next reviewed file",
-                    "Opens the next changed file in the focused pull request pane; may repeat while held.",
-                    &draft.keyboard_shortcuts.review_next_file,
-                    SettingsField::ShortcutReviewNextFile,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Previous reviewed file",
-                    "Opens the previous changed file in the focused pull request pane; may repeat while held.",
-                    &draft.keyboard_shortcuts.review_previous_file,
-                    SettingsField::ShortcutReviewPreviousFile,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Next unviewed file",
-                    "Opens the next unviewed file in the focused pull request pane; may repeat while held.",
-                    &draft.keyboard_shortcuts.review_next_unviewed,
-                    SettingsField::ShortcutReviewNextUnviewed,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Next changed hunk",
-                    "Opens the next changed hunk in the focused pull request pane; may repeat while held.",
-                    &draft.keyboard_shortcuts.review_next_change,
-                    SettingsField::ShortcutReviewNextChange,
-                    &draft.keyboard_shortcuts,
-                ),
-                shortcut_input(
-                    "Previous changed hunk",
-                    "Opens the previous changed hunk in the focused pull request pane; may repeat while held.",
-                    &draft.keyboard_shortcuts.review_previous_change,
-                    SettingsField::ShortcutReviewPreviousChange,
-                    &draft.keyboard_shortcuts,
-                ),
-            ],
-        )],
+        SettingsCategory::Keyboard => keyboard_groups(draft, invalid),
     }
 }
 
@@ -1272,6 +1001,11 @@ fn settings_layout<'a>(
     width: f32,
 ) -> Element<'a, Message> {
     let (feedback, invalid) = (context.feedback, context.invalid);
+    let content_max_width = if category == SettingsCategory::Keyboard {
+        960.0
+    } else {
+        CONTENT_MAX_WIDTH
+    };
     let narrow = width < RAIL_BREAKPOINT;
     let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
@@ -1402,7 +1136,7 @@ fn settings_layout<'a>(
                 .spacing(space::S)
                 .width(Length::Fill),
         )
-        .max_width(CONTENT_MAX_WIDTH),
+        .max_width(content_max_width),
     )
     .padding(iced::Padding {
         top: space::M,
@@ -1416,7 +1150,7 @@ fn settings_layout<'a>(
             widget::column::with_children(results)
                 .spacing(5.0 * design::GRID_UNIT)
                 .width(Length::Fill)
-                .max_width(CONTENT_MAX_WIDTH),
+                .max_width(content_max_width),
         )
         .padding([space::M, gutter])
         .width(Length::Fill),
@@ -1479,111 +1213,355 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
     )
 }
 
+fn shortcut_group(field: SettingsField) -> &'static str {
+    use workspace_widget::GlobalShortcut as Action;
+    match field.shortcut_action().expect("shortcut field") {
+        Action::ChatPermissions | Action::ChatModel | Action::ChatAccount | Action::NewThread => {
+            "Chat"
+        }
+        Action::ReviewToggleViewed
+        | Action::ReviewNextFile
+        | Action::ReviewPreviousFile
+        | Action::ReviewNextUnviewed
+        | Action::ReviewNextChange
+        | Action::ReviewPreviousChange => "Review",
+        Action::CycleWorkspace(_)
+        | Action::CommandPalette
+        | Action::FocusProjectSearch
+        | Action::ToggleProjects
+        | Action::OpenSettings => "Navigation",
+        _ => "Panes",
+    }
+}
+
+fn keyboard_groups<'a>(
+    draft: &'a SettingsDraft,
+    invalid: &'a HashMap<SettingsField, String>,
+) -> Vec<Group<'a, Message>> {
+    let mut groups = vec![settings_group("Keyboard shortcuts", "Leave blank to unbind optional actions. Required actions need at least one chord. Fixed chords belong to native surfaces.", vec![setting_field("Filter shortcuts", "", widget::row::with_children(vec![
+        widget::button::text("Filter by pressed key").on_press(Message::Palette(palette_ui::Action::FilterKey)).into(),
+        widget::button::text("Conflicts").on_press(Message::SettingsSearchChanged("conflicts".into())).into(),
+    ]).spacing(space::S).into()).label_in_control()]).compact()];
+    for group in ["Panes", "Navigation", "Chat", "Review", "Editor"] {
+        let mut rows: Vec<_> = SettingsField::SHORTCUTS
+            .into_iter()
+            .filter(|field| shortcut_group(*field) == group)
+            .map(|field| {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered draft")
+                    .1;
+                shortcut_input(
+                    field.label(),
+                    value,
+                    field,
+                    &draft.keyboard_shortcuts,
+                    invalid,
+                )
+            })
+            .collect();
+        for fixed in settings::FIXED_SHORTCUTS
+            .iter()
+            .chain(settings::TEXT_EDITING_SHORTCUTS)
+            .filter(|fixed| fixed.scope == group)
+        {
+            let keys = fixed.chords.join(", ");
+            let row = widget::row::with_children(vec![
+                design::body(fixed.label)
+                    .width(Length::FillPortion(3))
+                    .into(),
+                design::caption(keys.clone())
+                    .width(Length::FillPortion(4))
+                    .into(),
+                design::caption("Fixed").width(64).into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center);
+            rows.push(
+                setting_field(fixed.label, "", row.into())
+                    .label_in_control()
+                    .keywords(&keys)
+                    .keywords("fixed"),
+            );
+        }
+        if !rows.is_empty() {
+            groups.push(settings_group(group, "Action · Keys · Source · Terminal", rows).compact());
+        }
+    }
+    groups
+}
+
 fn shortcut_input<'a>(
     label: &'static str,
-    detail: impl Into<Cow<'a, str>>,
     value: &'a str,
     field: SettingsField,
     draft: &ShortcutDraft,
+    invalid: &'a HashMap<SettingsField, String>,
 ) -> Setting<'a, Message> {
     let action = field
         .shortcut_action()
         .expect("shortcut setting has command");
+    let index = SettingsField::SHORTCUTS
+        .iter()
+        .position(|candidate| *candidate == field)
+        .expect("shortcut index");
     let chords = settings::parse_chords(value);
+    let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
+    let source = if value == default { "Default" } else { "User" };
     let mut controls: Vec<Element<'a, Message>> = chords
         .iter()
         .enumerate()
         .map(|(index, chord)| {
             let mut remaining = chords.clone();
             remaining.remove(index);
-            widget::container(
-                widget::row::with_children(vec![
-                    design::body(chord.clone()).into(),
-                    crate::ui_controls::icon_button(
-                        Icon::Close,
-                        format!("Remove {chord} shortcut for {label}"),
-                    )
-                    .on_press(Message::SettingsDraftChanged {
-                        field,
-                        value: settings::format_chords(&remaining),
-                    })
-                    .into(),
-                ])
-                .spacing(space::XS)
-                .align_y(Alignment::Center),
-            )
-            .padding([0.0, space::XS])
-            .class(design::surface(
-                Some(design::raised),
-                [design::RADIUS_S; 4],
-                false,
-            ))
-            .into()
+            crate::ui_controls::button::quiet(format!("{chord} ×"))
+                .on_press(Message::SettingsDraftChanged {
+                    field,
+                    value: settings::format_chords(&remaining),
+                })
+                .into()
         })
         .collect();
-    let record: Element<'a, Message> =
+    controls.push(
         crate::ui_controls::icon_button(Icon::Keyboard, format!("Record shortcut for {label}"))
+            .compact()
             .on_press(Message::Palette(palette_ui::Action::Record(field)))
-            .into();
-    let default = workspace_widget::shortcut_chords(action, &KeyboardShortcuts::default());
-    let reset: Element<'a, Message> =
+            .into(),
+    );
+    controls.push(
         crate::ui_controls::icon_button(Icon::Undo, format!("Reset {label} shortcut"))
+            .compact()
             .on_press_maybe((value != default).then(|| Message::SettingsDraftChanged {
                 field,
                 value: default,
             }))
-            .into();
-    controls.push(
-        widget::row::with_children(vec![record, reset])
-            .spacing(space::XS)
             .into(),
     );
-    let mut message = None;
-    for chord in &chords {
-        match settings::parse_shortcut(chord) {
-            Err(error) => {
-                message = Some(error.to_owned());
-                break;
-            }
-            Ok(binding) => {
-                if let Some((other, _)) =
-                    draft.shortcut_values().into_iter().find(|(other, value)| {
-                        *other != action
-                            && settings::parse_chords(value).iter().any(|chord| {
-                                settings::parse_shortcut(chord)
-                                    .is_ok_and(|candidate| candidate == binding)
-                            })
-                    })
-                {
-                    message = Some(format!(
-                        "Conflicts with {}",
-                        workspace_widget::shortcut_descriptor(other).label
-                    ));
+    let required = if settings::shortcut_required(index) {
+        " · required"
+    } else {
+        ""
+    };
+    let mut error = invalid.get(&field).cloned();
+    if error.is_none() {
+        for chord in &chords {
+            match settings::parse_shortcut(chord) {
+                Err(reason) => {
+                    error = Some(sentence(reason));
                     break;
+                }
+                Ok(binding) => {
+                    if let Some(reason) = settings::shortcut_chord_refusal(binding) {
+                        error = Some(sentence(reason));
+                        break;
+                    }
+                    if let Some((other, _)) =
+                        draft.shortcut_values().into_iter().find(|(other, value)| {
+                            *other != action
+                                && settings::parse_chords(value).iter().any(|chord| {
+                                    settings::parse_shortcut(chord)
+                                        .is_ok_and(|candidate| candidate == binding)
+                                })
+                        })
+                    {
+                        error = Some(format!(
+                            "Conflicts with {}",
+                            workspace_widget::shortcut_descriptor(other).label
+                        ));
+                        break;
+                    }
                 }
             }
         }
     }
-    let mut children = vec![
-        widget::flex_row(controls)
-            .spacing(space::XS as u16)
-            .align_items(Alignment::Center)
+    let row = widget::row::with_children(vec![
+        design::body(format!("{label}{required}"))
+            .width(Length::FillPortion(3))
             .into(),
-    ];
-    if let Some(message) = message {
+        widget::row::with_children(controls)
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .width(Length::FillPortion(4))
+            .into(),
+        design::caption(source).width(64).into(),
+        {
+            let action_key = KeyboardShortcuts::action_names()[index];
+            crate::ui_controls::field::checkbox(
+                draft
+                    .terminal_passthrough_actions
+                    .iter()
+                    .any(|name| name == action_key),
+            )
+            .label("Send to terminal")
+            .on_toggle(move |enabled| Message::ShortcutTerminalPassthrough {
+                action: action_key.to_owned(),
+                enabled,
+            })
+            .into()
+        },
+    ])
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    let mut children = vec![row.into()];
+    if let Some(reason) = chords
+        .iter()
+        .filter_map(|chord| settings::parse_shortcut(chord).ok())
+        .find_map(settings::text_editing_shortcut_conflict)
+    {
+        children.push(design::caption(format!("Scoped conflict: {reason}")).into());
+    }
+    if let Some(reason) = &error {
         children.push(
-            design::caption(message)
-                .class(cosmic::theme::Text::Color(design::warning_color(
-                    &cosmic::theme::active(),
-                )))
+            design::caption(reason.clone())
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
                 .into(),
         );
     }
+    let conflict = if error.is_some() {
+        "conflicts unsaved"
+    } else {
+        ""
+    };
     setting_field(
         label,
-        detail,
-        widget::column::with_children(children)
-            .spacing(space::XS)
-            .into(),
+        "",
+        widget::column::with_children(children).spacing(2).into(),
     )
+    .label_in_control()
+    .keywords(value)
+    .keywords(settings::shortcut_search_keywords(value))
+    .keywords(format!(
+        "keyboard_shortcuts send to terminal {source} {conflict}"
+    ))
+}
+
+#[cfg(test)]
+mod keyboard_table_tests {
+    use super::*;
+
+    #[test]
+    fn shortcut_rows_match_the_persisted_policy_registry() {
+        let mut table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
+        for (index, name) in KeyboardShortcuts::action_names().iter().enumerate() {
+            table.insert((*name).into(), vec![format!("action-{index}")].into());
+        }
+        let settings: KeyboardShortcuts = table.try_into().unwrap();
+        assert_eq!(
+            SettingsField::SHORTCUTS.len(),
+            KeyboardShortcuts::action_names().len()
+        );
+        for (field, values) in SettingsField::SHORTCUTS.into_iter().zip(settings.actions()) {
+            assert_eq!(
+                workspace_widget::shortcut_keys(field.shortcut_action().unwrap(), &settings),
+                values
+            );
+        }
+    }
+
+    #[test]
+    fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
+        use iced::{
+            Size,
+            advanced::{layout, widget::Tree},
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let draft = SettingsDraft::from_settings(&AppSettings::default());
+        let invalid = HashMap::new();
+        for field in SettingsField::SHORTCUTS {
+            let action = field.shortcut_action().unwrap();
+            let value = draft
+                .keyboard_shortcuts
+                .shortcut_values()
+                .into_iter()
+                .find(|(candidate, _)| *candidate == action)
+                .unwrap()
+                .1;
+            let row = shortcut_input(
+                field.label(),
+                value,
+                field,
+                &draft.keyboard_shortcuts,
+                &invalid,
+            );
+            let mut element = settings_group("Keyboard", "", vec![row])
+                .compact()
+                .view("Keyboard", "")
+                .unwrap();
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(960.0, 0.0), Size::new(960.0, 1000.0)),
+            );
+            fn controls_row(node: &layout::Node) -> Option<&layout::Node> {
+                let children = node.children();
+                if children.len() == 4 && (children[2].size().width - 64.0).abs() < 0.1 {
+                    Some(node)
+                } else {
+                    children.iter().find_map(controls_row)
+                }
+            }
+            let row = controls_row(&node).expect("registered shortcut controls row");
+            assert!(
+                row.size().height <= 36.0,
+                "{field:?} controls must remain on one line: {:?}",
+                row.size()
+            );
+            for child in row.children() {
+                assert!(
+                    child.bounds().x + child.size().width <= row.size().width + 0.1,
+                    "{field:?} control exceeds row bounds: {:?} in {:?}",
+                    child.bounds(),
+                    row.size()
+                );
+            }
+            let keys = &row.children()[1];
+            for control in keys.children() {
+                assert!(
+                    control.bounds().x + control.size().width <= keys.size().width + 0.1,
+                    "{field:?} key, Record or Reset exceeds key cell: {:?} in {:?}",
+                    control.bounds(),
+                    keys.size()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn key_filter_includes_fixed_rows_and_all_matching_registered_actions() {
+        let mut draft = SettingsDraft::from_settings(&AppSettings::default());
+        draft.keyboard_shortcuts.rename_pane = "Ctrl+Tab".into();
+        draft.keyboard_shortcuts.chat_model = "Ctrl+Tab".into();
+        let invalid = HashMap::new();
+        let groups = keyboard_groups(&draft, &invalid);
+        let matches = groups
+            .into_iter()
+            .filter_map(|group| group.view("Keyboard", "Ctrl+Tab"))
+            .count();
+        assert_eq!(
+            matches, 3,
+            "the pane action, chat action and fixed navigation row all match"
+        );
+        assert_eq!(
+            keyboard_groups(&draft, &invalid)
+                .into_iter()
+                .filter_map(|group| group.view("Keyboard", "Ctrl+="))
+                .count(),
+            1
+        );
+        draft.keyboard_shortcuts.rename_pane = "Control + F8".into();
+        draft.keyboard_shortcuts.chat_model = "F8 + Control".into();
+        assert_eq!(
+            keyboard_groups(&draft, &invalid)
+                .into_iter()
+                .filter_map(|group| group.view("Keyboard", "Ctrl+F8"))
+                .count(),
+            2,
+            "pressed keys find accepted aliases and modifier order"
+        );
+    }
 }

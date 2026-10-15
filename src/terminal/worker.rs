@@ -4,6 +4,7 @@ mod close_processes;
 #[cfg(test)]
 mod close_tests;
 pub(crate) mod holder;
+mod prompt_input;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
@@ -1387,6 +1388,9 @@ struct Worker {
     visibility: Visibility,
     generation: u64,
     capture_dirty: bool,
+    /// No ordered shell input-loop acknowledgement exists yet. A rendered
+    /// empty prompt cannot prove admitted user bytes have been consumed.
+    unacknowledged_input: bool,
     viewport_reads: Vec<(
         Option<u64>,
         u16,
@@ -1571,9 +1575,7 @@ impl Worker {
 
         let mut command = match &config.execution_environment {
             Some(environment) => {
-                let mut command = CommandBuilder::new(&session.launch.program);
-                command.args(&session.launch.arguments);
-                command.cwd(&session.launch.working_directory);
+                let mut command = command_for_shell(&session.launch);
                 command.env_clear();
                 for (name, value) in &environment.0 {
                     command.env(name, value);
@@ -1744,6 +1746,9 @@ impl Worker {
             visibility,
             generation: 0,
             capture_dirty: false,
+            // An adopted shell may already own input admitted by its previous
+            // daemon, even if its reconstructed screen looks empty.
+            unacknowledged_input: config.adoption.is_some(),
             viewport_reads: Vec::new(),
             force_capture: false,
             synchronized_since: None,
@@ -2261,7 +2266,7 @@ impl Worker {
                 let process = self.observe_agent_process().cloned();
                 let _ = sender.send(process);
             }
-            Command::Input(bytes) => self.write_pty(&bytes, "write terminal input"),
+            Command::Input(bytes) => self.write_user_input(&bytes, "write terminal input"),
             Command::Paste(text, origin) => self.paste(&text, origin),
             Command::Key(input) => self.encode_key(input),
             Command::Mouse(input) => self.encode_mouse(input),
@@ -2368,7 +2373,7 @@ impl Worker {
 
     fn encode_key(&mut self, input: KeyInput) {
         match encode_key_input(&self.terminal, &mut self.key_encoder, input) {
-            Ok(encoded) => self.write_pty(&encoded, "write encoded key"),
+            Ok(encoded) => self.write_user_input(&encoded, "write encoded key"),
             Err(error) => self.error("encode key", error.to_string()),
         }
     }
@@ -2386,7 +2391,7 @@ impl Worker {
                 if self.visibility == Visibility::Visible {
                     self.publish_snapshot(false);
                 }
-                self.write_pty(&encoded, "write terminal paste");
+                self.write_user_input(&encoded, "write terminal paste");
             }
             Err(error) => self.error("encode terminal paste", error.to_string()),
         }
@@ -2423,7 +2428,7 @@ impl Worker {
             });
         let mut encoded = Vec::with_capacity(32);
         match self.mouse_encoder.encode_to_vec(&event, &mut encoded) {
-            Ok(()) => self.write_pty(&encoded, "write encoded mouse event"),
+            Ok(()) => self.write_user_input(&encoded, "write encoded mouse event"),
             Err(error) => self.error("encode mouse event", error.to_string()),
         }
     }
@@ -2830,12 +2835,20 @@ impl Worker {
         if foreground <= 0 {
             return Err("Foreground process group unavailable".into());
         }
-        // Process-only policy deliberately permits terminating shell builtins.
-        // The original executable check still prevents an exec'd agent or
-        // command from inheriting an idle shell's authority.
+        // An idle process census alone cannot distinguish an empty shell
+        // prompt from an unfinished command or an in-shell builtin. Without
+        // prompt integration, require confirmation conservatively. The
+        // executable check also protects an exec'd command.
         let idle_shell = interactive_shell_launch(&self.launch) && root.original_executable();
         Ok((
-            family.has_jobs() || foreground != root.process.group || !idle_shell,
+            self.unacknowledged_input
+                || !self.commands.is_empty()
+                || family.has_jobs()
+                || foreground != root.process.group
+                || !idle_shell
+                || prompt_input::has_prompt_input(&self.terminal)
+                    .map_err(|error| format!("Inspect terminal prompt: {error}"))?
+                    .unwrap_or(true),
             family,
         ))
     }
@@ -2957,6 +2970,15 @@ impl Worker {
             *current = Some(title.clone());
             self.emit(TerminalEvent::ConversationTitleChanged(title));
         }
+    }
+
+    fn write_user_input(&mut self, bytes: &[u8], operation: &'static str) {
+        if !bytes.is_empty() {
+            // Mark before attempting the write: partial/fatal admission must
+            // never regain an unconfirmed close through an empty VT screen.
+            self.unacknowledged_input = true;
+        }
+        self.write_pty(bytes, operation);
     }
 
     fn write_pty(&mut self, bytes: &[u8], operation: &'static str) {
@@ -3333,10 +3355,23 @@ fn interactive_shell_launch(recipe: &LaunchRecipe) -> bool {
     true
 }
 
-fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
+fn command_for_shell(recipe: &LaunchRecipe) -> CommandBuilder {
     let mut command = CommandBuilder::new(&recipe.program);
+    if interactive_shell_launch(recipe)
+        && std::path::Path::new(&recipe.program)
+            .file_name()
+            .is_some_and(|name| name == "fish")
+    {
+        command.arg("--init-command");
+        command.arg(prompt_input::FISH_INTEGRATION);
+    }
     command.args(&recipe.arguments);
     command.cwd(&recipe.working_directory);
+    command
+}
+
+fn command_from_recipe(recipe: &LaunchRecipe) -> CommandBuilder {
+    let mut command = command_for_shell(recipe);
     scrub_inherited_markers(&mut command);
     terminal_environment(&mut command);
     // Last, so an explicit per-session entry still wins over our defaults.
@@ -6296,6 +6331,33 @@ mod tests {
             working_directory: PathBuf::from("/"),
             environment,
         }
+    }
+
+    #[test]
+    fn interactive_fish_prompt_integration_survives_environment_replacement() {
+        let mut recipe = env_recipe(BTreeMap::new());
+        recipe.program = "/usr/bin/fish".into();
+        recipe.arguments = vec!["--login".into()];
+        let mut captured_environment = command_for_shell(&recipe);
+        captured_environment.env_clear();
+        assert_eq!(
+            captured_environment.get_argv(),
+            command_from_recipe(&recipe).get_argv()
+        );
+        assert_eq!(
+            captured_environment.get_argv()[1],
+            OsStr::new("--init-command")
+        );
+        assert_eq!(
+            captured_environment.get_argv()[2],
+            OsStr::new(prompt_input::FISH_INTEGRATION)
+        );
+        recipe.arguments = vec!["-c".into(), "printf fixture".into()];
+        assert_eq!(
+            command_for_shell(&recipe).get_argv().len(),
+            3,
+            "noninteractive commands must not load prompt hooks"
+        );
     }
 
     #[test]

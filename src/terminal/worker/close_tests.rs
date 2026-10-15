@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fs,
-    os::unix::fs::PermissionsExt,
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -36,7 +39,7 @@ impl CloseSafetyShell {
         fs::write(home.path().join(".bashrc"), "PS1='CLOSE_READY> '\n").unwrap();
         fs::write(
             config_home.join("fish/config.fish"),
-            "function fish_prompt\nprintf 'CLOSE_READY> '\nend\n",
+            "command cat /proc/$fish_pid/stat > .fish_stat\nfunction fish_prompt\nprintf 'CLOSE_READY> '\nend\n",
         )
         .unwrap();
         let launch = LaunchRecipe {
@@ -214,8 +217,125 @@ fn installed_fish() -> Option<PathBuf> {
 }
 
 #[test]
-fn an_idle_shell_closes_without_confirmation_from_its_daemon_owner() {
-    CloseSafetyShell::shell(Path::new("/bin/bash")).assert_unconfirmed_close();
+fn a_shell_without_prompt_integration_requires_confirmation_even_when_idle() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
+}
+
+#[test]
+fn an_unsent_command_without_prompt_integration_is_never_discarded_silently() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    shell.terminal.input(b"echo unfinished-command").unwrap();
+    shell.wait_for_text("unfinished-command");
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
+}
+
+#[test]
+fn an_unsent_fish_command_and_unacknowledged_cleared_line_require_confirmation() {
+    let Some(fish) = installed_fish() else { return };
+    let shell = CloseSafetyShell::shell(&fish);
+    shell.terminal.input(b"echo unfinished-command").unwrap();
+    shell.wait_for_text("unfinished-command");
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    shell.terminal.input(b"\x15").unwrap();
+    shell.wait_for("cleared prompt", || {
+        !shell.screen().contains("unfinished-command")
+    });
+    // Clearing changes the rendered line, not the lack of an ordered shell
+    // acknowledgement. Quiet closing after prior input remains unsupported.
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
+}
+
+#[test]
+fn kernel_admitted_input_without_echo_requires_confirmation() {
+    let Some(fish) = installed_fish() else { return };
+    let shell = CloseSafetyShell::shell(&fish);
+    // The shell records its own identity during startup in the private HOME.
+    // Pin that exact identity before signalling, even if a numeric pid recycles.
+    let recorded = fs::read(shell.home.path().join(".fish_stat")).unwrap();
+    let pid: libc::pid_t = std::str::from_utf8(&recorded)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let (_, start) = crate::model::agent_recovery::process_identity(&recorded).unwrap();
+    let root = crate::daemon::holder_registry::Process { pid, start };
+    // SAFETY: pidfd_open observes a process without affecting it.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    assert!(descriptor >= 0);
+    // SAFETY: successful pidfd_open returned a fresh owned descriptor.
+    let pidfd = unsafe { fs::File::from_raw_fd(descriptor as libc::c_int) };
+    assert!(root.is_current());
+    struct ResumeOnDrop(fs::File);
+    impl Drop for ResumeOnDrop {
+        fn drop(&mut self) {
+            let _ = close_processes::signal(&self.0, libc::SIGCONT);
+        }
+    }
+    let stopped = ResumeOnDrop(pidfd);
+    let slave = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+        .open(format!("/proc/{pid}/fd/0"))
+        .unwrap();
+    shell.wait_for("fish raw input mode", || {
+        let mut settings = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: ioctl initializes the allocated termios object on success.
+        let result = unsafe { libc::tcgetattr(slave.as_raw_fd(), settings.as_mut_ptr()) };
+        result == 0 && unsafe { settings.assume_init() }.c_lflag & (libc::ICANON | libc::ECHO) == 0
+    });
+    close_processes::signal(&stopped.0, libc::SIGSTOP).unwrap();
+    shell.wait_for("stopped fixture fish", || {
+        fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(") ")
+                .is_some_and(|(_, fields)| fields.as_bytes().first() == Some(&b'T'))
+        })
+    });
+    shell.terminal.input(b"unrendered-command").unwrap();
+    shell.wait_for("positive kernel input admission", || {
+        let mut queued: libc::c_int = 0;
+        // SAFETY: queued is a valid writable c_int for this slave descriptor.
+        assert_eq!(
+            unsafe { libc::ioctl(slave.as_raw_fd(), libc::TIOCINQ, &mut queued) },
+            0
+        );
+        queued > 0
+    });
+    assert!(!shell.screen().contains("unrendered-command"));
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
 }
 
 #[test]
@@ -256,7 +376,7 @@ fn an_exec_replacement_cannot_inherit_the_shells_idle_close_authority() {
 fn checked_close_delivers_its_kill_provenance_before_reporting_completion() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     assert_eq!(
-        shell.terminal.close_checked(false),
+        shell.terminal.close_checked(true),
         TerminalCloseResult::Closed
     );
     // close_checked joins teardown; its Exited event is already observable
@@ -272,15 +392,21 @@ fn checked_close_delivers_its_kill_provenance_before_reporting_completion() {
 }
 
 #[test]
-fn a_shell_builtin_read_closes_without_confirmation_under_process_only_detection() {
+fn a_shell_builtin_read_requires_confirmation_without_prompt_integration() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     shell
         .terminal
         .input(b"printf 'READY_%s\\n' BUILTIN; read reply\n")
         .unwrap();
     shell.wait_for_text("READY_BUILTIN");
-    // This deliberately does not attempt to classify in-shell execution.
-    shell.assert_unconfirmed_close();
+    assert_eq!(
+        shell.terminal.close_checked(false),
+        TerminalCloseResult::Active
+    );
+    assert_eq!(
+        shell.terminal.close_checked(true),
+        TerminalCloseResult::Closed
+    );
 }
 
 #[test]
