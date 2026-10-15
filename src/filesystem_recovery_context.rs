@@ -151,6 +151,23 @@ pub(crate) mod fixtures {
     pub(crate) fn fixture_context(source: &Root) -> io::Result<FilesystemRecoveryContext> {
         fixture_context_with_guard(source, ())
     }
+    pub(crate) fn fixture_context_at_runtime(
+        source: &Root,
+        runtime: &std::path::Path,
+    ) -> io::Result<FilesystemRecoveryContext> {
+        let outside = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()?;
+        let protection =
+            crate::worktree_cleanup::fixture_protection(runtime, source.path(), false)?;
+        let source = Arc::new(source.try_clone()?);
+        let placement = RecoveryPlacement::acquire(
+            Arc::new(Root::open(outside.path())?),
+            source.clone(),
+            Arc::from([source.clone()]),
+        )?;
+        FilesystemRecoveryContext::from_placement(&source, protection, placement, outside)
+    }
     pub(crate) fn fixture_context_with_guard(
         source: &Root,
         guard: impl Send + Sync + 'static,
