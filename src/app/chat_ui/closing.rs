@@ -1020,6 +1020,30 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_return_cannot_capture_a_new_shared_removal_basis_for_the_held_end() {
+        let (mut app, card, directory) = fixture();
+        write(&mut app, card, "keep original failed-return draft", false);
+        retain_in_channel(&mut app, directory.path(), vec![card]);
+        shared_scope(&mut app, card, directory.path());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("original chat"); };
+        let target = runtime.target;
+        app.chat_ui.phases.insert(card, Phase::Returning { target, local: None, close_requested: false });
+        drop(app.begin_chat_close(card));
+        assert!(app.chat_ui.end_requests.contains_key(&target));
+        app.workspace_model.views[0].scope = crate::workspace_model::views::Scope::Worktree {
+            repository: directory.path().into(), path: directory.path().join("new-owner"),
+        };
+        drop(app.update(Message::ChatUi(super::super::Action::HandoffFinished(target, Err("original return failed".into())))));
+        assert!(app.chat_ui.end_requests.is_empty());
+        assert!(app.chat_ui.phases.is_empty());
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(app.recently_closed.is_empty());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("original runtime kept"); };
+        assert_eq!(runtime.unsent_text(), "keep original failed-return draft");
+    }
+
+    #[test]
     fn an_unpublished_hidden_chat_end_cannot_cross_a_registry_join() {
         let (mut app, card, directory) = fixture();
         let source = attach_durable_owner(&mut app, card);

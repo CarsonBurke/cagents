@@ -4936,6 +4936,13 @@ impl Cagents {
     pub(super) fn begin_chat_close_for(&mut self, card: CardId, batch: Option<uuid::Uuid>) -> Task<Message> {
         if !self.pane_close_decision_current(card, batch) { return Task::none(); }
         let Some(request) = closing::EndRequest::capture(self, card, batch) else { return Task::none(); };
+        self.begin_chat_close_request(card, request)
+    }
+    /// An asynchronous return failure keeps the original End intent. It must
+    /// not capture new registry/view authority when that result arrives.
+    fn begin_chat_close_request(&mut self, card: CardId, request: closing::EndRequest) -> Task<Message> {
+        if !request.current(self, card) { self.stop_pane_close_batch(request.batch); return Task::none(); }
+        let batch = request.batch;
         self.remember_conversation_draft(card);
         if let Some(Phase::Closing { target, restart: None }) = self.chat_ui.phases.get(&card) {
             if self.chat_ui.end_requests.get(target).is_none_or(|pending| pending.batch != batch) {
@@ -8287,7 +8294,7 @@ impl Cagents {
                         self.status = Some(TransientNotice::error(error));
                         self.reread_chat_activity(target);
                         return if close {
-                            self.begin_chat_close_for(target.card, batch)
+                            request.map_or_else(Task::none, |request| self.begin_chat_close_request(target.card, request))
                         } else {
                             Task::none()
                         };
