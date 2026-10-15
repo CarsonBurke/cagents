@@ -12306,7 +12306,7 @@ mod tests {
         let now=crate::chat::now_ms().unwrap();
         for (id,status) in [(Account::system(Provider::Codex).id(),account::UsageStatus::Limited),(alternate.clone(),account::UsageStatus::Ok)] {
             drop(app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {owner:app.account_ui.probe_owner(&id).unwrap(),id,
-                outcome:account::probe::Outcome::Answered {identity:None,catalog:None,snapshot:account::UsageSnapshot::state(status,"",now)}})));
+                outcome:account::probe::Outcome::Answered {verification:None,identity:None,catalog:None,snapshot:account::UsageSnapshot::state(status,"",now)}})));
         }
         assert!(app.automatic_chat_account(target,PromptMode::Send).is_none());
         let cards=app.durable.cards.len();
