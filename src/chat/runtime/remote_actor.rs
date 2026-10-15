@@ -56,6 +56,8 @@ pub(crate) struct ActorInspection {
     pub identity:ActorIdentity,
     pub source:chat::Session,
     pub previous_sources:Vec<chat::Session>,
+    pub execution_console:Option<crate::model::LaunchRecipe>,
+    pub paired_holder:Option<crate::terminal::holder::Record>,
     pub state:Resident,
     pub execution_environment:crate::terminal_ipc::ChatExecutionEnvironment,
     pub recovery_environment:BTreeMap<String,String>,
@@ -400,11 +402,28 @@ impl Drop for Remote {
     }
 }
 
+fn published_source(source:&chat::Session,confirmed:Option<&str>,continuity:&chat::NativeContinuity)->chat::Session {
+    let mut projected=source.clone();
+    if let Some(confirmed)=confirmed {projected.launch.session_id=Some(confirmed.to_owned());}
+    projected.native_continuity=continuity.clone();projected
+}
+fn validate_pair(source:&chat::Session,console:Option<&crate::model::LaunchRecipe>,pair:Option<&crate::terminal::holder::Record>,previous:Option<&crate::terminal::holder::Record>)->Result<(),String> {
+    if source.terminal.is_some()!=pair.is_some() || pair.is_some_and(|record|record.terminal!=source.id || record.kind!=Kind::Terminal || record.application!=crate::instance::APPLICATION_ID || source.proof.as_ref().is_none_or(|proof|proof.boot_id!=record.boot) || previous.is_some_and(|old|old!=record)) {
+        return Err("Paired view does not retain the exact original terminal holder".into());
+    }
+    if (console.is_some()&&source.terminal.is_none()) || source.terminal.as_ref().is_some_and(|terminal|terminal.id!=source.id || terminal.continuity.live_proof().as_ref()!=source.proof.as_ref() || match console {Some(recipe)=> &terminal.launch!=recipe || terminal.owned_codex_listener.is_some(),None=>terminal.owned_codex_listener!=source.owned_codex_listener}) {
+        return Err("Paired view changed issued console or native conversation ownership".into());
+    }
+    Ok(())
+}
+
 struct Server {
     actor:LocalHandle,
     identity:ActorIdentity,
     source:chat::Session,
     lineage:Vec<chat::Session>,
+    execution_console:Option<crate::model::LaunchRecipe>,
+    paired_holder:Option<crate::terminal::holder::Record>,
     proof:HostSessionProof,
     epoch:uuid::Uuid,
     installed:bool,
@@ -463,7 +482,7 @@ impl Server {
         let mut build=registry::BuildIdentity::current(Kind::Native);build.capabilities.push(CAPABILITY.into());
         let identity=ActorIdentity {instance:actor.close_observation().actor_id,record:Record {version:4,build:Some(build),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot,terminal:startup.source.id,holder:Process::read(std::process::id() as i32).map_err(|error|error.to_string())?,root:provider}};
         identity.record.create(&directory_path).map_err(|error|error.to_string())?;
-        Ok(Self {actor,identity,source:startup.source,lineage:Vec::new(),proof,epoch:uuid::Uuid::new_v4(),installed:false,journal,changed,pending:Vec::new(),account_reports,environment,recovery_environment:startup.recovery_environment,listener,socket,socket_identity,_directory:directory})
+        Ok(Self {actor,identity,source:startup.source,lineage:Vec::new(),execution_console:None,paired_holder:None,proof,epoch:uuid::Uuid::new_v4(),installed:false,journal,changed,pending:Vec::new(),account_reports,environment,recovery_environment:startup.recovery_environment,listener,socket,socket_identity,_directory:directory})
     }
     fn revision(&self)->u64 {self.changed.load(Ordering::Acquire).wrapping_add(self.actor.close_observation().close_revision)}
     fn resident(&self)->Result<Resident,String> {
@@ -477,6 +496,16 @@ impl Server {
         Ok(Resident {generation,session_id,title,ready,busy,waiting,working,activity,outcome,usage,requests,native_continuity:if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly},close:self.actor.close_observation(),installed:self.installed,owns_work:self.actor.owns_work()||failure.is_some(),completed:self.actor.is_completed(),idle:self.actor.is_idle(),failure,confirmed_session:self.actor.confirmed_session_id(),background_subagents:self.actor.background_subagents(),interrupt_subagents:self.actor.interrupt_subagents(),account_reports:self.account_reports.lock().unwrap_or_else(|p|p.into_inner()).clone(),next_input:journal.next_input()?,outbox_ack:journal.acknowledged()?,outbox_latest:journal.latest()?,changed:self.revision()})
     }
 
+    fn published_sources(&self)->Vec<chat::Session> {
+        let confirmed=self.actor.confirmed_session_id();
+        let continuity=if self.installed {chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()}}else {chat::NativeContinuity::ReconnectOnly};
+        let mut sources=self.lineage.clone();
+        for source in self.lineage.iter().chain(std::iter::once(&self.source)) {
+            let projected=published_source(source,confirmed.as_deref(),&continuity);
+            if projected!=self.source && !sources.contains(&projected) {sources.push(projected);}
+        }
+        sources
+    }
     fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
     fn finish_inputs(&mut self) {
         let journal=self.journal.clone();
@@ -490,10 +519,10 @@ impl Server {
         });
     }
     fn invoke(&mut self,request:Invocation)->Result<Value,String> {
-        if request.method=="inspect" {return serde_json::to_value(ActorInspection {identity:self.identity.clone(),source:self.source.clone(),previous_sources:self.lineage.clone(),state:self.resident()?,execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()}).map_err(|error|error.to_string());}
+        if request.method=="inspect" {return serde_json::to_value(ActorInspection {identity:self.identity.clone(),source:self.source.clone(),previous_sources:self.published_sources(),execution_console:self.execution_console.clone(),paired_holder:self.paired_holder.clone(),state:self.resident()?,execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()}).map_err(|error|error.to_string());}
         if request.method=="attach" {
             let (source,):(chat::Session,)=serde_json::from_value(request.args).map_err(|error|error.to_string())?;
-            if source!=self.source && !self.lineage.contains(&source) {return Err("Retained actor source/account identity does not match this chat".into());}
+            if source!=self.source && !self.published_sources().contains(&source) {return Err("Retained actor source/account identity does not match this chat".into());}
             self.epoch=uuid::Uuid::new_v4();self.proof=request.proof;
             return serde_json::to_value(self.attached()?).map_err(|error|error.to_string());
         }
@@ -537,12 +566,17 @@ impl Server {
             "preserve"=>{if !self.installed {return Err("Cannot preserve an uninstalled actor".into());}Ok(Value::Null)},
             "update_source"=>{
                 let (source,console,pair)=decode!((chat::Session,Option<crate::model::LaunchRecipe>,Option<crate::terminal::holder::Record>));
-                if console.is_some() || pair.is_some() {return Err("Claude actors cannot acquire a Codex console pairing".into());}
-                let mut expected=self.source.launch.clone();expected.session_id=self.actor.confirmed_session_id().or(expected.session_id);chat::protocol::align_resume_identity(&mut expected)?;
-                if source.id!=self.source.id || source.launch!=expected || source.proof.as_ref()!=Some(&self.proof) {return Err("Retained source update changed provider/account/launch identity".into());}
-                let retained=serde_json::to_vec(&self.lineage).map_err(|error|error.to_string())?.len();
-                if self.lineage.len()>=1024 || retained+serde_json::to_vec(&self.source).map_err(|error|error.to_string())?.len()>4*1024*1024 {return Err("Retained source lineage capacity reached".into());}
-                if source!=self.source {self.lineage.push(self.source.clone());self.source=source;}
+                let mut permitted=self.published_sources();permitted.push(self.source.clone());
+                let matches=permitted.iter().any(|previous| {
+                    let mut expected=previous.clone();expected.proof=Some(self.proof.clone());expected.terminal=source.terminal.clone();expected==source
+                });
+                if !matches {return Err("Retained source update changed provider/account/issued recipe identity".into());}
+                validate_pair(&source,console.as_ref(),pair.as_ref(),self.paired_holder.as_ref())?;
+                let mut lineage=self.published_sources();
+                if source!=self.source && !lineage.contains(&self.source) {lineage.push(self.source.clone());}
+                let retained=serde_json::to_vec(&lineage).map_err(|error|error.to_string())?.len();
+                if lineage.len()>1024 || retained>4*1024*1024 {return Err("Retained source lineage capacity reached".into());}
+                self.lineage=lineage;self.source=source;self.execution_console=console;self.paired_holder=pair;
                 Ok(Value::Null)
             },
             "close_if_revision"=>{let (revision,)=decode!((u64,));self.actor.close_if_revision(revision)?;reap_orphans()?;self.publish_close()?;Ok(Value::Null)},
@@ -551,7 +585,7 @@ impl Server {
             _=>Err("Unknown retained actor method/version".into()),
         }
     }
-    fn publish_close(&self)->Result<(),String> {chat::native_holder::publish_actor_close(&self.identity.record,&self.proof,&self.source,&self.lineage)}
+    fn publish_close(&self)->Result<(),String> {chat::native_holder::publish_actor_close(&self.identity.record,&self.proof,&self.source,&self.published_sources(),self.paired_holder.as_ref())}
     fn serve(mut self,startup:UnixStream)->Result<(),String> {
         send(&startup,&Ok::<_,String>(self.attached()?),Duration::from_secs(30))?;
         loop {
@@ -666,6 +700,23 @@ fn terminal_endpoint_error(error:&str,holder_current:bool)->bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn published_source_retains_issued_recipe_and_exact_account_identity() {
+        let source=chat::Session {id:crate::model::TerminalId::new(),
+            launch:chat::Launch {provider:crate::agent::Provider::Claude,
+                recipe:crate::model::LaunchRecipe {program:"claude".into(),arguments:vec!["--session-id".into(),"issued".into()],working_directory:"/var/tmp".into(),environment:BTreeMap::from([("CLAUDE_CONFIG_DIR".into(),"/account-a".into())]),unset_environment:Default::default()},session_id:None},
+            proof:None,terminal:None,owned_codex_listener:None,native_continuity:chat::NativeContinuity::ReconnectOnly};
+        let continuity=chat::NativeContinuity::Durable {provider_version:"claude-stream-json/actor-v1".into()};
+        let published=published_source(&source,Some("confirmed"),&continuity);
+        assert_eq!(published.launch.recipe,source.launch.recipe);
+        assert_eq!(published.launch.session_id.as_deref(),Some("confirmed"));
+        let mut invented=published.clone();invented.launch.session_id=Some("invented".into());
+        assert_ne!(published,invented);
+        invented=published.clone();invented.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(),"/account-b".into());
+        assert_ne!(published,invented);
+        assert!(validate_pair(&source,None,None,None).is_ok());
+        assert!(validate_pair(&source,Some(&source.launch.recipe),None,None).is_err());
+    }
     #[test]
     fn attachment_metadata_and_observation_are_local_and_body_free() {
         let actor=RemoteActor::fixture();

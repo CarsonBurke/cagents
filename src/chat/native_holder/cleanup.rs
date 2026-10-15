@@ -62,8 +62,8 @@ pub(super) fn publish(
     save(&path, &receipt)
 }
 
-pub(crate) fn publish_actor_close(record:&Record,proof:&HostSessionProof,source:&crate::chat::Session,lineage:&[crate::chat::Session])->Result<(),String> {
-    let receipt=Receipt {record:record.clone(),proof:proof.clone(),sources:lineage.iter().chain(std::iter::once(source)).map(source_digest).collect::<Result<_,_>>()?,paired_closed:true,paired_holder:None};
+pub(crate) fn publish_actor_close(record:&Record,proof:&HostSessionProof,source:&crate::chat::Session,lineage:&[crate::chat::Session],paired_holder:Option<&Record>)->Result<(),String> {
+    let receipt=Receipt {record:record.clone(),proof:proof.clone(),sources:lineage.iter().chain(std::iter::once(source)).map(source_digest).collect::<Result<_,_>>()?,paired_closed:paired_holder.is_none(),paired_holder:paired_holder.cloned()};
     save(&path(record.terminal,&record.holder)?,&receipt)
 }
 

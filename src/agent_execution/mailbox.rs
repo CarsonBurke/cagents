@@ -459,7 +459,7 @@ mod tests {
         let actor = Seal::new(daemon.export_private_key());
         let message = message();
         let sealed = daemon.seal(&message, 0);
-        assert_eq!(actor.open(&sealed).unwrap().body, message.body);
+        assert_eq!(actor.open(&sealed).unwrap().body, message.body.trim_end());
         assert!(actor.open(&sealed.replace("Hold off", "Go ahead")).is_none());
         assert_eq!(format!("{actor:?}"), "Seal(<redacted>)");
     }
