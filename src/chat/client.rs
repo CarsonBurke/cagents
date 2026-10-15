@@ -86,7 +86,13 @@ type Pending = Arc<
 >;
 type FilePending =
     Arc<Mutex<BTreeMap<u64, crossbeam_channel::Sender<Result<super::FileChangeReply, String>>>>>;
-type SourcePending = Arc<Mutex<BTreeMap<u64, tokio::sync::oneshot::Sender<Result<super::cache::SourcePage, super::cache::SourceError>>>>>;
+#[derive(Debug)]
+enum SourceReply {
+    Text(super::cache::SourcePage),
+    Changes(super::cache::changes::Manifest),
+    Patch(super::cache::changes::PatchPage),
+}
+type SourcePending = Arc<Mutex<BTreeMap<u64, tokio::sync::oneshot::Sender<Result<SourceReply, super::cache::SourceError>>>>>;
 struct SourceRequest<'a> { pending: &'a SourcePending, id: u64 }
 impl Drop for SourceRequest<'_> {
     fn drop(&mut self) { self.pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&self.id); }
@@ -1055,7 +1061,9 @@ impl ClientHandle {
                 }
                 if let Some(reply)=envelope.request_id.and_then(|request|source_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
-                        ServerMessage::Response{response:ServerResponse::ChatSource{chat_id,result}} if chat_id==id=>result,
+                        ServerMessage::Response{response:ServerResponse::ChatSource{chat_id,result}} if chat_id==id=>result.map(SourceReply::Text),
+                        ServerMessage::Response{response:ServerResponse::ChatChangesManifest{chat_id,result}} if chat_id==id=>result.map(SourceReply::Changes),
+                        ServerMessage::Response{response:ServerResponse::ChatChangePatch{chat_id,result}} if chat_id==id=>result.map(SourceReply::Patch),
                         ServerMessage::Error(error)=>Err(super::cache::SourceError::Transport(error.message)),
                         _=>Err(super::cache::SourceError::Transport("Unexpected source reply".into())),
                     };
@@ -1356,6 +1364,29 @@ impl ClientHandle {
     /// Fetch a bounded original-text page on this connection's own reply channel.
     /// The existing reader resolves the future; no request spawns an actor or thread.
     pub async fn source_page(&self, query: super::cache::SourceQuery) -> Result<super::cache::SourcePage, super::cache::SourceError> {
+        self.source_page_with_timeout(query,Duration::from_secs(40)).await
+    }
+    async fn source_page_with_timeout(&self,query:super::cache::SourceQuery,timeout:Duration)->Result<super::cache::SourcePage,super::cache::SourceError>{
+        match self.source_request_with_timeout(Command::LoadSource{query},timeout).await? {
+            SourceReply::Text(page)=>Ok(page),
+            _=>Err(super::cache::SourceError::Transport("Unexpected original-text reply type".into())),
+        }
+    }
+    pub async fn changes_manifest(&self,query:super::cache::changes::ManifestQuery)->Result<super::cache::changes::Manifest,super::cache::SourceError>{
+        let expected=query.clone();
+        match self.source_request_with_timeout(Command::LoadChangesManifest{query},Duration::from_secs(40)).await? {
+            SourceReply::Changes(page) if page.matches_query(&expected)=>Ok(page),
+            _=>Err(super::cache::SourceError::Transport("Unexpected Changes manifest reply".into())),
+        }
+    }
+    pub async fn change_patch(&self,query:super::cache::changes::PatchQuery)->Result<super::cache::changes::PatchPage,super::cache::SourceError>{
+        let expected=query.clone();
+        match self.source_request_with_timeout(Command::LoadChangePatch{query},Duration::from_secs(40)).await? {
+            SourceReply::Patch(page) if page.matches_query(&expected)=>Ok(page),
+            _=>Err(super::cache::SourceError::Transport("Unexpected Changes patch reply".into())),
+        }
+    }
+    async fn source_request_with_timeout(&self,command:Command,timeout:Duration)->Result<SourceReply,super::cache::SourceError>{
         use super::cache::SourceError;
         if !self.inner.alive.load(Ordering::Acquire) {return Err(SourceError::Transport("Chat is disconnected".into()));}
         let id=self.inner.next.fetch_add(1,Ordering::Relaxed);
@@ -1366,10 +1397,10 @@ impl ClientHandle {
             pending.insert(id,reply);
         }
         let _request=SourceRequest{pending:&self.inner.source_pending,id};
-        transmit(&self.inner.wire,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command:Command::LoadSource{query}}).map_err(SourceError::Transport)?;
-        tokio::time::timeout(Duration::from_secs(40),response).await
-            .map_err(|_|SourceError::Transport("Source request timed out".into()))?
-            .map_err(|_|SourceError::Transport("Source request disconnected".into()))?
+        tokio::time::timeout(timeout,async{
+            transmit_async(&self.inner.wire,&self.inner.alive,&self.inner.proof,id,ClientRequest::ChatCommand{chat_id:self.inner.id,command}).await.map_err(SourceError::Transport)?;
+            response.await.map_err(|_|SourceError::Transport("Source request disconnected".into()))?
+        }).await.map_err(|_|SourceError::Transport("Source request timed out".into()))?
     }
     pub fn send(&self, command: Command) -> Result<(), String> {
         self.request(ClientRequest::ChatCommand {
@@ -3239,6 +3270,118 @@ mod tests {
             tokio::task::yield_now().await;
             assert_eq!(handle.inner.source_pending.lock().unwrap().len(),1);
             task.abort();assert!(task.await.unwrap_err().is_cancelled());
+            assert!(handle.inner.source_pending.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn changes_manifest_and_patch_replies_correlate_without_snapshot_hydration() {
+        use super::super::cache::{SourceEpoch,SourceKey,changes::*};
+        let (client,mut server)=UnixStream::pair().unwrap();
+        let (done,finished)=std::sync::mpsc::channel();
+        let epoch=SourceEpoch{incarnation:uuid::Uuid::new_v4(),revision:4};
+        let worker=thread::spawn(move || {
+            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let proof=host_proof("changes-source");
+            let mut codec=FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond=|codec:&mut FrameCodec,server:&mut UnixStream,request_id,response| {
+                codec.write(server,&ServerEnvelope{version:PROTOCOL_VERSION,request_id,proof:proof.clone(),message:ServerMessage::Response{response}}).unwrap();
+            };
+            let connect:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            respond(&mut codec,&mut server,Some(connect.request_id),ServerResponse::Connected{proof:proof.clone(),resumed:vec![]});
+            let start:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart{session,..}=start.request else {panic!("start expected")};
+            let chat_id=session.id;
+            respond(&mut codec,&mut server,Some(start.request_id),ServerResponse::ChatAttached{session,snapshot:Snapshot{generation:7,..Default::default()}});
+            let first:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            let second:ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            for request in [second,first] {
+                let ClientRequest::ChatCommand{command,..}=request.request else {panic!("cache query expected")};
+                let response=match command {
+                    Command::LoadChangesManifest{query}=>ServerResponse::ChatChangesManifest{chat_id,result:Ok(Manifest{
+                        source:query.source,epoch,metadata:Metadata{role:super::super::Role::Assistant,status:super::super::ToolStatus::Succeeded,at:None,started_at:None,total_files:1,total_bytes:4,additions:None,deletions:None,unavailable:None},offset:0,next_offset:None,files:vec![File{file_index:0,path:"manifest.rs".into(),kind:super::super::ChangeKind::Updated,source_len:4,additions:None,deletions:None}],omitted_files:0,
+                    })},
+                    Command::LoadChangePatch{query}=>ServerResponse::ChatChangePatch{chat_id,result:Ok(PatchPage{
+                        source:query.source,epoch,file:File{file_index:query.file_index,path:"patch.rs".into(),kind:super::super::ChangeKind::Updated,source_len:4,additions:None,deletions:None},offset:0,next_offset:4,text:"data".into(),complete:true,
+                    })},
+                    _=>panic!("unexpected cache command"),
+                };
+                respond(&mut codec,&mut server,Some(request.request_id),response);
+            }
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let handle=ClientHandle::connect_on(client,omp_card(None,None),Intent::Start,None,false,None,None,|_|{}).unwrap();
+        let runtime=tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        runtime.block_on(async {
+            let metadata=handle.clone();
+            let manifest=tokio::spawn(async move {metadata.changes_manifest(ManifestQuery{source:SourceKey{agent_id:None,source_id:"manifest".into()},offset:0,limit:1,expected_epoch:None}).await.unwrap()});
+            let patch=handle.clone();
+            let page=tokio::spawn(async move {patch.change_patch(PatchQuery{source:SourceKey{agent_id:Some("child".into()),source_id:"patch".into()},file_index:2,offset:0,limit:4,expected_epoch:epoch,until:4}).await.unwrap()});
+            assert_eq!(manifest.await.unwrap().source.source_id,"manifest");
+            assert_eq!(page.await.unwrap().text,"data");
+        });
+        assert_eq!(handle.snapshot().generation,7);
+        assert!(handle.snapshot().items.is_empty());
+        assert!(handle.snapshot().changes_parts.is_empty());
+        assert!(handle.inner.source_pending.lock().unwrap().is_empty());
+        done.send(()).unwrap();worker.join().unwrap();
+    }
+
+    fn source_query()->super::super::cache::SourceQuery{super::super::cache::SourceQuery{source:super::super::cache::SourceKey{agent_id:None,source_id:"bounded-source".into()},offset:0,limit:256,expected_epoch:None,until:None}}
+    #[test]
+    fn source_query_deadline_includes_shared_wire_admission() {
+        use super::super::cache::SourceError;
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        let holder = handle.clone();
+        let (locked, acquired) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = thread::spawn(move || {
+            let _wire = holder.inner.wire.lock().unwrap();
+            locked.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(2));
+        });
+        acquired.recv().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let started = Instant::now();
+        let result = runtime.block_on(handle.source_page_with_timeout(source_query(),Duration::from_millis(50)));
+        let elapsed = started.elapsed();
+        release.send(()).unwrap(); holder.join().unwrap();
+        assert!(matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out")));
+        assert!(elapsed < Duration::from_secs(1), "wire admission blocked for {elapsed:?}");
+        assert!(handle.inner.source_pending.lock().unwrap().is_empty());
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn source_query_deadline_and_cancellation_cover_socket_backpressure() {
+        use std::os::fd::AsRawFd;
+        use super::super::cache::SourceError;
+        let handle = ClientHandle::fixture(omp_card(None, None), Snapshot::default());
+        {
+            let wire = handle.inner.wire.lock().unwrap();
+            // Fill the socket without changing descriptor flags shared with
+            // the response reader. The fixture peer never consumes writes.
+            let byte = [0u8];
+            loop {
+                // SAFETY: the wire owns the socket and byte is a live buffer.
+                let sent = unsafe { libc::send(wire.stream.as_raw_fd(), byte.as_ptr().cast(), byte.len(), libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) };
+                if sent < 0 {
+                    assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+                    break;
+                }
+                assert_eq!(sent, 1);
+            }
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap();
+        let result = runtime.block_on(handle.source_page_with_timeout(source_query(),Duration::from_millis(50)));
+        assert!(matches!(result, Err(SourceError::Transport(message)) if message.contains("timed out")));
+        assert!(handle.inner.source_pending.lock().unwrap().is_empty());
+        assert!(handle.inner.alive.load(Ordering::Acquire));
+        runtime.block_on(async {
+            let requester = handle.clone();
+            let request = tokio::spawn(async move { requester.source_page(source_query()).await });
+            while handle.inner.source_pending.lock().unwrap().is_empty() { tokio::task::yield_now().await; }
+            request.abort(); assert!(request.await.unwrap_err().is_cancelled());
             assert!(handle.inner.source_pending.lock().unwrap().is_empty());
         });
     }

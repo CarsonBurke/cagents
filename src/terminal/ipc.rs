@@ -785,6 +785,14 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         result: Result<crate::chat::cache::SourcePage, crate::chat::cache::SourceError>,
     },
+    ChatChangesManifest {
+        chat_id: TerminalId,
+        result: Result<crate::chat::cache::changes::Manifest, crate::chat::cache::SourceError>,
+    },
+    ChatChangePatch {
+        chat_id: TerminalId,
+        result: Result<crate::chat::cache::changes::PatchPage, crate::chat::cache::SourceError>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

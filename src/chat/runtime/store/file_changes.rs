@@ -250,16 +250,25 @@ impl Store {
         body: &str,
         spans: &[usize],
     ) -> Result<(), String> {
+        if !source.is_empty() {
+            let prepared = self.prepare_changes_source(item,source)?;
+            if super::changes_source::record(&self.db, source, &item.id, prepared.as_ref())? { self.changes_revision = self.changes_revision.wrapping_add(1); }
+        }
         self.db
             .execute_batch("SAVEPOINT file_index")
             .map_err(|e| e.to_string())?;
         let revision = self.file_revision;
         let counts = (self.file_keys, self.applied_files);
         match self.index_file_item_inner(item, source, ordinal, imported, body, spans) {
-            Ok(()) => self
-                .db
-                .execute_batch("RELEASE file_index")
-                .map_err(|e| e.to_string()),
+            Ok(()) => {
+                if let Err(error) = self.finish_changes_index(source, &item.id) {
+                    let _ = self.db.execute_batch("ROLLBACK TO file_index; RELEASE file_index");
+                    self.file_revision = revision;
+                    (self.file_keys, self.applied_files) = counts;
+                    return Err(error);
+                }
+                self.db.execute_batch("RELEASE file_index").map_err(|e| e.to_string())
+            },
             Err(error) => {
                 let _ = self
                     .db
@@ -377,10 +386,16 @@ impl Store {
             }
             Event::SubagentItemsRemoved { id, ids } => {
                 for item in ids {
+                    if self.db.execute("DELETE FROM changes_sources WHERE source=?1 AND item_id=?2",params![format!("c:{id}"),item]).map_err(|e|e.to_string())? > 0 { self.changes_revision = self.changes_revision.wrapping_add(1); }
                     if self.remove_file_item(&format!("c:{id}"), item)? {
                         self.file_revision = self.file_revision.saturating_add(1);
                     }
                 }
+            }
+            Event::SubagentTextDelta { id, item_id, .. } => {
+                let source=format!("c:{id}");
+                if self.remove_file_item(&source,item_id)? { self.file_revision=self.file_revision.saturating_add(1); }
+                if self.db.execute("DELETE FROM changes_sources WHERE source=?1 AND item_id=?2",params![source,item_id]).map_err(|e|e.to_string())? > 0 {self.changes_revision=self.changes_revision.wrapping_add(1);}
             }
             _ => {}
         }
@@ -395,6 +410,8 @@ impl Store {
         Ok(())
     }
     pub(super) fn files_reset(&mut self) -> Result<(), String> {
+        self.db.execute("DELETE FROM changes_sources", []).map_err(|e|e.to_string())?;
+        self.changes_revision = self.changes_revision.wrapping_add(1);
         self.db
             .execute("DELETE FROM file_edits", [])
             .map_err(|e| e.to_string())?;
