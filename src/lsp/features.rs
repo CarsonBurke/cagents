@@ -371,6 +371,16 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn informational_notice_flood_does_not_replace_staged_error(){
+        let mut pending=PendingInner::default();let doc=LspDocumentId(1);
+        pending.stage(LspEvent::ServerMessage{doc,level:LspMessageLevel::Error,message:"workspace failed".into()});
+        for i in 0..1024 {pending.stage(LspEvent::ServerMessage{doc,level:LspMessageLevel::Info,message:i.to_string()});}
+        assert_eq!(pending.replaceable.len(),2);
+        assert!(matches!(pending.take(false),Some(LspEvent::ServerMessage{level:LspMessageLevel::Error,..})));
+        assert!(matches!(pending.take(false),Some(LspEvent::ServerMessage{level:LspMessageLevel::Info,message,..}) if message=="1023"));
+    }
+
+    #[test]
     fn workspace_annotations_require_confirmation_and_bad_ranges_refuse_the_whole_batch(){
         let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
         store.register(LspDocumentId(1),&uri,&key,4,Arc::from("a𝄞b"));
