@@ -25,6 +25,8 @@ use crate::{
 };
 
 mod agent_locations;
+mod session_locations;
+pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
 pub(crate) use agent_locations::Location as AgentLocation;
 mod automation_proposals;
 mod automations;
@@ -37,7 +39,7 @@ mod relocation;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 13;
+const SCHEMA_VERSION: u32 = 14;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -198,6 +200,7 @@ impl Registry {
             views: views::all(&self.db)?,
             agents: self.agents(None)?,
             agent_locations: agent_locations::all(&self.db)?,
+            session_location_refusals: session_locations::refusals(&self.db)?,
             identity,
             sequence: sequence as u64,
             projects,
@@ -212,7 +215,20 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
+        self.apply_with_session_moves(edit, &[])
+    }
+
+    pub(crate) fn apply_with_session_moves(&mut self, edit: &ModelEdit, moves: &[SessionMove]) -> Result<Applied, String> {
+        if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
+            return Err("Session directory proofs may only accompany their project relocation".into());
+        }
+        if let ModelEdit::RelocateProject { relocation } = edit
+            && moves.iter().any(|movement| movement.repository != relocation.destination)
+        {
+            return Err("Session proofs do not belong to the requested destination project".into());
+        }
         let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        session_locations::pin_owned_agents(&transaction, moves)?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
@@ -393,6 +409,7 @@ impl Registry {
             }
         };
         if changed {
+            session_locations::apply(&transaction, moves)?;
             transaction
                 .execute(
                     "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
@@ -630,6 +647,9 @@ fn migrate(db: &Connection) -> Result<(), String> {
     }
     if version < 13 {
         agent_locations::migrate(db)?;
+    }
+    if version < 14 {
+        session_locations::migrate(db)?;
     }
     Ok(())
 }

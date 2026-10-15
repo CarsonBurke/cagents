@@ -167,6 +167,15 @@ pub struct AgentLocation {
     pub blocked_directory: Option<PathBuf>,
 }
 
+/// Actionable location failures only. Private launch/process/directory proof
+/// records remain in the daemon and never cross the presentation boundary.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionLocationRefusal {
+    pub session: crate::model::TerminalId,
+    pub directory: PathBuf,
+    pub reason: String,
+}
+
 impl AgentLocation {
     /// Logical placement can be restored even when process authority refuses
     /// to move to a replacement inode. This path grants no execution authority.
@@ -206,6 +215,8 @@ pub struct WorkspaceModel {
     pub agents: Vec<crate::agent_execution::Agent>,
     #[serde(default)]
     pub agent_locations: Vec<AgentLocation>,
+    #[serde(default)]
+    pub session_location_refusals: Vec<SessionLocationRefusal>,
 }
 
 impl WorkspaceModel {

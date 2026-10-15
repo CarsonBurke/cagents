@@ -9,6 +9,7 @@ mod lock;
 mod model;
 mod notifications;
 mod service;
+mod session_locations;
 mod state;
 
 use std::{
