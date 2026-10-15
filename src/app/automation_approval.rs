@@ -329,7 +329,9 @@ impl Cagents {
         revision: u64,
         generation: u64,
     ) -> bool {
-        self.automation_approval.generation == generation
+        !self.update_prepared
+            && self.top_modal() == Some(modal_ui::Modal::Approval)
+            && self.automation_approval.generation == generation
             && self
                 .automation_approval
                 .proposal
@@ -345,16 +347,16 @@ impl Cagents {
             return Task::none();
         }
         state.error = None;
-        if let Some(restore) = state.restore_keyboard_nav.take() {
+        let restore = state.restore_keyboard_nav.take();
+        if !self.modal_is_open() && let Some(restore) = restore {
             self.core.set_keyboard_nav(restore);
         }
-        iced::widget::operation::focus(
+        self.modal_restore_focus(
             self.workspace
                 .focused()
                 .map(|card| self.card_keyboard_focus(card))
                 .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
         )
-        .map(cosmic::Action::App)
     }
 
     pub(super) fn automation_approval_open(&self) -> bool {
@@ -723,7 +725,8 @@ impl Cagents {
                         state.proposal = None;
                         state.available = None;
                         state.pending.retain(|pending| pending.id != receipt.id);
-                        if let Some(restore) = state.restore_keyboard_nav.take() {
+                        let restore = state.restore_keyboard_nav.take();
+                        if !self.modal_is_open() && let Some(restore) = restore {
                             self.core.set_keyboard_nav(restore);
                         }
                         self.modal_restore_focus(
@@ -1640,4 +1643,68 @@ mod tests {
         })));
         assert!(app.automation_approval.deciding);
     }
+    #[test]
+    fn hidden_approval_decisions_are_blocked_but_model_retirement_preserves_upper_focus() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        app.automation_approval.proposal = Some(proposal.clone());
+        app.automation_approval.available = Some(proposal.clone());
+        app.automation_approval.pending = vec![ProposalSummary::from(&proposal)];
+        app.automation_approval.generation = 17;
+        app.automation_approval.restore_keyboard_nav = Some(true);
+        app.core.set_keyboard_nav(false);
+        drop(app.finish_modal_update(Task::none()));
+        let dismiss = app.automation_approval_dismiss_action().unwrap();
+        app.settings_reset_confirm = true;
+        drop(app.finish_modal_update(Task::none()));
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
+        drop(app.update_automation_approval(dismiss));
+        drop(app.update_automation_approval(Action::Decide {
+            id: proposal.id, revision: proposal.revision, generation: 17, approved: true,
+        }));
+        assert!(app.automation_approval_open());
+        assert!(!app.automation_approval.deciding);
+        let focused = widget::Id::new("dialog.reset-settings.confirm");
+        let focus = app.modal_focus(focused.clone());
+        drop(app.update_automation_approval(Action::Updated(Vec::new())));
+        assert!(app.automation_approval_open());
+        let mut receipt = proposal.clone();
+        receipt.state = ProposalState::Declined;
+        let retired = app.update_automation_approval(Action::ReviewRefreshed {
+            generation: 17, pushed: app.automation_approval.pushed, result: Arc::new(Ok(receipt)),
+        });
+        assert!(!app.automation_approval_open());
+        assert!(!app.core.keyboard_nav(), "hidden retirement cannot change the upper modal's keyboard mode");
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), focus.chain(retired)), Some(focused));
+        drop(app.finish_modal_update(Task::none()));
+        assert_eq!(app.top_modal(), Some(modal_ui::Modal::SettingsReset));
+    }
+
+    #[test]
+    fn prepared_update_blocks_approval_decisions_but_keeps_lifecycle_retirement() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        app.automation_approval.proposal = Some(proposal.clone());
+        app.automation_approval.available = Some(proposal.clone());
+        app.automation_approval.pending = vec![ProposalSummary::from(&proposal)];
+        app.automation_approval.generation = 17;
+        app.update_prepared = true;
+        drop(app.cancel_automation_approval());
+        drop(app.update_automation_approval(Action::Decide {
+            id: proposal.id, revision: proposal.revision, generation: 17, approved: true,
+        }));
+        assert!(app.automation_approval_open());
+        assert!(!app.automation_approval.deciding);
+        drop(app.update_automation_approval(Action::Updated(Vec::new())));
+        assert!(app.automation_approval_open());
+        let mut receipt = proposal.clone();
+        receipt.state = ProposalState::Declined;
+        drop(app.update_automation_approval(Action::ReviewRefreshed {
+            generation: 17, pushed: app.automation_approval.pushed, result: Arc::new(Ok(receipt)),
+        }));
+        assert!(!app.automation_approval_open());
+    }
+
+
+
 }

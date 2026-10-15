@@ -290,6 +290,7 @@ impl Stack {
 impl Cagents {
     fn modal_instance(&self, modal: Modal) -> Option<Instance> {
         match modal {
+            Modal::Approval => self.approval_dialog_generation().map(Instance::Counter),
             Modal::Discard => self
                 .sidebar_state
                 .pending_discard()
