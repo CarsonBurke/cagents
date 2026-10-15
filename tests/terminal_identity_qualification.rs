@@ -141,7 +141,7 @@ fn qualify(cli_variable: &str, old_variable: &str, new_variable: &str, old_appli
         "old_cli":binary(&cli), "old_daemon":binary(&old), "new_daemon":binary(&new)})).unwrap()).unwrap();
     let script = fixture.root.join("terminal.py");
     fs::write(&script, r#"import json, os, signal, subprocess, sys
-child = subprocess.Popen(['/bin/sleep', '600'])
+child = subprocess.Popen(['/bin/sleep', '600'], start_new_session=True)
 root = os.getpid()
 def start(pid):
     return int(open('/proc/%d/stat' % pid).read().rsplit(')',1)[1].split()[19])
@@ -149,7 +149,7 @@ def draw(*unused):
     print('\033[2J\033[Horiginal-private-pty', flush=True)
 signal.signal(signal.SIGWINCH, draw)
 with open(sys.argv[1], 'x') as stream:
-    json.dump({'root':root,'root_start':start(root),'child':child.pid,'child_start':start(child.pid),'tty':os.readlink('/proc/self/fd/0'),'account':os.environ['ACCOUNT_HOME']}, stream)
+    json.dump({'root':root,'root_start':start(root),'child':child.pid,'child_start':start(child.pid),'root_pgid':os.getpgid(root),'child_pgid':os.getpgid(child.pid),'tty':os.readlink('/proc/self/fd/0'),'account':os.environ['ACCOUNT_HOME']}, stream)
 draw()
 for line in sys.stdin:
     draw()
@@ -178,6 +178,7 @@ for line in sys.stdin:
     assert_eq!(record["application"], old_application, "supplied old product must really have the source identity");
     assert_eq!(record["root"]["pid"], identity["root"]);
     assert_eq!(record["root"]["start"], identity["root_start"]);
+    assert_ne!(identity["root_pgid"], identity["child_pgid"], "fixture background child must escape the root process group");
     for (pid, start) in [("root", "root_start"), ("child", "child_start")] {
         fixture.owned.push(OwnedProcess::capture(identity[pid].as_i64().unwrap() as i32, identity[start].as_u64().unwrap()));
     }
@@ -221,6 +222,8 @@ for line in sys.stdin:
     forged.launch.environment.insert("ACCOUNT_HOME".into(), "/unissued/account".into());
     assert!(client.reconcile_terminal(forged).is_err());
     assert!(fixture.owned.iter().all(OwnedProcess::current));
+    assert_eq!(unsafe { libc::getpgid(identity["root"].as_i64().unwrap() as i32) }, identity["root_pgid"].as_i64().unwrap() as i32);
+    assert_eq!(unsafe { libc::getpgid(identity["child"].as_i64().unwrap() as i32) }, identity["child_pgid"].as_i64().unwrap() as i32);
     assert_eq!(fs::read_link(format!("/proc/{}/fd/0", identity["root"].as_i64().unwrap())).unwrap(), PathBuf::from(identity["tty"].as_str().unwrap()));
     let environment = fs::read(format!("/proc/{}/environ", identity["root"].as_i64().unwrap())).unwrap();
     let account_entry = format!("ACCOUNT_HOME={}", fixture.root.join("account").display());
