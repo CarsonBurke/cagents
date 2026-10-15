@@ -4914,7 +4914,7 @@ mod tests {
             state.id = card;
             state.kind = CardKind::Chat(runtime.session.clone());
             Arc::make_mut(&mut app.durable).cards.push(state);
-            app.cards.insert(card, CardRuntime::Chat(runtime));
+            app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
             app.observe_agent_activity_for_card(
                 card,
                 Some(crate::agent::Activity {
@@ -4955,7 +4955,7 @@ mod tests {
         state.id = card;
         state.kind = CardKind::Chat(runtime.session.clone());
         Arc::make_mut(&mut app.durable).cards.push(state);
-        app.cards.insert(card, CardRuntime::Chat(runtime));
+        app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
         handle.observe_outcome_for_test(
             crate::agent::ActivityState::Unknown,
             Some(crate::agent::ActivityOutcome::Succeeded),

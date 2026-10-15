@@ -528,6 +528,11 @@ pub fn channel_worktree<'a>(
 }
 
 impl SidebarChannel {
+    #[cfg(test)]
+    pub(crate) fn tooltip_for_test(&self) -> &str {
+        &self.tooltip
+    }
+
     pub fn set_attribution(
         &mut self,
         worktree: Option<(WorktreeId, String)>,
