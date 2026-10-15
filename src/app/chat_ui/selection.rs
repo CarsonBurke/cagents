@@ -1518,6 +1518,7 @@ mod tests {
             rows[0].cells[1] = vec![markdown::Item::CodeBlock {
                 language: None,
                 code: content.into(),
+                source: Arc::from(content),
                 reader_source: super::reader_source::Source::new(content),
                 lines: Vec::new(),
             }];
@@ -1542,6 +1543,7 @@ mod tests {
                 .map(|code| markdown::Item::CodeBlock {
                     language: None,
                     code: code.into(),
+                    source: Arc::from(code),
                     reader_source: super::reader_source::Source::new(code),
                     lines: Vec::new(),
                 })

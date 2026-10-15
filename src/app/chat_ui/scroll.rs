@@ -1898,6 +1898,7 @@ mod tests {
                 start: 0,
                 paint: None,
             }),
+            None, None,
         );
         let mut cases = vec![(text, identity, byte)];
         let list = format!(

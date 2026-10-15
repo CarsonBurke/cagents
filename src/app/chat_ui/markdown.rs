@@ -91,11 +91,12 @@ impl Content {
         if !markdown.contains(['\r', '\0'])
             && let Some(mut fence) = self.open_fence.take()
             && !fence.advance(markdown)
-            && let Some(Item::CodeBlock { code, reader_source, .. }) = self.items.last_mut()
+            && let Some(Item::CodeBlock { code, reader_source, source, .. }) = self.items.last_mut()
         {
             self.state.leftover.push_str(markdown);
             reader_source.append(code, markdown);
             code.push_str(markdown);
+            *source = Arc::from(code.as_str());
             self.open_fence = Some(fence);
             return;
         }
@@ -258,6 +259,8 @@ pub enum Item {
         language: Option<String>,
         /// The raw code of the code block.
         code: String,
+        /// Immutable display input prepared once with this parser revision.
+        source: Arc<str>,
         /// The styled lines of text in the code block.
         lines: Vec<Text>,
         /// Stable source digest and bounded append proof for nested reader geometry.
@@ -855,6 +858,7 @@ fn parse_with<'a>(
                     &mut stack,
                     Item::CodeBlock {
                         language: code_language.take(),
+                        source: Arc::from(code.as_str()),
                         reader_source: super::reader_source::Source::new(&code),
                         code: mem::take(&mut code),
                         lines: code_lines.drain(..).collect(),
