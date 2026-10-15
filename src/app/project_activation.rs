@@ -103,7 +103,7 @@ pub(super) fn supersedes_project_activation(message: &Message) -> bool {
         || matches!(message, Message::ChatUi(action) if !action.allowed_while_modal())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 

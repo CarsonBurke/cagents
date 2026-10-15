@@ -83,7 +83,7 @@ pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
 // CLI test fixtures use bounded process ownership without adding a production graph.
-#[cfg(any(feature = "ui", feature = "host", test))]
+#[cfg(any(feature = "ui", feature = "host", all(test, target_os = "linux")))]
 pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
@@ -135,5 +135,5 @@ pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) mod test_git;

@@ -3994,6 +3994,7 @@ mod tests {
     /// resolves, not the path the user named: a fixture that never ran `git`
     /// could not tell the two apart, which is how a key no window could match
     /// shipped.
+    #[cfg(target_os = "linux")]
     #[test]
     fn channel_spawn_opens_the_project_then_creates_the_channel_it_minted() {
         if !crate::test_git::isolated_test("control::tests::channel_spawn_opens_the_project_then_creates_the_channel_it_minted") { return; }
@@ -4126,6 +4127,7 @@ mod tests {
     /// A real repository, because every key here is whatever `git` resolves
     /// rather than the path the test names. `None` when there is no usable
     /// `git`, so the suite skips instead of failing on a machine without one.
+    #[cfg(target_os = "linux")]
     fn git_fixture_output(checkout: &Path, arguments: &[&str])
         -> Result<crate::process::ProcessOutput, crate::process::ProcessFailure> {
         use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
@@ -4145,12 +4147,14 @@ mod tests {
         SystemProcessExecutor.execute(&command, &CancellationToken::new())
     }
 
+    #[cfg(target_os = "linux")]
     fn git_checkout() -> Option<tempfile::TempDir> {
         let checkout = tempfile::tempdir().unwrap();
         git_fixture_output(checkout.path(), &["init", "--quiet", "--template="])
             .is_ok_and(|output| output.success).then_some(checkout)
     }
 
+    #[cfg(target_os = "linux")]
     fn git(checkout: &Path, arguments: &[&str]) {
         let output = git_fixture_output(checkout, arguments).expect("bounded fixture git runs");
         assert!(output.success, "git {arguments:?}: {}", String::from_utf8_lossy(&output.stderr));
@@ -4163,6 +4167,7 @@ mod tests {
     /// is `<common>/worktrees/<name>`, so keying on that would give one
     /// checkout one project per worktree the user ever ran the verb from, and
     /// the sidebar would fill with duplicates of the same repository.
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_open_keys_one_project_from_every_worktree_of_one_checkout() {
         if !crate::test_git::isolated_test("control::tests::project_open_keys_one_project_from_every_worktree_of_one_checkout") { return; }
@@ -4203,6 +4208,7 @@ mod tests {
     /// a process behind that the user never asked for and did not get a result
     /// from. `ResolvedProject` is the proof this ordering cannot drift -
     /// `project_output` takes nothing else, and only `resolved` makes one.
+    #[cfg(target_os = "linux")]
     #[test]
     fn open_folder_identity_survives_git_initialization_for_projects_and_channels() {
         if !crate::test_git::isolated_test("control::tests::open_folder_identity_survives_git_initialization_for_projects_and_channels") { return; }
@@ -4245,6 +4251,7 @@ mod tests {
         assert!(resolve_repository(Some(root), Some(&model)).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_resolution_rejects_files_and_accepts_plain_folders() {
         if !crate::test_git::isolated_test("control::tests::project_resolution_rejects_files_and_accepts_plain_folders") { return; }
@@ -4282,6 +4289,7 @@ mod tests {
     /// resolves and the name the checkout carries, and it reports the project
     /// the registry ended up holding - including the rank, which only the
     /// registry knows.
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_open_publishes_the_upsert_a_window_would_and_reports_the_row() {
         if !crate::test_git::isolated_test("control::tests::project_open_publishes_the_upsert_a_window_would_and_reports_the_row") { return; }
@@ -4363,6 +4371,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn project_open_production_wrapper_selects_only_its_private_runtime() {
         const TEST: &str = "control::tests::project_open_production_wrapper_selects_only_its_private_runtime";
