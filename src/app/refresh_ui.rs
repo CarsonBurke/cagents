@@ -426,14 +426,17 @@ mod tests {
 
     #[tokio::test]
     async fn document_tick_repairs_a_branch_comparison_without_a_native_watcher_event() {
+        if !crate::git_watch::tests::fixture_isolated("app::refresh_ui::tests::document_tick_repairs_a_branch_comparison_without_a_native_watcher_event") { return; }
         use crate::repository::{DiffBasis, Oid, RepoPath, ValidatedRefName};
         let root = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            let output = std::process::Command::new("git").current_dir(root.path()).args(args).output().unwrap();
-            assert!(output.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&output.stderr));
+            let command = crate::repository::CommandSpec::new("git").cwd(root.path())
+                .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null"]).args(args.iter().copied());
+            let output = crate::git_watch::tests::run_fixture_command(
+                crate::git_watch::tests::isolated_fixture_command(command));
             String::from_utf8(output.stdout).unwrap().trim().to_owned()
         };
-        git(&["init", "-b", "main"]);
+        git(&["init", "--template=", "-b", "main"]);
         git(&["config", "user.name", "Test"]);
         git(&["config", "user.email", "test@example.invalid"]);
         git(&["config", "commit.gpgsign", "false"]);
