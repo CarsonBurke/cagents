@@ -103,12 +103,10 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
             if record.handle.owns_work() && consent.is_none() && !(restart && record.handle.is_completed()) {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
-            let ServerResponse::ChatAttached {
-                session: observed, ..
-            } = session_snapshot(record)
-            else {
-                unreachable!()
-            };
+            // Admission needs only resident identity metadata. A Local
+            // attachment snapshot may lock/hydrate Store/files and must not
+            // run while the global HostState census is locked.
+            let observed = session_descriptor(record);
             // A fresh managed console publishes its pair to the authenticated
             // helper and hosted record while Agent.session keeps the exact
             // earlier no-pair source. require_current above authenticated that

@@ -2,6 +2,137 @@
 // peer is a private real app-server process; no Actor.child is injected. The
 // ended-pane seed models a legacy database without historical generation proof.
 
+
+// Own the exact subprocess through a fixed deadline. A failed/hung child never
+// turns exit0/zero selected tests into owning-contract evidence, and its private
+// runtime/receipts remain available for diagnosis instead of TempDir deletion.
+struct OwningCloseDirectory(Option<tempfile::TempDir>);
+impl Drop for OwningCloseDirectory {
+    fn drop(&mut self) {
+        if let Some(directory) = self.0.take() {
+            eprintln!("owning close fixture evidence retained at {}", directory.keep().display());
+        }
+    }
+}
+
+struct OwningCloseChild {
+    child: Option<std::process::Child>,
+    pidfd: Option<std::fs::File>,
+    reservation: Option<crate::daemon::child_reaper::Reservation>,
+}
+impl OwningCloseChild {
+    fn status(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.as_mut().expect("original fixture child").try_wait()?;
+        if status.is_some() {
+            self.child.take();
+            self.pidfd.take();
+            self.reservation.take();
+        }
+        Ok(status)
+    }
+}
+impl Drop for OwningCloseChild {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        let Some(mut child) = self.child.take() else { return; };
+        let reservation = self.reservation.take().expect("spawn-time original-child credit");
+        reservation.quarantine();
+        if let Some(pidfd) = &self.pidfd {
+            // SAFETY: this is the retained pidfd captured for our still-owned
+            // original Child. No numeric PID lookup/reopening authorizes it.
+            unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL, std::ptr::null::<libc::siginfo_t>(), 0); }
+        } else {
+            // The sole unreaped Child still owns this PID if capture failed.
+            let _ = child.kill();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if matches!(child.try_wait(), Ok(Some(_))) { return; }
+            if Instant::now() >= deadline { break; }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        match self.pidfd.take() {
+            Some(pidfd) => if let Err((error, child, pidfd, reservation)) = reservation.retain(child, pidfd) {
+                reservation.preserve_suspended(child, Some(pidfd), &format!("owning close fixture: {error}"));
+            },
+            None => reservation.preserve_suspended(child, None, "owning close fixture pidfd capture failed"),
+        }
+    }
+}
+
+fn owning_close_isolated(name: &str) -> Option<tempfile::TempDir> {
+    use std::{os::{fd::FromRawFd, unix::{fs::OpenOptionsExt, process::CommandExt}}, process::Stdio};
+    const CHILD: &str = "CAGENTS_EXECUTION_SERVICE_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(name) { return None; }
+    let mut directory = OwningCloseDirectory(Some(tempfile::Builder::new().prefix("cagents-owning-close-").tempdir().unwrap()));
+    let root = directory.0.as_ref().unwrap().path();
+    for name in ["bin", "home/.claude", "home/.codex", "data", "config", "cache", "tmp", "run", "project"] {
+        std::fs::create_dir_all(root.join(name)).unwrap();
+    }
+    install_claude(&root.join("bin/claude"));
+    let open_log = |name| std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(root.join(name)).unwrap();
+    let stdout = open_log("child.stdout.log");
+    let stderr = open_log("child.stderr.log");
+    let exact = format!("host::agent_execution::tests::{name}");
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command.args(["--exact", &exact, "--nocapture", "--test-threads=1"])
+        .env_clear().env(CHILD, name).env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("HOME", root.join("home")).env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config")).env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TMPDIR", root.join("tmp")).env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("PATH", format!("{}:/usr/bin:/bin", root.join("bin").display()))
+        .stdin(Stdio::null()).stdout(Stdio::from(stdout)).stderr(Stdio::from(stderr));
+    if name == "combined_close_retained_actor_and_real_pair_keep_receipts_across_late_conflict" {
+        command.env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1");
+    }
+    // SAFETY: only async-signal-safe setrlimit calls run between fork and exec;
+    // no allocation, mutex, or parent-side mutation is performed here.
+    unsafe { command.pre_exec(|| {
+        let file = libc::rlimit {rlim_cur: 4 * 1024 * 1024, rlim_max: 4 * 1024 * 1024};
+        let core = libc::rlimit {rlim_cur: 0, rlim_max: 0};
+        if libc::setrlimit(libc::RLIMIT_FSIZE, &file) != 0 || libc::setrlimit(libc::RLIMIT_CORE, &core) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }); }
+    let reservation = crate::daemon::child_reaper::reserve().unwrap();
+    let child = command.spawn().unwrap();
+    let pid = child.id();
+    let mut original = OwningCloseChild {child: Some(child), pidfd: None, reservation: Some(reservation)};
+    // SAFETY: capture occurs while this original Child is exclusively retained
+    // and unreaped. No successor numeric PID can replace that kernel identity.
+    let descriptor = unsafe {libc::syscall(libc::SYS_pidfd_open, pid, 0)};
+    assert!(descriptor >= 0, "cannot capture original fixture pidfd");
+    // SAFETY: successful pidfd_open returned a new owned descriptor.
+    original.pidfd = Some(unsafe {std::fs::File::from_raw_fd(descriptor as i32)});
+    let startup = serde_json::json!({"schema":"owning-close-test-child-v1", "test":exact,
+        "pid":pid, "authority":"retained_original_child_and_pidfd", "deadline_seconds":90,
+        "stdout_limit_bytes":4*1024*1024, "stderr_limit_bytes":4*1024*1024});
+    std::fs::write(root.join("child-startup.json"), serde_json::to_vec_pretty(&startup).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = original.status().unwrap() { break status; }
+        assert!(Instant::now() < deadline, "owning test deadline exceeded: {exact}");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let out = std::fs::read(root.join("child.stdout.log")).unwrap();
+    let err = std::fs::read(root.join("child.stderr.log")).unwrap();
+    assert!(out.len() <= 4*1024*1024 && err.len() <= 4*1024*1024);
+    let text = String::from_utf8_lossy(&out);
+    let named = text.lines().filter(|line| line.trim() == format!("test {exact} ... ok")).count();
+    let summaries = text.lines().filter(|line| line.starts_with("test result:")).collect::<Vec<_>>();
+    let one = text.lines().filter(|line| *line == "running 1 test").count() == 1
+        && named == 1 && summaries.len() == 1
+        && summaries[0].starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;");
+    let result = serde_json::json!({"schema":"owning-close-test-result-v1", "test":exact,
+        "exit_code":status.code(), "exact_named_one_passed":one, "original_child_reaped":true,
+        "native_or_full_cohort_retirement_claimed":false});
+    std::fs::write(root.join("child-result.json"), serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+    assert!(status.success() && one, "owning test did not execute exactly one passing named contract: {exact}; inspect private retained child.stdout.log/child.stderr.log");
+    Some(directory.0.take().unwrap())
+}
+
 struct LocalCodexPresentationFixture {
     host: SharedHost,
     path: std::path::PathBuf,
@@ -148,7 +279,7 @@ impl Drop for LocalCodexPresentationFixture {
 
 #[test]
 fn combined_close_local_codex_without_actor_child_uses_real_server_and_fresh_pair_alias() {
-    if isolated("combined_close_local_codex_without_actor_child_uses_real_server_and_fresh_pair_alias").is_some() { return; }
+    if owning_close_isolated("combined_close_local_codex_without_actor_child_uses_real_server_and_fresh_pair_alias").is_some() { return; }
     let fixture = LocalCodexPresentationFixture::start();
     let store = registry(&fixture.host).unwrap();
     let before = store.lock().unwrap().model().unwrap();
@@ -183,7 +314,7 @@ fn combined_close_local_codex_without_actor_child_uses_real_server_and_fresh_pai
 
 #[test]
 fn combined_close_local_codex_failure_keeps_exact_holder_then_retries_without_respawn() {
-    if isolated("combined_close_local_codex_failure_keeps_exact_holder_then_retries_without_respawn").is_some() { return; }
+    if owning_close_isolated("combined_close_local_codex_failure_keeps_exact_holder_then_retries_without_respawn").is_some() { return; }
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::io::Write;
     let fixture = LocalCodexPresentationFixture::start();
@@ -239,7 +370,7 @@ fn combined_close_local_codex_failure_keeps_exact_holder_then_retries_without_re
 // not claimed as Codex decoder or native UI qualification.
 #[test]
 fn combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation() {
-    if isolated("combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation").is_some() { return; }
+    if owning_close_isolated("combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation").is_some() { return; }
     use crate::daemon::holder_registry::{self as holders, Kind};
     use chat::protocol::{ExecutionContext, ProcessSpec, TransportSpec};
     let (host, mut request, path) = fixture();
@@ -373,4 +504,52 @@ fn combined_close_server_cold_retry_uses_saved_owner_after_lease_rotation() {
     assert_eq!(std::fs::read(&receipt_path).unwrap(), receipt_bytes, "fresh lease must never rewrite the original saved proof");
     assert_eq!(close(&next, &Authority::default(), agent.id).unwrap(), closed);
     drop(detached); // No provider call; already-proved cleanup was consumed.
+}
+
+
+#[test]
+fn combined_close_local_admission_avoids_held_presentation_store_and_host_census() {
+    if owning_close_isolated("combined_close_local_admission_avoids_held_presentation_store_and_host_census").is_some() { return; }
+    let fixture = LocalCodexPresentationFixture::start();
+    let target = fixture.inspect();
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release_store, released) = std::sync::mpsc::channel();
+    let handle = fixture.handle.clone();
+    let owner = std::thread::spawn(move || handle.with_presentation_store_locked(|| {
+        held.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(10)).unwrap();
+    }));
+    holding.recv_timeout(Duration::from_secs(1)).unwrap();
+    let (admitted, admission) = std::sync::mpsc::channel();
+    let (release_close, released_close) = std::sync::mpsc::channel();
+    crate::host::chat::before_presentation_provider_close(move || {
+        admitted.send(()).unwrap();
+        released_close.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let host = fixture.host.clone();
+    let close = std::thread::spawn(move || process(&host, Authority::default(),
+        Operation::ConfirmPresentationClose {observed: target}));
+    // The destructive-call gate is after identity admission and outside
+    // HostState. It must be reachable while actual Store is still held.
+    let admitted = admission.recv_timeout(Duration::from_secs(2));
+    let (census_done, census) = std::sync::mpsc::channel();
+    let host = fixture.host.clone();
+    let census_owner = std::thread::spawn(move || {
+        census_done.send(host.lock().unwrap().chats.len()).unwrap();
+    });
+    let responsive = census.recv_timeout(Duration::from_millis(500));
+    // Always release both bounded latches before joins/assertions. Even a
+    // regression keeps the original test child under the parent deadline.
+    release_store.send(()).unwrap();
+    let _ = release_close.send(());
+    owner.join().unwrap();
+    census_owner.join().unwrap();
+    let outcome = close.join().unwrap();
+    assert!(admitted.is_ok(), "close admission hydrated/locked presentation Store under HostState");
+    assert!(responsive.is_ok(), "unrelated host census waited on presentation Store");
+    let Reply::Closed(closed) = outcome.unwrap() else {panic!("not closed")};
+    assert!(closed.closed);
+    let store = registry(&fixture.host).unwrap();
+    assert_eq!(store.lock().unwrap().agent_run(fixture.run.id).unwrap(), fixture.run);
+    assert!(store.lock().unwrap().inspect_presentation_repair(&Origin::User, fixture.agent.id).unwrap().is_none());
 }

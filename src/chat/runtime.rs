@@ -198,6 +198,12 @@ impl Drop for OwnedSocket {
 }
 
 impl LocalHandle {
+    #[cfg(test)]
+    pub(crate) fn with_presentation_store_locked(&self, action: impl FnOnce()) {
+        let _store = self.0.store.lock().unwrap();
+        action();
+    }
+
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
         self.0.native_holder_record.as_ref()
     }
