@@ -5777,8 +5777,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if !paths.iter().any(|path| conflicted.contains(path)) {
             return Ok(None);
         }
-        let root = fs_safety::Root::open(&request.worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let root = self.captured_worktree_root(&request.worktree)?;
         let version = |metadata: &fs::Metadata| {
             (
                 metadata.dev(),
@@ -6265,14 +6264,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let command = self.git_read(worktree, arguments);
         let output = self.run_checked(&command, cancellation)?;
-        Ok(output
-            .stdout
-            .split(|byte| *byte == b'\n')
-            .filter(|line| !line.is_empty())
-            .map(bytes_to_path)
-            // `--git-path` answers relative to the working directory it ran
-            // in, which is the worktree.
-            .any(|path| worktree.join(path).exists()))
+        for path in output.stdout.split(|byte| *byte == b'\n').filter(|line| !line.is_empty()).map(bytes_to_path) {
+            // `--git-path` is relative to Git's scoped working directory.
+            if self.captured_worktree_path(&worktree.join(path))?.exists() { return Ok(true); }
+        }
+        Ok(false)
     }
 
     /// Commits the index, reconciling the outcome against HEAD.
@@ -12934,7 +12930,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         Ok(
-            fs::canonicalize(parse_path_line(&output.stdout, "common_dir")?)
+            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "common_dir")?)?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?,
         )
     }
@@ -12954,7 +12950,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             cancellation,
         )?;
         Ok(
-            fs::canonicalize(parse_path_line(&output.stdout, "git_dir")?)
+            fs::canonicalize(self.captured_worktree_path(&parse_path_line(&output.stdout, "git_dir")?)?)
                 .map_err(|e| ValidationError::Io(e.to_string()))?,
         )
     }

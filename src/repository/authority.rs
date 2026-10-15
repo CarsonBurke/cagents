@@ -59,7 +59,7 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
         let mut anchored = false;
         let mut index = 0;
         while index < scoped.arguments.len() {
-            let argument = scoped.arguments[index].to_string_lossy();
+            let argument = scoped.arguments[index].to_string_lossy().into_owned();
             if argument == "--" || !argument.starts_with('-') { break; }
             match argument.as_ref() {
                 "-C" => {
