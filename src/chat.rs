@@ -20,6 +20,8 @@ pub mod client;
 pub(crate) mod native_holder;
 #[cfg(feature = "host")]
 pub mod protocol;
+mod configured_start;
+pub use configured_start::ConfiguredChatStart;
 #[cfg(feature = "host")]
 pub mod runtime;
 #[cfg(any(feature = "ui", feature = "host"))]

@@ -472,6 +472,10 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Start a new draft using this daemon's saved provider execution policy.
+    ChatStartConfigured {
+        start: crate::chat::ConfiguredChatStart,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

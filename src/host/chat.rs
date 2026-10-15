@@ -4,6 +4,7 @@ mod account_isolation_tests;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
+mod configured_start;
 #[cfg(test)]
 mod startup_tests;
 use crate::{
@@ -705,6 +706,7 @@ fn start(
         execution_environment,
         None,
         None,
+        false,
     )
 }
 
@@ -724,6 +726,7 @@ pub(super) fn start_execution(
         Default::default(),
         Some(context),
         None,
+        false,
     )
 }
 
@@ -751,6 +754,7 @@ fn start_with_execution(
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
+    fresh_only: bool,
 ) -> Result<ServerResponse, ProtocolError> {
     // A managed CLI is a second view of the thread that this daemon owns.
     // Reattach that proven pair before trying to infer anything from argv or
@@ -803,6 +807,9 @@ fn start_with_execution(
         chat::NativeContinuity::Durable { .. }
     ) || has_native_owner(&session)?
     {
+        if fresh_only {
+            return Err(error("This conversation identifier has a native owner; explicitly recover it"));
+        }
         return native_recovery::restore(host, client, &session).map_err(unavailable);
     }
     let reservation_id = session.id;
@@ -1048,6 +1055,9 @@ fn start_with_execution(
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
             return Err(unavailable("Daemon is shutting down"));
+        }
+        if fresh_only {
+            configured_start::require_fresh_in(&state, session.id)?;
         }
         if state.chat_handoffs.contains_key(&session.id) {
             return Err(error(
@@ -1963,6 +1973,9 @@ fn process_inner(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     match request {
+        ClientRequest::ChatStartConfigured { start: intent } => {
+            configured_start::start(host, client, intent)
+        }
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
                 .lock()
@@ -2864,6 +2877,7 @@ pub(super) fn restore_upgrade(
         Default::default(),
         None,
         restart_launch,
+        false,
     )
     .map_err(|error| error.message)?;
     let id = match response {
