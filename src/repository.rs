@@ -3952,6 +3952,21 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    /// Worker-only retry of an existing opaque recovery capability. No Git
+    /// command or diagnostic pathname is reconstructed. UI callers must retain
+    /// the capability with its original actor/document until resolution.
+    pub fn resolve_recovery(
+        &self, authority: &crate::recovery_authority::RecoveryAuthority,
+        cancellation: &CancellationToken,
+    ) -> Result<(), RepositoryError> {
+        if cancellation.is_cancelled() {
+            return Err(ValidationError::Io("Recovery was cancelled before retry".into()).into());
+        }
+        authority.retry().map_err(|message| RepositoryError::Recovery {
+            message, authority: authority.clone(),
+        })
+    }
+
     /// The queries every repository load starts from, in the order
     /// [`Self::discover`] consumes them.
     ///
