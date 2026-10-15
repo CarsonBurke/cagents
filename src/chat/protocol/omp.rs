@@ -2583,6 +2583,138 @@ mod tests {
     }
 
     #[test]
+    fn compaction_completion_requires_its_own_boundary_or_post_ack_idle_probe() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("same".into()),
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
+        assert!(
+            requested
+                .events
+                .contains(&Event::Compaction { active: true })
+        );
+        let old = adapter.request("get_state");
+        let unrelated=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            !unrelated
+                .events
+                .contains(&Event::Compaction { active: false }),
+            "an idle query issued before the compact acknowledgement cannot finish maintenance"
+        );
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        assert!(
+            !acknowledged
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        let probe = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let completed=adapter.receive(json!({"type":"response","id":probe["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(
+            !completed
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+        let started = adapter
+            .receive(json!({"type":"auto_compaction_start"}))
+            .unwrap();
+        assert!(started.events.contains(&Event::Compaction { active: true }));
+        let ended = adapter
+            .receive(json!({"type":"auto_compaction_end"}))
+            .unwrap();
+        assert!(ended.events.contains(&Event::Compaction { active: false }));
+        assert!(
+            !ended
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::TurnFinished { .. }))
+        );
+    }
+
+    #[test]
+    fn post_ack_compaction_probe_survives_a_superseding_refresh() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("same".into()),
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        let old = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let refreshed = adapter.command(Command::Refresh).unwrap();
+        let current = refreshed
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        assert_ne!(old["id"], current["id"]);
+        let old=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            old.events.is_empty(),
+            "superseded state replies remain fenced"
+        );
+        let current=adapter.receive(json!({"type":"response","id":current["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            current
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+        assert!(!adapter.compaction_active);
+    }
+
+    #[test]
+    fn a_new_compaction_start_rejects_an_earlier_idle_probe() {
+        let mut adapter = Omp {
+            ready: true,
+            session_id: Some("same".into()),
+            ..Default::default()
+        };
+        let requested = adapter.command(Command::Compact).unwrap();
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        let old = acknowledged
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        let started = adapter
+            .receive(json!({"type":"auto_compaction_start"}))
+            .unwrap();
+        let current = started
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "get_state")
+            .unwrap();
+        assert_ne!(old["id"], current["id"]);
+        let old=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(old.events.is_empty());
+        assert!(
+            adapter.compaction_active,
+            "pre-start idle metadata cannot end later maintenance"
+        );
+        let completed=adapter.receive(json!({"type":"response","id":current["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(
+            completed
+                .events
+                .contains(&Event::Compaction { active: false })
+        );
+    }
+
+    #[test]
     fn exact_resume_refuses_a_different_conversation() {
         let mut adapter = Omp {
             expected_session: Some("expected".into()),
