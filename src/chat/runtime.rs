@@ -991,12 +991,10 @@ impl LocalHandle {
                         });
                     }
                     if state.outcome.is_some() && state.finished_at.is_none() { state.finished_at = observed_at(); }
-                    let terminal=match &state.outcome {Some(crate::agent::ActivityOutcome::Failed{..})=>Some(ToolStatus::Failed),Some(crate::agent::ActivityOutcome::Cancelled|crate::agent::ActivityOutcome::Interrupted{..})=>Some(ToolStatus::Stopped),_=>None};
-                    if let Some(status)=terminal {
-                        finish_snapshot_work(&mut state,status,direct_closed&&native_closed);
-                        drop(state);
-                        if let Err(error)=actor.store.lock().unwrap_or_else(|p|p.into_inner()).finish_running(status) {tracing::warn!(%error,"Cannot settle ended provider tool metadata");}
-                    }
+                    // Provider/holder cleanup has process-family scope, while
+                    // Tool/Command/Changes and delegated rows can describe work
+                    // on external MCP servers. Preserve their last native item
+                    // status until an exact per-item terminal proof arrives.
                 }
                 actor.apply(Event::Exited { code });
                 let usage = actor
@@ -4363,14 +4361,7 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::TurnFinished { outcome, .. } => {
             use crate::{agent::ActivityOutcome, notifications::Kind};
-            match outcome {
-                Kind::Cancelled => {
-                    let all = state.capabilities.interrupt_stops_background;
-                    finish_snapshot_work(state, ToolStatus::Stopped, all);
-                }
-                Kind::Failed => finish_snapshot_work(state, ToolStatus::Failed, false),
-                _ => {}
-            }
+            // Only exact native item/request resolution may retire external work.
             state.outcome = match outcome {
                 Kind::Succeeded => Some(ActivityOutcome::Succeeded),
                 Kind::Cancelled => Some(ActivityOutcome::Cancelled),
@@ -4822,37 +4813,6 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
     }
 }
 
-fn finish_snapshot_work(state: &mut Snapshot, status: ToolStatus, include_background: bool) {
-    fn finish_items(items: &mut [Arc<Item>], status: ToolStatus) {
-        for item in items {
-            if item.content.status() != Some(ToolStatus::Running) {
-                continue;
-            }
-            match &mut Arc::make_mut(item).content {
-                ItemContent::Tool {
-                    status: current, ..
-                }
-                | ItemContent::Command {
-                    status: current, ..
-                }
-                | ItemContent::Changes {
-                    status: current, ..
-                } => *current = status,
-                _ => {}
-            }
-        }
-    }
-    finish_items(&mut state.items, status);
-    for child in &mut state.subagents {
-        if child.status == ToolStatus::Running && (!child.background || include_background) {
-            child.status = status;
-            child.waiting = false;
-            child.detail.clear();
-            finish_items(&mut child.items, status);
-        }
-    }
-}
-
 /// Running task identities authorize interruption and idle waits. Retiring
 /// presentation history must never retire that ownership evidence. Keep only
 /// the newest 32 rich child transcripts, with older active entries remaining
@@ -4925,6 +4885,67 @@ mod tests {
         let context = Arc::new(super::super::protocol::ExecutionContext::capture(path).unwrap());
         context.observe_provider_directory(path).unwrap();
         context
+    }
+
+    #[test]
+    fn turn_outcomes_preserve_independent_decisions_until_resolution_or_exit() {
+        let waiting = || Snapshot {
+            ready: true,
+            busy: true,
+            waiting: true,
+            requests: vec![super::super::Request {
+                kind: super::super::RequestKind::Approval,
+                id: "pending".into(),
+                title: "Approve tool".into(),
+                description: String::new(),
+                fields: Vec::new(),
+                actions: Vec::new(),
+            }],
+            ..Default::default()
+        };
+        for outcome in [
+            crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed,
+        ] {
+            let mut state = waiting();
+            let mut indices = BTreeMap::new();
+            assert_eq!(state.activity(), ActivityState::Waiting);
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::TurnFinished { key: None, outcome },
+            );
+            assert_eq!(state.requests.len(),1);
+            assert!(state.waiting);
+            assert_eq!(state.activity(),ActivityState::Waiting);
+            assert!(state.outcome.is_some());
+            apply_event(&mut state,&mut indices,Event::RequestResolved {id:"pending".into()});
+            apply_event(&mut state,&mut indices,Event::Waiting(false));
+            apply_event(&mut state,&mut indices,Event::Status {busy:false,detail:String::new()});
+            assert_eq!(state.activity(),ActivityState::Idle);
+            apply_event(&mut state,&mut indices,Event::TurnStarted);
+            assert_eq!(state.activity(),ActivityState::Idle);
+        }
+        let mut state = waiting();
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::Error {
+                message: "Provider failed".into(),
+                fatal: true,
+            },
+        );
+        assert!(state.requests.is_empty());
+        assert!(!state.waiting);
+        let mut state = waiting();
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::Exited { code: Some(3) },
+        );
+        assert!(state.requests.is_empty());
+        assert!(!state.waiting);
+        assert_eq!(state.activity(), ActivityState::Unknown);
     }
 
     #[test]
@@ -5467,6 +5488,95 @@ mod tests {
     }
 
     #[test]
+    fn actual_claude_late_interrupt_and_supersession_keep_new_turn_scalar_and_attention_authority() {
+        struct Driver {
+            claude: Box<dyn Adapter>, interrupts: Vec<String>, ack: usize, result: usize, accepted: bool,
+        }
+        impl Adapter for Driver {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                let mut step = match command {
+                    command @ Command::Prompt { .. } => self.claude.command(command)?,
+                    Command::Interrupt => {
+                        let step = self.claude.command(Command::Interrupt)?;
+                        self.interrupts.push(step.writes[0]["request_id"].as_str().unwrap().into());
+                        step
+                    }
+                    Command::Compact => {
+                        let id = if self.result == 0 { "A" } else { "B" };
+                        self.result += 1;
+                        self.claude.receive(json!({"type":"result","subtype":"success","uuid":id,"is_error":false}))?
+                    }
+                    Command::RefreshPermissions => {
+                        let id = &self.interrupts[self.ack]; self.ack += 1;
+                        let response = if self.accepted { json!({"request_id":id,"subtype":"success","response":{}}) }
+                            else { json!({"request_id":id,"subtype":"error","error":"already settled"}) };
+                        self.claude.receive(json!({"type":"control_response","response":response}))?
+                    }
+                    Command::SetFastMode { enabled: true } => self.claude.receive(json!({"type":"control_request","request_id":"approval-B","request":{"subtype":"can_use_tool","tool_name":"Bash","tool_use_id":"tool-B","input":{"command":"true"}}}))?,
+                    Command::SetFastMode { enabled: false } => self.claude.receive(json!({"type":"control_cancel_request","request_id":"approval-B"}))?,
+                    _ => return Err("Unexpected decoder-to-actor fixture command".into()),
+                };
+                // Commands above exercise the actual decoder/reducer, with
+                // transport input driven explicitly instead of echoed outbound
+                // requests being mistaken for provider responses.
+                step.writes.clear();
+                Ok(step)
+            }
+        }
+        for supersede in [false, true] {
+            for accepted in [false, true] {
+                let mut claude = super::super::protocol::claude::fixture_adapter();
+                let initialize = claude.initialize().unwrap();
+                let id = initialize.writes[0]["request_id"].clone();
+                let mut initial = claude.receive(json!({"type":"control_response","response":{"request_id":id,"subtype":"success","response":{"commands":[]}}})).unwrap();
+                initial.writes.clear();
+                assert!(initial.events.contains(&Event::Ready(true)));
+                let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+                let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
+                    transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(),
+                    working_directory: directory.path().into(), environment: BTreeMap::new() };
+                let store = preflight(&spec, &mut initial).unwrap();
+                let (send, receive) = crossbeam_channel::unbounded();
+                let handle = LocalHandle::start(spec, Box::new(Driver { claude, interrupts: Vec::new(), ack: 0, result: 0, accepted }), initial, store, None,
+                    move |update| { let _ = send.send(update); }).unwrap();
+                until(&handle, |state| state.ready);
+                let prompt = |text: &str| Command::Prompt { text: text.into(), attachments: Vec::new(), mode: super::super::PromptMode::Send };
+                handle.command(prompt("turn A")).unwrap();
+                handle.command(Command::Interrupt).unwrap();
+                handle.command(Command::Compact).unwrap(); // Native result A, before ACK.
+                handle.command(prompt("turn B")).unwrap();
+                handle.command(Command::SetFastMode { enabled: true }).unwrap();
+                let before = handle.snapshot(None).unwrap();
+                assert!(before.outcome.is_none());
+                assert_eq!(before.activity(), ActivityState::Waiting);
+                if supersede { handle.command(Command::Interrupt).unwrap(); }
+                else { handle.command(Command::RefreshPermissions).unwrap(); }
+                let after = handle.snapshot(None).unwrap();
+                assert_eq!(after.turn_generation, before.turn_generation);
+                assert_eq!(after.outcome, before.outcome);
+                assert_eq!(after.finished_at, before.finished_at);
+                assert_eq!(after.requests, before.requests);
+                assert_eq!(after.activity(), ActivityState::Waiting);
+                let updates = receive.try_iter().collect::<Vec<_>>();
+                let old_outcome = if !supersede && accepted { crate::notifications::Kind::Cancelled } else { crate::notifications::Kind::Succeeded };
+                assert_eq!(updates.iter().filter(|update| matches!(update, Update::PastAttention(evidence) if evidence.key=="claude:A" && evidence.kind==old_outcome)).count(), 1);
+                assert!(!updates.iter().any(|update| matches!(update, Update::Attention(evidence) if evidence.key=="claude:A")), "old proof must not replace current B journal/desktop attention");
+                handle.command(Command::SetFastMode { enabled: false }).unwrap();
+                handle.command(Command::Compact).unwrap(); // Native result B.
+                if supersede {
+                    handle.command(Command::RefreshPermissions).unwrap(); // Late ignored A ACK.
+                    handle.command(Command::RefreshPermissions).unwrap(); // Exact B ACK.
+                }
+                assert_eq!(handle.snapshot(None).unwrap().outcome,
+                    Some(if supersede && accepted { crate::agent::ActivityOutcome::Cancelled } else { crate::agent::ActivityOutcome::Succeeded }));
+                handle.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn default_provider_exit_retains_complete_private_stderr_without_general_log_exposure() {
         const STAGE: &str = "CAGENTS_PRIVATE_STDERR_RUNTIME_TEST";
         let Some(directory) = std::env::var_os(STAGE) else {
@@ -5652,7 +5762,7 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_work_does_not_become_running_again_when_the_next_turn_starts() {
+    fn cancelled_turn_does_not_invent_tool_or_delegated_process_completion() {
         let tool = Arc::new(Item {
             id: "old-tool".into(),
             role: Role::Assistant,
@@ -5680,8 +5790,8 @@ mod tests {
                 outcome: crate::notifications::Kind::Cancelled,
             },
         );
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
+        assert_eq!(state.subagents[0].status, ToolStatus::Running);
         assert_eq!(
             state.subagents[1].status,
             ToolStatus::Running,
@@ -5689,14 +5799,12 @@ mod tests {
         );
         apply_event(&mut state, &mut indices, Event::TurnStarted);
         assert!(state.outcome.is_none());
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
-        finish_snapshot_work(&mut state, ToolStatus::Failed, true);
-        assert_eq!(
-            state.subagents[1].status,
-            ToolStatus::Failed,
-            "confirmed provider teardown settles all owned children"
-        );
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
+        assert_eq!(state.subagents[0].status, ToolStatus::Running);
+        apply_event(&mut state, &mut indices, Event::Exited { code: Some(3) });
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Running));
+        assert_eq!(state.subagents[1].status, ToolStatus::Running,
+            "provider exit alone has no per-item remote/delegated completion authority");
     }
 
     #[test]
@@ -6713,7 +6821,7 @@ mod tests {
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (send, receive) = crossbeam_channel::unbounded();
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
             let _ = send.send(update);
         })
         .unwrap();
@@ -6814,7 +6922,7 @@ mod tests {
             let mut adapter: Box<dyn Adapter> = Box::new(Echo);
             let mut initial = adapter.initialize().unwrap();
             let store = preflight(&spec, &mut initial).unwrap();
-            let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+            let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
             let state = until(&handle, |snapshot| snapshot.exited);
             if fails {
                 let error = state.error.as_deref().unwrap();
@@ -6873,7 +6981,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Denials);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let snapshot = until(&handle, |state| state.ready);
         assert!(!snapshot.exited);
         assert!(snapshot.error.is_none());
@@ -6984,7 +7092,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Echo);
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         let state = until(&handle, |state| state.exited);
         let diagnostic = state.provider_exit.as_ref().unwrap();
         assert!(diagnostic.summary.len() <= 1024 && diagnostic.summary.lines().count() <= 5);
@@ -7092,7 +7200,7 @@ mod tests {
         let mut adapter: Box<dyn Adapter> = Box::new(Controls(None));
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |state| state.ready);
         let pending = handle
             .enqueue_command(Command::SetPermissionMode {
@@ -7114,53 +7222,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn cancelled_work_does_not_become_running_again_when_the_next_turn_starts() {
-        let tool = Arc::new(Item {
-            id: "old-tool".into(),
-            role: Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Tool {
-                name: "Bash".into(),
-                input: "work".into(),
-                output: String::new(),
-                status: ToolStatus::Running,
-            },
-        });
-        let mut state = Snapshot {
-            items: vec![tool],
-            ..Default::default()
-        };
-        subagent(&mut state, "foreground");
-        subagent(&mut state, "background").background = true;
-        let mut indices = BTreeMap::new();
-        apply_event(
-            &mut state,
-            &mut indices,
-            Event::TurnFinished {
-                key: None,
-                outcome: crate::notifications::Kind::Cancelled,
-            },
-        );
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
-        assert_eq!(
-            state.subagents[1].status,
-            ToolStatus::Running,
-            "a background child outside interruption ownership remains live"
-        );
-        apply_event(&mut state, &mut indices, Event::TurnStarted);
-        assert!(state.outcome.is_none());
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
-        finish_snapshot_work(&mut state, ToolStatus::Failed, true);
-        assert_eq!(
-            state.subagents[1].status,
-            ToolStatus::Failed,
-            "confirmed provider teardown settles all owned children"
-        );
-    }
 
     #[test]
     fn prompt_suggestion_metadata_cannot_survive_a_turn_session_or_process_boundary() {
@@ -9496,6 +9557,9 @@ mod tests {
             vec![text("echo", "hello world world")]
         );
     }
+    fn independent_websocket_command()->Item {
+        Item {id:"background-process".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"exec_command".into(),input:"long-running independent process".into(),output:String::new(),status:ToolStatus::Running}}
+    }
     struct WebSocketFixture;
     impl Adapter for WebSocketFixture {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -9513,6 +9577,8 @@ mod tests {
         }
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             let mut step = Echo.receive(frame.clone())?;
+            if frame["background"]==true {step.events.push(Event::Item(independent_websocket_command()));}
+            if frame["cancelled"]==true {step.events.push(Event::TurnFinished {key:Some("fixture-turn".into()),outcome:crate::notifications::Kind::Cancelled});}
             step.events.push(Event::Status {
                 busy: frame["busy"].as_bool().unwrap_or(false),
                 detail: String::new(),
@@ -9570,7 +9636,7 @@ mod tests {
             );
             socket
                 .send(Message::Text(
-                    json!({"text": "hello", "busy": true}).to_string().into(),
+                    json!({"text": "hello", "busy": true,"background":true}).to_string().into(),
                 ))
                 .unwrap();
             socket
@@ -9588,7 +9654,7 @@ mod tests {
             );
             socket
                 .send(Message::Text(
-                    json!({"text": " stopped", "busy": false})
+                    json!({"text": " stopped", "busy": false,"cancelled":true})
                         .to_string()
                         .into(),
                 ))
@@ -9606,7 +9672,7 @@ mod tests {
         })
         .unwrap();
         until(&handle, |snapshot| {
-            snapshot.busy && unstamped(&snapshot.items) == vec![text("echo", "hello")]
+            snapshot.busy && unstamped(&snapshot.items) == vec![text("echo", "hello"),independent_websocket_command()]
         });
         pong_received.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(matches!(
@@ -9651,9 +9717,11 @@ mod tests {
         let snapshot = handle.snapshot(None).unwrap();
         assert!(snapshot.exited);
         assert!(!snapshot.busy);
+        assert_eq!(snapshot.outcome,Some(crate::agent::ActivityOutcome::Cancelled));
         assert_eq!(
             unstamped(&snapshot.items),
-            vec![text("echo", "hello stopped")]
+            vec![text("echo", "hello stopped"),independent_websocket_command()],
+            "disconnecting this unowned server connection cannot invent background process completion"
         );
     }
 
@@ -9847,6 +9915,81 @@ mod tests {
     }
 
     #[test]
+    fn owned_holder_cleanup_does_not_claim_remote_mcp_item_completion() {
+        const ROLE: &str = "CAGENTS_REMOTE_ITEM_AUTHORITY_TEST";
+        const TEST: &str = "chat::runtime::tests::owned_holder_cleanup_does_not_claim_remote_mcp_item_completion";
+        match std::env::var(ROLE).as_deref() {
+            Ok("server") => {
+                let listener = std::os::unix::net::UnixListener::bind(
+                    std::env::var_os("CAGENTS_REMOTE_ITEM_SOCKET").unwrap(),
+                ).unwrap();
+                let (stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+                let mut socket = tungstenite::accept(stream).unwrap();
+                while let Ok(message) = socket.read() {
+                    if matches!(message, tungstenite::Message::Close(_)) { break; }
+                }
+                return;
+            }
+            Ok("controller") => {}
+            _ => {
+                let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+                let output = Process::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture"])
+                    .env(ROLE, "controller")
+                    .env("XDG_RUNTIME_DIR", directory.path())
+                    .env("XDG_DATA_HOME", directory.path().join("data"))
+                    .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                    .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                    .env("CAGENTS_LOCAL_DEBUG", "0")
+                    .output().unwrap();
+                assert!(output.status.success(), "stdout={} stderr={}",
+                    String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                return;
+            }
+        }
+        let mut source = super::super::native_holder::fixture_source();
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id = boot;
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let spec = ProcessSpec {
+            execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket { socket: socket.clone() },
+            program: std::env::current_exe().unwrap().to_string_lossy().into_owned(),
+            arguments: vec!["--exact".into(), TEST.into(), "--nocapture".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::from([(ROLE.into(), "server".into()),
+                ("CAGENTS_REMOTE_ITEM_SOCKET".into(), socket.to_string_lossy().into_owned())]),
+        };
+        let remote = Item { id: "mcp-job-outside-local-family".into(), role: Role::Assistant,
+            started_at: None, at: None, content: ItemContent::Tool {
+                name: "mcp__external__long_job".into(), input: "{}".into(), output: String::new(),
+                status: ToolStatus::Running,
+            }};
+        let mut initial = Echo.initialize().unwrap();
+        initial.events.extend([Event::TurnStarted, Event::Status { busy: true, detail: "Remote job reported".into() }, Event::Item(remote.clone())]);
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start_owned(spec, Box::new(Echo), initial, store, source.clone(), BTreeMap::new(), None, |_| {}).unwrap();
+        until(&handle, |state| state.busy && state.items.iter().any(|item| item.id == remote.id));
+        let root = crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
+        let record = crate::daemon::holder_registry::evidence(
+            &crate::daemon::holder_registry::socket(&root, source.id),
+            crate::daemon::holder_registry::Kind::Native,
+        ).unwrap().unwrap();
+        assert!(record.root.is_current());
+        handle.close_until(Instant::now() + Duration::from_secs(10)).unwrap();
+        assert!(!record.root.is_current(), "the actual owned provider family must have closed");
+        assert_eq!(handle.snapshot(None).unwrap().items.iter().find(|item| item.id == remote.id).unwrap().content, remote.content,
+            "local family cleanup cannot manufacture a terminal result for an unbound external tool");
+        assert_eq!(handle.0.store.lock().unwrap().window().unwrap().items.iter().find(|item| item.id == remote.id).unwrap().content, remote.content,
+            "canonical source and resident projection must preserve the same last native item status");
+    }
+
+    #[test]
     fn bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure() {
         use std::os::unix::fs::OpenOptionsExt;
         const CHILD: &str = "CAGENTS_RETAINED_CLOSE_RETRY_TEST";
@@ -9974,9 +10117,7 @@ mod tests {
                 assert!(!record.root.is_current());
                 continue;
             }
-            *handle.0.retained_native.lock().unwrap() = Some(holder);
-            handle.0.completed.store(false, Ordering::Release);
-            *handle.0.failure.lock().unwrap() = Some("Native teardown remains unconfirmed".into());
+            handle.fixture_retained_native_holder(holder, "Native teardown remains unconfirmed".into());
             assert!(
                 handle
                     .close_until(Instant::now() + Duration::from_secs(2))

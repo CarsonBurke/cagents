@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     chat::Command,
-    model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, TerminalId},
+    model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
     terminal_ipc::{
         ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
         ServerMessage, ServerResponse,
@@ -34,29 +34,30 @@ fn client_key(proof: &HostSessionProof, client: ClientId) -> ClientKey {
 #[derive(Default)]
 struct Budget {
     normal: BTreeMap<ClientKey, usize>,
-    interrupts: BTreeSet<(ClientKey, TerminalId)>,
+    interrupts: usize,
     total: usize,
 }
 struct Credit {
     budget: Arc<Mutex<Budget>>,
     client: ClientKey,
-    chat: TerminalId,
     interrupt: bool,
 }
 impl Credit {
     fn acquire(
         budget: &Arc<Mutex<Budget>>,
         client: ClientKey,
-        chat: TerminalId,
         interrupt: bool,
     ) -> Result<Self, String> {
         let mut state = budget.lock().unwrap_or_else(|p| p.into_inner());
         if interrupt {
-            if state.interrupts.len() >= INTERRUPT_TOTAL
-                || !state.interrupts.insert((client.clone(), chat))
-            {
-                return Err("An interrupt is already pending or interruption capacity is busy; try again after its reply".into());
+            if state.interrupts >= INTERRUPT_TOTAL {
+                return Err("Provider interruption capacity is busy; retry when a pending reply settles".into());
             }
+            // A new explicit Stop targets current work at execution. An old
+            // turn's unanswered Stop must not reserve this whole chat. The
+            // adapter supersedes old controls; every outstanding reply still
+            // consumes one real, globally bounded credit until it settles.
+            state.interrupts += 1;
         } else {
             if state.total >= NORMAL_TOTAL
                 || state.normal.get(&client).copied().unwrap_or(0) >= PER_CLIENT
@@ -69,7 +70,6 @@ impl Credit {
         Ok(Self {
             budget: budget.clone(),
             client,
-            chat,
             interrupt,
         })
     }
@@ -78,7 +78,7 @@ impl Drop for Credit {
     fn drop(&mut self) {
         let mut state = self.budget.lock().unwrap_or_else(|p| p.into_inner());
         if self.interrupt {
-            state.interrupts.remove(&(self.client.clone(), self.chat));
+            state.interrupts = state.interrupts.saturating_sub(1);
         } else {
             state.total = state.total.saturating_sub(1);
             if let Some(count) = state.normal.get_mut(&self.client) {
@@ -163,7 +163,7 @@ pub(super) fn try_defer(
     if !is_deferred(&request) {
         return Ok(Some(request));
     }
-    let ClientRequest::ChatCommand { chat_id, command } = &request else {
+    let ClientRequest::ChatCommand { command, .. } = &request else {
         unreachable!()
     };
     let refused =
@@ -177,10 +177,9 @@ pub(super) fn try_defer(
     let credit = Credit::acquire(
         &broker.budget,
         client_key(&proof, client_id),
-        *chat_id,
         matches!(command, Command::Interrupt),
     )
-    .map_err(refused)?;
+    .map_err(|message| ProtocolError::new(ProtocolErrorCode::QueueFull,message,true))?;
     let gate = super::client::control_gate(host);
     let _admission = match gate.try_read() {
         Ok(guard) => guard,
@@ -342,24 +341,41 @@ mod tests {
     #[test]
     fn ordinary_credit_saturation_does_not_block_an_interrupt_and_credits_return() {
         let budget = Arc::new(Mutex::new(Budget::default()));
-        let chat = TerminalId::new();
         let controls = (0..PER_CLIENT)
-            .map(|_| Credit::acquire(&budget, key(1), chat, false).unwrap())
+            .map(|_| Credit::acquire(&budget, key(1), false).unwrap())
             .collect::<Vec<_>>();
-        assert!(Credit::acquire(&budget, key(1), chat, false).is_err());
-        let stop = Credit::acquire(&budget, key(1), chat, true).unwrap();
-        assert!(Credit::acquire(&budget, key(1), chat, true).is_err());
-        assert!(Credit::acquire(&budget, key(2), chat, false).is_ok());
+        assert!(Credit::acquire(&budget, key(1), false).is_err());
+        let stop = Credit::acquire(&budget, key(1), true).unwrap();
+        let later_stop=Credit::acquire(&budget,key(1),true).unwrap();
+        assert!(Credit::acquire(&budget, key(2), false).is_ok());
         let mut other_host = key(1);
         other_host.2 = HostIncarnation::new("replacement");
         assert!(
-            Credit::acquire(&budget, other_host, chat, false).is_ok(),
+            Credit::acquire(&budget, other_host, false).is_ok(),
             "reused client ids from another daemon have independent credits"
         );
         drop(controls);
         drop(stop);
-        assert!(Credit::acquire(&budget, key(1), chat, false).is_ok());
-        assert!(Credit::acquire(&budget, key(1), chat, true).is_ok());
+        drop(later_stop);
+        assert!(Credit::acquire(&budget, key(1), false).is_ok());
+        assert!(Credit::acquire(&budget, key(1), true).is_ok());
+    }
+    #[test]
+    fn repeated_stops_remain_globally_bounded_and_each_reply_owns_its_credit() {
+        let budget=Arc::new(Mutex::new(Budget::default()));
+        let mut pending=(0..INTERRUPT_TOTAL).map(|_|Credit::acquire(&budget,key(1),true).unwrap()).collect::<Vec<_>>();
+        assert!(Credit::acquire(&budget,key(1),true).is_err());
+        assert_eq!(budget.lock().unwrap().interrupts,INTERRUPT_TOTAL);
+        // Settling A returns exactly one credit without clearing B or later
+        // generations belonging to the same client/chat.
+        drop(pending.pop());
+        let replacement=Credit::acquire(&budget,key(1),true).unwrap();
+        assert!(Credit::acquire(&budget,key(1),true).is_err());
+        drop(pending);
+        assert_eq!(budget.lock().unwrap().interrupts,1);
+        drop(replacement);
+        assert_eq!(budget.lock().unwrap().interrupts,0);
+        assert_eq!(budget.lock().unwrap().total,0);
     }
     #[test]
     fn an_unanswered_control_does_not_hold_up_a_later_interrupt_reply() {
@@ -368,7 +384,6 @@ mod tests {
         let (cancel, cancelled) = crossbeam_channel::bounded(4);
         let worker = std::thread::spawn(move || run(receive, cancelled));
         let budget = Arc::new(Mutex::new(Budget::default()));
-        let chat = TerminalId::new();
         let (ignored, reply) = crossbeam_channel::bounded(1);
         let event = events.clone();
         send.send(Pending {
@@ -377,7 +392,7 @@ mod tests {
             complete: Box::new(move |reply| {
                 event.send(("ordinary", reply)).unwrap();
             }),
-            _credit: Credit::acquire(&budget, key(1), chat, false).unwrap(),
+            _credit: Credit::acquire(&budget, key(1), false).unwrap(),
         })
         .unwrap_or_else(|_| panic!("broker fixture stopped"));
         let (interrupt, reply) = crossbeam_channel::bounded(1);
@@ -387,7 +402,7 @@ mod tests {
             complete: Box::new(move |reply| {
                 events.send(("interrupt", reply)).unwrap();
             }),
-            _credit: Credit::acquire(&budget, key(1), chat, true).unwrap(),
+            _credit: Credit::acquire(&budget, key(1), true).unwrap(),
         })
         .unwrap_or_else(|_| panic!("broker fixture stopped"));
         interrupt.send(Ok(())).unwrap();
@@ -411,8 +426,7 @@ mod tests {
             let (cancel, cancelled) = crossbeam_channel::bounded(4);
             let worker = std::thread::spawn(move || run(receive, cancelled));
             let budget = Arc::new(Mutex::new(Budget::default()));
-            let chat = TerminalId::new();
-            let (provider, reply) = crossbeam_channel::bounded(1);
+                let (provider, reply) = crossbeam_channel::bounded(1);
             let (event, observed) = crossbeam_channel::bounded(1);
             send.send(Pending {
                 reply,
@@ -424,7 +438,7 @@ mod tests {
                 complete: Box::new(move |reply| {
                     let _ = event.send(reply);
                 }),
-                _credit: Credit::acquire(&budget, key(1), chat, false).unwrap(),
+                _credit: Credit::acquire(&budget, key(1), false).unwrap(),
             })
             .unwrap_or_else(|_| panic!("broker fixture stopped"));
             if disconnected {

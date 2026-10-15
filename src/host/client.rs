@@ -3462,6 +3462,118 @@ mod tests {
         assert!(snapshot.error.is_none());
     }
 
+    #[test]
+    fn a_new_turn_can_be_stopped_on_the_same_connection_before_the_old_stop_acknowledges() {
+        use crate::{agent::Provider,chat::{self,Command,Event,protocol::{Adapter,ProcessSpec,Step}}};
+        use std::collections::BTreeMap;
+        struct Driver { claude:Box<dyn Adapter>, interrupt_ids:Vec<String>, admitted:crossbeam_channel::Sender<usize> }
+        impl Adapter for Driver {
+            fn initialize(&mut self)->Result<Step,String>{Ok(Step::default())}
+            fn receive(&mut self,_:serde_json::Value)->Result<Step,String>{Ok(Step::default())}
+            fn command_ack(&mut self)->Option<String>{self.claude.command_ack()}
+            fn control_replies(&mut self)->Vec<(String,Result<(),String>)>{self.claude.control_replies()}
+            fn tick(&mut self)->Step{self.claude.tick()}
+            fn command(&mut self,command:Command)->Result<Step,String>{
+                let mut step=match command {
+                    command@Command::Prompt{..}=>self.claude.command(command)?,
+                    Command::Interrupt=>{
+                        let step=self.claude.command(Command::Interrupt)?;
+                        self.interrupt_ids.push(step.writes[0]["request_id"].as_str().unwrap().into());
+                        self.admitted.send(self.interrupt_ids.len()).unwrap();
+                        step
+                    },
+                    Command::Compact=>self.claude.receive(serde_json::json!({"type":"result","subtype":"success","uuid":"A","is_error":false}))?,
+                    Command::Refresh=>{
+                        assert_eq!(self.interrupt_ids.len(),2);
+                        let mut step=self.claude.receive(serde_json::json!({"type":"control_response","response":{"request_id":self.interrupt_ids[1],"subtype":"success","response":{}}}))?;
+                        let result=self.claude.receive(serde_json::json!({"type":"result","subtype":"success","uuid":"B","is_error":false}))?;
+                        step.events.extend(result.events);
+                        step.writes.extend(result.writes);
+                        step
+                    },
+                    _=>return Err("Unexpected two-turn Stop fixture command".into()),
+                };
+                // Exercise the actual decoder/control receipts; /bin/cat is a
+                // lifecycle-only child, never an invented provider ACK source.
+                step.writes.clear();
+                Ok(step)
+            }
+        }
+        fn send(stream:&mut UnixStream,proof:&HostSessionProof,id:u64,request:ClientRequest){
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES).write(stream,&ClientEnvelope {version:PROTOCOL_VERSION,request_id:id,proof:Some(proof.clone()),request}).unwrap();
+        }
+        fn receive(reader:&mut FrameCodec,stream:&mut UnixStream,id:u64){
+            loop {
+                let envelope=reader.read::<ServerEnvelope>(stream).unwrap().unwrap();
+                if envelope.request_id.is_none(){continue;}
+                assert_eq!(envelope.request_id,Some(id));
+                assert!(matches!(envelope.message,ServerMessage::Response{..}));
+                return;
+            }
+        }
+        struct Cleanup {stream:UnixStream,server:Option<thread::JoinHandle<()>>,handle:chat::runtime::Handle}
+        impl Drop for Cleanup {fn drop(&mut self){let _=self.stream.shutdown(Shutdown::Both);let _=self.handle.close();if let Some(server)=self.server.take(){let _=server.join();}}}
+        let (proof,host)=panic_test_host("same-stream-two-turn-interrupts");
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new(),unset_environment:Default::default()};
+        let spec=ProcessSpec::from(&recipe);
+        let mut claude=chat::protocol::claude::fixture_adapter();
+        let initialize=claude.initialize().unwrap();
+        let mut initial=claude.receive(serde_json::json!({"type":"control_response","response":{"request_id":initialize.writes[0]["request_id"],"subtype":"success","response":{"commands":[]}}})).unwrap();
+        initial.writes.clear();
+        assert!(initial.events.contains(&Event::Ready(true)));
+        let store=chat::runtime::preflight(&spec,&mut initial).unwrap();
+        let (admitted,observed)=crossbeam_channel::bounded(2);
+        let handle=chat::runtime::Handle::start(spec,Box::new(Driver {claude,interrupt_ids:Vec::new(),admitted}),initial,store,None,|_|{}).unwrap();
+        let chat_id=TerminalId::new();
+        host.lock().unwrap().chats.insert(chat_id,super::super::chat::Record {
+            execution_instance:uuid::Uuid::nil(),console_recipe:None,paired_terminal:None,
+            session:chat::Session {native_continuity:Default::default(),owned_codex_listener:None,id:chat_id,launch:chat::Launch {provider:Provider::Claude,recipe,session_id:None},proof:Some(proof.clone()),terminal:None},
+            handle:handle.clone(),source_process:None,subscribers:BTreeMap::from([(1,false)]),observations:BTreeMap::new(),completion_observed:false,returning_terminal:false,
+        });
+        let (mut stream,server_stream)=UnixStream::pair().unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server_host=host.clone();
+        let _cleanup=Cleanup {stream:stream.try_clone().unwrap(),server:Some(thread::spawn(move||serve(server_stream,1,server_host))),handle:handle.clone()};
+        let mut reader=FrameCodec::new(MAX_FRAME_BYTES);
+        send(&mut stream,&proof,1,ClientRequest::Connect {expected_host:Some(proof.clone()),resume:Vec::new()});
+        receive(&mut reader,&mut stream,1);
+        let prompt=|text:&str|Command::Prompt {text:text.into(),attachments:Vec::new(),mode:chat::PromptMode::Send};
+        let request=|command|ClientRequest::ChatCommand {chat_id,command};
+        send(&mut stream,&proof,2,request(prompt("A")));
+        receive(&mut reader,&mut stream,2);
+        send(&mut stream,&proof,3,request(Command::Interrupt));
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).unwrap(),1);
+        // A actually finishes before its interrupt control response. Its
+        // pending credit must not block this same client's explicit Stop B.
+        send(&mut stream,&proof,4,request(Command::Compact));
+        receive(&mut reader,&mut stream,4);
+        send(&mut stream,&proof,5,request(prompt("B")));
+        receive(&mut reader,&mut stream,5);
+        let before=handle.snapshot(None).unwrap();
+        assert!(before.outcome.is_none());
+        send(&mut stream,&proof,6,request(Command::Interrupt));
+        assert_eq!(observed.recv_timeout(Duration::from_secs(1)).expect("new Stop must reach the actual adapter while old ACK remains withheld"),2);
+        send(&mut stream,&proof,7,request(Command::Refresh));
+        let mut replies=std::collections::BTreeSet::new();
+        while replies.len()<3 {
+            let envelope=reader.read::<ServerEnvelope>(&mut stream).unwrap().unwrap();
+            assert_eq!(envelope.proof,proof);
+            let Some(id)=envelope.request_id else {continue};
+            assert!(replies.insert(id),"one correlated reply per request");
+            match id {
+                3=>assert!(matches!(envelope.message,ServerMessage::Error(ref error) if error.message.contains("superseded"))),
+                6|7=>assert!(matches!(envelope.message,ServerMessage::Response {response:ServerResponse::Accepted})),
+                _=>panic!("Unexpected two-turn Stop reply {id}"),
+            }
+        }
+        let after=handle.snapshot(None).unwrap();
+        assert_eq!(after.turn_generation,before.turn_generation);
+        assert_eq!(after.outcome,Some(crate::agent::ActivityOutcome::Cancelled));
+        assert!(after.error.is_none());
+    }
+
     fn panic_test_host(name: &str) -> (HostSessionProof, SharedHost) {
         let proof = HostSessionProof {
             host_session_id: crate::model::HostSessionId::new(name),

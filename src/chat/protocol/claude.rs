@@ -465,11 +465,19 @@ impl Claude {
     }
 
     fn control(&mut self, mut request: Value) -> Result<Step, String> {
-        let expired = self.expire_controls(std::time::Instant::now());
+        let now = std::time::Instant::now();
         let interrupt = string(&request, "subtype") == "interrupt";
-        if !interrupt && self.controls.len() >= MAX_PENDING {
+        // Refusal must not consume expired semantic outcomes and discard their
+        // Step. Leave those entries for tick() unless this call can return the
+        // expiry events together with its admitted request.
+        let active = self.controls.iter().filter(|(id, value)| {
+            string(value, "subtype") != "interrupt"
+                && self.control_deadlines.get(*id).is_none_or(|deadline| *deadline > now)
+        }).count();
+        if !interrupt && active >= MAX_PENDING {
             return Err("Too many pending Claude control operations".into());
         }
+        let mut expired = self.expire_controls(now);
         let id = uuid::Uuid::new_v4().to_string();
         // Repeated interrupts supersede an unanswered interrupt, keeping the
         // emergency lane bounded without letting ordinary requests block it.
@@ -481,10 +489,24 @@ impl Claude {
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in old {
-                self.controls.remove(&id);
+                let old = self.controls.remove(&id).unwrap();
                 self.control_deadlines.remove(&id);
+                if let Some(generation) = old["_cagents_turn"].as_u64()
+                    && let Some((key, outcome, run)) = self.deferred_attention.remove(&generation)
+                {
+                    // We received this old turn's native result, but never a
+                    // confirming interrupt ACK. Retire its known result just
+                    // as timeout does, using only its captured generation/run.
+                    self.publish_deferred_finish(generation, key, outcome, &mut expired);
+                    if let Some(run) = run {
+                        expired.events.push(Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Finished { outcome },
+                        });
+                    }
+                }
                 self.control_replies.push((
-                    id,
+                    old["_cagents_ack"].as_str().unwrap_or(&id).to_owned(),
                     Err("A newer interrupt request superseded this one".into()),
                 ));
             }
@@ -2092,7 +2114,12 @@ impl Adapter for Claude {
                 self.retire(required(&frame, "request_id")?.into(), &mut step);
             }
             "conversation_reset" => {
+                // Pending control receipts still name their original native
+                // generation. A reset begins a different current conversation,
+                // even before another prompt emits TurnStarted.
+                self.attention_generation = self.attention_generation.wrapping_add(1);
                 self.started_generation = None;
+                self.interruption = None;
                 self.session_id = None;
                 self.history = None;
                 self.pending.clear();
@@ -2190,6 +2217,7 @@ impl Adapter for Claude {
                         request.as_object_mut().unwrap().remove("promptSuggestions");
                         let retry = self.followup_control(request, &acknowledgement, deadline)?;
                         step.writes.extend(retry.writes);
+                        step.events.extend(retry.events);
                         return Ok(step);
                     }
                     if string(&request, "subtype") == "initialize" {
@@ -2256,6 +2284,7 @@ impl Adapter for Claude {
                             let next = self.followup_control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}), &acknowledgement, deadline)?;
                             chained = true;
                             step.writes.extend(next.writes);
+                            step.events.extend(next.events);
                         }
                         "get_settings" => {
                             let snapshot =
@@ -2283,6 +2312,7 @@ impl Adapter for Claude {
                             let next = self.followup_control(json!({"subtype":"get_settings", "_cagents_permission_update":request["_cagents_permission_update"]}), &acknowledgement, deadline)?;
                             chained = true;
                             step.writes.extend(next.writes);
+                            step.events.extend(next.events);
                         }
                         "apply_flag_settings" if request["settings"].get("fastMode").is_some() => {
                             // Only the acknowledged session overlay changes this setting.
@@ -4242,8 +4272,13 @@ impl Claude {
             // the usage again exactly as a refresh does, rather than
             // narrating itself into the transcript.
             "compact_boundary" => {
-                let usage = self.control(json!({"subtype":"get_context_usage"}))?;
-                step.writes.extend(usage.writes);
+                match self.control(json!({"subtype":"get_context_usage"})) {
+                    Ok(usage) => {
+                        step.writes.extend(usage.writes);
+                        step.events.extend(usage.events);
+                    }
+                    Err(error) => tracing::warn!(%error, "Deferring advisory Claude context refresh while controls are full"),
+                }
             }
             // Auxiliary session frames are not transcript data. Each one used
             // to reach the transcript as a system item holding the raw JSON of
@@ -5239,6 +5274,49 @@ mod tests {
     use std::io::Write as _;
 
     #[test]
+    fn superseding_an_old_interrupt_settles_only_its_captured_result_and_keeps_the_new_interrupt() {
+        let mut adapter = Claude {
+            busy: true,
+            ..Default::default()
+        };
+        let old = adapter.command(Command::Interrupt).unwrap().writes[0]["request_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        adapter
+            .receive(json!({"type":"result","uuid":"old","subtype":"success","is_error":false}))
+            .unwrap();
+        let mut started = Step::default();
+        adapter.start_turn(&mut started);
+        adapter.busy = true;
+        let superseding = adapter.command(Command::Interrupt).unwrap();
+        let current = superseding.writes[0]["request_id"].as_str().unwrap().to_owned();
+        assert_eq!(adapter.interruption, Some(false));
+        assert!(!adapter.controls.contains_key(&old));
+        assert!(!adapter.control_deadlines.contains_key(&old));
+        assert!(adapter.deferred_attention.is_empty(), "the superseded old result must not become an orphan");
+        assert!(superseding.events.iter().any(|event| matches!(
+            event, Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Succeeded } if key=="claude:old"
+        )));
+        assert!(!superseding.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        assert!(adapter.controls.contains_key(&current));
+        let late = adapter.receive(reply(&old, json!({}))).unwrap();
+        assert!(!late.events.iter().any(|event| matches!(event, Event::TurnFinished { .. } | Event::PastTurnFinished { .. })));
+        assert_eq!(adapter.interruption, Some(false));
+        adapter
+            .receive(json!({"type":"result","uuid":"new","subtype":"success","is_error":false}))
+            .unwrap();
+        let acknowledged=adapter.receive(json!({"type":"control_response","response":{"subtype":"success","request_id":current,"response":{}}})).unwrap();
+        assert!(acknowledged.events.iter().any(|event| matches!(
+            event,
+            Event::TurnFinished {
+                outcome: crate::notifications::Kind::Cancelled,
+                ..
+            }
+        )));
+    }
+
+    #[test]
     fn three_hundred_completed_tools_never_imply_a_successful_turn() {
         let run = crate::model::RunId::new();
         let mut adapter = Claude {
@@ -5478,6 +5556,86 @@ mod tests {
             event,
             Event::TurnFinished { .. } | Event::Status { busy: false, .. }
         )));
+    }
+
+    #[test]
+    fn refused_control_keeps_expired_old_turn_proof_for_the_runtime_tick() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let old = interrupt.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"A","subtype":"success","is_error":false})).unwrap();
+        let mut started = Step::default();
+        adapter.start_turn(&mut started);
+        adapter.busy = true;
+        let now = std::time::Instant::now();
+        adapter.control_deadlines.insert(old.clone(), now - std::time::Duration::from_secs(1));
+        for index in 0..MAX_PENDING {
+            let id = format!("active-normal-{index}");
+            adapter.controls.insert(id.clone(), json!({"subtype":"get_settings"}));
+            adapter.control_deadlines.insert(id, now + std::time::Duration::from_secs(60));
+        }
+        assert!(adapter.control(json!({"subtype":"get_settings"})).is_err());
+        assert!(adapter.controls.contains_key(&old));
+        assert_eq!(adapter.deferred_attention.len(), 1,
+            "an ordinary refusal cannot discard an old turn's native terminal evidence");
+        let tick = adapter.tick();
+        assert!(tick.events.iter().any(|event| matches!(event,
+            Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Succeeded } if key=="claude:A")));
+        assert!(!tick.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        assert!(adapter.deferred_attention.is_empty());
+        assert!(adapter.busy, "the new current turn must remain active");
+    }
+
+    #[test]
+    fn chained_settings_ack_preserves_expired_old_turn_evidence() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let old = interrupt.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"A","subtype":"success","is_error":false})).unwrap();
+        let mut started = Step::default(); adapter.start_turn(&mut started); adapter.busy = true;
+        let setting = adapter.control(json!({"subtype":"set_model","model":"sonnet","_cagents_reasoning":"high"})).unwrap();
+        let setting = setting.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.control_deadlines.insert(old, std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let response = adapter.receive(reply(&setting, json!({}))).unwrap();
+        assert!(response.events.iter().any(|event| matches!(event,
+            Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Succeeded } if key=="claude:A")));
+        assert!(!response.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        assert!(adapter.deferred_attention.is_empty());
+        assert!(response.writes.iter().any(|frame| frame["request"]["subtype"]=="apply_flag_settings"));
+        assert!(adapter.busy);
+    }
+
+    #[test]
+    fn a_full_ordinary_control_pool_keeps_its_chained_slot_and_skips_advisory_refresh() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let setting = adapter.control(json!({"subtype":"set_model","model":"sonnet","_cagents_reasoning":"high"})).unwrap();
+        let setting = setting.writes[0]["request_id"].as_str().unwrap().to_owned();
+        for _ in 1..MAX_PENDING { adapter.control(json!({"subtype":"get_context_usage"})).unwrap(); }
+        adapter.command(Command::Interrupt).unwrap();
+        assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
+        let response = adapter.receive(reply(&setting, json!({}))).unwrap();
+        assert!(response.writes.iter().any(|frame| frame["request"]["subtype"]=="apply_flag_settings"),
+            "the emergency interrupt credit cannot consume an existing ordinary settings chain's slot");
+        assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
+        let advisory = adapter.receive(json!({"type":"system","subtype":"compact_boundary"})).unwrap();
+        assert!(advisory.writes.is_empty());
+        assert!(!advisory.events.iter().any(|event| matches!(event, Event::Error { .. })));
+        assert_eq!(adapter.controls.len(), MAX_PENDING + 1);
+    }
+
+    #[test]
+    fn reset_before_old_interrupt_ack_keeps_old_outcome_out_of_the_new_idle_conversation() {
+        let mut adapter = Claude { ready: true, busy: true, ..Default::default() };
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let id = interrupt.writes[0]["request_id"].as_str().unwrap().to_owned();
+        adapter.receive(json!({"type":"result","uuid":"old-before-reset","subtype":"success","is_error":false})).unwrap();
+        let reset = adapter.receive(json!({"type":"conversation_reset"})).unwrap();
+        assert!(reset.events.iter().any(|event| matches!(event, Event::Reset { .. })));
+        let acknowledged = adapter.receive(reply(&id, json!({}))).unwrap();
+        assert!(acknowledged.events.iter().any(|event| matches!(event,
+            Event::PastTurnFinished { key:Some(key), outcome:crate::notifications::Kind::Cancelled } if key=="claude:old-before-reset")));
+        assert!(!acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { .. })));
+        assert!(adapter.deferred_attention.is_empty());
     }
 
     #[test]
@@ -8802,7 +8960,7 @@ mod tests {
             } else {
                 crate::notifications::Kind::Succeeded
             };
-            assert!(acknowledged.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
+            assert!(acknowledged.events.iter().any(|event| matches!(event, Event::PastTurnFinished { key, outcome } if key.as_deref() == Some("claude:first") && *outcome == expected)));
             let second = adapter
                 .receive(
                     json!({"type":"result","subtype":"success","uuid":"second","is_error":false}),

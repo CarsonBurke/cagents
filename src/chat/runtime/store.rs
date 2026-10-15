@@ -705,16 +705,9 @@ impl Store {
         if let Some(warning) = self.flush_input()? {
             out.push(nonfatal(warning));
         }
-        if let Event::TurnFinished { outcome, .. } = &event {
-            let status = match outcome {
-                crate::notifications::Kind::Cancelled => Some(crate::chat::ToolStatus::Stopped),
-                crate::notifications::Kind::Failed => Some(crate::chat::ToolStatus::Failed),
-                _ => None,
-            };
-            if let Some(status) = status {
-                self.finish_running(status)?;
-            }
-        }
+        // A turn outcome does not prove that every tool/process ended.
+        // Resumable provider terminals can intentionally outlive a cancelled
+        // turn. Only exact item-end/native cleanup evidence may retire them.
         let input_delta = matches!(&event, Event::InputDelta { .. });
         match event {
             Event::InputDelta { id, offset, delta } | Event::OutputDelta { id, offset, delta } => {
@@ -858,60 +851,6 @@ impl Store {
             }
         }
         Ok(out)
-    }
-    /// Finalize only the indexed live tools, leaving transcript bodies and
-    /// completed history untouched. Batch metadata bounds transient memory.
-    pub(super) fn finish_running(&mut self, status: crate::chat::ToolStatus) -> Result<(), String> {
-        let _ = self.flush_text()?;
-        let _ = self.flush_input()?;
-        loop {
-            let rows = {
-                let mut query = self
-                    .db
-                    .prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64")
-                    .map_err(|error| error.to_string())?;
-                let rows = query
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                rows
-            };
-            if rows.is_empty() {
-                break;
-            }
-            for (id, metadata) in rows {
-                let mut item: Item =
-                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
-                match &mut item.content {
-                    ItemContent::Tool {
-                        status: current, ..
-                    }
-                    | ItemContent::Command {
-                        status: current, ..
-                    }
-                    | ItemContent::Changes {
-                        status: current, ..
-                    } if *current == crate::chat::ToolStatus::Running => *current = status,
-                    _ => {}
-                }
-                if matches!(item.content, ItemContent::Changes { .. }) {
-                    self.finish_file_status("", &id, status)?;
-                }
-                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-                self.db
-                    .execute(
-                        "UPDATE items SET metadata=?2,running=0 WHERE id=?1",
-                        params![id, metadata],
-                    )
-                    .map_err(|error| error.to_string())?;
-                self.changed(&id);
-                self.dirty = true;
-            }
-        }
-        Ok(())
     }
     fn flush_input(&mut self) -> Result<Option<String>, String> {
         match self.pending_input.take() {
@@ -1906,21 +1845,8 @@ mod tests {
     }
 
     #[test]
-    fn terminal_outcomes_update_only_running_metadata_and_never_rewrite_bodies() {
-        for (outcome, expected) in [
-            (
-                crate::notifications::Kind::Cancelled,
-                crate::chat::ToolStatus::Stopped,
-            ),
-            (
-                crate::notifications::Kind::Failed,
-                crate::chat::ToolStatus::Failed,
-            ),
-            (
-                crate::notifications::Kind::Succeeded,
-                crate::chat::ToolStatus::Running,
-            ),
-        ] {
+    fn turn_outcomes_preserve_native_tool_status_and_never_rewrite_bodies() {
+        for outcome in [crate::notifications::Kind::Cancelled,crate::notifications::Kind::Failed,crate::notifications::Kind::Succeeded] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut store = Store::at(directory.path().into()).unwrap();
             let input = "retained input".repeat(1000);
@@ -1952,17 +1878,13 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 after - before,
-                if outcome == crate::notifications::Kind::Succeeded {
-                    0
-                } else {
-                    1
-                },
-                "only the metadata row changes; chunks are never deleted or rewritten"
+                0,
+                "turn settlement is not per-item terminal proof; neither metadata nor chunks are rewritten"
             );
             store.apply(Event::TurnStarted).unwrap();
             let page = store.window().unwrap();
             assert!(
-                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==expected)
+                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==crate::chat::ToolStatus::Running)
             );
         }
     }
