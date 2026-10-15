@@ -1940,7 +1940,7 @@ impl Adapter for Claude {
                     PromptMode::Send,
                 )
             }
-            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadOriginal { .. } | Command::PromptOriginal { .. } => {
+            Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } | Command::LoadOriginal { .. } | Command::PromptOriginal { .. } | Command::PromptNamed { .. } => {
                 return Err("File changes are served by the transcript cache".into());
             }
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),

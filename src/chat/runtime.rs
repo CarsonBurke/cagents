@@ -2068,7 +2068,7 @@ impl Actor {
                 None
             };
             let mut command=command;
-            let starts_turn = matches!(&command, Command::Prompt { .. }|Command::PromptOriginal{..});
+            let starts_turn = matches!(&command, Command::Prompt { .. }|Command::PromptOriginal{..}|Command::PromptNamed{..});
             if run.is_some() && starts_turn {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if !state.ready || state.busy || state.waiting || !state.requests.is_empty() {
@@ -2081,6 +2081,7 @@ impl Actor {
             let authorizes_work = match &command {
                 Command::Prompt { .. }
                 | Command::PromptOriginal { .. }
+                | Command::PromptNamed { .. }
                 | Command::Compact
                 | Command::Slash { .. }
                 | Command::StartQueued { .. }
@@ -2100,6 +2101,12 @@ impl Actor {
                 let _ = reply.send(Err(error));
                 continue;
             }
+            // Normalize actor-owned display hints before provider admission.
+            // They never select a file, account, or provider identity.
+            let names=if let Command::PromptNamed{text,attachments,mode}=command{
+                let (attachments,names):(Vec<_>,Vec<_>)=attachments.into_iter().map(|attachment|(super::Attachment{path:attachment.path},attachment.display_path)).unzip();
+                command=Command::Prompt{text,attachments,mode};names
+            }else{Vec::new()};
             let retry=if let Command::PromptOriginal{session_id,original,turn_generation}=&command{
                 let state=self.state.lock().unwrap_or_else(|p|p.into_inner());
                 let allowed=run.is_none() && state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty() && state.queued_messages.is_empty() && state.turn_generation==*turn_generation && state.session_id.as_deref()==Some(session_id.as_str()) && state.capabilities.original_retry && self.pending.is_empty() && self.output.is_empty();
@@ -2114,7 +2121,7 @@ impl Actor {
             // leaves the ordinary command and picker paths intact, and cannot
             // prevent the user from sending work to the provider.
             let original=if let Some((id,_))=&retry{Some(id.clone())}else if run.is_none() && self.adapter.supports_original_commands(&command){
-                match self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare(&mut command,&self.working_directory){
+                match self.annotations.lock().unwrap_or_else(|p|p.into_inner()).prepare_named(&mut command,&self.working_directory,&names){
                     Ok(id)=>id,
                     Err(error)=>{tracing::warn!(?error,"original command capture unavailable");None},
                 }
