@@ -10210,6 +10210,20 @@ mod account_continuation_capture_tests {
         start_with_speed(directory,label,policy,busy,Some(chat::FastMode::default()))
     }
     fn start_with_speed(directory: &std::path::Path, label: &str, policy: Value, busy: bool, speed:Option<chat::FastMode>) -> (chat::runtime::LocalHandle, PathBuf) {
+        let models:Vec<Model> = ["launch-model", "current-model"].into_iter().map(|id| Model {
+            id:id.into(),label:id.into(),reasoning:vec!["low".into(),"high".into()],
+        }).collect();
+        let adapter = Claude {ready:true,busy,models:models.clone(),selected:Some("launch-model".into()),reasoning:Some("low".into()),
+            fast_mode:speed.clone(),..Default::default()};
+        let capabilities = adapter.capabilities();
+        let mut initial = Step {events:vec![Event::Ready(true),Event::Status {busy,detail:String::new()},
+            Event::Capabilities(capabilities),Event::Models {models,selected:Some("launch-model".into()),reasoning:Some("low".into())},
+            Event::PermissionMode(Some("plan".into()))],..Default::default()};
+        if let Some(speed)=speed { initial.events.push(Event::FastMode(speed)); }
+        start_actor(directory,label,policy,adapter,initial)
+    }
+
+    fn start_actor(directory:&std::path::Path,label:&str,policy:Value,adapter:Claude,mut initial:Step)->(chat::runtime::LocalHandle,PathBuf) {
         let log = directory.join(format!("{label}-wire.jsonl"));
         let recipe = crate::model::LaunchRecipe {
             program: "/usr/bin/python3".into(),
@@ -10226,17 +10240,7 @@ for line in sys.stdin:
 "#.into(), policy.to_string(), log.to_string_lossy().into_owned()],
             working_directory: directory.to_path_buf(), environment: Default::default(), unset_environment: Default::default(),
         };
-        let models:Vec<Model> = ["launch-model", "current-model"].into_iter().map(|id| Model {
-            id:id.into(),label:id.into(),reasoning:vec!["low".into(),"high".into()],
-        }).collect();
-        let adapter = Claude {ready:true,busy,models:models.clone(),selected:Some("launch-model".into()),reasoning:Some("low".into()),
-            fast_mode:speed.clone(),..Default::default()};
-        let capabilities = adapter.capabilities();
         let spec = ProcessSpec::from(&recipe);
-        let mut initial = Step {events:vec![Event::Ready(true),Event::Status {busy,detail:String::new()},
-            Event::Capabilities(capabilities),Event::Models {models,selected:Some("launch-model".into()),reasoning:Some("low".into())},
-            Event::PermissionMode(Some("plan".into()))],..Default::default()};
-        if let Some(speed)=speed { initial.events.push(Event::FastMode(speed)); }
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let handle = chat::runtime::LocalHandle::start(spec,Box::new(adapter),initial,store,None,|_|{}).unwrap();
         (handle, log)
@@ -10260,6 +10264,23 @@ for line in sys.stdin:
         assert_eq!(read[0]["request"]["subtype"],"get_settings");
         assert!(!handle.is_completed(),"metadata capture retains the original live actor");
         handle.close().unwrap();
+    }
+
+    #[test]
+    fn live_continuation_refuses_unattested_effort_absence_from_initialize_metadata() {
+        let directory=tempfile::tempdir().unwrap();
+        for (label,model) in [("missing-catalog",json!({"value":"launch-model"})),("empty-catalog",json!({"value":"launch-model","supportedEffortLevels":[]}))] {
+            let mut adapter=Claude::default();
+            let initialize=adapter.initialize().unwrap();
+            let initial=adapter.receive(json!({"type":"control_response","response":{"subtype":"success",
+                "request_id":initialize.writes[0]["request_id"],"response":{"models":[model],"model":"launch-model","current_permission_mode":"plan","fast_mode_state":"off"}}})).unwrap();
+            adapter.command_ack(); adapter.control_replies();
+            let (handle,_)=start_actor(directory.path(),label,policy(),adapter,initial);
+            let snapshot=handle.snapshot(None).unwrap();
+            assert!(snapshot.models[0].reasoning.is_empty()); assert!(snapshot.reasoning.is_none());
+            assert!(handle.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap_err().contains("not confirmed all"));
+            assert!(!handle.is_completed()); handle.close().unwrap();
+        }
     }
 
     #[test]

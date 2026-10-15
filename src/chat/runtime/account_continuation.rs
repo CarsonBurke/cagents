@@ -57,7 +57,6 @@ fn capture_known(snapshot: &Snapshot, policy: super::super::PermissionSettings) 
     let model = snapshot.models.iter().find(|model| &model.id == selected).ok_or_else(unknown)?;
     match snapshot.reasoning.as_ref() {
         Some(effort) if model.reasoning.contains(effort) => {},
-        None if model.reasoning.is_empty() => {},
         _ => return Err(unknown()),
     }
     let mode = snapshot.permission_mode.as_ref().filter(|value| !value.is_empty()).ok_or_else(unknown)?;
@@ -104,19 +103,28 @@ mod tests {
             }
             assert!(capture_known(&state,policy.clone()).is_err(),"{missing}");
         }
-        let mut unsupported = complete;
-        unsupported.models[0].reasoning.clear(); unsupported.reasoning=None;
-        unsupported.capabilities.fast_mode=false;
-        let controls = capture_known(&unsupported,policy).unwrap();
+        let mut disabled_speed = complete.clone();
+        disabled_speed.capabilities.fast_mode=false;
+        let controls = capture_known(&disabled_speed,policy.clone()).unwrap();
         assert_eq!(controls.controls().fast_mode,Some(false),"confirmed nonchangeable speed is retained");
+        let mut absent_catalog = complete;
+        absent_catalog.models[0].reasoning.clear(); absent_catalog.reasoning=None;
+        assert!(capture_known(&absent_catalog,policy).is_err(),"a projected empty effort catalog does not attest an unsupported control");
     }
 }
 
 #[cfg(test)]
 mod deadline_tests {
     use super::*;
-    struct IdleReader;
+    struct IdleReader {
+        admitted:crossbeam_channel::Sender<()>,
+        release:crossbeam_channel::Receiver<()>,
+    }
     impl Adapter for IdleReader {
+        fn before_account_continuation_readiness(&mut self) {
+            self.admitted.send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
         fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
         fn command(&mut self, _:Command) -> Result<Step,String> { Err("the busy actor must never read settings".into()) }
         fn receive(&mut self,_:serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
@@ -128,15 +136,20 @@ mod deadline_tests {
         let spec=ProcessSpec::from(&recipe);
         let mut initial=Step {events:vec![Event::Ready(true),Event::Status {busy:true,detail:String::new()}],..Step::default()};
         let store=super::super::preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(IdleReader),initial,store,None,|_|{}).unwrap();
-        let state=handle.0.state.lock().unwrap();
+        let (admitted,observed)=crossbeam_channel::bounded(1);
+        let (release,resume)=crossbeam_channel::bounded(1);
+        let handle=LocalHandle::start(spec,Box::new(IdleReader {admitted,release:resume}),initial,store,None,|_|{}).unwrap();
         let capture=handle.clone(); let (entered,started)=crossbeam_channel::bounded(1);
         let worker=thread::spawn(move|| {
-            let deadline=Instant::now()+Duration::from_millis(150);
+            let deadline=Instant::now()+Duration::from_secs(2);
             entered.send(deadline).unwrap();
             capture.capture_continuation_options(deadline)
         });
         let deadline=started.recv_timeout(Duration::from_secs(5)).unwrap();
+        observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(Instant::now()<deadline,"the actor admitted the query inside its original budget");
+        let state=handle.0.state.lock().unwrap();
+        release.send(()).unwrap();
         thread::sleep(deadline.saturating_duration_since(Instant::now())+Duration::from_millis(10));
         drop(state);
         assert!(worker.join().unwrap().unwrap_err().contains("budget expired"));

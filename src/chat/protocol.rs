@@ -347,6 +347,9 @@ pub trait Adapter: Send {
     fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
         Ok(())
     }
+    #[cfg(test)]
+    fn before_account_continuation_readiness(&mut self) {}
+
     /// Exact policy coverage for a new conversation that may automatically
     /// receive an unaccepted request. A UI settings projection is insufficient.
     /// Only an adapter with a fresh provider settings response may attest it.

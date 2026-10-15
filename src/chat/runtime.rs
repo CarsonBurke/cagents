@@ -3135,6 +3135,8 @@ impl Actor {
                     continue;
                 }
                 ActorCommand::AccountSwitchGeneration(readiness) => {
+                    #[cfg(test)]
+                    self.adapter.before_account_continuation_readiness();
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     let generation = (self.update_readiness(&state) == UpdateReadiness::Idle
                         && self.adapter.account_switch_ready()
