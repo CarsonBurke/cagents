@@ -525,7 +525,7 @@ impl Snapshot {
     }
 
     fn from_native(version: i32, native: TextSnapshot) -> Self {
-        Self {version,text:OnceLock::new(),native:Some(native),line_starts:OnceLock::new()}
+        Self {version,text:OnceLock::new(),native:Some(native.without_cached_text()),line_starts:OnceLock::new()}
     }
 
     fn full_text(&self) -> &Arc<str> {

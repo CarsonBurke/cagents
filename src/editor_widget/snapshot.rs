@@ -135,6 +135,12 @@ impl TextSnapshot {
         }).collect();
         Self { root: build(&lines), serialized: Arc::new(OnceLock::new()), #[cfg(test)] serializations: Arc::new(std::sync::atomic::AtomicUsize::new(0)) }
     }
+    /// Shares immutable lines while giving a consumer its own empty text
+    /// cache. Protocol history must not retain a full string cached by a diff.
+    pub fn without_cached_text(&self)->Self {
+        Self {root:self.root.clone(),serialized:Arc::new(OnceLock::new()),#[cfg(test)] serializations:Arc::clone(&self.serializations)}
+    }
+
     /// A functional replacement for protocol-compatible native lines. Only
     /// the boundary lines, inserted text and AVL ancestors are copied.
     pub fn replaced(&self, start: Position, end: Position, inserted: &str) -> Option<Self> {
@@ -248,6 +254,21 @@ mod tests {
             assert_balanced(left); assert_balanced(right);
         }
     }
+    #[test]
+    fn detached_consumer_cache_shares_lines_without_retaining_full_text() {
+        let source = TextSnapshot::from_lines([("first",LineEnding::Lf,"\n"),("second",LineEnding::None,"")]);
+        let text = source.text();
+        let weak = Arc::downgrade(&text);
+        let protocol = source.without_cached_text();
+        assert!(Arc::ptr_eq(source.root.as_ref().unwrap(),protocol.root.as_ref().unwrap()));
+        assert!(source.same_text(&protocol));
+        assert!(source.is_materialized());assert!(!protocol.is_materialized());
+        drop(text);drop(source);
+        assert!(weak.upgrade().is_none(),"protocol history must not own the diff's full serialization");
+        assert_eq!(protocol.line(1).unwrap().text,"second");
+        assert_eq!(protocol.text().as_ref(),"first\nsecond");
+    }
+
     #[test]
     fn functional_replacements_preserve_native_lines_without_serializing() {
         let original = TextSnapshot::from_lines([("α",LineEnding::CrLf,"\r\n"),("middle",LineEnding::Lf,"\n"),("last",LineEnding::None,"")]);
