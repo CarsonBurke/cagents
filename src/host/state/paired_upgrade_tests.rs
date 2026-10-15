@@ -911,7 +911,7 @@ fn restore_missing_native_with_carried_scope(
     fs::create_dir(&proc_root).unwrap();
     assert_eq!(
         restore_upgrade_from(&restored, store, &proc_root, Some(&holders)).unwrap(),
-        vec![issued.id]
+        vec![native_id]
     );
     let handle = {
         let state = restored.lock().unwrap();
