@@ -2082,6 +2082,39 @@ mod tests {
     }
 
     #[test]
+    fn restart_keeps_only_the_exact_authenticated_retained_run_and_process() {
+        for changed in ["none", "run", "proof", "account", "actor", "provider"] {
+            let (mut registry, directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 10).unwrap();
+            let source = source();
+            registry.bind_agent(accepted.agent.id, None, source.clone()).unwrap();
+            let running = registry.update_agent_run(accepted.run.id, accepted.run.revision,
+                Update::Started { provider_key: "retained-command".into() }, 11).unwrap();
+            let mut retained = source;
+            let mut run = accepted.run.id;
+            let HostedSession::Chat(candidate) = &mut retained else { unreachable!() };
+            match changed {
+                "run" => run = RunId::new(),
+                "proof" => candidate.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("unrelated"),
+                "account" => { candidate.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(), "/another-account".into()); },
+                "actor" => candidate.id = crate::model::TerminalId::new(),
+                "provider" => candidate.launch.provider = Provider::Codex,
+                _ => {},
+            }
+            drop(registry);
+            let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+            registry.interrupt_unproven_agent_runs_except(12, &[(run, retained)]).unwrap();
+            let actual = registry.agent_run(accepted.run.id).unwrap();
+            if changed == "none" {
+                assert_eq!(actual, running, "authenticated live reducer retains the original accepted run");
+                assert!(!registry.claim_agent_dispatch(&accepted, 13).unwrap(), "retaining a run never authorizes redelivery");
+            } else {
+                assert_eq!(actual.state, State::Interrupted, "{changed} is not evidence for this accepted run");
+            }
+        }
+    }
+
+    #[test]
     fn committed_dispatch_claim_is_once_only_and_restart_never_reauthorizes_it() {
         let (mut registry, directory, request) = fixture();
         let accepted = registry.submit_agent(&Origin::User, &request, 10).unwrap();
