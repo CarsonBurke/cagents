@@ -700,6 +700,7 @@ impl Cagents {
     }
 
     fn project_has_unsaved_editors(&self, project: ProjectId) -> bool {
+        if self.project_has_publication_recovery(project) {return true;}
         self.project_cards(project).into_iter().any(|card| {
             self.card_has_editor_recovery(card) || match self.cards.get(&card) {
                 Some(CardRuntime::Repository(runtime)) => runtime.blocks_navigation(),
@@ -1573,7 +1574,8 @@ impl Cagents {
                     // The daemon has already closed every terminal and chat in
                     // the directory, so their cards are tombstoned here without
                     // a second close request: dropping a runtime only detaches.
-                    let retained_editors = self.durable.cards.iter().any(|card| {
+                    let window_recovery=self.publication_recovery_blocks(&target.path);
+                    let retained_editors = window_recovery || self.durable.cards.iter().any(|card| {
                         card.existence.is_open() && card_belongs_to(card, &target.path)
                             && (self.card_has_editor_recovery(card.id) || self.card_has_project_editor_write(card.id))
                     });
@@ -1583,6 +1585,7 @@ impl Cagents {
                         .iter()
                         .filter(|card| {
                             card.existence.is_open() && card_belongs_to(card, &target.path)
+                                && !window_recovery
                                 && !self.card_has_editor_recovery(card.id)
                                 && !self.card_has_project_editor_write(card.id)
                         })
@@ -1876,6 +1879,9 @@ impl Cagents {
         }
         if worktree.locked {
             return Some("This worktree is locked. Unlock it explicitly in Git first.".into());
+        }
+        if self.publication_recovery_blocks(&target.path) {
+            return Some("Resolve this worktree's file recovery before deleting it.".into());
         }
         if self.cards.iter().any(|(card, runtime)| {
             self.card_has_editor_recovery(*card) && match runtime {
@@ -3204,6 +3210,39 @@ mod tests {
         assert!(!app.channel_ui.is_deleting(channel));assert!(app.durable.channels.iter().any(|row|row.id==channel));
         assert!(app.card_state(card).unwrap().existence.is_open());assert!(app.sidebar_model.project(project).is_some());
         assert!(app.status.as_ref().is_some_and(|notice|notice.message.contains("original project identity")));
+    }
+
+    #[tokio::test]
+    async fn window_owned_orphan_recovery_fences_only_its_project_and_resumes_original_close() {
+        use cosmic::iced::futures::StreamExt;
+        let repository=PathBuf::from("/window-recovery-project");
+        let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+        let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+        let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+        let other=ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(other,RepositoryId::new(),"Other".into(),"/unrelated-project".into(),Vec::new(),Vec::new()).with_kind(ProjectKind::Folder));
+        let authority=crate::editor::RecoverySlot::reserve().unwrap().retain("unopened files still owned by real recovery".into(),||Ok(()));
+        let failure=crate::editor_workspace_edit::PublicationFailure {message:"original unopened operation needs recovery".into(),recovery:Some(authority.clone()),worktree:Some(linked.path.clone())};
+        // An orphan result carries live authority even though there is no card
+        // or current publisher to own it. Dispatch the actual stale receipt.
+        drop(app.update(Message::EditorFeatures(super::super::editor_features::Action::Published{ticket:999,result:Err(failure)})));
+        assert!(app.project_has_editor_recovery(project));assert!(!app.project_has_editor_recovery(other));
+        assert!(app.selected_project_removal_blocker(project).is_some());assert!(app.selected_project_removal_blocker(other).is_none());
+        assert!(app.selected_worktree_deletion_blocker(project,linked.id).unwrap().contains("recovery"));
+        drop(app.close_shared_project(&repository));let generation=app.project_ui.close_generation[&project];
+        drop(app.handle_project_action(Action::ProjectSessionsClosed(project,generation,Ok(ProjectSessionClosure::for_roots(vec![repository])))));
+        assert_eq!(app.project_ui.recovery_closures[&project].0,generation);assert!(app.sidebar_model.project(project).is_some());
+        let retry=app.update(Message::EditorFeatures(super::super::editor_features::Action::RetryPublicationRecovery(authority.clone())));
+        let mut stream=iced::runtime::task::into_stream(retry).unwrap();let mut delivered=false;
+        while let Some(action)=stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message))=action {
+                delivered|=matches!(&message,Message::EditorFeatures(super::super::editor_features::Action::PublicationRecoveryResolved{..}));
+                drop(app.update(message));
+            }
+        }
+        assert!(delivered);assert!(authority.is_resolved());
+        assert!(app.sidebar_model.project(project).is_none());assert!(app.sidebar_model.project(other).is_some());
+        assert!(!app.project_ui.recovery_closures.contains_key(&project));
     }
 
     #[test]

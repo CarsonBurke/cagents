@@ -198,8 +198,19 @@ impl Cagents {
             .map(|card| card.id)
             .collect()
     }
+    pub(super) fn project_has_publication_recovery(&self, project: ProjectId) -> bool {
+        let Some(row)=self.sidebar_model.project(project) else {return false;};
+        let roots=std::iter::once(self.project_root(row))
+            .chain(std::iter::once(row.repository.clone()))
+            .chain(row.worktrees.iter().map(|worktree|worktree.path.clone()))
+            .chain(self.project_ui.checkout_roots.get(&row.repository).cloned())
+            .chain(self.project_ui.primary_checkout_roots.get(&row.repository).cloned())
+            .collect::<HashSet<_>>();
+        roots.iter().any(|root|self.publication_recovery_blocks(root))
+    }
     pub(super) fn project_has_editor_recovery(&self, project: ProjectId) -> bool {
-        self.project_cards(project).into_iter().any(|card| self.card_has_editor_recovery(card))
+        self.project_has_publication_recovery(project)
+            || self.project_cards(project).into_iter().any(|card| self.card_has_editor_recovery(card))
     }
     pub(super) fn missing_project_cards(&self) -> HashSet<CardId> {
         self.sidebar_model
