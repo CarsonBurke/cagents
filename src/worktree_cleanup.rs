@@ -1050,6 +1050,7 @@ mod tests {
         assert!(acquire(&runtime, &original, true).is_ok());
     }
 
+    #[cfg(any(feature = "host", feature = "ui"))]
     #[test]
     fn sync_retains_moved_directory_inode_lease_until_scope_leaves() {
         let runtime = tempfile::tempdir().unwrap();

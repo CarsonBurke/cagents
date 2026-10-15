@@ -21,7 +21,6 @@ pub(super) fn require_complete_inventory(output: &ProcessOutput) -> Result<(), R
     Ok(())
 }
 
-
 impl<E: ProcessExecutor> RepositoryService<E> {
     /// Safety decisions require a complete census, even when Git returns
     /// success while warning that a directory could not be read.
@@ -34,5 +33,4 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         require_complete_inventory(&output)?;
         invalid_output(parse_status(&output.stdout), output)
     }
-
 }
