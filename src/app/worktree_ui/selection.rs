@@ -110,7 +110,7 @@ fn prepare_target(
 
 impl Cagents {
     pub(in crate::app) fn select_worktree_then(&mut self, path: PathBuf, create: bool, intent: Intent) -> Task<Message> {
-        self.worktree_selection.cancel();
+        let cancelled=self.cancel_worktree_selection();
         // Headless fixture windows own no filesystem leases. Keep their
         // existing synchronous navigation semantics; production takes the
         // exact same commit path after off-thread preparation.
@@ -118,7 +118,7 @@ impl Cagents {
             let scope = self.commit_worktree_selection_scope(path, create, &intent);
             let initialization = self.initialize_prepared_scope_runtimes();
             let after = self.finish_worktree_selection(intent);
-            return Task::batch([scope, initialization, after, self.resolve_worktree_owner_paths()]);
+            return Task::batch([cancelled, scope, initialization, after, self.resolve_worktree_owner_paths()]);
         }
         let epoch = self.worktree_owner_paths.invalidate_watched();
         self.refresh_worktree_owners(Some(&path));
@@ -130,11 +130,37 @@ impl Cagents {
         )).collect::<Vec<_>>();
         let cached = self.worktree_owner_paths.cached.get(&path).cloned();
         let watch = self.worktree_owner_paths.watch.clone();
-        self.prepare_worktree_selection(generation, path, create, intent, epoch, move |path| {
+        let prepare=self.prepare_worktree_selection(generation, path, create, intent, epoch, move |path| {
             prepare_target(path, roots, cached, &watch, |path| path.canonicalize(), |path| {
                 crate::worktree_cleanup::protect(path)?.ok_or_else(|| std::io::Error::other("local worktree protection became unavailable")).map(Some)
             })
-        })
+        });
+        Task::batch([cancelled,prepare])
+    }
+
+    /// Drop superseded prepared guards even if a modal is keeping successful
+    /// navigation completions deferred, and settle their dependent lifecycles.
+    pub(super) fn cancel_worktree_selection(&mut self) -> Task<Message> {
+        self.worktree_selection.cancel();
+        let deferred=std::mem::take(&mut self.deferred_navigation);
+        let mut tasks=Vec::new();
+        for message in deferred {
+            match message {
+                Message::WorktreeSelectionPrepared {generation,create,receipt}=>
+                    tasks.push(self.worktree_selection_prepared(generation,create,receipt)),
+                other=>self.deferred_navigation.push_back(other),
+            }
+        }
+        Task::batch(tasks)
+    }
+
+    pub(super) fn prepared_selection_navigates(&self, generation: u64, receipt: &Receipt) -> bool {
+        generation==self.worktree_selection.generation && self.worktree_selection.pending
+            && receipt.0.lock().unwrap().as_ref().is_some_and(|(_,epoch,roots,intent,result)| {
+                *epoch==self.worktree_owner_paths.watch.epoch() && roots==&self.known_worktree_roots
+                    && match intent {Intent::Channel {id,path,..}=>self.channel_scope_path(*id).as_ref()==Some(path),_=>true}
+                    && result.is_ok()
+            })
     }
 
     fn prepare_worktree_selection(
@@ -411,6 +437,77 @@ mod tests {
         let inserted=app.durable.cards.iter().find(|card|matches!(&card.kind,CardKind::Terminal(session) if session.id==terminal)).unwrap();
         assert!(app.durable.channels.iter().find(|row|row.id==channel).unwrap().cards.contains(&inserted.id));
         assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(),next.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+    }
+
+    fn ready_selection_message(app: &mut Cagents,path: PathBuf,guard: crate::worktree_cleanup::Protection,intent: Intent) -> Message {
+        app.worktree_selection.cancel();
+        app.worktree_selection.pending=true;
+        let generation=app.worktree_selection.generation;
+        let epoch=app.worktree_owner_paths.watch.epoch();
+        let task=app.prepare_worktree_selection(generation,path,false,intent,epoch,move |path| {
+            Ok((path.clone(),vec![(path.clone(),path)],Some(guard)))
+        });
+        crate::app::tests::task_app_message(task)
+    }
+
+    #[test]
+    fn successful_prepared_scope_waits_for_a_modal_then_commits_once() {
+        let runtime=tempfile::tempdir().unwrap();let old=tempfile::tempdir().unwrap();let next=tempfile::tempdir().unwrap();
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.extend([old.path().to_owned(),next.path().to_owned()]);
+        drop(app.select_worktree_inner(old.path().to_owned(),false));
+        let guard=crate::worktree_cleanup::fixture_protection(runtime.path(),next.path(),false).unwrap();
+        let message=ready_selection_message(&mut app,next.path().to_owned(),guard,Intent::Navigate);
+        app.resume_ui.open=true;
+        drop(app.update(message));
+        assert_eq!(app.deferred_navigation.len(),1);
+        assert_eq!(app.active_workspace.as_deref(),Some(old.path()));
+        assert!(matches!(crate::worktree_cleanup::fixture_protection(runtime.path(),next.path(),true),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock));
+        app.resume_ui.open=false;
+        let task=app.release_deferred_navigation_if_unblocked();
+        let message=crate::app::tests::task_app_message(task);
+        drop(app.update(message));
+        assert_eq!(app.active_workspace.as_deref(),Some(next.path()));
+        assert!(app.deferred_navigation.is_empty());
+        assert!(app.worktree_selection.inflight.is_empty());
+    }
+
+    #[test]
+    fn cancelling_a_modal_deferred_selection_releases_its_guard_before_removal_callback() {
+        let runtime=tempfile::tempdir().unwrap();let old=tempfile::tempdir().unwrap();let next=tempfile::tempdir().unwrap();
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        app.known_worktree_roots.extend([old.path().to_owned(),next.path().to_owned()]);
+        drop(app.select_worktree_inner(old.path().to_owned(),false));
+        app.worktree_protections.install_prepared(Some(crate::worktree_cleanup::fixture_protection(runtime.path(),old.path(),false).unwrap()));
+        let CardKind::Terminal(session)=crate::app::tests::terminal_card_state().kind else {unreachable!()};
+        let marker=CardId::new();
+        let intent=Intent::TerminalWithLifecycle {session,committed:Box::new(Message::TerminalError {card:marker,message:"unexpected commit".into()}),
+            rejected:Box::new(Message::TerminalError {card:marker,message:"prepared cancellation settled".into()})};
+        let guard=crate::worktree_cleanup::fixture_protection(runtime.path(),next.path(),false).unwrap();
+        let message=ready_selection_message(&mut app,next.path().to_owned(),guard,intent);
+        app.resume_ui.open=true;
+        app.deferred_navigation.push_back(Message::SettingsSearchChanged("before".into()));
+        drop(app.update(message));
+        app.deferred_navigation.push_back(Message::SettingsSearchChanged("after".into()));
+        let worker_runtime=runtime.path().to_owned();let target=next.path().to_owned();
+        let (completed,received)=crossbeam_channel::bounded(1);
+        let sync=app.sync_worktree_protections_then_released(target.clone(),move |result| {
+            let result=result.and_then(|()|crate::worktree_cleanup::fixture_protection(&worker_runtime,&target,true).map(|_|()).map_err(|error|error.to_string()));
+            completed.send(result).unwrap();
+            Message::TerminalError {card:marker,message:"removal lease callback ran".into()}
+        });
+        let message=crate::app::tests::task_app_message(sync);
+        drop(app.update(message));
+        assert!(received.try_recv().is_err());
+        drop(app.cancel_worktree_selection());
+        assert_eq!(received.recv_timeout(Duration::from_secs(3)).unwrap(),Ok(()));
+        assert_eq!(app.active_workspace.as_deref(),Some(old.path()));
+        assert!(app.worktree_selection.inflight.is_empty());
+        assert_eq!(app.notices.entries.iter().filter(|entry|entry.notice.message=="prepared cancellation settled").count(),1);
+        assert!(!app.notices.entries.iter().any(|entry|entry.notice.message=="unexpected commit"));
+        let order=app.deferred_navigation.iter().filter_map(|message|match message {Message::SettingsSearchChanged(value)=>Some(value.as_str()),_=>None}).collect::<Vec<_>>();
+        assert_eq!(order,vec!["before","after"]);
+        crate::worktree_cleanup::fixture_protection(runtime.path(),next.path(),true).unwrap();
     }
 
     #[test]
