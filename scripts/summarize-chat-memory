@@ -21,6 +21,7 @@ OWNER_COUNTERS = {
     "chat_client": ("resident_bytes",),
     "chat_offline": ("pending_bytes", "in_flight_bytes", "io_buffer_capacity", "disk_bytes"),
     "chat_source_pool": ("admitted_bytes", "reserved_bytes"),
+    "chat_plain_copy_output": ("retained_bytes",),
     "ipc": ("read_capacity", "write_capacity"),
 }
 
@@ -30,7 +31,8 @@ def trace_owners(log, pid=None):
     stacks = {}
     coverage = {"matched_lines": 0, "missing_process_id_lines": 0,
                 "complete_owner_events": 0, "incomplete_owner_events": 0,
-                "incomplete_stack_events": 0}
+                "incomplete_stack_events": 0,
+                "complete_events_by_owner": {owner: 0 for owner in OWNER_COUNTERS}}
     with log.open(errors="replace") as source:
         for line in source:
             if "cagents::memory" not in line:
@@ -62,10 +64,13 @@ def trace_owners(log, pid=None):
                     stacks.pop((thread, base), None)
                     stacks[(thread, base)] = (size, guard, role)
             elif owner in owners:
-                identity = fields.get({"ipc": "codec", "chat_offline": "offline_id", "chat_source_pool": "pool_id"}.get(owner, "chat_id"))
+                identity = ("global" if owner == "chat_plain_copy_output" else
+                    fields.get({"ipc": "codec", "chat_offline": "offline_id", "chat_source_pool": "pool_id"}.get(owner, "chat_id")))
                 try:
                     if not identity or not line.endswith("\n"):
                         raise ValueError("unfinished owner event")
+                    if owner == "chat_plain_copy_output" and int(fields["process_id"]) <= 0:
+                        raise ValueError("global copy output needs an explicit process identity")
                     if owner == "chat_source_pool" and (identity != "1" or fields.get("accounting") != "logical_source_payload"):
                         raise ValueError("unknown shared source accounting schema")
                     # A partial write or a probe schema mismatch must not turn a
@@ -79,6 +84,7 @@ def trace_owners(log, pid=None):
                     coverage["incomplete_owner_events"] += 1
                     continue
                 coverage["complete_owner_events"] += 1
+                coverage["complete_events_by_owner"][owner] += 1
                 if fields.get("released") == "true":
                     owners[owner].pop((fields.get("process_id"), identity), None)
                 else:
@@ -181,8 +187,13 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     owners, stacks, coverage = trace_owners(args.log, args.pid)
-    report = {"schema_version": 4, "owner_totals": owner_totals(owners),
+    report = {"schema_version": 5, "owner_totals": owner_totals(owners),
               "trace_coverage": coverage,
+              "owner_counter_observed": {owner: count > 0 for owner, count in coverage["complete_events_by_owner"].items()},
+              "unobserved_owner_totals_are_unavailable_not_measured_zero": True,
+              "plain_copy_output_is_one_latest_global_sample_per_process": True,
+              "plain_copy_output_counts_queued_string_capacity_only": True,
+              "plain_copy_parser_temporaries_and_transferred_clipboard_are_unattributed": True,
               "incomplete_events_preserve_last_complete_owner_sample": True,
               "body_bytes_are_arc_references_not_unique_heap": True,
               "exposed_presentation_bytes_omit_opaque_parser_and_renderer": True,

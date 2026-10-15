@@ -78,6 +78,31 @@ class OwnerCensus(unittest.TestCase):
             "owners": 1, "admitted_bytes": 16384, "reserved_bytes": 0})
         self.assertEqual(coverage["incomplete_owner_events"], 2)
 
+    def test_plain_copy_output_is_one_global_capacity_sample_and_rejects_partial_updates(self):
+        prefix = 'cagents::memory: process_id=42 owner="chat_plain_copy_output" '
+        owners, _, coverage = self.parse(prefix + 'retained_bytes=8192\n'
+            + prefix + 'retained_bytes=16384\n' + prefix + 'retained_bytes=0')
+        self.assertEqual(CENSUS["owner_totals"](owners)["chat_plain_copy_output"], {"owners": 1, "retained_bytes": 16384})
+        self.assertEqual(coverage["complete_events_by_owner"]["chat_plain_copy_output"], 2)
+        self.assertEqual(coverage["incomplete_owner_events"], 1)
+        owners, _, coverage = self.parse(prefix + 'retained_bytes=8192\n' + prefix + 'retained_bytes=0\n')
+        self.assertEqual(CENSUS["owner_totals"](owners)["chat_plain_copy_output"]["retained_bytes"], 0)
+        self.assertEqual(coverage["complete_events_by_owner"]["chat_plain_copy_output"], 2)
+
+    def test_absent_counter_has_no_observation_proof_even_when_other_owners_are_complete(self):
+        _, _, coverage = self.parse('cagents::memory: process_id=42 owner="chat_client" chat_id=chat resident_bytes=16\n')
+        self.assertEqual(coverage["complete_events_by_owner"]["chat_client"], 1)
+        self.assertEqual(coverage["complete_events_by_owner"]["chat_plain_copy_output"], 0)
+        self.assertEqual(coverage["complete_events_by_owner"]["chat_source_pool"], 0)
+
+    def test_global_copy_output_without_explicit_pid_is_not_attributed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "ui.log"
+            path.write_text('cagents::memory: owner="chat_plain_copy_output" retained_bytes=8192\n')
+            owners, _, coverage = CENSUS["trace_owners"](path)
+            self.assertEqual(CENSUS["owner_totals"](owners)["chat_plain_copy_output"]["owners"], 0)
+            self.assertEqual(coverage["incomplete_owner_events"], 1)
+
     def test_mapping_intersections_do_not_prorate_partial_vmas(self):
         result = CENSUS["stack_totals"]([(4096, 8192), (8192, 4096)], [
             {"start": 4096, "end": 8192, "Rss": 8, "Pss": 7},
