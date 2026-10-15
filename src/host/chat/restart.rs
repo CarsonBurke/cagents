@@ -56,7 +56,7 @@ pub(super) fn run(host:&SharedHost, client:ClientId, source:&Session, execution:
                 (Some((plan,receipt)),Some(actor),Vec::new())
             } else {
                 let aliases = restart.aliases.clone();
-                if aliases.len() >= MAX_ALIASES { return Err(unavailable("This pane has reached the bounded restart history. Save and reopen its current exact descriptor before restarting again")); }
+                if aliases.len() >= MAX_ALIASES { return Err(unavailable("This conversation has reached its bounded exact restart history. Its pane and ownership evidence were retained. Explicitly close the conversation and resume its saved provider thread if another actor is needed")); }
                 (None,None,aliases)
             }
             }
@@ -97,7 +97,7 @@ pub(super) fn run(host:&SharedHost, client:ClientId, source:&Session, execution:
         let mut aliases=aliases;
         if !aliases.contains(source) { aliases.push(source.clone()); }
         if !aliases.contains(&canonical) { aliases.push(canonical); }
-        if !aliases_fit(&aliases) {return Err(unavailable("The bounded exact restart history is full; save the current pane before restarting"));}
+        if !aliases_fit(&aliases) {return Err(unavailable("The exact restart history exceeds its bounded metadata limit. No owner was stopped. Explicitly close this conversation and resume its saved provider thread if another actor is needed"));}
         state.chat_restarts.insert(source.id,Restart{plan:plan.clone(),aliases,busy:true,actor:None,receipt:None,request:uuid::Uuid::new_v4()});
     }
     let _claim=Claim{host:host.clone(),id:source.id};
