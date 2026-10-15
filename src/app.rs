@@ -16053,7 +16053,7 @@ impl Application for Cagents {
                     && !self.workspace_inputs_blocked()
                     && let Some(card) = self.workspace.focused()
                     && let Some(runtime) = match self.cards.get(&card) {
-                        Some(CardRuntime::Repository(runtime)) => Some(runtime),
+                        Some(CardRuntime::Repository(runtime)) => Some(runtime.as_ref()),
                         Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
                         _ => None,
                     }
