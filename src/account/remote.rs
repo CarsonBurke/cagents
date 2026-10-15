@@ -889,10 +889,12 @@ mod tests {
         let homes = super::super::home::Homes::at(root.path().join("homes"));
         let store = super::super::registry::Store::at(root.path().join("registry"));
         let (key, home) = store.create_pending(&homes, Provider::Claude, 1, || {
-            homes.create_with_config_initialized(
-                Provider::Claude, None, super::super::home::CodexConfig::Shared,
-                |receipt| std::fs::write(receipt.home().join("namespace-pointer-fixture"), "registered namespace"),
-            )
+            let (key, home) = homes.create(Provider::Claude, None)?;
+            // A synthetic durable metadata marker, not a bootstrap/read grant.
+            // Keep this retention regression portable to the issuer before
+            // the separate typed creation/export prerequisite is integrated.
+            std::fs::write(home.join("namespace-pointer-fixture"), "registered namespace")?;
+            Ok((key, home))
         }).unwrap();
         let before = store.load().unwrap();
         let cli = super::super::probe::Cli {
