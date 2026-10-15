@@ -1854,6 +1854,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn activity_ipc_preserves_failed_outcome_and_reason() {
+        let message = ServerMessage::ChatActivity {
+            chat_id: TerminalId::new(),
+            state: crate::agent::ActivityState::Idle,
+            generation: 42,
+            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "Provider exited with status 3".into() }),
+        };
+        let binary = postcard::to_stdvec(&message).unwrap();
+        let decoded: ServerMessage = postcard::from_bytes(&binary).unwrap();
+        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+        let json = serde_json::to_value(&message).unwrap();
+        let decoded: ServerMessage = serde_json::from_value(json).unwrap();
+        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+    }
+
+    #[test]
     fn frame_codec_resumes_after_timeouts_inside_prefix_and_payload() {
         struct TimeoutReader {
             bytes: Vec<u8>,
