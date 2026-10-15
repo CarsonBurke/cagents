@@ -256,11 +256,12 @@ impl State {
         self.revision=self.revision.wrapping_add(1);Ok(())
     }
     pub(super) fn project(&mut self,raw:Arc<Snapshot>,selected:Option<&str>,expanded:&HashSet<String>,find:bool)->Arc<Snapshot> {
-        if self.raw.as_ref().is_some_and(|old|old.session_id!=raw.session_id) || self.selected.as_deref()!=selected {
+        if self.raw.as_ref().is_some_and(|old|old.session_id!=raw.session_id || old.source_incarnation!=raw.source_incarnation) || self.selected.as_deref()!=selected {
             self.clear();self.selected=selected.map(str::to_owned);
         }
         let active=match selected {Some(id)=>raw.subagents.iter().find(|agent|agent.id==id).map(|agent|&agent.items),None=>Some(&raw.items)};
-        let parts:HashMap<_,_>=raw.changes_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected)
+        let parts:HashMap<_,_>=raw.changes_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected
+            && raw.source_incarnation.is_none_or(|incarnation|part.epoch.incarnation==incarnation))
             .map(|part|(part.item_id.as_str(),part)).collect();
         let mut visible=HashSet::new();let mut aliases=HashMap::new();
         if let Some(items)=active {
@@ -812,6 +813,17 @@ mod tests {
         state.toggle_file(&page.source.source_id,0,false);state.project(raw,None,&expanded,false);
         assert!(state.copy_patch(&page.source.source_id,0).is_none());assert!(weak.upgrade().is_none());
     }
+    #[tokio::test]
+    async fn same_session_source_reset_rejects_old_patch_and_unchanged_descriptor() {
+        let text="@@ -1 +1 @@\n-before\n+old\n";let page=fixture(text);let(mut state,raw,expanded)=open(&page,"visible-part");
+        let request=state.entries[&page.source].patch_requests[&0];let old=ready(&page,text).await;
+        let context=state.context;let mut reset=(*raw).clone();reset.source_incarnation=Some(uuid::Uuid::from_u128(999));
+        state.project(Arc::new(reset),None,&expanded,false);
+        assert_ne!(state.context,context);assert!(state.entries.is_empty());
+        assert!(!state.complete_patch(&page.source,0,request,Ok(old)));
+        assert_eq!(state.retained_bytes(),0);
+    }
+
     #[tokio::test]
     async fn stale_store_nonce_and_cleared_context_cannot_install_pending_patch_or_retain_it() {
         let text="exact original patch";let page=fixture(text);let (mut state,_,expanded)=open(&page,"part");
