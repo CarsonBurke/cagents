@@ -84,6 +84,7 @@ pub mod persistence;
 #[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
 pub mod process;
 pub mod project_location;
+pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
 #[cfg(feature = "ui")]
