@@ -50,7 +50,17 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     fn view(self, query: &str) -> Element<'a, Message> {
         let mut children = Vec::new();
         if !self.label_in_control {
-            children.push(highlighted(self.label.to_owned(), query, design::heading_font()).into());
+            children.push(if query.trim().is_empty() {
+                design::heading(self.label).into()
+            } else {
+                highlighted(
+                    self.label.to_owned(),
+                    query,
+                    design::heading_font(),
+                    design::TEXT_HEADING,
+                    design::LINE_BODY,
+                )
+            });
         }
         children.push(self.control);
         if let Some(error) = self.error {
@@ -82,6 +92,8 @@ fn highlighted<'a, Message: 'a>(
     text: String,
     query: &str,
     font: iced::Font,
+    size: f32,
+    line_height: f32,
 ) -> Element<'a, Message> {
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut spans = Vec::new();
@@ -113,7 +125,11 @@ fn highlighted<'a, Message: 'a>(
             span.font(font)
         });
     }
-    iced::widget::rich_text(spans).width(Length::Fill).into()
+    iced::widget::rich_text(spans)
+        .size(size)
+        .line_height(iced::widget::text::LineHeight::Absolute(line_height.into()))
+        .width(Length::Fill)
+        .into()
 }
 
 pub fn matches(text: &str, query: &str) -> bool {
@@ -183,7 +199,13 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         let mut heading: Vec<Element<'a, Message>> = vec![if query.trim().is_empty() {
             design::title(self.title).into()
         } else {
-            highlighted(breadcrumb, query, design::heading_font()).into()
+            highlighted(
+                breadcrumb,
+                query,
+                design::title_font(),
+                design::TEXT_TITLE,
+                design::LINE_TITLE,
+            )
         }];
         if !self.detail.is_empty() {
             heading.push(
@@ -289,6 +311,42 @@ pub fn search_id() -> widget::Id {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_search_preserves_label_and_group_title_line_boxes() {
+        use iced::advanced::{layout, widget::Tree};
+
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        for query in ["", "Font"] {
+            let mut setting = field::<()>("Font", "", widget::Space::new(1, 1).into())
+                .view(query);
+            let mut tree = Tree::new(&setting);
+            let node = setting.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 600.0)),
+            );
+            assert_eq!(node.children()[0].size().height, design::LINE_BODY);
+
+            let mut group = group(
+                "Font",
+                "",
+                vec![field::<()>("Font", "", widget::Space::new(1, 1).into())],
+            )
+            .view("Editor", query)
+            .unwrap();
+            let mut tree = Tree::new(&group);
+            let node = group.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 600.0)),
+            );
+            assert_eq!(
+                node.children()[0].children()[0].size().height,
+                design::LINE_TITLE,
+            );
+        }
+    }
+
     #[test]
     fn search_indexes_keys_values_captions_and_current_shortcuts() {
         let cases = [
