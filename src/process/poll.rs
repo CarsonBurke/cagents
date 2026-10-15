@@ -113,6 +113,16 @@ impl<R: Read + AsFd> PipeCapture<R> {
         }
     }
 
+    fn empty(limit: usize) -> Self {
+        Self {
+            pipe: None,
+            captured: PipeRead { output: Vec::new(), limit_exceeded: false },
+            listing: None,
+            error: None,
+            limit,
+        }
+    }
+
     fn descriptor(&self) -> i32 {
         self.pipe
             .as_ref()
@@ -217,10 +227,10 @@ pub(super) fn execute(
     })?;
     let identity = child_identity(&child);
     let setup = (|| {
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| io::Error::other("stdout pipe was unavailable"))?;
+        let stdout = child.stdout.take();
+        if stdout.is_none() && spec.stdout_file.is_none() {
+            return Err(io::Error::other("stdout pipe was unavailable"));
+        }
         let stderr = child
             .stderr
             .take()
@@ -229,7 +239,7 @@ pub(super) fn execute(
         if spec.stdin.is_some() && stdin.is_none() {
             return Err(io::Error::other("stdin pipe was unavailable"));
         }
-        set_nonblocking(stdout.as_fd())?;
+        if let Some(stdout) = &stdout { set_nonblocking(stdout.as_fd())?; }
         set_nonblocking(stderr.as_fd())?;
         if let Some(stdin) = &stdin {
             set_nonblocking(stdin.as_fd())?;
@@ -264,9 +274,13 @@ pub(super) fn execute(
     let mut child = PolledChild::new(child, identity);
     let _registration =
         cancellation.register_notifier(CancellationNotifier::Descriptor(Arc::clone(&wake)));
-    let mut stdout = PipeCapture::new(stdout, spec.stdout_limit);
+    let mut stdout = match stdout {
+        Some(stdout) => PipeCapture::new(stdout, spec.stdout_limit),
+        None => PipeCapture::empty(spec.stdout_limit),
+    };
     stdout.listing = spec
         .stdout_record_limit
+        .filter(|_| spec.stdout_file.is_none())
         .map(|records| super::record_capture::NulPrefix::new(records, spec.stdout_limit));
     let mut stderr = PipeCapture::new(stderr, spec.stderr_limit);
     let input = spec.stdin.as_deref().unwrap_or_default();
