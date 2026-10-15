@@ -9582,6 +9582,45 @@ mod tests {
     }); }
 
     #[test]
+    fn opaque_code_actions_refuse_only_relevant_pending_peer_discovery() { block_on(async {
+        let (_guard,worktree,file)=workspace();
+        let origin=LspDocumentId(1);
+        let mut manager=ready_code_actions(origin,&file,&worktree,"foo").await;
+        let action=request_fixture_code_action(&mut manager,origin).await;
+        let context=action.context();
+        assert!(action.command.is_some());
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+
+        let peer=file.with_file_name("pending.rs");
+        std::fs::write(&peer,"unsynchronized peer").unwrap();
+        let pending=LspDocumentId(2);
+        assert_eq!(manager.open(pending,&peer,&worktree,rust_language(),1,"unsynchronized peer"),LspStatus::Starting);
+        assert!(manager.pending_opens.contains_key(&pending));
+        assert_eq!(manager.document_incarnation(pending),None);
+        assert!(matches!(manager.validate_code_action_context_token(&context),Err(LspError::Unsupported(message)) if message.contains("synchronize")));
+        manager.close(pending);
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+
+        // The same server's unrelated worktree does not belong to this
+        // action, and another server in this worktree cannot join its session.
+        let unrelated=worktree.join("unrelated-worktree");
+        std::fs::create_dir(&unrelated).unwrap();
+        let unrelated_file=unrelated.join("main.rs");
+        std::fs::write(&unrelated_file,"other project").unwrap();
+        assert_eq!(manager.open(pending,&unrelated_file,&unrelated,rust_language(),1,"other project"),LspStatus::Starting);
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+        manager.close(pending);
+        let mut other_server=manager.servers[0].clone();
+        other_server.id="other-server".into();
+        manager.servers.push(other_server);
+        let other_language=LspLanguage{server_id:"other-server".into(),language_id:"rust".into()};
+        assert_eq!(manager.open(pending,&peer,&worktree,other_language,1,"other server"),LspStatus::Starting);
+        assert!(manager.validate_code_action_context_token(&context).is_ok());
+        manager.close(pending);
+        manager.begin_shutdown().await;
+    }); }
+
+    #[test]
     fn workspace_edit_conversion_refuses_stale_targets_and_preserves_document_changes_precedence(){
         let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
         store.register(LspDocumentId(1),&uri,&key,2,Arc::from("a𝄞foo"));

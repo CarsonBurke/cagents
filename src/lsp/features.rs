@@ -210,6 +210,16 @@ impl LspManager {
     pub fn validate_code_action_context_token(&self,context:&LspCodeActionContext)->Result<(),LspError> {
         let Some(doc)=context.origin_doc else {return Ok(());};
         let reference=self.documents.get(&doc).ok_or(LspError::UnknownDocument(doc.0))?;
+        // Discovery has not registered a snapshot yet, so the synchronized
+        // peer set below cannot account for these open editor buffers. Their
+        // exact session root is still unknown. Refuse only candidates for
+        // this worktree and configured server until synchronization finishes.
+        if self.pending_opens.values().any(|pending| {
+            pending.worktree.as_path()==reference.worktree.as_ref()
+                && pending.language.server_id.as_str()==reference.session.server_id.as_ref()
+        }) {
+            return Err(LspError::Unsupported("Wait for peer documents to synchronize, then request a fresh code action".into()));
+        }
         let inner=self.snapshots.lock();
         // Opaque commands do not disclose edited targets. A newly opened peer
         // therefore requires requesting a fresh action, just as conversion
