@@ -370,8 +370,39 @@ mod branch_delete_tests {
                     "retain on refusal",
                 ],
             );
-            let policy = path.join(".git/hooks/reference-transaction");
-            fs::write(&policy,"#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' \"$1\" >> \"$CAGENTS_BRANCH_RACE_ROOT/policy-phases\"\n").unwrap();
+            let policy = if mode == "policy" {
+                let hooks = path.join("relative'hooks");
+                fs::create_dir(&hooks).unwrap();
+                git(
+                    &path,
+                    &["config", "--local", "core.hooksPath", "relative'hooks"],
+                );
+                let delegate = hooks.join("cagents-policy");
+                fs::write(
+                    &delegate,
+                    r##"#!/bin/sh
+set -eu
+[ "$(git config --get cagents.inherited)" = parameters ]
+[ "$(git config --get cagents.count)" = count ]
+[ "$(git config --get core.fsmonitor)" = false ]
+/bin/cat >/dev/null
+printf '%s\n' "$1" >> "$CAGENTS_BRANCH_RACE_ROOT/policy-phases"
+"##,
+                )
+                .unwrap();
+                fs::set_permissions(&delegate, fs::Permissions::from_mode(0o700)).unwrap();
+                let hook = hooks.join("reference-transaction");
+                fs::write(
+                    &hook,
+                    "#!/bin/sh\n/bin/cat > \"$CAGENTS_BRANCH_RACE_ROOT/policy-input.$1\"\nexec git hook run cagents-policy -- \"$@\"\n",
+                )
+                .unwrap();
+                hook
+            } else {
+                let hook = path.join(".git/hooks/reference-transaction");
+                fs::write(&hook,"#!/bin/sh\n/bin/cat >/dev/null\nprintf '%s\\n' \"$1\" >> \"$CAGENTS_BRANCH_RACE_ROOT/policy-phases\"\n").unwrap();
+                hook
+            };
             fs::set_permissions(&policy, fs::Permissions::from_mode(0o700)).unwrap();
             let result = delete_branch_checked_at(
                 &path,
@@ -390,6 +421,14 @@ mod branch_delete_tests {
                 );
                 assert_eq!(git(&other, &["symbolic-ref", "HEAD"]), "refs/heads/other");
                 assert!(git(&path, &["branch", "--list", "topic"]).is_empty());
+            } else if mode == "policy" {
+                result.unwrap();
+                assert!(git(&path, &["branch", "--list", "topic"]).is_empty());
+                assert!(
+                    fs::read_to_string(root.join("policy-input.prepared"))
+                        .unwrap()
+                        .contains(" refs/heads/topic\n")
+                );
             } else {
                 assert!(result.is_err());
                 assert_eq!(git(&path, &["rev-parse", "refs/heads/topic"]), next);
@@ -405,9 +444,15 @@ mod branch_delete_tests {
             // Actual deletion still invokes it once per native transaction phase.
             let phases = fs::read_to_string(root.join("policy-phases")).unwrap();
             assert!(phases.lines().any(|phase| phase == "prepared"));
+            if mode == "policy" {
+                assert_eq!(
+                    phases.lines().filter(|phase| *phase == "prepared").count(),
+                    1
+                );
+            }
             return;
         }
-        for mode in ["checkout", "advance"] {
+        for mode in ["checkout", "advance", "policy"] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let root = directory.path();
             fs::create_dir(root.join("repo")).unwrap();
@@ -420,7 +465,7 @@ case " $* " in
     if [ "$CAGENTS_BRANCH_RACE_MODE" = checkout ]; then
       /usr/bin/git -C "$CAGENTS_BRANCH_RACE_ROOT/other" checkout -q topic
       printf '%s\n' "$?" > "$CAGENTS_BRANCH_RACE_ROOT/checkout-status"
-    else
+    elif [ "$CAGENTS_BRANCH_RACE_MODE" = advance ]; then
       next=$(/bin/cat "$CAGENTS_BRANCH_RACE_ROOT/advance-oid")
       /usr/bin/git -C "$CAGENTS_BRANCH_RACE_ROOT/repo" update-ref refs/heads/topic "$next" || exit 90
     fi
@@ -436,6 +481,8 @@ exec /usr/bin/git "$@"
                 .args(["--exact","worktree_branch::branch_delete_tests::force_deletion_fences_checkout_and_changed_commit_during_final_effect","--nocapture"])
                 .env(MODE,mode).env("CAGENTS_BRANCH_RACE_ROOT",root).env("PATH",path)
                 .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_SYSTEM","/dev/null")
+                .env("GIT_CONFIG_PARAMETERS","'cagents.inherited=parameters'")
+                .env("GIT_CONFIG_COUNT","1").env("GIT_CONFIG_KEY_0","cagents.count").env("GIT_CONFIG_VALUE_0","count")
                 .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).spawn().unwrap();
             let deadline = Instant::now() + Duration::from_secs(20);
             while child.try_wait().unwrap().is_none() {
