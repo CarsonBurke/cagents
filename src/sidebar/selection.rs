@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 
 use crate::model::{ChannelId, ProjectId, WorktreeId};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Row {
     Project(ProjectId),
     Worktree(ProjectId, WorktreeId),
@@ -64,6 +64,10 @@ pub(super) struct Selection {
 }
 
 impl Selection {
+    pub(super) fn iter(&self) -> impl Iterator<Item = Row> + '_ {
+        self.rows.iter().copied()
+    }
+
     pub(super) fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }

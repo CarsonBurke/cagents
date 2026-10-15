@@ -508,6 +508,10 @@ impl Default for State {
     }
 }
 impl State {
+    pub(super) fn parked_runtime(&self, card: CardId) -> Option<&Runtime> {
+        self.parked.get(&card).map(Box::as_ref)
+    }
+
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,
@@ -2237,6 +2241,20 @@ impl Runtime {
             cached.rehighlight(theme);
         }
     }
+    pub(super) fn native_activity(&self) -> Option<Activity> {
+        self.handle().map(|handle| Activity {
+            provider: self.session.launch.provider,
+            state: handle.take_activity(),
+        })
+    }
+
+    pub(super) fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
+        match self.handle() {
+            Some(handle) => handle.activity_outcome(),
+            None => self.snapshot.outcome.clone(),
+        }
+    }
+
     fn source_now_ms(&self) -> Option<u64> {
         self.source_clock
             .map(chat::client::SourceClock::now)
@@ -2273,7 +2291,9 @@ impl Runtime {
         {
             return;
         }
-        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at {
+        if self.finished_stamp.as_ref().map(|stamp| stamp.0) != snapshot.finished_at
+            || self.snapshot.outcome != snapshot.outcome
+        {
             self.finished_stamp = snapshot.finished_at.and_then(|at| {
                 let time = chat::local_time(i64::try_from(at / 1000).ok()?)?;
                 let full = format!(
@@ -2283,7 +2303,16 @@ impl Runtime {
                     time.day,
                     time.clock()
                 );
-                Some((at, format!("Finished at {}", time.clock()), full))
+                let label = snapshot
+                    .outcome
+                    .as_ref()
+                    .map_or("Finished", crate::agent::ActivityOutcome::label);
+                let full = snapshot
+                    .outcome
+                    .as_ref()
+                    .and_then(crate::agent::ActivityOutcome::reason)
+                    .map_or_else(|| full.clone(), |reason| format!("{full} · {reason}"));
+                Some((at, format!("{label} at {}", time.clock()), full))
             });
         }
         self.subagent_scroll
@@ -2523,6 +2552,12 @@ impl Runtime {
             self.failures.retain(|(anchor, message)| {
                 anchor.as_deref() != current_anchor || !chat::requires_sign_in(provider, message)
             });
+        }
+        let mut turns = turns;
+        if snapshot.outcome.is_some() && (!snapshot.is_working() || snapshot.exited) {
+            for turn in &mut turns {
+                turn.running = false;
+            }
         }
         self.turns = turns;
         reconcile_disclosure(&mut self.opened, &self.turns);
@@ -4227,6 +4262,11 @@ impl Cagents {
                     repository_navigation.remove(card);
                 }
             }
+        }
+        let mut agent_updates = self.sidebar_state.unread_updates().clone();
+        agent_updates.retain(|card, _| open_cards.contains(card));
+        if agent_updates != self.durable.agent_updates {
+            Arc::make_mut(&mut self.durable).agent_updates = agent_updates;
         }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
@@ -6542,12 +6582,18 @@ impl Cagents {
                         }
                         _ => None,
                     };
+                    let activity = matches!(wake, Wake::Activity | Wake::Changed)
+                        .then(|| runtime.native_activity())
+                        .flatten();
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
                     if let Some((name, source)) = name {
                         self.suggest_channel_title(target.card, name, source);
+                    }
+                    if let Some(activity) = activity {
+                        self.observe_agent_activity_for_card(target.card, Some(activity));
                     }
                     return Task::none();
                 }
@@ -7319,7 +7365,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7461,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11147,14 +11195,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11226,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);

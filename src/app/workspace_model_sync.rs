@@ -207,7 +207,13 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if let ModelEdit::ReopenProject { repository, .. } = request {
+                    if let ModelEdit::ReopenProject { repository, .. }
+                    | ModelEdit::VisitProject {
+                        repository,
+                        reopen: true,
+                        ..
+                    } = request
+                    {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
                             error: error.to_string(),
@@ -234,7 +240,12 @@ fn send(
         _ => None,
     };
     let reopened = match &edit {
-        ModelEdit::ReopenProject { repository, .. } => Some(repository.clone()),
+        ModelEdit::ReopenProject { repository, .. }
+        | ModelEdit::VisitProject {
+            repository,
+            reopen: true,
+            ..
+        } => Some(repository.clone()),
         _ => None,
     };
     let view_edit = match &edit {
@@ -482,7 +493,12 @@ impl Cagents {
                 };
                 let closing = match &edit {
                     ModelEdit::CloseProject { repository } => Some(repository.clone()),
-                    ModelEdit::ReopenProject { repository, .. } => {
+                    ModelEdit::ReopenProject { repository, .. }
+                    | ModelEdit::VisitProject {
+                        repository,
+                        reopen: true,
+                        ..
+                    } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
                         // The observer can see a reopen from another window
@@ -912,9 +928,43 @@ impl Cagents {
         if self.project_ui.closed.contains(&shared.repository) {
             return Adoption::Retained;
         }
+        let primary_changed = shared.primary_checkout.as_ref().is_some_and(|checkout| {
+            self.project_ui
+                .primary_checkout_roots
+                .insert(shared.repository.clone(), checkout.clone())
+                .as_ref()
+                != Some(checkout)
+        });
+        let checkout_changed = shared.checkout.as_ref().is_some_and(|checkout| {
+            self.project_ui
+                .checkout_roots
+                .insert(shared.repository.clone(), checkout.clone())
+                .as_ref()
+                != Some(checkout)
+        });
         if let Some(project_id) = self.project_for_repository(&shared.repository) {
-            if crate::device::is_remote()
-                && !self.workspace_model_opens.contains(&shared.repository)
+            if let Some(project) = self
+                .sidebar_model
+                .projects
+                .iter_mut()
+                .find(|project| project.id == project_id)
+            {
+                project.name.clone_from(&shared.name);
+            }
+            let needs_checkout_read = primary_changed
+                || (checkout_changed
+                    && self
+                        .sidebar_model
+                        .project(project_id)
+                        .is_some_and(|project| {
+                            project.kind == ProjectKind::Git
+                                && (project.unreachable.is_some()
+                                    || project.worktrees.is_empty()
+                                    || project.reloading)
+                        }));
+            if needs_checkout_read
+                || (crate::device::is_remote()
+                    && !self.workspace_model_opens.contains(&shared.repository))
             {
                 return Adoption::Opening(self.project_load_task(
                     shared.repository.clone(),
@@ -1078,10 +1128,27 @@ impl Cagents {
         let repository = project.repository.clone();
         let name = project.name.clone();
         let kind = project.kind;
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
         // The project first: a channel in a repository no project owns is
         // reachable from no sidebar. Both edits go through one queue, so the
         // registry sees them in this order.
-        self.publish_model_edit(ModelEdit::OpenProject {
+        self.publish_model_edit(ModelEdit::VisitProject {
+            reopen: false,
+            checkout: checkout.clone(),
+            primary_checkout: primary_checkout.clone(),
             kind,
             repository: repository.clone(),
             name,
@@ -1113,7 +1180,24 @@ impl Cagents {
         }
         let name = project.name.clone();
         let kind = project.kind;
-        self.publish_model_edit(ModelEdit::OpenProject {
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
+        self.publish_model_edit(ModelEdit::VisitProject {
+            reopen: false,
+            checkout: checkout.clone(),
+            primary_checkout: primary_checkout.clone(),
             kind,
             repository: repository.clone(),
             name,
@@ -1140,18 +1224,29 @@ impl Cagents {
         let repository = project.repository.clone();
         let name = project.name.clone();
         let kind = project.kind;
-        let edit = if self.project_ui.is_reopening(&repository) {
-            ModelEdit::ReopenProject {
-                repository,
-                name,
-                kind,
-            }
-        } else {
-            ModelEdit::OpenProject {
-                repository,
-                name,
-                kind,
-            }
+        let checkout = self
+            .project_ui
+            .checkout_roots
+            .get(&repository)
+            .cloned()
+            .or_else(|| {
+                self.known_project_checkout(&repository, project_id)
+                    .map(|(path, _)| path)
+            });
+        let primary_checkout = self
+            .project_ui
+            .primary_checkout_roots
+            .get(&repository)
+            .cloned();
+        // A delayed filesystem load or channel sync must not overwrite a
+        // rename committed after this window's last model observation.
+        let edit = ModelEdit::VisitProject {
+            reopen: self.project_ui.is_reopening(&repository),
+            checkout,
+            primary_checkout,
+            repository,
+            name,
+            kind,
         };
         self.publish_model_edit(edit);
     }
@@ -1182,6 +1277,71 @@ mod tests {
     use super::*;
 
     #[test]
+    fn linked_checkout_keeps_primary_read_root_without_changing_actual_checkout() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let repository = PathBuf::from("/metadata/separate.git");
+        let primary = PathBuf::from("/checkouts/primary");
+        let linked = PathBuf::from("/checkouts/linked");
+        let shared = ModelProject {
+            repository: repository.clone(),
+            checkout: Some(linked.clone()),
+            primary_checkout: Some(primary.clone()),
+            name: "project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        drop(app.adopt_shared_project(&shared));
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "project".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        assert_eq!(
+            app.known_project_checkout(&linked, project),
+            Some((linked.clone(), repository.clone())),
+            "a linked-path reload still uses canonical project discovery metadata"
+        );
+        assert_eq!(
+            app.known_project_checkout(&repository, project),
+            Some((linked.clone(), repository.clone()))
+        );
+        assert_eq!(
+            app.project_ui.primary_checkout_roots.get(&repository),
+            Some(&primary)
+        );
+        assert_eq!(
+            app.project_ui.checkout_roots.get(&repository),
+            Some(&linked)
+        );
+    }
+
+    #[test]
+    fn shared_checkout_metadata_is_kept_separate_from_project_identity() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let repository = PathBuf::from("/metadata/separate.git");
+        let checkout = PathBuf::from("/checkouts/project");
+        let shared = ModelProject {
+            repository: repository.clone(),
+            checkout: Some(checkout.clone()),
+            primary_checkout: None,
+            name: "project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        // Unavailable roots remain absent rather than becoming local folders.
+        drop(app.adopt_shared_project(&shared));
+        assert_eq!(
+            app.project_ui.checkout_roots.get(&repository),
+            Some(&checkout)
+        );
+        assert!(app.project_for_repository(&checkout).is_none());
+    }
+
+    #[test]
     fn device_project_metadata_creates_durable_sidebar_without_local_filesystem() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let storage = tempfile::tempdir().unwrap();
@@ -1201,6 +1361,8 @@ mod tests {
             "fixture must be absent on the displaying host"
         );
         let metadata = ModelProject {
+            checkout: None,
+            primary_checkout: None,
             repository: repository.clone(),
             name: "Device repository".into(),
             kind: ProjectKind::Git,
@@ -1570,6 +1732,8 @@ mod tests {
         drop(app.apply_workspace_model_update(ModelUpdate::Edited {
             sequence: 2,
             edit: ModelEdit::ReopenProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: repository.clone(),
                 name: "repo".into(),
@@ -1600,6 +1764,8 @@ mod tests {
         app.project_ui.reopening.insert(project, repository.clone());
         let mut model = registry(Vec::new());
         model.projects.push(ModelProject {
+            checkout: None,
+            primary_checkout: None,
             kind: Default::default(),
             repository: repository.clone(),
             name: "repo".into(),
@@ -1690,6 +1856,8 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.workspace_model = WorkspaceModel {
             projects: vec![ModelProject {
+                checkout: None,
+                primary_checkout: None,
                 repository: repository.clone(),
                 name: "Folder".into(),
                 kind: ProjectKind::Folder,
@@ -1702,6 +1870,7 @@ mod tests {
         let project = app.sidebar_model.projects.first().unwrap();
         assert_eq!(project.repository, repository);
         assert_eq!(project.kind, ProjectKind::Folder);
+        assert!(app.durable.project_order.contains(&project.id));
         assert!(project.worktrees.is_empty());
         assert!(app.durable.cards.is_empty());
     }
@@ -1720,6 +1889,8 @@ mod tests {
             canonical_repository(&checkout.path().join(".git")).expect("an absolute key");
         app.workspace_model = WorkspaceModel {
             projects: vec![ModelProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: repository.clone(),
                 name: "opened elsewhere".into(),
@@ -1749,6 +1920,383 @@ mod tests {
             "and it does not move the user into the repository it just heard about"
         );
         assert_eq!(app.workspace.focused(), focused);
+        let adopted = app.project_for_repository(&repository).unwrap();
+        assert_eq!(app.durable.project_order.last(), Some(&adopted));
+    }
+
+    #[test]
+    fn activation_during_adoption_reuses_the_pending_project_identity_and_rank() {
+        let (mut app, _, _) = app_with_project();
+        let repository = PathBuf::from("/pending/.git");
+        let pending = ProjectId::new();
+        app.project_ui
+            .pending_loads
+            .insert(repository.clone(), pending);
+        Arc::make_mut(&mut app.durable).project_order.push(pending);
+        let order = app.durable.project_order.clone();
+        assert!(first_message(app.activate_project(repository.clone())).is_none());
+        assert_eq!(app.project_ui.select_on_load, Some(repository));
+        assert_eq!(app.durable.project_order, order);
+        assert_eq!(
+            app.project_ui
+                .pending_loads
+                .values()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![pending]
+        );
+    }
+
+    #[test]
+    fn explicit_project_activation_selects_primary_without_creating_a_terminal() {
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        let root = checkout.path().canonicalize().unwrap();
+        let repository = canonical_repository(&root.join(".git")).unwrap();
+        let (mut app, project_id, _) = app_with_project();
+        let cards = app.durable.cards.len();
+        let project = app
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|project| project.id == project_id)
+            .unwrap();
+        *project = SidebarProject::new(
+            project_id,
+            RepositoryId::new(),
+            "fixture".into(),
+            repository.clone(),
+            vec![SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                root.clone(),
+                Some("main".into()),
+            )],
+            Vec::new(),
+        );
+        drop(app.activate_project(repository));
+        assert_eq!(app.active_workspace.as_deref(), Some(root.as_path()));
+        assert_eq!(app.durable.cards.len(), cards);
+        assert!(app.project_ui.select_on_load.is_none());
+    }
+
+    #[test]
+    fn explicit_project_activation_uses_checkout_provenance_instead_of_bare_metadata() {
+        let (mut app, project_id, _) = app_with_project();
+        let repository = PathBuf::from("/fixture/metadata.git");
+        let linked = PathBuf::from("/fixture/linked");
+        let primary = PathBuf::from("/fixture/primary");
+        let row = |path: &Path| {
+            SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                path.to_path_buf(),
+                Some("topic".into()),
+            )
+        };
+        let mut project = SidebarProject::new(
+            project_id,
+            RepositoryId::new(),
+            "fixture".into(),
+            repository.clone(),
+            vec![row(&repository), row(&linked)],
+            Vec::new(),
+        );
+        app.project_ui
+            .checkout_roots
+            .insert(repository.clone(), linked.clone());
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(linked.clone()),
+            "Git's first bare metadata record must not displace the actual checkout"
+        );
+        app.project_ui
+            .primary_checkout_roots
+            .insert(repository.clone(), primary.clone());
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(linked.clone()),
+            "a retained primary absent from current rows must not fence a usable linked checkout"
+        );
+        project.worktrees.push(row(&primary));
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(primary.clone()),
+            "a verified separate-directory primary wins over a linked checkout regardless of row order"
+        );
+        app.project_ui.primary_checkout_roots.clear();
+        app.project_ui.checkout_roots.clear();
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(linked.clone()),
+            "legacy fallback also skips the non-checkout metadata row"
+        );
+        project.worktrees.truncate(1);
+        assert_eq!(app.project_activation_worktree(&project), None);
+        project.kind = ProjectKind::Folder;
+        project.worktrees.clear();
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(repository.clone()),
+            "folder projects navigate to their root without Git rows"
+        );
+        project.kind = ProjectKind::Git;
+        project.repository = primary.join(".git");
+        project.worktrees = vec![row(&linked), row(&primary)];
+        app.project_ui
+            .checkout_roots
+            .insert(project.repository.clone(), linked);
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(primary),
+            "an ordinary primary remains selected when only a linked checkout was opened explicitly"
+        );
+    }
+
+    #[test]
+    fn bare_project_activation_selects_a_checkout_in_both_observer_orders_and_duplicate_loads() {
+        let fixture = tempfile::tempdir().unwrap();
+        let git = |cwd: &Path, args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(cwd)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_COMMON_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .args([
+                    "-c",
+                    "core.fsmonitor=false",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "-c",
+                    "user.name=Fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                ])
+                .args(args)
+                .output()
+                .expect("Git is required for repository message-order contracts");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(
+            fixture.path(),
+            &["init", "--quiet", "--initial-branch=main", "seed"],
+        );
+        git(
+            &fixture.path().join("seed"),
+            &["commit", "--quiet", "--allow-empty", "-m", "initial"],
+        );
+        git(
+            fixture.path(),
+            &["clone", "--quiet", "--bare", "seed", "metadata.git"],
+        );
+        let repository = fixture.path().join("metadata.git").canonicalize().unwrap();
+        let linked = fixture.path().join("linked-b");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked-b",
+                linked.to_str().unwrap(),
+            ],
+        );
+        let other = fixture.path().join("linked-c");
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "linked-c",
+                other.to_str().unwrap(),
+            ],
+        );
+        let linked = linked.canonicalize().unwrap();
+        let other = other.canonicalize().unwrap();
+        let model = || {
+            let mut model = registry(Vec::new());
+            model.projects.push(ModelProject {
+                repository: repository.clone(),
+                checkout: Some(linked.clone()),
+                primary_checkout: None,
+                name: "Shared bare project".into(),
+                kind: ProjectKind::Git,
+                ordinal: 1,
+            });
+            model
+        };
+
+        // Activation and model observation arrive on independent subscriptions.
+        // Drive their real read tasks through the normal updater in both orders;
+        // also cover the early return which reconciles a concurrent duplicate.
+        for order in ["activation-first", "model-first", "duplicate"] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let _publishes = intercept_publishes(&mut app);
+            let cards = app.durable.cards.len();
+            let task = if order == "model-first" {
+                let task = app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                    model(),
+                )));
+                drop(app.update(Message::ActivateProject(repository.clone())));
+                task
+            } else {
+                app.update(Message::ActivateProject(repository.clone()))
+            };
+            let message = first_message(task).expect("actual repository read completion");
+            let Message::RepositoryLoaded {
+                result: Ok(loaded), ..
+            } = &message
+            else {
+                panic!("expected a successful actual Git read for {order}");
+            };
+            if order != "model-first" {
+                assert!(loaded.repository.as_ref().unwrap().is_bare);
+                assert!(loaded.repository.as_ref().unwrap().worktree_root.is_none());
+                assert_eq!(
+                    loaded.worktrees.first().unwrap().0.path,
+                    repository,
+                    "fixture must exercise Git's metadata-first bare listing"
+                );
+            }
+            let existing = if order == "duplicate" {
+                let existing = ProjectId::new();
+                app.sidebar_model.projects.push(SidebarProject::new(
+                    existing,
+                    loaded.repository.as_ref().unwrap().id,
+                    "Concurrent row".into(),
+                    repository.clone(),
+                    loaded
+                        .worktrees
+                        .iter()
+                        .map(|(record, status)| {
+                            SidebarWorktree::from_repository(record, status.as_ref())
+                        })
+                        .collect(),
+                    Vec::new(),
+                ));
+                Some(existing)
+            } else {
+                None
+            };
+            drop(app.update(message));
+            assert_eq!(
+                app.active_workspace.as_deref(),
+                Some(linked.as_path()),
+                "{order}"
+            );
+            assert_ne!(app.active_workspace.as_deref(), Some(repository.as_path()));
+            assert!(app.project_ui.select_on_load.is_none());
+            assert_eq!(app.sidebar_model.projects.len(), 1, "{order}");
+            if let Some(existing) = existing {
+                assert_eq!(app.sidebar_model.projects[0].id, existing);
+            }
+            if order != "model-first" {
+                drop(
+                    app.update(Message::WorkspaceModelObserved(ModelUpdate::Connected(
+                        model(),
+                    ))),
+                );
+            }
+            assert_eq!(
+                app.active_workspace.as_deref(),
+                Some(linked.as_path()),
+                "late observer: {order}"
+            );
+            assert_eq!(
+                app.durable.cards.len(),
+                cards,
+                "activation must not create a terminal"
+            );
+            let project = &app.sidebar_model.projects[0];
+            assert!(project.worktrees.iter().any(|row| row.path == other));
+        }
+    }
+
+    #[test]
+    fn shared_checkout_reload_keeps_the_latest_name_and_publishes_a_visit() {
+        let Some(checkout) = git_checkout() else {
+            return;
+        };
+        let root = checkout.path().canonicalize().unwrap();
+        let repository = canonical_repository(&root.join(".git")).unwrap();
+        let (mut app, project, _) = app_with_project();
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Old local label".into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        )];
+        app.sidebar_model.projects[0].unreachable = Some("Previous read failed".into());
+        let shared = ModelProject {
+            repository: repository.clone(),
+            checkout: Some(root),
+            primary_checkout: None,
+            name: "Custom shared label".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        };
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.projects.push(shared.clone());
+        let publishes = intercept_publishes(&mut app);
+        let Adoption::Opening(task) = app.adopt_shared_project(&shared) else {
+            panic!("new checkout metadata on an unreachable row must reload it");
+        };
+        assert_eq!(app.sidebar_model.projects[0].name, "Custom shared label");
+        let message = first_message(task).expect("actual repository read completion");
+        let Message::RepositoryLoaded {
+            result: Ok(loaded), ..
+        } = &message
+        else {
+            panic!("expected a successful actual Git read");
+        };
+        assert_ne!(loaded.project.name, "Custom shared label");
+        // The read only knows the filesystem-derived name. A newer observed
+        // rename must win when its old completion reaches the UI.
+        app.workspace_model.projects[0].name = "Newest shared label".into();
+        drop(app.update(message));
+        assert_eq!(
+            app.sidebar_model.project(project).unwrap().name,
+            "Newest shared label"
+        );
+        let edits = drain(&publishes);
+        assert!(edits.iter().any(|edit| matches!(edit,
+            ModelEdit::VisitProject { repository: key, name, reopen: false, .. }
+                if key == &repository && name == "Newest shared label")));
+        assert!(
+            !edits.iter().any(|edit| matches!(
+                edit,
+                ModelEdit::OpenProject { .. } | ModelEdit::ReopenProject { .. }
+            )),
+            "read completion may publish discovery, never a rename"
+        );
+        // Even a rename not yet observed by this window must survive its
+        // queued publication: the visit remains only an insert-time hint.
+        app.sidebar_model.projects[0].name = "Older local label".into();
+        app.project_ui.reopening.insert(project, repository.clone());
+        app.publish_project_opened(project);
+        assert!(
+            matches!(publishes.try_recv().unwrap(), ModelEdit::VisitProject {
+            repository: key, reopen: true, ..
+        } if key == repository)
+        );
+        drop(app.apply_workspace_model_update(ModelUpdate::Reopened {
+            repository: repository.clone(),
+            model: app.workspace_model.clone(),
+        }));
+        assert!(!app.project_ui.is_reopening(&repository));
     }
 
     /// A channel another window created arrives as a scope, not as a
@@ -1940,7 +2488,10 @@ mod tests {
                 .filter(|edit| !matches!(edit, ModelEdit::SeedView { .. }))
                 .collect::<Vec<_>>(),
             vec![
-                ModelEdit::OpenProject {
+                ModelEdit::VisitProject {
+                    reopen: false,
+                    checkout: None,
+                    primary_checkout: None,
                     kind: Default::default(),
                     repository: repository.clone(),
                     name: "repo".into(),

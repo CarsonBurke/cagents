@@ -51,6 +51,7 @@ pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
 };
+use worktree_ui::card_directory;
 
 use std::{
     borrow::Cow,
@@ -158,6 +159,20 @@ const APPLICATION_NAME: &str = instance::APPLICATION_NAME;
 /// Separates what the window is showing from the application name, following
 /// the desktop convention of "<document> — <application>".
 const WINDOW_TITLE_SEPARATOR: &str = " — ";
+
+fn format_window_title(header: &str, device: Option<&str>, waiting: usize) -> String {
+    let title = if header == APPLICATION_NAME {
+        header.to_owned()
+    } else {
+        format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+    };
+    let title = device.map_or(title.clone(), |device| format!("{device} · {title}"));
+    if waiting > 0 {
+        format!("({waiting}) {title}")
+    } else {
+        title
+    }
+}
 
 /// Embedded artwork for initial window creation, independent of icon themes.
 pub fn application_window_icon() -> window::Icon {
@@ -1602,10 +1617,14 @@ fn reconcile_restored_projects(
     order: &[ProjectId],
 ) {
     projects.sort_by_key(|project| {
-        order
-            .iter()
-            .position(|id| *id == project.id)
-            .unwrap_or(usize::MAX)
+        (
+            order
+                .iter()
+                .position(|id| *id == project.id)
+                .unwrap_or(usize::MAX),
+            project.repository.clone(),
+            project.id,
+        )
     });
     let mut repositories = HashMap::new();
     let mut aliases = HashMap::new();
@@ -1764,6 +1783,7 @@ pub struct LoadedRepository {
     project: ProjectState,
     repository: Option<RepositoryInfo>,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
+    operations: HashMap<crate::model::WorktreeId, crate::repository::GitOperationKind>,
     github: GitHubAvailability,
     review_repository: Option<GitHubRepoKey>,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
@@ -2479,6 +2499,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::FocusAttention(_)
         | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
@@ -2538,6 +2559,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
         || matches!(
             message,
             Message::KeyEvent { .. }
+                | Message::ActivateProject(_)
                 | Message::Viewport { .. }
                 | Message::NewWindow
                 | Message::WindowCloseRequested(_)
@@ -2624,6 +2646,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
+            | Message::FocusAttention(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -2669,17 +2692,20 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
-        Message::RepositoryLoaded {
-            open_cards: true,
-            result: Ok(_),
-            ..
-        } | Message::WorktreeCreated {
-            result: Ok(WorktreeCreationOutcome::Created { .. }),
-            ..
-        } | Message::PullRequestCreated {
-            result: Ok(PullRequestCreationOutcome::Created { .. }),
-            ..
-        }
+        Message::ActivateProject(_)
+            | Message::RepositoryLoaded {
+                open_cards: true,
+                result: Ok(_),
+                ..
+            }
+            | Message::WorktreeCreated {
+                result: Ok(WorktreeCreationOutcome::Created { .. }),
+                ..
+            }
+            | Message::PullRequestCreated {
+                result: Ok(PullRequestCreationOutcome::Created { .. }),
+                ..
+            }
     )
 }
 
@@ -2771,6 +2797,8 @@ pub enum SettingsField {
     ShortcutCyclePaneWidth,
     ShortcutPreviousWorkspace,
     ShortcutNextWorkspace,
+    ShortcutNextAttention,
+    ShortcutPreviousAttention,
     ShortcutReviewToggleViewed,
     ShortcutReviewNextFile,
     ShortcutReviewPreviousFile,
@@ -2802,7 +2830,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 40] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2814,6 +2842,8 @@ impl SettingsField {
         Self::ShortcutCyclePaneWidth,
         Self::ShortcutPreviousWorkspace,
         Self::ShortcutNextWorkspace,
+        Self::ShortcutNextAttention,
+        Self::ShortcutPreviousAttention,
         Self::ShortcutReviewToggleViewed,
         Self::ShortcutReviewNextFile,
         Self::ShortcutReviewPreviousFile,
@@ -2926,6 +2956,8 @@ impl SettingsField {
             Self::ShortcutCyclePaneWidth => "Cycle pane width",
             Self::ShortcutPreviousWorkspace => "Previous workspace",
             Self::ShortcutNextWorkspace => "Next workspace",
+            Self::ShortcutNextAttention => "Next pane needing attention",
+            Self::ShortcutPreviousAttention => "Previous pane needing attention",
             Self::ShortcutReviewToggleViewed => "Mark reviewed file viewed",
             Self::ShortcutReviewNextFile => "Next reviewed file",
             Self::ShortcutReviewPreviousFile => "Previous reviewed file",
@@ -3011,6 +3043,8 @@ impl SettingsField {
             | Self::ShortcutCyclePaneWidth
             | Self::ShortcutPreviousWorkspace
             | Self::ShortcutNextWorkspace
+            | Self::ShortcutNextAttention
+            | Self::ShortcutPreviousAttention
             | Self::ShortcutReviewToggleViewed
             | Self::ShortcutReviewNextFile
             | Self::ShortcutReviewPreviousFile
@@ -3070,6 +3104,8 @@ struct ShortcutDraft {
     cycle_pane_width: String,
     previous_workspace: String,
     next_workspace: String,
+    next_attention: String,
+    previous_attention: String,
     review_toggle_viewed: String,
     review_next_file: String,
     review_previous_file: String,
@@ -3113,6 +3149,8 @@ impl ShortcutDraft {
             cycle_pane_width: settings::format_chords(&shortcuts.cycle_pane_width),
             previous_workspace: settings::format_chords(&shortcuts.previous_workspace),
             next_workspace: settings::format_chords(&shortcuts.next_workspace),
+            next_attention: settings::format_chords(&shortcuts.next_attention),
+            previous_attention: settings::format_chords(&shortcuts.previous_attention),
             review_toggle_viewed: settings::format_chords(&shortcuts.review_toggle_viewed),
             review_next_file: settings::format_chords(&shortcuts.review_next_file),
             review_previous_file: settings::format_chords(&shortcuts.review_previous_file),
@@ -3356,6 +3394,10 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutPreviousWorkspace => {
                 self.keyboard_shortcuts.previous_workspace = value;
+            }
+            SettingsField::ShortcutNextAttention => self.keyboard_shortcuts.next_attention = value,
+            SettingsField::ShortcutPreviousAttention => {
+                self.keyboard_shortcuts.previous_attention = value
             }
             SettingsField::ShortcutNextWorkspace => {
                 self.keyboard_shortcuts.next_workspace = value;
@@ -3750,6 +3792,14 @@ fn settings_update(
             next.keyboard_shortcuts.previous_workspace = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutNextAttention => {
+            next.keyboard_shortcuts.next_attention = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPreviousAttention => {
+            next.keyboard_shortcuts.previous_attention = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::ShortcutNextWorkspace => {
             next.keyboard_shortcuts.next_workspace = settings::parse_chords(value);
             Ok(())
@@ -3935,6 +3985,15 @@ fn grouped_digits(value: usize) -> String {
 }
 
 #[derive(Debug, Clone)]
+pub struct SourceControlRead {
+    prepared: Option<Box<(RepositorySnapshot, SourceControlModel)>>,
+    status: StatusSnapshot,
+    operation: Option<crate::repository::GitOperationKind>,
+    head_repository: Option<GitHubRepoKey>,
+    read: u64,
+}
+
+#[derive(Debug, Clone)]
 pub enum Message {
     Device(device_ui::Action),
     ReviewFilePanelToggle {
@@ -3955,10 +4014,11 @@ pub enum Message {
     /// whenever the focused card names a different worktree, so a result whose
     /// key is no longer the bound one is a read of a tree nobody is looking at
     /// and is dropped rather than rendered.
+    SourceControlReleased,
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Box<RepositorySnapshot>, String>,
+        result: Result<SourceControlRead, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -4169,6 +4229,7 @@ pub enum Message {
     ActivateUi {
         token: Option<String>,
     },
+    ActivateProject(PathBuf),
     ActivateSession {
         session: TerminalId,
         token: Option<String>,
@@ -4345,6 +4406,11 @@ pub enum Message {
     RetrySessionSave,
     SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
+    AcknowledgeVisiblePane {
+        card: CardId,
+        epoch: u64,
+    },
+    FocusAttention(CardId),
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
@@ -4893,6 +4959,9 @@ pub struct Cagents {
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
+    window_waiting_count: usize,
+    attention_navigation: Vec<CardId>,
+    attention_focus_epoch: u64,
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
     worktree_offsets: HashMap<PathBuf, f32>,
@@ -5185,6 +5254,16 @@ impl Cagents {
         self.project_load_task(path, project_id, open_cards, None)
     }
 
+    fn remember_project_opening(&mut self, path: &Path, project: ProjectId) {
+        self.project_ui
+            .pending_loads
+            .insert(path.to_path_buf(), project);
+        if !self.durable.project_order.contains(&project) {
+            Arc::make_mut(&mut self.durable).project_order.push(project);
+            self.persist();
+        }
+    }
+
     fn project_load_task(
         &mut self,
         path: PathBuf,
@@ -5192,14 +5271,16 @@ impl Cagents {
         open_cards: bool,
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
+        let project_id = project_id
+            .or_else(|| self.project_ui.pending_loads.get(&path).copied())
+            .unwrap_or_default();
         if crate::device::is_remote() {
-            let project_id = project_id.unwrap_or_default();
+            self.remember_project_opening(&path, project_id);
             self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
             let generation = self.repository_load_sequence;
             self.repository_generations.insert(project_id, generation);
             return self.device_project_read_task(path, project_id, generation, kind);
         }
-        let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
                 self.status = Some(TransientNotice::warning(
@@ -5221,6 +5302,7 @@ impl Cagents {
             self.project_ui.closed.remove(&repository);
             self.project_ui.reopening.insert(project_id, repository);
         }
+        self.remember_project_opening(&path, project_id);
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
@@ -7207,7 +7289,8 @@ impl Cagents {
         if !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
             return None;
         }
-        self.sidebar_model.worktree_at(self.card_worktree(state)?)
+        self.sidebar_model
+            .worktree_at(self.unchanneled_card_worktree(state)?)
     }
 
     /// Whether `project` holds the scope the workspace shows: the active
@@ -7231,13 +7314,15 @@ impl Cagents {
     }
 
     fn pane_is_active(&self, card: CardId) -> bool {
-        self.workspace.focused() == Some(card)
+        self.refresh_ui.focused
+            && self.workspace.focused() == Some(card)
             && self.workspace_surfaces_visible()
             && !self.modal_is_open()
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
         if self.pane_is_active(card)
+            || self.sidebar_state.has_card_update(card)
             || !self
                 .card_state(card)
                 .is_some_and(|state| state.existence.is_open())
@@ -7250,6 +7335,7 @@ impl Cagents {
         } else {
             self.sidebar_state.observe_card_update(card);
         }
+        self.persist();
     }
 
     pub(super) fn observe_agent_activity_for_card(
@@ -7257,6 +7343,34 @@ impl Cagents {
         card: CardId,
         activity: Option<crate::agent::Activity>,
     ) {
+        let activity = self
+            .chat_ui
+            .parked_runtime(card)
+            .and_then(|runtime| runtime.native_activity())
+            .or(activity);
+        let outcome = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.activity_outcome(),
+            _ if self.chat_ui.parked_runtime(card).is_some() => self
+                .chat_ui
+                .parked_runtime(card)
+                .and_then(|runtime| runtime.activity_outcome()),
+            _ if activity
+                .is_some_and(|activity| activity.state == crate::agent::ActivityState::Working) =>
+            {
+                None
+            }
+            _ => self.sidebar_state.card_outcome(card).cloned(),
+        };
+        let activity = activity.or_else(|| {
+            outcome
+                .as_ref()
+                .and_then(|_| self.sidebar_state.card_activity(card))
+                .map(|mut last| {
+                    last.state = crate::agent::ActivityState::Idle;
+                    last
+                })
+        });
+        self.sidebar_state.set_card_outcome(card, outcome);
         let previous = self
             .sidebar_state
             .card_activity(card)
@@ -7300,6 +7414,95 @@ impl Cagents {
         }
     }
 
+    fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| {
+                self.sidebar_state.acknowledge_agent_update(card);
+                self.acknowledge_card_notices(card);
+                if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                    && let Err(error) = handle.acknowledge_updates()
+                {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not acknowledge terminal output: {error}"
+                    )));
+                }
+                self.acknowledge_chat_updates(card)
+            })
+            .collect();
+        self.refresh_sidebar_channels();
+        self.persist();
+        Task::batch(tasks)
+    }
+
+    fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
+        if self.workspace_inputs_blocked() {
+            return Task::none();
+        }
+        let Some(card) = self
+            .card_state(id)
+            .filter(|card| card.existence.is_open())
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&id))
+            .map(|channel| channel.id);
+        let scope = if let Some(channel) = channel {
+            self.select_channel(channel)
+        } else {
+            let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
+            directory.map_or_else(Task::none, |directory| {
+                self.select_worktree(directory, false)
+            })
+        };
+        let focus = self.focus_workspace_card(id);
+        let read = self.mark_cards_read(vec![id]);
+        Task::batch([scope, focus, read])
+    }
+
+    fn cycle_attention(&mut self, backwards: bool) -> Task<Message> {
+        let cards: Vec<_> = self
+            .sidebar_state
+            .attention_cards()
+            .into_iter()
+            .filter(|id| {
+                self.card_state(*id)
+                    .is_some_and(|card| card.existence.is_open())
+            })
+            .collect();
+        let current = self.workspace.focused();
+        let next = if current.is_some_and(|current| !cards.contains(&current)) {
+            current
+                .and_then(|current| {
+                    self.attention_navigation
+                        .iter()
+                        .position(|card| *card == current)
+                })
+                .and_then(|index| {
+                    (1..=self.attention_navigation.len()).find_map(|step| {
+                        let len = self.attention_navigation.len();
+                        let offset = if backwards {
+                            (index + len - step) % len
+                        } else {
+                            (index + step) % len
+                        };
+                        let candidate = self.attention_navigation[offset];
+                        cards.contains(&candidate).then_some(candidate)
+                    })
+                })
+                .or_else(|| sidebar::cycle_attention(&cards, current, backwards))
+        } else {
+            sidebar::cycle_attention(&cards, current, backwards)
+        };
+        self.attention_navigation = cards;
+        next.map_or_else(Task::none, |card| self.focus_attention_card(card))
+    }
+
     fn acknowledge_active_pane(&mut self) -> Task<Message> {
         let Some(card) = self
             .workspace
@@ -7311,6 +7514,15 @@ impl Cagents {
         if !self.sidebar_state.has_card_update(card) {
             return Task::none();
         }
+        if let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))
+            .map(|channel| channel.id)
+        {
+            self.sidebar_state.retain_attention_channel(channel);
+        }
         self.sidebar_state.acknowledge_agent_update(card);
         if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
             && let Err(error) = handle.acknowledge_updates()
@@ -7319,6 +7531,8 @@ impl Cagents {
                 "Could not acknowledge terminal output: {error}"
             )));
         }
+        self.acknowledge_card_notices(card);
+        self.persist();
         self.acknowledge_chat_updates(card)
     }
 
@@ -7545,19 +7759,21 @@ impl Cagents {
                 .map(|card| self.card_display_title(card).trim())
                 .filter(|title| !title.is_empty())
                 .unwrap_or(APPLICATION_NAME);
-            if self.core.window.header_title == showing {
+            if self.core.window.header_title == showing
+                && self.window_waiting_count == self.sidebar_state.waiting_count()
+            {
                 return Task::none();
             }
             showing.to_owned()
         };
-        let mut window_title = if header == APPLICATION_NAME {
-            header.clone()
-        } else {
-            format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
-        };
-        if let Some(device) = crate::device::selected() {
-            window_title = format!("{} · {}", device.name, window_title);
-        }
+        let waiting = self.sidebar_state.waiting_count();
+        self.window_waiting_count = waiting;
+        let device = crate::device::selected();
+        let window_title = format_window_title(
+            &header,
+            device.as_ref().map(|device| device.name.as_str()),
+            waiting,
+        );
         self.set_header_title(header);
         match self.core.main_window_id() {
             Some(id) => self.set_window_title(window_title, id),
@@ -8075,6 +8291,9 @@ impl Cagents {
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
         let focus_changed = self.durable.focused != focused;
+        if focus_changed {
+            self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
+        }
         let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
         if focus_changed || exposure_changed {
             apply_durable_viewport_update(
@@ -10051,9 +10270,57 @@ impl Cagents {
         }
     }
 
-    /// Rebinds the source-control panel to whatever worktree is now focused,
-    /// and loads a snapshot when that is a different worktree.
-    ///
+    /// Retires the old binding off the UI thread and releases large free arenas.
+    fn release_source_control(&mut self) -> Task<Message> {
+        let previous = self.sidebar_model.source_control.take();
+        let cache = self.refresh_ui.source_cache.take();
+        if previous.is_none() && cache.is_none() {
+            return Task::none();
+        }
+        // Old cancelled readers retain the old binding's invalidation flag.
+        self.refresh_ui.source_invalidated = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let large = previous.as_ref().is_some_and(|source| {
+            source.files.len() > 8192
+                || source
+                    .groups()
+                    .iter()
+                    .map(|group| group.rows().len())
+                    .sum::<usize>()
+                    > 8192
+        });
+        cosmic::task::future(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                // Wait for a cancelled old reader to drop its temporary model.
+                if let Some((_, cache)) = &cache {
+                    drop(
+                        cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                }
+                drop(previous);
+                drop(cache);
+            })
+            .await;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            if large {
+                // Give the native view a frame to release its old widget tree.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    // SAFETY: glibc's allocator trimming is thread-safe and
+                    // takes no application pointers. It never runs on the UI.
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                })
+                .await;
+            }
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            let _ = large;
+            Message::SourceControlReleased
+        })
+    }
+
     /// Runs at the tail of every update, beside the selection sync, because
     /// focus changes for reasons that are not sidebar actions: a card closing,
     /// a session restoring, a project list arriving. Rebinding drops the
@@ -10073,9 +10340,9 @@ impl Cagents {
                 self.history_ui.cancel();
                 self.history_ui.next_page_request();
             }
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return self.release_source_control();
         }
+        self.prioritize_git_watches();
         if !changed {
             return self.load_pending_history();
         }
@@ -10083,9 +10350,9 @@ impl Cagents {
         self.cancel_branch_changes();
         self.history_ui.cancel();
         self.history_ui.next_page_request();
+        let release = self.release_source_control();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return release;
         };
         if self.folder_scope(&key)
             && matches!(
@@ -10102,7 +10369,7 @@ impl Cagents {
                 .map(|mutation| mutation.kind),
         );
         self.sidebar_model.source_control = Some(source);
-        self.source_control_snapshot_task(key)
+        Task::batch([release, self.source_control_snapshot_task(key)])
     }
 
     /// Asks for the first page of history once, and only once the `History`
@@ -10891,12 +11158,29 @@ impl Cagents {
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
             source.set_reloading(true);
         }
+        self.refresh_ui.source_last_refresh = Instant::now();
         self.source_control_snapshot_task(key.clone())
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
         if crate::device::is_remote() {
             return Task::none();
+        }
+        self.refresh_ui.source_last_refresh = Instant::now();
+        if self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .is_none_or(|source| source.data_state != sidebar::SidebarDataState::Ready)
+        {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
+        }
+        if self.refresh_ui.source_cancel.is_some() {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
@@ -10941,10 +11225,11 @@ impl Cagents {
             });
         }
         let worktree = key.canonical_path.clone();
-        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
+        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
+            || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
             untracked_changes,
-            untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
+            untracked_files: self.context_tab == ContextTab::Files,
         };
         let browse_files = self.context_tab == ContextTab::Files;
         let previous_errors = self
@@ -10959,16 +11244,77 @@ impl Cagents {
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
+        if self
+            .refresh_ui
+            .source_cache
+            .as_ref()
+            .is_none_or(|(path, _)| path != &worktree)
+        {
+            self.refresh_ui.source_cache = Some((
+                worktree.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    crate::repository::SnapshotCache::default(),
+                )),
+            ));
+        }
+        if browse_files
+            && (self.refresh_ui.source_expanded != expanded
+                || self.refresh_ui.source_ignored_errors != previous_errors)
+        {
+            self.refresh_ui.source_expanded = expanded.clone();
+            self.refresh_ui.source_ignored_errors = previous_errors.clone();
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
+        let invalidated = self.refresh_ui.source_invalidated.clone();
+        let model_key = key.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                let mut snapshot = service
-                    .snapshot_with_options(&worktree, options, &cancellation)
+                let mut cache = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let invalidation = invalidated.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if invalidation != 0 {
+                    cache.invalidate(invalidation & 2 != 0);
+                }
+                let status_read = git_ui::next_status_read();
+                let snapshot = service
+                    .snapshot_cached(&worktree, options, &cancellation, &mut cache)
                     .map_err(|error| error.to_string())?;
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
+                let (status, operation) = cache.row_status().ok_or_else(|| {
+                    "successful source-control read did not expose display status".to_owned()
+                })?;
+                let head_repository = cache.publication_remote().and_then(|remote| {
+                    remote
+                        .push_url
+                        .as_deref()
+                        .or(remote.fetch_url.as_deref())
+                        .and_then(crate::github::remote_repository_key)
+                });
+                let mut read = SourceControlRead {
+                    prepared: None,
+                    status: status.clone(),
+                    operation,
+                    head_repository,
+                    read: status_read,
+                };
+                let Some(mut snapshot) = snapshot else {
+                    return Ok(read);
+                };
                 if browse_files {
                     let ignored = service
                         .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| {
+                            cache.invalidate(false);
+                            error.to_string()
+                        })?;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
@@ -10977,14 +11323,21 @@ impl Cagents {
                         &expanded,
                         &previous_errors,
                         &cancellation,
-                    )?;
+                    )
+                    .inspect_err(|_| cache.invalidate(false))?;
+                    cache.observe_browse(&worktree, &snapshot.files);
                 }
-                Ok(snapshot)
+                let model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
+                read.prepared = Some(Box::new((snapshot, model)));
+                Ok(read)
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
+            .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -11272,8 +11625,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -12744,7 +13100,7 @@ impl Application for Cagents {
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
         let Bootstrap {
-            workspace: durable,
+            workspace: mut durable,
             session,
             mut projects,
             mut worktrees,
@@ -12757,6 +13113,11 @@ impl Application for Cagents {
             settings_warnings,
         } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
+        for project in &projects {
+            if !durable.project_order.contains(&project.id) {
+                durable.project_order.push(project.id);
+            }
+        }
         let retired = worktree_ui::retire_missing_worktrees(&mut worktrees);
         if let Some(session) = &session {
             session.save_worktrees(retired);
@@ -12906,6 +13267,9 @@ impl Application for Cagents {
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
+            window_waiting_count: 0,
+            attention_navigation: Vec::new(),
+            attention_focus_epoch: 0,
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
@@ -13024,6 +13388,8 @@ impl Application for Cagents {
             app.sidebar_state.restore_view(view.sidebar);
             app.worktree_offsets = view.worktree_offsets;
         }
+        app.sidebar_state
+            .restore_unread_updates(app.durable.agent_updates.clone());
         app.sidebar_model
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
@@ -13152,7 +13518,6 @@ impl Application for Cagents {
                 Message::ResumeConversation(_)
                 | Message::Repository(_)
                 | Message::ProjectUi(_)
-                | Message::GitUi(_)
                 | Message::SubmitWorktree => {
                     self.status = Some(TransientNotice::warning(
                         "Use Device files for remote files and Git operations",
@@ -13199,7 +13564,9 @@ impl Application for Cagents {
             return Task::none();
         }
         if (self.focused_repository_is_saving() || self.modal_is_open())
-            && completion_navigates(&message)
+            && (completion_navigates(&message)
+                || matches!(&message, Message::RepositoryLoaded { result: Ok(loaded), .. }
+                    if self.project_ui.select_on_load.as_ref() == Some(&loaded.project.repository)))
         {
             self.deferred_navigation.push_back(message);
             return Task::none();
@@ -13235,6 +13602,7 @@ impl Application for Cagents {
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
                 | Message::FocusCard(_)
+                | Message::FocusAttention(_)
                 | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
@@ -13432,6 +13800,9 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                self.project_ui
+                    .pending_loads
+                    .retain(|_, id| *id != project_id);
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
@@ -13441,10 +13812,28 @@ impl Application for Cagents {
                 );
                 let mut task = Task::none();
                 match result {
-                    Ok(loaded) => {
+                    Ok(mut loaded) => {
                         if self.project_ui.closed.contains(&loaded.project.repository) {
                             self.repository_generations.remove(&project_id);
                             return Task::none();
+                        }
+                        // Filesystem discovery names a new project, but a
+                        // completed read cannot rename an existing one. Use
+                        // the latest shared name after the read, including a
+                        // rename observed while it was running.
+                        let known_name = self
+                            .workspace_model
+                            .project(&loaded.project.repository)
+                            .map(|project| project.name.clone())
+                            .or_else(|| {
+                                self.sidebar_model
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.repository == loaded.project.repository)
+                                    .map(|project| project.name.clone())
+                            });
+                        if let Some(name) = &known_name {
+                            loaded.project.name.clone_from(name);
                         }
                         let pr_request = if let GitHubAvailability::Ready {
                             repository_key,
@@ -13495,6 +13884,9 @@ impl Application for Cagents {
                                         }))
                             })
                         {
+                            if known_name.is_some() {
+                                existing.name.clone_from(&loaded.project.name);
+                            }
                             // A load of that project which began after this
                             // one lists the repository more recently, whether
                             // it has landed yet or not, and it is also how a
@@ -13539,12 +13931,23 @@ impl Application for Cagents {
                                         existence: Existence::Open,
                                     }]);
                                 }
-                                existing.worktrees.push(SidebarWorktree::from_repository(
-                                    record,
-                                    status.as_ref(),
-                                ));
+                                let mut row =
+                                    SidebarWorktree::from_repository(record, status.as_ref());
+                                row.apply_operation(loaded.operations.get(&record.id).copied());
+                                existing.worktrees.push(row);
                             }
                             let existing_id = existing.id;
+                            let order = &mut Arc::make_mut(&mut self.durable).project_order;
+                            if let Some(first) = order
+                                .iter()
+                                .position(|id| *id == project_id || *id == existing_id)
+                            {
+                                order.retain(|id| *id != project_id && *id != existing_id);
+                                order.insert(first.min(order.len()), existing_id);
+                            }
+                            self.sidebar_model
+                                .apply_project_order(&self.durable.project_order);
+                            self.persist();
                             self.repository_generations.remove(&project_id);
                             if let Some(previous) =
                                 self.repository_pr_cancellations.remove(&project_id)
@@ -13555,9 +13958,28 @@ impl Application for Cagents {
                             self.review_repositories.remove(&project_id);
                             self.sync_worktree_operation_rows();
                             self.sidebar_model.data_state = SidebarDataState::Ready;
-                            let task = if open_cards && !self.refuse_in_deleting_worktree(&worktree)
+                            let selecting = self.project_ui.select_on_load.as_ref()
+                                == Some(&loaded.project.repository);
+                            let activation = if selecting {
+                                self.sidebar_model
+                                    .project(existing_id)
+                                    .and_then(|project| self.project_activation_worktree(project))
+                            } else {
+                                None
+                            };
+                            if activation.is_some() {
+                                self.project_ui.select_on_load = None;
+                            }
+                            let worktree = if selecting {
+                                activation
+                            } else {
+                                Some(worktree)
+                            };
+                            let task = if (selecting || open_cards)
+                                && let Some(worktree) = worktree
+                                && !self.refuse_in_deleting_worktree(&worktree)
                             {
-                                self.select_worktree(worktree, true)
+                                self.select_worktree(worktree, open_cards)
                             } else {
                                 Task::none()
                             };
@@ -13592,10 +14014,25 @@ impl Application for Cagents {
                             .worktrees
                             .iter()
                             .map(|(record, status)| {
-                                let mut row =
-                                    SidebarWorktree::from_repository(record, status.as_ref());
-                                row.head_repository =
-                                    loaded.head_repositories.get(&record.id).cloned();
+                                let mut row = self
+                                    .sidebar_model
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.id == project_id)
+                                    .and_then(|project| {
+                                        project.worktrees.iter().find(|row| row.id == record.id)
+                                    })
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        SidebarWorktree::from_repository(record, None)
+                                    });
+                                row.apply_repository(record, status.as_ref());
+                                row.apply_operation(loaded.operations.get(&record.id).copied());
+                                let head = loaded.head_repositories.get(&record.id).cloned();
+                                if row.head_repository != head {
+                                    row.clear_pull_request();
+                                }
+                                row.head_repository = head;
                                 row
                             })
                             .collect();
@@ -13732,7 +14169,23 @@ impl Application for Cagents {
                             self.prune_pull_request_refs(project_id),
                             self.update_review_requests(review_request_ui::Action::Tick),
                         ]);
-                        if open_cards {
+                        if self.project_ui.select_on_load.as_ref()
+                            == Some(&loaded.project.repository)
+                        {
+                            // Model observation and activation are independent
+                            // subscriptions. Even before checkout metadata
+                            // arrives, select only a navigable current row.
+                            let activation = self
+                                .sidebar_model
+                                .project(project_id)
+                                .and_then(|project| self.project_activation_worktree(project));
+                            if let Some(path) = activation {
+                                self.project_ui.select_on_load = None;
+                                if !self.refuse_in_deleting_worktree(&path) {
+                                    task = self.select_worktree(path, false);
+                                }
+                            }
+                        } else if open_cards {
                             if !self.refuse_in_deleting_worktree(&worktree) {
                                 task = self.select_worktree(worktree, true);
                             }
@@ -14143,18 +14596,19 @@ impl Application for Cagents {
                     SidebarAction::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
                     SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
                     SidebarAction::MarkChannelRead(id) => {
+                        self.sidebar_state.retain_attention_channel(id);
                         let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
-                        let tasks: Vec<_> = cards.into_iter().map(|card| {
-                            self.sidebar_state.acknowledge_agent_update(card);
-                            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
-                                && let Err(error) = handle.acknowledge_updates()
-                            {
-                                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
-                            }
-                            self.acknowledge_chat_updates(card)
-                        }).collect();
-                        self.refresh_sidebar_channels();
-                        Task::batch(tasks)
+                        self.mark_cards_read(cards)
+                    }
+                    SidebarAction::MarkAllRead => {
+                        let cards = self.durable.cards.iter().filter(|card| card.existence.is_open()).map(|card| card.id).collect();
+                        self.mark_cards_read(cards)
+                    }
+                    SidebarAction::MarkWorktreeRead(project, worktree) => {
+                        let cards = self.durable.cards.iter().filter(|card| card.existence.is_open())
+                            .filter(|card| self.agent_worktree(card.id).is_some_and(|key| key.project_id == project && key.worktree_id == worktree))
+                            .map(|card| card.id).collect();
+                        self.mark_cards_read(cards)
                     }
                     SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
                         widget::Id::new("sidebar.projects.scroll"),
@@ -14589,6 +15043,14 @@ impl Application for Cagents {
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
             }
+            Message::AcknowledgeVisiblePane { card, epoch } => {
+                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
+                    self.acknowledge_active_pane()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::FocusAttention(card) => self.focus_attention_card(card),
             Message::FocusCard(id) => {
                 // Explicit activation also cancels a pending entry on this same
                 // card, even if no view has observed its acknowledgment yet.
@@ -15248,6 +15710,7 @@ impl Application for Cagents {
                 self.sync_context_overlay_state()
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
+            Message::ActivateProject(repository) => self.activate_project(repository),
             Message::ActivateSession { session, token } => {
                 let activation = match token {
                     Some(token) => self.activate_main_window(Some(token)),
@@ -16141,6 +16604,9 @@ impl Application for Cagents {
                     }
                     _ => None,
                 };
+                if account_focus.is_some_and(|(focused, _)| focused != self.refresh_ui.focused) {
+                    self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
+                }
                 // A colour-only theme change reaches the hook but not the mode
                 // watch, so the periodic refresh is where that one is caught.
                 let refresh = self.update_refresh(action);
@@ -16152,7 +16618,24 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
+                let acknowledge = if account_focus.is_some_and(|(_, regained)| regained) {
+                    let epoch = self.attention_focus_epoch;
+                    self.workspace.focused().map_or_else(Task::none, |card| {
+                        cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            Message::AcknowledgeVisiblePane { card, epoch }
+                        })
+                    })
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                    acknowledge,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -16295,6 +16778,7 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::SourceControlReleased => Task::none(),
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -16306,8 +16790,20 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.source_cancel = None;
-                if let Ok(snapshot) = &result
-                    && let Some(worktree) = self
+                // The expensive panel model follows its existing request
+                // generation. Watcher scalar updates do not restart it under
+                // continuous writes; only row/cache facts use the shared order.
+                if let Ok(read) = &result
+                    && self.refresh_ui.git.accept_bound_status(
+                        &key,
+                        &read.status,
+                        read.operation,
+                        read.head_repository.as_ref(),
+                        read.read,
+                    )
+                {
+                    let head_repository = read.head_repository.clone();
+                    if let Some(worktree) = self
                         .sidebar_model
                         .projects
                         .iter_mut()
@@ -16318,12 +16814,30 @@ impl Application for Cagents {
                                 .iter_mut()
                                 .find(|worktree| worktree.id == key.worktree_id)
                         })
-                {
-                    worktree.apply_status(&snapshot.status);
+                    {
+                        worktree.apply_status(&read.status);
+                        worktree.apply_status_head(&read.status.head);
+                        if head_repository.is_none() || worktree.head_repository != head_repository
+                        {
+                            worktree.clear_pull_request();
+                        }
+                        worktree.head_repository = head_repository;
+                        worktree.apply_operation(read.operation);
+                    }
                 }
-                let mut next = match &result {
-                    Ok(snapshot) => SourceControlModel::ready(key, snapshot),
-                    Err(error) => SourceControlModel::failed(key, error.clone()),
+                if matches!(&result, Ok(read) if read.prepared.is_none()) {
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
+                    return Task::none();
+                }
+                let (snapshot, mut next) = match result {
+                    Ok(read) => {
+                        let (snapshot, model) =
+                            *read.prepared.expect("unchanged reads returned above");
+                        (Some(snapshot), model)
+                    }
+                    Err(error) => (None, SourceControlModel::failed(key, error)),
                 };
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
@@ -16332,9 +16846,9 @@ impl Application for Cagents {
                     previous.carry_mutation_into(&mut next);
                 }
                 self.sidebar_model.source_control = Some(next);
-                match result {
-                    Ok(snapshot) => self.refresh_branch_changes(&snapshot),
-                    Err(_) => {
+                match snapshot {
+                    Some(snapshot) => self.refresh_branch_changes(&snapshot),
+                    None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
@@ -16532,17 +17046,23 @@ impl Application for Cagents {
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
-            .map(|activation| match activation.update {
-                Some(request) => Message::UiUpdate(request),
-                None => match activation.session {
-                    Some(session) => Message::ActivateSession {
-                        session,
-                        token: activation.token,
-                    },
-                    None => Message::ActivateUi {
-                        token: activation.token,
-                    },
-                },
+            .map(|activation| {
+                if let Some(repository) = activation.project {
+                    Message::ActivateProject(repository)
+                } else {
+                    match activation.update {
+                        Some(request) => Message::UiUpdate(request),
+                        None => match activation.session {
+                            Some(session) => Message::ActivateSession {
+                                session,
+                                token: activation.token,
+                            },
+                            None => Message::ActivateUi {
+                                token: activation.token,
+                            },
+                        },
+                    }
+                }
             }),
             event::listen_with(|event, status, event_window| match event {
                 iced::Event::Keyboard(event) => Some(Message::KeyEvent {
@@ -17498,6 +18018,7 @@ fn load_project(
         },
         repository: None,
         worktrees: Vec::new(),
+        operations: HashMap::new(),
         github: GitHubAvailability::NotAssociated,
         review_repository: None,
         head_repositories: HashMap::new(),
@@ -17522,7 +18043,7 @@ fn load_repository(
         .discover(&path, &cancellation)
         .map_err(|error| error.to_string())?;
     let worktrees = service
-        .list_worktrees(&repository.common_dir, &cancellation)
+        .list_worktrees_for_repository(&repository, &cancellation)
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
@@ -17530,13 +18051,19 @@ fn load_repository(
             let status = (!worktree.bare)
                 .then(|| {
                     service
-                        .status_with_untracked(&worktree.path, false, &cancellation)
+                        .status_with_untracked(&worktree.path, true, &cancellation)
                         .ok()
                 })
                 .flatten();
             (worktree, status)
         })
         .collect::<Vec<_>>();
+    let operations = worktrees
+        .iter()
+        .filter_map(|(record, _)| {
+            git_ui::worktree_operation(&record.path, None).map(|kind| (record.id, kind))
+        })
+        .collect();
     let head_repositories = worktrees
         .iter()
         .filter_map(|(record, _)| {
@@ -17569,6 +18096,7 @@ fn load_repository(
         },
         repository: Some(repository),
         worktrees,
+        operations,
         github: github_availability,
         review_repository,
         head_repositories,
@@ -18838,6 +19366,7 @@ mod tests {
                 .send_blocking(instance::UiActivation {
                     token: None,
                     session: None,
+                    project: None,
                     update: None,
                 })
                 .is_err()
@@ -20788,6 +21317,9 @@ mod tests {
                 normalization_warning: None,
             }),
         }));
+        assert!(completion_navigates(&Message::ActivateProject(
+            PathBuf::from("/repo/.git")
+        )));
         assert!(!completion_navigates(&Message::ExternalLinkOpened(Ok(()))));
     }
 
@@ -23466,6 +23998,7 @@ mod tests {
                 is_bare: false,
             }),
             worktrees: Vec::new(),
+            operations: HashMap::new(),
             github: GitHubAvailability::NotAssociated,
             review_repository: None,
             head_repositories: HashMap::new(),
@@ -25195,6 +25728,9 @@ mod tests {
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
+            window_waiting_count: 0,
+            attention_navigation: Vec::new(),
+            attention_focus_epoch: 0,
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
@@ -25273,9 +25809,152 @@ mod tests {
     }
 
     #[test]
+    fn attention_window_title_tracks_count_without_renaming_the_pane() {
+        let base = format!("Review{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}");
+        assert_eq!(format_window_title("Review", None, 0), base);
+        assert_eq!(
+            format_window_title("Review", Some("fw16"), 2),
+            format!("(2) fw16 · {base}")
+        );
+        assert_eq!(format_window_title("Review", None, 0), base);
+        let mut app = context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        drop(app.sync_window_title());
+        let header = app.core.window.header_title.clone();
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        assert!(iced::runtime::task::into_stream(app.sync_window_title()).is_some());
+        assert_eq!(app.window_waiting_count, 1);
+        assert_eq!(app.core.window.header_title, header);
+        app.sidebar_state.clear_agent_activity(card);
+        assert!(iced::runtime::task::into_stream(app.sync_window_title()).is_some());
+        assert_eq!(app.window_waiting_count, 0);
+    }
+
+    #[test]
+    fn stale_visible_acknowledgement_cannot_read_an_update_from_a_later_focus_cycle() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        let stale_epoch = app.attention_focus_epoch;
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        app.observe_agent_update_for_card(card);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        assert_ne!(stale_epoch, app.attention_focus_epoch);
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: stale_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        let epoch = app.attention_focus_epoch;
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn attention_shortcut_switches_projects_focuses_exact_pane_and_acknowledges_it() {
+        use crate::model::{ChannelId, ProjectChannel};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        let first = app.workspace.focused().unwrap();
+        let second = terminal_card_state();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        let projects = [ProjectId::new(), ProjectId::new()];
+        let channels = [ChannelId::new(), ChannelId::new()];
+        for (index, card) in [first, second_id].into_iter().enumerate() {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                projects[index],
+                RepositoryId::new(),
+                format!("Project{index}"),
+                "/tmp".into(),
+                Vec::new(),
+                Vec::new(),
+            ));
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    title_source: Default::default(),
+                    id: channels[index],
+                    project_id: projects[index],
+                    title: format!("Channel{index}"),
+                    ordinal: index as u32,
+                    shared: false,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
+        }
+        drop(app.select_channel(channels[0]));
+        app.sidebar_state.observe_card_update(first);
+        app.sidebar_state.observe_card_update(second_id);
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.durable.active_channel, Some(channels[1]));
+        assert_eq!(app.workspace.focused(), Some(second_id));
+        assert!(!app.sidebar_state.has_card_update(second_id));
+        assert!(app.sidebar_state.has_card_update(first));
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.durable.active_channel, Some(channels[0]));
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(!app.sidebar_state.has_card_update(first));
+    }
+
+    #[test]
+    fn focused_pane_finishing_in_background_is_unread_until_visible_acknowledgement() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        let activity = |state| {
+            Some(Activity {
+                provider: Provider::Omp,
+                state,
+            })
+        };
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        app.refresh_ui.focused = true;
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
     fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_its_pane() {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
         app.context_inspector_open = false;
         app.settings.focus_follows_mouse = true;
         let first = app.workspace.focused().unwrap();

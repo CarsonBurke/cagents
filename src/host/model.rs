@@ -31,10 +31,11 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod navigation;
+mod project_checkout;
 mod terminal_owners;
 mod views;
 
-const SCHEMA_VERSION: u32 = 12;
+const SCHEMA_VERSION: u32 = 13;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -107,11 +108,13 @@ impl Registry {
         })?;
         let mut projects = self
             .db
-            .prepare("SELECT repository, name, ordinal, kind FROM projects ORDER BY ordinal")
+            .prepare("SELECT repository, name, ordinal, kind, checkout, primary_checkout FROM projects ORDER BY ordinal")
             .map_err(|error| error.to_string())?;
         let projects = projects
             .query_map([], |row| {
                 Ok(ModelProject {
+                    checkout: row.get::<_, Option<String>>(4)?.map(PathBuf::from),
+                    primary_checkout: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
                     repository: PathBuf::from(row.get::<_, String>(0)?),
                     name: row.get(1)?,
                     ordinal: row.get::<_, i64>(2)? as u32,
@@ -217,16 +220,33 @@ impl Registry {
             }
             ModelEdit::OpenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
             }
             | ModelEdit::ReopenProject {
                 repository,
+                checkout,
+                primary_checkout,
                 name,
                 kind,
+            }
+            | ModelEdit::VisitProject {
+                repository,
+                checkout,
+                primary_checkout,
+                name,
+                kind,
+                ..
             } => {
                 let key = repository_key(repository)?;
-                let explicit = matches!(edit, ModelEdit::ReopenProject { .. });
+                let checkout = checkout.as_deref().map(repository_key).transpose()?;
+                let primary_checkout = primary_checkout.as_deref().map(repository_key).transpose()?;
+                let explicit = matches!(edit,
+                    ModelEdit::ReopenProject { .. }
+                    | ModelEdit::VisitProject { reopen: true, .. });
+                let visiting = matches!(edit, ModelEdit::VisitProject { .. });
                 let tombstoned: bool = transaction
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM closed_projects WHERE repository = ?1)",
@@ -248,21 +268,24 @@ impl Registry {
                     } else {
                         false
                     };
-                    let existing: Option<String> = transaction
+                    let existing: Option<(String, Option<String>, Option<String>)> = transaction
                         .query_row(
-                            "SELECT name FROM projects WHERE repository = ?1",
+                            "SELECT name, checkout, primary_checkout FROM projects WHERE repository = ?1",
                             params![key],
-                            |row| row.get(0),
+                            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                         )
                         .optional()
                         .map_err(|error| error.to_string())?;
                     match existing {
-                        Some(current) if current == *name => reopened,
-                        Some(_) => {
+                        Some((current, current_checkout, current_primary)) if (visiting || current == *name)
+                            && checkout.is_none_or(|checkout| Some(checkout) == current_checkout.as_deref())
+                            && primary_checkout.is_none_or(|primary| Some(primary) == current_primary.as_deref()) => reopened,
+                        Some((current, _, _)) => {
+                            let name = if visiting { &current } else { name };
                             transaction
                                 .execute(
-                                    "UPDATE projects SET name = ?2 WHERE repository = ?1",
-                                    params![key, name],
+                                    "UPDATE projects SET name = ?2, checkout = COALESCE(?3, checkout), primary_checkout = COALESCE(?4, primary_checkout) WHERE repository = ?1",
+                                    params![key, name, checkout, primary_checkout],
                                 )
                                 .map_err(|error| error.to_string())?;
                             true
@@ -271,8 +294,8 @@ impl Registry {
                             let ordinal = take_ordinal(&transaction, "next_project_ordinal")?;
                             transaction
                                 .execute(
-                                    "INSERT INTO projects(repository, name, ordinal, kind) \
-                                 VALUES (?1, ?2, ?3, ?4)",
+                                    "INSERT INTO projects(repository, name, ordinal, kind, checkout, primary_checkout) \
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                                     params![
                                         key,
                                         name,
@@ -280,7 +303,9 @@ impl Registry {
                                         match kind {
                                             ProjectKind::Git => "git",
                                             ProjectKind::Folder => "folder",
-                                        }
+                                        },
+                                        checkout,
+                                        primary_checkout,
                                     ],
                                 )
                                 .map_err(|error| error.to_string())?;
@@ -623,6 +648,11 @@ fn migrate(db: &Connection) -> Result<(), String> {
     if version < 12 {
         mailbox::migrate_attention(db)?;
     }
+    if version < 13 {
+        project_checkout::migrate(db)?;
+        db.pragma_update(None, "user_version", 13)
+            .map_err(|error| error.to_string())?;
+    }
     Ok(())
 }
 
@@ -846,6 +876,8 @@ mod tests {
 
     fn open(repository: &str) -> ModelEdit {
         ModelEdit::OpenProject {
+            checkout: None,
+            primary_checkout: None,
             kind: Default::default(),
             repository: PathBuf::from(repository),
             name: repository.rsplit('/').next().unwrap().to_owned(),
@@ -870,6 +902,8 @@ mod tests {
         let path = directory.path().join("model.sqlite3");
         registry
             .apply(&ModelEdit::OpenProject {
+                checkout: None,
+                primary_checkout: None,
                 repository: "/folder".into(),
                 name: "Folder".into(),
                 kind: ProjectKind::Folder,
@@ -880,6 +914,8 @@ mod tests {
         let mut observed = registry.model().unwrap();
         assert_eq!(observed.projects[0].kind, ProjectKind::Folder);
         let repeat = ModelEdit::ReopenProject {
+            checkout: None,
+            primary_checkout: None,
             repository: "/folder".into(),
             name: "Renamed".into(),
             kind: ProjectKind::Git,
@@ -970,6 +1006,8 @@ mod tests {
         assert_eq!(stale.model.closed_projects, [PathBuf::from("/tmp/one")]);
         let opened = registry
             .apply(&ModelEdit::ReopenProject {
+                checkout: None,
+                primary_checkout: None,
                 kind: Default::default(),
                 repository: PathBuf::from("/tmp/one"),
                 name: "one".into(),

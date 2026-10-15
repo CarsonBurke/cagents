@@ -14,6 +14,14 @@ struct AutomaticAttempt {
 
 #[derive(Debug, Default)]
 pub struct State {
+    /// Last explicit CLI activation; adoption alone never changes this window's scope.
+    pub(super) select_on_load: Option<PathBuf>,
+    /// Reserve one identity while registry adoption and CLI activation race.
+    pub(super) pending_loads: HashMap<PathBuf, ProjectId>,
+    /// Discovery roots keyed by canonical repository identity. Device values
+    /// remain in that device's namespace and are never inspected locally.
+    pub(super) checkout_roots: HashMap<PathBuf, PathBuf>,
+    pub(super) primary_checkout_roots: HashMap<PathBuf, PathBuf>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
@@ -214,6 +222,115 @@ pub enum Action {
 }
 
 impl Cagents {
+    pub(super) fn activate_project(&mut self, repository: PathBuf) -> Task<Message> {
+        self.cancel_workspace_preview();
+        self.chrome_ui.close();
+        let project = self
+            .sidebar_model
+            .projects
+            .iter()
+            .find(|project| project.repository == repository);
+        if let Some(project) = project {
+            let primary = self.project_activation_worktree(project);
+            if let Some(path) = primary {
+                self.project_ui.select_on_load = None;
+                return self.select_worktree(path, false);
+            }
+        }
+        let id = project.map(|project| project.id);
+        let kind = project.map(|project| project.kind);
+        self.project_ui.select_on_load = Some(repository.clone());
+        if self.project_ui.pending_loads.contains_key(&repository) {
+            return Task::none();
+        }
+        self.project_load_task(repository, id, false, kind)
+    }
+
+    /// Discovery records the primary separately from the last opened checkout.
+    /// Prefer those known roots while they are in the current row inventory;
+    /// a bare common directory is metadata, never a navigable checkout.
+    pub(super) fn project_activation_worktree(&self, project: &SidebarProject) -> Option<PathBuf> {
+        if project.kind == ProjectKind::Folder {
+            return Some(project.repository.clone());
+        }
+        let checkout =
+            |path: &Path| project.kind != ProjectKind::Git || path != project.repository.as_path();
+        let listed = |path: &Path| {
+            project
+                .worktrees
+                .iter()
+                .any(|row| row.path.as_path() == path)
+        };
+        self.project_ui
+            .primary_checkout_roots
+            .get(&project.repository)
+            .filter(|path| listed(path))
+            .or_else(|| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| {
+                        checkout(&row.path)
+                            && sidebar::is_primary_worktree(&project.repository, &row.path)
+                    })
+                    .map(|row| &row.path)
+            })
+            .or_else(|| {
+                self.project_ui
+                    .checkout_roots
+                    .get(&project.repository)
+                    .filter(|path| listed(path))
+            })
+            .or_else(|| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| checkout(&row.path))
+                    .map(|row| &row.path)
+            })
+            .cloned()
+    }
+
+    pub(super) fn known_project_checkout(
+        &self,
+        repository: &Path,
+        project_id: ProjectId,
+    ) -> Option<(PathBuf, PathBuf)> {
+        // Read requests can name a linked checkout while their stable ID names
+        // the canonical project. Discovery caches are keyed by that identity.
+        let project = self.sidebar_model.project(project_id);
+        let repository = project.map_or(repository, |project| project.repository.as_path());
+        if let Some(checkout) = self
+            .project_ui
+            .checkout_roots
+            .get(repository)
+            .or_else(|| self.project_ui.primary_checkout_roots.get(repository))
+        {
+            return Some((checkout.clone(), repository.to_owned()));
+        }
+        let project = project?;
+        if project.kind == ProjectKind::Folder {
+            return Some((project.repository.clone(), project.repository.clone()));
+        }
+        let checkout = project
+            .worktrees
+            .iter()
+            .find(|row| {
+                project
+                    .repository
+                    .file_name()
+                    .is_some_and(|name| name == ".git")
+                    && project.repository.parent() == Some(row.path.as_path())
+            })
+            .or_else(|| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| row.path != project.repository)
+            })?;
+        Some((checkout.path.clone(), project.repository.clone()))
+    }
+
     pub(super) fn sync_worktree_protections(&mut self) {
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
@@ -1005,6 +1122,13 @@ impl Cagents {
                     return Task::none();
                 }
                 match command {
+                    ProjectCommand::MarkRead => {
+                        return worktree_id.map_or_else(Task::none, |worktree| {
+                            self.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+                                project_id, worktree,
+                            )))
+                        });
+                    }
                     ProjectCommand::CopyPath => {
                         return iced::clipboard::write(target.path.display().to_string());
                     }
@@ -2859,12 +2983,16 @@ mod tests {
         let model = WorkspaceModel {
             projects: vec![
                 ModelProject {
+                    checkout: None,
+                    primary_checkout: None,
                     repository: child.clone(),
                     name: "Child folder".into(),
                     kind: ProjectKind::Folder,
                     ordinal: 1,
                 },
                 ModelProject {
+                    checkout: None,
+                    primary_checkout: None,
                     repository: git_root.join(".git"),
                     name: "Other Git".into(),
                     kind: ProjectKind::Git,

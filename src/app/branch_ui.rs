@@ -385,6 +385,9 @@ mod tests {
 
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot {
                 head: HeadState::Detached {
                     oid: "ab".repeat(20),

@@ -350,6 +350,8 @@ impl Cagents {
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
+            Command::NextAttention => self.cycle_attention(false),
+            Command::PreviousAttention => self.cycle_attention(true),
             Command::ToggleProjects => self.update_chrome(chrome_ui::Action::ToggleProjects),
             Command::RenamePane => self.workspace.focused().map_or_else(Task::none, |id| {
                 self.update_chrome(chrome_ui::Action::Rename(id))
@@ -524,6 +526,8 @@ impl SettingsField {
             Self::ShortcutNextColumn => Some(Command::FocusAdjacent(
                 crate::workspace::FocusDirection::Right,
             )),
+            Self::ShortcutNextAttention => Some(Command::NextAttention),
+            Self::ShortcutPreviousAttention => Some(Command::PreviousAttention),
             Self::ShortcutCyclePaneWidth => Some(Command::CyclePaneWidth),
             Self::ShortcutPreviousWorkspace => Some(Command::CycleWorkspace(
                 crate::workspace::FocusDirection::Left,
