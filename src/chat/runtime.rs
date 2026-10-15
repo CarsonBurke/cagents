@@ -1257,6 +1257,8 @@ impl LocalHandle {
 
     /// Restore controls only after exact-thread confirmation. No prompt is issued,
     /// and the successor's published launch recipe remains the original contract.
+    /// The budget fences admission and final success; an already-admitted
+    /// control keeps its own bounded acknowledgement wait and may settle later.
     pub(crate) fn restore_account_options(
         &self,
         options: &AccountSwitchOptions,
@@ -1268,6 +1270,9 @@ impl LocalHandle {
         let mut fast_sent = false;
         let mut permissions_requested = false;
         loop {
+            if Instant::now() >= deadline {
+                return Err("Account option restoration deadline expired; no further controls were admitted. Previously admitted controls keep their own acknowledgement deadline; do not replay them blindly.".into());
+            }
             if cancelled() || self.is_completed() {
                 return Err("The account switch stopped before the current conversation options were confirmed".into());
             }

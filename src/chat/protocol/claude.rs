@@ -10273,6 +10273,15 @@ for line in sys.stdin:
         assert!(writes.lines().all(|line|serde_json::from_str::<Value>(line).unwrap()["request"]["subtype"]=="get_settings"));
         assert!(!different.is_completed(),"a permission mismatch does not authorize stopping the actor");
         different.close().unwrap();
+
+        let (expired, _, log) = start("expired-deadline",json!({"source":"projectSettings","settings":{"permissions":{"deny":["Bash(rm *)"]}}}));
+        let initial = expired.snapshot(None).unwrap().permissions;
+        let refusal = expired.restore_account_options(&options,Instant::now()-Duration::from_millis(1),||false).unwrap_err();
+        assert!(refusal.contains("deadline expired"));
+        assert_eq!(expired.snapshot(None).unwrap().permissions,initial);
+        assert!(!log.exists(),"an expired local budget must not write even a refresh control");
+        assert!(!expired.is_completed());
+        expired.close().unwrap();
     }
 
 }
