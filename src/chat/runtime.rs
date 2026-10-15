@@ -3727,16 +3727,34 @@ mod tests {
         const STAGE: &str = "CAGENTS_PRIVATE_STDERR_RUNTIME_TEST";
         let Some(directory) = std::env::var_os(STAGE) else {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-            let output=std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact","chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure","--nocapture"])
-                .env(STAGE,directory.path()).env("XDG_CACHE_HOME",directory.path().join("cache"))
-                .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(
-                output.status.success(),
-                "stdout={} stderr={}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            );
+            use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+            use std::os::unix::fs::PermissionsExt as _;
+            for name in ["home", "config", "data", "cache", "runtime"] {
+                let path = directory.path().join(name);
+                std::fs::create_dir(&path).unwrap();
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let test = "chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure";
+            let spec = CommandSpec::new(std::env::current_exe().unwrap())
+                .args(["--exact", test, "--nocapture", "--test-threads=1"])
+                .cwd(directory.path())
+                .env(STAGE, directory.path())
+                .env("HOME", directory.path().join("home"))
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                .env("CAGENTS_LOCAL_DEBUG", "0")
+                .timeout(std::time::Duration::from_secs(60))
+                .output_limits(256 * 1024, 64 * 1024);
+            // Original Child/pipe ownership is bounded here; the strict outer
+            // runner separately settles actual provider/holder descendants.
+            let output = SystemProcessExecutor.execute(&spec, &CancellationToken::new()).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(output.success && output.exit_code == Some(0) && output.signal.is_none(),
+                "stdout={stdout} stderr={}", String::from_utf8_lossy(&output.stderr));
+            assert!(stdout.lines().any(|line| line == format!("test {test} ... ok")));
+            assert!(stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"));
             let general = std::fs::read_to_string(directory.path().join("general.log")).unwrap();
             assert!(
                 !general.contains("private-api-token"),
