@@ -891,9 +891,9 @@ impl Cagents {
             // helper per row kind beside the one the worktree rows use.
             for channel in channels.get(&project.id).into_iter().flatten().copied() {
                 let title = if channel.title.is_empty() {
-                    new_channel_title(primary_branch)
+                    std::borrow::Cow::Owned(new_channel_title(primary_branch))
                 } else {
-                    channel_display_title(channel).to_owned()
+                    std::borrow::Cow::Borrowed(channel_display_title(channel))
                 };
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
@@ -930,7 +930,7 @@ impl Cagents {
                 }
                 let unchanged = project.channels.get(index).is_some_and(|row| {
                     row.id == channel.id
-                        && row.title == title
+                        && row.title == title.as_ref()
                         && row.selected == selected
                         && row.activity == activity
                         && row.unread == unread
@@ -942,7 +942,7 @@ impl Cagents {
                 if !unchanged {
                     let mut row = SidebarChannel::new(
                         channel.id,
-                        title.to_owned(),
+                        title.into_owned(),
                         selected,
                         activity,
                         unread,
