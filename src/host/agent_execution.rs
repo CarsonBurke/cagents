@@ -924,6 +924,10 @@ fn hide_secrets(requests: &mut [chat::Request]) {
 /// agent stays under its owner's control afterwards. Both act only on the
 /// owner's own active run: once a person has taken the agent over, its turns
 /// and the questions they raise are that person's.
+///
+/// A run settles when its main turn ends, while a background subagent may
+/// still wait on a decision. The owner may still turn that down, since a
+/// refusal authorizes no work, but approving it needs an active run.
 fn control(
     host: &SharedHost,
     authority: &Authority,
@@ -944,7 +948,8 @@ fn control(
     {
         return Err("A person took this agent over; its controls are theirs".into());
     }
-    if run.state.is_terminal() {
+    let declines = matches!(&command, Control::Answer { action, .. } if chat::declines(action));
+    if run.state.is_terminal() && !declines {
         return Err(format!(
             "The agent has no active run; its latest is {:?}",
             run.state
