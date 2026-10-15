@@ -1125,7 +1125,7 @@ where
             // Scan in source order so multiline comment state is exact on both
             // sides of the caret. Keep only nesting positions, never source text.
             let mut stack = Vec::new();
-            let mut block = 0;
+            let mut block = brackets::State::default();
             let mut budget = 8 * 1024 * 1024usize;
             let mut reached = false;
             for (line_index, line) in lines.iter().enumerate() {
@@ -5455,6 +5455,16 @@ mod tests {
         assert_eq!(nested.matching_brackets(), Some((Position { line: 0, column: 7 }, Position { line: 6, column: 0 })));
         nested.set_cursor(Cursor { position: Position { line: 3, column: 0 }, selection: None });
         assert_eq!(nested.matching_brackets(), None);
+        for source in [
+            "fn a() {\nlet s = \"hello\n} world\";\nreal();\n}",
+            "fn a() {\nlet s = r#\"hello \"\n} world\"#;\nreal();\n}",
+        ] {
+            let mut multiline: Content = Content::with_text(source);
+            multiline.set_cursor(Cursor { position: Position { line: 0, column: 7 }, selection: None });
+            assert_eq!(multiline.matching_brackets(), Some((Position { line: 0, column: 7 }, Position { line: 4, column: 0 })));
+            multiline.set_cursor(Cursor { position: Position { line: 2, column: 0 }, selection: None });
+            assert_eq!(multiline.matching_brackets(), None);
+        }
         let mut malformed: Content = Content::with_text("([)]");
         malformed.set_cursor(Cursor { position: Position { line: 0, column: 0 }, selection: None });
         assert_eq!(malformed.matching_brackets(), None);
