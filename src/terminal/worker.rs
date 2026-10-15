@@ -941,6 +941,38 @@ impl TerminalHandle {
         self.inner.published.set_agent_activity(None);
     }
 
+    /// A genuinely blocked OS worker for host shutdown-batch contracts. No
+    /// process or holder exists in this fixture, so joining it must never be
+    /// mistaken for confirmed PTY teardown. Sending or dropping the release
+    /// sender lets the exact shared join owner retire the thread after a test.
+    #[cfg(test)]
+    pub(crate) fn spawn_with_wedged_worker_for_test() -> (Self, Sender<()>) {
+        let reservation = joins::reserve().expect("test worker cleanup admission");
+        let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
+        published
+            .join_reservation
+            .set(reservation)
+            .expect("test worker reserves cleanup before spawning");
+        let (commands, inbox) = command_channel(1);
+        let (events, event_receiver) = crossbeam_channel::unbounded();
+        let (release, blocked) = crossbeam_channel::bounded(1);
+        let worker = thread::spawn(move || {
+            // Keep both public channels connected while the body is stuck.
+            let _inbox = inbox;
+            let _events = events;
+            let _ = blocked.recv();
+        });
+        let handle = Self {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: event_receiver,
+                published,
+                worker: Arc::new(Mutex::new(Some(worker))),
+            }),
+        };
+        (handle, release)
+    }
+
     #[cfg(test)]
     pub(crate) fn spawn_with_missing_exit_report_for_test(session: TerminalSession) -> Self {
         let (commands, receiver) = command_channel(1);
