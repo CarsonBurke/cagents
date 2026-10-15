@@ -452,6 +452,7 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
         | ClientRequest::CloseTerminalChecked { terminal_id, .. }
         | ClientRequest::ChatReturnTerminal {
             chat_id: terminal_id,
+            ..
         }
         | ClientRequest::ChatCommitTerminal { terminal_id }
         | ClientRequest::ChatClose {
@@ -470,7 +471,7 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
         {
             Some(*chat_id)
         }
-        ClientRequest::ChatCloseRetained { session } => Some(session.id),
+        ClientRequest::ChatCloseRetained { session } | ClientRequest::ChatCloseSession { session } => Some(session.id),
         _ => None,
     };
     if session.is_some_and(|id| active.iter().any(|scope| scope.sessions.contains(&id))) {
@@ -500,7 +501,8 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
             Some(&session.launch.working_directory),
             Some(session.id),
         )?,
-        ClientRequest::ChatStart { session, .. }
+        ClientRequest::ChatAttach { session }
+        | ClientRequest::ChatStart { session, .. }
         | ClientRequest::ChatStartSelected { session, .. } => ensure_available(
             host,
             None,
