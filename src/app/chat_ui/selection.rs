@@ -1648,11 +1648,21 @@ mod tests {
             &renderer,
             &layout::Limits::new(Size::ZERO, viewport.size()),
         );
-        ACTIVE.store(
-            tree.state.downcast_ref::<State>().identity,
-            Ordering::Relaxed,
-        );
+        // Focus through actual pointer input. Setting ACTIVE alone does not
+        // make a transcript focused, so it never exercises the copy command.
+        let mut visible = Read::new(None);
+        element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut visible);
+        let first = visible.blocks.iter().find_map(|block|
+            block.visible.and_then(|bounds| bounds.intersection(&viewport))).unwrap();
+        let point = Point::new(first.x + first.width.min(8.0) / 2.0, first.y + first.height / 2.0);
         let mut clipboard = ClipboardText::default();
+        for event in [mouse::Event::ButtonPressed(mouse::Button::Left), mouse::Event::ButtonReleased(mouse::Button::Left)] {
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(&mut tree, &Event::Mouse(event), Layout::new(&node),
+                mouse::Cursor::Available(point), &renderer, &mut clipboard, &mut Shell::new(&mut messages), &viewport);
+        }
+        assert!(tree.state.downcast_ref::<State>().focused, "native pointer focus must precede Ctrl+A/C");
+        assert_eq!(ACTIVE.load(Ordering::Relaxed), tree.state.downcast_ref::<State>().identity);
         for key in ["a", "c"] {
             let mut messages = Vec::new();
             element.as_widget_mut().update(
