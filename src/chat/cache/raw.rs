@@ -24,6 +24,7 @@ pub enum RawRepresentation {
 pub struct RawCommandCall {
     pub label: String,
     pub command: String,
+    /// App projection at capture time; not a kernel/provider scope receipt.
     pub working_directory: String,
     pub action: crate::chat::CommandAction,
 }
