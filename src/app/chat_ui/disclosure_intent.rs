@@ -24,9 +24,21 @@ impl<K:Eq+Hash,V> Cache<K,V> {
     }
     pub(super) fn usage(&self)->(usize,usize) {(self.values.len(),self.bytes)}
 }
+/// Exact opaque UI provenance, independent of logical leaf IDs/body hashes.
+/// This is a lossless encoding of the actual Store-issued token, not new wire.
+pub(super) fn source_stamp(epoch:crate::chat::cache::SourceEpoch)->[u8;24] {
+    let mut stamp=[0;24];stamp[..16].copy_from_slice(epoch.incarnation.as_bytes());stamp[16..].copy_from_slice(&epoch.revision.to_le_bytes());stamp
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn source_stamp_preserves_actual_incarnation_and_all_revision_bits() {
+        let epoch=crate::chat::cache::SourceEpoch {incarnation:uuid::Uuid::from_u128(7),revision:u64::MAX-1};let stamp=source_stamp(epoch);
+        assert_eq!(&stamp[..16],epoch.incarnation.as_bytes());assert_eq!(&stamp[16..],&epoch.revision.to_le_bytes());
+        assert_ne!(stamp,source_stamp(crate::chat::cache::SourceEpoch {revision:epoch.revision-1,..epoch}));
+        assert_ne!(stamp,source_stamp(crate::chat::cache::SourceEpoch {incarnation:uuid::Uuid::from_u128(8),..epoch}));
+    }
     #[test]
     fn replacement_and_weighted_eviction_keep_both_indexes_bounded() {
         let mut cache=Cache::default();
