@@ -19,6 +19,16 @@ pub(in crate::host) struct Startup {
     pub(super) context: Arc<chat::protocol::ExecutionContext>,
 }
 
+impl Startup {
+    /// Cheap custody snapshot for NEGATIVE scope inventory only. Capture a
+    /// bounded set under HostState, then inspect original directory metadata
+    /// outside HostState. Neither absence nor these clones authorize cleanup,
+    /// adoption or another start; reconcile_startup retains sole clearing proof.
+    pub(in crate::host) fn scope_snapshot(&self) -> (Session, Arc<chat::protocol::ExecutionContext>) {
+        (self.source.clone(), self.context.clone())
+    }
+}
+
 /// Unit-only HostState fixtures intentionally exercise local transports without
 /// a daemon lease. The retained-actor integration fixture opts into the genuine
 /// exec/socket/lease boundary. Production has no fallback or environment knob.
