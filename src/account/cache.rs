@@ -53,7 +53,9 @@ pub struct IdentityVerification {
     pending: bool,
 }
 impl IdentityVerification {
-    pub(crate) fn pending(&self) -> bool { self.pending }
+    pub(crate) fn pending(&self) -> bool {
+        self.pending
+    }
 }
 
 /// Compare causal verdicts before usage timestamps. A known later revision
@@ -71,12 +73,20 @@ pub(crate) fn adopt_identity_verdict(
             return new.epoch == old.epoch && new.revision > old.revision;
         }
         (Some(_), None) => return true,
-        (None, Some(_)) if !matches!(snapshot.status,
-            super::UsageStatus::NeedsLogin | super::UsageStatus::Unavailable) => return false,
+        (None, Some(_))
+            if !matches!(
+                snapshot.status,
+                super::UsageStatus::NeedsLogin | super::UsageStatus::Unavailable
+            ) =>
+        {
+            return false;
+        }
         _ => {}
     }
-    previous.is_none_or(|old| snapshot.observed_at > old.observed_at
-        || (allow_equal && snapshot.observed_at == old.observed_at))
+    previous.is_none_or(|old| {
+        snapshot.observed_at > old.observed_at
+            || (allow_equal && snapshot.observed_at == old.observed_at)
+    })
 }
 
 /// What is remembered about one account.
@@ -153,7 +163,9 @@ impl Cache {
     /// stamped in the future is left out: the cache only ever saves a probe,
     /// so losing it costs one.
     pub fn load(&self, now: u64) -> BTreeMap<String, Entry> {
-        let Ok(_lock) = self.lock(libc::LOCK_SH) else { return BTreeMap::new() };
+        let Ok(_lock) = self.lock(libc::LOCK_SH) else {
+            return BTreeMap::new();
+        };
         let mut entries = read_document(&self.path())
             .map(|document| {
                 document
@@ -165,7 +177,9 @@ impl Cache {
                     .collect()
             })
             .unwrap_or_default();
-        if self.overlay_verification(&mut entries).is_err() { entries.clear(); }
+        if self.overlay_verification(&mut entries).is_err() {
+            entries.clear();
+        }
         entries
     }
 

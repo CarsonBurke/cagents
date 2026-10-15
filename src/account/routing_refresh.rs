@@ -67,11 +67,20 @@ async fn refresh_with<F, Fut>(
                     // verdict so a later login invalidation cannot be erased
                     // by an unqualified duplicate write of this old answer.
                     let entry = match &cache {
-                        Some(cache) => cache.load(crate::chat::now_ms().unwrap_or(now)).remove(&key),
-                        None => Some(Entry { verification: None, identity, snapshot }),
+                        Some(cache) => cache
+                            .load(crate::chat::now_ms().unwrap_or(now))
+                            .remove(&key),
+                        None => Some(Entry {
+                            verification: None,
+                            identity,
+                            snapshot,
+                        }),
                     };
-                    if let Some(entry) = entry { entries.insert(key.clone(), entry); }
-                    else { entries.remove(&key); }
+                    if let Some(entry) = entry {
+                        entries.insert(key.clone(), entry);
+                    } else {
+                        entries.remove(&key);
+                    }
                     break;
                 }
                 Ok(probe::Outcome::Busy) => {

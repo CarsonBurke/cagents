@@ -218,7 +218,12 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
     };
     let (cli, key, lock, verification) = match setup {
         Ok(Prepared::Done(outcome)) => return outcome,
-        Ok(Prepared::Probe { cli, key, lock, verification }) => (cli, key, lock, verification),
+        Ok(Prepared::Probe {
+            cli,
+            key,
+            lock,
+            verification,
+        }) => (cli, key, lock, verification),
         Err(_) => return Outcome::Failed("The probe could not be prepared".into()),
     };
     let probed = tokio::time::timeout(TIMEOUT, probe_cli(&account, &cli)).await;
@@ -244,11 +249,23 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         )),
     };
     let (identity, snapshot, catalog) = match outcome {
-        Outcome::Answered { identity, snapshot, catalog, .. } => (identity, snapshot, catalog),
-        other => { drop(lock); return other; }
+        Outcome::Answered {
+            identity,
+            snapshot,
+            catalog,
+            ..
+        } => (identity, snapshot, catalog),
+        other => {
+            drop(lock);
+            return other;
+        }
     };
     let reported_identity = identity.clone();
-    let entry = Entry { verification: None, identity, snapshot };
+    let entry = Entry {
+        verification: None,
+        identity,
+        snapshot,
+    };
     let saved_catalog = catalog.clone();
     let provider = account.provider;
     // Keep the provider lock until the causal identity verdict and durable
@@ -259,17 +276,22 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
         let entry = if let Some((verification_cache, token)) = verification {
             verification_cache.finish_verification(token, entry, cache.is_some())?
         } else {
-            if let (Some(cache), Some(key)) = (&cache, &key) { cache.store(key, entry.clone())?; }
+            if let (Some(cache), Some(key)) = (&cache, &key) {
+                cache.store(key, entry.clone())?;
+            }
             entry
         };
         if let (Some(cache), Some(catalog)) = (&cache, saved_catalog) {
             let _ = cache.store_catalog(provider, catalog);
         }
         Ok::<_, std::io::Error>(entry)
-    }).await;
+    })
+    .await;
     match committed {
         Ok(Ok(entry)) => after_verification(entry, reported_identity, catalog),
-        Ok(Err(error)) => Outcome::Failed(format!("The account verification could not be committed: {error}")),
+        Ok(Err(error)) => Outcome::Failed(format!(
+            "The account verification could not be committed: {error}"
+        )),
         Err(_) => Outcome::Failed("The account verification could not be committed".into()),
     }
 }
@@ -277,18 +299,38 @@ pub async fn run(account: Account, cache: Option<Cache>, force: bool) -> Outcome
 /// Cache identity is redacted while authentication is pending. The actual
 /// probe's Some+NeedsLogin is also a retry disposition for sign-in callers:
 /// it must never become indistinguishable from a genuinely signed-out home.
-fn after_verification(entry: Entry, reported_identity: Option<Identity>, catalog: Option<Catalog>) -> Outcome {
-    let identity = if entry.snapshot.status == UsageStatus::NeedsLogin && reported_identity.is_some() {
-        reported_identity
-    } else { entry.identity };
-    Outcome::Answered { verification: entry.verification, identity, snapshot: entry.snapshot, catalog }
+fn after_verification(
+    entry: Entry,
+    reported_identity: Option<Identity>,
+    catalog: Option<Catalog>,
+) -> Outcome {
+    let identity =
+        if entry.snapshot.status == UsageStatus::NeedsLogin && reported_identity.is_some() {
+            reported_identity
+        } else {
+            entry.identity
+        };
+    Outcome::Answered {
+        verification: entry.verification,
+        identity,
+        snapshot: entry.snapshot,
+        catalog,
+    }
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_verified_outcome(cache: &Cache, key: &str, entry: Entry, persist: bool) -> Outcome {
+pub(crate) fn fixture_verified_outcome(
+    cache: &Cache,
+    key: &str,
+    entry: Entry,
+    persist: bool,
+) -> Outcome {
     let reported_identity = entry.identity.clone();
-    match cache.begin_verification(key).and_then(|token|cache.finish_verification(token,entry,persist)) {
-        Ok(entry) => after_verification(entry,reported_identity,None),
+    match cache
+        .begin_verification(key)
+        .and_then(|token| cache.finish_verification(token, entry, persist))
+    {
+        Ok(entry) => after_verification(entry, reported_identity, None),
         Err(error) => Outcome::Failed(error.to_string()),
     }
 }
@@ -351,12 +393,19 @@ fn prepare(
     let verification = match key.as_ref() {
         Some(key) => match lock_cache.begin_verification(key) {
             Ok(token) => Some((lock_cache.clone(), token)),
-            Err(error) => return Prepared::Done(Outcome::Failed(format!("Account identity verification is unavailable: {error}"))),
+            Err(error) => {
+                return Prepared::Done(Outcome::Failed(format!(
+                    "Account identity verification is unavailable: {error}"
+                )));
+            }
         },
         None => None,
     };
-    let awaiting_identity = verification.as_ref().is_some_and(|(_,token)| token.pending());
-    if !force && !awaiting_identity
+    let awaiting_identity = verification
+        .as_ref()
+        .is_some_and(|(_, token)| token.pending());
+    if !force
+        && !awaiting_identity
         && let Some(entry) = key
             .as_ref()
             .and_then(|key| cache.and_then(|cache| cache.load(now).remove(key)))
@@ -364,10 +413,19 @@ fn prepare(
     {
         let mut snapshot = entry.snapshot;
         snapshot.source = UsageSource::Cache;
-        return Prepared::Done(Outcome::Answered { verification: entry.verification,
-            identity: entry.identity, snapshot, catalog: None });
+        return Prepared::Done(Outcome::Answered {
+            verification: entry.verification,
+            identity: entry.identity,
+            snapshot,
+            catalog: None,
+        });
     }
-    Prepared::Probe { cli, key, lock, verification }
+    Prepared::Probe {
+        cli,
+        key,
+        lock,
+        verification,
+    }
 }
 
 fn answered(identity: Option<Identity>, snapshot: UsageSnapshot) -> Outcome {
@@ -1256,32 +1314,96 @@ mod tests {
     #[test]
     fn cached_redaction_preserves_expired_login_disposition_and_uncached_actual_auth() {
         use super::*;
-        for persist in [false,true] {
+        for persist in [false, true] {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
             let cache = Cache::at(root.path());
             let key = "codex:/private-auth-fixture";
-            let identity = Some(Identity { email: Some("cached@fixture.invalid".into()),..Identity::default() });
-            let outcome = fixture_verified_outcome(&cache,key,Entry { verification: None,
-                identity: identity.clone(),snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"Expired",100) },persist);
-            let transported: Outcome = serde_json::from_value(serde_json::to_value(outcome).unwrap()).unwrap();
-            assert!(matches!(transported,Outcome::Answered { identity: Some(_),snapshot: UsageSnapshot { status: UsageStatus::NeedsLogin,.. },.. }),
-                "named expired identity remains a retry disposition across device JSON");
+            let identity = Some(Identity {
+                email: Some("cached@fixture.invalid".into()),
+                ..Identity::default()
+            });
+            let outcome = fixture_verified_outcome(
+                &cache,
+                key,
+                Entry {
+                    verification: None,
+                    identity: identity.clone(),
+                    snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "Expired", 100),
+                },
+                persist,
+            );
+            let transported: Outcome =
+                serde_json::from_value(serde_json::to_value(outcome).unwrap()).unwrap();
+            assert!(
+                matches!(
+                    transported,
+                    Outcome::Answered {
+                        identity: Some(_),
+                        snapshot: UsageSnapshot {
+                            status: UsageStatus::NeedsLogin,
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "named expired identity remains a retry disposition across device JSON"
+            );
             let shared = cache.load(100).remove(key).unwrap();
             assert!(shared.identity.is_none());
-            assert_eq!(shared.snapshot.status,UsageStatus::NeedsLogin);
+            assert_eq!(shared.snapshot.status, UsageStatus::NeedsLogin);
             // A caller explicitly skipping quota persistence still receives
             // its actual successful auth result; it cannot clear shared pending
             // metadata or claim that cache's causal verification revision.
-            let verified = fixture_verified_outcome(&cache,key,Entry { verification: None,
-                identity,snapshot: UsageSnapshot::state(UsageStatus::Ok,"",101) },false);
-            assert!(matches!(verified,Outcome::Answered { identity: Some(_),verification: None,
-                snapshot: UsageSnapshot { status: UsageStatus::Ok,.. },.. }));
-            assert_eq!(cache.load(101)[key].snapshot.status,UsageStatus::NeedsLogin);
-            let signed_out = fixture_verified_outcome(&cache,key,Entry { verification: None,
-                identity: None,snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"Signed out",102) },persist);
-            assert!(matches!(signed_out,Outcome::Answered { identity: None,
-                snapshot: UsageSnapshot { status: UsageStatus::NeedsLogin,.. },.. }),
-                "a genuinely signed-out home is never invented as an expired named identity");
+            let verified = fixture_verified_outcome(
+                &cache,
+                key,
+                Entry {
+                    verification: None,
+                    identity,
+                    snapshot: UsageSnapshot::state(UsageStatus::Ok, "", 101),
+                },
+                false,
+            );
+            assert!(matches!(
+                verified,
+                Outcome::Answered {
+                    identity: Some(_),
+                    verification: None,
+                    snapshot: UsageSnapshot {
+                        status: UsageStatus::Ok,
+                        ..
+                    },
+                    ..
+                }
+            ));
+            assert_eq!(
+                cache.load(101)[key].snapshot.status,
+                UsageStatus::NeedsLogin
+            );
+            let signed_out = fixture_verified_outcome(
+                &cache,
+                key,
+                Entry {
+                    verification: None,
+                    identity: None,
+                    snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "Signed out", 102),
+                },
+                persist,
+            );
+            assert!(
+                matches!(
+                    signed_out,
+                    Outcome::Answered {
+                        identity: None,
+                        snapshot: UsageSnapshot {
+                            status: UsageStatus::NeedsLogin,
+                            ..
+                        },
+                        ..
+                    }
+                ),
+                "a genuinely signed-out home is never invented as an expired named identity"
+            );
         }
     }
     #[test]

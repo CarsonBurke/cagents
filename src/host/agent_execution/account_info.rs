@@ -200,7 +200,11 @@ pub(super) fn read(
                     identity, snapshot, ..
                 } => apply(
                     &mut info,
-                    Entry { verification: None, identity, snapshot },
+                    Entry {
+                        verification: None,
+                        identity,
+                        snapshot,
+                    },
                     crate::chat::now_ms().unwrap_or(now),
                 ),
                 probe::Outcome::Failed(error) => {

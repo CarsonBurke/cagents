@@ -603,16 +603,22 @@ impl State {
             // Daemon and other windows share this cache. Adopt newer evidence
             // before scheduling a focus probe, preserving any newer live report.
             if let Some(entry) = restored.entry.filter(|entry| {
-                restored.present && account::cache::adopt_identity_verdict(
-                    entry.verification.as_ref(), state.verification.as_ref(),
-                    &entry.snapshot, state.snapshot.as_ref(), false,
-                )
+                restored.present
+                    && account::cache::adopt_identity_verdict(
+                        entry.verification.as_ref(),
+                        state.verification.as_ref(),
+                        &entry.snapshot,
+                        state.snapshot.as_ref(),
+                        false,
+                    )
             }) {
                 let mut snapshot = entry.snapshot;
                 snapshot.source = UsageSource::Cache;
                 state.schedule.observe(snapshot.observed_at);
                 state.identity = entry.identity;
-                if entry.verification.is_some() { state.verification = entry.verification; }
+                if entry.verification.is_some() {
+                    state.verification = entry.verification;
+                }
                 state.snapshot = Some(snapshot);
                 state.failure = None;
             }
@@ -2299,7 +2305,10 @@ impl Cagents {
             }
             if let LiveReport::CodexLogin(login) = &report {
                 login_changed |= !login.describes(state.snapshot.as_ref(), state.identity.as_ref());
-            } else if !state.verification.as_ref().is_some_and(|proof|proof.pending())
+            } else if !state
+                .verification
+                .as_ref()
+                .is_some_and(|proof| proof.pending())
                 && let Some(snapshot) = state.snapshot.as_mut()
                 && snapshot.status != UsageStatus::NeedsLogin
                 && report.apply(snapshot, observed_at, now)
@@ -3213,23 +3222,40 @@ impl Cagents {
         match outcome {
             // Causal identity verdicts precede usage wall-clock ordering.
             // A stale probe without a newer verdict cannot rewind the state.
-            Outcome::Answered { ref snapshot, ref verification, .. }
-                if !account::cache::adopt_identity_verdict(
-                    verification.as_ref(), state.verification.as_ref(),
-                    snapshot, state.snapshot.as_ref(), true,
-                ) =>
+            Outcome::Answered {
+                ref snapshot,
+                ref verification,
+                ..
+            } if !account::cache::adopt_identity_verdict(
+                verification.as_ref(),
+                state.verification.as_ref(),
+                snapshot,
+                state.snapshot.as_ref(),
+                true,
+            ) =>
             {
                 state.schedule.abandon();
             }
             // Current provider evidence settles this probe.
             Outcome::Answered {
-                mut identity, snapshot, verification, ..
+                mut identity,
+                snapshot,
+                verification,
+                ..
             } => {
-                if verification.is_some() { state.verification = verification; }
+                if verification.is_some() {
+                    state.verification = verification;
+                }
                 // Sign-in consumers separately retain the provider's expired
                 // identity as retry disposition. Ordinary account display
                 // must not learn it as verified shared identity.
-                if state.verification.as_ref().is_some_and(|proof|proof.pending()) { identity = None; }
+                if state
+                    .verification
+                    .as_ref()
+                    .is_some_and(|proof| proof.pending())
+                {
+                    identity = None;
+                }
                 // A changed identity confirms that the login attempt ended,
                 // but accepting that identity for this account is separate.
                 // The attempt ends once the home reports
@@ -3262,8 +3288,13 @@ impl Cagents {
                 // A signed-out answer, or an identity lookup that failed this
                 // time, names nobody; the account last seen is still the one
                 // it is, or the one to sign back in to.
-                if identity.is_some() || snapshot.status == UsageStatus::Unavailable
-                    || state.verification.as_ref().is_some_and(|proof|proof.pending()) {
+                if identity.is_some()
+                    || snapshot.status == UsageStatus::Unavailable
+                    || state
+                        .verification
+                        .as_ref()
+                        .is_some_and(|proof| proof.pending())
+                {
                     state.identity = identity;
                 }
                 if let (Some(key), Some(identity)) =
@@ -8034,8 +8065,10 @@ mod app_tests {
             .account
             .cache_key()
             .unwrap();
-        assert!(cache.load(now_ms()).remove(&key).is_none(),
-            "only daemon-captured account scope may persist these live figures");
+        assert!(
+            cache.load(now_ms()).remove(&key).is_none(),
+            "only daemon-captured account scope may persist these live figures"
+        );
     }
 
     /// The startup load does not wait on the shell: an account whose CLI only
@@ -8160,23 +8193,47 @@ mod app_tests {
     #[test]
     fn legacy_signed_out_cache_without_a_stamp_cannot_become_live_allowance() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let account = Account::managed(Provider::Codex,uuid::Uuid::new_v4(),root.path().into());
+        let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), root.path().into());
         let id = account.id();
         let mut app = context_inspector_test_app(false);
         app.account_ui.accounts = vec![AccountState::new(account)];
-        app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(Entry {
-            verification: None,identity: None,
-            snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"Signed out",100),
-        }) }]);
-        let recipe = recipe_on(&app,&id);
-        assert_eq!(app.chat_account(Provider::Codex,&recipe),Some(id.clone()));
-        drop(app.account_reported(Provider::Codex,&recipe,vec![(LiveReport::CodexLimits(account::codex::LimitsUpdate {
-            windows: vec![UsageWindow { key: "codex:session".into(),kind: account::WindowKind::Session,
-                label: "Session".into(),used: 0.2,resets_at: None,span_secs: None,binding: true }],
-            credits: None,plan: Some("pro".into()),limited: false,
-        }),101)]));
+        app.account_ui.restore(vec![Restored {
+            id: id.clone(),
+            present: true,
+            entry: Some(Entry {
+                verification: None,
+                identity: None,
+                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "Signed out", 100),
+            }),
+        }]);
+        let recipe = recipe_on(&app, &id);
+        assert_eq!(app.chat_account(Provider::Codex, &recipe), Some(id.clone()));
+        drop(app.account_reported(
+            Provider::Codex,
+            &recipe,
+            vec![(
+                LiveReport::CodexLimits(account::codex::LimitsUpdate {
+                    windows: vec![UsageWindow {
+                        key: "codex:session".into(),
+                        kind: account::WindowKind::Session,
+                        label: "Session".into(),
+                        used: 0.2,
+                        resets_at: None,
+                        span_secs: None,
+                        binding: true,
+                    }],
+                    credits: None,
+                    plan: Some("pro".into()),
+                    limited: false,
+                }),
+                101,
+            )],
+        ));
         let state = app.account_ui.account(&id).unwrap();
-        assert_eq!(state.snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin);
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().status,
+            UsageStatus::NeedsLogin
+        );
         assert!(state.verification.is_none());
     }
 
@@ -8184,84 +8241,203 @@ mod app_tests {
     fn identity_verdicts_cross_quota_timestamps_in_restore_and_actual_probe_dispatch() {
         for delivered_by_probe in [false, true] {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
-            let home = root.path().join("home"); std::fs::create_dir(&home).unwrap();
-            let account = Account::managed(Provider::Codex,uuid::Uuid::new_v4(),home);
-            let id = account.id(); let key = account.cache_key().unwrap();
+            let home = root.path().join("home");
+            std::fs::create_dir(&home).unwrap();
+            let account = Account::managed(Provider::Codex, uuid::Uuid::new_v4(), home);
+            let id = account.id();
+            let key = account.cache_key().unwrap();
             let cache = Cache::at(root.path().join("cache"));
             let reading = |at, email: &str| Entry {
                 verification: None,
-                identity: Some(Identity { email: Some(email.into()), plan: Some("pro".into()), organization: None }),
-                snapshot: UsageSnapshot::state(UsageStatus::Ok,"",at),
+                identity: Some(Identity {
+                    email: Some(email.into()),
+                    plan: Some("pro".into()),
+                    organization: None,
+                }),
+                snapshot: UsageSnapshot::state(UsageStatus::Ok, "", at),
             };
-            let old = reading(100,"old@fixture.invalid");
-            cache.store(&key,old.clone()).unwrap();
+            let old = reading(100, "old@fixture.invalid");
+            cache.store(&key, old.clone()).unwrap();
             let mut app = context_inspector_test_app(false);
             app.account_ui.accounts = vec![AccountState::new(account)];
             let state = app.account_ui.account_mut(&id).unwrap();
-            state.present = true; state.identity = old.identity; state.snapshot = Some(old.snapshot);
-            cache.invalidate_identity(&key,100,"Verify the changed login").unwrap();
+            state.present = true;
+            state.identity = old.identity;
+            state.snapshot = Some(old.snapshot);
+            cache
+                .invalidate_identity(&key, 100, "Verify the changed login")
+                .unwrap();
             let pending = cache.load(100).remove(&key).unwrap();
-            app.account_ui.restore(vec![Restored { id: id.clone(), present: true, entry: Some(pending.clone()) }]);
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(pending.clone()),
+            }]);
             let state = app.account_ui.account(&id).unwrap();
-            assert_eq!(state.snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin,
-                "pending authority must replace equal-time positive quota");
+            assert_eq!(
+                state.snapshot.as_ref().unwrap().status,
+                UsageStatus::NeedsLogin,
+                "pending authority must replace equal-time positive quota"
+            );
             assert!(state.identity.is_none());
             // A real UI live-report dispatch must not turn the pending identity
             // back into positive display evidence, even at a newer time.
-            let recipe = recipe_on(&app,&id);
-            drop(app.account_reported(Provider::Codex,&recipe,vec![(LiveReport::CodexLimits(account::codex::LimitsUpdate {
-                windows: vec![UsageWindow { key: "codex:session".into(),kind: account::WindowKind::Session,
-                    label: "Session".into(),used: 0.2,resets_at: None,span_secs: None,binding: true }],
-                credits: None,plan: Some("pro".into()),limited: false,
-            }),101)]));
-            assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin);
-            let mut newer_quota = pending.clone(); newer_quota.snapshot.observed_at = 101;
-            cache.store(&key,newer_quota).unwrap();
+            let recipe = recipe_on(&app, &id);
+            drop(app.account_reported(
+                Provider::Codex,
+                &recipe,
+                vec![(
+                    LiveReport::CodexLimits(account::codex::LimitsUpdate {
+                        windows: vec![UsageWindow {
+                            key: "codex:session".into(),
+                            kind: account::WindowKind::Session,
+                            label: "Session".into(),
+                            used: 0.2,
+                            resets_at: None,
+                            span_secs: None,
+                            binding: true,
+                        }],
+                        credits: None,
+                        plan: Some("pro".into()),
+                        limited: false,
+                    }),
+                    101,
+                )],
+            ));
+            assert_eq!(
+                app.account_ui
+                    .account(&id)
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                UsageStatus::NeedsLogin
+            );
+            let mut newer_quota = pending.clone();
+            newer_quota.snapshot.observed_at = 101;
+            cache.store(&key, newer_quota).unwrap();
             let old_pending = cache.load(101).remove(&key).unwrap();
-            app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(old_pending.clone()) }]);
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(old_pending.clone()),
+            }]);
             // This is the real pre-auth-token commit API, called through its
             // test-only fixture. No provider process or native ABI is claimed.
-            let verified = cache.fixture_verify_identity(&key,reading(100,"new@fixture.invalid")).unwrap();
-            assert_eq!(verified.snapshot.observed_at,100,"never fabricate a newer quota timestamp");
+            let verified = cache
+                .fixture_verify_identity(&key, reading(100, "new@fixture.invalid"))
+                .unwrap();
+            assert_eq!(
+                verified.snapshot.observed_at, 100,
+                "never fabricate a newer quota timestamp"
+            );
             if delivered_by_probe {
                 drop(app.update(Message::AccountUi(Action::Probed {
-                    owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
-                    outcome: Outcome::Answered { verification: verified.verification.clone(),
-                        identity: verified.identity.clone(),snapshot: verified.snapshot.clone(),catalog: None },
+                    owner: app.account_ui.probe_owner(&id).unwrap(),
+                    id: id.clone(),
+                    outcome: Outcome::Answered {
+                        verification: verified.verification.clone(),
+                        identity: verified.identity.clone(),
+                        snapshot: verified.snapshot.clone(),
+                        catalog: None,
+                    },
                 })));
             } else {
-                app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(verified.clone()) }]);
+                app.account_ui.restore(vec![Restored {
+                    id: id.clone(),
+                    present: true,
+                    entry: Some(verified.clone()),
+                }]);
             }
             let state = app.account_ui.account(&id).unwrap();
-            assert_eq!(state.identity.as_ref().unwrap().email.as_deref(),Some("new@fixture.invalid"));
-            assert_eq!(state.snapshot.as_ref().unwrap().observed_at,100);
+            assert_eq!(
+                state.identity.as_ref().unwrap().email.as_deref(),
+                Some("new@fixture.invalid")
+            );
+            assert_eq!(state.snapshot.as_ref().unwrap().observed_at, 100);
             assert!(!state.verification.as_ref().unwrap().pending());
             // Late negative and unqualified newer positive replies cannot
             // reverse the retained causal verdict in either adoption path.
-            app.account_ui.restore(vec![Restored { id: id.clone(),present: true,entry: Some(old_pending.clone()) }]);
-            for entry in [old_pending,reading(200,"unproved@fixture.invalid")] {
+            app.account_ui.restore(vec![Restored {
+                id: id.clone(),
+                present: true,
+                entry: Some(old_pending.clone()),
+            }]);
+            for entry in [old_pending, reading(200, "unproved@fixture.invalid")] {
                 drop(app.update(Message::AccountUi(Action::Probed {
-                    owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
-                    outcome: Outcome::Answered { verification: entry.verification,
-                        identity: entry.identity,snapshot: entry.snapshot,catalog: None },
+                    owner: app.account_ui.probe_owner(&id).unwrap(),
+                    id: id.clone(),
+                    outcome: Outcome::Answered {
+                        verification: entry.verification,
+                        identity: entry.identity,
+                        snapshot: entry.snapshot,
+                        catalog: None,
+                    },
                 })));
             }
-            assert_eq!(app.account_ui.account(&id).unwrap().identity.as_ref().unwrap().email.as_deref(),Some("new@fixture.invalid"));
-            let negative = cache.fixture_verify_identity(&key,Entry { verification: None,identity: None,
-                snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"Signed out",99) }).unwrap();
+            assert_eq!(
+                app.account_ui
+                    .account(&id)
+                    .unwrap()
+                    .identity
+                    .as_ref()
+                    .unwrap()
+                    .email
+                    .as_deref(),
+                Some("new@fixture.invalid")
+            );
+            let negative = cache
+                .fixture_verify_identity(
+                    &key,
+                    Entry {
+                        verification: None,
+                        identity: None,
+                        snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin, "Signed out", 99),
+                    },
+                )
+                .unwrap();
             drop(app.update(Message::AccountUi(Action::Probed {
-                owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
-                outcome: Outcome::Answered { verification: negative.verification,
-                    identity: negative.identity,snapshot: negative.snapshot,catalog: None },
+                owner: app.account_ui.probe_owner(&id).unwrap(),
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    verification: negative.verification,
+                    identity: negative.identity,
+                    snapshot: negative.snapshot,
+                    catalog: None,
+                },
             })));
-            assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin);
+            assert_eq!(
+                app.account_ui
+                    .account(&id)
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                UsageStatus::NeedsLogin
+            );
             drop(app.update(Message::AccountUi(Action::Probed {
-                owner: app.account_ui.probe_owner(&id).unwrap(),id: id.clone(),
-                outcome: Outcome::Answered { verification: verified.verification,
-                    identity: verified.identity,snapshot: verified.snapshot,catalog: None },
+                owner: app.account_ui.probe_owner(&id).unwrap(),
+                id: id.clone(),
+                outcome: Outcome::Answered {
+                    verification: verified.verification,
+                    identity: verified.identity,
+                    snapshot: verified.snapshot,
+                    catalog: None,
+                },
             })));
-            assert_eq!(app.account_ui.account(&id).unwrap().snapshot.as_ref().unwrap().status,UsageStatus::NeedsLogin,
-                "a late positive with the old verified revision cannot undo negative authentication");
+            assert_eq!(
+                app.account_ui
+                    .account(&id)
+                    .unwrap()
+                    .snapshot
+                    .as_ref()
+                    .unwrap()
+                    .status,
+                UsageStatus::NeedsLogin,
+                "a late positive with the old verified revision cannot undo negative authentication"
+            );
         }
     }
 
@@ -8826,11 +9002,14 @@ mod app_tests {
         let mut app = context_inspector_test_app(false);
         let key = pending_login(&mut app, 515);
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let home = root.path().join("codex-home"); std::fs::create_dir(&home).unwrap();
-        std::fs::write(home.join("saved-provider-history"),"retain for retry").unwrap();
+        let home = root.path().join("codex-home");
+        std::fs::create_dir(&home).unwrap();
+        std::fs::write(home.join("saved-provider-history"), "retain for retry").unwrap();
         app.account_ui.logins[0].provider = Provider::Codex;
         app.account_ui.logins[0].home = home.clone();
-        app.account_ui.registry.begin(Provider::Codex,key,now_ms());
+        app.account_ui
+            .registry
+            .begin(Provider::Codex, key, now_ms());
         let cache = Cache::at(root.path().join("cache"));
         std::fs::create_dir(root.path().join("cache")).unwrap();
         for attempt in 1..=LOGIN_ATTEMPTS {
@@ -8838,15 +9017,34 @@ mod app_tests {
             let _ = app.check_logins();
             let _ = app.login_verified(
                 key,
-                probe::fixture_verified_outcome(&cache,"codex:/private-login-fixture",Entry {
-                    verification: None,
-                    identity: Some(Identity { email: Some("cached@example.com".into()),..Identity::default() }),
-                    snapshot: UsageSnapshot::state(UsageStatus::NeedsLogin,"expired credentials",NOW),
-                },true),
+                probe::fixture_verified_outcome(
+                    &cache,
+                    "codex:/private-login-fixture",
+                    Entry {
+                        verification: None,
+                        identity: Some(Identity {
+                            email: Some("cached@example.com".into()),
+                            ..Identity::default()
+                        }),
+                        snapshot: UsageSnapshot::state(
+                            UsageStatus::NeedsLogin,
+                            "expired credentials",
+                            NOW,
+                        ),
+                    },
+                    true,
+                ),
             );
             assert!(app.account_ui.registry.find(key).is_none());
-            assert_eq!(std::fs::read_to_string(home.join("saved-provider-history")).unwrap(),"retain for retry");
-            assert!(cache.load(NOW)["codex:/private-login-fixture"].identity.is_none());
+            assert_eq!(
+                std::fs::read_to_string(home.join("saved-provider-history")).unwrap(),
+                "retain for retry"
+            );
+            assert!(
+                cache.load(NOW)["codex:/private-login-fixture"]
+                    .identity
+                    .is_none()
+            );
             assert!(
                 app.account_ui
                     .registry
