@@ -77,7 +77,7 @@ pub struct LspCodeAction {
     origin_version: i32,
     // Retains original peer context across an opaque lazy resolve. Recapturing
     // current versions would bless stale server data after close/reopen.
-    observed_documents: HashMap<Url, ObservedDocument>,
+    observed_documents: Arc<HashMap<Url, ObservedDocument>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub(super) enum RequestArgs {
     Formatting(LspFormattingOptions),
     RangeFormatting {range:lsp_types::Range,options:LspFormattingOptions},
     CodeActions {range:lsp_types::Range,diagnostics:Vec<lsp_types::Diagnostic>},
-    Resolve { action:lsp_types::CodeAction, observed:HashMap<Url,ObservedDocument> },
+    Resolve { action:lsp_types::CodeAction, observed:Arc<HashMap<Url,ObservedDocument>> },
     Execute(LspCommand),
     Signature {trigger:Option<String>,is_retrigger:bool,active:Option<lsp_types::SignatureHelp>},
 }
@@ -190,7 +190,7 @@ impl LspManager {
     /// must validate its original peer context. An edit-only action instead
     /// fences only its actual targets via observed_incarnation in the planner.
     pub fn validate_code_action_context(&self,item:&LspCodeAction)->Result<(),LspError> {
-        for (uri,observed) in &item.observed_documents {
+        for (uri,observed) in item.observed_documents.iter() {
             let Some((snapshot,incarnation))=self.snapshots.observation(uri) else {
                 return Err(LspError::Unsupported("A code-action peer document was closed after the action was requested".into()));
             };
@@ -629,7 +629,7 @@ impl LspCodeAction {
     /// Constructs a local action without protocol resolution data.
     pub fn local(title:String,edit:Option<LspWorkspaceEdit>,command:Option<LspCommand>)->Self {
         let raw=lsp_types::CodeActionOrCommand::CodeAction(lsp_types::CodeAction{title:title.clone(),..Default::default()});
-        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1,observed_documents:HashMap::new()}
+        Self{title,kind:None,is_preferred:false,disabled:None,edit,command,needs_resolve:false,raw,origin_version:-1,observed_documents:Arc::new(HashMap::new())}
     }
 }
 
@@ -652,13 +652,16 @@ mod tests {
         let request=PendingRequest{id:LspRequestId(9),doc:LspDocumentId(1),uri,worktree:Arc::from(Path::new("/repo")),kind:RequestKind::CodeActions,position:lsp_types::Position::default(),version:1,args:RequestArgs::None,timeout:Duration::from_secs(15),observed_versions:store.observations_for_session(&key)};
         let raw:lsp_types::CodeActionOrCommand=serde_json::from_value(json!({"title":"Fix and run","command":{"title":"Run","command":"server.run"},"data":{"resolve_edit":true}})).unwrap();
         let item=convert_action(&store,&request,raw).unwrap();assert!(item.needs_resolve);assert!(item.command.is_some());assert!(item.edit.is_none());
+        let sibling=convert_action(&store,&request,item.raw.clone()).unwrap();
+        assert!(Arc::ptr_eq(&item.observed_documents,&request.observed_versions));
+        assert!(Arc::ptr_eq(&item.observed_documents,&sibling.observed_documents));
     }
 
     #[test]
     fn command_acknowledgement_survives_its_own_workspace_edit(){
         let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
         store.register(LspDocumentId(1),&uri,&key,2,Arc::from("fixed"));
-        let request=PendingRequest{id:LspRequestId(9),doc:LspDocumentId(1),uri,worktree:Arc::from(Path::new("/repo")),kind:RequestKind::ExecuteCommand,position:lsp_types::Position::default(),version:1,args:RequestArgs::None,timeout:Duration::from_secs(15),observed_versions:HashMap::new()};
+        let request=PendingRequest{id:LspRequestId(9),doc:LspDocumentId(1),uri,worktree:Arc::from(Path::new("/repo")),kind:RequestKind::ExecuteCommand,position:lsp_types::Position::default(),version:1,args:RequestArgs::None,timeout:Duration::from_secs(15),observed_versions:Arc::new(HashMap::new())};
         assert!(matches!(convert_result(&store,&request,RawResult::Feature(RawFeatureResult::CommandExecuted(None))),LspEvent::CommandExecuted{request:LspRequestId(9),..}));
     }
 

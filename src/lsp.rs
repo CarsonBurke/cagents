@@ -999,11 +999,11 @@ impl SnapshotStore {
         Some((state.latest(), state.incarnation.clone()))
     }
 
-    fn observations_for_session(&self, session: &SessionKey) -> HashMap<Url, ObservedDocument> {
-        self.lock().uris.iter().filter(|(_, state)| &state.session == session)
+    fn observations_for_session(&self, session: &SessionKey) -> Arc<HashMap<Url, ObservedDocument>> {
+        Arc::new(self.lock().uris.iter().filter(|(_, state)| &state.session == session)
             .map(|(uri, state)| ((**uri).clone(), ObservedDocument {
                 version: state.latest().version, incarnation: state.incarnation.clone(),
-            })).collect()
+            })).collect())
     }
 
     fn document_incarnation(&self, doc: LspDocumentId) -> Option<LspDocumentIncarnation> {
@@ -2018,7 +2018,7 @@ struct PendingRequest {
     version: i32,
     args: RequestArgs,
     timeout: Duration,
-    observed_versions: HashMap<Url, ObservedDocument>,
+    observed_versions: Arc<HashMap<Url, ObservedDocument>>,
 }
 
 enum SessionCommand {
@@ -4708,7 +4708,7 @@ impl LspManager {
         let observed_versions = match &args {
             RequestArgs::Resolve { observed, .. } => observed.clone(),
             _ if matches!(kind,RequestKind::Rename|RequestKind::Formatting|RequestKind::RangeFormatting|RequestKind::CodeActions|RequestKind::ExecuteCommand) => self.snapshots.observations_for_session(&reference.session),
-            _ => HashMap::new(),
+            _ => Arc::new(HashMap::new()),
         };
         if let Err(reason) = session
             .commands
@@ -9195,7 +9195,7 @@ mod tests {
             kind: RequestKind::Definition,
             position: lsp_types::Position::new(0, 0),
             version: 1,
-                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
+                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: Arc::new(HashMap::new()),
         }
     }
 
@@ -9363,7 +9363,7 @@ mod tests {
             kind: RequestKind::Completion,
             position: lsp_types::Position::new(0, 3),
             version: 1,
-                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: HashMap::new(),
+                args: RequestArgs::None, timeout: Duration::from_secs(15), observed_versions: Arc::new(HashMap::new()),
         };
         let event = convert_result(
             &store,
@@ -9547,7 +9547,7 @@ mod tests {
         let edit: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"changes":{"file:///ignored.rs":[]},"documentChanges":[{"textDocument":{"uri":uri.as_str(),"version":2},"edits":[{"range":{"start":{"line":0,"character":3},"end":{"line":0,"character":6}},"newText":"bar"}]}]})).unwrap();
         let observed=store.observations_for_session(&key);
         let converted=features::convert_workspace_edit(&store,edit.clone(),Some(&observed)).unwrap();assert_eq!(converted.documents.len(),1);assert_eq!(converted.documents[0].edits[0].range.start.character,2);
-        let mut stale=observed;stale.get_mut(&*uri).unwrap().version=1;
+        let mut stale=observed;Arc::make_mut(&mut stale).get_mut(&*uri).unwrap().version=1;
         assert!(matches!(features::convert_workspace_edit(&store,edit,Some(&stale)),Err(LspError::StaleVersion{..})));
         let resource: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"kind":"create","uri":"file:///repo/new.rs"}]})).unwrap();assert!(matches!(features::convert_workspace_edit(&store,resource,None),Err(LspError::Unsupported(_))));
         assert_eq!(features::configuration(&json!({"rust-analyzer":{"check":{"command":"clippy"}}}),Some("rust-analyzer.check.command")),json!("clippy"));
