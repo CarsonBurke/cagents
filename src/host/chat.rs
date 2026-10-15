@@ -3582,12 +3582,16 @@ fn process_inner(
                         )
                         .map_err(unavailable)?;
                 }
-                    source_binding::mark_return_attempt(host, chat_id, &continuation)?;
-                    let published = super::state::spawn_terminal_view_owned_at_directory(
+                    let attempt = source_binding::mark_return_attempt(host, chat_id, &continuation)?;
+                    let published = super::state::spawn_terminal_view_owned_at_directory_attempt(
                         host, client, terminal,
                         crate::terminal_ipc::TerminalSpawnOptions { initially_visible: false, ..Default::default() },
-                        Some(handle.execution_environment()), false, execution,
-                    )?;
+                        Some(handle.execution_environment()), false, execution, &attempt,
+                    ).map_err(|failure| {
+                        if failure.attempt.id() != attempt.id() {
+                            unavailable("Terminal start failure belongs to another exact attempt; original custody retained")
+                        } else { failure.error }
+                    })?;
                     source_binding::remember_return_worker(host, chat_id, &continuation, published.0.clone(), published.1.clone())?;
                     published
                 }

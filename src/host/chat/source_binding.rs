@@ -45,7 +45,7 @@ struct PendingHandoff {
 struct ReturnTarget {
     reservation: Reservation,
     source: crate::model::TerminalSession,
-    attempted: bool,
+    attempt: Option<crate::terminal::TerminalStartAttempt>,
     published: Option<(crate::terminal_ipc::TerminalDescriptor, crate::terminal::TerminalHandle)>,
 }
 impl History {
@@ -802,35 +802,66 @@ pub(super) fn reserve_return_target(
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     state.native_sources.ensure(source.id)?;
     let reservation = state.native_sources.pin_existing(source.id)?;
-    continuation.returned = Some(ReturnTarget { reservation, source: source.clone(), attempted: false, published: None });
+    continuation.returned = Some(ReturnTarget { reservation, source: source.clone(), attempt: None, published: None });
     Ok(source)
 }
-/// Unknown after an actual spawn attempt never means no provider. HR11's exact
-/// start ticket supplies the eventual positive retry disposition; until then
-/// keep this operation and refuse another resume attempt.
+/// Unknown after an actual spawn attempt never means no provider. Reconcile
+/// only the original owner's typed ticket, retaining it on every uncertainty.
 pub(super) fn prepare_return_attempt(
     host: &SharedHost, id: TerminalId, continuation: &Continuation, source: crate::model::TerminalSession,
 ) -> Result<Option<(crate::terminal_ipc::TerminalDescriptor, crate::terminal::TerminalHandle)>, ProtocolError> {
+    use crate::terminal::TerminalStartDisposition as Disposition;
+    let (attempt, published) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let pending = state.native_sources.entries.get(&id).and_then(|entry| entry.pending_handoff.as_ref())
+            .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
+            .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
+        let target = pending.returned.as_ref().filter(|target| target.source.id == source.id)
+            .ok_or_else(|| unavailable("The exact attempted return target changed"))?;
+        (target.attempt.clone(), target.published.clone())
+    };
+    if published.is_some() { return Ok(published); }
+    if let Some(attempt) = &attempt {
+        if attempt.terminal_id() != source.id || attempt.session() != &source {
+            return Err(unavailable("The retained terminal attempt does not match the exact return recipe"));
+        }
+        let disposition = match attempt.disposition() {
+            Disposition::Unknown => attempt.retry_cleanup(), // off HostLock, bounded existing queue only
+            disposition => disposition,
+        };
+        match disposition {
+            Disposition::Published => {
+                let published = attempt.published().ok_or_else(|| unavailable("The exact published return worker is busy; no replacement was started"))?;
+                remember_return_worker(host, id, continuation, published.0.clone(), published.1.clone())?;
+                return Ok(Some(published));
+            }
+            Disposition::Pending | Disposition::Unknown => return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")),
+            Disposition::NoProvider | Disposition::FamilySettled => {}
+        }
+    }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
         .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
-        .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
-    let target = pending.returned.as_mut().filter(|target| target.source.id == source.id)
-        .ok_or_else(|| unavailable("The exact attempted return target changed"))?;
-    if let Some(published) = &target.published { return Ok(Some(published.clone())); }
-    if target.attempted { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
+        .ok_or_else(|| unavailable("The exact closed source operation changed during start reconciliation"))?;
+    let target = pending.returned.as_mut().filter(|target| target.source.id == source.id
+        && target.attempt.as_ref().map(|attempt| attempt.id()) == attempt.as_ref().map(|attempt| attempt.id()))
+        .ok_or_else(|| unavailable("The exact terminal start attempt was replaced"))?;
+    // Only the original owner's positive NoProvider/family receipt above may
+    // release an attempted ticket. Keep the same privately reserved target ID.
+    target.attempt = None;
     target.source = source;
     Ok(None)
 }
-pub(super) fn mark_return_attempt(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<(), ProtocolError> {
+pub(super) fn mark_return_attempt(host: &SharedHost, id: TerminalId, continuation: &Continuation) -> Result<crate::terminal::TerminalStartAttempt, ProtocolError> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pending = state.native_sources.entries.get_mut(&id).and_then(|entry| entry.pending_handoff.as_mut())
         .filter(|pending| pending.backend_closed && pending.token == continuation.claim && pending.owner.same_actor(&continuation.handle))
         .ok_or_else(|| unavailable("The exact closed source operation is unavailable"))?;
     let target = pending.returned.as_mut().ok_or_else(|| unavailable("The exact return target was not reserved"))?;
-    if target.attempted { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
-    target.attempted = true;
-    Ok(())
+    if target.attempt.is_some() { return Err(unavailable("The exact previous terminal start is unconfirmed; no second resume process was started")); }
+    let attempt = crate::terminal::TerminalStartAttempt::new(target.source.clone());
+    target.attempt = Some(attempt.clone());
+    Ok(attempt)
 }
 pub(super) fn remember_return_worker(
     host: &SharedHost, id: TerminalId, continuation: &Continuation,
@@ -845,6 +876,10 @@ pub(super) fn remember_return_worker(
         .ok_or_else(|| unavailable("The exact returned operation changed"))?;
     let target = pending.returned.as_mut().filter(|target| target.source.id == descriptor.session.id)
         .ok_or_else(|| unavailable("The returned worker belongs to another attempted target"))?;
+    if target.attempt.as_ref().is_none_or(|attempt| attempt.worker_instance() != Some(worker.execution_instance())
+        || attempt.published().is_none_or(|(issued, actual)| issued != descriptor || !actual.same_worker(&worker))) {
+        return Err(unavailable("The returned worker has no matching exact successful start ticket"));
+    }
     target.published = Some((descriptor, worker));
     Ok(())
 }
@@ -892,7 +927,7 @@ pub(in crate::host) fn capture_pending_close(host: &SharedHost, source: &Session
         let Some(pending) = &entry.pending_handoff else { return Ok(None); };
         validate_proof(source.proof.as_ref(), state.proof())?;
         if pending.original_pair.is_some() || pending.created_pair.is_some()
-            || pending.returned.as_ref().is_some_and(|target| target.attempted || target.published.is_some()) {
+            || pending.returned.as_ref().is_some_and(|target| target.attempt.is_some() || target.published.is_some()) {
             return Err(unavailable("This handoff retains attempted or paired terminal ownership; exact cleanup disposition is still required"));
         }
         if (source != &pending.intent.source && source != &pending.admitted.source)
@@ -926,7 +961,7 @@ pub(in crate::host) fn release_pending_close(
             && current.witness == *pending.witness() && current.owner.same_actor(pending.owner())
             && current.token == pending.claim_token() && current.backend_closed
             && current.original_pair.is_none() && current.created_pair.is_none()
-            && current.returned.as_ref().is_none_or(|target| !target.attempted && target.published.is_none())
+            && current.returned.as_ref().is_none_or(|target| target.attempt.is_none() && target.published.is_none())
     });
     if !matches { return Err(unavailable("The exact pending phase changed; cleanup authority was retained")); }
     entry.pending_handoff = None;
