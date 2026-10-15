@@ -25,16 +25,18 @@ impl Marker {
             ActivityOutcome::Cancelled => Tone::Cancelled,
             ActivityOutcome::Failed { .. } | ActivityOutcome::Interrupted { .. } => Tone::Failed,
         };
+        // Hydrated history records when the terminal evidence was first seen,
+        // which may be much later than the provider's actual completion.
         let time = i64::try_from(record.finished_at / 1000)
             .ok()
             .and_then(chat::local_time);
         let label = time.as_ref().map_or_else(
             || outcome.label().to_owned(),
-            |time| format!("{} at {}", outcome.label(), time.clock()),
+            |time| format!("{} · observed {}", outcome.label(), time.clock()),
         );
         let mut detail = time.map_or_else(
             || outcome.label().to_owned(),
-            |time| format!("{} · {:04}-{:02}-{:02} {}", outcome.label(), time.year + 1900, time.month + 1, time.day, time.clock()),
+            |time| format!("{} · observed {:04}-{:02}-{:02} {}", outcome.label(), time.year + 1900, time.month + 1, time.day, time.clock()),
         );
         if let Some(reason) = outcome.reason() {
             detail.push_str(" · ");
@@ -177,6 +179,8 @@ mod tests {
             let record = record("input", &["item"], outcome);
             let marker = Marker::from_record(&record.outcome);
             assert!(marker.label.starts_with(label));
+            assert!(marker.label.contains("observed"));
+            assert!(marker.detail.contains("observed"));
             assert_eq!(marker.tone, tone);
             if let Some(reason) = expected_reason { assert!(marker.detail.contains(&reason)); }
         }
