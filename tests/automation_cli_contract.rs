@@ -468,7 +468,7 @@ fn more_than_sixty_four_headfull_fresh_runs_retire_providers_and_keep_lazy_archi
     let provider = fixture.root.path().join("bin/claude");
     let source = format!(
         "{}\n{}",
-        "#!/bin/sh\nprintf 'spawn\\n' >> \"$HOME/../spawns\"",
+        "#!/bin/sh\nprintf 'spawn\\n' >> \"$HOME/../spawns\"\nif [ -r /proc/$$/stat ]; then printf '%s ' \"$$\" >> \"$HOME/../provider-pids\"\nawk '{print $22}' /proc/$$/stat >> \"$HOME/../provider-pids\"; fi",
         include_str!("fixtures/automation-claude.sh").trim_start_matches("#!/bin/sh\n")
     );
     fs::write(&provider, source).unwrap();
@@ -543,6 +543,16 @@ fn more_than_sixty_four_headfull_fresh_runs_retire_providers_and_keep_lazy_archi
             client.list_chats().unwrap().is_empty(),
             "no hosted provider may accumulate after fresh completion"
         );
+        #[cfg(target_os="linux")]
+        {
+        let identities=fs::read_to_string(fixture.root.path().join("provider-pids")).unwrap();
+        let latest=identities.lines().last().unwrap().split_whitespace().collect::<Vec<_>>();
+        assert_eq!(latest.len(),2);
+        if let Ok(stat)=fs::read_to_string(format!("/proc/{}/stat",latest[0])) {
+            let observed=stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19).unwrap();
+            assert_ne!(observed,latest[1],"the exact completed provider process must have exited, even if its PID was subsequently reused");
+        }
+        }
         last_agent = Some(
             detail["run"]["agent"]["id"]
                 .as_str()
@@ -589,4 +599,36 @@ fn more_than_sixty_four_headfull_fresh_runs_retire_providers_and_keep_lazy_archi
             .count(),
         70
     );
+}
+
+#[test]
+fn actual_execution_console_roundtrips_to_the_same_saved_pane_without_provider_replay() {
+    use cagents::{agent_execution::{Agent,HostedSession},model::{BootId,CardId,CardKind,CardState,Existence,Exposure,Residency,WorkspaceState},persistence::{SnapshotBase,StateStore}};
+    let fixture=Fixture::new();let project=fixture.root.path().join("project");
+    fixture.cli(&["project","open",project.to_str().unwrap()]);
+    let provider=fixture.root.path().join("bin/claude");fs::write(&provider,include_str!("fixtures/automation-claude.sh")).unwrap();fs::set_permissions(&provider,fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
+    let definition=json!({"name":"Actual console archive","prompt":"Return a fixture result","agent":{"provider":"Claude","account":null,"target":{"repository":project,"directory":project,"placement":null},"surface":"Terminal","model":null,"permission_mode":null},"schedule":{"pattern":{"daily":{"hour":3,"minute":0}},"timezone":"UTC"},"session_mode":"fresh","visibility":"headfull","precheck":null});
+    let path=fixture.root.path().join("terminal.json");fs::write(&path,serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created=fixture.cli(&["automation","create","--definition",path.to_str().unwrap()]);
+    let id=created["automation"]["id"].as_str().unwrap();let revision=created["automation"]["execution_revision"].as_u64().unwrap().to_string();
+    let request=uuid::Uuid::new_v4().to_string();let accepted=fixture.cli(&["automation","run-now",id,"--execution-revision",&revision,"--request-id",&request,"--confirm"]);
+    let firing=accepted["firing"]["id"].as_str().unwrap();let deadline=Instant::now()+Duration::from_secs(20);
+    let _detail=loop {let detail=fixture.cli(&["automation","run",firing]);let shown=fixture.cli(&["automation","show",id]);if detail["run"]["firing"]["state"]=="succeeded" && shown["automation"]["active_firing"].is_null() {break detail}assert!(Instant::now()<deadline,"actual console did not settle: {detail}");thread::sleep(Duration::from_millis(20));};
+    let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client=cagents::control::ControlClient::connect(&socket).unwrap();
+    let cagents::automations::Response::Detail(saved)=client.automation(cagents::agent_execution::Authority::default(),cagents::automations::Request::ShowFiring {id:firing.parse().unwrap()}).unwrap() else {panic!("typed run receipt")};
+    let agent:Agent=saved.agent.unwrap();assert!(agent.closed);
+    let console=agent.console.clone().expect("actual create_console descriptor");
+    let Some(HostedSession::Chat(mut session))=agent.session.clone() else {panic!("original native provider descriptor")};
+    assert_eq!(console.id,session.id);assert_eq!(console.launch.arguments,vec!["agent".to_owned(),"console".to_owned(),agent.id.to_string()]);
+    let card=CardId::from_uuid(agent.id.as_uuid());let store=StateStore::open(fixture.root.path().join("pane.sqlite3"),BootId::new("console-fixture")).unwrap();
+    let mut workspace=WorkspaceState::default();workspace.cards.push(CardState {id:card,generation:0,title:"Scheduled console".into(),width_fraction:0.6,existence:Existence::Open,exposure:Exposure::Visible,residency:Residency::Cold,kind:CardKind::Terminal(console.clone())});workspace.focused=Some(card);
+    let first=store.save_workspace(&workspace,SnapshotBase {workspace:0,cards:&Default::default()}).unwrap();
+    session.terminal=Some(console);workspace.cards[0].kind=CardKind::Chat(session.clone());workspace.automation_archives.insert(card,agent.id);
+    store.save_workspace(&workspace,SnapshotBase {workspace:first.generation,cards:&first.card_generations}).unwrap();
+    let restored=store.load_workspace(workspace.id,None).unwrap().unwrap();assert_eq!(restored.cards[0].id,card);assert_eq!(restored.cards[0].kind,CardKind::Chat(session.clone()));
+    let before=fs::read_to_string(fixture.root.path().join("prompts")).unwrap();
+    for _ in 0..2 {let cagents::automations::Response::ArchivedConversation(archive)=client.automation(cagents::agent_execution::Authority::default(),cagents::automations::Request::ArchivedConversation {agent:agent.id}).unwrap() else {panic!("saved view")};assert!(cagents::automations::archive::ArchivedPaneReadiness::qualify(agent.id,&session,&archive).unwrap().matches(agent.id,&session));}
+    assert!(client.list_chats().unwrap().is_empty());assert_eq!(before,fs::read_to_string(fixture.root.path().join("prompts")).unwrap());assert_eq!(before.lines().count(),1);
 }

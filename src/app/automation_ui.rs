@@ -165,6 +165,17 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
+                if archived
+                    && !self.can_present_automation_archive(
+                        CardId::from_uuid(agent.id.as_uuid()),
+                        &agent,
+                    )
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This pane changed after the run completed. Its saved result remains available in run history.",
+                    ));
+                    return Task::none();
+                }
                 let Some(placement) = self.workspace_model.agent_view_scope(&agent).cloned() else {
                     self.status = Some(TransientNotice::warning(
                         "This agent's exact pane is no longer available in a single view. Its result remains available in run history.",

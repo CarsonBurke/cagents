@@ -105,6 +105,13 @@ pub enum Request {
     ArchivedConversation {
         agent: AgentId,
     },
+    ArchivedAgents {
+        scope: agent_execution::Placement,
+        identity: Uuid,
+        sequence: u64,
+        after: Option<AgentId>,
+        limit: usize,
+    },
 }
 
 impl Request {
@@ -134,6 +141,18 @@ pub enum Response {
     Proposal(Box<Proposal>),
     Proposals(Vec<ProposalSummary>),
     ArchivedConversation(Box<ArchivedConversation>),
+    ArchivedAgents(ArchiveAgentPage),
+}
+
+/// Destination discovery is paged independently of the bounded model push.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveAgentPage {
+    pub scope: agent_execution::Placement,
+    pub identity: Uuid,
+    pub sequence: u64,
+    pub proof: crate::model::HostSessionProof,
+    pub agents: Vec<agent_execution::Agent>,
+    pub next: Option<AgentId>,
 }
 
 /// Bounded final presentation of an exact retired provider conversation.

@@ -378,23 +378,19 @@ impl Handle {
         for id in candidates {
             // A manual request can add a worker after the active census. The
             // absent snapshot entry alone never authorizes deleting its proof.
-            if self
-                .0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?
-                .is_none()
-            {
-                continue;
-            }
+            let Some(revision)=self.0.registry.lock().unwrap_or_else(|p|p.into_inner()).retired_automation_precheck(id)? else {continue;};
             let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
             let Some(worker) = workers.get_mut(&id) else {
                 continue;
             };
             match worker.retire() {
                 Ok(true) => {
-                    workers.remove(&id);
+                    // Files are gone, but keep this worker entry retryable if
+                    // the durable coalescing transaction fails. Do not nest
+                    // the registry lock beneath the worker census mutex.
+                    drop(workers);
+                    self.0.registry.lock().unwrap_or_else(|p|p.into_inner()).coalesce_retired_automation_precheck(id,revision)?;
+                    self.0.workers.lock().unwrap_or_else(|p|p.into_inner()).remove(&id);
                 }
                 Ok(false) => {} // Reap/reclaim again on the next bounded tick.
                 Err(error) => {
@@ -713,7 +709,7 @@ impl Handle {
             };
             let mut worker = Worker::recover(&self.0.root, id, revision);
             match worker.retire() {
-                Ok(true) => {}
+                Ok(true) => {self.0.registry.lock().unwrap_or_else(|p|p.into_inner()).coalesce_retired_automation_precheck(id,revision)?;}
                 Ok(false) => {
                     self.0
                         .workers

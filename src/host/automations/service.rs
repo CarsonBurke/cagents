@@ -123,6 +123,12 @@ pub(in crate::host) fn process_under_control(
                 .archived_automation_conversation(agent)
                 .map(|archive| Response::ArchivedConversation(Box::new(archive)));
         }
+        Request::ArchivedAgents { scope,identity,sequence,after,limit } => {
+            let proof=host.lock().unwrap_or_else(|p|p.into_inner()).proof().clone();
+            return registry.lock().unwrap_or_else(|p|p.into_inner())
+                .archived_automation_agents_page(scope,identity,sequence,after,limit,proof)
+                .map(Response::ArchivedAgents);
+        }
         Request::Show { id } => {
             return registry
                 .lock()

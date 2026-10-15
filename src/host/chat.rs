@@ -1947,11 +1947,36 @@ fn confirm_account_conversation(
     }
 }
 
+pub(in crate::host) fn executable_automation_sessions(request: &ClientRequest) -> Vec<crate::model::TerminalId> {
+    match request {
+        ClientRequest::ChatStart {session,..}|ClientRequest::ChatStartSelected {session,..}=>vec![session.id],
+        ClientRequest::ChatPrepareResume {source}=>vec![source.id],
+        ClientRequest::ChatRecoverAccount {source,replacement,..}=>vec![source.id,replacement.id],
+        ClientRequest::ChatReturnTerminal {chat_id}=>vec![*chat_id],
+        ClientRequest::ChatCommand {chat_id,command} if !matches!(command,chat::Command::Refresh|chat::Command::LoadEarlier)=>vec![*chat_id],
+        _=>Vec::new(),
+    }
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
+    // Window watches are asynchronous. The persisted archive reservation is
+    // authoritative even if a stale client still presents live controls.
+    let sessions=executable_automation_sessions(&request);
+    if !sessions.is_empty() {
+        let registry=host.lock().unwrap_or_else(|p|p.into_inner()).execution_registry.clone();
+        if let Some(registry)=registry {
+            let registry=registry.lock().unwrap_or_else(|p|p.into_inner());
+            for id in sessions {
+                if registry.is_archived_automation_session(id).map_err(unavailable)? {
+                    return Err(error("Completed scheduled conversations are saved read-only. Open their saved view or create a distinct new conversation."));
+                }
+            }
+        }
+    }
     super::agent_execution::interactive(host, client, request, |request| {
         process_inner(host, client, request)
     })

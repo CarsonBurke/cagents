@@ -24,6 +24,8 @@ pub(in crate::host) fn interactive(
             *chat_id,
             !matches!(command, Command::Refresh | Command::LoadEarlier),
         ),
+        ClientRequest::ChatStart {session,..}|ClientRequest::ChatStartSelected {session,..} => (session.id,false),
+        ClientRequest::ChatPrepareResume {source}|ClientRequest::ChatRecoverAccount {source,..} => (source.id,false),
         ClientRequest::ChatReturnTerminal { chat_id } => (*chat_id, true),
         ClientRequest::ChatCommitTerminal { terminal_id } => (*terminal_id, false),
         ClientRequest::ChatClose { chat_id } => (*chat_id, false),
@@ -44,12 +46,33 @@ pub(in crate::host) fn interactive(
         .unwrap_or_else(|p| p.into_inner())
         .agent_for_session(id)
         .map_err(unavailable)?;
-    let Some(agent) = agent else {
-        return apply(request);
-    };
-    let gate = agent_gate(host, agent.id);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let executable = super::super::chat::executable_automation_sessions(&request);
+    let mut owners=agent.iter().map(|agent|agent.id).collect::<Vec<_>>();
+    {
+        let registry=registry.lock().unwrap_or_else(|p|p.into_inner());
+        for session in &executable {
+            if let Some(owner)=registry.agent_for_session(*session).map_err(unavailable)? {
+                owners.push(owner.id);
+            }
+        }
+    }
+    // Account recovery acts on both its source and replacement identities.
+    // Lock every registered owner in stable order so a concurrent scheduler
+    // close of the replacement cannot race a source-only preflight check.
+    owners.sort_unstable();owners.dedup();
+    let gates=owners.into_iter().map(|owner|agent_gate(host,owner)).collect::<Vec<_>>();
+    let _dispatch=gates.iter().map(|gate|gate.lock().unwrap_or_else(|p|p.into_inner())).collect::<Vec<_>>();
+    {
+        let registry=registry.lock().unwrap_or_else(|p|p.into_inner());
+        for session in executable {
+            if registry.is_archived_automation_session(session).map_err(unavailable)? {
+                return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                    "Completed scheduled conversations are saved read-only. Open their saved view or create a distinct new conversation.",false));
+            }
+        }
+    }
     if claims {
+        let Some(agent)=agent else {return apply(request);};
         let authorized = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())

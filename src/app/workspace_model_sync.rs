@@ -423,6 +423,7 @@ impl Cagents {
                 {
                     return Task::none();
                 }
+                self.chat_ui.archive_discovery.reconnected();
                 self.join_workspace_model(model.identity);
                 self.workspace_model = model;
                 let closed = self.apply_closed_project_tombstones();
@@ -699,6 +700,10 @@ impl Cagents {
         let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
         for agent in &model.archived_automation_agents {
             let card = CardId::from_uuid(agent.id.as_uuid());
+            if !self.can_present_automation_archive(card,agent) {continue;}
+            if self.card_state(card).is_some_and(|state|!state.existence.is_open()) {
+                continue;
+            }
             let Some(display)=display_index.resolve(agent) else {continue;};
             if self.durable.automation_archives.get(&card) != Some(&agent.id) {
                 Arc::make_mut(&mut self.durable)
@@ -713,6 +718,14 @@ impl Cagents {
             }
         }
 
+        if !model.archived_automation_agents.is_empty() {
+            // Completion changes runtime ownership even when the pane's
+            // geometry and persisted map were already current. Hydrate on
+            // that model edge, without waiting for an unrelated viewport move.
+            let visible=self.workspace.mounted_visibility().filter_map(|(card,class)|
+                (class==VisibilityClass::Visible).then_some(card)).collect();
+            tasks.push(self.hydrate_visible_automation_archives(&visible));
+        }
         for agent in &model.agents {
             // Headfull runs attach their exact hosted descriptor, including
             // after a UI restart. Durable pane tombstones below preserve closes.
@@ -741,6 +754,7 @@ impl Cagents {
             self.persist();
             tasks.push(self.sync_chrome());
         }
+        tasks.push(self.discover_scope_automation_archives());
         Task::batch(tasks)
     }
 
