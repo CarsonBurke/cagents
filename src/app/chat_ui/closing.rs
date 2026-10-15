@@ -36,17 +36,26 @@ struct CloseSource {
 pub(super) struct EndRequest {
     pub(super) batch: Option<uuid::Uuid>,
     kind: CardKind,
-    session: Option<chat::Session>,
+    pub(super) session: Option<chat::Session>,
+    shared_source: Option<shared_views::RemovalSource>,
     pub(super) paired_terminal: Option<terminal_close::QueuedCardClose>,
 }
 impl EndRequest {
     pub(super) fn capture(app: &mut Cagents, card: CardId, batch: Option<uuid::Uuid>) -> Option<Self> {
         let kind = app.card_state(card).filter(|state| state.existence.is_open())?.kind.clone();
         let session = app.chat_return_session(card);
+        let shared_source = match app.capture_shared_removal_source(card) {
+            Ok(source) => source,
+            Err(error) => {
+                app.stop_pane_close_batch(batch);
+                app.status = Some(TransientNotice::warning(error));
+                return None;
+            }
+        };
         let paired_terminal = if matches!(&kind, CardKind::Terminal(_)) {
             Some(app.capture_card_close_for(card, batch)?)
         } else { None };
-        Some(Self { batch, kind, session, paired_terminal })
+        Some(Self { batch, kind, session, shared_source, paired_terminal })
     }
     pub(super) fn source_current(&self, app: &Cagents, card: CardId) -> bool {
         let Some(state) = app.card_state(card).filter(|state| state.existence.is_open()) else { return false; };
@@ -65,6 +74,15 @@ impl EndRequest {
             (None, None) => true,
             _ => false,
         }
+    }
+    /// Only the initial End intake captures publication authority. Installing
+    /// it after cleanup verifies that same basis and never adopts a successor.
+    pub(super) fn install_removal_source(&self, app: &mut Cagents, card: CardId) -> bool {
+        if !self.current(app, card) || !app.install_shared_removal_source(card, self.shared_source.clone()) {
+            app.stop_pane_close_batch(self.batch);
+            return false;
+        }
+        true
     }
     pub(super) fn current(&self, app: &Cagents, card: CardId) -> bool {
         self.source_current(app, card) && app.pane_close_decision_current(card, self.batch)
@@ -364,10 +382,17 @@ impl Cagents {
                 })
             });
         self.remember_conversation_draft(card);
+        // Retirement validates the installed original shared basis while the
+        // observed runtime is still available. Do not discard that identity
+        // before the source-owned publication check has accepted the removal.
+        let retired = self.retire_offstrip_card(card);
+        if self.card_state(card).is_some_and(|state| state.existence.is_open()) {
+            self.stop_pane_close_batch(batch);
+            return Some(retired);
+        }
         self.recently_closed.push((saved, destination));
         if self.recently_closed.len() > 32 { self.recently_closed.remove(0); }
         self.chat_discard(card);
-        let retired = self.retire_offstrip_card(card);
         let next = self.finish_selected_pane_close(card, batch);
         Some(Task::batch([retired, next]))
     }
@@ -827,6 +852,59 @@ mod tests {
         assert!(app.recently_closed.is_empty());
     }
 
+    fn shared_scope(app: &mut Cagents, card: CardId, directory: &Path) {
+        use crate::workspace_model::{ModelChannel, ModelProject, WorkspaceModel, views::{Pane, Scope, View}};
+        let channel = app.durable.active_channel.expect("retained channel");
+        let scope = Scope::Channel(channel);
+        let pane = Pane::from_card(app.card_state(card).unwrap(), Some(directory.into())).unwrap();
+        let mut view = View::empty(scope);
+        view.panes = vec![pane];
+        let mut model = WorkspaceModel::default();
+        model.identity = uuid::Uuid::new_v4();
+        model.projects = vec![ModelProject { repository: directory.into(), checkout: None, primary_checkout: None, name: "Recorded project".into(), kind: Default::default(), ordinal: 1 }];
+        model.channels = vec![ModelChannel { id: channel, repository: directory.into(), title: "Retained conversation".into(), title_source: Default::default(), ordinal: 1 }];
+        model.views = vec![view];
+        app.workspace_model = model;
+    }
+
+    #[test]
+    fn hidden_end_keeps_original_shared_source_through_cleanup_without_adopting_a_replacement() {
+        for replace in [false, true] {
+            let (mut app, card, directory) = fixture();
+            let source = attach_durable_owner(&mut app, card);
+            write(&mut app, card, "shared retained draft", false);
+            retain_in_channel(&mut app, directory.path(), vec![card]);
+            shared_scope(&mut app, card, directory.path());
+            drop(app.update(Message::CloseCard(card)));
+            let decision = hide_decision(&app);
+            let receipt = hide_receipt(app.update(decision));
+            drop(app.update(receipt));
+            assert!(!app.workspace.order().any(|id| id == card));
+            drop(app.update(Message::ChatClose(Action::End(card))));
+            let decision = emitted_confirm(&app);
+            drop(app.update(decision));
+            let target = pending_end(&app, card);
+            let before = app.workspace_model.clone();
+            if replace {
+                let CardKind::Chat(session) = &mut app.workspace_model.views[0].panes[0].kind else { panic!("shared chat"); };
+                session.launch.session_id = Some("replacement-in-authoritative-view".into());
+            }
+            let expected = app.workspace_model.clone();
+            drop(app.update(Message::ChatUi(super::super::Action::RetainedCloseFinished(target, source, Ok(())))));
+            if replace {
+                assert!(app.card_state(card).unwrap().existence.is_open());
+                assert!(app.cards.contains_key(&card));
+                assert!(app.recently_closed.is_empty());
+                assert_eq!(app.workspace_model, expected);
+                assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("shared pane changed")) || app.notices.entries.iter().any(|entry| entry.notice.message.contains("shared pane changed")));
+            } else {
+                assert!(!app.card_state(card).unwrap().existence.is_open());
+                assert!(!app.cards.contains_key(&card));
+                assert_eq!(before.identity, app.workspace_model.identity);
+            }
+        }
+    }
+
     #[test]
     fn parked_actor_cleanup_resumes_only_the_terminal_worker_captured_before_cleanup() {
         for replacement in [false, true] {
@@ -863,6 +941,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn unconfirmed_parked_actor_cleanup_keeps_its_runtime_and_cannot_resume_cli_close() {
+        let (mut app, card, _directory) = fixture();
+        let session = attach_durable_owner(&mut app, card);
+        let proof = session.proof.clone().unwrap();
+        let mut terminal = return_terminal(&session).unwrap();
+        terminal.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        app.card_state_mut(card).unwrap().kind = CardKind::Terminal(terminal.clone());
+        let Some(CardRuntime::Chat(mut runtime)) = app.cards.remove(&card) else { panic!("chat"); };
+        runtime.session.terminal = Some(terminal.clone());
+        app.chat_ui.parked.insert(card, runtime);
+        app.record_terminal_close_binding_for_test(card, crate::terminal::HostedTerminalBinding { source: terminal.clone(), execution_instance: uuid::Uuid::new_v4() }, proof, false);
+        drop(app.update(Message::CloseCard(card)));
+        let target = pending_end(&app, card);
+        let completion = app.update(Message::ChatUi(super::super::Action::CloseFinished(target, Err("fixture cleanup unconfirmed".into()))));
+        assert!(app.chat_ui.parked.contains_key(&card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.card_state(card).unwrap().kind, CardKind::Terminal(terminal));
+        assert!(app.terminal_close.is_none());
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.chat_ui.end_requests.is_empty());
+        assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("cleanup unconfirmed")) || app.notices.entries.iter().any(|entry| entry.notice.message.contains("cleanup unconfirmed")));
+        drop(completion); // no fresh CLI source may be captured from this result
     }
 
     #[test]

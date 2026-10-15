@@ -5026,6 +5026,7 @@ impl Cagents {
                 Message::ChatUi(Action::RetainedCloseFinished(target, session, result))
             });
         }
+        if !request.install_removal_source(self, card) { return Task::none(); }
         let Some(remove) = self.remove_chat_card_for(card, None, batch) else {
             return Task::none();
         };
@@ -6589,6 +6590,7 @@ impl Cagents {
                 // Closed while returning: no terminal is started only to be
                 // stopped again.
                 if close {
+                    if !request.as_ref().is_some_and(|request| request.install_removal_source(self, card)) { return retry; }
                     return Task::batch([
                         retry,
                         self.remove_chat_card_for(card, None, batch).unwrap_or_else(Task::none),
@@ -8360,6 +8362,7 @@ impl Cagents {
                     self.status = Some(TransientNotice::error(error));
                     return Task::none();
                 }
+                if !request.install_removal_source(self, target.card) { return Task::none(); }
                 return self
                     .remove_chat_card_for(target.card, None, request.batch)
                     .unwrap_or_else(Task::none);
@@ -8390,18 +8393,24 @@ impl Cagents {
                         self.stop_pane_close_batch(request.batch);
                         return Task::none();
                     }
-                    // A chat parked behind its source terminal: the actor is
-                    // closed or unreachable either way, and the card is that
-                    // terminal now, so its own close takes over from here.
-                    self.chat_ui.parked.remove(&target.card);
-                    self.observe_agent_activity_for_card(target.card, None);
+                    // Only the correlated successful actor cleanup may
+                    // project its separately observed parked runtime away.
+                    // A failed cleanup retains the original source for retry.
                     if let Err(error) = result {
+                        self.stop_pane_close_batch(request.batch);
                         self.status = Some(TransientNotice::warning(format!(
                             "The chat could not be confirmed stopped: {error}"
                         )));
+                        return Task::none();
                     }
+                    let Some(closed) = request.session.as_ref() else {
+                        self.stop_pane_close_batch(request.batch);
+                        return Task::none();
+                    };
+                    self.chat_ui.parked.remove(&target.card);
+                    self.observe_agent_activity_for_card(target.card, None);
                     return if self.pane_close_decision_current(target.card, request.batch) {
-                        request.paired_terminal.map(|captured| self.resume_captured_card_close(captured)).unwrap_or_else(Task::none)
+                        request.paired_terminal.map(|captured| self.resume_captured_card_close_after_chat_cleanup(captured, closed)).unwrap_or_else(Task::none)
                     } else {
                         self.stop_pane_close_batch(request.batch);
                         Task::none()
