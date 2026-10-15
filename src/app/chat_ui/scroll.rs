@@ -69,6 +69,61 @@ pub(super) fn steps_id(id: &str) -> Id {
     Id::new(format!("chat-scroll-steps-{id}"))
 }
 
+/// One explicit Find navigation measurement. The caller accepts it only for
+/// its current query/document/navigation generations, applies `offset`, waits
+/// for the resulting layout, and retries until `exact` or its bounded limit.
+/// Wheel/drag navigation must cancel that pending correction in the caller.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct LogicalLocation {
+    pub offset: f32,
+    pub exact: bool,
+    pub stage: u8,
+}
+
+pub(super) fn locate_logical(target: Target, item: String, identity: u64, byte: usize)
+    -> iced::Task<Option<LogicalLocation>> {
+    struct Locate {
+        scroll: Id, item: Id, identity: u64, byte: usize,
+        content: Option<Rectangle>, viewport: Option<Rectangle>,
+        found: Option<(Rectangle, u8)>,
+    }
+    impl Locate {
+        fn candidate(&mut self, bounds: Rectangle, stage: u8) {
+            if self.found.as_ref().is_none_or(|(_, previous)| stage >= *previous) {
+                self.found = Some((bounds, stage));
+            }
+        }
+    }
+    impl Operation<Option<LogicalLocation>> for Locate {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Option<LogicalLocation>>)) { visit(self); }
+        fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, content: Rectangle,
+            _: Vector, _: &mut dyn operation::Scrollable) {
+            if id == Some(&self.scroll) { self.content = Some(content); self.viewport = Some(viewport); }
+        }
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if id == Some(&self.item) { self.candidate(bounds, 0); }
+        }
+        fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
+            if let Some((bounds, stage)) = virtualized::logical_bounds(state, bounds, self.identity, self.byte) {
+                self.candidate(bounds, stage);
+            }
+            if let Some(prose) = state.downcast_ref::<selectable_prose::State>()
+                && let Some(local) = prose.logical_byte_bounds(self.identity, self.byte) {
+                self.candidate(Rectangle { x: bounds.x + local.x, y: bounds.y + local.y, ..local }, 3);
+            }
+        }
+        fn finish(&self) -> operation::Outcome<Option<LogicalLocation>> {
+            operation::Outcome::Some(self.content.zip(self.viewport).zip(self.found).map(|((content, viewport), (found, stage))| {
+                let travel = (content.height - viewport.height).max(0.0);
+                let from_top = (found.y - content.y - (viewport.height - found.height) / 2.0).clamp(0.0, travel);
+                LogicalLocation { offset: travel - from_top, exact: stage == 3, stage }
+            }))
+        }
+    }
+    iced::advanced::widget::operate(Locate { scroll: card_control_id(target.card, "chat-transcript"),
+        item: item_id(&item), identity, byte, content: None, viewport: None, found: None })
+}
+
 struct ItemBounds<'a> {
     ids: std::collections::HashMap<Id, Vec<&'a str>>,
     rows: std::collections::HashMap<&'a str, Rectangle>,
