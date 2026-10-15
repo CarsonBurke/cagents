@@ -196,11 +196,13 @@ impl Cagents {
     ) -> Task<Message> {
         let cancelled = self.cancel_worktree_selection();
         let epoch = local_window.then(|| self.worktree_owner_paths.invalidate_watched());
+        let resolved = self.refresh_worktree_owners(Some(&path));
         if local_window
             && !create
             && matches!(&intent, Intent::Navigate)
             && self.durable.active_channel.is_none()
             && self.active_workspace.as_ref() == Some(&path)
+            && resolved.as_ref() == Some(&path)
             && self.worktree_owner_paths.cached.get(&path)
                 .is_some_and(|physical| self.worktree_protections.protects_exact(physical))
         {
@@ -229,7 +231,6 @@ impl Cagents {
             ]);
         }
         let epoch = epoch.expect("local window sampled its ownership epoch");
-        self.refresh_worktree_owners(Some(&path));
         let generation = self.worktree_selection.generation;
         self.worktree_selection.pending = true;
         let roots = self
@@ -265,6 +266,25 @@ impl Cagents {
                 )
             });
         Task::batch([cancelled, prepare])
+    }
+
+    /// Repository discovery updates ownership without superseding a deliberate
+    /// navigation that is still preparing its destination.
+    pub(super) fn reproject_current_workspace_scope(&mut self) -> Task<Message> {
+        let Some(active) = self.active_workspace.clone() else {
+            return Task::none();
+        };
+        self.refresh_worktree_owners(Some(&active));
+        if self.worktree_selection.pending {
+            // A changed root set fences the pending receipt, which will retry
+            // its own destination. Reloading A must never navigate away from B.
+            return self.resolve_worktree_owner_paths();
+        }
+        if let Some(channel) = self.durable.active_channel {
+            self.select_channel(channel)
+        } else {
+            self.select_worktree(active, false)
+        }
     }
 
     /// Drop superseded prepared guards even if a modal is keeping successful
@@ -575,6 +595,44 @@ mod tests {
         }
         drop(app.select_worktree_then_with_window(selected, false, Intent::EnsureDefaultPane, true));
         assert!(app.worktree_selection.pending, "dependent actions must still prepare");
+    }
+
+    #[test]
+    fn newly_discovered_parent_root_cannot_reuse_a_nested_directory_lease() {
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let parent = directory.path().join("repository");
+        let nested = parent.join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.worktree_owner_paths.cached.insert(nested.clone(), nested.canonicalize().unwrap());
+        drop(app.select_worktree_inner(nested.clone(), false));
+        app.worktree_protections.install_prepared(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), &nested, false).unwrap(),
+        ));
+        app.known_worktree_roots.insert(parent.clone());
+        app.worktree_owner_paths.cached.insert(parent.clone(), parent.canonicalize().unwrap());
+        assert!(!app.worktree_protections.protects_exact(&parent));
+        drop(app.select_worktree_then_with_window(nested.clone(), false, Intent::Navigate, true));
+        assert!(app.worktree_selection.pending);
+        assert!(!app.worktree_selection.inflight.is_empty());
+        assert_eq!(app.active_workspace.as_ref(), Some(&nested));
+        assert!(!app.worktree_protections.protects_exact(&parent));
+    }
+
+    #[test]
+    fn automatic_repository_reprojection_preserves_pending_explicit_navigation() {
+        let (mut app, _runtime, _directory, selected) = protected_reload_app();
+        let destination = selected.parent().unwrap().join("worktree-1");
+        drop(app.select_worktree_then_with_window(destination, false, Intent::EnsureDefaultPane, true));
+        let generation = app.worktree_selection.generation;
+        let inflight = app.worktree_selection.inflight.clone();
+        assert!(app.worktree_selection.pending);
+        drop(app.reproject_current_workspace_scope());
+        assert_eq!(app.worktree_selection.generation, generation);
+        assert_eq!(app.worktree_selection.inflight, inflight);
+        assert!(app.worktree_selection.pending);
+        assert_eq!(app.active_workspace.as_ref(), Some(&selected));
     }
 
     #[test]
