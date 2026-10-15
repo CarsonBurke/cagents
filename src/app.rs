@@ -21885,6 +21885,136 @@ mod tests {
     }
 
     #[test]
+    fn expanded_chat_survives_failed_worktree_then_new_scope_and_remount_frames() {
+        use crate::repository::{WorktreeLock, WorktreeRecord};
+        use crate::model::WorktreeId;
+        let (mut app, chat, _socket) = live_agent_app("codex");
+        app.settings.default_worktree_pane = settings::DefaultPane::NativeChat;
+        drop(app.update(Message::ChatUi(chat_ui::Action::Switch(chat))));
+        let ready = chat_ui::ready_message_for_pending_switch(&app, chat, busy_chat_snapshot());
+        drop(app.update(ready));
+        let target = match app.cards.get(&chat).unwrap() {
+            CardRuntime::Chat(runtime) => runtime.target,
+            _ => panic!("fixture must mount a native chat"),
+        };
+        drop(app.update(Message::ChatUi(chat_ui::Action::Toggle(target, "tool-1".into()))));
+        assert!(chat_ui::chat_step_is_expanded_for_test(&app, chat, "tool-1"));
+        let old_scope = match app.cards.get_mut(&chat).unwrap() {
+            CardRuntime::Chat(runtime) => {
+                runtime.tool_groups_expanded = true;
+                runtime.session.launch.recipe.working_directory.clone()
+            }
+            _ => panic!("fixture must mount a native chat"),
+        };
+        app.known_worktree_roots.insert(old_scope.clone());
+        Arc::make_mut(&mut app.durable).card_scopes.insert(chat, old_scope.clone());
+        drop(app.select_worktree(old_scope.clone(), false));
+        let mut editor = terminal_card_state();
+        let mut editor_runtime = RepositoryRuntime::dirty_fixture(editor.id);
+        editor_runtime.descriptor.worktree = old_scope.clone();
+        let editor_id = editor.id;
+        let editor_text = editor_runtime.editor_text();
+        assert!(editor_runtime.is_dirty());
+        editor.title = "Fixture editor".into();
+        editor.kind = CardKind::Repository(editor_runtime.descriptor.clone());
+        editor.residency = Residency::Hot;
+        Arc::make_mut(&mut app.durable).card_scopes.insert(editor.id, old_scope.clone());
+        app.cards.insert(editor.id, CardRuntime::Repository(Box::new(editor_runtime)));
+        Arc::make_mut(&mut app.durable).cards.push(editor);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        assert_eq!(app.workspace.cards().len(), 3);
+        let settings_id = open_settings_panes(&app)[0];
+        app.settings_search = "retained fixture settings filter".into();
+
+        let first = ProjectId::new();
+        let second = ProjectId::new();
+        let new_repository = PathBuf::from("/cagents-fixture-second-project");
+        for (id, path) in [(first, old_scope.clone()), (second, new_repository.clone())] {
+            app.sidebar_model.projects.push(sidebar::SidebarProject::new(
+                id, RepositoryId::new(), "Fixture project".into(), path.join(".git"),
+                Vec::new(), Vec::new(),
+            ));
+        }
+        app.known_worktree_roots.insert(new_repository.clone());
+        let mut renderer = headless_renderer();
+        let mut tree = cosmic::iced::advanced::widget::Tree::empty();
+        let mut frames = |app: &Cagents, count| {
+            for _ in 0..count {
+                present(app, &mut renderer, &mut tree);
+            }
+        };
+        // Carry the full libcosmic window tree, including modal membership.
+        // The original Retained ID forwarding is expected to expose the
+        // duplicate-name collision on the second expanded-chat frame.
+        frames(&app, 2);
+        drop(app.update(Message::Sidebar(SidebarAction::NewWorktree {
+            project_id: first, repository: old_scope.join(".git"),
+        })));
+        frames(&app, 2);
+        // Only completed backend messages are injected; this fixture performs
+        // no remote authentication, Git mutation, or provider execution.
+        drop(app.update(Message::WorktreeCreated {
+            project_id: first, repository: old_scope.join(".git"),
+            result: Err("Fixture remote authentication refused".into()),
+        }));
+        frames(&app, 2);
+        drop(app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+            },
+            captured: false,
+        }));
+        assert!(app.worktree_dialog.is_none());
+        frames(&app, 2);
+        drop(app.update(Message::Sidebar(SidebarAction::NewWorktree {
+            project_id: second, repository: new_repository.join(".git"),
+        })));
+        drop(app.update(Message::WorktreeBranchChanged("feat-y".into())));
+        frames(&app, 2);
+        // Submission closes the dialog before the completion selects scope.
+        app.worktree_dialog = None;
+        let new_scope = new_repository.join("feat-y");
+        drop(app.update(Message::WorktreeCreated {
+            project_id: second, repository: new_repository.join(".git"),
+            result: Ok(WorktreeCreationOutcome::Created {
+                worktree: WorktreeRecord {
+                    id: WorktreeId::new(), path: new_scope.clone(), created_at_unix_ms: None,
+                    head_oid: None, branch: Some("refs/heads/feat-y".into()), detached: false,
+                    bare: false, lock: WorktreeLock::default(), prunable_reason: None,
+                },
+                warnings: Vec::new(),
+            }),
+        }));
+        assert_eq!(app.active_workspace.as_ref(), Some(&new_scope));
+        assert!(app.workspace.order().any(|card| {
+            matches!(app.card_state(card).map(|state| &state.kind), Some(CardKind::Chat(_)))
+        }));
+        frames(&app, 3);
+        drop(app.select_worktree(old_scope.clone(), false));
+        assert_eq!(app.active_workspace.as_ref(), Some(&old_scope));
+        assert!(app.workspace.order().any(|card| card == chat));
+        assert!(matches!(app.cards.get(&chat), Some(CardRuntime::Chat(runtime))
+            if runtime.tool_groups_expanded));
+        assert!(chat_ui::chat_step_is_expanded_for_test(&app, chat, "tool-1"));
+        let Some(CardRuntime::Repository(editor)) = app.cards.get(&editor_id) else {
+            panic!("the unsaved editor must remain mounted or parked");
+        };
+        assert!(editor.is_dirty());
+        assert_eq!(editor.editor_text(), editor_text);
+        assert!(app.workspace.order().any(|card| card == editor_id));
+        assert!(app.workspace.order().any(|card| card == settings_id));
+        assert_eq!(open_settings_panes(&app), vec![settings_id]);
+        assert_eq!(app.settings_search, "retained fixture settings filter");
+        frames(&app, 3);
+    }
+
+    #[test]
     fn a_refused_switch_keeps_the_terminal_on_screen() {
         let (mut app, card, _socket) = live_agent_app("claude");
         draw_frames(&mut app, 2, |app, frame| {

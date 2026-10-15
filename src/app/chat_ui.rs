@@ -8438,6 +8438,11 @@ pub(super) fn pending_switch_target(app: &Cagents, card: CardId) -> Target {
 }
 
 #[cfg(test)]
+pub(super) fn chat_step_is_expanded_for_test(app: &Cagents, card: CardId, id: &str) -> bool {
+    matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.expanded.contains(id))
+}
+
+#[cfg(test)]
 pub(super) fn ready_message_for_pending_switch(
     app: &Cagents,
     card: CardId,
