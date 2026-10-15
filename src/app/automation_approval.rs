@@ -8,7 +8,7 @@ pub(super) struct State {
     proposal: Option<Proposal>,
     available: Option<Proposal>,
     pending: Vec<ProposalSummary>,
-    reading: bool,
+    reading: Option<(uuid::Uuid,u64)>,
     deciding: bool,
     generation: u64,
     focus: usize,
@@ -167,15 +167,13 @@ impl Cagents {
                 revision,
                 result,
             } => {
-                self.automation_approval.reading = false;
+                if self.automation_approval.reading!=Some((id,revision)) {return Task::none();}
+                self.automation_approval.reading = None;
                 let proposal = match result.as_ref() {
                     Ok(proposal)
                         if proposal.id == id
                             && proposal.revision == revision
-                            && proposal.state == ProposalState::Pending
-                            && self.automation_approval.pending.iter().any(|summary| {
-                                summary.id == id && summary.revision == revision
-                            }) =>
+                            && proposal.state == ProposalState::Pending =>
                     {
                         proposal.clone()
                     }
@@ -185,6 +183,12 @@ impl Cagents {
                         return Task::none();
                     }
                 };
+                // An explicit notification activation can precede its model
+                // push. The exact user-authorized Pending reply is sufficient
+                // to review it; this never approves or enables any schedule.
+                if !self.automation_approval.pending.iter().any(|summary|summary.id==id) {
+                    self.automation_approval.pending.push(ProposalSummary::from(&proposal));
+                }
                 self.automation_approval.available = Some(proposal);
                 self.update_automation_approval(Action::Open { id, revision })
             }
@@ -216,16 +220,10 @@ impl Cagents {
                     .filter(|proposal| proposal.id == id && proposal.revision == revision)
                     .cloned();
                 let Some(proposal) = proposal else {
-                    if self.automation_approval.reading
-                        || !self
-                            .automation_approval
-                            .pending
-                            .iter()
-                            .any(|proposal| proposal.id == id && proposal.revision == revision)
-                    {
+                    if self.automation_approval.reading.is_some() {
                         return Task::none();
                     }
-                    self.automation_approval.reading = true;
+                    self.automation_approval.reading = Some((id,revision));
                     return cosmic::task::future(async move {
                         let result = tokio::task::spawn_blocking(move || {
                             let socket = crate::terminal::ensure_daemon_ready()
@@ -254,7 +252,7 @@ impl Cagents {
                 };
                 self.automation_approval.generation =
                     self.automation_approval.generation.wrapping_add(1);
-                self.automation_approval.reading = false;
+                self.automation_approval.reading = None;
                 self.automation_approval.proposal = Some(proposal);
                 self.automation_approval.focus = 0;
                 self.automation_approval.error = None;
@@ -647,11 +645,10 @@ mod tests {
         assert!(!app.modal_is_open());
         assert!(app.core.keyboard_nav());
         assert!(app.automation_approval.available.is_none(),"model pushes carry bounded summaries; full consent is fetched only for explicit review");
-        drop(app.update_automation_approval(Action::Open {
-            id: uuid::Uuid::new_v4(),
-            revision: 1,
-        }));
+        let absent=uuid::Uuid::new_v4();
+        drop(app.update_automation_approval(Action::Open {id:absent,revision:1}));
         assert!(!app.automation_approval_open());
+        drop(app.update_automation_approval(Action::Loaded {id:absent,revision:1,result:Arc::new(Err("The request no longer exists".into()))}));
         drop(app.update_automation_approval(Action::Open {
             id: proposal.id,
             revision: proposal.revision,
@@ -676,6 +673,25 @@ mod tests {
         drop(app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal))}));
         assert!(!app.automation_approval_open());
         assert!(app.automation_approval.available.is_none());
+    }
+
+    #[test]
+    fn explicit_notification_review_can_arrive_before_the_proposal_model_push() {
+        let mut app=super::super::tests::context_inspector_test_app(false);
+        let proposal=proposal();
+        assert!(app.automation_approval.pending.is_empty());
+        drop(app.update_automation_approval(Action::Open {id:proposal.id,revision:proposal.revision}));
+        assert!(!app.automation_approval_open());
+        drop(app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal.clone()))}));
+        assert!(app.automation_approval_open());
+        assert_eq!(app.automation_approval.pending,vec![ProposalSummary::from(&proposal)]);
+        assert!(!app.automation_approval.deciding);
+        drop(app.update_automation_approval(Action::Dismiss));
+        assert!(!app.automation_approval_open());
+        assert_eq!(app.automation_approval.pending.len(),1);
+        // An old/unsolicited load cannot reopen a dismissed dialog.
+        drop(app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal))}));
+        assert!(!app.automation_approval_open());
     }
 
     #[test]
