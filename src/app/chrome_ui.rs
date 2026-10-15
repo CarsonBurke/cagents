@@ -20,9 +20,9 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
     let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
         content: title,
         bounds: Size::new(f32::INFINITY, f32::INFINITY),
-        size: Pixels(design::TEXT_BODY),
-        line_height: text::LineHeight::Absolute(Pixels(design::LINE_BODY)),
-        font: cosmic::font::default(),
+        size: Pixels(design::interface_size()),
+        line_height: text::LineHeight::Absolute(Pixels(design::interface_size() + 5.0)),
+        font: design::interface_font(),
         align_x: text::Alignment::Left,
         align_y: iced::alignment::Vertical::Top,
         shaping: text::Shaping::Advanced,
@@ -280,6 +280,88 @@ mod tests {
                 >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW"),
             "the real title allocation must fit, after its icon, padding and controls"
         );
+    }
+
+    #[test]
+    fn mounted_tab_width_tracks_interface_size_and_family_without_a_title_change() {
+        use iced::advanced::{
+            Layout, layout,
+            widget::{Operation, Tree},
+        };
+        const TITLE: &str = "Native tab";
+        struct TitleBounds(Option<iced::Rectangle>);
+        impl Operation for TitleBounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: iced::Rectangle, text: &str) {
+                if text == TITLE {
+                    self.0 = Some(bounds);
+                }
+            }
+        }
+        let _typography = design::typography_test_guard();
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 1600.0);
+        let id = app.durable.cards[0].id;
+        app.chrome_ui.user_titles.insert(id, TITLE.into());
+        app.settings.interface_font_family.clear();
+        app.settings.interface_font_size = 13.0;
+        drop(app.sync_chrome());
+        let initial_font = design::interface_font();
+        let initial_revision = app.card_chrome[&id].typography_revision;
+        let initial_width = app.card_chrome[&id].title_width;
+        let initial_tab_width = app.tab_strip_geometry().1;
+        let assert_mounted = |app: &Cagents| {
+            let width = app.tab_strip_geometry().1;
+            let mut header = app.column_header(id, true, width);
+            let mut tree = Tree::new(header.as_widget());
+            let size = iced::Size::new(width, design::PRIMARY_CONTROL_SIZE);
+            let node = header.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(size, size),
+            );
+            let mut title = TitleBounds(None);
+            header.as_widget_mut().operate(
+                &mut tree,
+                Layout::new(&node),
+                &renderer,
+                &mut title,
+            );
+            let bounds = title.0.expect("the actual mounted tab title");
+            assert!(bounds.width + 0.1 >= measure_tab_title(TITLE));
+            assert!(bounds.height + 0.1 >= design::interface_size() + 5.0);
+            assert!((app.card_chrome[&id].title_width - measure_tab_title(TITLE)).abs() < 0.1);
+        };
+        assert_mounted(&app);
+
+        // sync_chrome must apply new settings before refreshing its cache;
+        // neither a label change nor an intervening view call is required.
+        app.settings.interface_font_size = 24.0;
+        drop(app.sync_chrome());
+        assert_eq!(design::interface_size(), 24.0);
+        assert!(app.card_chrome[&id].typography_revision > initial_revision);
+        assert!(app.card_chrome[&id].title_width > initial_width);
+        assert!(app.tab_strip_geometry().1 > initial_tab_width);
+        assert_mounted(&app);
+
+        let sized_revision = app.card_chrome[&id].typography_revision;
+        let family = design::installed_font_families(false)
+            .iter()
+            .find(|family| iced::font::Family::Name(family.as_str()) != initial_font.family)
+            .expect("a renderer-installed family differs from the initial font");
+        app.settings.interface_font_family = family.clone();
+        drop(app.sync_chrome());
+        assert_eq!(
+            design::interface_font().family,
+            iced::font::Family::Name(family.as_str())
+        );
+        assert!(app.card_chrome[&id].typography_revision > sized_revision);
+        assert_mounted(&app);
+        let stable_revision = app.card_chrome[&id].typography_revision;
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&id].typography_revision, stable_revision);
     }
 
     #[test]
