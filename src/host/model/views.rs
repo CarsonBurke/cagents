@@ -237,29 +237,30 @@ pub(super) fn all(db: &Connection) -> Result<Vec<View>, String> {
         .collect()
 }
 
-/// Retire only the pane still presenting this execution agent's resource.
+/// Read the pane still presenting this execution agent's resource without
+/// changing it. Preflight and retirement share this exact authority predicate.
 /// The current owner can differ from the agent's original placement after a
 /// transfer. A replacement conversation in the same card belongs to its owner.
-pub(super) fn retire_agent(
+fn agent_retirement_view(
     db: &Connection,
     agent: &crate::agent_execution::Agent,
-) -> Result<bool, String> {
+) -> Result<Option<View>, String> {
     use crate::{
         agent_execution::HostedSession,
         model::{CardId, CardKind},
     };
     let id = CardId::from_uuid(agent.id.as_uuid());
     let Some(scope) = owner(db, id)? else {
-        return Ok(false);
+        return Ok(None);
     };
-    let mut view = read(db, &scope)?;
+    let view = read(db, &scope)?;
     let Some(pane) = view.panes.iter().find(|pane| pane.id == id) else {
-        return Ok(false);
+        return Ok(None);
     };
     let current = match &pane.kind {
         CardKind::Chat(session) => HostedSession::Chat(session.clone()),
         CardKind::Terminal(session) => HostedSession::Terminal(session.clone()),
-        _ => return Ok(false),
+        _ => return Ok(None),
     };
     let retained = agent
         .session
@@ -302,8 +303,18 @@ pub(super) fn retire_agent(
         false
     };
     if !retained {
-        return Ok(false);
+        return Ok(None);
     }
+    Ok(Some(view))
+}
+
+pub(super) fn preflight_retire_agent(db: &Connection, agent: &crate::agent_execution::Agent) -> Result<(), String> {
+    agent_retirement_view(db, agent).map(|_| ())
+}
+
+pub(super) fn retire_agent(db: &Connection, agent: &crate::agent_execution::Agent) -> Result<bool, String> {
+    let Some(mut view) = agent_retirement_view(db, agent)? else { return Ok(false); };
+    let id = crate::model::CardId::from_uuid(agent.id.as_uuid());
     view.apply(&Change::Remove { id })?;
     view.revision = view
         .revision
