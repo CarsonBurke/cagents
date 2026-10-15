@@ -41,6 +41,50 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Validate every captured wrapper before entering host-specific effects.
+fn captured_sidebar_action(editor: &Editor, mut action: SidebarAction) -> Option<SidebarAction> {
+    let mut binding = None;
+    loop {
+        action = match action {
+            SidebarAction::RunBound { binding: captured, action } => {
+                editor.current()?.sidebar.source_control.as_ref()?.matches_command_binding(captured).then_some(())?;
+                binding = Some(captured);
+                *action
+            }
+            SidebarAction::RunCommand { command, action } => {
+                (sidebar::commands::command_id(&action) == Some(command)).then_some(())?;
+                let tab = editor.current()?;
+                match sidebar::commands::bound_payload(&action) {
+                    SidebarAction::HistoryCommand { .. } => {
+                        let target = sidebar::commands::CommandTarget::from_bound_action(&action)?;
+                        (target.resolve_in(&tab.sidebar, &tab.navigation, command).as_ref() == Some(action.as_ref())).then_some(())?;
+                    }
+                    SidebarAction::FileCommand { key, path, .. } => {
+                        let SidebarAction::RunBound { binding: captured, .. } = action.as_ref() else { return None; };
+                        let source = tab.sidebar.source_control.as_ref()?;
+                        (source.matches_command_binding(*captured) && source.key == *key
+                            && tab.navigation.active_worktree() == Some(key) && !source.is_reloading() && !source.busy()
+                            && sidebar::commands::file_rows(source).any(|row| row.path == *path)).then_some(())?;
+                    }
+                    _ => return None,
+                }
+                *action
+            }
+            SidebarAction::RunChangeGroup { key, area, command, selection_revision } => {
+                binding?;
+                let tab = editor.current()?;
+                sidebar::resolve_captured_change_group(&tab.sidebar, &tab.navigation, &key, area, command, selection_revision, editor.modal_open())?
+            }
+            SidebarAction::RunChangeCommand { command, key, row, selection_revision } => {
+                let target = sidebar::commands::CommandTarget::Changes { binding: binding?, key, row, selection_revision };
+                let tab = editor.current()?;
+                target.resolve_in(&tab.sidebar, &tab.navigation, command)?
+            }
+            action => return Some(action),
+        };
+    }
+}
+
 const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
 
@@ -3865,74 +3909,9 @@ impl Application for Editor {
                     Task::batch(tasks)
                 }
                 Message::Sidebar(action) => {
-                    // Sidebar menus share command identities with the ADE,
-                    // while this host owns its file mutations and preferences.
-                    let action = match action {
-                        SidebarAction::RunChangeGroup { key, area, command, selection_revision } => {
-                            let resolved = self.current().and_then(|tab| sidebar::resolve_captured_change_group(
-                                &tab.sidebar, &tab.navigation, &key, area, command, selection_revision, self.modal_open(),
-                            ));
-                            let Some(action) = resolved else {
-                                self.notice = Some("The original change group is no longer available.".into());
-                                return Task::none();
-                            };
-                            action
-                        }
-                        SidebarAction::RunChangeCommand {
-                            command,
-                            key,
-                            row,
-                            selection_revision,
-                        } => {
-                            let target = sidebar::commands::CommandTarget::Changes {
-                                key,
-                                row,
-                                selection_revision,
-                            };
-                            let resolved = self.current().and_then(|tab| {
-                                target.resolve_in(&tab.sidebar, &tab.navigation, command)
-                            });
-                            let Some(action) = resolved else {
-                                self.notice = Some(
-                                    "The original change selection is no longer available.".into(),
-                                );
-                                return Task::none();
-                            };
-                            action
-                        }
-                        SidebarAction::RunCommand { command, action } => {
-                            let valid = cagents::sidebar::commands::command_id(&action)
-                                == Some(command)
-                                && self.current().is_some_and(|tab| {
-                                    if matches!(action.as_ref(), SidebarAction::HistoryCommand { .. }) {
-                                        return cagents::sidebar::commands::CommandTarget::from_action(&action)
-                                            .and_then(|target| target.resolve_in(&tab.sidebar, &tab.navigation, command)).as_ref() == Some(action.as_ref());
-                                    }
-                                    let SidebarAction::FileCommand { key, path, .. } =
-                                        action.as_ref()
-                                    else {
-                                        return false;
-                                    };
-                                    tab.navigation.active_worktree() == Some(key)
-                                        && tab.sidebar.source_control.as_ref().is_some_and(
-                                            |source| {
-                                                source.key == *key
-                                                    && !source.is_reloading()
-                                                    && !source.busy()
-                                                    && cagents::sidebar::commands::file_rows(source)
-                                                        .any(|row| row.path == *path)
-                                            },
-                                        )
-                                });
-                            if !valid {
-                                self.notice = Some(
-                                    "The original sidebar menu target is no longer available.".into(),
-                                );
-                                return Task::none();
-                            }
-                            *action
-                        }
-                        action => action,
+                    let Some(action) = captured_sidebar_action(self, action) else {
+                        self.notice = Some("The original sidebar target is no longer available.".into());
+                        return Task::none();
                     };
                     if let SidebarAction::ChangeGroup { key, area, command } = action {
                         return self.enqueue_change_group(key, area, command);
@@ -4524,6 +4503,7 @@ impl Application for Editor {
                             let mut source = SourceControlModel::ready(key, &snapshot);
                             source.revealed_path = target;
                             if let Some(previous) = tab.sidebar.source_control.as_ref() {
+                                source.set_command_binding_id(previous.command_binding_id());
                                 previous.carry_mutation_into(&mut source);
                             }
                             tab.navigation.reconcile_change_rows(&source);
@@ -4574,7 +4554,8 @@ impl Application for Editor {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
                                     let mut source = SourceControlModel::ready(key, &snapshot);
                                     if let Some(previous) = tab.sidebar.source_control.as_ref() {
-                                        previous.carry_mutation_into(&mut source);
+                                        source.set_command_binding_id(previous.command_binding_id());
+                                previous.carry_mutation_into(&mut source);
                                     }
                                     if let Some(reason) = WorktreeAuthority::unsupported_reason() { source.set_mutation_unavailable_reason(Some(Arc::from(reason))); }
                                     source.set_mutation(tab.mutation);
@@ -6199,6 +6180,8 @@ mod tests {
     }
 
     pub(super) fn sidebar_action(app: &mut Editor, action: SidebarAction) {
+        let action = app.current().and_then(|tab| tab.sidebar.source_control.as_ref())
+            .map_or(action.clone(), |source| sidebar::commands::bound(source.command_binding_id(), action));
         let task = app.update(Message::Sidebar(action));
         run_tasks(app, task);
     }

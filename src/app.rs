@@ -2514,6 +2514,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
 /// is exactly two variants, and neither can destroy anything the dialog did
 /// not already count and show.
 fn answers_discard_confirmation(action: &SidebarAction) -> bool {
+    if let SidebarAction::RunBound { action, .. } = action { return answers_discard_confirmation(action); }
     matches!(
         action,
         SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
@@ -2741,6 +2742,9 @@ fn resolve_restore_card(
 }
 
 fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
+    if let Message::Sidebar(SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. }) = message {
+        return workspace_navigation_blocked_during_save(&Message::Sidebar((**action).clone()));
+    }
     // The channel deletion dialog is the one channel command that navigates
     // nowhere, so a save in flight must not strand it with no way out.
     if let Message::ChannelUi(action) = message {
@@ -2814,6 +2818,9 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 }
 
 fn completion_navigates(message: &Message) -> bool {
+    if let Message::Sidebar(SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. }) = message {
+        return completion_navigates(&Message::Sidebar((**action).clone()));
+    }
     matches!(
         message,
         Message::RepositoryLoaded {
@@ -7594,6 +7601,7 @@ const fn diagnostics_are_current(published: Option<i32>, document: Option<i32>) 
 
 impl WorkspaceDestination {
     fn from_action(action: &SidebarAction) -> Option<Self> {
+        if let SidebarAction::RunBound { action, .. } | SidebarAction::RunCommand { action, .. } = action { return Self::from_action(action); }
         match action {
             SidebarAction::OpenRepository { project_id, .. } => Some(Self::Folder(*project_id)),
             SidebarAction::OpenWorktree { worktree_id, .. } => Some(Self::Worktree(*worktree_id)),
@@ -18631,7 +18639,20 @@ impl Application for Cagents {
                 Task::batch(tasks)
             }
             Message::Sidebar(action) => {
+                let (action, captured_binding) = match action {
+                    SidebarAction::RunBound { binding, action } => {
+                        let current = self.sidebar_model.source_control.as_ref().is_some_and(|source| source.matches_command_binding(binding))
+                            && (self.active_folder_scope() || self.refresh_ui.source_binding.as_ref().is_some_and(|owner| owner.id == binding));
+                        let cleanup = matches!(action.as_ref(), SidebarAction::CancelGitMutation { key }
+                            if self.source_control_mutations.get(&key.canonical_path).is_some_and(|active| active.binding.id == binding))
+                            || matches!(action.as_ref(), SidebarAction::CancelDiscard if self.refresh_ui.discard_binding == Some(binding));
+                        if !current && !cleanup { return Task::none(); }
+                        (*action, Some(binding))
+                    }
+                    action => (action, None),
+                };
                 if let SidebarAction::RunChangeGroup { key, area, command, selection_revision } = action {
+                    if captured_binding.is_none() { return Task::none(); }
                     if self.focused_repository_is_saving() || self.workspace_inputs_blocked() { return Task::none(); }
                     let Some(action) = sidebar::resolve_captured_change_group(&self.sidebar_model, &self.sidebar_state, &key, area, command, selection_revision, self.modal_is_open()) else {
                         self.status = Some(TransientNotice::warning("The original change group changed; choose it again"));
@@ -18646,7 +18667,8 @@ impl Application for Cagents {
                     selection_revision,
                 } = action
                 {
-                    return self.run_captured_change_command(command, key, row, selection_revision);
+                    let Some(binding) = captured_binding else { return Task::none(); };
+                    return self.run_captured_change_command(binding, command, key, row, selection_revision);
                 }
 
                 if let SidebarAction::RunCommand { command, action } = action {
@@ -18837,7 +18859,7 @@ impl Application for Cagents {
                         } else { Task::none() }
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
-                    SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } | SidebarAction::RunChangeGroup { .. } => unreachable!("registered commands are validated before dispatch"),
+                    SidebarAction::RunBound { .. } | SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } | SidebarAction::RunChangeGroup { .. } => unreachable!("registered commands are validated before dispatch"),
                     SidebarAction::DeleteRows(rows) => {
                         if rows.len() == 1 {
                             self.delete_sidebar_row(rows[0])
@@ -19023,7 +19045,7 @@ impl Application for Cagents {
                         let open = self.set_context_inspector_open(true);
                         Task::batch([open, self.reload_source_control(&key)])
                     }
-                    SidebarAction::IgnoreChangePath { key, path } => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::IgnorePath { path } })),
+                    SidebarAction::IgnoreChangePath { key, path } => self.enqueue_git_mutation(key, QueuedGitMutation::Operation(crate::repository::GitOperation::IgnorePath { path })),
                     SidebarAction::SelectChangeRows { key, row, intent } => {
                         let id = sidebar::change_row_focus_id(&key, &row);
                         if let Some(source) = &self.sidebar_model.source_control {
@@ -19145,11 +19167,11 @@ impl Application for Cagents {
                                 self.open_worktree_dialog(key.project_id, project.repository.clone(), WorktreeDraft { base: oid.as_str().to_owned(), ..WorktreeDraft::default() }, None)
                             }
                             sidebar::HistoryCommand::CreateBranch => Task::none(),
-                            sidebar::HistoryCommand::Revert => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::RevertCommit { oid, mainline } })),
-                            sidebar::HistoryCommand::CherryPick => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::CherryPick { oid, mainline } })),
+                            sidebar::HistoryCommand::Revert => self.enqueue_git_mutation(key, QueuedGitMutation::Operation(crate::repository::GitOperation::RevertCommit { oid, mainline })),
+                            sidebar::HistoryCommand::CherryPick => self.enqueue_git_mutation(key, QueuedGitMutation::Operation(crate::repository::GitOperation::CherryPick { oid, mainline })),
                         }
                     }
-                    SidebarAction::CreateHistoryBranch { key, oid, name } => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::CreateBranch { oid, name } })),
+                    SidebarAction::CreateHistoryBranch { key, oid, name } => self.enqueue_git_mutation(key, QueuedGitMutation::Operation(crate::repository::GitOperation::CreateBranch { oid, name })),
                     SidebarAction::AmendChanged { key, amend } => {
                         let Some(revision) = self.sidebar_state.amend_request_revision().filter(|_| amend) else {
                             return Task::none();
@@ -22166,8 +22188,9 @@ impl Application for Cagents {
         if top == modal_ui::Modal::Discard
             && let Some(pending) = self.sidebar_state.pending_discard() {
             return Some(dialog_ui::overlay(
-                sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
-                Some(Message::Sidebar(SidebarAction::CancelDiscard)),
+                sidebar::discard_confirmation_dialog(pending).map(|action| Message::Sidebar(
+                    self.refresh_ui.discard_binding.map_or(action.clone(), |binding| sidebar::commands::bound(binding, action)))),
+                Some(Message::Sidebar(self.refresh_ui.discard_binding.map_or(SidebarAction::CancelDiscard, |binding| sidebar::commands::bound(binding, SidebarAction::CancelDiscard)))),
                 1.0,
             ));
         }
@@ -35057,6 +35080,7 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_git_on_exit_clears_pending_and_wakes_active_process() {
+        if !crate::repository::WorktreeAuthority::supported() { return; }
         let (_temporary, mut app, key, sibling) = source_control_test_app();
         app.active_workspace = Some(key.canonical_path.clone());
         for index in 0..2 {

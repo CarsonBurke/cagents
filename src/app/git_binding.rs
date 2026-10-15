@@ -168,6 +168,13 @@ pub(super) mod tests {
         let source = app.sidebar_model.source_control.as_mut().unwrap();
         source.key.canonical_path = root.to_owned();
         let key = source.key.clone();
+        for project in &mut app.sidebar_model.projects {
+            for worktree in &mut project.worktrees {
+                if worktree.id == key.worktree_id { worktree.path = root.to_owned(); }
+            }
+        }
+        app.active_workspace = Some(root.to_owned());
+        app.sidebar_state.sync_active_worktree(&app.sidebar_model, &SidebarFocus::Repository { worktree: root.to_owned() });
         let mut binding = Binding::new(key.clone());
         binding.initialize().unwrap();
         app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(binding.id);
@@ -259,6 +266,36 @@ pub(super) mod tests {
             assert!(app.sidebar_state.pending_discard().is_none());
             assert!(app.sidebar_model.source_control.as_ref().unwrap().pending_marker_stage.is_none());
         }
+    }
+
+    #[test]
+    fn emitted_stage_and_pending_discard_cannot_cross_same_key_actor_replacement() {
+        if !WorktreeAuthority::supported() { return; }
+        let temporary = tempfile::tempdir().unwrap();
+        init(temporary.path(), "original\n");
+        let (mut app, key) = app_for(temporary.path());
+        let original = app.refresh_ui.source_binding.as_ref().unwrap().id;
+        let selection = vec![crate::repository::PathSelection::new(RepoPath::parse("file.txt").unwrap())];
+        let old_stage = sidebar::commands::bound(original, SidebarAction::Stage { key: key.clone(), selection: selection.clone() });
+        let request = crate::repository::DiscardRequest { worktree: key.canonical_path.clone(), tracked: selection.clone(), untracked: Vec::new(), confirmed: false };
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(original, SidebarAction::RequestDiscard { key: key.clone(), request }))));
+        let confirm = app.sidebar_state.pending_discard().unwrap().confirm_action();
+        let mut replacement = Binding::new(key.clone());
+        replacement.initialize().unwrap();
+        let current = replacement.id;
+        app.refresh_ui.source_binding = Some(replacement);
+        app.sidebar_model.source_control.as_mut().unwrap().set_command_binding_id(current);
+        drop(app.update(Message::Sidebar(old_stage)));
+        assert!(app.source_control_mutations.is_empty());
+        // Even wrapping a prior prompt payload with the new panel owner cannot
+        // turn the old confirmation into permission for that newer actor.
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(current, confirm))));
+        assert!(app.source_control_mutations.is_empty());
+        assert!(app.sidebar_state.pending_discard().is_some());
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(original, SidebarAction::CancelDiscard))));
+        assert!(app.sidebar_state.pending_discard().is_none(), "old-owner negative cleanup remains possible");
+        drop(app.update(Message::Sidebar(sidebar::commands::bound(current, SidebarAction::Stage { key: key.clone(), selection }))));
+        assert!(app.source_control_mutations.contains_key(&key.canonical_path), "current actor retains positive admission");
     }
 
 }
