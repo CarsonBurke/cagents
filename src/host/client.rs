@@ -1690,13 +1690,10 @@ mod tests {
             }
         ));
         assert!(actor.is_completed());
-        assert!(!host.lock().unwrap().chats.contains_key(&session.id));
-        assert!(
-            host.lock()
-                .unwrap()
-                .notification_closed
-                .contains(&session.id)
-        );
+        let state = host.lock().unwrap();
+        assert!(!state.chats.contains_key(&session.id));
+        assert!(!state.terminals.contains_key(&session.id), "explicit release retires the completed descriptor too");
+        assert!(!state.notification_closed.contains(&session.id), "no closed-record suppression remains after retirement");
     }
 
     #[test]
