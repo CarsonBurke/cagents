@@ -3263,6 +3263,21 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    pub(super) fn chat_control_available(&self, card: CardId, command: crate::workspace_widget::GlobalShortcut) -> bool {
+        use crate::workspace_widget::GlobalShortcut;
+        if self.chat_start_pending(card) { return false; }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else { return false; };
+        match command {
+            GlobalShortcut::ChatAccount => runtime.choosing()
+                && self.chat_accounts(runtime.session.launch.provider, &runtime.session.launch.recipe).is_some(),
+            GlobalShortcut::ChatModel => runtime.is_draft()
+                || (runtime.snapshot.capabilities.model_selection && !runtime.snapshot.models.is_empty()),
+            GlobalShortcut::ChatPermissions => !runtime.snapshot.capabilities.permission_modes.is_empty()
+                && !(runtime.session.launch.provider == Provider::Codex && runtime.snapshot.busy),
+            _ => false,
+        }
+    }
+
     /// Keyboard and palette commands use the same pickers as the composer.
     /// Respect the control's availability before capturing a selection gesture.
     pub(super) fn open_chat_control(
@@ -3273,39 +3288,13 @@ impl Cagents {
         let Some(card) = self.workspace.focused() else {
             return Task::none();
         };
-        if self.chat_start_pending(card) {
-            return Task::none();
-        }
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
-            return Task::none();
-        };
+        if !self.chat_control_available(card, command) { return Task::none(); }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else { return Task::none(); };
         let target = runtime.target;
         let action = match command {
-            GlobalShortcut::ChatAccount
-                if runtime.choosing()
-                    && self
-                        .chat_accounts(
-                            runtime.session.launch.provider,
-                            &runtime.session.launch.recipe,
-                        )
-                        .is_some() =>
-            {
-                Action::AccountPicker(target, !runtime.account_picker)
-            }
-            GlobalShortcut::ChatModel
-                if runtime.is_draft()
-                    || (runtime.snapshot.capabilities.model_selection
-                        && !runtime.snapshot.models.is_empty()) =>
-            {
-                Action::ModelPicker(target, runtime.model_picker.is_none())
-            }
-            GlobalShortcut::ChatPermissions
-                if !runtime.snapshot.capabilities.permission_modes.is_empty()
-                    && !(runtime.session.launch.provider == Provider::Codex
-                        && runtime.snapshot.busy) =>
-            {
-                Action::PermissionPicker(target, !runtime.permission_picker)
-            }
+            GlobalShortcut::ChatAccount => Action::AccountPicker(target, !runtime.account_picker),
+            GlobalShortcut::ChatModel => Action::ModelPicker(target, runtime.model_picker.is_none()),
+            GlobalShortcut::ChatPermissions => Action::PermissionPicker(target, !runtime.permission_picker),
             _ => return Task::none(),
         };
         let permission_controls = runtime.permission_controls(

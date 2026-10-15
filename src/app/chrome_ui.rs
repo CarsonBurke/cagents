@@ -739,22 +739,75 @@ enum PaneMenuCommand {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PaneMenu(CardId, PaneMenuCommand);
 
+impl PaneMenuCommand {
+    fn command(self) -> workspace_widget::GlobalShortcut {
+        use workspace_widget::GlobalShortcut as Command;
+        match self {
+            Self::Rename => Command::RenamePane,
+            Self::Clone => Command::ClonePane,
+            Self::CopyPath => Command::CopyPath,
+            Self::Reveal => Command::RevealInProjects,
+            Self::CloseOthers => Command::CloseOtherPanes,
+            Self::CloseToRight => Command::ClosePanesToRight,
+            Self::Close => Command::CloseFocusedCard,
+            Self::Switch => Command::SwitchPane,
+            Self::Fork(_) => Command::ForkConversation,
+            Self::ReviewChanges(_) => Command::ReviewConversationChanges,
+        }
+    }
+}
+
+#[cfg(test)]
+mod command_registry_tests {
+    use super::*;
+
+    #[test]
+    fn palette_every_pane_context_menu_command_maps_to_a_registered_id() {
+        let card = CardId::new();
+        let target = chat_ui::Target {
+            card,
+            generation: 1,
+        };
+        for menu in [
+            PaneMenuCommand::Rename,
+            PaneMenuCommand::Clone,
+            PaneMenuCommand::CopyPath,
+            PaneMenuCommand::Reveal,
+            PaneMenuCommand::CloseOthers,
+            PaneMenuCommand::CloseToRight,
+            PaneMenuCommand::Close,
+            PaneMenuCommand::Switch,
+            PaneMenuCommand::Fork(target),
+            PaneMenuCommand::ReviewChanges(target),
+        ] {
+            let descriptor = workspace_widget::shortcut_descriptor(menu.command());
+            assert!(!descriptor.id().is_empty());
+            assert!(!descriptor.label.is_empty());
+            match widget::menu::Action::message(&PaneMenu(card, menu)) {
+                Message::Palette(palette_ui::Action::RunPane(id, command)) => {
+                    assert_eq!(id, card);
+                    assert_eq!(command, menu.command());
+                    assert!(!matches!(menu, PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)));
+                }
+                Message::Palette(palette_ui::Action::RunChatPane(actual, command)) => {
+                    assert_eq!(actual, target, "retain the conversation generation captured by the menu");
+                    assert_eq!(command, menu.command());
+                    assert!(matches!(menu, PaneMenuCommand::Fork(_) | PaneMenuCommand::ReviewChanges(_)));
+                }
+                _ => panic!("pane menu must use the registered command dispatcher"),
+            }
+        }
+    }
+}
+
 impl widget::menu::Action for PaneMenu {
     type Message = Message;
     fn message(&self) -> Message {
-        let id = self.0;
-        Message::ChromeUi(match self.1 {
-            PaneMenuCommand::Rename => Action::Rename(id),
-            PaneMenuCommand::Clone => Action::Clone(id),
-            PaneMenuCommand::CopyPath => Action::CopyPath(id),
-            PaneMenuCommand::Reveal => Action::Reveal(id),
-            PaneMenuCommand::CloseOthers => Action::CloseOthers(id),
-            PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
-            PaneMenuCommand::Close => return Message::CloseCard(id),
-            PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
-        })
+        let action = match self.1 {
+            PaneMenuCommand::Fork(target) | PaneMenuCommand::ReviewChanges(target) => palette_ui::Action::RunChatPane(target, self.1.command()),
+            _ => palette_ui::Action::RunPane(self.0, self.1.command()),
+        };
+        Message::Palette(action)
     }
 }
 
@@ -2074,7 +2127,33 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::ReviewChanges(target)),
                 ));
             }
-            widget::menu::items(&HashMap::new(), entries)
+            entries.retain(|entry| match entry {
+                widget::menu::Item::Button(_, _, action) => {
+                    self.pane_command_available(id, action.1.command())
+                }
+                _ => true,
+            });
+            let bindings = entries
+                .iter()
+                .filter_map(|entry| {
+                    let widget::menu::Item::Button(_, _, action) = entry else {
+                        return None;
+                    };
+                    workspace_widget::menu_shortcut(
+                        action.1.command(),
+                        &self.settings.keyboard_shortcuts,
+                    )
+                    .map(|chord| (chord, *action))
+                })
+                .collect::<HashMap<_, _>>();
+            for entry in &mut entries {
+                if let widget::menu::Item::Button(label, _, action) = entry {
+                    *label = workspace_widget::shortcut_descriptor(action.1.command())
+                        .label
+                        .to_owned();
+                }
+            }
+            widget::menu::items(&bindings, entries)
         })
     }
 

@@ -2479,6 +2479,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::Palette(palette_ui::Action::FocusPane(_))
         | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
@@ -2624,6 +2625,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
+            | Message::Palette(palette_ui::Action::FocusPane(_))
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -2798,11 +2800,44 @@ pub enum SettingsField {
     ShortcutFocusPane9,
     ShortcutToggleProjects,
     ShortcutRenamePane,
+    ShortcutNewBrowser,
+    ShortcutOpenFolder,
+    ShortcutNewWorktree,
+    ShortcutCloseOtherPanes,
+    ShortcutClosePanesToRight,
+    ShortcutCopyPath,
+    ShortcutRevealInProjects,
+    ShortcutForkConversation,
+    ShortcutFocusSidebarTree,
+    ShortcutRestartDaemon,
+    ShortcutToggleTheme,
+    ShortcutResumeConversation,
+    ShortcutSwitchPane,
+    ShortcutReviewConversationChanges,
+    ShortcutFocusProject1,
+    ShortcutFocusProject2,
+    ShortcutFocusProject3,
+    ShortcutFocusProject4,
+    ShortcutFocusProject5,
+    ShortcutFocusProject6,
+    ShortcutFocusProject7,
+    ShortcutFocusProject8,
+    ShortcutFocusProject9,
+    ShortcutSettingsGeneral,
+    ShortcutSettingsAppearance,
+    ShortcutSettingsTerminal,
+    ShortcutSettingsLinks,
+    ShortcutSettingsKeyboard,
+    ShortcutSettingsNativeChat,
+    ShortcutSettingsEditor,
+    ShortcutSettingsAccounts,
+    ShortcutSettingsNotifications,
+    ShortcutSettingsAbout,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 71] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2841,12 +2876,48 @@ impl SettingsField {
         Self::ShortcutFocusPane9,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
+        Self::ShortcutNewBrowser,
+        Self::ShortcutOpenFolder,
+        Self::ShortcutNewWorktree,
+        Self::ShortcutCloseOtherPanes,
+        Self::ShortcutClosePanesToRight,
+        Self::ShortcutCopyPath,
+        Self::ShortcutRevealInProjects,
+        Self::ShortcutForkConversation,
+        Self::ShortcutFocusSidebarTree,
+        Self::ShortcutRestartDaemon,
+        Self::ShortcutToggleTheme,
+        Self::ShortcutResumeConversation,
+        Self::ShortcutSwitchPane,
+        Self::ShortcutReviewConversationChanges,
+        Self::ShortcutFocusProject1,
+        Self::ShortcutFocusProject2,
+        Self::ShortcutFocusProject3,
+        Self::ShortcutFocusProject4,
+        Self::ShortcutFocusProject5,
+        Self::ShortcutFocusProject6,
+        Self::ShortcutFocusProject7,
+        Self::ShortcutFocusProject8,
+        Self::ShortcutFocusProject9,
+        Self::ShortcutSettingsGeneral,
+        Self::ShortcutSettingsAppearance,
+        Self::ShortcutSettingsTerminal,
+        Self::ShortcutSettingsLinks,
+        Self::ShortcutSettingsKeyboard,
+        Self::ShortcutSettingsNativeChat,
+        Self::ShortcutSettingsEditor,
+        Self::ShortcutSettingsAccounts,
+        Self::ShortcutSettingsNotifications,
+        Self::ShortcutSettingsAbout,
     ];
 
     /// The label the settings pane shows for this setting, which is also
     /// the name its messages use for it.
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         use crate::notifications::Field;
+        if let Some(action) = self.shortcut_action() {
+            return workspace_widget::shortcut_descriptor(action).label;
+        }
         match self {
             Self::Notifications(Field::Enabled) => "System notifications",
             Self::Notifications(Field::Success) => "Successful completion",
@@ -2882,6 +2953,40 @@ impl SettingsField {
             Self::ConfirmMultilinePaste => "Confirm multiline paste",
             Self::ShortcutToggleProjects => "Toggle Projects sidebar",
             Self::ShortcutRenamePane => "Rename focused pane",
+            Self::ShortcutNewBrowser => "New browser pane",
+            Self::ShortcutOpenFolder => "Open folder / add project",
+            Self::ShortcutNewWorktree => "New worktree",
+            Self::ShortcutCloseOtherPanes => "Close other panes",
+            Self::ShortcutClosePanesToRight => "Close panes to the right",
+            Self::ShortcutCopyPath => "Copy path",
+            Self::ShortcutRevealInProjects => "Reveal in Projects",
+            Self::ShortcutForkConversation => "Fork conversation",
+            Self::ShortcutFocusSidebarTree => "Focus Projects tree",
+            Self::ShortcutRestartDaemon => "Restart daemon",
+            Self::ShortcutToggleTheme => "Toggle theme",
+            Self::ShortcutResumeConversation => "Resume conversation",
+            Self::ShortcutSwitchPane => "Switch conversation view",
+            Self::ShortcutReviewConversationChanges => "Review conversation changes",
+            Self::ShortcutFocusProject1 => "Go to project 1",
+            Self::ShortcutFocusProject2 => "Go to project 2",
+            Self::ShortcutFocusProject3 => "Go to project 3",
+            Self::ShortcutFocusProject4 => "Go to project 4",
+            Self::ShortcutFocusProject5 => "Go to project 5",
+            Self::ShortcutFocusProject6 => "Go to project 6",
+            Self::ShortcutFocusProject7 => "Go to project 7",
+            Self::ShortcutFocusProject8 => "Go to project 8",
+            Self::ShortcutFocusProject9 => "Go to project 9",
+            Self::ShortcutSettingsGeneral => "Open settings: General",
+            Self::ShortcutSettingsAppearance => "Open settings: Appearance",
+            Self::ShortcutSettingsTerminal => "Open settings: Terminal",
+            Self::ShortcutSettingsLinks => "Open settings: Links",
+            Self::ShortcutSettingsKeyboard => "Open settings: Keyboard",
+            Self::ShortcutSettingsNativeChat => "Open settings: Native chat",
+            Self::ShortcutSettingsEditor => "Open settings: Editor",
+            Self::ShortcutSettingsAccounts => "Open settings: Accounts",
+            Self::ShortcutSettingsNotifications => "Open settings: Notifications",
+            Self::ShortcutSettingsAbout => "Open settings: About",
+
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
             Self::ShortcutChatPermissions => "Choose chat permission mode",
@@ -2981,6 +3086,39 @@ impl SettingsField {
             | Self::BrowserSearchUrl => SettingsCategory::Links,
             Self::ShortcutNewTerminal
             | Self::ShortcutToggleProjects
+            | Self::ShortcutNewBrowser
+            | Self::ShortcutOpenFolder
+            | Self::ShortcutNewWorktree
+            | Self::ShortcutCloseOtherPanes
+            | Self::ShortcutClosePanesToRight
+            | Self::ShortcutCopyPath
+            | Self::ShortcutRevealInProjects
+            | Self::ShortcutForkConversation
+            | Self::ShortcutFocusSidebarTree
+            | Self::ShortcutRestartDaemon
+            | Self::ShortcutToggleTheme
+            | Self::ShortcutResumeConversation
+            | Self::ShortcutSwitchPane
+            | Self::ShortcutReviewConversationChanges
+            | Self::ShortcutFocusProject1
+            | Self::ShortcutFocusProject2
+            | Self::ShortcutFocusProject3
+            | Self::ShortcutFocusProject4
+            | Self::ShortcutFocusProject5
+            | Self::ShortcutFocusProject6
+            | Self::ShortcutFocusProject7
+            | Self::ShortcutFocusProject8
+            | Self::ShortcutFocusProject9
+            | Self::ShortcutSettingsGeneral
+            | Self::ShortcutSettingsAppearance
+            | Self::ShortcutSettingsTerminal
+            | Self::ShortcutSettingsLinks
+            | Self::ShortcutSettingsKeyboard
+            | Self::ShortcutSettingsNativeChat
+            | Self::ShortcutSettingsEditor
+            | Self::ShortcutSettingsAccounts
+            | Self::ShortcutSettingsNotifications
+            | Self::ShortcutSettingsAbout
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3040,6 +3178,40 @@ enum SettingsFeedback {
 struct ShortcutDraft {
     toggle_projects: String,
     rename_pane: String,
+    new_browser: String,
+    open_folder: String,
+    new_worktree: String,
+    close_other_panes: String,
+    close_panes_to_right: String,
+    copy_path: String,
+    reveal_in_projects: String,
+    fork_conversation: String,
+    focus_sidebar_tree: String,
+    restart_daemon: String,
+    toggle_theme: String,
+    resume_conversation: String,
+    switch_pane: String,
+    review_conversation_changes: String,
+    focus_project_1: String,
+    focus_project_2: String,
+    focus_project_3: String,
+    focus_project_4: String,
+    focus_project_5: String,
+    focus_project_6: String,
+    focus_project_7: String,
+    focus_project_8: String,
+    focus_project_9: String,
+    settings_general: String,
+    settings_appearance: String,
+    settings_terminal: String,
+    settings_links: String,
+    settings_keyboard: String,
+    settings_native_chat: String,
+    settings_editor: String,
+    settings_accounts: String,
+    settings_notifications: String,
+    settings_about: String,
+
     command_palette: String,
     new_native_thread: String,
     chat_permissions: String,
@@ -3083,6 +3255,42 @@ impl ShortcutDraft {
         Self {
             toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
+            new_browser: settings::format_chords(&shortcuts.new_browser),
+            open_folder: settings::format_chords(&shortcuts.open_folder),
+            new_worktree: settings::format_chords(&shortcuts.new_worktree),
+            close_other_panes: settings::format_chords(&shortcuts.close_other_panes),
+            close_panes_to_right: settings::format_chords(&shortcuts.close_panes_to_right),
+            copy_path: settings::format_chords(&shortcuts.copy_path),
+            reveal_in_projects: settings::format_chords(&shortcuts.reveal_in_projects),
+            fork_conversation: settings::format_chords(&shortcuts.fork_conversation),
+            focus_sidebar_tree: settings::format_chords(&shortcuts.focus_sidebar_tree),
+            restart_daemon: settings::format_chords(&shortcuts.restart_daemon),
+            toggle_theme: settings::format_chords(&shortcuts.toggle_theme),
+            resume_conversation: settings::format_chords(&shortcuts.resume_conversation),
+            switch_pane: settings::format_chords(&shortcuts.switch_pane),
+            review_conversation_changes: settings::format_chords(
+                &shortcuts.review_conversation_changes,
+            ),
+            focus_project_1: settings::format_chords(&shortcuts.focus_project_1),
+            focus_project_2: settings::format_chords(&shortcuts.focus_project_2),
+            focus_project_3: settings::format_chords(&shortcuts.focus_project_3),
+            focus_project_4: settings::format_chords(&shortcuts.focus_project_4),
+            focus_project_5: settings::format_chords(&shortcuts.focus_project_5),
+            focus_project_6: settings::format_chords(&shortcuts.focus_project_6),
+            focus_project_7: settings::format_chords(&shortcuts.focus_project_7),
+            focus_project_8: settings::format_chords(&shortcuts.focus_project_8),
+            focus_project_9: settings::format_chords(&shortcuts.focus_project_9),
+            settings_general: settings::format_chords(&shortcuts.settings_general),
+            settings_appearance: settings::format_chords(&shortcuts.settings_appearance),
+            settings_terminal: settings::format_chords(&shortcuts.settings_terminal),
+            settings_links: settings::format_chords(&shortcuts.settings_links),
+            settings_keyboard: settings::format_chords(&shortcuts.settings_keyboard),
+            settings_native_chat: settings::format_chords(&shortcuts.settings_native_chat),
+            settings_editor: settings::format_chords(&shortcuts.settings_editor),
+            settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
+            settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
+            settings_about: settings::format_chords(&shortcuts.settings_about),
+
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
             chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
@@ -3311,6 +3519,70 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.toggle_projects = value
             }
             SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = value,
+            SettingsField::ShortcutNewBrowser => self.keyboard_shortcuts.new_browser = value,
+            SettingsField::ShortcutOpenFolder => self.keyboard_shortcuts.open_folder = value,
+            SettingsField::ShortcutNewWorktree => self.keyboard_shortcuts.new_worktree = value,
+            SettingsField::ShortcutCloseOtherPanes => {
+                self.keyboard_shortcuts.close_other_panes = value
+            }
+            SettingsField::ShortcutClosePanesToRight => {
+                self.keyboard_shortcuts.close_panes_to_right = value
+            }
+            SettingsField::ShortcutCopyPath => self.keyboard_shortcuts.copy_path = value,
+            SettingsField::ShortcutRevealInProjects => {
+                self.keyboard_shortcuts.reveal_in_projects = value
+            }
+            SettingsField::ShortcutForkConversation => {
+                self.keyboard_shortcuts.fork_conversation = value
+            }
+            SettingsField::ShortcutFocusSidebarTree => {
+                self.keyboard_shortcuts.focus_sidebar_tree = value
+            }
+            SettingsField::ShortcutRestartDaemon => self.keyboard_shortcuts.restart_daemon = value,
+            SettingsField::ShortcutToggleTheme => self.keyboard_shortcuts.toggle_theme = value,
+            SettingsField::ShortcutResumeConversation => {
+                self.keyboard_shortcuts.resume_conversation = value
+            }
+            SettingsField::ShortcutSwitchPane => self.keyboard_shortcuts.switch_pane = value,
+            SettingsField::ShortcutReviewConversationChanges => {
+                self.keyboard_shortcuts.review_conversation_changes = value
+            }
+            SettingsField::ShortcutFocusProject1 => self.keyboard_shortcuts.focus_project_1 = value,
+            SettingsField::ShortcutFocusProject2 => self.keyboard_shortcuts.focus_project_2 = value,
+            SettingsField::ShortcutFocusProject3 => self.keyboard_shortcuts.focus_project_3 = value,
+            SettingsField::ShortcutFocusProject4 => self.keyboard_shortcuts.focus_project_4 = value,
+            SettingsField::ShortcutFocusProject5 => self.keyboard_shortcuts.focus_project_5 = value,
+            SettingsField::ShortcutFocusProject6 => self.keyboard_shortcuts.focus_project_6 = value,
+            SettingsField::ShortcutFocusProject7 => self.keyboard_shortcuts.focus_project_7 = value,
+            SettingsField::ShortcutFocusProject8 => self.keyboard_shortcuts.focus_project_8 = value,
+            SettingsField::ShortcutFocusProject9 => self.keyboard_shortcuts.focus_project_9 = value,
+            SettingsField::ShortcutSettingsGeneral => {
+                self.keyboard_shortcuts.settings_general = value
+            }
+            SettingsField::ShortcutSettingsAppearance => {
+                self.keyboard_shortcuts.settings_appearance = value
+            }
+            SettingsField::ShortcutSettingsTerminal => {
+                self.keyboard_shortcuts.settings_terminal = value
+            }
+            SettingsField::ShortcutSettingsLinks => self.keyboard_shortcuts.settings_links = value,
+            SettingsField::ShortcutSettingsKeyboard => {
+                self.keyboard_shortcuts.settings_keyboard = value
+            }
+            SettingsField::ShortcutSettingsNativeChat => {
+                self.keyboard_shortcuts.settings_native_chat = value
+            }
+            SettingsField::ShortcutSettingsEditor => {
+                self.keyboard_shortcuts.settings_editor = value
+            }
+            SettingsField::ShortcutSettingsAccounts => {
+                self.keyboard_shortcuts.settings_accounts = value
+            }
+            SettingsField::ShortcutSettingsNotifications => {
+                self.keyboard_shortcuts.settings_notifications = value
+            }
+            SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
             }
@@ -3404,6 +3676,138 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::ShortcutNewBrowser => {
+            next.keyboard_shortcuts.new_browser = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenFolder => {
+            next.keyboard_shortcuts.open_folder = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutNewWorktree => {
+            next.keyboard_shortcuts.new_worktree = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCloseOtherPanes => {
+            next.keyboard_shortcuts.close_other_panes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutClosePanesToRight => {
+            next.keyboard_shortcuts.close_panes_to_right = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCopyPath => {
+            next.keyboard_shortcuts.copy_path = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRevealInProjects => {
+            next.keyboard_shortcuts.reveal_in_projects = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutForkConversation => {
+            next.keyboard_shortcuts.fork_conversation = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusSidebarTree => {
+            next.keyboard_shortcuts.focus_sidebar_tree = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRestartDaemon => {
+            next.keyboard_shortcuts.restart_daemon = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutToggleTheme => {
+            next.keyboard_shortcuts.toggle_theme = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutResumeConversation => {
+            next.keyboard_shortcuts.resume_conversation = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSwitchPane => {
+            next.keyboard_shortcuts.switch_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReviewConversationChanges => {
+            next.keyboard_shortcuts.review_conversation_changes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject1 => {
+            next.keyboard_shortcuts.focus_project_1 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject2 => {
+            next.keyboard_shortcuts.focus_project_2 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject3 => {
+            next.keyboard_shortcuts.focus_project_3 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject4 => {
+            next.keyboard_shortcuts.focus_project_4 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject5 => {
+            next.keyboard_shortcuts.focus_project_5 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject6 => {
+            next.keyboard_shortcuts.focus_project_6 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject7 => {
+            next.keyboard_shortcuts.focus_project_7 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject8 => {
+            next.keyboard_shortcuts.focus_project_8 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject9 => {
+            next.keyboard_shortcuts.focus_project_9 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsGeneral => {
+            next.keyboard_shortcuts.settings_general = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsAppearance => {
+            next.keyboard_shortcuts.settings_appearance = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsTerminal => {
+            next.keyboard_shortcuts.settings_terminal = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsLinks => {
+            next.keyboard_shortcuts.settings_links = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsKeyboard => {
+            next.keyboard_shortcuts.settings_keyboard = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsNativeChat => {
+            next.keyboard_shortcuts.settings_native_chat = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsEditor => {
+            next.keyboard_shortcuts.settings_editor = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsAccounts => {
+            next.keyboard_shortcuts.settings_accounts = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsNotifications => {
+            next.keyboard_shortcuts.settings_notifications = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsAbout => {
+            next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
+            Ok(())
+        }
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -11272,8 +11676,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -20768,6 +21175,7 @@ mod tests {
                 "https://example.com".into(),
             )),
             Message::FocusCard(CardId::new()),
+            Message::Palette(palette_ui::Action::FocusPane(focused)),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
             Message::ToggleContextInspector,
             Message::Repository(RepositoryAction::NewTerminal { card: focused }),

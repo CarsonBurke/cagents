@@ -6,6 +6,7 @@ pub(super) struct State {
     recording: Option<SettingsField>,
     query: Option<String>,
     selected: usize,
+    panes_only: bool,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -16,10 +17,15 @@ impl State {
 pub enum Action {
     Record(SettingsField),
     Open,
+    OpenPanes,
+    ClosePane(CardId),
     Close,
     Query(String),
     Run(MessageBox),
     Submit,
+    FocusPane(CardId),
+    RunPane(CardId, Command),
+    RunChatPane(chat_ui::Target, Command),
 }
 // Box breaks the recursive Message/Action representation.
 #[derive(Debug, Clone)]
@@ -28,6 +34,204 @@ pub struct MessageBox(pub Box<Message>);
 const ROW_HEIGHT: f32 = 40.0;
 const ROW_SPACING: f32 = space::XXS;
 
+/// Category prefixes are parsed before scoring and never participate in matching.
+fn palette_query(query: &str) -> (Option<char>, &str) {
+    let query = query.trim();
+    match query.chars().next() {
+        Some(prefix @ ('>' | '@' | '#')) => (Some(prefix), query[1..].trim_start()),
+        _ => (None, query),
+    }
+}
+
+fn search_label(label: &str) -> &str {
+    ["Focus pane: ", "Open workspace: ", "Open channel: "]
+        .into_iter()
+        .find_map(|prefix| label.strip_prefix(prefix))
+        .unwrap_or(label)
+}
+
+fn entry_category(message: &Message) -> char {
+    match message {
+        Message::Palette(Action::FocusPane(_)) => '@',
+        Message::Sidebar(
+            SidebarAction::OpenWorktree { .. }
+            | SidebarAction::OpenChannel { .. }
+            | SidebarAction::OpenRepository { .. },
+        ) => '#',
+        _ => '>',
+    }
+}
+
+fn entry_key(message: &Message) -> String {
+    match message {
+        Message::RunCommand(command) => format!("command:{}", command.id()),
+        Message::Palette(Action::FocusPane(id)) | Message::FocusCard(id) => format!("pane:{id}"),
+        Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, .. }) => {
+            format!("worktree:{worktree_id}")
+        }
+        Message::Sidebar(SidebarAction::OpenChannel { channel_id }) => {
+            format!("channel:{channel_id}")
+        }
+        Message::Sidebar(SidebarAction::OpenRepository { project_id, .. }) => {
+            format!("folder:{project_id}")
+        }
+        Message::CloseCard(_) => format!("command:{}", Command::CloseFocusedCard.id()),
+        _ => "command:resume_conversation".into(),
+    }
+}
+
+/// The sidebar and palette share match ranking; palette callers pass display
+/// labels, while the shared scorer consumes case-folded text.
+fn match_score(label: &str, query: &str) -> Option<usize> {
+    crate::search_match::score(&label.to_lowercase(), &query.to_lowercase())
+}
+
+fn highlighted_label(label: &str, query: &str) -> Element<'static, Message> {
+    use iced::widget::text::Span;
+    if query.is_empty() {
+        return design::body(label.to_owned())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill)
+            .into();
+    }
+    let searchable = search_label(label);
+    let offset = label.len() - searchable.len();
+    let folded: Vec<_> = searchable
+        .char_indices()
+        .flat_map(|(index, ch)| {
+            ch.to_lowercase()
+                .map(move |folded| (folded, offset + index..offset + index + ch.len_utf8()))
+        })
+        .collect();
+    let needle = query.to_lowercase().chars().collect::<Vec<_>>();
+    let mut matches = Vec::new();
+    if !needle.is_empty() {
+        let contiguous = folded
+            .windows(needle.len())
+            .enumerate()
+            .filter(|(_, window)| window.iter().map(|(ch, _)| *ch).eq(needle.iter().copied()))
+            .min_by_key(|(index, _)| {
+                if *index == 0 {
+                    0
+                } else if !folded[index - 1].0.is_alphanumeric() {
+                    1
+                } else {
+                    2
+                }
+            });
+        if let Some((_, window)) = contiguous {
+            matches.extend(window.iter().map(|(_, range)| range.clone()));
+        } else {
+            let mut cursor = 0;
+            for needle in needle {
+                if let Some(index) = folded[cursor..].iter().position(|(ch, _)| *ch == needle) {
+                    cursor += index;
+                    matches.push(folded[cursor].1.clone());
+                    cursor += 1;
+                }
+            }
+        }
+    }
+    let mut spans: Vec<Span<'static, ()>> = Vec::new();
+    let mut start = 0;
+    let mut highlighted = false;
+    for (index, _) in label.char_indices() {
+        let next = matches.iter().any(|range| range.contains(&index));
+        if next != highlighted {
+            if start < index {
+                let span = Span::new(label[start..index].to_owned());
+                spans.push(if highlighted {
+                    span.color(design::accent_color(&cosmic::theme::active()))
+                        .font(iced::Font {
+                            weight: iced::font::Weight::Bold,
+                            ..cosmic::font::default()
+                        })
+                } else {
+                    span
+                });
+            }
+            start = index;
+            highlighted = next;
+        }
+    }
+    let span = Span::new(label[start..].to_owned());
+    spans.push(if highlighted {
+        span.color(design::accent_color(&cosmic::theme::active()))
+            .font(iced::Font {
+                weight: iced::font::Weight::Bold,
+                ..cosmic::font::default()
+            })
+    } else {
+        span
+    });
+    widget::container(
+        iced::widget::rich_text(spans)
+            .size(design::TEXT_BODY)
+            .font(cosmic::font::default())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::widget::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            ))
+            .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .clip(true)
+    .class(design::transparent())
+    .into()
+}
+
+fn palette_row_style(selected: bool) -> cosmic::theme::Button {
+    fn appearance(selected: bool, hover: bool, theme: &cosmic::Theme) -> widget::button::Style {
+        let mut accent = design::accent_color(theme);
+        accent.a = if selected { 0.18 } else { 0.08 };
+        widget::button::Style {
+            background: (selected || hover).then_some(iced::Background::Color(accent)),
+            border_radius: design::RADIUS_S.into(),
+            ..design::button_style()
+        }
+    }
+    cosmic::theme::Button::Custom {
+        active: Box::new(move |_, theme| appearance(selected, false, theme)),
+        disabled: Box::new(move |theme| appearance(selected, false, theme)),
+        hovered: Box::new(move |_, theme| appearance(selected, true, theme)),
+        pressed: Box::new(move |_, theme| appearance(true, true, theme)),
+    }
+}
+
+fn project_command_index(command: Command) -> Option<usize> {
+    match command {
+        Command::FocusProject1 => Some(0),
+        Command::FocusProject2 => Some(1),
+        Command::FocusProject3 => Some(2),
+        Command::FocusProject4 => Some(3),
+        Command::FocusProject5 => Some(4),
+        Command::FocusProject6 => Some(5),
+        Command::FocusProject7 => Some(6),
+        Command::FocusProject8 => Some(7),
+        Command::FocusProject9 => Some(8),
+        _ => None,
+    }
+}
+
+fn settings_command_category(command: Command) -> Option<SettingsCategory> {
+    match command {
+        Command::SettingsGeneral => Some(SettingsCategory::General),
+        Command::SettingsAppearance => Some(SettingsCategory::Appearance),
+        Command::SettingsTerminal => Some(SettingsCategory::Terminal),
+        Command::SettingsLinks => Some(SettingsCategory::Links),
+        Command::SettingsKeyboard => Some(SettingsCategory::Keyboard),
+        Command::SettingsNativeChat => Some(SettingsCategory::NativeChat),
+        Command::SettingsEditor => Some(SettingsCategory::Editor),
+        Command::SettingsAccounts => Some(SettingsCategory::Accounts),
+        Command::SettingsNotifications => Some(SettingsCategory::Notifications),
+        Command::SettingsAbout => Some(SettingsCategory::About),
+        _ => None,
+    }
+}
+
 impl Cagents {
     pub(super) fn update_palette(&mut self, action: Action) -> Task<Message> {
         match action {
@@ -35,10 +239,12 @@ impl Cagents {
                 self.palette.recording = Some(field);
                 Task::none()
             }
-            Action::Open => {
+            Action::ClosePane(card) => self.run_palette_command(Message::CloseCard(card)),
+            Action::Open | Action::OpenPanes => {
                 if self.workspace_inputs_blocked() {
                     return Task::none();
                 }
+                self.palette.panes_only = matches!(action, Action::OpenPanes);
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
                 self.palette.selected = 0;
@@ -60,6 +266,49 @@ impl Cagents {
                 self.reveal_palette_selection()
             }
             Action::Run(MessageBox(message)) => self.run_palette_command(*message),
+            Action::RunChatPane(target, command) => {
+                let current = match command {
+                    Command::ForkConversation => self.chat_fork_target(target.card),
+                    Command::ReviewConversationChanges => self.chat_changes_target(target.card),
+                    _ => None,
+                };
+                if current != Some(target) {
+                    self.status = Some(TransientNotice::warning("This conversation changed; open its menu again"));
+                    return Task::none();
+                }
+                self.update_palette(Action::RunPane(target.card, command))
+            }
+            Action::RunPane(id, command) => match self.pane_command_message(id, command) {
+                Some(message) => self.update(message),
+                None => {
+                    self.status = Some(TransientNotice::warning(
+                        "This pane command is no longer available",
+                    ));
+                    Task::none()
+                }
+            },
+            Action::FocusPane(id) => {
+                let Some(card) = self.card_state(id).filter(|card| card.existence.is_open()) else {
+                    return Task::none();
+                };
+                let channel = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.cards.contains(&id))
+                    .map(|channel| channel.id);
+                let path = self.card_worktree(card).map(Path::to_path_buf).or_else(|| self.active_workspace.clone());
+                let navigation = if self.workspace.order().any(|candidate| candidate == id) {
+                    Task::none()
+                } else if let Some(channel) = channel {
+                    self.select_channel(channel)
+                } else if let Some(path) = path {
+                    self.select_worktree(path, false)
+                } else {
+                    Task::none()
+                };
+                navigation.chain(self.update(Message::FocusCard(id)))
+            }
             Action::Submit => {
                 let entry = self
                     .palette_entries()
@@ -74,8 +323,20 @@ impl Cagents {
     }
 
     fn run_palette_command(&mut self, message: Message) -> Task<Message> {
+        let key = entry_key(&message);
+        self.settings
+            .palette_recents
+            .retain(|recent| recent != &key);
+        self.settings.palette_recents.insert(0, key);
+        self.settings.palette_recents.truncate(24);
         self.palette.query = None;
         let command = self.update(message);
+        let save = if self.settings_path.is_some() {
+            self.save_settings_task(false)
+        } else {
+            Task::none()
+        };
+        let command = Task::batch([command, save]);
         // A command can move focus to another pane synchronously. Restore
         // that current pane before running the command's explicit focus
         // effects, which may instead land in a dialog or another control.
@@ -200,10 +461,13 @@ impl Cagents {
     }
 
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
-        let mut entries: Vec<_> = workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
+        let (category, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
+        let mut entries: Vec<_> = if !self.palette.panes_only && category.is_none_or(|category| category == '>') {
+            let context = self.command_context(self.workspace.focused());
+            workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.action != Command::CommandPalette)
-            .filter(|descriptor| descriptor.scope.applies_to(self.focused_pane()))
+            .filter(|descriptor| descriptor.available(&context))
             .map(|descriptor| {
                 (
                     descriptor.label.to_owned(),
@@ -214,56 +478,124 @@ impl Cagents {
                     Message::RunCommand(descriptor.action),
                 )
             })
+            .collect()
+        } else { Vec::new() };
+        let current_order: HashMap<_, _> = self
+            .workspace
+            .order()
+            .enumerate()
+            .map(|(index, id)| (id, index))
             .collect();
-        entries.push((
-            "Resume conversation".into(),
-            "Search saved native chats".into(),
-            Message::ResumeConversation(resume_ui::Action::Open),
-        ));
-        for id in self.workspace.order() {
-            if let Some(card) = self.card_state(id) {
-                entries.push((
-                    format!("Focus pane: {}", self.card_display_title(card)),
-                    String::new(),
-                    Message::FocusCard(id),
-                ));
+        if category.is_none_or(|category| category == '@') {
+        for card in self.durable.cards.iter().filter(|card| {
+            card.existence.is_open()
+                && (!self.palette.panes_only || current_order.contains_key(&card.id))
+        }) {
+            let place = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card.id))
+                .map(|channel| channel.title.clone())
+                .or_else(|| {
+                    self.card_worktree(card).map(|path| {
+                        path.file_name()
+                            .unwrap_or(path.as_os_str())
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                })
+                .unwrap_or_else(|| "Global".into());
+            let status = if self.sidebar_state.has_card_update(card.id) {
+                "● Unread"
+            } else {
+                match self
+                    .sidebar_state
+                    .card_activity(card.id)
+                    .map(|activity| activity.state)
+                {
+                    Some(crate::agent::ActivityState::Working) => "◌ Working",
+                    Some(crate::agent::ActivityState::Waiting) => "! Waiting",
+                    _ => "○ Idle",
+                }
+            };
+            entries.push((
+                if self.palette.panes_only {
+                    self.card_display_title(card).to_owned()
+                } else {
+                    format!("Focus pane: {} · {}", self.card_display_title(card), place)
+                },
+                status.into(),
+                Message::Palette(Action::FocusPane(card.id)),
+            ));
+        }
+        }
+        if !self.palette.panes_only && category.is_none_or(|category| category == '#') {
+            for project in &self.sidebar_model.projects {
+                if project.kind == ProjectKind::Folder {
+                    entries.push((
+                        format!("Open workspace: {}", project.name),
+                        String::new(),
+                        Message::Sidebar(SidebarAction::OpenRepository {
+                            project_id: project.id,
+                            repository: project.repository.clone(),
+                        }),
+                    ));
+                }
+
+                for channel in &project.channels {
+                    entries.push((
+                        format!("Open channel: {} · {}", channel.title, project.name),
+                        String::new(),
+                        Message::Sidebar(SidebarAction::OpenChannel {
+                            channel_id: channel.id,
+                        }),
+                    ));
+                }
+                for worktree in &project.worktrees {
+                    entries.push((
+                        format!("Open workspace: {} · {}", worktree.label(), project.name),
+                        String::new(),
+                        Message::Sidebar(SidebarAction::OpenWorktree {
+                            project_id: project.id,
+                            worktree_id: worktree.id,
+                            path: worktree.path.clone(),
+                        }),
+                    ));
+                }
             }
         }
-        for project in &self.sidebar_model.projects {
-            for channel in &project.channels {
-                entries.push((
-                    format!("Open channel: {} · {}", channel.title, project.name),
-                    String::new(),
-                    Message::Sidebar(SidebarAction::OpenChannel {
-                        channel_id: channel.id,
-                    }),
-                ));
-            }
-            for worktree in &project.worktrees {
-                entries.push((
-                    format!("Open workspace: {} · {}", worktree.label(), project.name),
-                    String::new(),
-                    Message::Sidebar(SidebarAction::OpenWorktree {
-                        project_id: project.id,
-                        worktree_id: worktree.id,
-                        path: worktree.path.clone(),
-                    }),
-                ));
-            }
-        }
-        let query = self
-            .palette
-            .query
-            .as_deref()
-            .unwrap_or("")
-            .trim()
-            .to_lowercase();
-        if !query.is_empty() {
-            entries.retain(|(label, _, _)| {
-                let mut chars = label.chars().flat_map(char::to_lowercase);
-                query
-                    .chars()
-                    .all(|needle| chars.by_ref().any(|ch| ch == needle))
+
+        entries.retain(|(label, _, message)| {
+            category.is_none_or(|category| entry_category(message) == category)
+                && match_score(search_label(label), query).is_some()
+        });
+        if self.palette.panes_only && query.is_empty() {
+            entries.sort_by_key(|(_, _, message)| match message {
+                Message::Palette(Action::FocusPane(id)) => {
+                    current_order.get(id).copied().unwrap_or(usize::MAX)
+                }
+                _ => usize::MAX,
+            });
+        } else {
+            entries.sort_by_cached_key(|(label, _, message)| {
+                let recent = self
+                    .settings
+                    .palette_recents
+                    .iter()
+                    .position(|key| key == &entry_key(message))
+                    .unwrap_or(usize::MAX);
+                let common = match message {
+                    Message::RunCommand(Command::NewThread) => 0,
+                    Message::RunCommand(Command::NewTerminal) => 1,
+                    Message::RunCommand(Command::OpenSettings) => 2,
+                    _ => 3,
+                };
+                (
+                    match_score(search_label(label), query).unwrap_or(usize::MAX),
+                    recent,
+                    common,
+                )
             });
         }
         entries
@@ -280,35 +612,81 @@ impl Cagents {
             );
         }
         let query = self.palette.query.as_ref()?;
-        let input =
-            crate::ui_controls::field::search("Search commands, panes and workspaces", query)
-                .id(widget::Id::new("palette.query"))
-                .on_input(|query| Message::Palette(Action::Query(query)));
+        let input = crate::ui_controls::field::search(
+            if self.palette.panes_only {
+                "Search open panes"
+            } else {
+                "Search · > commands · @ panes · # workspaces"
+            },
+            query,
+        )
+        .id(widget::Id::new("palette.query"))
+        .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
             .enumerate()
             .map(|(index, (label, chord, message))| {
-                let row = widget::row::with_children(vec![
-                    design::body(label).width(Length::Fill).into(),
-                    design::caption(chord).into(),
-                ])
-                .spacing(space::M)
-                .align_y(Alignment::Center);
-                let button = if index == self.palette.selected {
-                    widget::button::custom(row).class(cosmic::theme::Button::Suggested)
-                } else {
-                    widget::button::custom(row)
+                let pane = match &message {
+                    Message::Palette(Action::FocusPane(id)) => Some(*id),
+                    _ => None,
                 };
+                let (_, needle) = palette_query(query);
+                let label = highlighted_label(&label, needle);
+                let mut children = Vec::new();
+                if let Some(card) = pane {
+                    children.push(
+                        self.card_icon(card)
+                            .icon()
+                            .size(design::ROW_ICON_SIZE)
+                            .into(),
+                    );
+                }
+                children.push(label);
+                children.push(
+                    design::caption(chord)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                );
+                let row = widget::row::with_children(children)
+                    .spacing(space::M)
+                    .align_y(Alignment::Center);
+                let button: Element<'_, Message> = widget::button::custom(
+                    widget::container(row)
+                        .height(Length::Fill)
+                        .align_y(Alignment::Center),
+                )
+                .class(palette_row_style(index == self.palette.selected))
+                .padding([0, 12])
+                .width(Length::Fill)
+                .height(ROW_HEIGHT)
+                .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
+                .into();
+                if self.palette.panes_only {
+                    if let Some(card) = pane {
+                        return widget::row::with_children(vec![
+                            button,
+                            crate::ui_controls::icon_button(Icon::Close, "Close pane")
+                                .id(widget::Id::new(format!("pane-list.close.{card}")))
+                                .on_press(Message::Palette(Action::ClosePane(card)))
+                                .into(),
+                        ])
+                        .align_y(Alignment::Center)
+                        .into();
+                    }
+                }
                 button
-                    .width(Length::Fill)
-                    .height(ROW_HEIGHT)
-                    .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
-                    .into()
             })
             .collect();
         let rows = if rows.is_empty() {
-            widget::column::with_children(vec![design::caption("No matching commands").into()])
+            widget::column::with_children(vec![
+                design::caption(if self.palette.panes_only {
+                    "No matching panes"
+                } else {
+                    "No matching commands"
+                })
+                .into(),
+            ])
         } else {
             widget::column::with_children(rows)
         };
@@ -317,9 +695,11 @@ impl Cagents {
                 widget::column::with_children(vec![
                     input.into(),
                     widget::container(
-                        widget::scrollable(rows.spacing(ROW_SPACING))
-                            .id(widget::Id::new("palette.commands"))
-                            .height(Length::Shrink),
+                        widget::scrollable(
+                            widget::container(rows.spacing(ROW_SPACING)).padding([0, 16]),
+                        )
+                        .id(widget::Id::new("palette.commands"))
+                        .height(Length::Shrink),
                     )
                     .max_height(360)
                     .into(),
@@ -334,6 +714,221 @@ impl Cagents {
         )
     }
 
+    fn command_project(&self) -> Option<&SidebarProject> {
+        if let Some(channel) = self.durable.active_channel.and_then(|id| {
+            self.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+        }) {
+            return self.sidebar_model.project(channel.project_id);
+        }
+        let selected = self.active_workspace.as_deref().and_then(|path| {
+            self.sidebar_model
+                .projects
+                .iter()
+                .filter(|project| self.project_owns_active_scope(project.id, path))
+                .max_by_key(|project| {
+                    std::iter::once(project.repository.as_path())
+                        .chain(
+                            project
+                                .worktrees
+                                .iter()
+                                .map(|worktree| worktree.path.as_path()),
+                        )
+                        .filter(|root| path.starts_with(root))
+                        .map(|root| root.components().count())
+                        .max()
+                        .unwrap_or(0)
+                })
+        });
+        selected.or_else(|| {
+            (self.sidebar_model.projects.len() == 1).then(|| &self.sidebar_model.projects[0])
+        })
+    }
+
+    /// Availability is shared by palette listing and execution. A stale menu
+    /// or shortcut cannot turn an unavailable command into a silent no-op.
+    fn command_context(&self, card: Option<CardId>) -> workspace_widget::CommandContext {
+        let pane_index =
+            card.and_then(|id| self.workspace.order().position(|candidate| candidate == id));
+        let state = card.and_then(|id| self.card_state(id));
+        workspace_widget::CommandContext {
+            focused: if card == self.workspace.focused() {
+                self.focused_pane()
+            } else {
+                match card.and_then(|id| self.cards.get(&id)) {
+                    Some(CardRuntime::Terminal(_))
+                        if state.is_some_and(|state| ended_terminal(Some(state)).is_none()) =>
+                    {
+                        workspace_widget::FocusedPane::Terminal
+                    }
+                    Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
+                    Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+                    Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
+                        workspace_widget::FocusedPane::Review
+                    }
+                    _ => workspace_widget::FocusedPane::Other,
+                }
+            },
+            pane_index,
+            pane_count: self.workspace.order().count(),
+            project_count: self.sidebar_model.projects.len(),
+            sidebar_has_rows: !sidebar::visible_selection_rows(
+                &self.sidebar_model,
+                &self.sidebar_state,
+                self.projects_sidebar_mode() == SidebarMode::Compact,
+            )
+            .is_empty(),
+            active_git_project: self
+                .command_project()
+                .is_some_and(|project| project.kind != ProjectKind::Folder),
+            pane_has_path: card
+                .is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(_))))
+                || state.and_then(super::worktree_ui::card_directory).is_some(),
+            pane_revealable: pane_index.is_some() && self.active_workspace_destination().is_some(),
+            pane_cloneable: !self.focused_repository_is_saving() && state.is_some_and(|state| {
+                state.existence.is_open()
+                    && !state.kind.is_utility()
+                    && !self.project_ui.deleting_card(state)
+            }),
+            can_fork: card.and_then(|id| self.chat_fork_target(id)).is_some(),
+            chat_account: card.is_some_and(|id| self.chat_control_available(id, Command::ChatAccount)),
+            chat_model: card.is_some_and(|id| self.chat_control_available(id, Command::ChatModel)),
+            chat_permissions: card.is_some_and(|id| self.chat_control_available(id, Command::ChatPermissions)),
+            can_switch: card
+                .is_some_and(|id| self.chat_switch_available(id) && self.chat_switch_ready(id)),
+            can_review: card.and_then(|id| self.chat_changes_target(id)).is_some(),
+            is_pull_request: card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::PullRequests(_)))) ,
+            can_find: card.is_some_and(|id| match self.cards.get(&id) {
+                Some(CardRuntime::Repository(runtime)) => runtime.editor_focus_target(id).is_some(),
+                Some(CardRuntime::Chat(_) | CardRuntime::Settings | CardRuntime::Terminal(_)) => {
+                    true
+                }
+                _ => false,
+            }),
+            daemon_can_restart: !crate::device::is_remote(),
+            can_reopen: self
+                .recently_closed
+                .iter()
+                .any(|(_, scope)| *scope == self.active_workspace_destination()),
+        }
+    }
+
+    pub(super) fn command_available(&self, command: Command) -> bool {
+        workspace_widget::shortcut_descriptor(command)
+            .available(&self.command_context(self.workspace.focused()))
+    }
+
+    pub(super) fn pane_command_available(&self, card: CardId, command: Command) -> bool {
+        workspace_widget::shortcut_descriptor(command).available(&self.command_context(Some(card)))
+    }
+
+    /// Pane menus carry their original target, independently of current focus.
+    pub(super) fn pane_command_message(&self, id: CardId, command: Command) -> Option<Message> {
+        if !self.pane_command_available(id, command) {
+            return None;
+        }
+        Some(match command {
+            Command::RenamePane => Message::ChromeUi(chrome_ui::Action::Rename(id)),
+            Command::ClonePane => Message::ChromeUi(chrome_ui::Action::Clone(id)),
+            Command::CloseFocusedCard => Message::CloseCard(id),
+            Command::CloseOtherPanes => Message::ChromeUi(chrome_ui::Action::CloseOthers(id)),
+            Command::ClosePanesToRight => Message::ChromeUi(chrome_ui::Action::CloseToRight(id)),
+            Command::CopyPath => Message::ChromeUi(chrome_ui::Action::CopyPath(id)),
+            Command::RevealInProjects => Message::ChromeUi(chrome_ui::Action::Reveal(id)),
+            Command::SwitchPane => Message::ChatUi(chat_ui::Action::Switch(id)),
+            Command::ForkConversation => Message::ChatUi(chat_ui::Action::BranchPicker(
+                self.chat_fork_target(id)?,
+                true,
+            )),
+            Command::ReviewConversationChanges => Message::ChatUi(chat_ui::Action::ChangesPicker(
+                self.chat_changes_target(id)?,
+                true,
+            )),
+            _ => return None,
+        })
+    }
+
+    fn run_registered_command(&mut self, command: Command) -> Task<Message> {
+        if let Some(index) = project_command_index(command) {
+            let Some(project) = self.sidebar_model.projects.get(index) else {
+                return Task::none();
+            };
+            return self.update(Message::Sidebar(SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }));
+        }
+        if let Some(category) = settings_command_category(command) {
+            let open = self.update(Message::Sidebar(SidebarAction::OpenSettings));
+            return Task::batch([open, self.update(Message::SelectSettingsCategory(category))]);
+        }
+        if let Some(message) = self
+            .workspace
+            .focused()
+            .and_then(|id| self.pane_command_message(id, command))
+        {
+            return self.update(message);
+        }
+        match command {
+            Command::NewBrowser => self.update(Message::NewBrowser),
+            Command::OpenFolder => self.update(Message::OpenRepository),
+            Command::NewWorktree => {
+                let Some(project) = self.command_project() else {
+                    return Task::none();
+                };
+                self.update(Message::Sidebar(SidebarAction::NewWorktree {
+                    project_id: project.id,
+                    repository: project.repository.clone(),
+                }))
+            }
+            Command::ResumeConversation => {
+                self.update(Message::ResumeConversation(resume_ui::Action::Open))
+            }
+            Command::FocusSidebarTree => {
+                self.chrome_ui.projects_collapsed = false;
+                let overlay = self.sync_context_overlay_state();
+                let rows = sidebar::visible_selection_rows(
+                    &self.sidebar_model,
+                    &self.sidebar_state,
+                    self.projects_sidebar_mode() == SidebarMode::Compact,
+                );
+                let row = self
+                    .sidebar_state
+                    .selected_rows(&rows)
+                    .first()
+                    .copied()
+                    .or_else(|| rows.first().copied());
+                Task::batch([
+                    overlay,
+                    row.map_or_else(Task::none, |row| {
+                        sidebar::focus_and_reveal(sidebar::selection_row_focus_id(row))
+                            .map(cosmic::Action::App)
+                    }),
+                ])
+            }
+            Command::RestartDaemon => self.update(Message::DaemonHealthUi(
+                daemon_health_ui::Action::OpenRequested,
+            )),
+            Command::ToggleTheme => {
+                let theme = if self
+                    .settings
+                    .app_theme
+                    .resolve(self.core.system_theme())
+                    .theme_type
+                    .is_dark()
+                {
+                    AppTheme::Light
+                } else {
+                    AppTheme::Dark
+                };
+                self.apply_setting_input(SettingsField::AppTheme, theme.key().into())
+            }
+            _ => Task::none(),
+        }
+    }
+
     pub(super) fn run_workspace_command(
         &mut self,
         command: Command,
@@ -346,7 +941,47 @@ impl Cagents {
         {
             return Task::none();
         }
+        if !self.command_available(command) {
+            self.status = Some(TransientNotice::warning(format!(
+                "{} is unavailable in the current context",
+                workspace_widget::shortcut_descriptor(command).label
+            )));
+            return Task::none();
+        }
         match command {
+            Command::NewBrowser
+            | Command::OpenFolder
+            | Command::NewWorktree
+            | Command::CloseOtherPanes
+            | Command::ClosePanesToRight
+            | Command::CopyPath
+            | Command::RevealInProjects
+            | Command::ForkConversation
+            | Command::FocusSidebarTree
+            | Command::RestartDaemon
+            | Command::ToggleTheme
+            | Command::ResumeConversation
+            | Command::SwitchPane
+            | Command::ReviewConversationChanges
+            | Command::FocusProject1
+            | Command::FocusProject2
+            | Command::FocusProject3
+            | Command::FocusProject4
+            | Command::FocusProject5
+            | Command::FocusProject6
+            | Command::FocusProject7
+            | Command::FocusProject8
+            | Command::FocusProject9
+            | Command::SettingsGeneral
+            | Command::SettingsAppearance
+            | Command::SettingsTerminal
+            | Command::SettingsLinks
+            | Command::SettingsKeyboard
+            | Command::SettingsNativeChat
+            | Command::SettingsEditor
+            | Command::SettingsAccounts
+            | Command::SettingsNotifications
+            | Command::SettingsAbout => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -512,6 +1147,40 @@ impl SettingsField {
         match self {
             Self::ShortcutToggleProjects => Some(Command::ToggleProjects),
             Self::ShortcutRenamePane => Some(Command::RenamePane),
+            Self::ShortcutNewBrowser => Some(Command::NewBrowser),
+            Self::ShortcutOpenFolder => Some(Command::OpenFolder),
+            Self::ShortcutNewWorktree => Some(Command::NewWorktree),
+            Self::ShortcutCloseOtherPanes => Some(Command::CloseOtherPanes),
+            Self::ShortcutClosePanesToRight => Some(Command::ClosePanesToRight),
+            Self::ShortcutCopyPath => Some(Command::CopyPath),
+            Self::ShortcutRevealInProjects => Some(Command::RevealInProjects),
+            Self::ShortcutForkConversation => Some(Command::ForkConversation),
+            Self::ShortcutFocusSidebarTree => Some(Command::FocusSidebarTree),
+            Self::ShortcutRestartDaemon => Some(Command::RestartDaemon),
+            Self::ShortcutToggleTheme => Some(Command::ToggleTheme),
+            Self::ShortcutResumeConversation => Some(Command::ResumeConversation),
+            Self::ShortcutSwitchPane => Some(Command::SwitchPane),
+            Self::ShortcutReviewConversationChanges => Some(Command::ReviewConversationChanges),
+            Self::ShortcutFocusProject1 => Some(Command::FocusProject1),
+            Self::ShortcutFocusProject2 => Some(Command::FocusProject2),
+            Self::ShortcutFocusProject3 => Some(Command::FocusProject3),
+            Self::ShortcutFocusProject4 => Some(Command::FocusProject4),
+            Self::ShortcutFocusProject5 => Some(Command::FocusProject5),
+            Self::ShortcutFocusProject6 => Some(Command::FocusProject6),
+            Self::ShortcutFocusProject7 => Some(Command::FocusProject7),
+            Self::ShortcutFocusProject8 => Some(Command::FocusProject8),
+            Self::ShortcutFocusProject9 => Some(Command::FocusProject9),
+            Self::ShortcutSettingsGeneral => Some(Command::SettingsGeneral),
+            Self::ShortcutSettingsAppearance => Some(Command::SettingsAppearance),
+            Self::ShortcutSettingsTerminal => Some(Command::SettingsTerminal),
+            Self::ShortcutSettingsLinks => Some(Command::SettingsLinks),
+            Self::ShortcutSettingsKeyboard => Some(Command::SettingsKeyboard),
+            Self::ShortcutSettingsNativeChat => Some(Command::SettingsNativeChat),
+            Self::ShortcutSettingsEditor => Some(Command::SettingsEditor),
+            Self::ShortcutSettingsAccounts => Some(Command::SettingsAccounts),
+            Self::ShortcutSettingsNotifications => Some(Command::SettingsNotifications),
+            Self::ShortcutSettingsAbout => Some(Command::SettingsAbout),
+
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
             Self::ShortcutClonePane => Some(Command::ClonePane),
@@ -565,6 +1234,57 @@ impl ShortcutDraft {
         vec![
             (Command::ToggleProjects, self.toggle_projects.as_str()),
             (Command::RenamePane, self.rename_pane.as_str()),
+            (Command::NewBrowser, self.new_browser.as_str()),
+            (Command::OpenFolder, self.open_folder.as_str()),
+            (Command::NewWorktree, self.new_worktree.as_str()),
+            (Command::CloseOtherPanes, self.close_other_panes.as_str()),
+            (
+                Command::ClosePanesToRight,
+                self.close_panes_to_right.as_str(),
+            ),
+            (Command::CopyPath, self.copy_path.as_str()),
+            (Command::RevealInProjects, self.reveal_in_projects.as_str()),
+            (Command::ForkConversation, self.fork_conversation.as_str()),
+            (Command::FocusSidebarTree, self.focus_sidebar_tree.as_str()),
+            (Command::RestartDaemon, self.restart_daemon.as_str()),
+            (Command::ToggleTheme, self.toggle_theme.as_str()),
+            (
+                Command::ResumeConversation,
+                self.resume_conversation.as_str(),
+            ),
+            (Command::SwitchPane, self.switch_pane.as_str()),
+            (
+                Command::ReviewConversationChanges,
+                self.review_conversation_changes.as_str(),
+            ),
+            (Command::FocusProject1, self.focus_project_1.as_str()),
+            (Command::FocusProject2, self.focus_project_2.as_str()),
+            (Command::FocusProject3, self.focus_project_3.as_str()),
+            (Command::FocusProject4, self.focus_project_4.as_str()),
+            (Command::FocusProject5, self.focus_project_5.as_str()),
+            (Command::FocusProject6, self.focus_project_6.as_str()),
+            (Command::FocusProject7, self.focus_project_7.as_str()),
+            (Command::FocusProject8, self.focus_project_8.as_str()),
+            (Command::FocusProject9, self.focus_project_9.as_str()),
+            (Command::SettingsGeneral, self.settings_general.as_str()),
+            (
+                Command::SettingsAppearance,
+                self.settings_appearance.as_str(),
+            ),
+            (Command::SettingsTerminal, self.settings_terminal.as_str()),
+            (Command::SettingsLinks, self.settings_links.as_str()),
+            (Command::SettingsKeyboard, self.settings_keyboard.as_str()),
+            (
+                Command::SettingsNativeChat,
+                self.settings_native_chat.as_str(),
+            ),
+            (Command::SettingsEditor, self.settings_editor.as_str()),
+            (Command::SettingsAccounts, self.settings_accounts.as_str()),
+            (
+                Command::SettingsNotifications,
+                self.settings_notifications.as_str(),
+            ),
+            (Command::SettingsAbout, self.settings_about.as_str()),
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
             (Command::ClonePane, self.clone_pane.as_str()),
@@ -707,6 +1427,181 @@ mod tests {
         view.as_widget_mut()
             .operate(tree, Layout::new(&node), &renderer, &mut probe);
         probe.offset.expect("the results scrollable is mounted")
+    }
+
+    #[test]
+    fn pane_picker_stays_in_the_active_workspace_and_preserves_strip_order() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let mut cards = (1..=20)
+            .map(|index| {
+                let mut card = super::super::tests::terminal_card_state();
+                card.title = format!("Pane {index}");
+                card
+            })
+            .collect::<Vec<_>>();
+        let hidden = cards.pop().unwrap();
+        let chosen = cards[13].id;
+        Arc::make_mut(&mut app.durable).cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(900.0);
+        Arc::make_mut(&mut app.durable).cards.push(hidden.clone());
+        drop(app.update_palette(Action::OpenPanes));
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 19);
+        assert!(!entries.iter().any(
+            |entry| matches!(entry.2, Message::Palette(Action::FocusPane(id)) if id == hidden.id)
+        ));
+        assert_eq!(
+            entries
+                .iter()
+                .filter_map(|entry| match entry.2 {
+                    Message::Palette(Action::FocusPane(id)) => Some(id),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            app.workspace.order().collect::<Vec<_>>()
+        );
+        drop(app.update_palette(Action::Query("pane14".into())));
+        assert_eq!(app.palette_entries().len(), 1);
+        drop(app.update_palette(Action::Submit));
+        assert_eq!(app.workspace.focused(), Some(chosen));
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("@Pane20".into())));
+        assert_eq!(
+            app.palette_entries().len(),
+            1,
+            "the global palette still covers inactive panes"
+        );
+    }
+
+    #[test]
+    fn scorer_orders_exact_prefix_boundary_substring_and_subsequence() {
+        let labels = [
+            "refactor",
+            "refactor ui · alpha",
+            "alpha refactor",
+            "arefactor",
+            "Investigate task in alpha-wt-refactor-ui",
+            "r e f a c t o r",
+        ];
+        let scores: Vec<_> = labels
+            .iter()
+            .map(|label| match_score(label, "refactor").unwrap())
+            .collect();
+        assert!(scores[0] < scores[1]);
+        assert!(scores[1] < scores[2]);
+        assert!(scores[2] < scores[3]);
+        assert!(scores[3] < scores[5]);
+        assert!(scores[1] < scores[4]);
+        assert_eq!(match_score("migration", "refactor"), None);
+        assert!(match_score("Réfactor UI", "réfactor").is_some());
+    }
+
+    #[test]
+    fn refactor_workspace_ranks_before_the_loose_channel_match() {
+        let mut app = settings_focus_fixture();
+        let project_id = ProjectId::new();
+        let worktree_id = crate::model::WorktreeId::new();
+        let mut project = SidebarProject::new(
+            project_id,
+            crate::repository::RepositoryId::new(),
+            "alpha".into(),
+            "/alpha".into(),
+            vec![sidebar::SidebarWorktree::new(
+                worktree_id,
+                "/alpha/refactor ui".into(),
+                None,
+                false,
+                false,
+                None,
+                None,
+                None,
+            )],
+            Vec::new(),
+        );
+        project.channels.push(sidebar::SidebarChannel::new(
+            crate::model::ChannelId::new(),
+            "Investigate task in alpha-wt-refactor-ui".into(),
+            false,
+            None,
+            false,
+            0,
+            false,
+            1,
+        ));
+        app.sidebar_model.projects = vec![project];
+        drop(app.update_palette(Action::Open));
+        drop(app.update_palette(Action::Query("refactor".into())));
+        let entries = app.palette_entries();
+        assert!(
+            matches!(entries[0].2, Message::Sidebar(SidebarAction::OpenWorktree { worktree_id: id, .. }) if id == worktree_id)
+        );
+    }
+
+    #[test]
+    fn empty_query_lists_recent_commands_in_mru_order_and_prefixes_filter() {
+        let mut app = settings_focus_fixture();
+        app.settings.palette_recents = vec![
+            entry_key(&Message::RunCommand(Command::OpenSettings)),
+            entry_key(&Message::RunCommand(Command::NewTerminal)),
+        ];
+        let _ = app.update_palette(Action::Open);
+        let entries = app.palette_entries();
+        assert!(matches!(
+            entries[0].2,
+            Message::RunCommand(Command::OpenSettings)
+        ));
+        assert!(matches!(
+            entries[1].2,
+            Message::RunCommand(Command::NewTerminal)
+        ));
+        for prefix in ['>', '@', '#'] {
+            app.palette.query = Some(prefix.to_string());
+            assert!(
+                app.palette_entries()
+                    .iter()
+                    .all(|entry| entry_category(&entry.2) == prefix)
+            );
+        }
+    }
+
+    #[test]
+    fn selecting_a_command_updates_bounded_mru_without_duplicate_entries() {
+        let mut app = settings_focus_fixture();
+        app.settings.palette_recents = (0..30).map(|index| format!("retired:{index}")).collect();
+        drop(app.run_palette_command(Message::RunCommand(Command::OpenSettings)));
+        let selected = entry_key(&Message::RunCommand(Command::OpenSettings));
+        assert_eq!(app.settings.palette_recents.first(), Some(&selected));
+        assert_eq!(app.settings.palette_recents.len(), 24);
+        drop(app.run_palette_command(Message::RunCommand(Command::OpenSettings)));
+        assert_eq!(app.settings.palette_recents.len(), 24);
+        assert_eq!(app.settings.palette_recents.iter().filter(|key| **key == selected).count(), 1);
+        drop(app.update_palette(Action::Open));
+        assert!(matches!(app.palette_entries()[0].2, Message::RunCommand(Command::OpenSettings)));
+    }
+
+    #[test]
+    fn panes_in_an_inactive_workspace_can_be_found_and_focused() {
+        let mut app = settings_focus_fixture();
+        let original = app.workspace.focused().unwrap();
+        let mut other = app.card_state(original).unwrap().clone();
+        other.id = CardId::new();
+        other.title = "Migration agent".into();
+        let path = PathBuf::from("/palette-inactive-worktree");
+        app.worktree_owners.insert(other.id, path.clone());
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(other.id, path.clone());
+        Arc::make_mut(&mut app.durable).cards.push(other.clone());
+        let _ = app.update_palette(Action::Open);
+        let _ = app.update_palette(Action::Query("@migration".into()));
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].0.contains("palette-inactive-worktree"));
+        assert!(matches!(entries[0].2, Message::Palette(Action::FocusPane(id)) if id == other.id));
+        let _ = app.update_palette(Action::FocusPane(other.id));
+        assert_eq!(app.active_workspace, Some(path));
+        assert_eq!(app.workspace.focused(), Some(other.id));
     }
 
     #[test]
@@ -902,7 +1797,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_no_op_command_restores_retained_settings_input() {
+    fn unavailable_commands_are_hidden_and_dismissal_restores_settings_input() {
         use iced::advanced::widget::Tree;
 
         let mut app = settings_focus_fixture();
@@ -911,7 +1806,7 @@ mod tests {
         let mut tree = Tree::new(focus_fixture_view(&app).as_widget());
         let open = app.update_palette(Action::Open);
         let _ = app.update_palette(Action::Query("move pane left".into()));
-        assert_eq!(app.palette_entries().len(), 1);
+        assert!(app.palette_entries().is_empty());
         let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
         let submit = app.update_palette(Action::Submit);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), before);
@@ -933,7 +1828,10 @@ mod tests {
         let mut tree = Tree::new(focus_fixture_view(&app).as_widget());
         let open = app.update_palette(Action::Open);
         let _ = app.update_palette(Action::Query("open settings".into()));
-        assert_eq!(app.palette_entries().len(), 1);
+        assert!(matches!(
+            app.palette_entries()[0].2,
+            Message::RunCommand(Command::OpenSettings)
+        ));
         let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
         let submit = app.update_palette(Action::Submit);
         let destination = app.workspace.focused().unwrap();

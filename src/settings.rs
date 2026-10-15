@@ -277,6 +277,39 @@ pub struct KeyboardShortcuts {
     pub focus_pane_9: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
+    pub new_browser: Vec<String>,
+    pub open_folder: Vec<String>,
+    pub new_worktree: Vec<String>,
+    pub close_other_panes: Vec<String>,
+    pub close_panes_to_right: Vec<String>,
+    pub copy_path: Vec<String>,
+    pub reveal_in_projects: Vec<String>,
+    pub fork_conversation: Vec<String>,
+    pub focus_sidebar_tree: Vec<String>,
+    pub restart_daemon: Vec<String>,
+    pub toggle_theme: Vec<String>,
+    pub resume_conversation: Vec<String>,
+    pub switch_pane: Vec<String>,
+    pub review_conversation_changes: Vec<String>,
+    pub focus_project_1: Vec<String>,
+    pub focus_project_2: Vec<String>,
+    pub focus_project_3: Vec<String>,
+    pub focus_project_4: Vec<String>,
+    pub focus_project_5: Vec<String>,
+    pub focus_project_6: Vec<String>,
+    pub focus_project_7: Vec<String>,
+    pub focus_project_8: Vec<String>,
+    pub focus_project_9: Vec<String>,
+    pub settings_general: Vec<String>,
+    pub settings_appearance: Vec<String>,
+    pub settings_terminal: Vec<String>,
+    pub settings_links: Vec<String>,
+    pub settings_keyboard: Vec<String>,
+    pub settings_native_chat: Vec<String>,
+    pub settings_editor: Vec<String>,
+    pub settings_accounts: Vec<String>,
+    pub settings_notifications: Vec<String>,
+    pub settings_about: Vec<String>,
 }
 
 impl Default for KeyboardShortcuts {
@@ -320,6 +353,39 @@ impl Default for KeyboardShortcuts {
             focus_pane_9: vec!["Alt+9".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
+            new_browser: Vec::new(),
+            open_folder: Vec::new(),
+            new_worktree: Vec::new(),
+            close_other_panes: Vec::new(),
+            close_panes_to_right: Vec::new(),
+            copy_path: Vec::new(),
+            reveal_in_projects: Vec::new(),
+            fork_conversation: Vec::new(),
+            focus_sidebar_tree: Vec::new(),
+            restart_daemon: Vec::new(),
+            toggle_theme: Vec::new(),
+            resume_conversation: Vec::new(),
+            switch_pane: Vec::new(),
+            review_conversation_changes: Vec::new(),
+            focus_project_1: Vec::new(),
+            focus_project_2: Vec::new(),
+            focus_project_3: Vec::new(),
+            focus_project_4: Vec::new(),
+            focus_project_5: Vec::new(),
+            focus_project_6: Vec::new(),
+            focus_project_7: Vec::new(),
+            focus_project_8: Vec::new(),
+            focus_project_9: Vec::new(),
+            settings_general: Vec::new(),
+            settings_appearance: Vec::new(),
+            settings_terminal: Vec::new(),
+            settings_links: Vec::new(),
+            settings_keyboard: Vec::new(),
+            settings_native_chat: Vec::new(),
+            settings_editor: Vec::new(),
+            settings_accounts: Vec::new(),
+            settings_notifications: Vec::new(),
+            settings_about: Vec::new(),
         }
     }
 }
@@ -329,7 +395,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 38] {
+    pub fn actions(&self) -> [&Vec<String>; 71] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -369,6 +435,39 @@ impl KeyboardShortcuts {
             &self.focus_pane_9,
             &self.toggle_projects,
             &self.rename_pane,
+            &self.new_browser,
+            &self.open_folder,
+            &self.new_worktree,
+            &self.close_other_panes,
+            &self.close_panes_to_right,
+            &self.copy_path,
+            &self.reveal_in_projects,
+            &self.fork_conversation,
+            &self.focus_sidebar_tree,
+            &self.restart_daemon,
+            &self.toggle_theme,
+            &self.resume_conversation,
+            &self.switch_pane,
+            &self.review_conversation_changes,
+            &self.focus_project_1,
+            &self.focus_project_2,
+            &self.focus_project_3,
+            &self.focus_project_4,
+            &self.focus_project_5,
+            &self.focus_project_6,
+            &self.focus_project_7,
+            &self.focus_project_8,
+            &self.focus_project_9,
+            &self.settings_general,
+            &self.settings_appearance,
+            &self.settings_terminal,
+            &self.settings_links,
+            &self.settings_keyboard,
+            &self.settings_native_chat,
+            &self.settings_editor,
+            &self.settings_accounts,
+            &self.settings_notifications,
+            &self.settings_about,
         ]
     }
 
@@ -414,7 +513,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 38] = [
+const SHORTCUT_ACTIONS: [&str; 71] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -453,6 +552,39 @@ const SHORTCUT_ACTIONS: [&str; 38] = [
     "focus_pane_9",
     "toggle_projects",
     "rename_pane",
+    "new_browser",
+    "open_folder",
+    "new_worktree",
+    "close_other_panes",
+    "close_panes_to_right",
+    "copy_path",
+    "reveal_in_projects",
+    "fork_conversation",
+    "focus_sidebar_tree",
+    "restart_daemon",
+    "toggle_theme",
+    "resume_conversation",
+    "switch_pane",
+    "review_conversation_changes",
+    "focus_project_1",
+    "focus_project_2",
+    "focus_project_3",
+    "focus_project_4",
+    "focus_project_5",
+    "focus_project_6",
+    "focus_project_7",
+    "focus_project_8",
+    "focus_project_9",
+    "settings_general",
+    "settings_appearance",
+    "settings_terminal",
+    "settings_links",
+    "settings_keyboard",
+    "settings_native_chat",
+    "settings_editor",
+    "settings_accounts",
+    "settings_notifications",
+    "settings_about",
 ];
 
 /// An action a shortcut table cannot bind.
@@ -904,6 +1036,9 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// Palette entries selected most recently, newest first.
+    #[serde(default)]
+    pub palette_recents: Vec<String>,
     /// External language servers, in declaration order. The first server whose
     /// language claims a file extension handles that file. An empty list
     /// disables LSP entirely.
@@ -924,6 +1059,7 @@ pub struct AppSettings {
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            palette_recents: Vec::new(),
             notifications: crate::notifications::Preferences::default(),
             schema_version: SETTINGS_SCHEMA_VERSION,
             max_hot_cards: 6,
@@ -1366,7 +1502,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 66] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1400,6 +1536,39 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 33] = [
     "review_next_unviewed",
     "review_next_change",
     "review_previous_change",
+    "new_browser",
+    "open_folder",
+    "new_worktree",
+    "close_other_panes",
+    "close_panes_to_right",
+    "copy_path",
+    "reveal_in_projects",
+    "fork_conversation",
+    "focus_sidebar_tree",
+    "restart_daemon",
+    "toggle_theme",
+    "resume_conversation",
+    "switch_pane",
+    "review_conversation_changes",
+    "focus_project_1",
+    "focus_project_2",
+    "focus_project_3",
+    "focus_project_4",
+    "focus_project_5",
+    "focus_project_6",
+    "focus_project_7",
+    "focus_project_8",
+    "focus_project_9",
+    "settings_general",
+    "settings_appearance",
+    "settings_terminal",
+    "settings_links",
+    "settings_keyboard",
+    "settings_native_chat",
+    "settings_editor",
+    "settings_accounts",
+    "settings_notifications",
+    "settings_about",
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -2914,6 +3083,18 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn palette_recents_default_for_old_settings_and_roundtrip_in_mru_order() {
+        let mut settings = AppSettings::default();
+        let mut old: toml::Table = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        old.remove("palette_recents");
+        let restored: AppSettings = toml::from_str(&toml::to_string(&old).unwrap()).unwrap();
+        assert!(restored.palette_recents.is_empty());
+        settings.palette_recents = vec!["command:new_worktree".into(), "pane:fixture".into()];
+        let restored: AppSettings = toml::from_str(&toml::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(restored.palette_recents, settings.palette_recents);
     }
 
     #[test]

@@ -127,6 +127,15 @@ determine which models and permission modes are available.
 - **Ctrl+Tab** previews recently used panes. Release **Ctrl** to focus the
   highlighted pane, or press **Escape** to cancel.
 - Use the command palette to search commands, panes, channels and workspaces.
+  Prefix the query with `>` for commands, `@` for panes, or `#` for workspaces.
+  Exact and prefix matches lead looser matches; matching characters are
+  highlighted. With an empty query, recent actions appear first and survive
+  restarts. Panes include inactive workspaces, show their activity status, and
+  switch to their workspace when selected.
+- Pane actions such as **Copy path**, **Close other panes**, **Close panes to
+  the right**, **Fork conversation**, and **Reveal in Projects** are available
+  in the palette and **Settings → Keyboard**. Their context menus use the same
+  labels and configured shortcuts. Actions appear only where they apply.
   Keyboard settings let you record a chord, remove it, or reset a command;
   conflicts name the command that already uses the chord.
 - **Alt+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**

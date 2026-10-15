@@ -49,6 +49,40 @@ pub enum WorkspaceViewportEvent {
 pub enum GlobalShortcut {
     ToggleProjects,
     RenamePane,
+    NewBrowser,
+    OpenFolder,
+    NewWorktree,
+    CloseOtherPanes,
+    ClosePanesToRight,
+    CopyPath,
+    RevealInProjects,
+    ForkConversation,
+    FocusSidebarTree,
+    RestartDaemon,
+    ToggleTheme,
+    ResumeConversation,
+    SwitchPane,
+    ReviewConversationChanges,
+    FocusProject1,
+    FocusProject2,
+    FocusProject3,
+    FocusProject4,
+    FocusProject5,
+    FocusProject6,
+    FocusProject7,
+    FocusProject8,
+    FocusProject9,
+    SettingsGeneral,
+    SettingsAppearance,
+    SettingsTerminal,
+    SettingsLinks,
+    SettingsKeyboard,
+    SettingsNativeChat,
+    SettingsEditor,
+    SettingsAccounts,
+    SettingsNotifications,
+    SettingsAbout,
+
     CommandPalette,
     NewThread,
     ChatAccount,
@@ -87,6 +121,84 @@ pub enum GlobalShortcut {
     ReviewNextUnviewed,
     ReviewNextChange,
     ReviewPreviousChange,
+}
+
+impl GlobalShortcut {
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::ToggleProjects => "toggle_projects",
+            Self::RenamePane => "rename_pane",
+            Self::NewBrowser => "new_browser",
+            Self::OpenFolder => "open_folder",
+            Self::NewWorktree => "new_worktree",
+            Self::CloseOtherPanes => "close_other_panes",
+            Self::ClosePanesToRight => "close_panes_to_right",
+            Self::CopyPath => "copy_path",
+            Self::RevealInProjects => "reveal_in_projects",
+            Self::ForkConversation => "fork_conversation",
+            Self::FocusSidebarTree => "focus_sidebar_tree",
+            Self::RestartDaemon => "restart_daemon",
+            Self::ToggleTheme => "toggle_theme",
+            Self::ResumeConversation => "resume_conversation",
+            Self::SwitchPane => "switch_pane",
+            Self::ReviewConversationChanges => "review_conversation_changes",
+            Self::FocusProject1 => "focus_project_1",
+            Self::FocusProject2 => "focus_project_2",
+            Self::FocusProject3 => "focus_project_3",
+            Self::FocusProject4 => "focus_project_4",
+            Self::FocusProject5 => "focus_project_5",
+            Self::FocusProject6 => "focus_project_6",
+            Self::FocusProject7 => "focus_project_7",
+            Self::FocusProject8 => "focus_project_8",
+            Self::FocusProject9 => "focus_project_9",
+            Self::SettingsGeneral => "settings_general",
+            Self::SettingsAppearance => "settings_appearance",
+            Self::SettingsTerminal => "settings_terminal",
+            Self::SettingsLinks => "settings_links",
+            Self::SettingsKeyboard => "settings_keyboard",
+            Self::SettingsNativeChat => "settings_native_chat",
+            Self::SettingsEditor => "settings_editor",
+            Self::SettingsAccounts => "settings_accounts",
+            Self::SettingsNotifications => "settings_notifications",
+            Self::SettingsAbout => "settings_about",
+            Self::CommandPalette => "command_palette",
+            Self::NewThread => "new_native_thread",
+            Self::ChatPermissions => "chat_permissions",
+            Self::ChatModel => "chat_model",
+            Self::ChatAccount => "chat_account",
+            Self::ToggleInspector => "toggle_inspector",
+            Self::OpenSettings => "open_settings",
+            Self::MovePaneLeft => "move_pane_left",
+            Self::MovePaneRight => "move_pane_right",
+            Self::ReopenPane => "reopen_pane",
+            Self::FocusPane1 => "focus_pane_1",
+            Self::FocusPane2 => "focus_pane_2",
+            Self::FocusPane3 => "focus_pane_3",
+            Self::FocusPane4 => "focus_pane_4",
+            Self::FocusPane5 => "focus_pane_5",
+            Self::FocusPane6 => "focus_pane_6",
+            Self::FocusPane7 => "focus_pane_7",
+            Self::FocusPane8 => "focus_pane_8",
+            Self::FocusPane9 => "focus_pane_9",
+            Self::NewTerminal => "new_terminal",
+            Self::NewChannel => "new_channel",
+            Self::ClonePane => "clone_pane",
+            Self::CloseFocusedCard => "close_focused_column",
+            Self::FocusProjectSearch => "search_projects",
+            Self::FindInPane => "find_in_pane",
+            Self::FocusAdjacent(FocusDirection::Left) => "previous_column",
+            Self::FocusAdjacent(FocusDirection::Right) => "next_column",
+            Self::CyclePaneWidth => "cycle_pane_width",
+            Self::CycleWorkspace(FocusDirection::Left) => "previous_workspace",
+            Self::CycleWorkspace(FocusDirection::Right) => "next_workspace",
+            Self::ReviewToggleViewed => "review_toggle_viewed",
+            Self::ReviewNextFile => "review_next_file",
+            Self::ReviewPreviousFile => "review_previous_file",
+            Self::ReviewNextUnviewed => "review_next_unviewed",
+            Self::ReviewNextChange => "review_next_change",
+            Self::ReviewPreviousChange => "review_previous_change",
+        }
+    }
 }
 
 /// Where a shortcut applies, which decides when its chord is withheld from
@@ -145,6 +257,132 @@ pub struct ShortcutDescriptor {
     pub scope: ShortcutScope,
 }
 
+/// Application context reduced to capabilities so registry availability is
+/// deterministic and can be tested without launching native panes.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CommandContext {
+    pub focused: FocusedPane,
+    pub pane_index: Option<usize>,
+    pub pane_count: usize,
+    pub project_count: usize,
+    pub sidebar_has_rows: bool,
+    pub active_git_project: bool,
+    pub pane_has_path: bool,
+    pub pane_revealable: bool,
+    pub pane_cloneable: bool,
+    pub can_fork: bool,
+    pub chat_account: bool,
+    pub chat_model: bool,
+    pub chat_permissions: bool,
+    pub can_switch: bool,
+    pub can_review: bool,
+    pub is_pull_request: bool,
+    pub can_find: bool,
+    pub daemon_can_restart: bool,
+    pub can_reopen: bool,
+}
+
+impl ShortcutDescriptor {
+    pub const fn id(self) -> &'static str {
+        self.action.id()
+    }
+
+    pub fn category(self) -> &'static str {
+        let id = self.id();
+        if id.starts_with("settings_")
+            || matches!(
+                self.action,
+                GlobalShortcut::OpenSettings
+                    | GlobalShortcut::ToggleTheme
+                    | GlobalShortcut::RestartDaemon
+            )
+        {
+            "Application"
+        } else if id.starts_with("focus_project_")
+            || matches!(
+                self.action,
+                GlobalShortcut::OpenFolder
+                    | GlobalShortcut::NewWorktree
+                    | GlobalShortcut::FocusSidebarTree
+                    | GlobalShortcut::FocusProjectSearch
+                    | GlobalShortcut::ToggleProjects
+                    | GlobalShortcut::CycleWorkspace(_)
+            )
+        {
+            "Projects"
+        } else if self.scope == ShortcutScope::Chat
+            || self.action == GlobalShortcut::ResumeConversation
+        {
+            "Conversations"
+        } else if self.scope == ShortcutScope::Review {
+            "Review"
+        } else {
+            "Panes"
+        }
+    }
+
+    pub fn default_chords(self) -> Vec<String> {
+        shortcut_keys(self.action, &KeyboardShortcuts::default()).to_vec()
+    }
+
+    pub fn available(self, context: &CommandContext) -> bool {
+        // OutsideTerminal controls chord reservation; explicit palette
+        // invocation remains available when the terminal has its own finder.
+        if matches!(self.scope, ShortcutScope::Chat | ShortcutScope::Review)
+            && !self.scope.applies_to(context.focused)
+        {
+            return false;
+        }
+        let pane = context.pane_index.is_some();
+        match self.action {
+            GlobalShortcut::NewWorktree => context.active_git_project,
+            GlobalShortcut::ReviewToggleViewed | GlobalShortcut::ReviewNextUnviewed => context.is_pull_request,
+            GlobalShortcut::ChatAccount => context.chat_account,
+            GlobalShortcut::ChatModel => context.chat_model,
+            GlobalShortcut::ChatPermissions => context.chat_permissions,
+            GlobalShortcut::FindInPane => context.can_find,
+            GlobalShortcut::CloseOtherPanes => pane && context.pane_count > 1,
+            GlobalShortcut::ClosePanesToRight | GlobalShortcut::MovePaneRight => context
+                .pane_index
+                .is_some_and(|index| index + 1 < context.pane_count),
+            GlobalShortcut::MovePaneLeft => context.pane_index.is_some_and(|index| index > 0),
+            GlobalShortcut::CopyPath => context.pane_has_path,
+            GlobalShortcut::RevealInProjects => context.pane_revealable,
+            GlobalShortcut::ClonePane => context.pane_cloneable,
+            GlobalShortcut::RenamePane
+            | GlobalShortcut::CloseFocusedCard
+            | GlobalShortcut::CyclePaneWidth => pane,
+            GlobalShortcut::ReopenPane => context.can_reopen,
+            GlobalShortcut::FocusAdjacent(_) => context.pane_count > 1,
+            GlobalShortcut::ForkConversation => context.can_fork,
+            GlobalShortcut::ReviewConversationChanges => context.can_review,
+            GlobalShortcut::SwitchPane => context.can_switch,
+            GlobalShortcut::FocusSidebarTree => context.sidebar_has_rows,
+            GlobalShortcut::FocusProjectSearch => context.project_count > 0,
+            GlobalShortcut::RestartDaemon => context.daemon_can_restart,
+            GlobalShortcut::FocusProject1 => context.project_count > 0,
+            GlobalShortcut::FocusProject2 => context.project_count > 1,
+            GlobalShortcut::FocusProject3 => context.project_count > 2,
+            GlobalShortcut::FocusProject4 => context.project_count > 3,
+            GlobalShortcut::FocusProject5 => context.project_count > 4,
+            GlobalShortcut::FocusProject6 => context.project_count > 5,
+            GlobalShortcut::FocusProject7 => context.project_count > 6,
+            GlobalShortcut::FocusProject8 => context.project_count > 7,
+            GlobalShortcut::FocusProject9 => context.project_count > 8,
+            GlobalShortcut::FocusPane1 => context.pane_count > 0,
+            GlobalShortcut::FocusPane2 => context.pane_count > 1,
+            GlobalShortcut::FocusPane3 => context.pane_count > 2,
+            GlobalShortcut::FocusPane4 => context.pane_count > 3,
+            GlobalShortcut::FocusPane5 => context.pane_count > 4,
+            GlobalShortcut::FocusPane6 => context.pane_count > 5,
+            GlobalShortcut::FocusPane7 => context.pane_count > 6,
+            GlobalShortcut::FocusPane8 => context.pane_count > 7,
+            GlobalShortcut::FocusPane9 => context.pane_count > 8,
+            _ => true,
+        }
+    }
+}
+
 /// How long the pointer must rest in a pane it moved into before hover
 /// activation gives that pane focus. Long enough that sweeping across the
 /// strip - toward the inspector, say - activates nothing on the way; short
@@ -179,7 +417,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         action: GlobalShortcut::RenamePane,
-        label: "Rename focused pane",
+        label: "Rename pane",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
@@ -293,13 +531,13 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     },
     ShortcutDescriptor {
         action: GlobalShortcut::ClonePane,
-        label: "Clone focused pane",
+        label: "Clone pane",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CloseFocusedCard,
-        label: "Close focused pane",
+        label: "Close pane",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
@@ -381,6 +619,204 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: true,
         scope: ShortcutScope::Review,
     },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NewBrowser,
+        label: "New browser pane",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::OpenFolder,
+        label: "Open folder / add project",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::NewWorktree,
+        label: "New worktree",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CloseOtherPanes,
+        label: "Close other panes",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ClosePanesToRight,
+        label: "Close panes to the right",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CopyPath,
+        label: "Copy path",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RevealInProjects,
+        label: "Reveal in Projects",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ForkConversation,
+        label: "Fork conversation",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusSidebarTree,
+        label: "Focus Projects tree",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::RestartDaemon,
+        label: "Restart daemon",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ToggleTheme,
+        label: "Toggle theme",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ResumeConversation,
+        label: "Resume conversation",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SwitchPane,
+        label: "Switch conversation view",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::ReviewConversationChanges,
+        label: "Review conversation changes",
+        repeatable: false,
+        scope: ShortcutScope::Chat,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject1,
+        label: "Go to project 1",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject2,
+        label: "Go to project 2",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject3,
+        label: "Go to project 3",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject4,
+        label: "Go to project 4",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject5,
+        label: "Go to project 5",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject6,
+        label: "Go to project 6",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject7,
+        label: "Go to project 7",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject8,
+        label: "Go to project 8",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusProject9,
+        label: "Go to project 9",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsGeneral,
+        label: "Open settings: General",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsAppearance,
+        label: "Open settings: Appearance",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsTerminal,
+        label: "Open settings: Terminal",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsLinks,
+        label: "Open settings: Links",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsKeyboard,
+        label: "Open settings: Keyboard",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsNativeChat,
+        label: "Open settings: Native chat",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsEditor,
+        label: "Open settings: Editor",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsAccounts,
+        label: "Open settings: Accounts",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsNotifications,
+        label: "Open settings: Notifications",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SettingsAbout,
+        label: "Open settings: About",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
 ];
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
@@ -395,6 +831,40 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     match action {
         GlobalShortcut::ToggleProjects => &shortcuts.toggle_projects,
         GlobalShortcut::RenamePane => &shortcuts.rename_pane,
+        GlobalShortcut::NewBrowser => &shortcuts.new_browser,
+        GlobalShortcut::OpenFolder => &shortcuts.open_folder,
+        GlobalShortcut::NewWorktree => &shortcuts.new_worktree,
+        GlobalShortcut::CloseOtherPanes => &shortcuts.close_other_panes,
+        GlobalShortcut::ClosePanesToRight => &shortcuts.close_panes_to_right,
+        GlobalShortcut::CopyPath => &shortcuts.copy_path,
+        GlobalShortcut::RevealInProjects => &shortcuts.reveal_in_projects,
+        GlobalShortcut::ForkConversation => &shortcuts.fork_conversation,
+        GlobalShortcut::FocusSidebarTree => &shortcuts.focus_sidebar_tree,
+        GlobalShortcut::RestartDaemon => &shortcuts.restart_daemon,
+        GlobalShortcut::ToggleTheme => &shortcuts.toggle_theme,
+        GlobalShortcut::ResumeConversation => &shortcuts.resume_conversation,
+        GlobalShortcut::SwitchPane => &shortcuts.switch_pane,
+        GlobalShortcut::ReviewConversationChanges => &shortcuts.review_conversation_changes,
+        GlobalShortcut::FocusProject1 => &shortcuts.focus_project_1,
+        GlobalShortcut::FocusProject2 => &shortcuts.focus_project_2,
+        GlobalShortcut::FocusProject3 => &shortcuts.focus_project_3,
+        GlobalShortcut::FocusProject4 => &shortcuts.focus_project_4,
+        GlobalShortcut::FocusProject5 => &shortcuts.focus_project_5,
+        GlobalShortcut::FocusProject6 => &shortcuts.focus_project_6,
+        GlobalShortcut::FocusProject7 => &shortcuts.focus_project_7,
+        GlobalShortcut::FocusProject8 => &shortcuts.focus_project_8,
+        GlobalShortcut::FocusProject9 => &shortcuts.focus_project_9,
+        GlobalShortcut::SettingsGeneral => &shortcuts.settings_general,
+        GlobalShortcut::SettingsAppearance => &shortcuts.settings_appearance,
+        GlobalShortcut::SettingsTerminal => &shortcuts.settings_terminal,
+        GlobalShortcut::SettingsLinks => &shortcuts.settings_links,
+        GlobalShortcut::SettingsKeyboard => &shortcuts.settings_keyboard,
+        GlobalShortcut::SettingsNativeChat => &shortcuts.settings_native_chat,
+        GlobalShortcut::SettingsEditor => &shortcuts.settings_editor,
+        GlobalShortcut::SettingsAccounts => &shortcuts.settings_accounts,
+        GlobalShortcut::SettingsNotifications => &shortcuts.settings_notifications,
+        GlobalShortcut::SettingsAbout => &shortcuts.settings_about,
+
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
         GlobalShortcut::ChatPermissions => &shortcuts.chat_permissions,
@@ -434,13 +904,29 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
     }
 }
 
+/// The same binding that dispatch reserves, expressed for native menu hints.
+/// Menus display the first configured chord; the palette/settings list all.
+pub fn menu_shortcut(
+    action: GlobalShortcut,
+    shortcuts: &KeyboardShortcuts,
+) -> Option<cosmic::widget::menu::KeyBind> {
+    menu_keybind(shortcut_keys(action, shortcuts).first()?)
+}
+
 /// Parse one configured chord for a native menu, including named keys.
 pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
     use cosmic::widget::menu::{KeyBind, key_bind::Modifier};
     use keyboard::{Key, key::Named};
     let binding = crate::settings::parse_shortcut(raw).ok()?;
-    let modifiers = [(binding.control, Modifier::Ctrl), (binding.alt, Modifier::Alt), (binding.logo, Modifier::Super), (binding.shift, Modifier::Shift)]
-        .into_iter().filter_map(|(held, modifier)| held.then_some(modifier)).collect();
+    let modifiers = [
+        (binding.control, Modifier::Ctrl),
+        (binding.alt, Modifier::Alt),
+        (binding.logo, Modifier::Super),
+        (binding.shift, Modifier::Shift),
+    ]
+    .into_iter()
+    .filter_map(|(held, modifier)| held.then_some(modifier))
+    .collect();
     let key = match binding.key {
         ShortcutKey::Character(ch) => Key::Character(ch.to_string().into()),
         ShortcutKey::ArrowLeft => Key::Named(Named::ArrowLeft),
@@ -451,9 +937,18 @@ pub fn menu_keybind(raw: &str) -> Option<cosmic::widget::menu::KeyBind> {
         ShortcutKey::PageUp => Key::Named(Named::PageUp),
         ShortcutKey::PageDown => Key::Named(Named::PageDown),
         ShortcutKey::Function(number) => Key::Named(match number {
-            1 => Named::F1, 2 => Named::F2, 3 => Named::F3, 4 => Named::F4,
-            5 => Named::F5, 6 => Named::F6, 7 => Named::F7, 8 => Named::F8,
-            9 => Named::F9, 10 => Named::F10, 11 => Named::F11, 12 => Named::F12,
+            1 => Named::F1,
+            2 => Named::F2,
+            3 => Named::F3,
+            4 => Named::F4,
+            5 => Named::F5,
+            6 => Named::F6,
+            7 => Named::F7,
+            8 => Named::F8,
+            9 => Named::F9,
+            10 => Named::F10,
+            11 => Named::F11,
+            12 => Named::F12,
             _ => return None,
         }),
     };
@@ -2146,6 +2641,96 @@ impl<'a, Message: 'a> From<WorkspaceSurface<'a, Message>> for Element<'a, Messag
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn palette_command_registry_ids_are_unique_and_context_capabilities_gate_actions() {
+        use super::*;
+        let mut ids = std::collections::HashSet::new();
+        for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
+            assert!(
+                ids.insert(descriptor.id()),
+                "duplicate command id {}",
+                descriptor.id()
+            );
+            assert!(!descriptor.category().is_empty());
+            assert_eq!(
+                descriptor.default_chords(),
+                shortcut_keys(descriptor.action, &KeyboardShortcuts::default())
+            );
+        }
+        let context = CommandContext::default();
+        for command in [
+            GlobalShortcut::NewWorktree,
+            GlobalShortcut::CloseOtherPanes,
+            GlobalShortcut::ClosePanesToRight,
+            GlobalShortcut::CopyPath,
+            GlobalShortcut::ForkConversation,
+            GlobalShortcut::FocusSidebarTree,
+            GlobalShortcut::FocusProject1,
+            GlobalShortcut::RestartDaemon,
+        ] {
+            assert!(
+                !shortcut_descriptor(command).available(&context),
+                "{command:?}"
+            );
+        }
+        let context = CommandContext {
+            focused: FocusedPane::Chat,
+            pane_index: Some(0),
+            pane_count: 2,
+            project_count: 1,
+            sidebar_has_rows: true,
+            active_git_project: true,
+            pane_has_path: true,
+            can_fork: true,
+            daemon_can_restart: true,
+            ..CommandContext::default()
+        };
+        for command in [
+            GlobalShortcut::NewWorktree,
+            GlobalShortcut::CloseOtherPanes,
+            GlobalShortcut::ClosePanesToRight,
+            GlobalShortcut::CopyPath,
+            GlobalShortcut::ForkConversation,
+            GlobalShortcut::FocusSidebarTree,
+            GlobalShortcut::FocusProject1,
+            GlobalShortcut::RestartDaemon,
+        ] {
+            assert!(
+                shortcut_descriptor(command).available(&context),
+                "{command:?}"
+            );
+        }
+        assert!(!shortcut_descriptor(GlobalShortcut::FocusProject2).available(&context));
+        assert!(
+            !shortcut_descriptor(GlobalShortcut::ClosePanesToRight).available(&CommandContext {
+                pane_index: Some(1),
+                ..context
+            })
+        );
+        assert!(
+            !shortcut_descriptor(GlobalShortcut::ForkConversation).available(&CommandContext {
+                focused: FocusedPane::Terminal,
+                ..context
+            })
+        );
+    }
+
+    #[test]
+    fn palette_menu_hint_tracks_the_current_configured_chord() {
+        use super::*;
+        let mut settings = KeyboardShortcuts::default();
+        assert!(menu_shortcut(GlobalShortcut::CopyPath, &settings).is_none());
+        settings.copy_path = vec!["Ctrl+Alt+Shift+K".into()];
+        let hint = menu_shortcut(GlobalShortcut::CopyPath, &settings).unwrap();
+        assert!(hint.matches(
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT,
+            &keyboard::Key::Character("k".into()),
+            None
+        ));
+        settings.copy_path.clear();
+        assert!(menu_shortcut(GlobalShortcut::CopyPath, &settings).is_none());
+    }
+
     use super::*;
     use crate::settings::parse_chords;
     use crate::workspace::{CardWidth, WorkspaceCard};

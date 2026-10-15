@@ -175,6 +175,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `palette_recents` | array of strings | `[]` | Recent command and navigation IDs, most recent first. Written by the palette and bounded to 24 entries |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -184,6 +185,26 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `notifications.review_requests` | boolean | `true` | Alerts for incoming GitHub review requests |
 
 ## Keyboard shortcuts
+
+The command palette, Keyboard settings, and pane context menus share the same
+command definitions. Additional commands are unbound by default: `new_browser`,
+`open_folder`, `new_worktree`, `close_other_panes`, `close_panes_to_right`,
+`copy_path`, `reveal_in_projects`, `fork_conversation`, `focus_sidebar_tree`,
+`restart_daemon`, `toggle_theme`, `resume_conversation`, `switch_pane`, and
+`review_conversation_changes`. Set their chord lists under `[keyboard_shortcuts]`,
+or bind them in **Settings → Keyboard**. For example:
+
+```toml
+copy_path = ["Ctrl+Alt+Shift+K"]
+close_other_panes = []
+```
+
+`focus_project_1` through `focus_project_9` select projects in sidebar order.
+The `settings_general`, `settings_appearance`, `settings_terminal`,
+`settings_links`, `settings_keyboard`, `settings_native_chat`, `settings_editor`,
+`settings_accounts`, `settings_notifications`, and `settings_about` commands
+open the corresponding Settings section. These commands also start unbound.
+
 
 Each action takes a list of chords. A chord has one key and one or more
 modifiers, joined by `+`. Names are case-insensitive.
