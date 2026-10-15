@@ -102,6 +102,7 @@ pub enum GlobalShortcut {
     FocusPane7,
     FocusPane8,
     FocusPane9,
+    FocusLastPane,
     NewTerminal,
     NewChannel,
     NextAttention,
@@ -184,6 +185,7 @@ impl GlobalShortcut {
             Self::FocusPane7 => "focus_pane_7",
             Self::FocusPane8 => "focus_pane_8",
             Self::FocusPane9 => "focus_pane_9",
+            Self::FocusLastPane => "focus_last_pane",
             Self::NewTerminal => "new_terminal",
             Self::NewChannel => "new_channel",
             Self::ClonePane => "clone_pane",
@@ -382,6 +384,7 @@ impl ShortcutDescriptor {
             GlobalShortcut::FocusPane7 => context.pane_count > 6,
             GlobalShortcut::FocusPane8 => context.pane_count > 7,
             GlobalShortcut::FocusPane9 => context.pane_count > 8,
+            GlobalShortcut::FocusLastPane => context.pane_count > 0,
             _ => true,
         }
     }
@@ -518,6 +521,12 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane9,
         label: "Focus pane 9",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::FocusLastPane,
+        label: "Focus last pane",
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
@@ -890,6 +899,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::FocusPane7 => &shortcuts.focus_pane_7,
         GlobalShortcut::FocusPane8 => &shortcuts.focus_pane_8,
         GlobalShortcut::FocusPane9 => &shortcuts.focus_pane_9,
+        GlobalShortcut::FocusLastPane => &shortcuts.focus_last_pane,
         GlobalShortcut::NewTerminal => &shortcuts.new_terminal,
         GlobalShortcut::NewChannel => &shortcuts.new_channel,
         GlobalShortcut::ClonePane => &shortcuts.clone_pane,

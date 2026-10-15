@@ -1,11 +1,32 @@
 use super::*;
 use crate::interaction::tooltip;
 
+/// Shape once when cached chrome changes, with the same font and size as the tab.
+pub(super) fn measure_tab_title(title: &str) -> f32 {
+    use iced::{Pixels, Size, advanced::text::{self, Paragraph as _}};
+    let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
+        content: title,
+        bounds: Size::new(f32::INFINITY, f32::INFINITY),
+        size: Pixels(design::TEXT_BODY),
+        line_height: text::LineHeight::Absolute(Pixels(design::LINE_BODY)),
+        font: cosmic::font::default(),
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: text::Shaping::Advanced,
+        wrapping: text::Wrapping::None,
+        ellipsize: text::Ellipsize::None,
+    });
+    paragraph.min_bounds().width
+}
+
+
 #[derive(Debug, Default)]
 pub(super) struct State {
     hovered_tab: Option<CardId>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
+    pub(super) terminal_ordinals: HashMap<CardId, u32>,
+    pub(super) terminal_next_ordinals: HashMap<PathBuf, u32>,
     /// Tab visibility follows pane focus even when a creation path already
     /// updated durable focus before applying its viewport changes.
     pub(super) tabs_focus: Option<CardId>,
@@ -39,6 +60,86 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+
+    fn tab_fixture(count: usize, width: f32) -> Cagents {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let cards = (0..count).map(|_| super::super::tests::terminal_card_state()).collect();
+        Arc::make_mut(&mut app.durable).cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(width);
+        drop(app.sync_chrome());
+        app
+    }
+
+    #[test]
+    fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
+        let mut app = tab_fixture(30, 900.0);
+        let (available, width) = app.tab_strip_geometry();
+        assert!(4.0 * (width + crate::tab_strip::SPACING)
+            + 2.0 * crate::tab_strip::EDGE_INSET <= available + 0.1);
+        let id = app.durable.cards[0].id;
+        app.chrome_ui.user_titles.insert(id, "WWWWWWWWWWWWWWWWWWWW".into());
+        app.workspace.resize_viewport(1600.0);
+        drop(app.sync_chrome());
+        let (_, width) = app.tab_strip_geometry();
+        assert!(width >= measure_tab_title("WWWWWWWWWWWWWWWWWWWW") + 112.0);
+    }
+
+    #[test]
+    fn plus_and_pane_list_stay_visible_when_thirty_tabs_overflow() {
+        use iced::advanced::{Layout, layout, widget::{Operation, Tree, operation::Focusable}};
+        use iced::{Rectangle, Size};
+        struct Bounds(HashMap<String, Rectangle>, Option<Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if let Some(id) = id { self.0.insert(id.to_string(), bounds); }
+            }
+            fn scrollable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: Rectangle,
+                _: iced::Vector, _: &mut dyn iced::advanced::widget::operation::Scrollable) {
+                if id == Some(&widget::Id::new("workspace.tabs")) { self.1 = Some(bounds); }
+            }
+            fn focusable(&mut self, id: Option<&widget::Id>, bounds: Rectangle, _: &mut dyn Focusable) {
+                if let Some(id) = id { self.0.insert(id.to_string(), bounds); }
+            }
+        }
+        let renderer = super::super::tests::headless_renderer();
+        for width in [900.0, 1600.0] {
+            let app = tab_fixture(30, width);
+            let mut element = app.workspace_chrome(widget::Space::new().height(Length::Fill).into());
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(Size::new(width, 600.0), Size::new(width, 600.0)));
+            let mut bounds = Bounds(HashMap::new(), None);
+            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+            if width == 900.0 {
+                let viewport = bounds.1.expect("native tab viewport");
+                let visible = app.workspace.order().filter(|id| {
+                    let tab = bounds.0[&card_control_id(*id, "tab").to_string()];
+                    tab.x >= viewport.x && tab.x + tab.width <= viewport.x + viewport.width + 0.1
+                }).count();
+                assert!(visible >= 4, "only {visible} complete tabs fit in {viewport:?}");
+            }
+            for id in [TOOLBAR_FOCUS_ID, "workspace.pane-list"] {
+                let rect = bounds.0.get(id).unwrap_or_else(|| panic!("missing {id}"));
+                assert!(rect.width > 0.0 && rect.x >= 0.0 && rect.x + rect.width <= width + 0.1,
+                    "{id} outside {width}px header: {rect:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn terminal_ordinals_survive_an_unrelated_tab_closing() {
+        let mut app = tab_fixture(3, 1600.0);
+        let survivor = app.durable.cards[2].id;
+        let before = app.card_chrome[&survivor].title.clone();
+        assert!(before.ends_with("(3)"), "{before}");
+        Arc::make_mut(&mut app.durable).cards.remove(0);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&survivor].title, before);
+    }
     use super::*;
 
     /// Retain the actual Settings pane while rename and palette modals change.
@@ -908,7 +1009,7 @@ fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
 
-fn command<'a>(
+pub(super) fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
     id: widget::Id,
@@ -1581,7 +1682,13 @@ impl Cagents {
 
     fn workspace_header_width(&self) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
-            design::PANE_NAVIGATOR_RESERVED_WIDTH
+            let total = self.workspace.cards().len();
+            let current = self.workspace.focused()
+                .and_then(|id| self.workspace.order().position(|candidate| candidate == id))
+                .map_or(0, |index| index + 1);
+            2.0 * ICON_CONTROL_SIZE + 2.0 * space::XXS
+                + (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
+                    .max(design::PANE_NAVIGATOR_MIN_WIDTH)
         } else {
             0.0
         };
@@ -1623,17 +1730,30 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
-        let available = (self.workspace.viewport_width() - self.workspace_header_width()).max(0.0);
+        let available = (self.workspace.viewport_width() - self.workspace_header_width()
+            - design::PRIMARY_CONTROL_SIZE - space::XXS).max(0.0);
         // Reordering uses one shared width. Derive that width from the titles
         // instead of giving every agent the same eight-character title budget.
         let desired = self
             .workspace
             .order()
             .filter_map(|id| self.card_chrome.get(&id))
-            .map(|chrome| 80.0 + chrome.title.chars().count().min(28) as f32 * 7.0)
+            .map(|chrome| chrome.title_width + 112.0)
             .fold(design::TAB_MIN_WIDTH, f32::max)
             .clamp(design::TAB_MIN_WIDTH, design::TAB_MAX_WIDTH);
-        (available, desired)
+        let width = if self.workspace.viewport_width() > 0.0
+            && self.workspace.viewport_width() < design::NARROW_WORKSPACE_WIDTH
+        {
+            // Four short titles remain reachable even beside the sidebar;
+            // the pinned pane list carries the complete title and status.
+            let visible = self.workspace.order().count().clamp(1, 4) as f32;
+            let fitting = (available / visible - crate::tab_strip::SPACING
+                - 2.0 * crate::tab_strip::EDGE_INSET / visible).max(56.0);
+            if visible < 4.0 { desired.min(fitting) } else { fitting.min(112.0) }
+        } else {
+            desired
+        };
+        (available, width)
     }
 
     /// Scrolls the tab strip by the least amount that brings the focused tab
@@ -1654,11 +1774,8 @@ impl Cagents {
         if available <= 0.0 {
             return Task::none();
         }
-        // The trailing "new tab" control shares the scrollable row, so a tab
-        // revealed flush against the viewport edge would sit underneath it.
         let pitch = width + crate::tab_strip::SPACING;
         let content = self.workspace.order().count() as f32 * pitch
-            + design::PRIMARY_CONTROL_SIZE
             + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
         if max_offset <= 0.0 {
@@ -1697,7 +1814,6 @@ impl Cagents {
             .workspace
             .order()
             .map(|id| self.column_header(id, self.workspace.focused() == Some(id), tab_width))
-            .chain(std::iter::once(self.new_tab_control()))
             .collect();
         let generation = self.workspace_view_generation;
         let tabs = crate::tab_strip::reorderable(
@@ -1722,6 +1838,10 @@ impl Cagents {
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(space::XXS)
             .align_y(Alignment::Center);
+        let tabs = widget::row::with_children(vec![
+            widget::container(tabs).width(Length::Fill).into(),
+            self.new_tab_control(),
+        ]).spacing(space::XXS).align_y(Alignment::Center).width(Length::Fill);
         let header = self.native_header(
             tabs.into(),
             Some(actions.into()),
@@ -1763,9 +1883,12 @@ impl Cagents {
                 )),
             ));
             actions.push(
-                iced::widget::container(crate::design::caption(format!("{current} / {total}")))
-                    .center_y(ICON_CONTROL_SIZE)
-                    .align_x(Alignment::Center)
+                widget::button::custom(crate::design::caption(format!("{current} / {total}")))
+                    .name("Show open panes")
+                    .id(widget::Id::new("workspace.pane-list"))
+                    .class(cosmic::theme::Button::Text)
+                    .height(ICON_CONTROL_SIZE)
+                    .on_press(Message::Palette(palette_ui::Action::OpenPanes))
                     .width(
                         (format!("{current} / {total}").len() as f32 * 7.0 + 16.0)
                             .max(design::PANE_NAVIGATOR_MIN_WIDTH),
@@ -2058,6 +2181,7 @@ impl Cagents {
                     .width(Length::Fill),
             )
             .padding([0.0, space::XS])
+            .id(chrome.map_or_else(|| card_control_id(id, "tab"), |chrome| chrome.tab_id.clone()))
             .height(design::PRIMARY_CONTROL_SIZE)
             .width(width)
             .class(cosmic::theme::Container::custom(move |theme| {

@@ -280,6 +280,7 @@ pub struct KeyboardShortcuts {
     pub focus_pane_7: Vec<String>,
     pub focus_pane_8: Vec<String>,
     pub focus_pane_9: Vec<String>,
+    pub focus_last_pane: Vec<String>,
     pub toggle_projects: Vec<String>,
     pub rename_pane: Vec<String>,
     pub new_browser: Vec<String>,
@@ -358,6 +359,7 @@ impl Default for KeyboardShortcuts {
             focus_pane_7: vec!["Alt+7".to_owned()],
             focus_pane_8: vec!["Alt+8".to_owned()],
             focus_pane_9: vec!["Alt+9".to_owned()],
+            focus_last_pane: vec!["Alt+0".to_owned()],
             toggle_projects: vec!["Ctrl+Shift+B".to_owned()],
             rename_pane: vec!["F2".to_owned()],
             new_browser: Vec::new(),
@@ -402,7 +404,7 @@ pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 73] {
+    pub fn actions(&self) -> [&Vec<String>; 74] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -442,6 +444,7 @@ impl KeyboardShortcuts {
             &self.focus_pane_7,
             &self.focus_pane_8,
             &self.focus_pane_9,
+            &self.focus_last_pane,
             &self.toggle_projects,
             &self.rename_pane,
             &self.new_browser,
@@ -604,7 +607,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 73] = [
+const SHORTCUT_ACTIONS: [&str; 74] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -643,6 +646,7 @@ const SHORTCUT_ACTIONS: [&str; 73] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "toggle_projects",
     "rename_pane",
     "new_browser",
@@ -1628,7 +1632,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 68] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 69] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1651,6 +1655,7 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 68] = [
     "focus_pane_7",
     "focus_pane_8",
     "focus_pane_9",
+    "focus_last_pane",
     "cycle_pane_width",
     "new_channel",
     "clone_pane",

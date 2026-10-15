@@ -293,6 +293,7 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
+    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -1551,6 +1552,7 @@ pub(super) struct Runtime {
     failures: Vec<(Option<String>, String)>,
     reasoning_picker: bool,
     permission_picker: bool,
+    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -2115,6 +2117,7 @@ impl Runtime {
             failures: Vec::new(),
             reasoning_picker: false,
             permission_picker: false,
+            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -4314,11 +4317,13 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
+            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
+                    runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -4424,7 +4429,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: chat_card_title(session.launch.provider).into(),
-            width_fraction: beside
+            width_fraction: self.new_pane_fraction(beside
                 .and_then(|(source, _)| self.card_state(source))
                 .map_or(self.settings.default_native_pane_fraction, |source| {
                     if matches!(source.kind, CardKind::Chat(_)) {
@@ -4432,7 +4437,7 @@ impl Cagents {
                     } else {
                         self.settings.default_native_pane_fraction
                     }
-                }),
+                })),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -5744,6 +5749,7 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
+            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
@@ -5836,6 +5842,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -6222,7 +6229,7 @@ impl Cagents {
                         session.proof = handle.proof();
                         let snapshot = handle.snapshot();
                         let channel_name = snapshot_channel_name(&snapshot);
-                        let title = snapshot.title.clone();
+                        let title = snapshot_channel_name(&snapshot).map(|(title, _)| title);
                         let activity = Activity {
                             provider: session.launch.provider,
                             state: handle.take_activity(),
@@ -6599,7 +6606,7 @@ impl Cagents {
                         let channel_name = needs_name
                             .then(|| snapshot_channel_name(&snapshot))
                             .flatten();
-                        let title = snapshot.title.clone();
+                        let title = snapshot_channel_name(&snapshot).map(|(title, _)| title);
                         if let Some((name, source)) = channel_name {
                             self.suggest_channel_title(target.card, name, source);
                         }
@@ -7146,12 +7153,20 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
+            Action::FooterPicker(target, open) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.footer_picker = open;
+                    runtime.permission_picker = false;
+                    runtime.composer_actions = false;
+                }
+            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
+                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -7210,6 +7225,7 @@ impl Cagents {
                     runtime.history_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -7995,6 +8011,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 if !runtime
                     .snapshot
                     .capabilities
@@ -8397,6 +8414,7 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -8422,6 +8440,7 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
+                    runtime.footer_picker = false;
                 }
             }
         }
@@ -12582,6 +12601,30 @@ mod tests {
         settle(app, card, Ok(()));
         assert!(chat_runtime(app, card).queued.is_none());
         card
+    }
+
+    #[test]
+    fn prompt_and_provider_titles_name_the_chat_tab_and_window() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = Snapshot { ready: true, ..Snapshot::default() };
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "prompt".into(), role: chat::Role::User,
+            content: text("Implement conversation titles"), started_at: None, at: None,
+        }));
+        for title in [None, Some("Provider summary".to_owned())] {
+            snapshot.title = title.clone();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot.clone());
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            drop(app.sync_chrome());
+            let expected = title.as_deref().unwrap_or("Implement conversation titles");
+            assert_eq!(app.card_display_title(app.card_state(card).unwrap()), expected);
+            assert_eq!(app.card_chrome[&card].title, expected);
+            assert_eq!(app.core.window.header_title, expected);
+        }
     }
 
     #[test]

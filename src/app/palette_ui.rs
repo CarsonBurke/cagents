@@ -531,6 +531,18 @@ impl Cagents {
         )
     }
 
+    fn pane_attention_label(&self, card: CardId) -> &'static str {
+        if self.sidebar_state.has_card_update(card) {
+            "Unread"
+        } else {
+            match self.sidebar_state.card_activity(card).map(|activity| activity.state) {
+                Some(crate::agent::ActivityState::Working) => "Working",
+                Some(crate::agent::ActivityState::Waiting) => "Waiting for input",
+                _ => "Idle",
+            }
+        }
+    }
+
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
         let (category, query) = palette_query(self.palette.query.as_deref().unwrap_or(""));
         let mut entries: Vec<_> = if !self.palette.panes_only && category.is_none_or(|category| category == '>') {
@@ -1162,6 +1174,10 @@ impl Cagents {
                     self.duplicate_pane_in_scope(card, owner)
                 }
             }
+            Command::FocusLastPane => {
+                let card = self.workspace.order().last();
+                card.map_or_else(Task::none, |id| self.update(Message::FocusCard(id)))
+            }
             Command::FocusPane1
             | Command::FocusPane2
             | Command::FocusPane3
@@ -1301,6 +1317,7 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => Some(Command::FocusPane7),
             Self::ShortcutFocusPane8 => Some(Command::FocusPane8),
             Self::ShortcutFocusPane9 => Some(Command::FocusPane9),
+            Self::ShortcutFocusLastPane => Some(Command::FocusLastPane),
             _ => None,
         }
     }
@@ -1424,12 +1441,38 @@ impl ShortcutDraft {
             (Command::FocusPane7, self.focus_pane_7.as_str()),
             (Command::FocusPane8, self.focus_pane_8.as_str()),
             (Command::FocusPane9, self.focus_pane_9.as_str()),
+            (Command::FocusLastPane, self.focus_last_pane.as_str()),
         ]
     }
 }
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn pane_list_filters_selects_and_focuses_the_chosen_pane() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let cards: Vec<_> = (1..=20).map(|index| {
+            let mut card = crate::app::tests::terminal_card_state();
+            card.title = format!("Pane {index}");
+            card
+        }).collect();
+        let chosen = cards[13].id;
+        Arc::make_mut(&mut app.durable).cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(900.0);
+        drop(app.update_palette(Action::OpenPanes));
+        assert_eq!(app.palette_entries().len(), 20);
+        drop(app.update_palette(Action::Query("pane14".into())));
+        let entries = app.palette_entries();
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(entries[0].2, Message::FocusCard(id) if id == chosen));
+        drop(app.update_palette(Action::Submit));
+        assert!(!app.palette.is_open());
+        assert_eq!(app.workspace.focused(), Some(chosen));
+        drop(app.run_workspace_command(Command::FocusLastPane, keyboard::Modifiers::empty()));
+        assert_eq!(app.workspace.focused(), app.workspace.order().last());
+    }
     use super::*;
 
     /// Run a real scroll operation against the retained native widget tree.
