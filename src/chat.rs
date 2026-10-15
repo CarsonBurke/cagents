@@ -2580,6 +2580,30 @@ pub(crate) fn fresh_session(
     working_directory: std::path::PathBuf,
     account: &crate::account::Account,
 ) -> Result<Session, String> {
+    fresh_session_inner(provider, id, working_directory, account, true)
+}
+
+/// UI draft construction performs no provider configuration reads. The UI
+/// resolves the preview in its shared worker and pins fresh Claude policy on
+/// the blocking pool before starting the provider.
+#[cfg(feature = "ui")]
+pub(crate) fn fresh_session_deferred_policy(
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
+) -> Result<Session, String> {
+    fresh_session_inner(provider, id, working_directory, account, false)
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn fresh_session_inner(
+    provider: Provider,
+    id: crate::model::TerminalId,
+    working_directory: std::path::PathBuf,
+    account: &crate::account::Account,
+    configure_policy: bool,
+) -> Result<Session, String> {
     let mut recipe = LaunchRecipe {
         unset_environment: account
             .credential_overrides()
@@ -2629,7 +2653,7 @@ pub(crate) fn fresh_session(
             // logins follow the current global default; independent homes
             // retain their own. Explicit environment choices and project
             // settings remain under Claude's own handling.
-            if let Some(mode) = claude_configured_default_mode(&recipe) {
+            if configure_policy && let Some(mode) = claude_configured_default_mode(&recipe) {
                 recipe.arguments.extend(["--permission-mode".into(), mode]);
             }
         }
