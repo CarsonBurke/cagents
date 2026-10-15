@@ -58,9 +58,13 @@ impl RepositoryRuntime {
         }
         self.disk_comparison_applied = None;
         let DocumentState::Editable(document) = &self.document else { unreachable!() };
+        let after = document.content.text_snapshot();
+        if after.len() as u64 > MAX_DIFF_SIDE_BYTES {
+            self.disk_comparison = Some(DiffState::ready(RenderedDiff::Error("The unsaved buffer exceeds the comparison size limit. Editing and safe saving remain available.".into())));
+            return Task::none();
+        }
         let disk = document.external_version.as_ref().expect("key proves external bytes");
         let before: Arc<str> = Arc::from(disk.text.as_str());
-        let after = document.content.text_snapshot();
         let present = document.present;
         let cancellation = CancellationToken::new(); let request = uuid::Uuid::new_v4();
         self.disk_comparison = Some(DiffState::Loading { request: request.as_u128() as u64, cancellation: cancellation.clone() });
