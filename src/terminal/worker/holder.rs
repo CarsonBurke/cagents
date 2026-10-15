@@ -894,6 +894,12 @@ fn hung_up(pipe: &std::io::PipeReader) -> bool {
 
 impl Drop for Holder {
     fn drop(&mut self) {
+        if let Some(process) = &self.process {
+            // The original Child can outlive startup admission while queued in
+            // the final-release pool. Publish ownership before any clone,
+            // handoff or error path can let the host cancel its spawn record.
+            process.reservation.quarantine();
+        }
         if self.adoption_pending {self.leave_for_successor();}
         if !self.detached {
             // Destruction never performs RPC, waits for a process, or joins a
