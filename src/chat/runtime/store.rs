@@ -1,6 +1,8 @@
 //! Private, disk-backed transcript. Stable provider IDs and byte-addressed chunks
 //! keep both long conversations and a single enormous tool result pageable.
 mod adapter_items;
+mod export_seed;
+pub(super) use export_seed::StoreExportSeed;
 mod child_tools;
 mod file_changes;
 pub(super) use adapter_items::reader as adapter_item_reader;

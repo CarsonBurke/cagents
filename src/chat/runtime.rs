@@ -26,6 +26,7 @@ mod store;
 mod websocket;
 mod worker_join;
 use store::Store;
+pub(crate) use store::StoreExportSeed;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
