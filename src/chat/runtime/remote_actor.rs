@@ -3385,9 +3385,15 @@ done"#;
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(5));
         }
-        // Stop the old proxy before observing/retiring this helper receipt.
-        // Its actual actor and provider continue under the retained helper.
-        actor.preserve().unwrap();
+        // Suspend only this test's metadata pump before admitting a command.
+        // Preserve itself fences new helper input, so manufacturing a command
+        // after preserve would test a forbidden ordering rather than a lost ACK.
+        actor.0.stop.store(true, Ordering::Release);
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while actor.0.worker.lock().unwrap().as_ref().is_some_and(|worker| !worker.is_finished()) {
+            assert!(Instant::now() < deadline, "old metadata pump did not stop");
+            thread::sleep(Duration::from_millis(5));
+        }
         let identity = InputIdentity {
             sequence: 1,
             id: uuid::Uuid::new_v4(),
@@ -3421,6 +3427,7 @@ done"#;
         let orphaned: Vec<InputReceipt> = actor.call("acknowledged_inputs", Value::Null).unwrap();
         assert_eq!(orphaned.len(), 1);
         assert_eq!(orphaned[0].identity, identity);
+        actor.preserve().unwrap();
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
