@@ -3129,7 +3129,7 @@ mod settings_recorder_tests {
         assert!(matches!(&after_refresh[0].2, Message::Palette(Action::RunGitStash(_, _, entry)) if entry == &original), "the selected index still names the originally displayed candidate");
         drop(after_refresh);
         drop(app.update_palette(Action::Submit));
-        assert!(app.status.as_ref().unwrap().message.contains("original stash"));
+        assert!(app.notices.recent().any(|entry| entry.notice.message.contains("original stash")));
         assert!(app.source_control_mutations.is_empty(), "Enter cannot pop the replacement stash");
     }
 

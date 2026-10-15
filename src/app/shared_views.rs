@@ -1623,7 +1623,7 @@ mod tests {
             if remove_original {
                 assert!(rx.try_recv().is_err(), "a vanished target cannot be replaced by the new channel at the same index");
                 assert!(!app.pane_transfer_pending(pane.id));
-                assert!(app.status.as_ref().unwrap().message.contains("Choose another channel"));
+                assert!(app.notices.recent().any(|entry| entry.notice.message.contains("Choose another channel")));
             } else {
                 assert!(matches!(rx.try_recv().unwrap(), ModelEdit::ChangeView { scope: Scope::Channel(from), change: Change::Transfer { destination: Scope::Channel(to), .. }, .. } if from == source && to == destination), "Enter retains the originally shown target even when a newer channel sorts first");
             }
