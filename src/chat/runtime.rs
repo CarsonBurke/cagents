@@ -1290,6 +1290,11 @@ impl LocalHandle {
                     snapshot.models.iter().any(|model|Some(&model.id)==options.model.as_ref()),
                     snapshot.permissions.clone())
             };
+            // The metadata mutex can itself span the caller's deadline. Fence
+            // both success and effects after observing it, not only beforehand.
+            if Instant::now() >= deadline {
+                return Err("Account option restoration deadline expired before its metadata observation completed; no further controls were admitted. Previously admitted controls may still settle.".into());
+            }
             // Inspect only current controls. Restoring settings must never page
             // or clone a transcript merely because the source pane is hidden.
             if ready {
@@ -9859,4 +9864,35 @@ mod tests {
         assert_eq!(state.error, None);
         assert_eq!(state.items, retained);
     }
+    #[test]
+    fn account_options_cannot_succeed_after_a_metadata_lock_spans_the_deadline() {
+        let directory=tempfile::tempdir().unwrap();
+        let recipe=crate::model::LaunchRecipe {
+            program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().to_path_buf(),
+            environment:BTreeMap::new(),unset_environment:Default::default(),
+        };
+        let spec=ProcessSpec::from(&recipe);
+        let mut initial=Step {events:vec![Event::Ready(true)],..Step::default()};
+        let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let locked=handle.0.state.lock().unwrap();
+        let options=AccountSwitchOptions::capture(&locked);
+        let worker_handle=handle.clone();
+        let (entered,observed)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move|| {
+            let deadline=Instant::now()+Duration::from_millis(150);
+            worker_handle.restore_account_options(&options,deadline,|| {
+                let _=entered.try_send(deadline);
+                false
+            })
+        });
+        let deadline=observed.recv_timeout(Duration::from_secs(5)).unwrap();
+        thread::sleep(deadline.saturating_duration_since(Instant::now())+Duration::from_millis(10));
+        drop(locked);
+        let error=worker.join().unwrap().unwrap_err();
+        assert!(error.contains("deadline expired"));
+        assert!(!handle.is_completed());
+        handle.close().unwrap();
+    }
+
 }
