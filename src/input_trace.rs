@@ -184,7 +184,11 @@ impl InputTrace {
 }
 
 fn keyboard_event_needs_focus(event: &Event) -> bool {
-    matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. } | keyboard::Event::KeyReleased { key, modifiers, .. }) if modifiers.control() || modifiers.alt() || modifiers.logo() || matches!(key, keyboard::Key::Named(_)))
+    matches!(
+        event,
+        Event::Keyboard(keyboard::Event::KeyPressed { .. } | keyboard::Event::KeyReleased { .. })
+            | Event::InputMethod(_)
+    )
 }
 
 /// Marks custom multiline text controls for native keyboard-focus queries.
@@ -194,22 +198,31 @@ pub(crate) struct TextEditing;
 #[derive(Default)]
 struct KeyboardFocus {
     focused: Option<(Option<cosmic::iced::widget::Id>, Rectangle)>,
+    focused_candidates: Vec<(
+        (Option<cosmic::iced::widget::Id>, Rectangle),
+        Option<KeyboardRegion>,
+    )>,
     inputs: Vec<(Option<cosmic::iced::widget::Id>, Rectangle)>,
     known_regions: Vec<(cosmic::iced::widget::Id, KeyboardRegion)>,
-    containers: Vec<(KeyboardRegion, Rectangle)>,
+    current_region: Option<KeyboardRegion>,
+    pending_region: Option<Option<KeyboardRegion>>,
 }
 impl Operation for KeyboardFocus {
-    fn container(&mut self, id: Option<&cosmic::iced::widget::Id>, bounds: Rectangle) {
-        if let Some((_, region)) = self
-            .known_regions
-            .iter()
-            .find(|(candidate, _)| Some(candidate) == id)
-        {
-            self.containers.push((*region, bounds));
-        }
+    fn container(&mut self, id: Option<&cosmic::iced::widget::Id>, _bounds: Rectangle) {
+        self.pending_region = Some(
+            self.known_regions
+                .iter()
+                .find(|(candidate, _)| Some(candidate) == id)
+                .map(|(_, region)| *region)
+                .or(self.current_region),
+        );
     }
     fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+        let previous = self.current_region;
+        self.current_region = self.pending_region.take().unwrap_or(previous);
         operate(self);
+        self.current_region = previous;
+        self.pending_region = None;
     }
     fn focusable(
         &mut self,
@@ -218,7 +231,10 @@ impl Operation for KeyboardFocus {
         state: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
     ) {
         if state.is_focused() {
-            self.focused = Some((id.cloned(), bounds));
+            let candidate = (id.cloned(), bounds);
+            self.focused = Some(candidate.clone());
+            self.focused_candidates
+                .push((candidate, self.current_region));
         }
     }
     fn custom(
@@ -242,24 +258,70 @@ impl Operation for KeyboardFocus {
 }
 impl KeyboardFocus {
     fn region(&self, regions: &[(cosmic::iced::widget::Id, KeyboardRegion)]) -> KeyboardRegion {
-        let Some((id, bounds)) = &self.focused else {
-            return FocusedPane::Other.into();
-        };
+        self.selected(regions)
+            .map_or_else(|| FocusedPane::Other.into(), |(_, region)| region)
+    }
+
+    /// Resolve the identity and region together. Captured outside clicks can
+    /// leave a raw card's old native focus flag set; that flag must not
+    /// override a focused sidebar, inspector or dialog control.
+    fn selected<'a>(
+        &'a self,
+        regions: &[(cosmic::iced::widget::Id, KeyboardRegion)],
+    ) -> Option<(
+        &'a (Option<cosmic::iced::widget::Id>, Rectangle),
+        KeyboardRegion,
+    )> {
+        self.focused_candidates
+            .iter()
+            .rev()
+            .find_map(|(candidate, inherited)| {
+                let region = self.region_for(candidate, regions, *inherited);
+                (region.card.is_none()
+                    && matches!(
+                        region.pane,
+                        FocusedPane::TextInput | FocusedPane::OutsideWorkspace
+                    ))
+                .then_some((candidate, region))
+            })
+            .or_else(|| {
+                self.focused_candidates
+                    .iter()
+                    .rev()
+                    .find_map(|(candidate, inherited)| {
+                        let region = self.region_for(candidate, regions, *inherited);
+                        (region.pane == FocusedPane::TextInput).then_some((candidate, region))
+                    })
+            })
+            .or_else(|| {
+                self.focused_candidates
+                    .last()
+                    .map(|(candidate, inherited)| {
+                        (candidate, self.region_for(candidate, regions, *inherited))
+                    })
+            })
+    }
+
+    fn widget_id(
+        &self,
+        regions: &[(cosmic::iced::widget::Id, KeyboardRegion)],
+    ) -> Option<cosmic::iced::widget::Id> {
+        self.selected(regions).and_then(|((id, _), _)| id.clone())
+    }
+
+    fn region_for(
+        &self,
+        (id, bounds): &(Option<cosmic::iced::widget::Id>, Rectangle),
+        regions: &[(cosmic::iced::widget::Id, KeyboardRegion)],
+        inherited: Option<KeyboardRegion>,
+    ) -> KeyboardRegion {
         if let Some((_, region)) = regions
             .iter()
             .find(|(candidate, _)| Some(candidate) == id.as_ref())
         {
             return *region;
         }
-        let container = self
-            .containers
-            .iter()
-            .rev()
-            .find(|(_, container)| container.contains(bounds.center()))
-            .map_or_else(
-                || KeyboardRegion::from(FocusedPane::OutsideWorkspace),
-                |(region, _)| *region,
-            );
+        let container = inherited.unwrap_or_else(|| FocusedPane::OutsideWorkspace.into());
         if self
             .inputs
             .iter()
@@ -351,8 +413,8 @@ impl<Message> Widget<Message, Theme, Renderer> for Observed<'_, Message> {
             );
             self.trace.1.set(Some(focus.region(regions)));
         } else if matches!(event, Event::Keyboard(_)) && self.focus_regions.is_some() {
-            // An ordinary key or modifier update must not reuse a previous
-            // chord's pane after the user moves focus with the pointer.
+            // Modifier updates without a focus sample must not reuse a
+            // previous chord's pane after pointer focus changes.
             self.trace.1.set(None);
         }
         let region = self
@@ -530,7 +592,7 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for ObservedOverlay<'_,
     ) {
         self.trace.record(event);
         let mut owns_keyboard = false;
-        if matches!(event, Event::Keyboard(_))
+        if keyboard_event_needs_focus(event)
             && let Some(regions) = &self.focus_regions
         {
             let mut focus = KeyboardFocus {
@@ -632,6 +694,55 @@ mod tests {
                 .pane,
             FocusedPane::TextInput
         );
+        // A captured sidebar click can prevent a raw pane from seeing the
+        // outside click that normally clears its old native focus flag.
+        let regions = [(
+            editor.clone(),
+            KeyboardRegion {
+                pane: FocusedPane::Editor,
+                card: Some(CardId::new()),
+            },
+        )];
+        let pane_bounds = Rectangle::new(Point::new(200., 0.), Size::new(100., 24.));
+        query.focusable(Some(&editor), pane_bounds, &mut Focus(true));
+        assert_eq!(query.region(&regions), FocusedPane::TextInput.into());
+        assert_eq!(query.widget_id(&regions), Some(sidebar.clone()));
+        let mut reversed = KeyboardFocus::default();
+        reversed.focusable(Some(&editor), pane_bounds, &mut Focus(true));
+        reversed.focusable(Some(&sidebar), bounds, &mut Focus(true));
+        reversed.custom(Some(&sidebar), bounds, &mut TextEditing);
+        assert_eq!(reversed.region(&regions), FocusedPane::TextInput.into());
+        assert_eq!(reversed.widget_id(&regions), Some(sidebar));
+
+        // Ownership follows actual traversal ancestry, even when an offscreen
+        // pane's rectangle overlaps a sidebar or an overlay control.
+        let container = cosmic::iced::widget::Id::new("pane.container");
+        let field = cosmic::iced::widget::Id::new("pane.find");
+        let owner = KeyboardRegion {
+            pane: FocusedPane::Other,
+            card: Some(CardId::new()),
+        };
+        let mut ancestry = KeyboardFocus {
+            known_regions: vec![(container.clone(), owner)],
+            ..KeyboardFocus::default()
+        };
+        ancestry.container(Some(&container), bounds);
+        ancestry.traverse(&mut |operation| {
+            operation.focusable(Some(&field), bounds, &mut Focus(true));
+            operation.custom(Some(&field), bounds, &mut TextEditing);
+        });
+        assert_eq!(
+            ancestry.region(&[]),
+            KeyboardRegion {
+                pane: FocusedPane::TextInput,
+                ..owner
+            }
+        );
+        let outside = cosmic::iced::widget::Id::new("outside.same-bounds");
+        ancestry.focusable(Some(&outside), bounds, &mut Focus(true));
+        ancestry.custom(Some(&outside), bounds, &mut TextEditing);
+        assert_eq!(ancestry.region(&[]), FocusedPane::TextInput.into());
+        assert_eq!(ancestry.widget_id(&[]), Some(outside));
         let mut query = KeyboardFocus::default();
         query.focusable(Some(&editor), bounds, &mut Focus(true));
         assert_eq!(
