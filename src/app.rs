@@ -2873,6 +2873,14 @@ pub enum SettingsField {
     ShortcutSettingsAccounts,
     ShortcutSettingsNotifications,
     ShortcutSettingsAbout,
+    ShortcutDiffCopy,
+    ShortcutDiffCopyOld,
+    ShortcutDiffCopyNew,
+    ShortcutDiffCopyPatch,
+    ShortcutDiffCopyLineReference,
+    ShortcutDiffOpenInEditor,
+    ShortcutDiffSelectAll,
+
     ShortcutNextDiagnostic,
     ShortcutPreviousDiagnostic,
 
@@ -2912,7 +2920,7 @@ pub enum SettingsField {
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 105] = [
+    const SHORTCUTS: [Self; 112] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2987,6 +2995,14 @@ impl SettingsField {
         Self::ShortcutSettingsAccounts,
         Self::ShortcutSettingsNotifications,
         Self::ShortcutSettingsAbout,
+        Self::ShortcutDiffCopy,
+        Self::ShortcutDiffCopyOld,
+        Self::ShortcutDiffCopyNew,
+        Self::ShortcutDiffCopyPatch,
+        Self::ShortcutDiffCopyLineReference,
+        Self::ShortcutDiffOpenInEditor,
+        Self::ShortcutDiffSelectAll,
+
         Self::ShortcutNextDiagnostic,
         Self::ShortcutPreviousDiagnostic,
 
@@ -3099,6 +3115,14 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => "Open settings: Accounts",
             Self::ShortcutSettingsNotifications => "Open settings: Notifications",
             Self::ShortcutSettingsAbout => "Open settings: About",
+            Self::ShortcutDiffCopy => "Copy",
+            Self::ShortcutDiffCopyOld => "Copy old side",
+            Self::ShortcutDiffCopyNew => "Copy new side",
+            Self::ShortcutDiffCopyPatch => "Copy as patch",
+            Self::ShortcutDiffCopyLineReference => "Copy line reference",
+            Self::ShortcutDiffOpenInEditor => "Open working file in editor at line",
+            Self::ShortcutDiffSelectAll => "Select all diff rows",
+
             Self::ShortcutNextDiagnostic => "Next diagnostic",
             Self::ShortcutPreviousDiagnostic => "Previous diagnostic",
 
@@ -3270,6 +3294,13 @@ impl SettingsField {
             | Self::ShortcutSettingsAccounts
             | Self::ShortcutSettingsNotifications
             | Self::ShortcutSettingsAbout
+            | Self::ShortcutDiffCopy
+            | Self::ShortcutDiffCopyOld
+            | Self::ShortcutDiffCopyNew
+            | Self::ShortcutDiffCopyPatch
+            | Self::ShortcutDiffCopyLineReference
+            | Self::ShortcutDiffOpenInEditor
+            | Self::ShortcutDiffSelectAll
             | Self::ShortcutNextDiagnostic
             | Self::ShortcutPreviousDiagnostic
             | Self::ShortcutEndConversation
@@ -3397,6 +3428,14 @@ struct ShortcutDraft {
     settings_accounts: String,
     settings_notifications: String,
     settings_about: String,
+    diff_copy: String,
+    diff_copy_old: String,
+    diff_copy_new: String,
+    diff_copy_patch: String,
+    diff_copy_line_reference: String,
+    diff_open_in_editor: String,
+    diff_select_all: String,
+
     next_diagnostic: String,
     previous_diagnostic: String,
 
@@ -3515,6 +3554,14 @@ impl ShortcutDraft {
             settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
             settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
             settings_about: settings::format_chords(&shortcuts.settings_about),
+            diff_copy: settings::format_chords(&shortcuts.diff_copy),
+            diff_copy_old: settings::format_chords(&shortcuts.diff_copy_old),
+            diff_copy_new: settings::format_chords(&shortcuts.diff_copy_new),
+            diff_copy_patch: settings::format_chords(&shortcuts.diff_copy_patch),
+            diff_copy_line_reference: settings::format_chords(&shortcuts.diff_copy_line_reference),
+            diff_open_in_editor: settings::format_chords(&shortcuts.diff_open_in_editor),
+            diff_select_all: settings::format_chords(&shortcuts.diff_select_all),
+
             next_diagnostic: settings::format_chords(&shortcuts.next_diagnostic),
             previous_diagnostic: settings::format_chords(&shortcuts.previous_diagnostic),
 
@@ -3845,6 +3892,14 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.settings_notifications = value
             }
             SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+            SettingsField::ShortcutDiffCopy => self.keyboard_shortcuts.diff_copy = value,
+            SettingsField::ShortcutDiffCopyOld => self.keyboard_shortcuts.diff_copy_old = value,
+            SettingsField::ShortcutDiffCopyNew => self.keyboard_shortcuts.diff_copy_new = value,
+            SettingsField::ShortcutDiffCopyPatch => self.keyboard_shortcuts.diff_copy_patch = value,
+            SettingsField::ShortcutDiffCopyLineReference => self.keyboard_shortcuts.diff_copy_line_reference = value,
+            SettingsField::ShortcutDiffOpenInEditor => self.keyboard_shortcuts.diff_open_in_editor = value,
+            SettingsField::ShortcutDiffSelectAll => self.keyboard_shortcuts.diff_select_all = value,
+
             SettingsField::ShortcutNextDiagnostic => self.keyboard_shortcuts.next_diagnostic = value,
             SettingsField::ShortcutPreviousDiagnostic => self.keyboard_shortcuts.previous_diagnostic = value,
 
@@ -4111,6 +4166,35 @@ fn settings_update(
             next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutDiffCopy => {
+            next.keyboard_shortcuts.diff_copy = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyOld => {
+            next.keyboard_shortcuts.diff_copy_old = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyNew => {
+            next.keyboard_shortcuts.diff_copy_new = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyPatch => {
+            next.keyboard_shortcuts.diff_copy_patch = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyLineReference => {
+            next.keyboard_shortcuts.diff_copy_line_reference = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffOpenInEditor => {
+            next.keyboard_shortcuts.diff_open_in_editor = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffSelectAll => {
+            next.keyboard_shortcuts.diff_select_all = settings::parse_chords(value);
+            Ok(())
+        }
+
         SettingsField::ShortcutNextDiagnostic => {
             next.keyboard_shortcuts.next_diagnostic = settings::parse_chords(value);
             Ok(())
@@ -17285,28 +17369,7 @@ impl Application for Cagents {
                     && !runtime.find_input_is_focused()
                     && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
                 {
-                    use repository_widget::ClipboardOp;
                     let action = match key {
-                        keyboard::Key::Character(character)
-                            if modifiers.command()
-                                && !modifiers.alt()
-                                && character.eq_ignore_ascii_case("c") =>
-                        {
-                            Some(RepositoryAction::Clipboard {
-                                card,
-                                op: ClipboardOp::Copy,
-                            })
-                        }
-                        keyboard::Key::Character(character)
-                            if modifiers.command()
-                                && !modifiers.alt()
-                                && character.eq_ignore_ascii_case("a") =>
-                        {
-                            Some(RepositoryAction::Clipboard {
-                                card,
-                                op: ClipboardOp::SelectAll,
-                            })
-                        }
                         keyboard::Key::Named(keyboard::key::Named::ArrowUp)
                             if !modifiers.command() && !modifiers.alt() =>
                         {

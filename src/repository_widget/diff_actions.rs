@@ -570,50 +570,30 @@ impl<'a> RowContext<'a> {
         crate::interaction::context_menu_lazy(content, move || {
             let command =
                 |command| MenuCommand(card, generation, revision, mode, source.sources, command);
-            use widget::menu::{Item, KeyBind, key_bind::Modifier};
-            let copy = command(DiffCommand::Copy);
-            let bindings = HashMap::from([(
-                KeyBind {
-                    modifiers: vec![Modifier::Ctrl],
-                    key: iced::keyboard::Key::Character("c".into()),
-                },
-                copy,
-            )]);
-            let mut items = vec![Item::Button("Copy", None, copy)];
-            if unified {
-                items.push(Item::Button(
-                    "Copy old side",
-                    None,
-                    command(DiffCommand::CopyOld),
-                ));
-                items.push(Item::Button(
-                    "Copy new side",
-                    None,
-                    command(DiffCommand::CopyNew),
-                ));
-            }
-            items.push(if changed {
-                Item::Button("Copy as patch", None, command(DiffCommand::CopyPatch))
-            } else {
-                Item::ButtonDisabled("Copy as patch", None, command(DiffCommand::CopyPatch))
-            });
-            items.push(Item::Divider);
-            items.push(Item::Button(
-                "Copy line reference",
-                None,
-                command(DiffCommand::CopyLineReference { row, side }),
-            ));
-            let open = command(DiffCommand::OpenInEditor { row, side });
-            let label = if editable {
-                "Open in editor at line"
-            } else {
-                "Open working file in editor at line"
+            use widget::menu::Item;
+            let mut bindings = HashMap::new();
+            let mut items = Vec::new();
+            {
+            let mut add = |intent: DiffCommand, available: bool| {
+                let descriptor = crate::workspace_widget::shortcut_descriptor_by_id(intent.command_id()).expect("registered diff menu template");
+                let action = command(intent);
+                if let Some(chord) = crate::workspace_widget::menu_shortcut(descriptor.action, &runtime.keyboard_shortcuts) { bindings.insert(chord, action); }
+                items.push(if available { Item::Button(descriptor.label, None, action) } else { Item::ButtonDisabled(descriptor.label, None, action) });
             };
-            items.push(if can_open {
-                Item::Button(label, None, open)
-            } else {
-                Item::ButtonDisabled(label, None, open)
-            });
+            add(DiffCommand::Copy, true);
+            if unified {
+                add(DiffCommand::CopyOld, true);
+                add(DiffCommand::CopyNew, true);
+            }
+            add(DiffCommand::CopyPatch, changed);
+            }
+            items.push(Item::Divider);
+            for (intent, available) in [(DiffCommand::CopyLineReference { row, side }, true), (DiffCommand::OpenInEditor { row, side }, can_open)] {
+                let descriptor = crate::workspace_widget::shortcut_descriptor_by_id(intent.command_id()).expect("registered diff menu template");
+                let action = command(intent);
+                if let Some(chord) = crate::workspace_widget::menu_shortcut(descriptor.action, &runtime.keyboard_shortcuts) { bindings.insert(chord, action); }
+                items.push(if available { Item::Button(descriptor.label, None, action) } else { Item::ButtonDisabled(descriptor.label, None, action) });
+            }
             widget::menu::items(&bindings, items)
         })
     }
@@ -876,6 +856,7 @@ mod tests {
             assert_eq!(mode,DiffMode::Inline);
             assert_eq!(sources,runtime.diff_source_key().unwrap().sources);
             assert_eq!(command.command_id(),id);
+            assert_eq!(crate::workspace_widget::shortcut_descriptor_by_id(id).expect("every menu command is registered").id(), id);
             if let DiffCommand::CopyLineReference { row: captured,side } | DiffCommand::OpenInEditor { row: captured,side } = command { assert_eq!(captured,row); assert_eq!(side,Side::Old); }
         }
         assert!(!runtime.diff_command_available("unknown"));

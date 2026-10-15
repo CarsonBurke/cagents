@@ -316,6 +316,14 @@ pub struct KeyboardShortcuts {
     pub settings_accounts: Vec<String>,
     pub settings_notifications: Vec<String>,
     pub settings_about: Vec<String>,
+    pub diff_copy: Vec<String>,
+    pub diff_copy_old: Vec<String>,
+    pub diff_copy_new: Vec<String>,
+    pub diff_copy_patch: Vec<String>,
+    pub diff_copy_line_reference: Vec<String>,
+    pub diff_open_in_editor: Vec<String>,
+    pub diff_select_all: Vec<String>,
+
     pub next_diagnostic: Vec<String>,
     pub previous_diagnostic: Vec<String>,
 
@@ -432,6 +440,14 @@ impl Default for KeyboardShortcuts {
             settings_accounts: Vec::new(),
             settings_notifications: Vec::new(),
             settings_about: Vec::new(),
+            diff_copy: vec!["Ctrl+C".into()],
+            diff_copy_old: vec![],
+            diff_copy_new: vec![],
+            diff_copy_patch: vec![],
+            diff_copy_line_reference: vec![],
+            diff_open_in_editor: vec![],
+            diff_select_all: vec!["Ctrl+A".into()],
+
             next_diagnostic: vec!["F8".into()],
             previous_diagnostic: vec!["Shift+F8".into()],
 
@@ -498,7 +514,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 105] {
+    pub fn actions(&self) -> [&Vec<String>; 112] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -574,6 +590,14 @@ impl KeyboardShortcuts {
             &self.settings_accounts,
             &self.settings_notifications,
             &self.settings_about,
+            &self.diff_copy,
+            &self.diff_copy_old,
+            &self.diff_copy_new,
+            &self.diff_copy_patch,
+            &self.diff_copy_line_reference,
+            &self.diff_open_in_editor,
+            &self.diff_select_all,
+
             &self.next_diagnostic,
             &self.previous_diagnostic,
 
@@ -614,7 +638,7 @@ impl KeyboardShortcuts {
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 105] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 112] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -690,6 +714,13 @@ impl KeyboardShortcuts {
             &mut self.settings_accounts,
             &mut self.settings_notifications,
             &mut self.settings_about,
+            &mut self.diff_copy,
+            &mut self.diff_copy_old,
+            &mut self.diff_copy_new,
+            &mut self.diff_copy_patch,
+            &mut self.diff_copy_line_reference,
+            &mut self.diff_open_in_editor,
+            &mut self.diff_select_all,
             &mut self.next_diagnostic,
             &mut self.previous_diagnostic,
             &mut self.end_conversation,
@@ -770,7 +801,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 105] = [
+const SHORTCUT_ACTIONS: [&str; 112] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -845,6 +876,14 @@ const SHORTCUT_ACTIONS: [&str; 105] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "diff_copy",
+    "diff_copy_old",
+    "diff_copy_new",
+    "diff_copy_patch",
+    "diff_copy_line_reference",
+    "diff_open_in_editor",
+    "diff_select_all",
+
     "next_diagnostic",
     "previous_diagnostic",
 
@@ -1034,7 +1073,10 @@ pub fn shortcut_binding_conflicts(left: &str, right: &str, binding: ShortcutBind
 }
 
 pub fn shortcut_chord_refusal_for(action: &str, binding: ShortcutBinding) -> Option<&'static str> {
-    if is_editor_command(action) && text_editing_shortcut_conflict(binding).is_some() {
+    if (is_editor_command(action) && text_editing_shortcut_conflict(binding).is_some())
+        || (action == "diff_copy" && parse_shortcut("Ctrl+C").ok() == Some(binding))
+        || (action == "diff_select_all" && parse_shortcut("Ctrl+A").ok() == Some(binding))
+    {
         None
     } else {
         shortcut_chord_refusal(binding)
@@ -2046,7 +2088,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 100] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 107] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2116,6 +2158,14 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 100] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "diff_copy",
+    "diff_copy_old",
+    "diff_copy_new",
+    "diff_copy_patch",
+    "diff_copy_line_reference",
+    "diff_open_in_editor",
+    "diff_select_all",
+
     "next_diagnostic",
     "previous_diagnostic",
 

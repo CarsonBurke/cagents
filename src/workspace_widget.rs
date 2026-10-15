@@ -82,6 +82,14 @@ pub enum GlobalShortcut {
     SettingsAccounts,
     SettingsNotifications,
     SettingsAbout,
+    DiffCopy,
+    DiffCopyOld,
+    DiffCopyNew,
+    DiffCopyPatch,
+    DiffCopyLineReference,
+    DiffOpenInEditor,
+    DiffSelectAll,
+
     NextDiagnostic,
     PreviousDiagnostic,
 
@@ -229,6 +237,14 @@ impl GlobalShortcut {
             Self::SettingsAccounts => "settings_accounts",
             Self::SettingsNotifications => "settings_notifications",
             Self::SettingsAbout => "settings_about",
+            Self::DiffCopy => "diff_copy",
+            Self::DiffCopyOld => "diff_copy_old",
+            Self::DiffCopyNew => "diff_copy_new",
+            Self::DiffCopyPatch => "diff_copy_patch",
+            Self::DiffCopyLineReference => "diff_copy_line_reference",
+            Self::DiffOpenInEditor => "diff_open_in_editor",
+            Self::DiffSelectAll => "diff_select_all",
+
             Self::NextDiagnostic => "next_diagnostic",
             Self::PreviousDiagnostic => "previous_diagnostic",
 
@@ -417,6 +433,7 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub editor_commands: u8,
+    pub diff_commands: u8,
     pub can_navigate_diagnostics: bool,
     pub can_search_project: bool,
     pub has_attention: bool,
@@ -486,6 +503,9 @@ impl ShortcutDescriptor {
             && !self.scope.applies_to(context.focused)
         {
             return false;
+        }
+        if let Some(bit) = diff_command_bit(self.action) {
+            return context.diff_commands & bit != 0;
         }
         if let Some(bit) = editor_command_bit(self.action) {
             return context.editor_commands & bit != 0;
@@ -1001,6 +1021,49 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         scope: ShortcutScope::Workspace,
     },
     ShortcutDescriptor {
+        action: GlobalShortcut::DiffCopy,
+        label: "Copy",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffCopyOld,
+        label: "Copy old side",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffCopyNew,
+        label: "Copy new side",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffCopyPatch,
+        label: "Copy as patch",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffCopyLineReference,
+        label: "Copy line reference",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffOpenInEditor,
+        label: "Open working file in editor at line",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::DiffSelectAll,
+        label: "Select all diff rows",
+        repeatable: false,
+        scope: ShortcutScope::Review,
+    },
+
+    ShortcutDescriptor {
         action: GlobalShortcut::NextDiagnostic,
         label: "Next diagnostic",
         repeatable: true,
@@ -1149,6 +1212,14 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::SettingsAccounts => &shortcuts.settings_accounts,
         GlobalShortcut::SettingsNotifications => &shortcuts.settings_notifications,
         GlobalShortcut::SettingsAbout => &shortcuts.settings_about,
+        GlobalShortcut::DiffCopy => &shortcuts.diff_copy,
+        GlobalShortcut::DiffCopyOld => &shortcuts.diff_copy_old,
+        GlobalShortcut::DiffCopyNew => &shortcuts.diff_copy_new,
+        GlobalShortcut::DiffCopyPatch => &shortcuts.diff_copy_patch,
+        GlobalShortcut::DiffCopyLineReference => &shortcuts.diff_copy_line_reference,
+        GlobalShortcut::DiffOpenInEditor => &shortcuts.diff_open_in_editor,
+        GlobalShortcut::DiffSelectAll => &shortcuts.diff_select_all,
+
         GlobalShortcut::NextDiagnostic => &shortcuts.next_diagnostic,
         GlobalShortcut::PreviousDiagnostic => &shortcuts.previous_diagnostic,
 
@@ -1680,6 +1751,23 @@ fn global_shortcut_descriptor(
                 parse_shortcut(chord).is_ok_and(|binding| shortcut_matches(binding, key, physical_key, modifiers))
             })
     })
+}
+
+pub const fn diff_command_bit(command: GlobalShortcut) -> Option<u8> {
+    Some(match command {
+        GlobalShortcut::DiffCopy => 1,
+        GlobalShortcut::DiffCopyOld => 2,
+        GlobalShortcut::DiffCopyNew => 4,
+        GlobalShortcut::DiffCopyPatch => 8,
+        GlobalShortcut::DiffCopyLineReference => 16,
+        GlobalShortcut::DiffOpenInEditor => 32,
+        GlobalShortcut::DiffSelectAll => 64,
+        _ => return None,
+    })
+}
+
+pub fn shortcut_descriptor_by_id(id: &str) -> Option<&'static ShortcutDescriptor> {
+    GLOBAL_SHORTCUT_DESCRIPTORS.iter().find(|descriptor| descriptor.id() == id)
 }
 
 pub const fn editor_command_bit(command: GlobalShortcut) -> Option<u8> {
@@ -5667,6 +5755,32 @@ mod tests {
             ),
             "Close terminal — unbound"
         );
+    }
+
+    #[test]
+    fn diff_clipboard_bindings_remap_and_respect_text_input_focus() {
+        use keyboard::key::Code;
+        let mut shortcuts = KeyboardShortcuts::default();
+        for (key, code, action) in [("c", Code::KeyC, GlobalShortcut::DiffCopy), ("a", Code::KeyA, GlobalShortcut::DiffSelectAll)] {
+            let event = key_press(key, code, keyboard::Modifiers::CTRL, false);
+            assert_eq!(global_shortcut(&event, &shortcuts, FocusedPane::Review), Some(action));
+            for focused in [FocusedPane::TextInput, FocusedPane::Chat, FocusedPane::Terminal, FocusedPane::Other] {
+                assert_eq!(global_shortcut(&event, &shortcuts, focused), None);
+            }
+        }
+        shortcuts.diff_copy = vec!["Ctrl+Alt+C".into()];
+        shortcuts.diff_select_all.clear();
+        assert!(shortcuts.fault().is_none());
+        assert_eq!(global_shortcut(&key_press("c", Code::KeyC, keyboard::Modifiers::CTRL, false), &shortcuts, FocusedPane::Review), None);
+        assert_eq!(global_shortcut(&key_press("a", Code::KeyA, keyboard::Modifiers::CTRL, false), &shortcuts, FocusedPane::Review), None);
+        assert_eq!(global_shortcut(&key_press("c", Code::KeyC, keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT, false), &shortcuts, FocusedPane::Review), Some(GlobalShortcut::DiffCopy));
+        let descriptor = shortcut_descriptor(GlobalShortcut::DiffCopy);
+        let mut context = CommandContext { focused: FocusedPane::Review, ..Default::default() };
+        assert!(!descriptor.available(&context));
+        context.diff_commands = diff_command_bit(GlobalShortcut::DiffCopy).unwrap();
+        assert!(descriptor.available(&context));
+        context.focused = FocusedPane::TextInput;
+        assert!(!descriptor.available(&context));
     }
 
     #[test]

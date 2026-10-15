@@ -1043,6 +1043,11 @@ impl Cagents {
                 _ => workspace_widget::FocusedPane::Other,
             },
             can_navigate_diagnostics: card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.diagnostic_navigation_available())),
+            diff_commands: card.map_or(0, |id| match self.cards.get(&id) {
+                Some(CardRuntime::Repository(runtime)) => Some(runtime.as_ref()),
+                Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
+                _ => None,
+            }.map_or(0, |runtime| workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| workspace_widget::diff_command_bit(descriptor.action).filter(|_| runtime.diff_command_available(descriptor.id()))).fold(0, |flags, bit| flags | bit))),
             editor_commands: card.map_or(0, |id| match self.cards.get(&id) { Some(CardRuntime::Repository(runtime)) => runtime.editor_command_capabilities(), _ => 0 }),
             pane_index,
             pane_count: self.workspace.order().count(),
@@ -1170,6 +1175,14 @@ impl Cagents {
         }
         match command {
             Command::EditorUndo | Command::EditorRedo | Command::EditorCut | Command::EditorCopy | Command::EditorPaste | Command::EditorSelectAll | Command::NextDiagnostic | Command::PreviousDiagnostic => self.workspace.focused().and_then(|card| repository_widget::editor_command_action(card, command)).map_or_else(Task::none, |action| self.update(Message::Repository(action))),
+            Command::DiffCopy | Command::DiffCopyOld | Command::DiffCopyNew | Command::DiffCopyPatch | Command::DiffCopyLineReference | Command::DiffOpenInEditor | Command::DiffSelectAll => {
+                let action = self.workspace.focused().and_then(|card| match self.cards.get(&card) {
+                    Some(CardRuntime::Repository(runtime)) => runtime.diff_command_action(card, command.id()),
+                    Some(CardRuntime::PullRequests(pane)) => pane.runtime.diff_command_action(card, command.id()),
+                    _ => None,
+                });
+                action.map_or_else(Task::none, |action| self.update(Message::Repository(action)))
+            }
             Command::NewBrowser => self.update(Message::NewBrowser),
             Command::MarkAllRead => self.update(Message::Sidebar(SidebarAction::MarkAllRead)),
             Command::SearchInProject => self.update(Message::SelectContextTab(ContextTab::Search)),
@@ -1296,6 +1309,13 @@ impl Cagents {
             | Command::EditorPaste
             | Command::EditorSelectAll
             | Command::EndConversation
+            | Command::DiffCopy
+            | Command::DiffCopyOld
+            | Command::DiffCopyNew
+            | Command::DiffCopyPatch
+            | Command::DiffCopyLineReference
+            | Command::DiffOpenInEditor
+            | Command::DiffSelectAll
             | Command::NextDiagnostic
             | Command::PreviousDiagnostic
             | Command::CopyBranch
@@ -1522,6 +1542,14 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => Some(Command::SettingsAccounts),
             Self::ShortcutSettingsNotifications => Some(Command::SettingsNotifications),
             Self::ShortcutSettingsAbout => Some(Command::SettingsAbout),
+            Self::ShortcutDiffCopy => Some(Command::DiffCopy),
+            Self::ShortcutDiffCopyOld => Some(Command::DiffCopyOld),
+            Self::ShortcutDiffCopyNew => Some(Command::DiffCopyNew),
+            Self::ShortcutDiffCopyPatch => Some(Command::DiffCopyPatch),
+            Self::ShortcutDiffCopyLineReference => Some(Command::DiffCopyLineReference),
+            Self::ShortcutDiffOpenInEditor => Some(Command::DiffOpenInEditor),
+            Self::ShortcutDiffSelectAll => Some(Command::DiffSelectAll),
+
             Self::ShortcutNextDiagnostic => Some(Command::NextDiagnostic),
             Self::ShortcutPreviousDiagnostic => Some(Command::PreviousDiagnostic),
             Self::ShortcutEndConversation => Some(Command::EndConversation),
@@ -1664,6 +1692,14 @@ impl ShortcutDraft {
                 self.settings_notifications.as_str(),
             ),
             (Command::SettingsAbout, self.settings_about.as_str()),
+            (Command::DiffCopy, self.diff_copy.as_str()),
+            (Command::DiffCopyOld, self.diff_copy_old.as_str()),
+            (Command::DiffCopyNew, self.diff_copy_new.as_str()),
+            (Command::DiffCopyPatch, self.diff_copy_patch.as_str()),
+            (Command::DiffCopyLineReference, self.diff_copy_line_reference.as_str()),
+            (Command::DiffOpenInEditor, self.diff_open_in_editor.as_str()),
+            (Command::DiffSelectAll, self.diff_select_all.as_str()),
+
             (Command::NextDiagnostic, self.next_diagnostic.as_str()),
             (Command::PreviousDiagnostic, self.previous_diagnostic.as_str()),
             (Command::EndConversation, self.end_conversation.as_str()),
