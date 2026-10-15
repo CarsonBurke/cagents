@@ -9,7 +9,7 @@ use std::{
         Arc, Condvar, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
-    thread::{self, JoinHandle},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -48,6 +48,7 @@ type WakeCallback = dyn Fn(TerminalWake) + Send + Sync + 'static;
 
 struct WorkerStop {
     requested: AtomicBool,
+    async_wake: tokio::sync::Notify,
     worker: OnceLock<thread::Thread>,
     notification_tx: Sender<()>,
     notification_rx: Receiver<()>,
@@ -59,6 +60,7 @@ impl Default for WorkerStop {
         let (notification_tx, notification_rx) = crossbeam_channel::bounded(1);
         Self {
             requested: AtomicBool::new(false),
+            async_wake: tokio::sync::Notify::new(),
             worker: OnceLock::new(),
             notification_tx,
             notification_rx,
@@ -74,6 +76,7 @@ impl WorkerStop {
 
     fn request(&self) {
         self.requested.store(true, Ordering::Release);
+        self.async_wake.notify_one();
         if let Ok(connection) = self.connection.lock()
             && let Some(connection) = connection.as_ref()
         {
@@ -200,6 +203,7 @@ struct HostedPublishedState {
     activity_current: AtomicBool,
     acknowledged_generation: AtomicU64,
     acknowledgement_tx: Sender<()>,
+    work_available: tokio::sync::Notify,
     acknowledgement_rx: Receiver<()>,
     /// The newest generation, or repaint reason, a wake has already announced
     /// to the UI.
@@ -239,6 +243,7 @@ impl HostedPublishedState {
             activity_current: AtomicBool::new(false),
             acknowledged_generation: AtomicU64::new(0),
             acknowledgement_tx,
+            work_available: tokio::sync::Notify::new(),
             acknowledgement_rx,
             announced_generation: AtomicU64::new(0),
             semantic_wake_pending: AtomicBool::new(false),
@@ -496,6 +501,7 @@ impl HostedPublishedState {
         // Wake after publication even if Hibernate was already drained before
         // the UI stored the placeholder and its expiration deadline.
         let _ = self.acknowledgement_tx.try_send(());
+        self.work_available.notify_one();
     }
 
     fn expire_retained(&self, now: Instant) {
@@ -568,6 +574,7 @@ impl HostedPublishedState {
             // The atomic carries the newest generation; one queued edge is
             // sufficient regardless of how many frames the UI acknowledges.
             let _ = self.acknowledgement_tx.try_send(());
+        self.work_available.notify_one();
         }
     }
 
@@ -790,18 +797,15 @@ struct HostedHandleInner {
     events: Receiver<TerminalEvent>,
     published: Arc<HostedPublishedState>,
     stop: Arc<WorkerStop>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Drop for HostedHandleInner {
     fn drop(&mut self) {
         self.stop.request();
         let _ = self.commands.try_send(ClientCommand::Stop);
-        if let Ok(worker) = self.worker.get_mut()
-            && let Some(worker) = worker.take()
-            && worker.thread().id() != thread::current().id()
-        {
-            let _ = worker.join();
+        if let Ok(worker) = self.worker.get_mut() && let Some(worker) = worker.take() {
+            worker.abort();
         }
     }
 }
@@ -906,21 +910,12 @@ impl HostedTerminalHandle {
         let stop = Arc::new(WorkerStop::default());
         let worker_stop = Arc::clone(&stop);
         let worker_published = Arc::clone(&published);
-        let worker = thread::Builder::new()
-            .name(format!("hosted-terminal-{terminal_id}"))
-            .spawn(move || {
-                worker_stop.register_current_thread();
-                client_loop(
-                    &socket,
-                    terminal_id,
-                    intent,
-                    command_rx,
-                    event_tx,
-                    worker_published,
-                    worker_stop,
-                );
-            })
-            .map_err(HostedTerminalStartError::Worker)?;
+        let runtime = super::transport::runtime().map_err(|error| HostedTerminalStartError::Worker(io::Error::other(error)))?;
+        let worker = runtime.spawn(async move {
+            client_loop(
+                &socket, terminal_id, intent, command_rx, event_tx, worker_published, worker_stop,
+            ).await;
+        });
 
         Ok(Self {
             inner: Arc::new(HostedHandleInner {
@@ -1152,7 +1147,9 @@ impl HostedTerminalHandle {
             .map_err(|error| match error {
                 TrySendError::Full(_) => TerminalSendError::Full,
                 TrySendError::Disconnected(_) => TerminalSendError::Closed,
-            })
+            })?;
+        self.inner.published.work_available.notify_one();
+        Ok(())
     }
 }
 
@@ -1434,71 +1431,52 @@ enum ServerRead {
     Closed,
 }
 
-/// One blocking reader owns the socket clone. The client loop selects between
-/// its bounded inbox and the command channel, so a quiet daemon can never delay
-/// keyboard input. The bounded channel is allocated once per connection rather
-/// than once per frame.
+/// Socket reads share the transport reactor. A bounded inbox and explicit
+/// read credit preserve backpressure without parking one OS thread per pane.
 struct ConnectionIo {
-    writer: UnixStream,
+    writer: Arc<tokio::io::unix::AsyncFd<UnixStream>>,
     codec: FrameCodec,
     incoming: Option<Receiver<ServerRead>>,
-    reader: Option<JoinHandle<()>>,
+    credit: Arc<tokio::sync::Notify>,
+    reader: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ConnectionIo {
-    fn new(writer: UnixStream, terminal_id: TerminalId) -> io::Result<Self> {
-        writer.set_read_timeout(None)?;
-        let mut reader_stream = writer.try_clone()?;
+    fn new(writer: Arc<tokio::io::unix::AsyncFd<UnixStream>>, published: Arc<HostedPublishedState>) -> io::Result<Self> {
         let (incoming_tx, incoming_rx) = crossbeam_channel::bounded(EVENT_CAPACITY);
-        let reader = thread::Builder::new()
-            .name(format!("hosted-terminal-reader-{terminal_id}"))
-            .spawn(move || {
-                let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let socket = Arc::clone(&writer);
+        let credit = Arc::new(tokio::sync::Notify::new());
+        let read_credit = Arc::clone(&credit);
+        let reader = super::transport::runtime().map_err(io::Error::other)?.spawn(async move {
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            loop {
+                let mut message = match super::transport::read::<ServerEnvelope>(&socket, &mut codec).await {
+                    Ok(Some(envelope)) => ServerRead::Envelope(Box::new(envelope)),
+                    Ok(None) | Err(_) => ServerRead::Closed,
+                };
+                let closed = matches!(message, ServerRead::Closed);
                 loop {
-                    let message = match codec.read::<ServerEnvelope>(&mut reader_stream) {
-                        Ok(Some(envelope)) => ServerRead::Envelope(Box::new(envelope)),
-                        Ok(None) | Err(_) => ServerRead::Closed,
-                    };
-                    let closed = matches!(message, ServerRead::Closed);
-                    if incoming_tx.send(message).is_err() || closed {
-                        return;
+                    match incoming_tx.try_send(message) {
+                        Ok(()) => { published.work_available.notify_one(); break; },
+                        Err(TrySendError::Disconnected(_)) => return,
+                        Err(TrySendError::Full(pending)) => message = pending,
                     }
+                    read_credit.notified().await;
                 }
-            })?;
-        Ok(Self {
-            writer,
-            codec: FrameCodec::new(MAX_FRAME_BYTES),
-            incoming: Some(incoming_rx),
-            reader: Some(reader),
-        })
+                if closed { return; }
+            }
+        });
+        Ok(Self { writer, codec: FrameCodec::new(MAX_FRAME_BYTES), incoming: Some(incoming_rx), credit, reader: Some(reader) })
     }
-
-    fn writer(&mut self) -> (&mut UnixStream, &mut FrameCodec) {
-        (&mut self.writer, &mut self.codec)
-    }
-
-    fn incoming(&self) -> &Receiver<ServerRead> {
-        self.incoming
-            .as_ref()
-            .expect("connection inbox exists until close")
-    }
-
+    fn writer(&mut self) -> (&tokio::io::unix::AsyncFd<UnixStream>, &mut FrameCodec) { (&self.writer, &mut self.codec) }
+    fn incoming(&self) -> &Receiver<ServerRead> { self.incoming.as_ref().expect("inbox until close") }
     fn close(&mut self) {
-        // Dropping the inbox releases a reader blocked on its bounded send;
-        // shutting down the socket releases one blocked in `read_frame`.
         self.incoming.take();
-        let _ = self.writer.shutdown(Shutdown::Both);
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
-        }
+        let _ = self.writer.get_ref().shutdown(Shutdown::Both);
+        if let Some(reader) = self.reader.take() { reader.abort(); }
     }
 }
-
-impl Drop for ConnectionIo {
-    fn drop(&mut self) {
-        self.close();
-    }
-}
+impl Drop for ConnectionIo { fn drop(&mut self) { self.close(); } }
 
 #[derive(Debug)]
 enum ClientWork {
@@ -1511,6 +1489,7 @@ enum ClientWork {
     ServerClosed,
 }
 
+#[cfg(test)]
 fn wait_for_client_work(
     stop: &WorkerStop,
     commands: &Receiver<ClientCommand>,
@@ -1530,6 +1509,7 @@ fn wait_for_client_work(
     }
 }
 
+#[cfg(test)]
 fn wait_for_server_or_stop(
     stop: &WorkerStop,
     incoming: &Receiver<ServerRead>,
@@ -1551,17 +1531,58 @@ fn server_work(message: Result<ServerRead, crossbeam_channel::RecvError>) -> Cli
     }
 }
 
+async fn wait_for_work_async(
+    stop: &WorkerStop, commands: Option<&Receiver<ClientCommand>>,
+    incoming: &Receiver<ServerRead>, published: &HostedPublishedState,
+    credit: &tokio::sync::Notify,
+) -> ClientWork {
+    loop {
+        let changed = published.work_available.notified();
+        let stopping = stop.async_wake.notified();
+        tokio::pin!(changed, stopping);
+        changed.as_mut().enable();
+        stopping.as_mut().enable();
+        if stop.is_requested() { return ClientWork::Stop; }
+        if published.acknowledgement_rx.try_recv().is_ok() { return ClientWork::Acknowledge; }
+        let expires = published.retained.load().as_ref().map(|frame| frame.expires);
+        if expires.is_some_and(|deadline| deadline <= Instant::now()) { return ClientWork::RetainedExpired; }
+        if let Some(commands) = commands {
+            match commands.try_recv() {
+                Ok(command) => return ClientWork::Command(command),
+                Err(TryRecvError::Disconnected) => return ClientWork::CommandsClosed,
+                Err(TryRecvError::Empty) => {},
+            }
+        }
+        match incoming.try_recv() {
+            Ok(message) => { credit.notify_one(); return server_work(Ok(message)); },
+            Err(TryRecvError::Disconnected) => return ClientWork::ServerClosed,
+            Err(TryRecvError::Empty) => {},
+        }
+        let expiration = async {
+            match expires {
+                Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! { biased;
+            _ = stopping => {},
+            _ = changed => {},
+            _ = expiration => {},
+        }
+    }
+}
+
 struct ConnectionContext<'a> {
     socket: &'a Path,
     terminal_id: TerminalId,
     intent: &'a ConnectionIntent,
     commands: &'a Receiver<ClientCommand>,
     events: &'a Sender<TerminalEvent>,
-    published: &'a HostedPublishedState,
+    published: &'a Arc<HostedPublishedState>,
     stop: &'a WorkerStop,
 }
 
-fn client_loop(
+async fn client_loop(
     socket: &Path,
     terminal_id: TerminalId,
     intent: ConnectionIntent,
@@ -1590,7 +1611,7 @@ fn client_loop(
         let end = serve_connection(&connection, &mut carried, || {
             reconnect_started = None;
             reconnect_delay = INITIAL_RECONNECT_DELAY;
-        });
+        }).await;
         published.invalidate_activity();
         let _ = published.observe_agent_activity(&events, None);
         match end {
@@ -1598,7 +1619,7 @@ fn client_loop(
             ConnectionEnd::Retry => {
                 let started = reconnect_started.get_or_insert_with(Instant::now);
                 if started.elapsed() >= DAEMON_READY_TIMEOUT {
-                    reject_handshake(
+                    reject_handshake_async(
                         &events,
                         &published,
                         &stop,
@@ -1607,13 +1628,13 @@ fn client_loop(
                             "daemon connection was lost; rediscovery is required before this terminal can continue",
                             false,
                         ),
-                    );
+                    ).await;
                     break;
                 }
             }
         }
 
-        if wait_before_reconnect(&stop, &commands, &mut carried, reconnect_delay)
+        if wait_before_reconnect_async(&stop, &commands, &published, &mut carried, reconnect_delay).await
             == ConnectionEnd::Stop
         {
             break;
@@ -1628,6 +1649,7 @@ fn client_loop(
     published.fail_attachment("hosted terminal connection stopped".to_owned());
 }
 
+#[cfg(test)]
 fn wait_before_reconnect(
     stop: &WorkerStop,
     commands: &Receiver<ClientCommand>,
@@ -1665,6 +1687,32 @@ fn wait_before_reconnect(
         }
     }
 }
+async fn wait_before_reconnect_async(
+    stop: &WorkerStop, commands: &Receiver<ClientCommand>, published: &HostedPublishedState,
+    carried: &mut Option<ClientCommand>, delay: Duration,
+) -> ConnectionEnd {
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        let changed = published.work_available.notified();
+        let stopping = stop.async_wake.notified();
+        tokio::pin!(changed, stopping);
+        changed.as_mut().enable(); stopping.as_mut().enable();
+        if stop.is_requested() { return ConnectionEnd::Stop; }
+        if carried.is_none() {
+            match commands.try_recv() {
+                Ok(ClientCommand::Stop) | Err(TryRecvError::Disconnected) => return ConnectionEnd::Stop,
+                Ok(command) => { *carried = Some(command); return ConnectionEnd::Retry; },
+                Err(TryRecvError::Empty) => {},
+            }
+        }
+        tokio::select! { biased;
+            _ = stopping => {},
+            _ = changed => {},
+            _ = tokio::time::sleep_until(deadline) => return ConnectionEnd::Retry,
+        }
+    }
+}
+
 fn coalesce_client_scroll_command(
     command: ClientCommand,
     commands: &Receiver<ClientCommand>,
@@ -1687,7 +1735,7 @@ fn coalesce_client_scroll_command(
     ClientCommand::Scroll(TerminalScroll::Lines(delta))
 }
 
-fn serve_connection(
+async fn serve_connection(
     context: &ConnectionContext<'_>,
     carried: &mut Option<ClientCommand>,
     mut did_attach: impl FnMut(),
@@ -1705,23 +1753,17 @@ fn serve_connection(
     if stop.is_requested() {
         return ConnectionEnd::Stop;
     }
-    let mut stream = match UnixStream::connect(socket) {
+    let stream = match tokio::net::UnixStream::connect(socket).await.and_then(|stream| stream.into_std()) {
         Ok(stream) => stream,
         Err(_) => return ConnectionEnd::Retry,
     };
-    let _connection = match stop.register_connection(&stream) {
+    let stream = match tokio::io::unix::AsyncFd::new(stream) {
+        Ok(stream) => Arc::new(stream), Err(_) => return ConnectionEnd::Retry,
+    };
+    let _connection = match stop.register_connection(stream.get_ref()) {
         Ok(registration) => registration,
         Err(_) => return ConnectionEnd::Retry,
     };
-    if stream
-        .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL))
-        .is_err()
-        || stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
 
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
@@ -1739,7 +1781,8 @@ fn serve_connection(
             }],
         },
     };
-    if write_frame(&mut stream, &connect).is_err() {
+    let mut connect_codec = FrameCodec::new(MAX_FRAME_BYTES);
+    if connect_codec.encode(&connect).is_err() || write_encoded(&stream, &connect_codec).await.is_err() {
         return ConnectionEnd::Retry;
     }
 
@@ -1755,7 +1798,10 @@ fn serve_connection(
         if Instant::now() >= handshake_deadline {
             return ConnectionEnd::Retry;
         }
-        let envelope = match handshake_codec.read::<ServerEnvelope>(&mut stream) {
+        let read_deadline = (Instant::now() + HANDSHAKE_POLL_INTERVAL).min(handshake_deadline);
+        let frame = tokio::time::timeout_at(tokio::time::Instant::from_std(read_deadline), super::transport::read::<ServerEnvelope>(&stream, &mut handshake_codec)).await
+            .unwrap_or_else(|_| Err(FrameError::Io(io::ErrorKind::TimedOut.into())));
+        let envelope = match frame {
             Ok(Some(envelope)) => envelope,
             Ok(None) => return ConnectionEnd::Retry,
             Err(FrameError::Io(error)) if is_timeout(&error) => {
@@ -1800,7 +1846,7 @@ fn serve_connection(
         let unsolicited = envelope.request_id.is_none();
         if envelope.request_id != Some(connect_id) {
             if unsolicited && let ServerMessage::Error(error) = envelope.message {
-                return reject_handshake(events, published, stop, error);
+                return reject_handshake_async(events, published, stop, error).await;
             }
             return ConnectionEnd::Retry;
         }
@@ -1809,7 +1855,7 @@ fn serve_connection(
                 response: ServerResponse::Connected { proof, resumed },
             } => {
                 if envelope.proof != proof || !published.pin_proof(&proof) {
-                    return reject_handshake(
+                    return reject_handshake_async(
                         events,
                         published,
                         stop,
@@ -1818,7 +1864,7 @@ fn serve_connection(
                             "the daemon returned a different or incomplete session proof",
                             false,
                         ),
-                    );
+                    ).await;
                 }
                 let attached = resumed
                     .iter()
@@ -1838,17 +1884,17 @@ fn serve_connection(
                     did_attach();
                 }
                 #[cfg(feature = "ui")]
-                crate::daemon_health::frame(&stream, None, health_request);
+                crate::daemon_health::frame(stream.get_ref(), None, health_request);
                 break (proof, attached);
             }
             ServerMessage::Error(error) => {
-                return reject_handshake(events, published, stop, error);
+                return reject_handshake_async(events, published, stop, error).await;
             }
             _ => return ConnectionEnd::Retry,
         }
     };
 
-    let mut connection = match ConnectionIo::new(stream, terminal_id) {
+    let mut connection = match ConnectionIo::new(stream, Arc::clone(published)) {
         Ok(connection) => connection,
         Err(_) => return ConnectionEnd::Retry,
     };
@@ -1892,7 +1938,7 @@ fn serve_connection(
             &mut pending,
             kind,
             request,
-        )
+        ).await
         .is_err()
         {
             return ConnectionEnd::Retry;
@@ -1914,7 +1960,7 @@ fn serve_connection(
             terminal_id,
             visibility: published.desired_visibility(),
         },
-    )
+    ).await
     .is_err()
     {
         return ConnectionEnd::Retry;
@@ -1932,7 +1978,7 @@ fn serve_connection(
             &mut pending,
             PendingRequest::Command("restore terminal output observation"),
             ClientRequest::TerminalAcknowledge { terminal_id, epoch },
-        )
+        ).await
         .is_err()
     {
         return ConnectionEnd::Retry;
@@ -1983,7 +2029,7 @@ fn serve_connection(
                 &mut pending,
                 pending_kind,
                 command.into_request(terminal_id),
-            )
+            ).await
             .is_err()
             {
                 return ConnectionEnd::Retry;
@@ -2003,7 +2049,7 @@ fn serve_connection(
                         terminal_id,
                         generation: acknowledged,
                     },
-                )
+                ).await
                 .is_err()
                 {
                     return ConnectionEnd::Retry;
@@ -2012,11 +2058,9 @@ fn serve_connection(
             }
         }
 
-        let work = if pending.len() < MAX_IN_FLIGHT_REQUESTS {
-            wait_for_client_work(stop, commands, connection.incoming(), published)
-        } else {
-            wait_for_server_or_stop(stop, connection.incoming(), published)
-        };
+        let work = wait_for_work_async(stop,
+            (pending.len() < MAX_IN_FLIGHT_REQUESTS).then_some(*commands),
+            connection.incoming(), published, &connection.credit).await;
         let envelope = match work {
             ClientWork::Acknowledge | ClientWork::RetainedExpired => continue,
             ClientWork::Stop => {
@@ -2125,7 +2169,7 @@ fn serve_connection(
                                     terminal_id,
                                     after_generation: 0,
                                 },
-                            )
+                            ).await
                             .is_err()
                             {
                                 return ConnectionEnd::Retry;
@@ -2238,7 +2282,7 @@ fn serve_connection(
                             terminal_id,
                             after_generation: published.snapshot_cursor(),
                         },
-                    )
+                    ).await
                     .is_err()
                     {
                         return ConnectionEnd::Retry;
@@ -2261,7 +2305,7 @@ fn serve_connection(
                             terminal_id,
                             after_generation: 0,
                         },
-                    )
+                    ).await
                     .is_err()
                     {
                         return ConnectionEnd::Retry;
@@ -2302,7 +2346,7 @@ fn serve_connection(
                             terminal_id,
                             after_generation: published.snapshot_cursor(),
                         },
-                    )
+                    ).await
                     .is_err()
                     {
                         return ConnectionEnd::Retry;
@@ -2318,8 +2362,8 @@ fn serve_connection(
     }
 }
 
-fn send_request(
-    (stream, codec): (&mut UnixStream, &mut FrameCodec),
+async fn send_request(
+    (stream, codec): (&tokio::io::unix::AsyncFd<UnixStream>, &mut FrameCodec),
     proof: &HostSessionProof,
     next_request_id: &mut u64,
     pending: &mut BTreeMap<u64, PendingRequest>,
@@ -2328,8 +2372,7 @@ fn send_request(
 ) -> Result<(), FrameError> {
     let request_id = *next_request_id;
     *next_request_id = (*next_request_id).wrapping_add(1).max(2);
-    codec.write(
-        stream,
+    codec.encode(
         &ClientEnvelope {
             version: PROTOCOL_VERSION,
             request_id,
@@ -2337,8 +2380,14 @@ fn send_request(
             request,
         },
     )?;
+    write_encoded(stream, codec).await?;
     pending.insert(request_id, kind);
     Ok(())
+}
+
+async fn write_encoded(socket: &tokio::io::unix::AsyncFd<UnixStream>, codec: &FrameCodec) -> Result<(), FrameError> {
+    tokio::time::timeout(Duration::from_secs(5), super::transport::write(socket, codec.encoded())).await
+        .unwrap_or_else(|_| Err(io::ErrorKind::TimedOut.into())).map_err(FrameError::Io)
 }
 
 fn is_timeout(error: &io::Error) -> bool {
@@ -2392,7 +2441,13 @@ fn is_committed_daemon_shutdown(error: &ProtocolError) -> bool {
             == "Daemon upgrade/shutdown is committed; no further control mutations are accepted"
 }
 
-fn reject_handshake(
+#[cfg(test)]
+fn reject_handshake(events: &Sender<TerminalEvent>, published: &HostedPublishedState,
+    stop: &WorkerStop, error: ProtocolError) -> ConnectionEnd {
+    super::transport::runtime().unwrap().block_on(reject_handshake_async(events, published, stop, error))
+}
+
+async fn reject_handshake_async(
     events: &Sender<TerminalEvent>,
     published: &HostedPublishedState,
     stop: &WorkerStop,
@@ -2421,13 +2476,25 @@ fn reject_handshake(
         operation: "connect to cagents daemon",
         message: error.message,
     };
-    crossbeam_channel::select_biased! {
-        recv(stop.notification()) -> _ => {}
-        send(events, event) -> sent => {
-            if sent.is_ok() {
-                published.request_semantic_wake();
-            }
+    let mut event = event;
+    let mut retry = Duration::from_millis(1);
+    loop {
+        let stopping = stop.async_wake.notified();
+        tokio::pin!(stopping); stopping.as_mut().enable();
+        if stop.is_requested() { break; }
+        match events.try_send(event) {
+            Ok(()) => { published.request_semantic_wake(); break; },
+            Err(TrySendError::Disconnected(_)) => break,
+            Err(TrySendError::Full(pending)) => event = pending,
         }
+        // Only permanent failure delivery retries: ordinary idle connections
+        // have no timer. The existing public receiver has no consume hook;
+        // back off while preserving its final error and cancel on handle drop.
+        tokio::select! { biased;
+            _ = stopping => break,
+            _ = tokio::time::sleep(retry) => {},
+        }
+        retry = (retry * 2).min(Duration::from_millis(256));
     }
     ConnectionEnd::Stop
 }
@@ -2468,6 +2535,65 @@ mod tests {
     };
 
     use super::*;
+    #[test]
+    fn thirty_hosted_terminals_add_no_os_threads() {
+        const FIXTURE: &str = "CAGENTS_HOSTED_TRANSPORT_CENSUS";
+        if std::env::var_os(FIXTURE).is_none() {
+            let result = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "terminal::hosted::tests::thirty_hosted_terminals_add_no_os_threads", "--nocapture", "--test-threads=1"])
+                .env(FIXTURE, "1").output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        let runtime = super::super::transport::runtime().unwrap();
+        let count = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        let idle = count();
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("transport-census.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let pinned = proof("transport-census");
+        let server_proof = pinned.clone();
+        let server = runtime.spawn(async move {
+            let listener = tokio::net::UnixListener::from_std(listener).unwrap();
+            let mut clients = Vec::new();
+            for _ in 0..30 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let pinned = server_proof.clone();
+                clients.push(tokio::spawn(async move {
+                    let stream = tokio::io::unix::AsyncFd::new(stream.into_std().unwrap()).unwrap();
+                    let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+                    while let Ok(Some(request)) = super::super::transport::read::<ClientEnvelope>(&stream, &mut codec).await {
+                        let response = match request.request {
+                            ClientRequest::Connect { resume, .. } => {
+                                let terminal_id = resume[0].terminal_id;
+                                let mut terminal = TerminalDescriptor::relaunchable(terminal_id, session().launch, None);
+                                terminal.attached = true;
+                                ServerResponse::Connected { proof: pinned.clone(), resumed: vec![terminal] }
+                            },
+                            ClientRequest::Snapshot { terminal_id, .. } => ServerResponse::Snapshot { terminal_id, snapshot: None },
+                            _ => ServerResponse::Accepted,
+                        };
+                        codec.encode(&ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(request.request_id), proof: pinned.clone(), message: ServerMessage::Response { response } }).unwrap();
+                        if super::super::transport::write(&stream, codec.encoded()).await.is_err() { break; }
+                    }
+                }));
+            }
+            for client in clients { client.await.unwrap(); }
+        });
+        let mut handles = Vec::new();
+        for _ in 0..30 {
+            let handle = HostedTerminalHandle::connect_at(socket.clone(), TerminalId::new(), Some(pinned.clone()), |_| {}).unwrap();
+            handle.wait_until_attached(Duration::from_secs(3)).unwrap();
+            handles.push(handle);
+        }
+        let attached = count();
+        assert!(attached <= idle, "idle={idle}, thirty_hosted_terminals={attached}");
+        println!("hosted_transport_thread_census idle={idle} thirty_terminals={attached}");
+        drop(handles);
+        runtime.block_on(async { tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap(); });
+    }
+
     #[test]
     fn stopping_an_attachment_interrupts_blocked_socket_io() {
         let stop = Arc::new(WorkerStop::default());

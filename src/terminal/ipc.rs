@@ -1657,6 +1657,13 @@ impl FrameCodec {
         writer: &mut impl Write,
         value: &T,
     ) -> Result<(), FrameError> {
+        self.encode(value)?;
+        writer.write_all(&self.write_buffer)?;
+        writer.flush()?;
+        Ok(())
+    }
+    /// Prepares one bounded frame for nonblocking transports without copying it.
+    pub(crate) fn encode<T: Serialize>(&mut self, value: &T) -> Result<(), FrameError> {
         let started =
             tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
                 .then(std::time::Instant::now);
@@ -1666,10 +1673,11 @@ impl FrameCodec {
         if let Some(started) = started {
             tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_encode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = payload_length);
         }
-        writer.write_all(&self.write_buffer)?;
-        writer.flush()?;
         Ok(())
     }
+
+    pub(crate) fn encoded(&self) -> &[u8] { &self.write_buffer }
+
 }
 
 const LENGTH_PREFIX_BYTES: usize = 4;

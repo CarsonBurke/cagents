@@ -1,9 +1,8 @@
 use std::{
-    io::{self, Read},
+    io,
     net::Shutdown,
     os::unix::net::UnixStream,
     sync::{Arc, RwLock},
-    thread,
     time::{Duration, Instant},
 };
 
@@ -14,7 +13,7 @@ use crate::{
         MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
         ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage,
         ServerResponse, ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot,
-        TerminalVisibility, WireTerminalEvent, read_frame_with_limit, validate_proof,
+        TerminalVisibility, WireTerminalEvent, validate_proof,
     },
 };
 
@@ -23,12 +22,19 @@ use super::{
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
+#[cfg(test)]
+use std::{io::Read, thread};
+#[cfg(test)]
+use crate::terminal_ipc::read_frame_with_limit;
+
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
 struct HandshakeReader<'a> {
     stream: &'a mut UnixStream,
     deadline: Instant,
 }
 
+#[cfg(test)]
 impl Read for HandshakeReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         let timeout = remaining_handshake_timeout(self.deadline, Instant::now())?;
@@ -37,6 +43,7 @@ impl Read for HandshakeReader<'_> {
     }
 }
 
+#[cfg(test)]
 fn read_handshake_frame(
     stream: &mut UnixStream,
     deadline: Instant,
@@ -47,6 +54,7 @@ fn read_handshake_frame(
     )
 }
 
+#[cfg(test)]
 fn remaining_handshake_timeout(deadline: Instant, now: Instant) -> io::Result<Duration> {
     deadline
         .checked_duration_since(now)
@@ -65,10 +73,11 @@ struct Registration {
     host: SharedHost,
     client_id: ClientId,
     delivery: Arc<DeliveryQueue>,
+    retired: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Registration {
-    fn new(host: SharedHost, client_id: ClientId) -> Self {
+    fn new(host: SharedHost, client_id: ClientId, retired: Option<Box<dyn FnOnce() + Send>>) -> Self {
         let delivery = host
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -77,20 +86,28 @@ impl Registration {
             host,
             client_id,
             delivery,
+            retired,
         }
     }
 }
 
 impl Drop for Registration {
     fn drop(&mut self) {
-        disconnect_client(&self.host, self.client_id);
         self.delivery.close_after_drain();
+        let host = Arc::clone(&self.host);
+        let client_id = self.client_id;
+        let retired = self.retired.take();
+        crate::terminal::transport::retire(move || {
+            disconnect_client(&host, client_id);
+            if let Some(retired) = retired { retired(); }
+        });
     }
 }
 
 type RequestHandler =
     fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome, ProtocolError>;
 
+#[cfg(test)]
 pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
     serve_with(stream, client_id, host, process_request);
 }
@@ -116,48 +133,32 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
         .then_some(credentials.pid as u32)
 }
 
+#[cfg(test)]
 fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
-    let registration = Registration::new(Arc::clone(&host), client_id);
-    if let Some(pid) = peer_pid(&stream) {
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .record_client_pid(client_id, pid);
-    }
-    let delivery = Arc::clone(&registration.delivery);
-    let Ok(writer_stream) = stream.try_clone() else {
-        return;
-    };
-    if writer_stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .is_err()
-    {
-        return;
-    }
-    let writer_delivery = Arc::clone(&delivery);
-    let writer = match thread::Builder::new()
-        .name(format!("cagentsd-writer-{client_id}"))
-        .spawn(move || writer_loop(writer_stream, writer_delivery))
-    {
-        Ok(writer) => writer,
-        Err(_) => {
-            delivery.abort("the client writer thread could not be started");
-            return;
-        }
-    };
+    let runtime = crate::terminal::transport::runtime().expect("test transport runtime");
+    runtime.block_on(serve_async(stream, client_id, host, handle, None));
+    runtime.block_on(crate::terminal::transport::flush_retired());
+}
 
-    let mut reader = stream;
-    let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
-    let mut connected = false;
-    loop {
-        let frame = if connected {
-            codec.read::<ClientEnvelope>(&mut reader)
-        } else {
-            read_handshake_frame(&mut reader, handshake_deadline)
-        };
-        let Ok(Some(envelope)) = frame else {
-            break;
-        };
+pub(crate) fn spawn(
+    stream: UnixStream, client_id: ClientId, host: SharedHost,
+    retired: impl FnOnce() + Send + 'static,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    Ok(crate::terminal::transport::runtime()?.spawn(serve_async(stream, client_id, host, process_request, Some(Box::new(retired)))))
+}
+
+struct Session {
+    registration: Registration,
+    connected: bool,
+    handle: RequestHandler,
+}
+
+impl Session {
+    fn process(&mut self, envelope: ClientEnvelope) -> bool {
+        let host = &self.registration.host;
+        let client_id = self.registration.client_id;
+        let delivery = &self.registration.delivery;
+        let handle = self.handle;
         if envelope.version != PROTOCOL_VERSION {
             let error = ProtocolError::new(
                 ProtocolErrorCode::UnsupportedVersion,
@@ -168,10 +169,10 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 false,
             );
             let _ = push_error(&delivery, &host, envelope.request_id, error);
-            break;
+            return false;
         }
 
-        if !connected {
+        if !self.connected {
             let ClientRequest::Connect {
                 expected_host,
                 resume,
@@ -183,7 +184,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     false,
                 );
                 let _ = push_error(&delivery, &host, envelope.request_id, error);
-                break;
+                return false;
             };
             if resume.len() > MAX_RESUME_TERMINALS {
                 let error = ProtocolError::new(
@@ -194,24 +195,21 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     false,
                 );
                 let _ = push_error(&delivery, &host, envelope.request_id, error);
-                break;
+                return false;
             }
             let proof = current_proof(&host);
             if let Some(expected) = expected_host.as_ref()
                 && let Err(error) = validate_proof(Some(expected), &proof)
             {
                 let _ = push_error(&delivery, &host, envelope.request_id, error);
-                break;
+                return false;
             }
-            if reader.set_read_timeout(None).is_err() {
-                break;
-            }
-            connected = true;
+            self.connected = true;
             let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let _ = push_error(&delivery, &host, envelope.request_id, error);
-                    break;
+                    return false;
                 }
             };
             if push_response(
@@ -225,7 +223,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
             )
             .is_err()
             {
-                break;
+                return false;
             }
             for message in replay {
                 if delivery
@@ -237,15 +235,15 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     })
                     .is_err()
                 {
-                    break;
+                    return false;
                 }
             }
-            continue;
+            return true;
         }
 
         if let Err(error) = validate_proof(envelope.proof.as_ref(), &current_proof(&host)) {
             let _ = push_error(&delivery, &host, envelope.request_id, error);
-            break;
+            return false;
         }
 
         let request_id = envelope.request_id;
@@ -275,7 +273,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     crate::daemon::wake();
                 }
                 if response_failed {
-                    break;
+                    return false;
                 }
                 for message in extras {
                     if delivery
@@ -287,20 +285,90 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                         })
                         .is_err()
                     {
-                        break;
+                        return false;
                     }
                 }
             }
             Err(error) => {
                 if push_error(&delivery, &host, request_id, error).is_err() {
-                    break;
+                    return false;
                 }
             }
         }
+        true
     }
+}
 
-    drop(registration);
-    let _ = writer.join();
+async fn serve_async(
+    stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler,
+    retired: Option<Box<dyn FnOnce() + Send>>,
+) {
+    use crate::terminal::transport;
+    let pid = peer_pid(&stream);
+    let mut session = match transport::dispatch(move || {
+        let registration = Registration::new(Arc::clone(&host), client_id, retired);
+        if let Some(pid) = pid { host.lock().unwrap_or_else(|p| p.into_inner()).record_client_pid(client_id, pid); }
+        Session { registration, connected: false, handle }
+    }).await { Ok(session) => session, Err(error) => { tracing::warn!(%error, "could not register daemon client"); return; } };
+    let socket = match tokio::io::unix::AsyncFd::new(stream) { Ok(socket) => Arc::new(socket), Err(_) => return };
+    let delivery = Arc::clone(&session.registration.delivery);
+    let write_socket = Arc::clone(&socket);
+    let writer_delivery = Arc::clone(&delivery);
+    let mut writer = transport::runtime().expect("initialized transport").spawn(async move {
+        writer_loop_async(write_socket, writer_delivery).await;
+    });
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
+    let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
+    loop {
+        let frame = if session.connected {
+            transport::read::<ClientEnvelope>(&socket, &mut codec).await
+        } else {
+            match tokio::time::timeout_at(deadline, transport::read::<ClientEnvelope>(&socket, &mut codec)).await {
+                Ok(frame) => frame,
+                Err(_) => break,
+            }
+        };
+        let Ok(Some(envelope)) = frame else { break; };
+        let result = transport::dispatch(move || {
+            let connected = session.process(envelope);
+            (session, connected)
+        }).await;
+        match result {
+            Ok((next, connected)) => { session = next; if !connected { break; } },
+            Err(error) => { delivery.abort(error); return; },
+        }
+    }
+    drop(session);
+    if tokio::time::timeout(Duration::from_secs(6), &mut writer).await.is_err() {
+        writer.abort();
+        delivery.abort("client did not drain within its close deadline");
+    }
+    let _ = socket.get_ref().shutdown(Shutdown::Both);
+}
+
+async fn writer_loop_async(socket: Arc<tokio::io::unix::AsyncFd<UnixStream>>, delivery: Arc<DeliveryQueue>) {
+    use crate::terminal::transport;
+    // Even cancellation or a panic must release the peer's reader.
+    struct Close(Arc<tokio::io::unix::AsyncFd<UnixStream>>);
+    impl Drop for Close { fn drop(&mut self) { let _ = self.0.get_ref().shutdown(Shutdown::Both); } }
+    let _close = Close(Arc::clone(&socket));
+    let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+    while let Some(message) = delivery.pop_async().await {
+        let encoded = transport::dispatch(move || {
+            let result = codec.encode(&message.wire());
+            (codec, result)
+        }).await;
+        match encoded {
+            Ok((next, Ok(()))) => codec = next,
+            Ok((_, Err(error))) => { delivery.abort(write_failure(&error)); break; },
+            Err(error) => { delivery.abort(error); break; },
+        }
+        match tokio::time::timeout(Duration::from_secs(5), transport::write(&socket, codec.encoded())).await {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => { delivery.abort(write_failure(&FrameError::Io(error))); break; },
+            Err(_) => { delivery.abort("the client socket could not be written within its send timeout"); break; },
+        }
+    }
 }
 
 fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
@@ -1346,6 +1414,7 @@ fn push_error(
         .map_err(|_| ())
 }
 
+#[cfg(test)]
 fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
     let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop() {
@@ -1386,6 +1455,46 @@ fn write_failure(error: &FrameError) -> String {
 mod tests {
     use super::*;
     use crate::model::TerminalId;
+
+    #[test]
+    fn thirty_client_connections_add_no_os_threads() {
+        const FIXTURE: &str = "CAGENTS_TRANSPORT_THREAD_CENSUS";
+        if std::env::var_os(FIXTURE).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::client::tests::thirty_client_connections_add_no_os_threads", "--nocapture", "--test-threads=1"])
+                .env(FIXTURE, "1").output().unwrap();
+            assert!(result.status.success(), "{}\n{}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+            return;
+        }
+        let runtime = crate::terminal::transport::runtime().unwrap();
+        let count = || std::fs::read_dir("/proc/self/task").unwrap().count();
+        let idle = count();
+        let (proof, host) = panic_test_host("transport-census");
+        let mut peers = Vec::new();
+        let mut tasks = Vec::new();
+        for client_id in 1..=30 {
+            let (mut peer, server) = UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            tasks.push(spawn(server, client_id, Arc::clone(&host), || {}).unwrap());
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            codec.write(&mut peer, &ClientEnvelope { version: PROTOCOL_VERSION, request_id: 1, proof: None,
+                request: ClientRequest::Connect { expected_host: Some(proof.clone()), resume: Vec::new() } }).unwrap();
+            let response: ServerEnvelope = codec.read(&mut peer).unwrap().unwrap();
+            assert!(matches!(response.message, ServerMessage::Response { response: ServerResponse::Connected { .. } }));
+            peers.push(peer);
+        }
+        let attached = count();
+        assert!(attached <= idle, "idle={idle}, thirty_connections={attached}");
+        println!("transport_thread_census idle={idle} thirty_connections={attached}");
+        drop(peers);
+        runtime.block_on(async {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                for task in tasks { task.await.unwrap(); }
+                crate::terminal::transport::flush_retired().await;
+            }).await.unwrap();
+        });
+        assert!(host.lock().unwrap().clients.is_empty());
+    }
 
     #[test]
     fn completed_release_refuses_live_or_changed_sessions() {
@@ -2290,12 +2399,13 @@ mod tests {
         let (delivered, delivery) = std::sync::mpsc::channel();
         let client_host = Arc::clone(&host);
         let client = thread::spawn(move || {
-            let registration = Registration::new(client_host, 7);
+            let registration = Registration::new(client_host, 7, None);
             delivered.send(Arc::clone(&registration.delivery)).unwrap();
             panic!("fixture client failure");
         });
         let delivery = delivery.recv().unwrap();
         assert!(client.join().is_err());
+        crate::terminal::transport::runtime().unwrap().block_on(crate::terminal::transport::flush_retired());
         assert!(!host.lock().unwrap().clients.contains_key(&7));
         // The writer blocks here until the queue is closed, holding the socket.
         assert!(delivery.pop().is_none());

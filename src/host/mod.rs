@@ -20,7 +20,6 @@ use std::{
         Arc,
         atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    thread::{self, JoinHandle},
 };
 
 use thiserror::Error;
@@ -40,11 +39,10 @@ use self::state::{HostState, SharedHost};
 // A card, a chat and every CLI or tray invocation each hold their own
 // connection for its lifetime, so this must never be the limit that binds
 // before `MAX_TERMINALS`: at 32 the 33rd card was refused with a bare EOF and
-// reported a lost daemon. A connection costs a reader thread, a writer thread,
-// one `DEFAULT_CLIENT_QUEUE_CAPACITY` queue that is empty while idle, and up to
-// MAX_CLIENT_FRAME_BYTES of read scratch while a request is in flight. Two
-// connections per terminal plus headroom for CLI and tray clients bounds the
-// steady-state cost at a few thousand mostly-parked threads; the peer is
+// reported a lost daemon. Connections share fixed I/O/dispatch pools and cost
+// one bounded delivery queue plus at most MAX_CLIENT_FRAME_BYTES of read
+// scratch while a request is in flight. Two connections per terminal plus
+// headroom for CLI and tray clients bounds retained connection state; the peer is
 // already restricted to this uid, so the frame-scratch ceiling is a resource
 // bound on the user's own processes, not a trust boundary.
 const MAX_ACTIVE_CLIENTS: usize = 2 * state::MAX_TERMINALS + 64;
@@ -97,17 +95,15 @@ impl Drop for ClientPermit {
     }
 }
 
-fn reap_finished(clients: &mut Vec<JoinHandle<()>>) {
+fn reap_finished(clients: &mut Vec<tokio::task::JoinHandle<()>>) {
     let mut index = 0;
     while index < clients.len() {
         if clients[index].is_finished() {
             let handle = clients.swap_remove(index);
-            if handle.join().is_err() {
-                tracing::warn!("cagents daemon client thread panicked");
+            if crate::terminal::transport::runtime().expect("initialized transport").block_on(handle).is_err() {
+                tracing::warn!("cagents daemon client task panicked");
             }
-        } else {
-            index += 1;
-        }
+        } else { index += 1; }
     }
 }
 
@@ -198,6 +194,7 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
+    crate::terminal::transport::runtime().map_err(io::Error::other)?;
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id()?,
@@ -334,16 +331,12 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 };
                 let client_id = next_client_id.fetch_add(1, Ordering::Relaxed);
                 let client_host = Arc::clone(&host);
-                match thread::Builder::new()
-                    .name(format!("cagentsd-client-{client_id}"))
-                    .spawn(move || {
-                        client::serve(stream, client_id, client_host);
-                        // Free the slot before the wakeup byte, so the loop this
-                        // wakes cannot refuse the connection the wakeup exists to
-                        // admit, and can reap this thread without a timer.
-                        drop(permit);
-                        daemon::wake();
-                    }) {
+                match client::spawn(stream, client_id, client_host, move || {
+                    // Retain admission until unregistering finishes. Cleanup
+                    // backlog can never exceed the authenticated client limit.
+                    drop(permit);
+                    daemon::wake();
+                }) {
                     Ok(client) => clients.push(client),
                     Err(error) => tracing::warn!(%error, "could not start cagents daemon client"),
                 }
@@ -407,8 +400,15 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             )));
         }
     }
-    for client in clients {
-        let _ = client.join();
+    let runtime = crate::terminal::transport::runtime().expect("initialized transport");
+    let clients_finished = runtime.block_on(async move {
+        tokio::time::timeout(std::time::Duration::from_secs(15), async move {
+            for client in clients { let _ = client.await; }
+            crate::terminal::transport::flush_retired().await;
+        }).await
+    });
+    if clients_finished.is_err() {
+        runtime_error = Some(io::Error::other("daemon clients exceeded their shutdown deadline"));
     }
     match runtime_error {
         Some(error) => Err(error.into()),

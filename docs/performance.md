@@ -212,3 +212,28 @@ Both fit the 50/100 ms input budgets. This is an upper bound to
 compositor-visible pixels, not presentation timestamps or physical scanout. The
 settled idle native terminal produced no additional terminal draws and no
 measurable UI CPU ticks in a three-second observation.
+
+## Connection transport resources
+
+Terminal attachments and daemon connections share a transport runtime with two
+I/O threads and four dispatcher workers. Requests on one connection remain
+serial, including the handshake and resume replay. Blocking host operations
+and outbound serialization use the fixed dispatcher, whose admission limit is
+64 jobs. Socket reads and writes use nonblocking readiness rather than one
+reader and writer thread per connection. The transport runtime is separate
+from the PTY reactor so host requests cannot park PTY output reads.
+
+A retiring client keeps its admission permit until unregistration finishes.
+This bounds queued cleanup by the admitted client count and allows retirement
+to run before ordinary dispatcher work. Per-frame writes have a five-second
+deadline; peer closure and delivery overflow still close both socket halves.
+UI terminal clients retain their bounded command/event queues and read credit.
+Ordinary idle attachments have no polling timer. Permanent handshake errors
+back off while awaiting space in the existing public semantic event receiver
+and remain cancelable when the handle is dropped.
+
+The isolated transport census tests warm shared resources before recording
+`/proc/self/task`, then attach thirty peers and thirty hosted terminal handles.
+These tests cover transport growth only; the full native measurement must also
+include the daemon's emulator workers, holder PSS, eight provider chats, and
+`scripts/benchmark-terminal input` p99 on the same workload before and after.

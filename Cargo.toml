@@ -42,6 +42,7 @@ host = [
     "dep:rusqlite",
     "dep:tempfile",
     "dep:tokio",
+    "tokio/net",
     "dep:tracing-subscriber",
     "dep:tungstenite",
 ]
@@ -72,6 +73,7 @@ ui = [
     "dep:rusqlite",
     "dep:tempfile",
     "dep:tokio",
+    "tokio/net",
     "dep:tokio-util",
     "dep:tracing-subscriber",
     "dep:two-face",
