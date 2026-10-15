@@ -641,7 +641,7 @@ impl Store for JsonStore {
 
 #[cfg(test)]
 mod draft_durability_tests {
-    use super as cache;
+    use crate::pull_request_review::cache;
     use super::*;
     #[test]
     fn json_recovery_text_has_order_conflict_and_eviction_protection() {

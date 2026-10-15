@@ -1009,7 +1009,7 @@ pub(super) fn reanchor(
                     new
                 };
                 side.text().map(str::to_owned).ok_or_else(|| {
-                    "The anchor is not a text file. Pick its new line in the gutter.".into()
+                    "The anchor is not a text file. Pick its new line in the gutter.".to_owned()
                 })
             }
             _ => Err(

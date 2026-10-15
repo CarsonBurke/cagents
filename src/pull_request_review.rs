@@ -1913,7 +1913,7 @@ impl State {
                         if refused.is_none() && !crate::github::polling::ready(&repository.host, false) {
                             refused = Some("GitHub polling is paused after a failure or rate limit. Retry after the reset.".into());
                         }
-                        let results = if let Some(message) = &refused {
+                        let results: Vec<(RepoPath, bool, ViewedOutcome)> = if let Some(message) = &refused {
                             paths.into_iter().map(|path| (path, viewed, ViewedOutcome::NotApplied(message.clone()))).collect()
                         } else {
                             let names: Vec<String> = paths.iter().map(|path| path.display().into_owned()).collect();
