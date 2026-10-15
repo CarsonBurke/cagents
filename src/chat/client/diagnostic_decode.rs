@@ -71,13 +71,23 @@ pub(super) fn decode(
 ) -> Result<Option<ServerEnvelope>, postcard::Error> {
     let (version, rest) = postcard::take_from_bytes::<u16>(frame)?;
     let (request, rest) = postcard::take_from_bytes::<Option<u64>>(rest)?;
-    let Some(request) = request.filter(|request| provider_exit::owns_request(*request)) else {
-        return postcard::from_bytes(frame).map(Some);
-    };
     let (proof, message) = postcard::take_from_bytes::<Proof<'_>>(rest)?;
     if version != PROTOCOL_VERSION || !proof.matches(expected) {
         return Err(postcard::Error::DeserializeBadEncoding);
     }
+    let tags = tags()?;
+    let (kind, body) = postcard::take_from_bytes::<u32>(message)?;
+    let is_output = kind == tags.response
+        && postcard::take_from_bytes::<u32>(body)?.0 == tags.output;
+    let Some(request) = request.filter(|request| provider_exit::owns_request(*request)) else {
+        if is_output {
+            // This client issues output queries exclusively in its high-bit
+            // namespace. An orphan/incorrectly addressed output must not
+            // bypass bounded decoding through the ordinary publication path.
+            return Ok(None);
+        }
+        return postcard::from_bytes(frame).map(Some);
+    };
     let Some(mut owner) = pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&request) else {
         // The full frame has arrived; no payload graph is decoded or allocated
         // for a locally retired request, including a late Error or Snapshot.
@@ -223,4 +233,18 @@ mod tests {
         let ordinary=ServerEnvelope{version:PROTOCOL_VERSION,request_id:None,proof:proof.clone(),message:ServerMessage::ChatActivity{chat_id:chat,state:ActivityState::Working,generation:7}};
         let raw=postcard::to_allocvec(&ordinary).unwrap();assert_eq!(decode(&raw,&proof,chat,&pending).unwrap(),Some(ordinary));
     }
+    #[test]
+    fn orphan_or_wrong_namespace_output_cannot_bypass_preowned_bounds() {
+        let _guard=diagnostic_read::diagnostic_test_guard();
+        let chat=TerminalId::new();let proof=super::super::tests::host_proof("borrowed-diagnostic-peer");
+        let(pending,_)=pending(provider_exit::REQUEST_NAMESPACE|22);
+        for request_id in [None,Some(22)] {
+            let envelope=ServerEnvelope{version:PROTOCOL_VERSION,request_id,proof:proof.clone(),message:ServerMessage::Response{response:ServerResponse::ChatProviderExitOutput{
+                chat_id:chat,log_id:"x".repeat(6_900_000),offset:0,bytes:vec![1;1_100_000],next_offset:None,omitted:0}}};
+            let frame=postcard::to_allocvec(&envelope).unwrap();assert!(frame.len()<ipc::MAX_FRAME_BYTES);drop(envelope);
+            OWNED_PAGE_CAPACITY.store(0,Ordering::Release);assert!(decode(&frame,&proof,chat,&pending).unwrap().is_none());
+            assert_eq!(OWNED_PAGE_CAPACITY.load(Ordering::Acquire),0);assert_eq!(pending.lock().unwrap().len(),1,"orphan output cannot settle a different request");
+        }
+    }
+
 }
