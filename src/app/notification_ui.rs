@@ -29,7 +29,7 @@ pub enum Action {
     Failed(String),
 }
 
-struct ActivatedAutomation {
+struct ManagedActivation {
     agent: crate::agent_execution::Agent,
     display: crate::workspace_model::views::ManagedDisplay,
     session: crate::agent_execution::HostedSession,
@@ -574,7 +574,7 @@ impl Cagents {
             } => {
                 if self.notification_ui.session_activation == Some(session)
                     && self.notification_ui.activation_generation == generation
-                    && self.activated_automation_agent(session).is_none()
+                    && self.resolved_activation_agent(session).is_none()
                     && !self
                         .durable
                         .cards
@@ -668,22 +668,24 @@ impl Cagents {
         }
         // A scheduled agent can remain headless in this window. Only this
         // explicit user activation may mount its exact authenticated descriptor.
-        let automation = self.activated_automation_agent(session);
-        if automation.is_none() && self.workspace_model.agents.iter().any(|agent| {
-            !agent.closed && matches!(agent.origin, crate::agent_execution::Origin::Automation { .. })
-                && (agent.session.as_ref().is_some_and(|owner| owner.id() == session)
+        let managed = self.resolved_activation_agent(session);
+        if managed.is_none() && self.workspace_model.agents.iter().any(|agent| {
+            !agent.closed && (agent.session.as_ref().is_some_and(|owner| owner.id() == session)
                     || agent.console.as_ref().is_some_and(|owner| owner.id == session))
         }) {
             // Invalid authoritative membership also fences a retained local
             // projection. It cannot silently downgrade to an unmanaged pane.
             return Task::none();
         }
-        let display_session = automation.as_ref().map_or(session, |activation| activation.session.id());
-        let existing = self
-            .durable
-            .cards
-            .iter()
-            .find(|card| card_session(card) == Some(display_session));
+        let existing = if let Some(activation) = &managed {
+            let canonical = CardId::from_uuid(activation.agent.id.as_uuid());
+            self.durable.cards.iter().find(|card| card.id == canonical)
+        } else {
+            // Inventory-only aliases have no model AgentId yet. An open exact
+            // session is usable; an older closed alias must not shadow it.
+            self.durable.cards.iter().find(|card| card.existence.is_open() && card_session(card) == Some(session))
+                .or_else(|| self.durable.cards.iter().find(|card| card_session(card) == Some(session)))
+        };
         if existing.is_some_and(|card| !card.existence.is_open()) {
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
@@ -691,7 +693,7 @@ impl Cagents {
         }
         let mut adopted = Task::none();
         let id = if let Some(card) = existing {
-            if let Some(activation) = &automation {
+            if let Some(activation) = &managed {
                 let expected = &activation.session;
                 let current = match &card.kind {
                     CardKind::Chat(session) => {
@@ -707,16 +709,21 @@ impl Cagents {
                 }
             }
             let id = card.id;
-            if let Some(activation) = &automation {
+            if let Some(activation) = &managed {
                 adopted = self.adopt_execution_agent_activation_display(&activation.agent, activation.display.clone(), activation.session.clone()).unwrap_or_else(Task::none);
                 self.refresh_sidebar_channels();
                 self.persist();
             }
             id
         } else {
-            let Some(activation) = automation else {
+            let Some(activation) = managed else {
                 return Task::none();
             };
+            // General managed adoption belongs to the model/inventory path.
+            // Only explicit automation activation may mount a headless actor.
+            if !matches!(activation.agent.origin, crate::agent_execution::Origin::Automation { .. }) {
+                return Task::none();
+            }
             let Some(task) = self.adopt_execution_agent_activation_display(&activation.agent, activation.display, activation.session) else {
                 return Task::none();
             };
@@ -745,8 +752,8 @@ impl Cagents {
     /// The model comes from the authenticated daemon watch. A session ID alone
     /// never grants launch authority: require one live owner, its proof, and a
     /// currently open exact placement. Model ambiguity is deferred, not guessed.
-    fn activated_automation_agent(&self, session: TerminalId) -> Option<ActivatedAutomation> {
-        use crate::agent_execution::{HostedSession, Origin, Placement};
+    fn resolved_activation_agent(&self, session: TerminalId) -> Option<ManagedActivation> {
+        use crate::agent_execution::{HostedSession, Placement};
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return None;
         }
@@ -757,7 +764,7 @@ impl Cagents {
                 || agent.console.as_ref().is_some_and(|owner| owner.id == session))
         });
         let agent = owners.next()?;
-        if owners.next().is_some() || !matches!(agent.origin, Origin::Automation { .. }) {
+        if owners.next().is_some() {
             return None;
         }
         let requested: Vec<_> = agent.session.iter().filter(|owner| owner.id() == session).cloned()
@@ -796,7 +803,7 @@ impl Cagents {
             || self.project_ui.closed.contains(repository)
             || self.workspace_model.closed_projects.contains(repository)
         { return None; }
-        Some(ActivatedAutomation { agent: agent.clone(), display, session: owner })
+        Some(ManagedActivation { agent: agent.clone(), display, session: owner })
     }
 
     pub(super) fn notification_subscription(&self) -> Subscription<Message> {
@@ -807,6 +814,7 @@ impl Cagents {
 
 /// Match the surface actually shown for this existing actor; never manufacture
 /// a console descriptor or substitute a different session from the same run.
+#[cfg(test)]
 fn activation_session(
     agent: &crate::agent_execution::Agent,
 ) -> Option<crate::agent_execution::HostedSession> {
@@ -1620,6 +1628,88 @@ mod tests {
                 "replaced canonical ownership cannot reactivate a stale retained local pane");
             assert_eq!(app.durable.cards, saved_cards);
             assert_eq!(app.workspace_model.agents[0], original);
+        }
+    }
+
+    #[test]
+    fn attention_unmanaged_open_session_is_not_shadowed_by_its_retired_alias() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        let card = app.workspace.focused().unwrap();
+        let session = card_session(app.card_state(card).unwrap()).unwrap();
+        let mut alias = app.card_state(card).unwrap().clone(); alias.id = CardId::new();
+        alias.existence = super::super::project_ui::removed_existence("retired inventory alias");
+        Arc::make_mut(&mut app.durable).cards.insert(0, alias.clone());
+        app.sidebar_state.observe_card_update(card);
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(!app.sidebar_state.has_card_update(card), "successful activation acknowledges the open exact session");
+        assert_eq!(app.card_state(alias.id).unwrap().existence, alias.existence);
+        assert_eq!(app.durable.cards.len(), 2);
+    }
+
+    #[test]
+    fn attention_non_automation_activation_waits_for_normal_model_adoption() {
+        let (mut app, mut agent) = scheduled_attention_fixture();
+        agent.origin = crate::agent_execution::Origin::User;
+        let session = agent.console.as_ref().unwrap().id;
+        app.workspace_model.agents.push(agent.clone());
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(app.durable.cards.is_empty());
+        assert_eq!(app.notification_ui.session_activation, Some(session));
+        drop(app.adopt_execution_agent(&agent).unwrap());
+        drop(app.retry_notification_activation());
+        assert_eq!(app.workspace.focused(), Some(CardId::from_uuid(agent.id.as_uuid())));
+        assert_eq!(app.durable.cards.len(), 1);
+    }
+
+    #[test]
+    fn attention_managed_activation_uses_canonical_identity_ahead_of_open_or_closed_aliases() {
+        use crate::agent_execution::Origin;
+        use crate::workspace_model::views::{Pane, View};
+        for automation in [false, true] {
+            for alias_open in [false, true] {
+                let (mut app, mut agent) = scheduled_attention_fixture();
+                if !automation { agent.origin = Origin::User; }
+                let session = agent.console.as_ref().unwrap().id;
+                let canonical = CardId::from_uuid(agent.id.as_uuid());
+                app.workspace_model.agents.push(agent.clone());
+                drop(app.adopt_execution_agent(&agent).unwrap());
+                let card = app.card_state(canonical).unwrap().clone();
+                app.workspace_model.views = vec![View { scope: agent.placement.clone(), revision: 1,
+                    panes: vec![Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap()], retired: vec![] }];
+                let mut alias = card.clone(); alias.id = CardId::new();
+                if !alias_open { alias.existence = super::super::project_ui::removed_existence("retired inventory alias"); }
+                let alias_id = alias.id;
+                let alias_existence = alias.existence.clone();
+                let durable = Arc::make_mut(&mut app.durable);
+                durable.cards.insert(0, alias);
+                durable.chat_drafts.insert(alias_id, "Preserved alias draft".into());
+                let other = ChannelId::new();
+                let mut local = durable.channels[0].clone();
+                local.id = other; local.cards.clear(); local.focused = None;
+                durable.channels.push(local);
+                let mut shared = app.workspace_model.channels[0].clone(); shared.id = other;
+                app.workspace_model.channels.push(shared);
+                drop(app.select_channel(other));
+                assert_ne!(app.workspace.focused(), Some(canonical));
+                drop(app.update_notifications(Action::Activated(Target::Session(session))));
+                assert_eq!(app.workspace.focused(), Some(canonical),
+                    "inventory alias order cannot determine managed activation identity");
+                assert_eq!(app.card_state(alias_id).unwrap().existence, alias_existence);
+                assert_eq!(app.durable.chat_drafts.get(&alias_id).map(String::as_str), Some("Preserved alias draft"));
+                assert_eq!(app.durable.cards.len(), 2);
+                assert_eq!(app.workspace_model.agents[0], agent);
+                drop(app.select_channel(other));
+                let focused = app.workspace.focused();
+                Arc::make_mut(&mut app.durable).cards.iter_mut().find(|card| card.id == canonical).unwrap().existence = super::super::project_ui::removed_existence("explicit canonical close");
+                let before = app.durable.cards.clone();
+                drop(app.update_notifications(Action::Activated(Target::Session(session))));
+                assert_eq!(app.workspace.focused(), focused);
+                assert_eq!(app.durable.cards, before,
+                    "an open alias must not bypass explicit canonical closure");
+                assert!(app.notification_ui.session_activation.is_none());
+            }
         }
     }
 
