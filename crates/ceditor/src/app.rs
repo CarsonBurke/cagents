@@ -91,11 +91,6 @@ struct Tab {
     mutation: Option<MutationKind>,
     snapshot_loading: bool,
     snapshot_refresh_pending: bool,
-    comparison_stamp: Option<(PathBuf, DiffBasis, cagents::repository::RepositoryMetadataStamp)>,
-    comparison_probe: Option<u64>,
-    next_comparison_probe: u64,
-    comparison_retry_after: Option<Instant>,
-    comparison_retry_delay: Duration,
     /// The pull request review behind the sidebar's Pull requests panel. It
     /// lists the GitHub repository the worktree's remotes name and drives
     /// `runtime` through the files of whichever pull request is open.
@@ -149,13 +144,6 @@ pub enum Message {
     WindowResized(iced::Size),
     RefreshVisible,
     RefreshDocuments,
-    ComparisonMetadata {
-        card: CardId,
-        request: u64,
-        path: PathBuf,
-        basis: DiffBasis,
-        result: Result<cagents::repository::RepositoryMetadataStamp, String>,
-    },
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
     DocumentToneStale,
@@ -677,15 +665,6 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
     task.map(Message::Repository).map(cosmic::Action::App)
 }
 
-fn same_live_comparison(left: &DiffBasis, right: &DiffBasis) -> bool {
-    match (left, right) {
-        (DiffBasis::IndexToWorktree, DiffBasis::IndexToWorktree)
-        | (DiffBasis::HeadToIndex, DiffBasis::HeadToIndex) => true,
-        (DiffBasis::MergeBaseToHead { base_ref: left, .. }, DiffBasis::MergeBaseToHead { base_ref: right, .. }) => left == right,
-        _ => false,
-    }
-}
-
 /// Whether a repository action is allowed to land while a modal is up.
 ///
 /// Input a reader could aim at the pane behind an overlay is refused, but a
@@ -702,6 +681,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::BinaryPageLoaded { .. }
             | RepositoryAction::DiskMetadata { .. }
+            | RepositoryAction::ComparisonMetadata { .. }
             | RepositoryAction::DiskLoaded { .. }
             | RepositoryAction::DiskComparisonLoaded { .. }
             | RepositoryAction::BranchBasisRefreshed { .. }
@@ -1552,11 +1532,6 @@ impl Editor {
             mutation,
             snapshot_loading: false,
             snapshot_refresh_pending: false,
-            comparison_stamp: None,
-            comparison_probe: None,
-            next_comparison_probe: 0,
-            comparison_retry_after: None,
-            comparison_retry_delay: Duration::from_secs(1),
             review,
         });
         if self.active.is_none() || (focus && !self.modal_open()) {
@@ -2313,61 +2288,11 @@ impl Editor {
 
     fn refresh_documents(&mut self) -> Task<Message> {
         if !self.can_refresh_documents() { return Task::none(); }
-        let mut tasks = Vec::new();
-        for tab in &mut self.tabs {
-            tasks.push(repository_task(tab.runtime.refresh_open_document(tab.id)));
-            let basis = tab.runtime.selected_diff_basis();
-            if !tab.git || (!tab.runtime.has_editable_document() && !tab.runtime.shows_diff()) || matches!(basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
-                || tab.comparison_probe.is_some() { continue; }
-            let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) else { continue; };
-            let basis = basis.clone();
-            let worktree = tab.runtime.descriptor.worktree.clone();
-            let card = tab.id;
-            tab.next_comparison_probe = tab.next_comparison_probe.wrapping_add(1).max(1);
-            let request = tab.next_comparison_probe;
-            tab.comparison_probe = Some(request);
-            tasks.push(cosmic::task::future(async move {
-                let observed = basis.clone();
-                let result = tokio::task::spawn_blocking(move || cagents::repository::repository_metadata_stamp(&worktree, &observed))
-                    .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
-                Message::ComparisonMetadata { card, request, path, basis, result }
-            }));
-        }
-        Task::batch(tasks)
+        Task::batch(self.tabs.iter_mut().map(|tab| repository_task(tab.runtime.refresh_open_sources(tab.id))).collect::<Vec<_>>())
     }
 
     fn can_refresh_documents(&self) -> bool {
-        !self.exiting && self.tabs.iter().any(|tab| tab.runtime.has_editable_document()
-            || (tab.git && tab.runtime.shows_diff() && !matches!(tab.runtime.selected_diff_basis(), DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })))
-    }
-
-    fn comparison_metadata(&mut self, card: CardId, request: u64, path: PathBuf, basis: DiffBasis, result: Result<cagents::repository::RepositoryMetadataStamp, String>) -> Task<Message> {
-        let Some(tab) = self.tab_mut(card) else { return Task::none(); };
-        if tab.comparison_probe != Some(request) { return Task::none(); }
-        tab.comparison_probe = None;
-        if tab.runtime.selected_path() != Some(path.as_path()) || tab.runtime.selected_diff_basis() != &basis { return Task::none(); }
-        let stamp = match result {
-            Ok(stamp) => stamp,
-            Err(error) => { self.notice = Some(format!("Could not refresh the comparison: {error}")); return Task::none(); }
-        };
-        // A changed stamp must remain unacknowledged while an earlier diff is
-        // running. The next metadata tick retries after that slot completes.
-        if tab.runtime.comparison_refresh_pending() { return Task::none(); }
-        let unchanged = tab.comparison_stamp.as_ref().is_some_and(|(old_path, old_basis, old)| old_path == &path && same_live_comparison(old_basis, &basis) && old == &stamp);
-        if unchanged {
-            if !tab.runtime.comparison_refresh_failed() {
-                tab.comparison_retry_after = None;
-                tab.comparison_retry_delay = Duration::from_secs(1);
-                return Task::none();
-            }
-            if tab.comparison_retry_after.is_some_and(|deadline| Instant::now() < deadline) { return Task::none(); }
-        } else { tab.comparison_retry_delay = Duration::from_secs(1); }
-        // Failed Git readers may recover without changing metadata. Retry the
-        // same observation with bounded backoff; a new observation bypasses it.
-        tab.comparison_retry_after = Some(Instant::now() + tab.comparison_retry_delay);
-        tab.comparison_retry_delay = tab.comparison_retry_delay.saturating_mul(2).min(Duration::from_secs(30));
-        tab.comparison_stamp = Some((path, basis, stamp));
-        repository_task(tab.runtime.refresh_open_comparison(card))
+        !self.exiting && self.tabs.iter().any(|tab| tab.runtime.observes_open_sources())
     }
 
     fn refresh(&mut self, id: CardId) -> Task<Message> {
@@ -3258,7 +3183,6 @@ impl Application for Editor {
                     Task::batch([self.refresh_visible(), self.flush_document_tone()])
                 }
                 Message::RefreshDocuments => self.refresh_documents(),
-                Message::ComparisonMetadata { card, request, path, basis, result } => self.comparison_metadata(card, request, path, basis, result),
                 Message::DocumentToneStale => {
                     self.document_tone_stale = self.settings.app_theme == AppTheme::System;
                     self.flush_document_tone()
@@ -5527,10 +5451,6 @@ mod tests {
     /// Execute actual application tasks, including mutation completion and
     /// subsequent snapshot/file refreshes, without a window or network remote.
     fn run_tasks(app: &mut Editor, task: Task<Message>) {
-        run_tasks_map(app, task, |message| message);
-    }
-
-    fn run_tasks_map(app: &mut Editor, task: Task<Message>, mut map: impl FnMut(Message) -> Message) {
         use cosmic::iced::futures::StreamExt;
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -5544,7 +5464,7 @@ mod tests {
                             if let iced::runtime::Action::Output(cosmic::Action::App(message)) =
                                 action
                             {
-                                pending.push(app.update(map(message)));
+                                pending.push(app.update(message));
                             }
                         }
                     }
@@ -7584,11 +7504,6 @@ mod tests {
         let task = app.update(Message::Repository(RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::HeadToIndex }));
         run_tasks(&mut app, task);
         let task = app.update(Message::RefreshDocuments);
-        let probe = app.tab(card).unwrap().comparison_probe;
-        assert!(probe.is_some());
-        let repeated = app.update(Message::RefreshDocuments);
-        assert_eq!(app.tab(card).unwrap().comparison_probe, probe);
-        run_tasks(&mut app, repeated);
         run_tasks(&mut app, task);
         assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(1));
         let input = tempfile::NamedTempFile::new().unwrap();
@@ -7601,52 +7516,9 @@ mod tests {
         let tab = app.tab(card).unwrap();
         assert_eq!(tab.runtime.inspector_context().diff_additions, Some(3));
         assert_eq!(tab.runtime.editor_text().as_deref(), Some("working stays\n"));
-        let stamp = tab.comparison_stamp.as_ref().unwrap().2.clone();
-        app.tab_mut(card).unwrap().comparison_probe = Some(900);
-        let unchanged = app.comparison_metadata(card, 900, "tracked.txt".into(), DiffBasis::HeadToIndex, Ok(stamp.clone()));
-        assert!(iced::runtime::task::into_stream(unchanged).is_none());
-        assert!(!app.tab(card).unwrap().runtime.comparison_refresh_pending());
-        app.tab_mut(card).unwrap().comparison_probe = Some(902);
-        drop(app.comparison_metadata(card, 902, "tracked.txt".into(), DiffBasis::HeadToIndex, Err("temporary metadata error".into())));
-        assert!(app.tab(card).unwrap().comparison_probe.is_none());
-        assert_eq!(app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2, stamp);
-
-        // Do not acknowledge an observation while the previous reader owns
-        // the slot: the next tick must reconsider it after completion.
-        let pending = app.tab_mut(card).unwrap().runtime.refresh_open_comparison(card);
-        app.tab_mut(card).unwrap().comparison_stamp = None;
-        app.tab_mut(card).unwrap().comparison_probe = Some(901);
-        drop(app.comparison_metadata(card, 901, "tracked.txt".into(), DiffBasis::HeadToIndex, Ok(stamp)));
-        assert!(app.tab(card).unwrap().comparison_stamp.is_none());
-        run_tasks(&mut app, repository_task(pending));
         let task = app.update(Message::RefreshDocuments);
         run_tasks(&mut app, task);
-        assert!(app.tab(card).unwrap().comparison_stamp.is_some());
-        let before_failure = app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2.clone();
-        let read = app.tab_mut(card).unwrap().runtime.refresh_open_comparison(card);
-        let mut injected = false;
-        run_tasks_map(&mut app, repository_task(read), |message| match message {
-            Message::Repository(RepositoryAction::DiffLoaded { identity, basis, request, .. }) if !injected => {
-                injected = true;
-                Message::Repository(RepositoryAction::DiffLoaded { identity, basis, request, content: cagents::diff_view::RenderedDiff::Error("temporary diff failure".into()) })
-            }
-            other => other,
-        });
-        assert!(injected);
-        assert!(app.tab(card).unwrap().runtime.comparison_refresh_failed());
-        app.tab_mut(card).unwrap().comparison_retry_after = Some(Instant::now() + Duration::from_secs(30));
-        app.tab_mut(card).unwrap().comparison_probe = Some(903);
-        let backoff = app.comparison_metadata(card, 903, "tracked.txt".into(), DiffBasis::HeadToIndex, Ok(before_failure.clone()));
-        assert!(iced::runtime::task::into_stream(backoff).is_none());
-        assert!(app.tab(card).unwrap().runtime.comparison_refresh_failed());
-        // Advance the retry deadline deterministically without sleeping or
-        // changing the metadata that must be retried.
-        app.tab_mut(card).unwrap().comparison_retry_after = None;
-        let task = app.update(Message::RefreshDocuments);
-        run_tasks(&mut app, task);
-        assert!(!app.tab(card).unwrap().runtime.comparison_refresh_failed());
         assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(3));
-        assert_eq!(app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2, before_failure);
     }
 
     #[test]
@@ -7678,44 +7550,6 @@ mod tests {
         assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head));
         app.settings_open = false;
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "topic one\ntopic two\n");
-        let before_failure = app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2.clone();
-        let resolve = app.tab_mut(card).unwrap().runtime.refresh_open_comparison(card);
-        let mut injected = false;
-        run_tasks_map(&mut app, repository_task(resolve), |message| match message {
-            Message::Repository(RepositoryAction::BranchBasisRefreshed { identity, request, previous, .. }) if !injected => {
-                injected = true;
-                Message::Repository(RepositoryAction::BranchBasisRefreshed { identity, request, previous, result: Err("temporary branch resolver failure".into()) })
-            }
-            other => other,
-        });
-        assert!(injected);
-        assert!(app.tab(card).unwrap().runtime.comparison_refresh_failed());
-        app.tab_mut(card).unwrap().comparison_retry_after = None;
-        let task = app.update(Message::RefreshDocuments);
-        run_tasks(&mut app, task);
-        assert!(!app.tab(card).unwrap().runtime.comparison_refresh_failed());
-        assert_eq!(app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2, before_failure);
-
-        // A failed diff after a successful branch resolution also needs a
-        // same-basis retry; resolving the same OIDs cannot leave its error cached.
-        let basis = app.tab(card).unwrap().runtime.selected_diff_basis().clone();
-        let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("tracked.txt").unwrap(), old_path: None, basis }));
-        let mut injected = false;
-        run_tasks_map(&mut app, task, |message| match message {
-            Message::Repository(RepositoryAction::DiffLoaded { identity, basis, request, .. }) if !injected => {
-                injected = true;
-                Message::Repository(RepositoryAction::DiffLoaded { identity, basis, request, content: cagents::diff_view::RenderedDiff::Error("temporary branch diff failure".into()) })
-            }
-            other => other,
-        });
-        assert!(injected);
-        assert!(app.tab(card).unwrap().runtime.comparison_refresh_failed());
-        app.tab_mut(card).unwrap().comparison_retry_after = None;
-        let task = app.update(Message::RefreshDocuments);
-        run_tasks(&mut app, task);
-        assert!(!app.tab(card).unwrap().runtime.comparison_refresh_failed());
-        assert_eq!(app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2, before_failure);
-
         for basis in [
             DiffBasis::CommitToParent { oid: head.clone(), parent: Some(initial.clone()) },
             DiffBasis::PullRequest { number: 1, base_ref: reference, head: head.clone(), merge_base: initial.clone() },
@@ -7724,7 +7558,6 @@ mod tests {
             run_tasks(&mut app, task);
             git(root, &["update-ref", "refs/heads/main", initial.as_str()]);
             let task = app.update(Message::RefreshDocuments);
-            assert!(app.tab(card).unwrap().comparison_probe.is_none());
             run_tasks(&mut app, task);
             assert_eq!(app.tab(card).unwrap().runtime.selected_diff_basis(), &basis);
             assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(2));

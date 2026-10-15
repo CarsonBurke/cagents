@@ -517,6 +517,7 @@ pub enum RepositoryAction {
         result: Result<SaveOutcome, FileIoError>,
     },
     DiskMetadata { identity: AsyncIdentity, ticket: u64, result: Result<Option<crate::editor_reload::Stamp>, String> },
+    ComparisonMetadata { identity: AsyncIdentity, ticket: u64, basis: DiffBasis, result: Result<crate::repository::RepositoryMetadataStamp, String> },
     DiskLoaded { identity: AsyncIdentity, ticket: u64, stamp: crate::editor_reload::Stamp, baseline: blake3::Hash, result: Result<crate::editor_reload::Version, String> },
     CompareDisk { card: CardId },
     DiskComparisonLoaded { identity: AsyncIdentity, revision: u64, disk_hash: blake3::Hash, model: Option<DiffModel> },
@@ -759,6 +760,7 @@ impl RepositoryAction {
             | Self::DirectoryListed { identity, .. }
             | Self::FileLoaded { identity, .. }
             | Self::DiskMetadata { identity, .. }
+            | Self::ComparisonMetadata { identity, .. }
             | Self::DiskLoaded { identity, .. }
             | Self::BranchBasisRefreshed { identity, .. }
             | Self::DiskComparisonLoaded { identity, .. }
@@ -1718,6 +1720,30 @@ struct WorkingDiffRefresh {
     additions: Vec<usize>,
 }
 
+struct ComparisonMetadataRefresh {
+    stamp: Option<(PathBuf, DiffBasis, crate::repository::RepositoryMetadataStamp)>,
+    probe: Option<u64>,
+    next_probe: u64,
+    retry_after: Option<Instant>,
+    retry_delay: Duration,
+    error: Option<String>,
+}
+
+impl Default for ComparisonMetadataRefresh {
+    fn default() -> Self {
+        Self { stamp: None, probe: None, next_probe: 0, retry_after: None, retry_delay: Duration::from_secs(1), error: None }
+    }
+}
+
+fn same_live_comparison(left: &DiffBasis, right: &DiffBasis) -> bool {
+    match (left, right) {
+        (DiffBasis::IndexToWorktree, DiffBasis::IndexToWorktree)
+        | (DiffBasis::HeadToIndex, DiffBasis::HeadToIndex) => true,
+        (DiffBasis::MergeBaseToHead { base_ref: left, .. }, DiffBasis::MergeBaseToHead { base_ref: right, .. }) => left == right,
+        _ => false,
+    }
+}
+
 /// Coalescing timer for the Markdown preview's parse, shaped exactly like
 /// [`WorkingDiffRefresh`]: at most one timer is ever in flight and it always
 /// observes the latest deadline, so continuous typing parses once when the
@@ -1888,6 +1914,7 @@ pub struct RepositoryRuntime {
     next_branch_refresh: u64,
     branch_refresh: Option<u64>,
     comparison_refresh_queued: bool,
+    comparison_metadata: ComparisonMetadataRefresh,
     disk_comparison: Option<DiffState>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
     /// deliberately use a separate epoch so they cannot obsolete an active
@@ -2117,6 +2144,7 @@ impl RepositoryRuntime {
             next_branch_refresh: 0,
             branch_refresh: None,
             comparison_refresh_queued: false,
+            comparison_metadata: ComparisonMetadataRefresh::default(),
             disk_comparison: None,
             generation: 0,
             file_list_generation: 0,
@@ -2905,6 +2933,66 @@ impl RepositoryRuntime {
     }
 
     pub fn has_editable_document(&self) -> bool { matches!(&self.document, DocumentState::Editable(_)) }
+
+    fn has_live_comparison(&self) -> bool {
+        !self.directory_only && self.selected.is_some()
+            && (self.has_editable_document() || self.source_surface == SourceSurface::Diff)
+            && !matches!(self.diff_basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
+    }
+
+    pub fn observes_open_sources(&self) -> bool { self.has_editable_document() || self.has_live_comparison() }
+
+    /// Shared document and Git-metadata fallback for both editor frontends.
+    /// Unchanged comparisons perform no Git commands or diff rebuilds.
+    pub fn refresh_open_sources(&mut self, card: CardId) -> Task<RepositoryAction> {
+        let document = self.refresh_open_document(card);
+        let comparison = self.refresh_comparison_metadata(card);
+        Task::batch([document, comparison])
+    }
+
+    fn refresh_comparison_metadata(&mut self, card: CardId) -> Task<RepositoryAction> {
+        if !self.has_live_comparison() || self.comparison_metadata.probe.is_some() { return Task::none(); }
+        let Some(path) = self.selected_path().map(Path::to_path_buf) else { return Task::none(); };
+        let identity = self.current_identity(card, path);
+        let basis = self.diff_basis.clone();
+        let worktree = identity.worktree.clone();
+        self.comparison_metadata.next_probe = self.comparison_metadata.next_probe.wrapping_add(1).max(1);
+        let ticket = self.comparison_metadata.next_probe;
+        self.comparison_metadata.probe = Some(ticket);
+        cosmic::task::future(async move {
+            let observed = basis.clone();
+            let result = tokio::task::spawn_blocking(move || crate::repository::repository_metadata_stamp(&worktree, &observed))
+                .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
+            RepositoryAction::ComparisonMetadata { identity, ticket, basis, result }
+        })
+    }
+
+    fn comparison_metadata_loaded(&mut self, identity: AsyncIdentity, ticket: u64, basis: DiffBasis, result: Result<crate::repository::RepositoryMetadataStamp, String>) -> Task<RepositoryAction> {
+        if self.comparison_metadata.probe != Some(ticket) { return Task::none(); }
+        self.comparison_metadata.probe = None;
+        if !self.accepts_selected(&identity) || self.diff_basis != basis || !self.has_live_comparison() { return Task::none(); }
+        let stamp = match result {
+            Ok(stamp) => { self.comparison_metadata.error = None; stamp },
+            Err(error) => { self.comparison_metadata.error = Some(error); return Task::none(); }
+        };
+        // Preserve a changed observation while an earlier reader owns the
+        // slot. A later tick reconsiders it after that reader completes.
+        if self.comparison_refresh_pending() { return Task::none(); }
+        let unchanged = self.comparison_metadata.stamp.as_ref().is_some_and(|(old_path, old_basis, old)| old_path == &identity.path && same_live_comparison(old_basis, &basis) && old == &stamp);
+        if unchanged {
+            if !self.comparison_refresh_failed() {
+                self.comparison_metadata.retry_after = None;
+                self.comparison_metadata.retry_delay = Duration::from_secs(1);
+                return Task::none();
+            }
+            if self.comparison_metadata.retry_after.is_some_and(|deadline| Instant::now() < deadline) { return Task::none(); }
+        } else { self.comparison_metadata.retry_delay = Duration::from_secs(1); }
+        self.comparison_metadata.retry_after = Some(Instant::now() + self.comparison_metadata.retry_delay);
+        self.comparison_metadata.retry_delay = self.comparison_metadata.retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+        let card = identity.card;
+        self.comparison_metadata.stamp = Some((identity.path, basis, stamp));
+        self.refresh_open_comparison(card)
+    }
 
     /// Whether a comparison reader already owns the single refresh slot.
     pub fn comparison_refresh_pending(&self) -> bool {
@@ -4885,6 +4973,7 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::ComparisonMetadata { identity, ticket, basis, result } => self.comparison_metadata_loaded(identity, ticket, basis, result),
             RepositoryAction::BranchBasisRefreshed { identity, request, previous, result } => {
                 self.branch_basis_refreshed(identity, request, previous, result)
             }
@@ -6751,6 +6840,8 @@ impl RepositoryRuntime {
     }
 
     fn next_identity(&mut self, card: CardId, path: PathBuf) -> AsyncIdentity {
+        let next_probe = self.comparison_metadata.next_probe;
+        self.comparison_metadata = ComparisonMetadataRefresh { next_probe, ..Default::default() };
         self.generation = self.generation.wrapping_add(1).max(1);
         AsyncIdentity {
             card,
@@ -8368,6 +8459,12 @@ fn selected_file_view<'a>(card: CardId, runtime: &'a RepositoryRuntime, review: 
         SourceSurface::Editor => editor_surface(card, runtime),
         SourceSurface::Diff => diff_surface(card, runtime, review),
     };
+    let content = if let Some(error) = &runtime.comparison_metadata.error {
+        widget::column::with_children(vec![
+            widget::container(crate::design::caption(format!("Could not check comparison changes: {error}. Retrying automatically."))).padding([space::XS, space::M]).into(),
+            content,
+        ]).height(Length::Fill).into()
+    } else { content };
     let DocumentState::Editable(document) = &runtime.document else { return content; };
     if document.external_version.is_none() && !document.external_deleted { return content; }
     let actions: Vec<Element<'a, RepositoryAction>> = vec![
@@ -12352,6 +12449,114 @@ mod tests {
             text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
             mapping: crate::editor_reload::LineMap::between(before, after),
         }) }));
+    }
+
+    fn metadata_observer_fixture() -> (tempfile::TempDir, RepositoryRuntime, AsyncIdentity, crate::repository::RepositoryMetadataStamp) {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git/refs/heads")).unwrap();
+        std::fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+        std::fs::write(root.path().join(".git/refs/heads/main"), "head\n").unwrap();
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "body");
+        runtime.descriptor.worktree = root.path().to_path_buf();
+        runtime.descriptor.repository = root.path().to_path_buf();
+        runtime.diff_basis = DiffBasis::HeadToIndex;
+        runtime.source_surface = SourceSurface::Diff;
+        runtime.selected.as_mut().unwrap().staged = true;
+        runtime.working_diff = WorkingDiffRefresh::default();
+        runtime.diffs.clear();
+        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::ready(metadata_ready_diff()));
+        let identity = runtime.current_identity(card, "file.rs".into());
+        let stamp = crate::repository::repository_metadata_stamp(root.path(), &runtime.diff_basis).unwrap();
+        runtime.comparison_metadata.stamp = Some((identity.path.clone(), runtime.diff_basis.clone(), stamp.clone()));
+        (root, runtime, identity, stamp)
+    }
+
+    fn metadata_ready_diff() -> RenderedDiff {
+        RenderedDiff::Text { model: two_change_model(), old_label: "Before".into(), new_label: "After".into() }
+    }
+
+    fn finish_metadata_diff(runtime: &mut RepositoryRuntime, identity: &AsyncIdentity, content: RenderedDiff) {
+        let basis = runtime.diff_basis.clone();
+        let Some(DiffState::Loading { request, .. }) = runtime.diff_state(&basis) else { panic!("a comparison reader must own the slot"); };
+        let request = *request;
+        drop(runtime.update(RepositoryAction::DiffLoaded { identity: identity.clone(), basis, request, content }));
+    }
+
+    #[test]
+    fn shared_metadata_observer_is_single_flight_and_refuses_obsolete_context() {
+        let (_root, mut runtime, identity, stamp) = metadata_observer_fixture();
+        let first = runtime.refresh_comparison_metadata(identity.card);
+        assert_eq!(runtime.comparison_metadata.probe, Some(1));
+        drop(runtime.refresh_comparison_metadata(identity.card));
+        assert_eq!(runtime.comparison_metadata.next_probe, 1);
+        drop(runtime.comparison_metadata_loaded(identity.clone(), 99, DiffBasis::HeadToIndex, Ok(stamp.clone())));
+        assert_eq!(runtime.comparison_metadata.probe, Some(1));
+        drop(runtime.comparison_metadata_loaded(identity.clone(), 1, DiffBasis::IndexToWorktree, Ok(stamp.clone())));
+        assert!(runtime.comparison_metadata.probe.is_none());
+        drop(runtime.refresh_comparison_metadata(identity.card));
+        drop(runtime.comparison_metadata_loaded(identity.clone(), 2, DiffBasis::HeadToIndex, Err("temporary metadata failure".into())));
+        assert!(runtime.comparison_metadata.error.is_some());
+        assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
+        drop(runtime.refresh_comparison_metadata(identity.card));
+        let unchanged = runtime.comparison_metadata_loaded(identity, 3, DiffBasis::HeadToIndex, Ok(stamp));
+        assert!(iced::runtime::task::into_stream(unchanged).is_none());
+        assert!(runtime.comparison_metadata.error.is_none());
+        drop(first);
+    }
+
+    #[test]
+    fn shared_metadata_observer_retries_same_stamp_diff_errors_and_defers_busy_changes() {
+        let (root, mut runtime, identity, stamp) = metadata_observer_fixture();
+        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::ready(RenderedDiff::Error("temporary diff failure".into())));
+        runtime.comparison_metadata.probe = Some(1);
+        drop(runtime.comparison_metadata_loaded(identity.clone(), 1, DiffBasis::HeadToIndex, Ok(stamp.clone())));
+        assert!(runtime.comparison_refresh_pending());
+        finish_metadata_diff(&mut runtime, &identity, RenderedDiff::Error("failed once more".into()));
+        runtime.comparison_metadata.retry_after = Some(Instant::now() + Duration::from_secs(30));
+        runtime.comparison_metadata.probe = Some(2);
+        let backoff = runtime.comparison_metadata_loaded(identity.clone(), 2, DiffBasis::HeadToIndex, Ok(stamp.clone()));
+        assert!(iced::runtime::task::into_stream(backoff).is_none());
+        runtime.comparison_metadata.retry_after = None;
+        runtime.comparison_metadata.probe = Some(3);
+        drop(runtime.comparison_metadata_loaded(identity.clone(), 3, DiffBasis::HeadToIndex, Ok(stamp.clone())));
+        finish_metadata_diff(&mut runtime, &identity, metadata_ready_diff());
+        assert!(!runtime.comparison_refresh_failed());
+        assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
+        std::fs::write(root.path().join(".git/index"), "new index").unwrap();
+        let changed = crate::repository::repository_metadata_stamp(root.path(), &DiffBasis::HeadToIndex).unwrap();
+        assert_ne!(stamp, changed);
+        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::Loading { request: 99, cancellation: CancellationToken::new() });
+        runtime.comparison_metadata.probe = Some(4);
+        drop(runtime.comparison_metadata_loaded(identity.clone(), 4, DiffBasis::HeadToIndex, Ok(changed.clone())));
+        assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
+        finish_metadata_diff(&mut runtime, &identity, metadata_ready_diff());
+        runtime.comparison_metadata.probe = Some(5);
+        drop(runtime.comparison_metadata_loaded(identity.clone(), 5, DiffBasis::HeadToIndex, Ok(changed.clone())));
+        assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, changed);
+        assert!(runtime.comparison_refresh_pending());
+    }
+
+    #[test]
+    fn shared_metadata_observer_recovers_branch_resolve_and_same_basis_diff_errors() {
+        let (root, mut runtime, identity, _) = metadata_observer_fixture();
+        let basis = DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: fixture_oid(2), merge_base: fixture_oid(1) };
+        runtime.diff_basis = basis.clone();
+        runtime.set_diff_state(basis.clone(), DiffState::ready(RenderedDiff::Error("temporary branch diff failure".into())));
+        let stamp = crate::repository::repository_metadata_stamp(root.path(), &basis).unwrap();
+        runtime.comparison_metadata.stamp = Some((identity.path.clone(), basis.clone(), stamp.clone()));
+        for ticket in 1..=3 {
+            runtime.comparison_metadata.retry_after = None;
+            runtime.comparison_metadata.probe = Some(ticket);
+            drop(runtime.comparison_metadata_loaded(identity.clone(), ticket, basis.clone(), Ok(stamp.clone())));
+            let request = runtime.branch_refresh.unwrap();
+            let result = if ticket == 1 { Err("temporary branch resolver failure".into()) } else { Ok(ResolvedBasis::Ready(basis.clone())) };
+            drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity: identity.clone(), request, previous: basis.clone(), result }));
+            if ticket == 2 { finish_metadata_diff(&mut runtime, &identity, RenderedDiff::Error("temporary branch diff failure".into())); }
+            if ticket == 3 { finish_metadata_diff(&mut runtime, &identity, metadata_ready_diff()); }
+        }
+        assert!(!runtime.comparison_refresh_failed());
+        assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
     }
 
     #[test]

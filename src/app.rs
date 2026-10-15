@@ -2367,6 +2367,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
         RepositoryAction::FilesLoaded { .. }
             | RepositoryAction::FileLoaded { .. }
             | RepositoryAction::DiskMetadata { .. }
+            | RepositoryAction::ComparisonMetadata { .. }
             | RepositoryAction::DiskLoaded { .. }
             | RepositoryAction::BranchBasisRefreshed { .. }
             | RepositoryAction::DiskComparisonLoaded { .. }
