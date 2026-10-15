@@ -28,6 +28,11 @@ impl Fixture {
             fs::Permissions::from_mode(0o700),
         )
         .unwrap();
+        // Missing-key behavior must not depend on a CI host's Secret Service
+        // installation or desktop environment. Specific keyring tests replace it.
+        let keyring = root.path().join("bin/secret-tool");
+        fs::write(&keyring, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&keyring, fs::Permissions::from_mode(0o700)).unwrap();
         let f = Self { root };
         let output = Command::new("git")
             .args(["init", "-q"])
@@ -415,4 +420,21 @@ fn team_and_state_names_use_filtered_connections_without_metadata_scans() {
     let history = fs::read_to_string(f.path().join("requests")).unwrap();
     assert!(history.contains("$filter:WorkflowStateFilter!"));
     assert!(history.contains("eqIgnoreCase"));
+}
+
+#[test]
+fn unavailable_keyring_helper_reports_the_install_and_unlock_action() {
+    let f = Fixture::new();
+    let missing = f.path().join("missing-bin");
+    fs::create_dir(&missing).unwrap();
+    let output = f.command(&["linear", "issue", "ENG-12"])
+        .env_remove("LINEAR_API_KEY")
+        .env("PATH", &missing)
+        .output().unwrap();
+    assert!(!output.status.success());
+    let error = serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone();
+    assert_eq!(error["kind"], "linear_keyring_unavailable");
+    assert!(error["message"].as_str().unwrap().contains("secret-tool"));
+    assert!(error["message"].as_str().unwrap().contains("unlock"));
+    assert_eq!(f.calls(), 0);
 }
