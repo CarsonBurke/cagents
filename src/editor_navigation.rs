@@ -74,6 +74,10 @@ impl SavedUndo {
 #[derive(Default)]
 pub(crate) struct UndoLru { entries: VecDeque<(PathBuf, SavedUndo)>, bytes: usize }
 impl UndoLru {
+    /// At most eight cached histories; clone original descriptor Arcs only.
+    pub(crate) fn retained_roots(&self) -> impl Iterator<Item = std::sync::Arc<crate::fs_safety::Root>> + '_ {
+        self.entries.iter().filter_map(|(_, undo)| undo.root.as_ref().map(crate::editor::FileRootIdentity::retained_root))
+    }
     pub fn insert(&mut self, path: PathBuf, mut undo: SavedUndo) {
         if let Some(index) = self.entries.iter().position(|(candidate, _)| *candidate == path) {
             if let Some((_, previous)) = self.entries.remove(index) { self.bytes -= previous.retained_bytes(); }

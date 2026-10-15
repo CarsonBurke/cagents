@@ -3778,6 +3778,17 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Complete bounded document/history census, including cached roots while
+    /// the new document is loading or read-only. Recovery/operation leases are
+    /// additionally enrolled with the domain issuer until their own release.
+    pub fn retained_filesystem_roots(&self) -> Vec<Arc<crate::fs_safety::Root>> {
+        let mut roots = self.retained_filesystem_root().into_iter().collect::<Vec<_>>();
+        for root in self.undo_lru.retained_roots() {
+            if !roots.iter().any(|previous| Arc::ptr_eq(previous, &root)) { roots.push(root); }
+        }
+        roots
+    }
+
     fn editor_root_unbound(&self) -> bool { matches!(&self.document, DocumentState::Editable(document) if document.root_unbound) }
 
     /// One descriptor metadata probe per second; unchanged files are never
@@ -13879,6 +13890,26 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn retained_root_census_includes_cached_original_during_and_after_new_root_load() {
+        let directory = tempfile::tempdir().unwrap(); let named = directory.path().join("root"); let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("source.rs"), "original").unwrap();
+        let card = CardId::new(); let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(card, "source.rs");
+        runtime.descriptor.worktree = named.clone(); identity.worktree = named.clone();
+        let task = file_task(identity, crate::editor::PdfTone::Original, None); finish_navigation_task(&mut runtime, task).await;
+        let original = runtime.retained_filesystem_root().unwrap();
+        std::fs::rename(&named, &moved).unwrap(); std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("other.txt"), "replacement").unwrap();
+        let task = runtime.open_file(card, "other.txt".into());
+        assert!(runtime.retained_filesystem_root().is_none());
+        assert!(runtime.retained_filesystem_roots().iter().any(|root| Arc::ptr_eq(root, &original)), "cached original remains in exclusions while replacement loads");
+        finish_navigation_task(&mut runtime, task).await;
+        let current = runtime.retained_filesystem_root().unwrap(); assert!(!Arc::ptr_eq(&current, &original));
+        let roots = runtime.retained_filesystem_roots();
+        assert!(roots.iter().any(|root| Arc::ptr_eq(root, &original)));
+        assert!(roots.iter().any(|root| Arc::ptr_eq(root, &current)));
+        assert!(roots.len() <= 9, "one current document plus eight bounded cached histories");
     }
 
     #[tokio::test]
