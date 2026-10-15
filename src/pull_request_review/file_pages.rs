@@ -27,6 +27,7 @@ pub(super) struct Pages {
     pub height: f32,
     pub wanted: Option<RepoPath>,
     pub seek_unviewed: bool,
+    pub hydrate_all: bool,
     pub(super) seen: BTreeSet<String>,
 }
 
@@ -40,6 +41,7 @@ impl Default for Pages {
             height: 640.0,
             wanted: None,
             seek_unviewed: false,
+            hydrate_all: false,
             seen: BTreeSet::new(),
         }
     }
@@ -151,6 +153,9 @@ impl State {
     }
 
     fn needs_file_page(&self) -> bool {
+        if self.pages.hydrate_all {
+            return true;
+        }
         let unknown = |path: &RepoPath| {
             self.file_index(path)
                 .is_some_and(|index| self.files[index].sync == ViewedSync::Unknown)
@@ -174,6 +179,9 @@ impl State {
         if self.pages.loading
             || self.pages.error.is_some()
             || self.refreshing
+            || self.target.as_ref().is_some_and(|target| {
+                !crate::github::polling::ready(&target.repository.host, false)
+            })
             || self.load != LoadState::Ready
             || self.context.is_none()
             || (!force && !self.needs_file_page())
@@ -378,6 +386,37 @@ mod tests {
             state.pages.loading,
             "refresh must hydrate the still-visible deep viewport"
         );
+    }
+
+    #[test]
+    fn refresh_keeps_later_page_marks_and_cursor_for_same_authority() {
+        let mut state = thousand_files();
+        drop(state.update(Action::FilePage(PageAction::More)));
+        answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+        let mut snapshot = loaded(
+            state.files.iter().map(|file| file.entry.clone()).collect(),
+            (0..100)
+                .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                .collect(),
+        );
+        snapshot.next_file_cursor = Some("page-2".into());
+        finish_load(&mut state, snapshot.clone());
+        finish_load(&mut state, snapshot.clone());
+        assert!(state.files[105].viewed);
+        assert_eq!(state.files[105].sync, ViewedSync::Settled);
+        assert!(state.pages.cursor.is_none());
+        assert!(state.pages.seen.contains("page-2"));
+        snapshot.context.head_oid = "c".repeat(40);
+        snapshot.range.head = Oid::parse(&snapshot.context.head_oid).unwrap();
+        finish_load(&mut state, snapshot);
+        assert_eq!(state.files[105].sync, ViewedSync::Unknown);
+        assert!(
+            state.pages.loading,
+            "changed heads automatically hydrate later pages"
+        );
+        answer(&mut state, vec![remote_file("file-0105.rs", true)], "me");
+        assert!(state.files[105].viewed);
+        assert_eq!(state.files[105].sync, ViewedSync::Settled);
     }
 
     #[test]
