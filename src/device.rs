@@ -613,7 +613,7 @@ struct Forwarding {
     stream: UnixStream,
     upstream: Option<thread::JoinHandle<io::Result<u64>>>,
     downstream: Option<thread::JoinHandle<io::Result<u64>>>,
-    diagnostics: Option<thread::JoinHandle<String>>,
+    diagnostics: Option<thread::JoinHandle<ForwardingDiagnostics>>,
     stop_diagnostics: Arc<Cancellation>,
     received_output: Arc<std::sync::atomic::AtomicBool>,
     settled: bool,
@@ -625,6 +625,9 @@ impl Forwarding {
         stream: UnixStream,
         transport: Option<Arc<Transport>>,
     ) -> io::Result<Self> {
+        if let Some(transport) = &transport {
+            transport.daemon_missing.store(false, std::sync::atomic::Ordering::Release);
+        }
         let stop = match Cancellation::new() {
             Ok(stop) => Arc::new(stop),
             Err(error) => {
@@ -717,7 +720,6 @@ impl Forwarding {
         if result.is_err() {
             let _ = self.child.kill();
         }
-        self.stop_diagnostics.cancel();
         let deadline = Instant::now() + MASTER_EXIT_TIMEOUT;
         let status = loop {
             if let Some(status) = self.child.try_wait()? {
@@ -746,12 +748,12 @@ impl Forwarding {
             && let Some(transport) = &self.transport
             && !transport.cancelled.is_cancelled()
         {
-            transport.daemon_missing.store(status.code()==Some(i32::from(BRIDGE_ABSENT_EXIT)) && detail.lines().any(|line|line==BRIDGE_ABSENT_MARKER),std::sync::atomic::Ordering::Release);
+            transport.daemon_missing.store(status.code()==Some(i32::from(BRIDGE_ABSENT_EXIT)) && detail.daemon_absent,std::sync::atomic::Ordering::Release);
             *transport
                 .last_error
                 .lock()
                 .unwrap_or_else(|p| p.into_inner()) =
-                Some(format!("SSH to {} exited {status}: {detail}", device.host));
+                Some(format!("SSH to {} exited {status}: {}", device.host,detail.text));
         }
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
         result.map(|_| ())
@@ -888,41 +890,51 @@ fn copy_transport(
     Ok(total)
 }
 
-fn capture_diagnostics(mut stderr: std::process::ChildStderr, stop: &Cancellation) -> String {
+#[derive(Default)]
+struct ForwardingDiagnostics {text:String,daemon_absent:bool}
+fn capture_diagnostics(mut stderr: std::process::ChildStderr, stop: &Cancellation) -> ForwardingDiagnostics {
     use std::io::Read;
     let mut captured = Vec::new();
     let mut chunk = [0u8; 1024];
+    let marker=BRIDGE_ABSENT_MARKER.as_bytes();
+    let mut marker_progress=Some(0usize);
+    let mut daemon_absent=false;
+    let mut cancelled_bytes=0usize;
     loop {
         match stderr.read(&mut chunk) {
             Ok(0) => break,
             Ok(count) => {
                 let remaining = 4096usize.saturating_sub(captured.len());
                 captured.extend_from_slice(&chunk[..count.min(remaining)]);
-                // Drain an already available diagnostic prefix after child
-                // exit, while bounding cancellation of a continuously busy
-                // descriptor inherited by the persistent master.
-                if stop.is_cancelled() && captured.len() == 4096 {
-                    break;
+                // Parse the receipt independently of the bounded diagnostic
+                // prefix, including markers split across pipe reads.
+                for byte in &chunk[..count] {
+                    if *byte==b'\n' {
+                        daemon_absent |= marker_progress==Some(marker.len());
+                        marker_progress=Some(0);
+                    } else {
+                        marker_progress=marker_progress.and_then(|index|(index<marker.len() && marker[index]==*byte).then_some(index+1));
+                    }
                 }
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                // Drain available bytes after settlement, but a persistent SSH
+                // master retaining a busy descriptor cannot prevent teardown.
                 if stop.is_cancelled() {
-                    break;
+                    cancelled_bytes=cancelled_bytes.saturating_add(count);
+                    if cancelled_bytes>=64*1024 {break;}
                 }
-                continue;
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if stop.is_cancelled() {
-                    break;
-                }
-                if wait_transport_io(&stderr, libc::POLLIN, stop, None).is_err() {
-                    break;
-                }
+                if stop.is_cancelled() {break;}
+                if wait_transport_io(&stderr, libc::POLLIN, stop, None).is_err() && !stop.is_cancelled() {break;}
+                // On cancellation try one final nonblocking drain: data and
+                // cancellation may become ready in the same scheduling slice.
             }
             Err(_) => break,
         }
     }
-    String::from_utf8_lossy(&captured).trim().to_owned()
+    daemon_absent |= marker_progress==Some(marker.len());
+    ForwardingDiagnostics{text:String::from_utf8_lossy(&captured).trim().to_owned(),daemon_absent}
 }
 
 fn lock_starting<'a>(
@@ -1125,10 +1137,11 @@ mod tests {
     #[test]
     fn remote_absence_is_published_before_eof_and_requires_both_typed_receipts() {
         use std::io::Read;
-        for (code,diagnostic,missing) in [(69,BRIDGE_ABSENT_MARKER,true),(255,BRIDGE_ABSENT_MARKER,false),(69,"ordinary SSH failure",false)] {
+        for (code,diagnostic,missing,delayed) in [(69,BRIDGE_ABSENT_MARKER,true,false),(255,BRIDGE_ABSENT_MARKER,false,false),(69,"ordinary SSH failure",false,false),(69,BRIDGE_ABSENT_MARKER,true,true)] {
             let directory=tempfile::tempdir().unwrap();
             let transport=fixture_transport(Device{name:"fixture".into(),host:"unused-fixture".into(),executable:"cagents".into()},directory.path().to_path_buf());
-            let child=Command::new("/bin/sh").arg("-c").arg("printf '%s\n' \"$1\" >&2; exit \"$2\"").arg("fixture").arg(diagnostic).arg(code.to_string()).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+            let script=if delayed {"exec 1>&-; printf '%s\n' \"$3\" >&2; sleep .05; printf '%s\n' \"$1\" >&2; exit \"$2\""} else {"printf '%s\n' \"$1\" >&2; exit \"$2\""};
+            let child=Command::new("/bin/sh").arg("-c").arg(script).arg("fixture").arg(diagnostic).arg(code.to_string()).arg("banner".repeat(1000)).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
             let (mut client,server)=UnixStream::pair().unwrap();
             client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let forwarding=Forwarding::start(child,server,Some(transport.clone())).unwrap();

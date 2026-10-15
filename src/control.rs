@@ -2016,7 +2016,7 @@ fn control_daemon_socket() -> Result<PathBuf, AppError> {
     if !daemon_autostart_disabled() {
         return terminal::ensure_daemon_ready().map_err(|e| AppError::new("daemon_start", e));
     }
-    let socket = daemon_socket_path().map_err(|e| AppError::new(if daemon_missing(&e) { "daemon_not_running" } else { "socket_path" }, e))?;
+    let socket = daemon_socket_path().map_err(|e| AppError::new("socket_path", e))?;
     match UnixStream::connect(&socket) {
         Ok(_) => Ok(socket),
         Err(error) if daemon_missing(&error) => Err(AppError::new(
@@ -2715,11 +2715,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             expected_generation,
             confirm,
         } => {
-            let socket = match daemon_socket_path() {
-                Ok(socket) => socket,
-                Err(error) if daemon_missing(&error) => return Ok(already_stopped()),
-                Err(error) => return Err(AppError::new("socket_path", error)),
-            };
+            let socket = daemon_socket_path().map_err(|error|AppError::new("socket_path",error))?;
             let mut client = match ControlClient::connect(&socket) {
                 Ok(client) => client,
                 Err(ControlError::Connect(error)) if daemon_missing(&error) => return Ok(already_stopped()),
