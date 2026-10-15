@@ -6,6 +6,9 @@ use std::cell::Cell;
 #[derive(Default)]
 pub(super) struct State { depth: Cell<usize>, poisoned: Cell<bool> }
 impl State {
+    /// An owned writer also becomes unusable after an uncertain release.
+    /// An eventual external rollback cannot restore source ownership proof.
+    pub(super) fn poison(&self) { self.poisoned.set(true); }
     pub(super) fn guard_connection(&self,db:&Connection)->Result<(),String> {
         if self.poisoned.get() { return Err(POISONED.into()); }
         let transaction=db.transaction_state::<&str>(None).map_err(|error| {
