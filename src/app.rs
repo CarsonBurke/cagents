@@ -2726,6 +2726,7 @@ fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
 pub enum AgentSetting { Model, Effort, PermissionMode, Executable, Arguments, Environment }
 
 impl AgentSetting {
+    const fn key(self) -> &'static str { match self { Self::Model => "model", Self::Effort => "effort", Self::PermissionMode => "permission_mode", Self::Executable => "executable", Self::Arguments => "arguments", Self::Environment => "environment" } }
     const fn label(self) -> &'static str { match self { Self::Model => "Default model", Self::Effort => "Default effort", Self::PermissionMode => "Default permission mode", Self::Executable => "Executable", Self::Arguments => "Extra arguments", Self::Environment => "Environment" } }
 }
 

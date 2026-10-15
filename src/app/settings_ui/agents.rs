@@ -6,9 +6,9 @@ fn select<'a>(provider: Provider, field: AgentSetting, selected: Option<&str>, o
     for value in offered { if !values.contains(&value) { values.push(value); } }
     if let Some(selected) = selected && !values.iter().any(|value| value == selected) { values.push(selected.into()); }
     let index = selected.and_then(|selected| values.iter().position(|value| value == selected)).or(Some(0));
-    let labels = values.iter().map(|value| if value.is_empty() { "Provider default".to_owned() } else { value.clone() }).collect::<Vec<_>>();
-    let keywords = labels.join(" ");
-    setting_field(field.label(), "Used for new conversations. Each composer can override this choice.", crate::ui_controls::field::select(labels, index, move |index| Message::SettingsChanged { field: SettingsField::Agent(provider, field), value: values[index].clone() }).into()).keywords(format!("agents.{}", settings::agents::provider_key(provider))).keywords(keywords).keywords(selected.unwrap_or(""))
+    let labels = values.iter().map(|value| if value.is_empty() { "Provider default".to_owned() } else if field == AgentSetting::PermissionMode { crate::app::chat_ui::permission_mode_label(value).to_owned() } else { value.clone() }).collect::<Vec<_>>();
+    let keywords = format!("{} {}", labels.join(" "), values.join(" "));
+    setting_field(field.label(), "Used for new conversations. Each composer can override this choice.", crate::ui_controls::field::select(labels, index, move |index| Message::SettingsChanged { field: SettingsField::Agent(provider, field), value: values[index].clone() }).into()).keywords(format!("agents.{}.{}", settings::agents::provider_key(provider), field.key())).keywords(keywords).keywords(selected.unwrap_or(""))
 }
 
 pub(super) fn controls<'a>(draft: &'a SettingsDraft, context: &SettingsContext<'a>) -> Vec<Group<'a, Message>> {
@@ -48,7 +48,7 @@ pub(super) fn controls<'a>(draft: &'a SettingsDraft, context: &SettingsContext<'
         }
         let mut added = configuration.arguments.clone(); added.push(String::new());
         arguments.push(crate::ui_controls::button::quiet("Add argument").on_press(Message::SettingsChanged { field: field(AgentSetting::Arguments), value: serde_json::to_string(&added).expect("argument strings serialize") }).into());
-        options.push(setting_field("Extra arguments", "One argument per row, in launch order. Spaces stay inside the argument; no shell parsing is performed.", widget::column::with_children(arguments).spacing(space::XS).into()).error(context.invalid.get(&field(AgentSetting::Arguments)).map(String::as_str)).keywords("arguments").keywords(configuration.arguments.join(" ")));
+        options.push(setting_field("Extra arguments", "One argument per row, in launch order. Spaces stay inside the argument; no shell parsing is performed.", widget::column::with_children(arguments).spacing(space::XS).into()).error(context.invalid.get(&field(AgentSetting::Arguments)).map(String::as_str)).keywords(format!("agents.{}.arguments", settings::agents::provider_key(provider))).keywords(configuration.arguments.join(" ")));
 
         let mut environment: Vec<Element<'a, Message>> = Vec::new();
         for (index, (name, value)) in entry.environment.iter().enumerate() {
@@ -67,7 +67,7 @@ pub(super) fn controls<'a>(draft: &'a SettingsDraft, context: &SettingsContext<'
         }
         let mut added = entry.environment.clone(); added.push((String::new(), String::new()));
         environment.push(crate::ui_controls::button::quiet("Add environment variable").on_press(Message::SettingsDraftChanged { field: field(AgentSetting::Environment), value: serde_json::to_string(&added).expect("environment strings serialize") }).into());
-        options.push(setting_field("Environment", "Values are masked. Account home and credential isolation variables cannot be overridden. Changes apply to future launches.", widget::column::with_children(environment).spacing(space::XS).into()).error(context.invalid.get(&field(AgentSetting::Environment)).map(String::as_str)).keywords("environment variables").keywords(entry.environment.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" ")));
+        options.push(setting_field("Environment", "Values are masked. Account home and credential isolation variables cannot be overridden. Changes apply to future launches.", widget::column::with_children(environment).spacing(space::XS).into()).error(context.invalid.get(&field(AgentSetting::Environment)).map(String::as_str)).keywords(format!("agents.{}.environment variables", settings::agents::provider_key(provider))).keywords(entry.environment.iter().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(" ")));
         groups.push(settings_group(provider.label(), "Provider defaults and launch options. Existing conversations keep their recorded recipe.", options));
     }
     groups

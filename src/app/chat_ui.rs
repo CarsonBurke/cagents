@@ -3029,6 +3029,11 @@ fn draft_snapshot(
     }
 }
 
+/// Settings and the composer present the same provider permission choices.
+pub(super) fn permission_mode_label(mode: &str) -> &str {
+    view::permission_mode_label(mode)
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
