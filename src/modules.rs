@@ -9,6 +9,7 @@ const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 pub const VERSION: &str = env!("CAGENTS_VERSION");
 
 mod names;
+pub mod search_match;
 
 pub mod account;
 pub mod agent;
@@ -22,6 +23,8 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
+#[cfg(feature = "ui")]
+pub(crate) mod change_list;
 pub mod chat;
 pub mod companion;
 pub mod control;
@@ -34,6 +37,10 @@ pub mod device;
 pub mod device_service;
 pub mod diagnostics;
 #[cfg(feature = "ui")]
+pub mod diff_interaction;
+#[cfg(feature = "ui")]
+pub mod diff_patch;
+#[cfg(feature = "ui")]
 pub mod diff_view;
 #[cfg(feature = "ui")]
 pub mod document_link;
@@ -44,6 +51,8 @@ pub mod editor;
 #[cfg(feature = "ui")]
 pub(crate) mod editor_history;
 #[cfg(feature = "ui")]
+pub mod editor_search;
+#[cfg(feature = "ui")]
 pub mod external_editor;
 #[cfg(feature = "ui")]
 pub mod file_drop;
@@ -52,6 +61,8 @@ pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
 pub mod fs_safety;
+#[cfg(feature = "ui")]
+pub mod git_patch;
 #[cfg(feature = "ui")]
 pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -69,6 +80,7 @@ pub mod instance;
 pub mod interaction;
 #[cfg(feature = "latency-harness")]
 pub mod latency_fixture;
+pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
 pub mod linear;
@@ -84,6 +96,8 @@ pub mod persistence;
 pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
+pub mod project_search;
+#[cfg(feature = "ui")]
 pub mod pull_request_review;
 #[cfg(feature = "ui")]
 pub mod reorder;
@@ -97,7 +111,6 @@ mod selected_file_path;
 mod separator;
 #[cfg(feature = "ui")]
 pub mod session;
-#[cfg(feature = "ui")]
 pub mod settings;
 #[cfg(feature = "ui")]
 pub mod settings_widgets;

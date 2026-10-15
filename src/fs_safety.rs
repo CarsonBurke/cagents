@@ -150,6 +150,12 @@ impl Root {
         metadata_of_descriptor(&self.directory)
     }
 
+    /// Enumerates this already-open directory, even if its old name is moved
+    /// or replaced. Child names must still be resolved beneath the root.
+    pub fn read_dir(&self) -> io::Result<std::fs::ReadDir> {
+        std::fs::read_dir(format!("/proc/self/fd/{}", self.directory.as_raw_fd()))
+    }
+
     fn descriptor(&self) -> RawFd {
         self.directory.as_raw_fd()
     }

@@ -204,19 +204,25 @@ impl AccountUsage {
 struct ActivityObservation {
     generation: u64,
     state: ActivityState,
+    outcome: Option<crate::agent::ActivityOutcome>,
     pending: bool,
 }
 
 impl ActivityObservation {
     fn observe(&mut self, generation: u64, state: ActivityState) -> bool {
+        self.observe_outcome(generation, state, None)
+    }
+
+    fn observe_outcome(&mut self, generation: u64, state: ActivityState, outcome: Option<crate::agent::ActivityOutcome>) -> bool {
         if generation < self.generation {
             return false;
         }
         self.generation = generation;
-        if self.state == state {
+        if self.state == state && self.outcome == outcome {
             return false;
         }
         self.state = state;
+        self.outcome = outcome;
         !std::mem::replace(&mut self.pending, true)
     }
 
@@ -478,6 +484,7 @@ impl ClientHandle {
                 activity: Arc::new(Mutex::new(ActivityObservation {
                     generation: 0,
                     state: ActivityState::Idle,
+                    outcome: None,
                     pending: false,
                 })),
                 observed: Arc::new(Mutex::new(OutputObservation::default())),
@@ -861,8 +868,9 @@ impl ClientHandle {
                     chat_id,
                     state,
                     generation,
+                    outcome,
                 } if chat_id == id && envelope.request_id.is_none() => {
-                    early_activity = Some((generation, state));
+                    early_activity = Some((generation, state, outcome));
                 }
                 ServerMessage::ChatObserved { chat_id, epoch }
                     if chat_id == id && envelope.request_id.is_none() =>
@@ -916,10 +924,11 @@ impl ClientHandle {
         let mut activity = ActivityObservation {
             generation: initial.generation,
             state: initial.activity(),
+            outcome: initial.outcome.clone(),
             pending: false,
         };
-        if let Some((generation, state)) = early_activity {
-            activity.observe(generation, state);
+        if let Some((generation, state, outcome)) = early_activity {
+            activity.observe_outcome(generation, state, outcome);
         }
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
@@ -1070,9 +1079,9 @@ impl ClientHandle {
                             wake(Wake::Observed);
                         }
                     },
-                    ServerMessage::ChatActivity { chat_id, state, generation } if chat_id == id => {
+                    ServerMessage::ChatActivity { chat_id, state, generation, outcome } if chat_id == id => {
                         let changed = activity.lock().unwrap_or_else(|p| p.into_inner())
-                            .observe(generation, state);
+                            .observe_outcome(generation, state, outcome);
                         if changed { wake(Wake::Activity); }
                     },
                     ServerMessage::ChatAccountUsage { chat_id, report, observed_at } if chat_id == id => {
@@ -1219,6 +1228,12 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
     }
+    /// Latest terminal outcome from the small activity stream, including for
+    /// hidden chats whose transcript is intentionally not subscribed.
+    pub fn activity_outcome(&self) -> Option<crate::agent::ActivityOutcome> {
+        self.inner.activity.lock().unwrap_or_else(|p| p.into_inner()).outcome.clone()
+    }
+
     /// Drains what the provider reported about the account this chat runs
     /// on, oldest first.
     pub fn take_account_usage(&self) -> Vec<(LiveReport, u64)> {
@@ -2027,6 +2042,7 @@ mod tests {
         let mut activity = ActivityObservation {
             generation: 5,
             state: ActivityState::Working,
+            outcome: None,
             pending: false,
         };
         assert!(!activity.observe(4, ActivityState::Idle));

@@ -20,11 +20,14 @@ use crate::file_manager::{self, open_system_url};
 mod browser_backend;
 mod browser_host;
 mod file_ui;
+mod git_group_ui;
+mod git_patch_ui;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
 mod notification_ui;
+mod onboarding_ui;
 mod palette_ui;
 mod project_ui;
 mod pull_request_ui;
@@ -33,6 +36,7 @@ mod resume_ui;
 mod review_request_ui;
 #[cfg(test)]
 mod safety_tests;
+mod search_ui;
 mod session_recovery;
 mod settings_ui;
 mod shared_views;
@@ -51,6 +55,7 @@ pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
 };
+use worktree_ui::card_directory;
 
 use std::{
     borrow::Cow,
@@ -83,7 +88,7 @@ use url::Url;
 
 use crate::{
     account::{self, Account},
-    design::{self, DockLayout, InspectorLayout, space},
+    design::{self, InspectorLayout, space},
     github::{
         CreatePullRequestRequest, GitHubAvailability, GitHubRepoKey, GitHubService,
         ListPullRequestsRequest, PullRequestCreationOutcome, PullRequestStateFilter,
@@ -158,6 +163,20 @@ const APPLICATION_NAME: &str = instance::APPLICATION_NAME;
 /// Separates what the window is showing from the application name, following
 /// the desktop convention of "<document> — <application>".
 const WINDOW_TITLE_SEPARATOR: &str = " — ";
+
+fn format_window_title(header: &str, device: Option<&str>, waiting: usize) -> String {
+    let title = if header == APPLICATION_NAME {
+        header.to_owned()
+    } else {
+        format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+    };
+    let title = device.map_or(title.clone(), |device| format!("{device} · {title}"));
+    if waiting > 0 {
+        format!("({waiting}) {title}")
+    } else {
+        title
+    }
+}
 
 /// Embedded artwork for initial window creation, independent of icon themes.
 pub fn application_window_icon() -> window::Icon {
@@ -2066,6 +2085,7 @@ pub struct PullRequestDialog {
 pub enum ContextTab {
     #[default]
     Files,
+    Search,
     Changes,
     PullRequest,
     Details,
@@ -2171,11 +2191,18 @@ async fn flush_workspace(
 }
 
 impl ContextTab {
-    const ALL: [Self; 4] = [Self::Files, Self::Changes, Self::PullRequest, Self::Details];
+    const ALL: [Self; 5] = [
+        Self::Files,
+        Self::Search,
+        Self::Changes,
+        Self::PullRequest,
+        Self::Details,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Files => "Files",
+            Self::Search => "Search",
             // The panel holds the Changes, Branch, and History views; naming
             // it after the first of them said "Changes" twice.
             Self::Changes => "Source control",
@@ -2282,22 +2309,6 @@ fn is_escape_press(event: &keyboard::Event) -> bool {
     )
 }
 
-fn is_save_press(event: &keyboard::Event) -> bool {
-    matches!(
-        event,
-        keyboard::Event::KeyPressed {
-            key: keyboard::Key::Character(key),
-            modifiers,
-            repeat: false,
-            ..
-        } if key.eq_ignore_ascii_case("s")
-            && modifiers.control()
-            && !modifiers.alt()
-            && !modifiers.shift()
-            && !modifiers.logo()
-    )
-}
-
 #[cfg(feature = "integrated-browser")]
 fn browser_shortcut(card: CardId, event: &keyboard::Event) -> Option<Message> {
     use keyboard::{Key, key::Named};
@@ -2376,6 +2387,8 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::WorkingDiffDue { .. }
             | RepositoryAction::WorkingDiffLoaded { .. }
             | RepositoryAction::FindLoaded { .. }
+            | RepositoryAction::DiffFindLoaded { .. }
+            | RepositoryAction::EndDiffSelection { .. }
             | RepositoryAction::AutoSaveDue { .. }
             // Refusing these strands the card's file list and markdown preview
             // behind their own debounce until the next self-heal.
@@ -2476,9 +2489,15 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
-        Message::NewTerminal
+        Message::ChatClose(chat_ui::closing::Action::End(_)) => true,
+        Message::Onboarding(onboarding_ui::Action::Clone | onboarding_ui::Action::HomeChat)
+        | Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
+        | Message::Palette(palette_ui::Action::FocusPane(_))
+        | Message::FocusAttention(_)
+        | Message::MovePaneToChannel { .. }
+        | Message::PaneDropToChannel { .. }
         | Message::TerminalReviewMode { .. }
         | Message::TerminalDropped { .. }
         | Message::ResizeCard { .. }
@@ -2509,6 +2528,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsDraftChanged { .. }
         | Message::ResetSettings
         | Message::DismissStatus => true,
+        Message::ProjectSearch(action) => !matches!(action, search_ui::Action::Progress { .. } | search_ui::Action::Run(_) | search_ui::Action::QueryFocus(_)),
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
@@ -2535,6 +2555,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
 
 fn user_message_blocked_during_update(message: &Message) -> bool {
     user_workspace_message_blocked_while_modal(message)
+        || matches!(message, Message::ChatClose(action) if !matches!(action, chat_ui::closing::Action::CommitHide(_)))
         || matches!(
             message,
             Message::KeyEvent { .. }
@@ -2623,7 +2644,11 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_)
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
+            | Message::MovePaneToChannel { .. }
+            | Message::PaneDropToChannel { .. }
             | Message::FocusCard(_)
+            | Message::Palette(palette_ui::Action::FocusPane(_))
+            | Message::FocusAttention(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -2634,6 +2659,11 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::ToggleContextInspector
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
+            | Message::Repository(RepositoryAction::OpenWorkingFileLocation { .. })
+            | Message::Repository(RepositoryAction::DiffCommand {
+                command: crate::diff_interaction::Command::OpenInEditor { .. },
+                ..
+            })
             | Message::Sidebar(
                 SidebarAction::OpenRepositoryPicker
                     | SidebarAction::OpenRepository { .. }
@@ -2729,6 +2759,7 @@ pub enum SettingsField {
     TerminalCursorStyle,
     TerminalTheme,
     MaxHotCards,
+    GitStatusLimit,
     HibernationDelayMs,
     TerminalFontSize,
     TerminalFontFamily,
@@ -2771,6 +2802,8 @@ pub enum SettingsField {
     ShortcutCyclePaneWidth,
     ShortcutPreviousWorkspace,
     ShortcutNextWorkspace,
+    ShortcutNextAttention,
+    ShortcutPreviousAttention,
     ShortcutReviewToggleViewed,
     ShortcutReviewNextFile,
     ShortcutReviewPreviousFile,
@@ -2796,13 +2829,134 @@ pub enum SettingsField {
     ShortcutFocusPane7,
     ShortcutFocusPane8,
     ShortcutFocusPane9,
+    ShortcutFocusLastPane,
     ShortcutToggleProjects,
     ShortcutRenamePane,
+    ShortcutNewBrowser,
+    ShortcutOpenFolder,
+    ShortcutNewWorktree,
+    ShortcutCloseOtherPanes,
+    ShortcutClosePanesToRight,
+    ShortcutCopyPath,
+    ShortcutRevealInProjects,
+    ShortcutForkConversation,
+    ShortcutFocusSidebarTree,
+    ShortcutRestartDaemon,
+    ShortcutToggleTheme,
+    ShortcutResumeConversation,
+    ShortcutSwitchPane,
+    ShortcutReviewConversationChanges,
+    ShortcutFocusProject1,
+    ShortcutFocusProject2,
+    ShortcutFocusProject3,
+    ShortcutFocusProject4,
+    ShortcutFocusProject5,
+    ShortcutFocusProject6,
+    ShortcutFocusProject7,
+    ShortcutFocusProject8,
+    ShortcutFocusProject9,
+    ShortcutSettingsGeneral,
+    ShortcutSettingsAppearance,
+    ShortcutSettingsTerminal,
+    ShortcutSettingsLinks,
+    ShortcutSettingsKeyboard,
+    ShortcutSettingsNativeChat,
+    ShortcutSettingsEditor,
+    ShortcutSettingsAccounts,
+    ShortcutSettingsNotifications,
+    ShortcutSettingsAbout,
+    ShortcutMovePaneToChannel,
+
+    ShortcutDiffCopy,
+    ShortcutDiffCopyOld,
+    ShortcutDiffCopyNew,
+    ShortcutDiffCopyPatch,
+    ShortcutDiffCopyLineReference,
+    ShortcutDiffOpenInEditor,
+    ShortcutDiffSelectAll,
+
+    ShortcutNextDiagnostic,
+    ShortcutPreviousDiagnostic,
+
+    ShortcutEndConversation,
+
+    ShortcutEditorUndo,
+    ShortcutEditorRedo,
+    ShortcutEditorCut,
+    ShortcutEditorCopy,
+    ShortcutEditorPaste,
+    ShortcutEditorSelectAll,
+
+    ShortcutMarkAllRead,
+    ShortcutSearchInProject,
+    ShortcutCloneRepository,
+    ShortcutCopyBranch,
+    ShortcutOpenOrCreatePullRequest,
+    ShortcutNewWorktreeFromBranch,
+    ShortcutMoveProjectUp,
+    ShortcutMoveProjectDown,
+    ShortcutResetSidebarOrder,
+    ShortcutRevealInFileManager,
+    ShortcutOpenRepositoryUrl,
+    ShortcutOpenInExternalEditor,
+    ShortcutDeleteWorktree,
+    ShortcutRemoveProject,
+    ShortcutDeleteSelectedRows,
+    ShortcutRenameChannel,
+    ShortcutMarkChannelRead,
+    ShortcutDeleteChannel,
+    ShortcutMarkWorktreeRead,
+    ShortcutRenameFile,
+    ShortcutDuplicateFile,
+    ShortcutCopyRelativePath,
+    ShortcutStageSelectedChanges,
+    ShortcutUnstageSelectedChanges,
+    ShortcutDiscardSelectedChanges,
+    ShortcutOpenFile,
+    ShortcutRevealInFiles,
+    ShortcutIgnoreChangePath,
+    ShortcutGitFetch,
+    ShortcutGitPush,
+    ShortcutGitPublish,
+    ShortcutGitSync,
+    ShortcutGitSyncRebase,
+    ShortcutGitStash,
+    ShortcutGitStashUntracked,
+    ShortcutGitStashes,
+    ShortcutGitApplyStash,
+    ShortcutGitPopStash,
+    ShortcutGitDropStash,
+    ShortcutGitCommit,
+    ShortcutGitAmend,
+    ShortcutGitRefresh,
+    ShortcutGitAbort,
+    ShortcutGitContinue,
+    ShortcutGitOutput,
+    ShortcutGitAcceptOurs,
+    ShortcutGitAcceptTheirs,
+    ShortcutEditorComplete,
+    ShortcutGoToDefinition,
+    ShortcutFindReferences,
+    ShortcutShowHover,
+    ShortcutShowDiagnostics,
+    ShortcutEditorSave,
+    ShortcutEditorDiscardEdits,
+    ShortcutEditorEdit,
+    ShortcutEditorPreview,
+    ShortcutEditorDiff,
+    ShortcutPdfFirstPage,
+    ShortcutPdfPreviousPage,
+    ShortcutPdfNextPage,
+    ShortcutPdfLastPage,
+    ShortcutPdfZoomOut,
+    ShortcutPdfZoomIn,
+    ShortcutPdfFit,
+    ShortcutPdfToggleColors,
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 38] = [
+    const SHORTCUTS: [Self; 156] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2814,6 +2968,8 @@ impl SettingsField {
         Self::ShortcutCyclePaneWidth,
         Self::ShortcutPreviousWorkspace,
         Self::ShortcutNextWorkspace,
+        Self::ShortcutNextAttention,
+        Self::ShortcutPreviousAttention,
         Self::ShortcutReviewToggleViewed,
         Self::ShortcutReviewNextFile,
         Self::ShortcutReviewPreviousFile,
@@ -2839,14 +2995,133 @@ impl SettingsField {
         Self::ShortcutFocusPane7,
         Self::ShortcutFocusPane8,
         Self::ShortcutFocusPane9,
+        Self::ShortcutFocusLastPane,
         Self::ShortcutToggleProjects,
         Self::ShortcutRenamePane,
+        Self::ShortcutNewBrowser,
+        Self::ShortcutOpenFolder,
+        Self::ShortcutNewWorktree,
+        Self::ShortcutCloseOtherPanes,
+        Self::ShortcutClosePanesToRight,
+        Self::ShortcutCopyPath,
+        Self::ShortcutRevealInProjects,
+        Self::ShortcutForkConversation,
+        Self::ShortcutFocusSidebarTree,
+        Self::ShortcutRestartDaemon,
+        Self::ShortcutToggleTheme,
+        Self::ShortcutResumeConversation,
+        Self::ShortcutSwitchPane,
+        Self::ShortcutReviewConversationChanges,
+        Self::ShortcutFocusProject1,
+        Self::ShortcutFocusProject2,
+        Self::ShortcutFocusProject3,
+        Self::ShortcutFocusProject4,
+        Self::ShortcutFocusProject5,
+        Self::ShortcutFocusProject6,
+        Self::ShortcutFocusProject7,
+        Self::ShortcutFocusProject8,
+        Self::ShortcutFocusProject9,
+        Self::ShortcutSettingsGeneral,
+        Self::ShortcutSettingsAppearance,
+        Self::ShortcutSettingsTerminal,
+        Self::ShortcutSettingsLinks,
+        Self::ShortcutSettingsKeyboard,
+        Self::ShortcutSettingsNativeChat,
+        Self::ShortcutSettingsEditor,
+        Self::ShortcutSettingsAccounts,
+        Self::ShortcutSettingsNotifications,
+        Self::ShortcutSettingsAbout,
+        Self::ShortcutMovePaneToChannel,
+        Self::ShortcutDiffCopy,
+        Self::ShortcutDiffCopyOld,
+        Self::ShortcutDiffCopyNew,
+        Self::ShortcutDiffCopyPatch,
+        Self::ShortcutDiffCopyLineReference,
+        Self::ShortcutDiffOpenInEditor,
+        Self::ShortcutDiffSelectAll,
+        Self::ShortcutNextDiagnostic,
+        Self::ShortcutPreviousDiagnostic,
+        Self::ShortcutEndConversation,
+        Self::ShortcutEditorUndo,
+        Self::ShortcutEditorRedo,
+        Self::ShortcutEditorCut,
+        Self::ShortcutEditorCopy,
+        Self::ShortcutEditorPaste,
+        Self::ShortcutEditorSelectAll,
+        Self::ShortcutMarkAllRead,
+        Self::ShortcutSearchInProject,
+        Self::ShortcutCloneRepository,
+        Self::ShortcutCopyBranch,
+        Self::ShortcutOpenOrCreatePullRequest,
+        Self::ShortcutNewWorktreeFromBranch,
+        Self::ShortcutMoveProjectUp,
+        Self::ShortcutMoveProjectDown,
+        Self::ShortcutResetSidebarOrder,
+        Self::ShortcutRevealInFileManager,
+        Self::ShortcutOpenRepositoryUrl,
+        Self::ShortcutOpenInExternalEditor,
+        Self::ShortcutDeleteWorktree,
+        Self::ShortcutRemoveProject,
+        Self::ShortcutDeleteSelectedRows,
+        Self::ShortcutRenameChannel,
+        Self::ShortcutMarkChannelRead,
+        Self::ShortcutDeleteChannel,
+        Self::ShortcutMarkWorktreeRead,
+        Self::ShortcutRenameFile,
+        Self::ShortcutDuplicateFile,
+        Self::ShortcutCopyRelativePath,
+        Self::ShortcutStageSelectedChanges,
+        Self::ShortcutUnstageSelectedChanges,
+        Self::ShortcutDiscardSelectedChanges,
+        Self::ShortcutOpenFile,
+        Self::ShortcutRevealInFiles,
+        Self::ShortcutIgnoreChangePath,
+        Self::ShortcutGitFetch,
+        Self::ShortcutGitPush,
+        Self::ShortcutGitPublish,
+        Self::ShortcutGitSync,
+        Self::ShortcutGitSyncRebase,
+        Self::ShortcutGitStash,
+        Self::ShortcutGitStashUntracked,
+        Self::ShortcutGitStashes,
+        Self::ShortcutGitApplyStash,
+        Self::ShortcutGitPopStash,
+        Self::ShortcutGitDropStash,
+        Self::ShortcutGitCommit,
+        Self::ShortcutGitAmend,
+        Self::ShortcutGitRefresh,
+        Self::ShortcutGitAbort,
+        Self::ShortcutGitContinue,
+        Self::ShortcutGitOutput,
+        Self::ShortcutGitAcceptOurs,
+        Self::ShortcutGitAcceptTheirs,
+        Self::ShortcutEditorComplete,
+        Self::ShortcutGoToDefinition,
+        Self::ShortcutFindReferences,
+        Self::ShortcutShowHover,
+        Self::ShortcutShowDiagnostics,
+        Self::ShortcutEditorSave,
+        Self::ShortcutEditorDiscardEdits,
+        Self::ShortcutEditorEdit,
+        Self::ShortcutEditorPreview,
+        Self::ShortcutEditorDiff,
+        Self::ShortcutPdfFirstPage,
+        Self::ShortcutPdfPreviousPage,
+        Self::ShortcutPdfNextPage,
+        Self::ShortcutPdfLastPage,
+        Self::ShortcutPdfZoomOut,
+        Self::ShortcutPdfZoomIn,
+        Self::ShortcutPdfFit,
+        Self::ShortcutPdfToggleColors,
     ];
 
     /// The label the settings pane shows for this setting, which is also
     /// the name its messages use for it.
-    const fn label(self) -> &'static str {
+    fn label(self) -> &'static str {
         use crate::notifications::Field;
+        if let Some(action) = self.shortcut_action() {
+            return workspace_widget::shortcut_descriptor(action).label;
+        }
         match self {
             Self::Notifications(Field::Enabled) => "System notifications",
             Self::Notifications(Field::Success) => "Successful completion",
@@ -2863,6 +3138,7 @@ impl SettingsField {
             Self::TerminalCursorStyle => "Cursor shape",
             Self::TerminalTheme => "Color theme",
             Self::MaxHotCards => "Maximum hot panes",
+            Self::GitStatusLimit => "Changes shown",
             Self::HibernationDelayMs => "Hibernation delay (ms)",
             Self::TerminalFontSize => "Font size",
             Self::TerminalFontFamily => "Font family",
@@ -2882,6 +3158,127 @@ impl SettingsField {
             Self::ConfirmMultilinePaste => "Confirm multiline paste",
             Self::ShortcutToggleProjects => "Toggle Projects sidebar",
             Self::ShortcutRenamePane => "Rename focused pane",
+            Self::ShortcutNewBrowser => "New browser pane",
+            Self::ShortcutOpenFolder => "Open folder / add project",
+            Self::ShortcutNewWorktree => "New worktree",
+            Self::ShortcutCloseOtherPanes => "Close other panes",
+            Self::ShortcutClosePanesToRight => "Close panes to the right",
+            Self::ShortcutCopyPath => "Copy path",
+            Self::ShortcutRevealInProjects => "Reveal in Projects",
+            Self::ShortcutForkConversation => "Fork conversation",
+            Self::ShortcutFocusSidebarTree => "Focus Projects tree",
+            Self::ShortcutRestartDaemon => "Restart daemon",
+            Self::ShortcutToggleTheme => "Toggle theme",
+            Self::ShortcutResumeConversation => "Resume conversation",
+            Self::ShortcutSwitchPane => "Switch conversation view",
+            Self::ShortcutReviewConversationChanges => "Review conversation changes",
+            Self::ShortcutFocusProject1 => "Go to project 1",
+            Self::ShortcutFocusProject2 => "Go to project 2",
+            Self::ShortcutFocusProject3 => "Go to project 3",
+            Self::ShortcutFocusProject4 => "Go to project 4",
+            Self::ShortcutFocusProject5 => "Go to project 5",
+            Self::ShortcutFocusProject6 => "Go to project 6",
+            Self::ShortcutFocusProject7 => "Go to project 7",
+            Self::ShortcutFocusProject8 => "Go to project 8",
+            Self::ShortcutFocusProject9 => "Go to project 9",
+            Self::ShortcutSettingsGeneral => "Open settings: General",
+            Self::ShortcutSettingsAppearance => "Open settings: Appearance",
+            Self::ShortcutSettingsTerminal => "Open settings: Terminal",
+            Self::ShortcutSettingsLinks => "Open settings: Links",
+            Self::ShortcutSettingsKeyboard => "Open settings: Keyboard",
+            Self::ShortcutSettingsNativeChat => "Open settings: Native chat",
+            Self::ShortcutSettingsEditor => "Open settings: Editor",
+            Self::ShortcutSettingsAccounts => "Open settings: Accounts",
+            Self::ShortcutSettingsNotifications => "Open settings: Notifications",
+            Self::ShortcutSettingsAbout => "Open settings: About",
+            Self::ShortcutMovePaneToChannel => "Move pane to channel…",
+
+            Self::ShortcutDiffCopy => "Copy",
+            Self::ShortcutDiffCopyOld => "Copy old side",
+            Self::ShortcutDiffCopyNew => "Copy new side",
+            Self::ShortcutDiffCopyPatch => "Copy as patch",
+            Self::ShortcutDiffCopyLineReference => "Copy line reference",
+            Self::ShortcutDiffOpenInEditor => "Open working file in editor at line",
+            Self::ShortcutDiffSelectAll => "Select all diff rows",
+
+            Self::ShortcutNextDiagnostic => "Next diagnostic",
+            Self::ShortcutPreviousDiagnostic => "Previous diagnostic",
+
+            Self::ShortcutEndConversation => "Close conversation…",
+
+            Self::ShortcutEditorUndo => "Undo in editor",
+            Self::ShortcutEditorRedo => "Redo in editor",
+            Self::ShortcutEditorCut => "Cut in editor",
+            Self::ShortcutEditorCopy => "Copy in editor",
+            Self::ShortcutEditorPaste => "Paste in editor",
+            Self::ShortcutEditorSelectAll => "Select all in editor",
+
+            Self::ShortcutMarkAllRead => "Mark all as read",
+            Self::ShortcutSearchInProject => "Search in project",
+            Self::ShortcutCloneRepository => "Clone repository",
+            Self::ShortcutCopyBranch => "Copy branch",
+            Self::ShortcutOpenOrCreatePullRequest => "Open or create pull request…",
+            Self::ShortcutNewWorktreeFromBranch => "New worktree from this branch…",
+            Self::ShortcutMoveProjectUp => "Move project up",
+            Self::ShortcutMoveProjectDown => "Move project down",
+            Self::ShortcutResetSidebarOrder => "Reset sidebar order",
+            Self::ShortcutRevealInFileManager => "Reveal in file manager",
+            Self::ShortcutOpenRepositoryUrl => "Open repository on GitHub",
+            Self::ShortcutOpenInExternalEditor => "Open in external editor",
+            Self::ShortcutDeleteWorktree => "Delete worktree…",
+            Self::ShortcutRemoveProject => "Remove project…",
+            Self::ShortcutDeleteSelectedRows => "Delete selected sidebar rows…",
+            Self::ShortcutRenameChannel => "Rename channel…",
+            Self::ShortcutMarkChannelRead => "Mark channel read",
+            Self::ShortcutDeleteChannel => "Delete channel…",
+            Self::ShortcutMarkWorktreeRead => "Mark worktree read",
+            Self::ShortcutRenameFile => "Rename file…",
+            Self::ShortcutDuplicateFile => "Duplicate file…",
+            Self::ShortcutCopyRelativePath => "Copy relative path",
+            Self::ShortcutStageSelectedChanges => "Stage selected changes",
+            Self::ShortcutUnstageSelectedChanges => "Unstage selected changes",
+            Self::ShortcutDiscardSelectedChanges => "Discard selected changes…",
+            Self::ShortcutOpenFile => "Open file",
+            Self::ShortcutRevealInFiles => "Reveal in Files",
+            Self::ShortcutIgnoreChangePath => "Add to .gitignore",
+            Self::ShortcutGitFetch => "Fetch",
+            Self::ShortcutGitPush => "Push",
+            Self::ShortcutGitPublish => "Publish branch…",
+            Self::ShortcutGitSync => "Sync",
+            Self::ShortcutGitSyncRebase => "Sync with rebase",
+            Self::ShortcutGitStash => "Stash changes",
+            Self::ShortcutGitStashUntracked => "Stash including new files",
+            Self::ShortcutGitStashes => "Show or hide stashes",
+            Self::ShortcutGitApplyStash => "Apply stash…",
+            Self::ShortcutGitPopStash => "Pop stash…",
+            Self::ShortcutGitDropStash => "Drop stash…",
+            Self::ShortcutGitCommit => "Commit changes",
+            Self::ShortcutGitAmend => "Toggle amend commit",
+            Self::ShortcutGitRefresh => "Refresh Git status",
+            Self::ShortcutGitAbort => "Abort Git operation",
+            Self::ShortcutGitContinue => "Continue Git operation",
+            Self::ShortcutGitOutput => "Show or hide Git output",
+            Self::ShortcutGitAcceptOurs => "Accept ours and stage",
+            Self::ShortcutGitAcceptTheirs => "Accept theirs and stage",
+            Self::ShortcutEditorComplete => "Trigger completion",
+            Self::ShortcutGoToDefinition => "Go to definition",
+            Self::ShortcutFindReferences => "Find references",
+            Self::ShortcutShowHover => "Show hover information",
+            Self::ShortcutShowDiagnostics => "Show diagnostics",
+            Self::ShortcutEditorSave => "Save file",
+            Self::ShortcutEditorDiscardEdits => "Discard unsaved edits",
+            Self::ShortcutEditorEdit => "Edit file",
+            Self::ShortcutEditorPreview => "Preview file",
+            Self::ShortcutEditorDiff => "View diff",
+            Self::ShortcutPdfFirstPage => "First PDF page",
+            Self::ShortcutPdfPreviousPage => "Previous PDF page",
+            Self::ShortcutPdfNextPage => "Next PDF page",
+            Self::ShortcutPdfLastPage => "Last PDF page",
+            Self::ShortcutPdfZoomOut => "Zoom PDF out",
+            Self::ShortcutPdfZoomIn => "Zoom PDF in",
+            Self::ShortcutPdfFit => "Fit PDF page to pane",
+            Self::ShortcutPdfToggleColors => "Toggle PDF adapted colors",
+
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
             Self::ShortcutChatPermissions => "Choose chat permission mode",
@@ -2901,6 +3298,7 @@ impl SettingsField {
             Self::ShortcutFocusPane7 => "Focus pane 7",
             Self::ShortcutFocusPane8 => "Focus pane 8",
             Self::ShortcutFocusPane9 => "Focus pane 9",
+            Self::ShortcutFocusLastPane => "Focus last pane",
             Self::ChatExpandToolGroups => "Expand tool groups by default",
             Self::ChatContentFraction => "Chat content width",
             Self::DefaultNativePaneFraction => "Native pane minimum width",
@@ -2926,6 +3324,8 @@ impl SettingsField {
             Self::ShortcutCyclePaneWidth => "Cycle pane width",
             Self::ShortcutPreviousWorkspace => "Previous workspace",
             Self::ShortcutNextWorkspace => "Next workspace",
+            Self::ShortcutNextAttention => "Next pane needing attention",
+            Self::ShortcutPreviousAttention => "Previous pane needing attention",
             Self::ShortcutReviewToggleViewed => "Mark reviewed file viewed",
             Self::ShortcutReviewNextFile => "Next reviewed file",
             Self::ShortcutReviewPreviousFile => "Previous reviewed file",
@@ -2958,6 +3358,7 @@ impl SettingsField {
             | Self::ConfirmMultilinePaste
             | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
             Self::MaxHotCards
+            | Self::GitStatusLimit
             | Self::HibernationDelayMs
             | Self::ManagedWorktreeDirectory
             | Self::WorktreeSort
@@ -2981,6 +3382,121 @@ impl SettingsField {
             | Self::BrowserSearchUrl => SettingsCategory::Links,
             Self::ShortcutNewTerminal
             | Self::ShortcutToggleProjects
+            | Self::ShortcutNewBrowser
+            | Self::ShortcutOpenFolder
+            | Self::ShortcutNewWorktree
+            | Self::ShortcutCloseOtherPanes
+            | Self::ShortcutClosePanesToRight
+            | Self::ShortcutCopyPath
+            | Self::ShortcutRevealInProjects
+            | Self::ShortcutForkConversation
+            | Self::ShortcutFocusSidebarTree
+            | Self::ShortcutRestartDaemon
+            | Self::ShortcutToggleTheme
+            | Self::ShortcutResumeConversation
+            | Self::ShortcutSwitchPane
+            | Self::ShortcutReviewConversationChanges
+            | Self::ShortcutFocusProject1
+            | Self::ShortcutFocusProject2
+            | Self::ShortcutFocusProject3
+            | Self::ShortcutFocusProject4
+            | Self::ShortcutFocusProject5
+            | Self::ShortcutFocusProject6
+            | Self::ShortcutFocusProject7
+            | Self::ShortcutFocusProject8
+            | Self::ShortcutFocusProject9
+            | Self::ShortcutSettingsGeneral
+            | Self::ShortcutSettingsAppearance
+            | Self::ShortcutSettingsTerminal
+            | Self::ShortcutSettingsLinks
+            | Self::ShortcutSettingsKeyboard
+            | Self::ShortcutSettingsNativeChat
+            | Self::ShortcutSettingsEditor
+            | Self::ShortcutSettingsAccounts
+            | Self::ShortcutSettingsNotifications
+            | Self::ShortcutSettingsAbout
+            | Self::ShortcutMovePaneToChannel
+            | Self::ShortcutDiffCopy
+            | Self::ShortcutDiffCopyOld
+            | Self::ShortcutDiffCopyNew
+            | Self::ShortcutDiffCopyPatch
+            | Self::ShortcutDiffCopyLineReference
+            | Self::ShortcutDiffOpenInEditor
+            | Self::ShortcutDiffSelectAll
+            | Self::ShortcutNextDiagnostic
+            | Self::ShortcutPreviousDiagnostic
+            | Self::ShortcutEndConversation
+            | Self::ShortcutEditorUndo
+            | Self::ShortcutEditorRedo
+            | Self::ShortcutEditorCut
+            | Self::ShortcutEditorCopy
+            | Self::ShortcutEditorPaste
+            | Self::ShortcutEditorSelectAll
+            | Self::ShortcutMarkAllRead
+            | Self::ShortcutSearchInProject
+            | Self::ShortcutCloneRepository
+            | Self::ShortcutCopyBranch
+            | Self::ShortcutOpenOrCreatePullRequest
+            | Self::ShortcutNewWorktreeFromBranch
+            | Self::ShortcutMoveProjectUp
+            | Self::ShortcutMoveProjectDown
+            | Self::ShortcutResetSidebarOrder
+            | Self::ShortcutRevealInFileManager
+            | Self::ShortcutOpenRepositoryUrl
+            | Self::ShortcutOpenInExternalEditor
+            | Self::ShortcutDeleteWorktree
+            | Self::ShortcutRemoveProject
+            | Self::ShortcutDeleteSelectedRows
+            | Self::ShortcutRenameChannel
+            | Self::ShortcutMarkChannelRead
+            | Self::ShortcutDeleteChannel
+            | Self::ShortcutMarkWorktreeRead
+            | Self::ShortcutRenameFile
+            | Self::ShortcutDuplicateFile
+            | Self::ShortcutCopyRelativePath
+            | Self::ShortcutStageSelectedChanges
+            | Self::ShortcutUnstageSelectedChanges
+            | Self::ShortcutDiscardSelectedChanges
+            | Self::ShortcutOpenFile
+            | Self::ShortcutRevealInFiles
+            | Self::ShortcutIgnoreChangePath
+            | Self::ShortcutGitFetch
+            | Self::ShortcutGitPush
+            | Self::ShortcutGitPublish
+            | Self::ShortcutGitSync
+            | Self::ShortcutGitSyncRebase
+            | Self::ShortcutGitStash
+            | Self::ShortcutGitStashUntracked
+            | Self::ShortcutGitStashes
+            | Self::ShortcutGitApplyStash
+            | Self::ShortcutGitPopStash
+            | Self::ShortcutGitDropStash
+            | Self::ShortcutGitCommit
+            | Self::ShortcutGitAmend
+            | Self::ShortcutGitRefresh
+            | Self::ShortcutGitAbort
+            | Self::ShortcutGitContinue
+            | Self::ShortcutGitOutput
+            | Self::ShortcutGitAcceptOurs
+            | Self::ShortcutGitAcceptTheirs
+            | Self::ShortcutEditorComplete
+            | Self::ShortcutGoToDefinition
+            | Self::ShortcutFindReferences
+            | Self::ShortcutShowHover
+            | Self::ShortcutShowDiagnostics
+            | Self::ShortcutEditorSave
+            | Self::ShortcutEditorDiscardEdits
+            | Self::ShortcutEditorEdit
+            | Self::ShortcutEditorPreview
+            | Self::ShortcutEditorDiff
+            | Self::ShortcutPdfFirstPage
+            | Self::ShortcutPdfPreviousPage
+            | Self::ShortcutPdfNextPage
+            | Self::ShortcutPdfLastPage
+            | Self::ShortcutPdfZoomOut
+            | Self::ShortcutPdfZoomIn
+            | Self::ShortcutPdfFit
+            | Self::ShortcutPdfToggleColors
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3001,6 +3517,7 @@ impl SettingsField {
             | Self::ShortcutFocusPane7
             | Self::ShortcutFocusPane8
             | Self::ShortcutFocusPane9
+            | Self::ShortcutFocusLastPane
             | Self::ShortcutNewChannel
             | Self::ShortcutClonePane
             | Self::ShortcutCloseFocusedColumn
@@ -3011,6 +3528,8 @@ impl SettingsField {
             | Self::ShortcutCyclePaneWidth
             | Self::ShortcutPreviousWorkspace
             | Self::ShortcutNextWorkspace
+            | Self::ShortcutNextAttention
+            | Self::ShortcutPreviousAttention
             | Self::ShortcutReviewToggleViewed
             | Self::ShortcutReviewNextFile
             | Self::ShortcutReviewPreviousFile
@@ -3038,8 +3557,130 @@ enum SettingsFeedback {
 /// typed it. The parsed form lives in `AppSettings`; this is only the text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShortcutDraft {
+    terminal_passthrough_actions: Vec<String>,
     toggle_projects: String,
     rename_pane: String,
+    new_browser: String,
+    open_folder: String,
+    new_worktree: String,
+    close_other_panes: String,
+    close_panes_to_right: String,
+    copy_path: String,
+    reveal_in_projects: String,
+    fork_conversation: String,
+    focus_sidebar_tree: String,
+    restart_daemon: String,
+    toggle_theme: String,
+    resume_conversation: String,
+    switch_pane: String,
+    review_conversation_changes: String,
+    focus_project_1: String,
+    focus_project_2: String,
+    focus_project_3: String,
+    focus_project_4: String,
+    focus_project_5: String,
+    focus_project_6: String,
+    focus_project_7: String,
+    focus_project_8: String,
+    focus_project_9: String,
+    settings_general: String,
+    settings_appearance: String,
+    settings_terminal: String,
+    settings_links: String,
+    settings_keyboard: String,
+    settings_native_chat: String,
+    settings_editor: String,
+    settings_accounts: String,
+    settings_notifications: String,
+    settings_about: String,
+    move_pane_to_channel: String,
+
+    diff_copy: String,
+    diff_copy_old: String,
+    diff_copy_new: String,
+    diff_copy_patch: String,
+    diff_copy_line_reference: String,
+    diff_open_in_editor: String,
+    diff_select_all: String,
+
+    next_diagnostic: String,
+    previous_diagnostic: String,
+
+    end_conversation: String,
+
+    editor_undo: String,
+    editor_redo: String,
+    editor_cut: String,
+    editor_copy: String,
+    editor_paste: String,
+    editor_select_all: String,
+
+    mark_all_read: String,
+    search_in_project: String,
+    clone_repository: String,
+    copy_branch: String,
+    open_or_create_pull_request: String,
+    new_worktree_from_branch: String,
+    move_project_up: String,
+    move_project_down: String,
+    reset_sidebar_order: String,
+    reveal_in_file_manager: String,
+    open_repository_url: String,
+    open_in_external_editor: String,
+    delete_worktree: String,
+    remove_project: String,
+    delete_selected_rows: String,
+    rename_channel: String,
+    mark_channel_read: String,
+    delete_channel: String,
+    mark_worktree_read: String,
+    rename_file: String,
+    duplicate_file: String,
+    copy_relative_path: String,
+    stage_selected_changes: String,
+    unstage_selected_changes: String,
+    discard_selected_changes: String,
+    open_file: String,
+    reveal_in_files: String,
+    ignore_change_path: String,
+    git_fetch: String,
+    git_push: String,
+    git_publish: String,
+    git_sync: String,
+    git_sync_rebase: String,
+    git_stash: String,
+    git_stash_untracked: String,
+    git_stashes: String,
+    git_apply_stash: String,
+    git_pop_stash: String,
+    git_drop_stash: String,
+    git_commit: String,
+    git_amend: String,
+    git_refresh: String,
+    git_abort: String,
+    git_continue: String,
+    git_output: String,
+    git_accept_ours: String,
+    git_accept_theirs: String,
+    editor_complete: String,
+    go_to_definition: String,
+    find_references: String,
+    show_hover: String,
+    show_diagnostics: String,
+    editor_save: String,
+    editor_discard_edits: String,
+    editor_edit: String,
+    editor_preview: String,
+    editor_diff: String,
+    pdf_first_page: String,
+    pdf_previous_page: String,
+    pdf_next_page: String,
+    pdf_last_page: String,
+    pdf_zoom_out: String,
+    pdf_zoom_in: String,
+    pdf_fit: String,
+    pdf_toggle_colors: String,
+
     command_palette: String,
     new_native_thread: String,
     chat_permissions: String,
@@ -3059,6 +3700,7 @@ struct ShortcutDraft {
     focus_pane_7: String,
     focus_pane_8: String,
     focus_pane_9: String,
+    focus_last_pane: String,
     new_terminal: String,
     new_channel: String,
     clone_pane: String,
@@ -3070,6 +3712,8 @@ struct ShortcutDraft {
     cycle_pane_width: String,
     previous_workspace: String,
     next_workspace: String,
+    next_attention: String,
+    previous_attention: String,
     review_toggle_viewed: String,
     review_next_file: String,
     review_previous_file: String,
@@ -3081,8 +3725,134 @@ struct ShortcutDraft {
 impl ShortcutDraft {
     fn from_shortcuts(shortcuts: &KeyboardShortcuts) -> Self {
         Self {
+            terminal_passthrough_actions: shortcuts.terminal_passthrough_actions.clone(),
             toggle_projects: settings::format_chords(&shortcuts.toggle_projects),
             rename_pane: settings::format_chords(&shortcuts.rename_pane),
+            new_browser: settings::format_chords(&shortcuts.new_browser),
+            open_folder: settings::format_chords(&shortcuts.open_folder),
+            new_worktree: settings::format_chords(&shortcuts.new_worktree),
+            close_other_panes: settings::format_chords(&shortcuts.close_other_panes),
+            close_panes_to_right: settings::format_chords(&shortcuts.close_panes_to_right),
+            copy_path: settings::format_chords(&shortcuts.copy_path),
+            reveal_in_projects: settings::format_chords(&shortcuts.reveal_in_projects),
+            fork_conversation: settings::format_chords(&shortcuts.fork_conversation),
+            focus_sidebar_tree: settings::format_chords(&shortcuts.focus_sidebar_tree),
+            restart_daemon: settings::format_chords(&shortcuts.restart_daemon),
+            toggle_theme: settings::format_chords(&shortcuts.toggle_theme),
+            resume_conversation: settings::format_chords(&shortcuts.resume_conversation),
+            switch_pane: settings::format_chords(&shortcuts.switch_pane),
+            review_conversation_changes: settings::format_chords(
+                &shortcuts.review_conversation_changes,
+            ),
+            focus_project_1: settings::format_chords(&shortcuts.focus_project_1),
+            focus_project_2: settings::format_chords(&shortcuts.focus_project_2),
+            focus_project_3: settings::format_chords(&shortcuts.focus_project_3),
+            focus_project_4: settings::format_chords(&shortcuts.focus_project_4),
+            focus_project_5: settings::format_chords(&shortcuts.focus_project_5),
+            focus_project_6: settings::format_chords(&shortcuts.focus_project_6),
+            focus_project_7: settings::format_chords(&shortcuts.focus_project_7),
+            focus_project_8: settings::format_chords(&shortcuts.focus_project_8),
+            focus_project_9: settings::format_chords(&shortcuts.focus_project_9),
+            settings_general: settings::format_chords(&shortcuts.settings_general),
+            settings_appearance: settings::format_chords(&shortcuts.settings_appearance),
+            settings_terminal: settings::format_chords(&shortcuts.settings_terminal),
+            settings_links: settings::format_chords(&shortcuts.settings_links),
+            settings_keyboard: settings::format_chords(&shortcuts.settings_keyboard),
+            settings_native_chat: settings::format_chords(&shortcuts.settings_native_chat),
+            settings_editor: settings::format_chords(&shortcuts.settings_editor),
+            settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
+            settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
+            settings_about: settings::format_chords(&shortcuts.settings_about),
+            move_pane_to_channel: settings::format_chords(&shortcuts.move_pane_to_channel),
+
+            diff_copy: settings::format_chords(&shortcuts.diff_copy),
+            diff_copy_old: settings::format_chords(&shortcuts.diff_copy_old),
+            diff_copy_new: settings::format_chords(&shortcuts.diff_copy_new),
+            diff_copy_patch: settings::format_chords(&shortcuts.diff_copy_patch),
+            diff_copy_line_reference: settings::format_chords(&shortcuts.diff_copy_line_reference),
+            diff_open_in_editor: settings::format_chords(&shortcuts.diff_open_in_editor),
+            diff_select_all: settings::format_chords(&shortcuts.diff_select_all),
+
+            next_diagnostic: settings::format_chords(&shortcuts.next_diagnostic),
+            previous_diagnostic: settings::format_chords(&shortcuts.previous_diagnostic),
+
+            end_conversation: settings::format_chords(&shortcuts.end_conversation),
+
+            editor_undo: settings::format_chords(&shortcuts.editor_undo),
+            editor_redo: settings::format_chords(&shortcuts.editor_redo),
+            editor_cut: settings::format_chords(&shortcuts.editor_cut),
+            editor_copy: settings::format_chords(&shortcuts.editor_copy),
+            editor_paste: settings::format_chords(&shortcuts.editor_paste),
+            editor_select_all: settings::format_chords(&shortcuts.editor_select_all),
+
+            mark_all_read: settings::format_chords(&shortcuts.mark_all_read),
+            search_in_project: settings::format_chords(&shortcuts.search_in_project),
+            clone_repository: settings::format_chords(&shortcuts.clone_repository),
+            copy_branch: settings::format_chords(&shortcuts.copy_branch),
+            open_or_create_pull_request: settings::format_chords(
+                &shortcuts.open_or_create_pull_request,
+            ),
+            new_worktree_from_branch: settings::format_chords(&shortcuts.new_worktree_from_branch),
+            move_project_up: settings::format_chords(&shortcuts.move_project_up),
+            move_project_down: settings::format_chords(&shortcuts.move_project_down),
+            reset_sidebar_order: settings::format_chords(&shortcuts.reset_sidebar_order),
+            reveal_in_file_manager: settings::format_chords(&shortcuts.reveal_in_file_manager),
+            open_repository_url: settings::format_chords(&shortcuts.open_repository_url),
+            open_in_external_editor: settings::format_chords(&shortcuts.open_in_external_editor),
+            delete_worktree: settings::format_chords(&shortcuts.delete_worktree),
+            remove_project: settings::format_chords(&shortcuts.remove_project),
+            delete_selected_rows: settings::format_chords(&shortcuts.delete_selected_rows),
+            rename_channel: settings::format_chords(&shortcuts.rename_channel),
+            mark_channel_read: settings::format_chords(&shortcuts.mark_channel_read),
+            delete_channel: settings::format_chords(&shortcuts.delete_channel),
+            mark_worktree_read: settings::format_chords(&shortcuts.mark_worktree_read),
+            rename_file: settings::format_chords(&shortcuts.rename_file),
+            duplicate_file: settings::format_chords(&shortcuts.duplicate_file),
+            copy_relative_path: settings::format_chords(&shortcuts.copy_relative_path),
+            stage_selected_changes: settings::format_chords(&shortcuts.stage_selected_changes),
+            unstage_selected_changes: settings::format_chords(&shortcuts.unstage_selected_changes),
+            discard_selected_changes: settings::format_chords(&shortcuts.discard_selected_changes),
+            open_file: settings::format_chords(&shortcuts.open_file),
+            reveal_in_files: settings::format_chords(&shortcuts.reveal_in_files),
+            ignore_change_path: settings::format_chords(&shortcuts.ignore_change_path),
+            git_fetch: settings::format_chords(&shortcuts.git_fetch),
+            git_push: settings::format_chords(&shortcuts.git_push),
+            git_publish: settings::format_chords(&shortcuts.git_publish),
+            git_sync: settings::format_chords(&shortcuts.git_sync),
+            git_sync_rebase: settings::format_chords(&shortcuts.git_sync_rebase),
+            git_stash: settings::format_chords(&shortcuts.git_stash),
+            git_stash_untracked: settings::format_chords(&shortcuts.git_stash_untracked),
+            git_stashes: settings::format_chords(&shortcuts.git_stashes),
+            git_apply_stash: settings::format_chords(&shortcuts.git_apply_stash),
+            git_pop_stash: settings::format_chords(&shortcuts.git_pop_stash),
+            git_drop_stash: settings::format_chords(&shortcuts.git_drop_stash),
+            git_commit: settings::format_chords(&shortcuts.git_commit),
+            git_amend: settings::format_chords(&shortcuts.git_amend),
+            git_refresh: settings::format_chords(&shortcuts.git_refresh),
+            git_abort: settings::format_chords(&shortcuts.git_abort),
+            git_continue: settings::format_chords(&shortcuts.git_continue),
+            git_output: settings::format_chords(&shortcuts.git_output),
+            git_accept_ours: settings::format_chords(&shortcuts.git_accept_ours),
+            git_accept_theirs: settings::format_chords(&shortcuts.git_accept_theirs),
+            editor_complete: settings::format_chords(&shortcuts.editor_complete),
+            go_to_definition: settings::format_chords(&shortcuts.go_to_definition),
+            find_references: settings::format_chords(&shortcuts.find_references),
+            show_hover: settings::format_chords(&shortcuts.show_hover),
+            show_diagnostics: settings::format_chords(&shortcuts.show_diagnostics),
+            editor_save: settings::format_chords(&shortcuts.editor_save),
+            editor_discard_edits: settings::format_chords(&shortcuts.editor_discard_edits),
+            editor_edit: settings::format_chords(&shortcuts.editor_edit),
+            editor_preview: settings::format_chords(&shortcuts.editor_preview),
+            editor_diff: settings::format_chords(&shortcuts.editor_diff),
+            pdf_first_page: settings::format_chords(&shortcuts.pdf_first_page),
+            pdf_previous_page: settings::format_chords(&shortcuts.pdf_previous_page),
+            pdf_next_page: settings::format_chords(&shortcuts.pdf_next_page),
+            pdf_last_page: settings::format_chords(&shortcuts.pdf_last_page),
+            pdf_zoom_out: settings::format_chords(&shortcuts.pdf_zoom_out),
+            pdf_zoom_in: settings::format_chords(&shortcuts.pdf_zoom_in),
+            pdf_fit: settings::format_chords(&shortcuts.pdf_fit),
+            pdf_toggle_colors: settings::format_chords(&shortcuts.pdf_toggle_colors),
+
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
             chat_permissions: settings::format_chords(&shortcuts.chat_permissions),
@@ -3102,6 +3872,7 @@ impl ShortcutDraft {
             focus_pane_7: settings::format_chords(&shortcuts.focus_pane_7),
             focus_pane_8: settings::format_chords(&shortcuts.focus_pane_8),
             focus_pane_9: settings::format_chords(&shortcuts.focus_pane_9),
+            focus_last_pane: settings::format_chords(&shortcuts.focus_last_pane),
             new_terminal: settings::format_chords(&shortcuts.new_terminal),
             new_channel: settings::format_chords(&shortcuts.new_channel),
             clone_pane: settings::format_chords(&shortcuts.clone_pane),
@@ -3113,6 +3884,8 @@ impl ShortcutDraft {
             cycle_pane_width: settings::format_chords(&shortcuts.cycle_pane_width),
             previous_workspace: settings::format_chords(&shortcuts.previous_workspace),
             next_workspace: settings::format_chords(&shortcuts.next_workspace),
+            next_attention: settings::format_chords(&shortcuts.next_attention),
+            previous_attention: settings::format_chords(&shortcuts.previous_attention),
             review_toggle_viewed: settings::format_chords(&shortcuts.review_toggle_viewed),
             review_next_file: settings::format_chords(&shortcuts.review_next_file),
             review_previous_file: settings::format_chords(&shortcuts.review_previous_file),
@@ -3136,6 +3909,7 @@ struct SettingsDraft {
     terminal_theme: String,
     has_custom_terminal_theme: bool,
     max_hot_cards: String,
+    git_status_limit: String,
     hibernation_delay_ms: String,
     terminal_font_size: String,
     terminal_font_family: String,
@@ -3190,6 +3964,7 @@ impl SettingsDraft {
             terminal_theme: settings.terminal_theme.id().into(),
             has_custom_terminal_theme: settings.custom_terminal_theme.is_some(),
             max_hot_cards: settings.max_hot_cards.to_string(),
+            git_status_limit: settings.git_status_limit.to_string(),
             hibernation_delay_ms: settings.hibernation_delay_ms.to_string(),
             terminal_font_size: settings.terminal_font_size.to_string(),
             terminal_font_family: settings.terminal_font_family.clone(),
@@ -3245,6 +4020,7 @@ impl SettingsDraft {
             SettingsField::TerminalTheme => self.terminal_theme = value,
             SettingsField::TerminalCursorStyle => self.terminal_cursor_style = value,
             SettingsField::MaxHotCards => self.max_hot_cards = value,
+            SettingsField::GitStatusLimit => self.git_status_limit = value,
             SettingsField::HibernationDelayMs => self.hibernation_delay_ms = value,
             SettingsField::TerminalFontSize => self.terminal_font_size = value,
             SettingsField::TerminalFontFamily => self.terminal_font_family = value,
@@ -3311,6 +4087,225 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.toggle_projects = value
             }
             SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = value,
+            SettingsField::ShortcutNewBrowser => self.keyboard_shortcuts.new_browser = value,
+            SettingsField::ShortcutOpenFolder => self.keyboard_shortcuts.open_folder = value,
+            SettingsField::ShortcutNewWorktree => self.keyboard_shortcuts.new_worktree = value,
+            SettingsField::ShortcutCloseOtherPanes => {
+                self.keyboard_shortcuts.close_other_panes = value
+            }
+            SettingsField::ShortcutClosePanesToRight => {
+                self.keyboard_shortcuts.close_panes_to_right = value
+            }
+            SettingsField::ShortcutCopyPath => self.keyboard_shortcuts.copy_path = value,
+            SettingsField::ShortcutRevealInProjects => {
+                self.keyboard_shortcuts.reveal_in_projects = value
+            }
+            SettingsField::ShortcutForkConversation => {
+                self.keyboard_shortcuts.fork_conversation = value
+            }
+            SettingsField::ShortcutFocusSidebarTree => {
+                self.keyboard_shortcuts.focus_sidebar_tree = value
+            }
+            SettingsField::ShortcutRestartDaemon => self.keyboard_shortcuts.restart_daemon = value,
+            SettingsField::ShortcutToggleTheme => self.keyboard_shortcuts.toggle_theme = value,
+            SettingsField::ShortcutResumeConversation => {
+                self.keyboard_shortcuts.resume_conversation = value
+            }
+            SettingsField::ShortcutSwitchPane => self.keyboard_shortcuts.switch_pane = value,
+            SettingsField::ShortcutReviewConversationChanges => {
+                self.keyboard_shortcuts.review_conversation_changes = value
+            }
+            SettingsField::ShortcutFocusProject1 => self.keyboard_shortcuts.focus_project_1 = value,
+            SettingsField::ShortcutFocusProject2 => self.keyboard_shortcuts.focus_project_2 = value,
+            SettingsField::ShortcutFocusProject3 => self.keyboard_shortcuts.focus_project_3 = value,
+            SettingsField::ShortcutFocusProject4 => self.keyboard_shortcuts.focus_project_4 = value,
+            SettingsField::ShortcutFocusProject5 => self.keyboard_shortcuts.focus_project_5 = value,
+            SettingsField::ShortcutFocusProject6 => self.keyboard_shortcuts.focus_project_6 = value,
+            SettingsField::ShortcutFocusProject7 => self.keyboard_shortcuts.focus_project_7 = value,
+            SettingsField::ShortcutFocusProject8 => self.keyboard_shortcuts.focus_project_8 = value,
+            SettingsField::ShortcutFocusProject9 => self.keyboard_shortcuts.focus_project_9 = value,
+            SettingsField::ShortcutSettingsGeneral => {
+                self.keyboard_shortcuts.settings_general = value
+            }
+            SettingsField::ShortcutSettingsAppearance => {
+                self.keyboard_shortcuts.settings_appearance = value
+            }
+            SettingsField::ShortcutSettingsTerminal => {
+                self.keyboard_shortcuts.settings_terminal = value
+            }
+            SettingsField::ShortcutSettingsLinks => self.keyboard_shortcuts.settings_links = value,
+            SettingsField::ShortcutSettingsKeyboard => {
+                self.keyboard_shortcuts.settings_keyboard = value
+            }
+            SettingsField::ShortcutSettingsNativeChat => {
+                self.keyboard_shortcuts.settings_native_chat = value
+            }
+            SettingsField::ShortcutSettingsEditor => {
+                self.keyboard_shortcuts.settings_editor = value
+            }
+            SettingsField::ShortcutSettingsAccounts => {
+                self.keyboard_shortcuts.settings_accounts = value
+            }
+            SettingsField::ShortcutSettingsNotifications => {
+                self.keyboard_shortcuts.settings_notifications = value
+            }
+            SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+            SettingsField::ShortcutMovePaneToChannel => {
+                self.keyboard_shortcuts.move_pane_to_channel = value
+            }
+
+            SettingsField::ShortcutDiffCopy => self.keyboard_shortcuts.diff_copy = value,
+            SettingsField::ShortcutDiffCopyOld => self.keyboard_shortcuts.diff_copy_old = value,
+            SettingsField::ShortcutDiffCopyNew => self.keyboard_shortcuts.diff_copy_new = value,
+            SettingsField::ShortcutDiffCopyPatch => self.keyboard_shortcuts.diff_copy_patch = value,
+            SettingsField::ShortcutDiffCopyLineReference => {
+                self.keyboard_shortcuts.diff_copy_line_reference = value
+            }
+            SettingsField::ShortcutDiffOpenInEditor => {
+                self.keyboard_shortcuts.diff_open_in_editor = value
+            }
+            SettingsField::ShortcutDiffSelectAll => self.keyboard_shortcuts.diff_select_all = value,
+
+            SettingsField::ShortcutNextDiagnostic => {
+                self.keyboard_shortcuts.next_diagnostic = value
+            }
+            SettingsField::ShortcutPreviousDiagnostic => {
+                self.keyboard_shortcuts.previous_diagnostic = value
+            }
+
+            SettingsField::ShortcutEndConversation => {
+                self.keyboard_shortcuts.end_conversation = value
+            }
+
+            SettingsField::ShortcutEditorUndo => self.keyboard_shortcuts.editor_undo = value,
+            SettingsField::ShortcutEditorRedo => self.keyboard_shortcuts.editor_redo = value,
+            SettingsField::ShortcutEditorCut => self.keyboard_shortcuts.editor_cut = value,
+            SettingsField::ShortcutEditorCopy => self.keyboard_shortcuts.editor_copy = value,
+            SettingsField::ShortcutEditorPaste => self.keyboard_shortcuts.editor_paste = value,
+            SettingsField::ShortcutEditorSelectAll => {
+                self.keyboard_shortcuts.editor_select_all = value
+            }
+
+            SettingsField::ShortcutMarkAllRead => self.keyboard_shortcuts.mark_all_read = value,
+            SettingsField::ShortcutSearchInProject => {
+                self.keyboard_shortcuts.search_in_project = value
+            }
+            SettingsField::ShortcutCloneRepository => {
+                self.keyboard_shortcuts.clone_repository = value
+            }
+            SettingsField::ShortcutCopyBranch => self.keyboard_shortcuts.copy_branch = value,
+            SettingsField::ShortcutOpenOrCreatePullRequest => {
+                self.keyboard_shortcuts.open_or_create_pull_request = value
+            }
+            SettingsField::ShortcutNewWorktreeFromBranch => {
+                self.keyboard_shortcuts.new_worktree_from_branch = value
+            }
+            SettingsField::ShortcutMoveProjectUp => self.keyboard_shortcuts.move_project_up = value,
+            SettingsField::ShortcutMoveProjectDown => {
+                self.keyboard_shortcuts.move_project_down = value
+            }
+            SettingsField::ShortcutResetSidebarOrder => {
+                self.keyboard_shortcuts.reset_sidebar_order = value
+            }
+            SettingsField::ShortcutRevealInFileManager => {
+                self.keyboard_shortcuts.reveal_in_file_manager = value
+            }
+            SettingsField::ShortcutOpenRepositoryUrl => {
+                self.keyboard_shortcuts.open_repository_url = value
+            }
+            SettingsField::ShortcutOpenInExternalEditor => {
+                self.keyboard_shortcuts.open_in_external_editor = value
+            }
+            SettingsField::ShortcutDeleteWorktree => {
+                self.keyboard_shortcuts.delete_worktree = value
+            }
+            SettingsField::ShortcutRemoveProject => self.keyboard_shortcuts.remove_project = value,
+            SettingsField::ShortcutDeleteSelectedRows => {
+                self.keyboard_shortcuts.delete_selected_rows = value
+            }
+            SettingsField::ShortcutRenameChannel => self.keyboard_shortcuts.rename_channel = value,
+            SettingsField::ShortcutMarkChannelRead => {
+                self.keyboard_shortcuts.mark_channel_read = value
+            }
+            SettingsField::ShortcutDeleteChannel => self.keyboard_shortcuts.delete_channel = value,
+            SettingsField::ShortcutMarkWorktreeRead => {
+                self.keyboard_shortcuts.mark_worktree_read = value
+            }
+            SettingsField::ShortcutRenameFile => self.keyboard_shortcuts.rename_file = value,
+            SettingsField::ShortcutDuplicateFile => self.keyboard_shortcuts.duplicate_file = value,
+            SettingsField::ShortcutCopyRelativePath => {
+                self.keyboard_shortcuts.copy_relative_path = value
+            }
+            SettingsField::ShortcutStageSelectedChanges => {
+                self.keyboard_shortcuts.stage_selected_changes = value
+            }
+            SettingsField::ShortcutUnstageSelectedChanges => {
+                self.keyboard_shortcuts.unstage_selected_changes = value
+            }
+            SettingsField::ShortcutDiscardSelectedChanges => {
+                self.keyboard_shortcuts.discard_selected_changes = value
+            }
+            SettingsField::ShortcutOpenFile => self.keyboard_shortcuts.open_file = value,
+            SettingsField::ShortcutRevealInFiles => self.keyboard_shortcuts.reveal_in_files = value,
+            SettingsField::ShortcutIgnoreChangePath => {
+                self.keyboard_shortcuts.ignore_change_path = value
+            }
+            SettingsField::ShortcutGitFetch => self.keyboard_shortcuts.git_fetch = value,
+            SettingsField::ShortcutGitPush => self.keyboard_shortcuts.git_push = value,
+            SettingsField::ShortcutGitPublish => self.keyboard_shortcuts.git_publish = value,
+            SettingsField::ShortcutGitSync => self.keyboard_shortcuts.git_sync = value,
+            SettingsField::ShortcutGitSyncRebase => self.keyboard_shortcuts.git_sync_rebase = value,
+            SettingsField::ShortcutGitStash => self.keyboard_shortcuts.git_stash = value,
+            SettingsField::ShortcutGitStashUntracked => {
+                self.keyboard_shortcuts.git_stash_untracked = value
+            }
+            SettingsField::ShortcutGitStashes => self.keyboard_shortcuts.git_stashes = value,
+            SettingsField::ShortcutGitApplyStash => self.keyboard_shortcuts.git_apply_stash = value,
+            SettingsField::ShortcutGitPopStash => self.keyboard_shortcuts.git_pop_stash = value,
+            SettingsField::ShortcutGitDropStash => self.keyboard_shortcuts.git_drop_stash = value,
+            SettingsField::ShortcutGitCommit => self.keyboard_shortcuts.git_commit = value,
+            SettingsField::ShortcutGitAmend => self.keyboard_shortcuts.git_amend = value,
+            SettingsField::ShortcutGitRefresh => self.keyboard_shortcuts.git_refresh = value,
+            SettingsField::ShortcutGitAbort => self.keyboard_shortcuts.git_abort = value,
+            SettingsField::ShortcutGitContinue => self.keyboard_shortcuts.git_continue = value,
+            SettingsField::ShortcutGitOutput => self.keyboard_shortcuts.git_output = value,
+            SettingsField::ShortcutGitAcceptOurs => self.keyboard_shortcuts.git_accept_ours = value,
+            SettingsField::ShortcutGitAcceptTheirs => {
+                self.keyboard_shortcuts.git_accept_theirs = value
+            }
+            SettingsField::ShortcutEditorComplete => {
+                self.keyboard_shortcuts.editor_complete = value
+            }
+            SettingsField::ShortcutGoToDefinition => {
+                self.keyboard_shortcuts.go_to_definition = value
+            }
+            SettingsField::ShortcutFindReferences => {
+                self.keyboard_shortcuts.find_references = value
+            }
+            SettingsField::ShortcutShowHover => self.keyboard_shortcuts.show_hover = value,
+            SettingsField::ShortcutShowDiagnostics => {
+                self.keyboard_shortcuts.show_diagnostics = value
+            }
+            SettingsField::ShortcutEditorSave => self.keyboard_shortcuts.editor_save = value,
+            SettingsField::ShortcutEditorDiscardEdits => {
+                self.keyboard_shortcuts.editor_discard_edits = value
+            }
+            SettingsField::ShortcutEditorEdit => self.keyboard_shortcuts.editor_edit = value,
+            SettingsField::ShortcutEditorPreview => self.keyboard_shortcuts.editor_preview = value,
+            SettingsField::ShortcutEditorDiff => self.keyboard_shortcuts.editor_diff = value,
+            SettingsField::ShortcutPdfFirstPage => self.keyboard_shortcuts.pdf_first_page = value,
+            SettingsField::ShortcutPdfPreviousPage => {
+                self.keyboard_shortcuts.pdf_previous_page = value
+            }
+            SettingsField::ShortcutPdfNextPage => self.keyboard_shortcuts.pdf_next_page = value,
+            SettingsField::ShortcutPdfLastPage => self.keyboard_shortcuts.pdf_last_page = value,
+            SettingsField::ShortcutPdfZoomOut => self.keyboard_shortcuts.pdf_zoom_out = value,
+            SettingsField::ShortcutPdfZoomIn => self.keyboard_shortcuts.pdf_zoom_in = value,
+            SettingsField::ShortcutPdfFit => self.keyboard_shortcuts.pdf_fit = value,
+            SettingsField::ShortcutPdfToggleColors => {
+                self.keyboard_shortcuts.pdf_toggle_colors = value
+            }
+
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
             }
@@ -3336,6 +4331,7 @@ impl SettingsDraft {
             SettingsField::ShortcutFocusPane7 => self.keyboard_shortcuts.focus_pane_7 = value,
             SettingsField::ShortcutFocusPane8 => self.keyboard_shortcuts.focus_pane_8 = value,
             SettingsField::ShortcutFocusPane9 => self.keyboard_shortcuts.focus_pane_9 = value,
+            SettingsField::ShortcutFocusLastPane => self.keyboard_shortcuts.focus_last_pane = value,
             SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = value,
             SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = value,
             SettingsField::ShortcutCloseFocusedColumn => {
@@ -3356,6 +4352,10 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutPreviousWorkspace => {
                 self.keyboard_shortcuts.previous_workspace = value;
+            }
+            SettingsField::ShortcutNextAttention => self.keyboard_shortcuts.next_attention = value,
+            SettingsField::ShortcutPreviousAttention => {
+                self.keyboard_shortcuts.previous_attention = value
             }
             SettingsField::ShortcutNextWorkspace => {
                 self.keyboard_shortcuts.next_workspace = value;
@@ -3404,6 +4404,472 @@ fn settings_update(
     let value = raw_value.trim();
     let mut next = current.clone();
     let parsed = match field {
+        SettingsField::ShortcutNewBrowser => {
+            next.keyboard_shortcuts.new_browser = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenFolder => {
+            next.keyboard_shortcuts.open_folder = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutNewWorktree => {
+            next.keyboard_shortcuts.new_worktree = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCloseOtherPanes => {
+            next.keyboard_shortcuts.close_other_panes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutClosePanesToRight => {
+            next.keyboard_shortcuts.close_panes_to_right = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCopyPath => {
+            next.keyboard_shortcuts.copy_path = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRevealInProjects => {
+            next.keyboard_shortcuts.reveal_in_projects = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutForkConversation => {
+            next.keyboard_shortcuts.fork_conversation = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusSidebarTree => {
+            next.keyboard_shortcuts.focus_sidebar_tree = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRestartDaemon => {
+            next.keyboard_shortcuts.restart_daemon = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutToggleTheme => {
+            next.keyboard_shortcuts.toggle_theme = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutResumeConversation => {
+            next.keyboard_shortcuts.resume_conversation = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSwitchPane => {
+            next.keyboard_shortcuts.switch_pane = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutReviewConversationChanges => {
+            next.keyboard_shortcuts.review_conversation_changes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject1 => {
+            next.keyboard_shortcuts.focus_project_1 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject2 => {
+            next.keyboard_shortcuts.focus_project_2 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject3 => {
+            next.keyboard_shortcuts.focus_project_3 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject4 => {
+            next.keyboard_shortcuts.focus_project_4 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject5 => {
+            next.keyboard_shortcuts.focus_project_5 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject6 => {
+            next.keyboard_shortcuts.focus_project_6 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject7 => {
+            next.keyboard_shortcuts.focus_project_7 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject8 => {
+            next.keyboard_shortcuts.focus_project_8 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusProject9 => {
+            next.keyboard_shortcuts.focus_project_9 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsGeneral => {
+            next.keyboard_shortcuts.settings_general = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsAppearance => {
+            next.keyboard_shortcuts.settings_appearance = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsTerminal => {
+            next.keyboard_shortcuts.settings_terminal = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsLinks => {
+            next.keyboard_shortcuts.settings_links = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsKeyboard => {
+            next.keyboard_shortcuts.settings_keyboard = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsNativeChat => {
+            next.keyboard_shortcuts.settings_native_chat = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsEditor => {
+            next.keyboard_shortcuts.settings_editor = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsAccounts => {
+            next.keyboard_shortcuts.settings_accounts = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsNotifications => {
+            next.keyboard_shortcuts.settings_notifications = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSettingsAbout => {
+            next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMovePaneToChannel => {
+            next.keyboard_shortcuts.move_pane_to_channel = settings::parse_chords(value);
+            Ok(())
+        }
+
+        SettingsField::ShortcutDiffCopy => {
+            next.keyboard_shortcuts.diff_copy = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyOld => {
+            next.keyboard_shortcuts.diff_copy_old = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyNew => {
+            next.keyboard_shortcuts.diff_copy_new = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyPatch => {
+            next.keyboard_shortcuts.diff_copy_patch = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffCopyLineReference => {
+            next.keyboard_shortcuts.diff_copy_line_reference = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffOpenInEditor => {
+            next.keyboard_shortcuts.diff_open_in_editor = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiffSelectAll => {
+            next.keyboard_shortcuts.diff_select_all = settings::parse_chords(value);
+            Ok(())
+        }
+
+        SettingsField::ShortcutNextDiagnostic => {
+            next.keyboard_shortcuts.next_diagnostic = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPreviousDiagnostic => {
+            next.keyboard_shortcuts.previous_diagnostic = settings::parse_chords(value);
+            Ok(())
+        }
+
+        SettingsField::ShortcutEndConversation => {
+            next.keyboard_shortcuts.end_conversation = settings::parse_chords(value);
+            Ok(())
+        }
+
+        SettingsField::ShortcutEditorUndo => {
+            next.keyboard_shortcuts.editor_undo = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorRedo => {
+            next.keyboard_shortcuts.editor_redo = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorCut => {
+            next.keyboard_shortcuts.editor_cut = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorCopy => {
+            next.keyboard_shortcuts.editor_copy = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorPaste => {
+            next.keyboard_shortcuts.editor_paste = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorSelectAll => {
+            next.keyboard_shortcuts.editor_select_all = settings::parse_chords(value);
+            Ok(())
+        }
+
+        SettingsField::ShortcutMarkAllRead => {
+            next.keyboard_shortcuts.mark_all_read = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSearchInProject => {
+            next.keyboard_shortcuts.search_in_project = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCloneRepository => {
+            next.keyboard_shortcuts.clone_repository = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCopyBranch => {
+            next.keyboard_shortcuts.copy_branch = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenOrCreatePullRequest => {
+            next.keyboard_shortcuts.open_or_create_pull_request = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutNewWorktreeFromBranch => {
+            next.keyboard_shortcuts.new_worktree_from_branch = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMoveProjectUp => {
+            next.keyboard_shortcuts.move_project_up = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMoveProjectDown => {
+            next.keyboard_shortcuts.move_project_down = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutResetSidebarOrder => {
+            next.keyboard_shortcuts.reset_sidebar_order = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRevealInFileManager => {
+            next.keyboard_shortcuts.reveal_in_file_manager = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenRepositoryUrl => {
+            next.keyboard_shortcuts.open_repository_url = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenInExternalEditor => {
+            next.keyboard_shortcuts.open_in_external_editor = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDeleteWorktree => {
+            next.keyboard_shortcuts.delete_worktree = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRemoveProject => {
+            next.keyboard_shortcuts.remove_project = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDeleteSelectedRows => {
+            next.keyboard_shortcuts.delete_selected_rows = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRenameChannel => {
+            next.keyboard_shortcuts.rename_channel = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMarkChannelRead => {
+            next.keyboard_shortcuts.mark_channel_read = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDeleteChannel => {
+            next.keyboard_shortcuts.delete_channel = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutMarkWorktreeRead => {
+            next.keyboard_shortcuts.mark_worktree_read = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRenameFile => {
+            next.keyboard_shortcuts.rename_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDuplicateFile => {
+            next.keyboard_shortcuts.duplicate_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCopyRelativePath => {
+            next.keyboard_shortcuts.copy_relative_path = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutStageSelectedChanges => {
+            next.keyboard_shortcuts.stage_selected_changes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutUnstageSelectedChanges => {
+            next.keyboard_shortcuts.unstage_selected_changes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutDiscardSelectedChanges => {
+            next.keyboard_shortcuts.discard_selected_changes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutOpenFile => {
+            next.keyboard_shortcuts.open_file = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutRevealInFiles => {
+            next.keyboard_shortcuts.reveal_in_files = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutIgnoreChangePath => {
+            next.keyboard_shortcuts.ignore_change_path = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitFetch => {
+            next.keyboard_shortcuts.git_fetch = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitPush => {
+            next.keyboard_shortcuts.git_push = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitPublish => {
+            next.keyboard_shortcuts.git_publish = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitSync => {
+            next.keyboard_shortcuts.git_sync = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitSyncRebase => {
+            next.keyboard_shortcuts.git_sync_rebase = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitStash => {
+            next.keyboard_shortcuts.git_stash = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitStashUntracked => {
+            next.keyboard_shortcuts.git_stash_untracked = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitStashes => {
+            next.keyboard_shortcuts.git_stashes = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitApplyStash => {
+            next.keyboard_shortcuts.git_apply_stash = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitPopStash => {
+            next.keyboard_shortcuts.git_pop_stash = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitDropStash => {
+            next.keyboard_shortcuts.git_drop_stash = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitCommit => {
+            next.keyboard_shortcuts.git_commit = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitAmend => {
+            next.keyboard_shortcuts.git_amend = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitRefresh => {
+            next.keyboard_shortcuts.git_refresh = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitAbort => {
+            next.keyboard_shortcuts.git_abort = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitContinue => {
+            next.keyboard_shortcuts.git_continue = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitOutput => {
+            next.keyboard_shortcuts.git_output = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitAcceptOurs => {
+            next.keyboard_shortcuts.git_accept_ours = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGitAcceptTheirs => {
+            next.keyboard_shortcuts.git_accept_theirs = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorComplete => {
+            next.keyboard_shortcuts.editor_complete = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutGoToDefinition => {
+            next.keyboard_shortcuts.go_to_definition = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFindReferences => {
+            next.keyboard_shortcuts.find_references = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutShowHover => {
+            next.keyboard_shortcuts.show_hover = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutShowDiagnostics => {
+            next.keyboard_shortcuts.show_diagnostics = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorSave => {
+            next.keyboard_shortcuts.editor_save = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorDiscardEdits => {
+            next.keyboard_shortcuts.editor_discard_edits = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorEdit => {
+            next.keyboard_shortcuts.editor_edit = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorPreview => {
+            next.keyboard_shortcuts.editor_preview = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutEditorDiff => {
+            next.keyboard_shortcuts.editor_diff = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfFirstPage => {
+            next.keyboard_shortcuts.pdf_first_page = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfPreviousPage => {
+            next.keyboard_shortcuts.pdf_previous_page = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfNextPage => {
+            next.keyboard_shortcuts.pdf_next_page = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfLastPage => {
+            next.keyboard_shortcuts.pdf_last_page = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfZoomOut => {
+            next.keyboard_shortcuts.pdf_zoom_out = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfZoomIn => {
+            next.keyboard_shortcuts.pdf_zoom_in = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfFit => {
+            next.keyboard_shortcuts.pdf_fit = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPdfToggleColors => {
+            next.keyboard_shortcuts.pdf_toggle_colors = settings::parse_chords(value);
+            Ok(())
+        }
+
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())
@@ -3486,6 +4952,10 @@ fn settings_update(
         }
         SettingsField::ShortcutFocusPane9 => {
             next.keyboard_shortcuts.focus_pane_9 = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutFocusLastPane => {
+            next.keyboard_shortcuts.focus_last_pane = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::Notifications(field) => value
@@ -3654,6 +5124,12 @@ fn settings_update(
             .parse::<f32>()
             .map(|value| next.terminal_scroll_speed = value)
             .map_err(|_| "Scroll speed must be a number.".to_owned()),
+        SettingsField::GitStatusLimit => value
+            .parse::<usize>()
+            .ok()
+            .filter(|value| (1..=100_000).contains(value))
+            .ok_or_else(|| "Changes shown must be a whole number from 1 to 100000.".to_owned())
+            .map(|value| next.git_status_limit = value),
         SettingsField::MaxHotCards => value
             .parse::<usize>()
             .map(|value| next.max_hot_cards = value)
@@ -3748,6 +5224,14 @@ fn settings_update(
         }
         SettingsField::ShortcutPreviousWorkspace => {
             next.keyboard_shortcuts.previous_workspace = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutNextAttention => {
+            next.keyboard_shortcuts.next_attention = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutPreviousAttention => {
+            next.keyboard_shortcuts.previous_attention = settings::parse_chords(value);
             Ok(())
         }
         SettingsField::ShortcutNextWorkspace => {
@@ -3863,6 +5347,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
 fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
     let fault = shortcuts.fault()?;
     let Some(owner) = fault.conflicts_with else {
+        if fault.action != action {
+            return None;
+        }
         let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
             return None;
         };
@@ -3936,6 +5423,14 @@ fn grouped_digits(value: usize) -> String {
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    Onboarding(onboarding_ui::Action),
+    ChatClose(chat_ui::closing::Action),
+    DiffPatchPrepared {
+        key: ActiveWorktreeKey,
+        identity: repository_widget::AsyncIdentity,
+        buffer_revision: Option<u64>,
+        result: Result<Option<crate::git_patch::Patch>, String>,
+    },
     Device(device_ui::Action),
     ReviewFilePanelToggle {
         card: CardId,
@@ -3955,10 +5450,18 @@ pub enum Message {
     /// whenever the focused card names a different worktree, so a result whose
     /// key is no longer the bound one is a read of a tree nobody is looking at
     /// and is dropped rather than rendered.
+    SourceControlReleased,
     SourceControlLoaded {
         key: ActiveWorktreeKey,
         request: u64,
-        result: Result<Box<RepositorySnapshot>, String>,
+        result: Result<Option<Box<(RepositorySnapshot, SourceControlModel)>>, String>,
+    },
+    SourceControlGroupSelection {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        area: crate::repository::ChangeArea,
+        command: sidebar::ChangeGroupCommand,
+        result: Result<Vec<crate::repository::PathSelection>, String>,
     },
     DirectoryFilesLoaded {
         key: ActiveWorktreeKey,
@@ -3974,11 +5477,20 @@ pub enum Message {
         head: crate::repository::Oid,
         result: Result<Vec<CommitSummary>, String>,
     },
+    SourceControlStageChecked {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        selection: Vec<crate::repository::PathSelection>,
+        markers: std::collections::BTreeMap<
+            crate::repository::RepoPath,
+            crate::repository::ConflictMarkerVersion,
+        >,
+    },
     /// A finished stage, unstage, discard, commit, or push.
     ///
     /// `report` is `None` when the mutation did everything it was asked to do.
-    /// Every outcome triggers a re-snapshot rather than an optimistic edit:
-    /// the only authority on what the index holds is Git.
+    /// A drained queue triggers one authoritative re-snapshot; queued stage
+    /// intents remain visible while the worker finishes its current batch.
     SourceControlMutated {
         key: ActiveWorktreeKey,
         operation: uuid::Uuid,
@@ -4057,6 +5569,15 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
+    MovePaneToChannel {
+        card: CardId,
+        channel: crate::model::ChannelId,
+    },
+    PaneDropToChannel {
+        generation: u64,
+        card: CardId,
+        channel: crate::model::ChannelId,
+    },
     TerminalReviewMode {
         card: CardId,
         terminal: crate::model::TerminalId,
@@ -4276,6 +5797,16 @@ pub enum Message {
         result: Result<PullRequestCreationOutcome, String>,
     },
     CancelDialog,
+    ShortcutTerminalPassthrough {
+        action: String,
+        enabled: bool,
+    },
+    RoutedKeyEvent {
+        event: keyboard::Event,
+        captured: bool,
+        region: crate::input_trace::KeyboardRegion,
+        widget: Option<widget::Id>,
+    },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -4285,6 +5816,7 @@ pub enum Message {
     },
     FocusAdjacent(crate::workspace::FocusDirection),
     FocusProjectSearch,
+    ProjectSearch(search_ui::Action),
     TerminalFind(terminal_ui::Action),
     ZoomFont {
         card: CardId,
@@ -4345,6 +5877,11 @@ pub enum Message {
     RetrySessionSave,
     SessionRecovery(session_recovery::Action),
     AcknowledgeSessionRecovery,
+    AcknowledgeVisiblePane {
+        card: CardId,
+        epoch: u64,
+    },
+    FocusAttention(CardId),
     DismissStatus,
     /// Dismisses exactly one logged notice; a stale id is a no-op.
     DismissNotice(u64),
@@ -4570,6 +6107,32 @@ struct CardLabels {
     unavailable: &'static str,
 }
 
+/// Inputs that can change a terminal's presentation. Ordinary runtime wakes
+/// reuse the numbered title instead of allocating it again for every pane.
+struct TerminalTitleSource {
+    reported: String,
+    directory: PathBuf,
+    program: String,
+    ordinal: u32,
+    fallback: bool,
+}
+
+impl TerminalTitleSource {
+    fn fallback(title: &str) -> bool {
+        // The host supplies a process/cwd fallback when OSC is absent. A
+        // nonempty reported title is authoritative even if it is a basename.
+        title.is_empty()
+    }
+
+    fn describes(&self, title: &str, directory: &Path, program: &str, ordinal: u32) -> bool {
+        let fallback = Self::fallback(title);
+        self.reported == title
+            && self.ordinal == ordinal
+            && self.fallback == fallback
+            && (!fallback || (self.directory == directory && self.program == program))
+    }
+}
+
 /// Widget ids and accessible names for one card.
 ///
 /// Both embed the card id and title, so they are built when a card appears or
@@ -4579,6 +6142,7 @@ struct CardChrome {
     tooltip: String,
     focus_id: widget::Id,
     title_id: widget::Id,
+    tab_id: widget::Id,
     container_id: widget::Id,
     close_id: widget::Id,
     resize_id: widget::Id,
@@ -4591,6 +6155,10 @@ struct CardChrome {
     browser_address_id: widget::Id,
     type_label: &'static str,
     title: String,
+    title_width: f32,
+    compact_title: Option<String>,
+    terminal_ordinal_suffix: Option<String>,
+    terminal_title_source: Option<TerminalTitleSource>,
     focused_name: String,
     caption: String,
     unfocused_name: String,
@@ -4608,6 +6176,7 @@ impl CardChrome {
             },
             focus_id: workspace_widget::card_focus_id(id),
             title_id: card_control_id(id, "title"),
+            tab_id: card_control_id(id, "tab"),
             container_id: workspace_widget::card_widget_id(id),
             close_id: card_control_id(id, "close"),
             resize_id: card_control_id(id, "resize"),
@@ -4620,6 +6189,10 @@ impl CardChrome {
             browser_address_id: card_control_id(id, "browser.address"),
             type_label,
             title: title.to_owned(),
+            title_width: chrome_ui::measure_tab_title(title),
+            compact_title: None,
+            terminal_ordinal_suffix: None,
+            terminal_title_source: None,
             caption: caption.to_owned(),
             focused_name: card_accessible_name(type_label, title, caption, true),
             unfocused_name: card_accessible_name(type_label, title, caption, false),
@@ -4740,10 +6313,88 @@ impl WorkspaceDestination {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Work queued behind a worktree's active command. Destructive operations keep
+/// their original confirmation and never merge with a neighbor.
+#[derive(Debug, Clone)]
+enum QueuedGitMutation {
+    Stage(Vec<crate::repository::PathSelection>),
+    /// Resolve an uncapped group only after all earlier worktree commands.
+    Area {
+        area: crate::repository::ChangeArea,
+        command: sidebar::ChangeGroupCommand,
+        preview: Vec<crate::repository::PathSelection>,
+    },
+    StageApproved {
+        selection: Vec<crate::repository::PathSelection>,
+        approved: std::collections::BTreeMap<
+            crate::repository::RepoPath,
+            crate::repository::ConflictMarkerVersion,
+        >,
+    },
+    Unstage(Vec<crate::repository::PathSelection>),
+    Discard(crate::repository::DiscardRequest),
+    Operation(crate::repository::GitOperation),
+}
+
+impl QueuedGitMutation {
+    fn kind(&self) -> MutationKind {
+        match self {
+            Self::Stage(_) | Self::StageApproved { .. } => MutationKind::Stage,
+            Self::Unstage(_) => MutationKind::Unstage,
+            Self::Discard(_) => MutationKind::Discard,
+            Self::Operation(_) => MutationKind::Other,
+            Self::Area { command, .. } => match command {
+                sidebar::ChangeGroupCommand::Stage => MutationKind::Stage,
+                sidebar::ChangeGroupCommand::Unstage => MutationKind::Unstage,
+                sidebar::ChangeGroupCommand::Discard => MutationKind::Other,
+            },
+        }
+    }
+
+    fn optimistic_selection(&self) -> Option<&[crate::repository::PathSelection]> {
+        match self {
+            Self::Stage(selection)
+            | Self::StageApproved { selection, .. }
+            | Self::Unstage(selection) => Some(selection),
+            Self::Area {
+                command: sidebar::ChangeGroupCommand::Stage | sidebar::ChangeGroupCommand::Unstage,
+                preview,
+                ..
+            } => Some(preview),
+            _ => None,
+        }
+    }
+
+    fn append(queue: &mut std::collections::VecDeque<Self>, next: Self) {
+        let selections = match (queue.back_mut(), &next) {
+            (Some(Self::Stage(existing)), Self::Stage(new))
+            | (Some(Self::Unstage(existing)), Self::Unstage(new)) => Some((existing, new)),
+            _ => None,
+        };
+        if let Some((existing, new)) = selections {
+            let mut seen = existing
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<HashSet<_>>();
+            existing.extend(
+                new.iter()
+                    .filter(|entry| seen.insert(entry.path.clone()))
+                    .cloned(),
+            );
+        } else {
+            queue.push_back(next);
+        }
+    }
+}
+
+#[derive(Debug)]
 struct SourceControlMutation {
     id: uuid::Uuid,
     kind: MutationKind,
+    cancellation: CancellationToken,
+    pending: std::collections::VecDeque<QueuedGitMutation>,
+    rollback: Option<SourceControlModel>,
+    request: Option<QueuedGitMutation>,
     commit_revision: Option<u64>,
 }
 
@@ -4754,6 +6405,7 @@ pub struct Cagents {
     cards: HashMap<CardId, CardRuntime>,
     terminal_working_directories: HashMap<CardId, PathBuf>,
     terminal_find: HashMap<CardId, terminal_ui::Find>,
+    search_ui: search_ui::State,
     terminal_review_card: Option<CardId>,
     terminal_review_revision: u64,
     terminal_review_identity: Option<crate::model::TerminalId>,
@@ -4893,6 +6545,9 @@ pub struct Cagents {
     chrome_ui: chrome_ui::State,
     pull_request_inspector: pull_request_ui::State,
     sidebar_state: SidebarState,
+    window_waiting_count: usize,
+    attention_navigation: Vec<CardId>,
+    attention_focus_epoch: u64,
     active_workspace: Option<PathBuf>,
     worktree_focus: HashMap<PathBuf, CardId>,
     worktree_offsets: HashMap<PathBuf, f32>,
@@ -5733,6 +7388,15 @@ impl Cagents {
         }
     }
 
+    fn new_pane_fraction(&self, configured: f32) -> f32 {
+        let width = self.workspace.viewport_width();
+        if width > 0.0 && width < design::NARROW_WORKSPACE_WIDTH {
+            1.0
+        } else {
+            configured
+        }
+    }
+
     fn add_terminal(&mut self, working_directory: PathBuf) -> Task<Message> {
         let mut launch = match LaunchRecipe::shell(working_directory.clone()) {
             Ok(launch) => launch,
@@ -5816,7 +7480,7 @@ impl Cagents {
                 .file_name()
                 .and_then(|name| normalize_card_name(&name.to_string_lossy()))
                 .unwrap_or_else(|| "Terminal".into()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hydrating { epoch: 1 },
@@ -6044,9 +7708,15 @@ impl Cagents {
             crate::terminal::monospace_font(self.settings.editor_font_family()),
             self.settings.editor_font_size(),
         );
+        runtime.set_keyboard_shortcuts(Arc::new(self.settings.keyboard_shortcuts.clone()));
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         PullRequestPane {
             repository: view.repository.clone(),
             review: pull_request_review::State::new(
@@ -6210,6 +7880,53 @@ impl Cagents {
         ])
     }
 
+    fn local_diff_file_target(
+        &self,
+        card: CardId,
+        forward: bool,
+    ) -> Option<(
+        &sidebar::ActiveWorktreeKey,
+        ChangeArea,
+        &crate::repository::RepoPath,
+    )> {
+        let CardRuntime::Repository(runtime) = self.cards.get(&card)? else {
+            return None;
+        };
+        if runtime.is_saving() || !runtime.shows_diff() {
+            return None;
+        }
+        let source = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| {
+                source.key.canonical_path == runtime.descriptor.worktree
+                    && self.sidebar_state.active_worktree() == Some(&source.key)
+            })?;
+        let staged = matches!(runtime.selected_diff_basis(), DiffBasis::HeadToIndex);
+        let rows = || {
+            source
+                .groups()
+                .iter()
+                .filter(|group| (group.area == ChangeArea::Staged) == staged)
+                .flat_map(|group| {
+                    group
+                        .rows()
+                        .iter()
+                        .map(move |row| (group.area, &row.entry.path))
+                })
+        };
+        let current = rows().position(|(_, path)| Some(path.as_path()) == runtime.selected_path());
+        let index = match current {
+            Some(index) if forward => index.checked_add(1)?,
+            Some(index) => index.checked_sub(1)?,
+            None => 0,
+        };
+        rows()
+            .nth(index)
+            .map(|(area, path)| (&source.key, area, path))
+    }
+
     fn navigate_local_diff(
         &mut self,
         card: CardId,
@@ -6230,43 +7947,13 @@ impl Cagents {
             GlobalShortcut::ReviewNextFile | GlobalShortcut::ReviewPreviousFile => {}
             _ => return Task::none(),
         }
-        let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
-            return Task::none();
-        };
-        let Some(source) = self
-            .sidebar_model
-            .source_control
-            .as_ref()
-            .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+        let Some((key, area, path)) =
+            self.local_diff_file_target(card, shortcut == GlobalShortcut::ReviewNextFile)
         else {
             return Task::none();
         };
-        let staged = matches!(runtime.selected_diff_basis(), DiffBasis::HeadToIndex);
-        let paths: Vec<_> = source
-            .groups()
-            .iter()
-            .filter(|group| (group.area == ChangeArea::Staged) == staged)
-            .flat_map(|group| {
-                group
-                    .rows()
-                    .iter()
-                    .map(move |row| (group.area, &row.entry.path))
-            })
-            .collect();
-        if paths.is_empty() {
-            return Task::none();
-        }
-        let current = paths
-            .iter()
-            .position(|(_, path)| Some(path.as_path()) == runtime.selected_path());
-        let index = match (shortcut, current) {
-            (GlobalShortcut::ReviewPreviousFile, Some(index)) => index.saturating_sub(1),
-            (_, Some(index)) => (index + 1).min(paths.len() - 1),
-            _ => 0,
-        };
-        let (area, path) = paths[index];
         cosmic::task::message(Message::Sidebar(SidebarAction::OpenChange {
-            key: source.key.clone(),
+            key: key.clone(),
             path: path.clone(),
             area,
         }))
@@ -6363,7 +8050,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6381,7 +8068,13 @@ impl Cagents {
             self.worktree_owners.insert(card_id, scope);
         }
         self.register_channel_card(card_id);
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card_id).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card_id, CardRuntime::PullRequests(Box::new(pane)));
         let index = self.workspace.cards().len();
@@ -6391,7 +8084,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_native_pane_fraction),
+                    ),
                 )
                 .expect("pull request card is valid"),
                 index,
@@ -6431,9 +8126,19 @@ impl Cagents {
     /// A terminal that has ended, or is closing, is read-only and forwards
     /// nothing, so it counts as any other pane.
     fn focused_pane(&self) -> workspace_widget::FocusedPane {
+        self.input_trace
+            .keyboard_focus()
+            .unwrap_or_else(|| self.workspace_pane_kind())
+    }
+
+    fn workspace_pane_kind(&self) -> workspace_widget::FocusedPane {
         let Some(card) = self.workspace.focused() else {
             return workspace_widget::FocusedPane::Other;
         };
+        self.pane_kind(card)
+    }
+
+    fn pane_kind(&self, card: CardId) -> workspace_widget::FocusedPane {
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_))
                 if ended_terminal(self.card_state(card)).is_none()
@@ -6441,10 +8146,22 @@ impl Cagents {
             {
                 workspace_widget::FocusedPane::Terminal
             }
-            Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
+            Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::ChatPane,
             Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+            Some(CardRuntime::Repository(runtime))
+                if runtime.shows_diff() && runtime.editor_history_surface_visible() =>
+            {
+                workspace_widget::FocusedPane::WorkingDiff
+            }
             Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
                 workspace_widget::FocusedPane::Review
+            }
+            Some(CardRuntime::Repository(_)) => workspace_widget::FocusedPane::RepositoryPane,
+            _ if self
+                .card_state(card)
+                .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) =>
+            {
+                workspace_widget::FocusedPane::ChatPane
             }
             _ => workspace_widget::FocusedPane::Other,
         }
@@ -6768,13 +8485,25 @@ impl Cagents {
             crate::terminal::monospace_font(self.settings.editor_font_family()),
             self.settings.editor_font_size(),
         );
+        runtime.set_keyboard_shortcuts(Arc::new(self.settings.keyboard_shortcuts.clone()));
         runtime.set_wrap_lines(self.settings.editor_wrap_lines);
+        runtime.set_find_preferences(
+            self.settings.editor_find_options,
+            self.settings.editor_replace_preserve_case,
+        );
         runtime.set_syntax_theme(self.settings.editor_syntax_theme);
         drop(runtime.set_diff_hide_unchanged(self.settings.diff_hide_unchanged));
+        runtime.set_diff_ignore_whitespace(self.settings.diff_ignore_whitespace);
         runtime.set_external_editors(self.sidebar_model.external_editors.clone());
         if let Some(navigation) = self.durable.repository_navigation.get(&card) {
             runtime.restore_navigation(navigation);
         }
+        runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -6795,7 +8524,13 @@ impl Cagents {
             );
             return Task::none();
         }
-        let pane = self.pull_request_pane(&view);
+        let mut pane = self.pull_request_pane(&view);
+        pane.runtime.set_diff_surface_visible(
+            self.workspace_surfaces_visible()
+                && self.card_state(card).is_some_and(|state| {
+                    state.existence.is_open() && state.exposure == Exposure::Visible
+                }),
+        );
         self.cards
             .insert(card, CardRuntime::PullRequests(Box::new(pane)));
         self.open_pending_pull_request(card)
@@ -6834,7 +8569,7 @@ impl Cagents {
             id: card_id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -6852,7 +8587,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     title,
-                    CardWidth::Fraction(self.settings.default_native_pane_fraction),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_native_pane_fraction),
+                    ),
                 )
                 .expect("repository card is valid"),
                 index,
@@ -6935,7 +8672,7 @@ impl Cagents {
                 .host_str()
                 .and_then(normalize_card_name)
                 .unwrap_or_else(|| "Browser".into()),
-            width_fraction: self.settings.default_column_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hydrating {
@@ -6963,7 +8700,9 @@ impl Cagents {
                 WorkspaceCard::new(
                     card_id,
                     "Browser",
-                    CardWidth::Fraction(self.settings.default_column_fraction),
+                    CardWidth::Fraction(
+                        self.new_pane_fraction(self.settings.default_column_fraction),
+                    ),
                 )
                 .expect("browser card is valid"),
                 index,
@@ -7207,7 +8946,8 @@ impl Cagents {
         if !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
             return None;
         }
-        self.sidebar_model.worktree_at(self.card_worktree(state)?)
+        self.sidebar_model
+            .worktree_at(self.unchanneled_card_worktree(state)?)
     }
 
     /// Whether `project` holds the scope the workspace shows: the active
@@ -7231,13 +8971,15 @@ impl Cagents {
     }
 
     fn pane_is_active(&self, card: CardId) -> bool {
-        self.workspace.focused() == Some(card)
+        self.refresh_ui.focused
+            && self.workspace.focused() == Some(card)
             && self.workspace_surfaces_visible()
             && !self.modal_is_open()
     }
 
     pub(super) fn observe_agent_update_for_card(&mut self, card: CardId) {
         if self.pane_is_active(card)
+            || self.sidebar_state.has_card_update(card)
             || !self
                 .card_state(card)
                 .is_some_and(|state| state.existence.is_open())
@@ -7250,6 +8992,7 @@ impl Cagents {
         } else {
             self.sidebar_state.observe_card_update(card);
         }
+        self.persist();
     }
 
     pub(super) fn observe_agent_activity_for_card(
@@ -7257,6 +9000,30 @@ impl Cagents {
         card: CardId,
         activity: Option<crate::agent::Activity>,
     ) {
+        let parked = self.parked_chat_runtime(card);
+        let activity = parked
+            .and_then(|runtime| runtime.native_activity())
+            .or(activity);
+        let outcome = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.activity_outcome(),
+            _ if parked.is_some() => parked.and_then(|runtime| runtime.activity_outcome()),
+            _ if activity
+                .is_some_and(|activity| activity.state == crate::agent::ActivityState::Working) =>
+            {
+                None
+            }
+            _ => self.sidebar_state.card_outcome(card).cloned(),
+        };
+        let activity = activity.or_else(|| {
+            outcome
+                .as_ref()
+                .and_then(|_| self.sidebar_state.card_activity(card))
+                .map(|mut last| {
+                    last.state = crate::agent::ActivityState::Idle;
+                    last
+                })
+        });
+        self.sidebar_state.set_card_outcome(card, outcome);
         let previous = self
             .sidebar_state
             .card_activity(card)
@@ -7300,6 +9067,111 @@ impl Cagents {
         }
     }
 
+    fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| {
+                if (self.sidebar_state.has_card_update(card)
+                    || self
+                        .sidebar_state
+                        .card_attention(card)
+                        .is_some_and(sidebar::AttentionState::needs_attention))
+                    && let Some(channel) = self
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.cards.contains(&card))
+                {
+                    self.sidebar_state.retain_attention_channel(channel.id);
+                }
+                self.sidebar_state.acknowledge_agent_update(card);
+                self.acknowledge_card_notices(card);
+                if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                    && let Err(error) = handle.acknowledge_updates()
+                {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not acknowledge terminal output: {error}"
+                    )));
+                }
+                self.acknowledge_chat_updates(card)
+            })
+            .collect();
+        self.refresh_sidebar_channels();
+        self.persist();
+        Task::batch(tasks)
+    }
+
+    fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
+        if self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
+            return Task::none();
+        }
+        let Some(card) = self
+            .card_state(id)
+            .filter(|card| card.existence.is_open())
+            .cloned()
+        else {
+            return Task::none();
+        };
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&id))
+            .map(|channel| channel.id);
+        let scope = if let Some(channel) = channel {
+            self.select_channel(channel)
+        } else {
+            let directory = self.unchanneled_card_worktree(&card).map(Path::to_path_buf);
+            directory.map_or_else(Task::none, |directory| {
+                self.select_worktree(directory, false)
+            })
+        };
+        let focus = self.focus_workspace_card(id);
+        let read = self.mark_cards_read(vec![id]);
+        Task::batch([scope, focus, read])
+    }
+
+    fn cycle_attention(&mut self, backwards: bool) -> Task<Message> {
+        let cards: Vec<_> = self
+            .sidebar_state
+            .attention_cards()
+            .into_iter()
+            .filter(|id| {
+                self.card_state(*id)
+                    .is_some_and(|card| card.existence.is_open())
+            })
+            .collect();
+        let current = self.workspace.focused();
+        let next = if current.is_some_and(|current| !cards.contains(&current)) {
+            current
+                .and_then(|current| {
+                    self.attention_navigation
+                        .iter()
+                        .position(|card| *card == current)
+                })
+                .and_then(|index| {
+                    (1..=self.attention_navigation.len()).find_map(|step| {
+                        let len = self.attention_navigation.len();
+                        let offset = if backwards {
+                            (index + len - step) % len
+                        } else {
+                            (index + step) % len
+                        };
+                        let candidate = self.attention_navigation[offset];
+                        cards.contains(&candidate).then_some(candidate)
+                    })
+                })
+                .or_else(|| sidebar::cycle_attention(&cards, current, backwards))
+        } else {
+            sidebar::cycle_attention(&cards, current, backwards)
+        };
+        self.attention_navigation = cards;
+        next.map_or_else(Task::none, |card| self.focus_attention_card(card))
+    }
+
     fn acknowledge_active_pane(&mut self) -> Task<Message> {
         let Some(card) = self
             .workspace
@@ -7311,6 +9183,15 @@ impl Cagents {
         if !self.sidebar_state.has_card_update(card) {
             return Task::none();
         }
+        if let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))
+            .map(|channel| channel.id)
+        {
+            self.sidebar_state.retain_attention_channel(channel);
+        }
         self.sidebar_state.acknowledge_agent_update(card);
         if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
             && let Err(error) = handle.acknowledge_updates()
@@ -7319,6 +9200,8 @@ impl Cagents {
                 "Could not acknowledge terminal output: {error}"
             )));
         }
+        self.acknowledge_card_notices(card);
+        self.persist();
         self.acknowledge_chat_updates(card)
     }
 
@@ -7358,28 +9241,6 @@ impl Cagents {
         if self.chrome_ui.user_titles.contains_key(&id) {
             return false;
         }
-        let title = if title.starts_with('/') || title.starts_with("~/") {
-            self.card_state(id)
-                .and_then(|state| match &state.kind {
-                    CardKind::Terminal(session) => {
-                        let process = Path::new(&session.launch.program)
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        let directory = session
-                            .launch
-                            .working_directory
-                            .file_name()
-                            .unwrap_or_default()
-                            .to_string_lossy();
-                        Some(format!("{process} · {directory}"))
-                    }
-                    _ => None,
-                })
-                .unwrap_or(title)
-        } else {
-            title
-        };
         let Some(title) = normalize_card_name(&title) else {
             return false;
         };
@@ -7418,6 +9279,45 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+        // A moved worktree keeps its pane numbers. Reconcile its new scope's
+        // counter before minting a number, including when insertion precedes
+        // an existing pane in the saved order.
+        if self.durable.cards.iter().any(|card| {
+            matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.terminal_ordinals.contains_key(&card.id)
+        }) {
+            for card in &self.durable.cards {
+                if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id).copied() {
+                    let scope = self
+                        .unchanneled_card_worktree(card)
+                        .unwrap_or_else(|| Path::new(""))
+                        .to_owned();
+                    let next = self
+                        .chrome_ui
+                        .terminal_next_ordinals
+                        .entry(scope)
+                        .or_default();
+                    *next = (*next).max(ordinal);
+                }
+            }
+        }
+        for card in &self.durable.cards {
+            if matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.terminal_ordinals.contains_key(&card.id)
+            {
+                let scope = self
+                    .unchanneled_card_worktree(card)
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_owned();
+                let next = self
+                    .chrome_ui
+                    .terminal_next_ordinals
+                    .entry(scope)
+                    .or_default();
+                *next += 1;
+                self.chrome_ui.terminal_ordinals.insert(card.id, *next);
+            }
+        }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
             let type_label = card_kind_labels(Some(&card.kind)).type_label;
@@ -7449,7 +9349,30 @@ impl Cagents {
                 .get(&card.id)
                 .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
             {
-                let chrome = CardChrome::new(card.id, type_label, &title, &caption);
+                let mut chrome = CardChrome::new(card.id, type_label, &title, &caption);
+                if matches!(card.kind, CardKind::Terminal(_))
+                    && !self.chrome_ui.user_titles.contains_key(&card.id)
+                    && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+                {
+                    let suffix = format!(" ({ordinal})");
+                    let base = title.strip_suffix(&suffix).unwrap_or(&title);
+                    chrome.compact_title = Some(format!("{ordinal} {base}"));
+                    chrome.terminal_ordinal_suffix = Some(suffix);
+                    if let CardKind::Terminal(session) = &card.kind {
+                        let reported = self.card_display_title(card);
+                        let directory = self
+                            .terminal_working_directories
+                            .get(&card.id)
+                            .unwrap_or(&session.launch.working_directory);
+                        chrome.terminal_title_source = Some(TerminalTitleSource {
+                            reported: reported.to_owned(),
+                            directory: directory.clone(),
+                            program: session.launch.program.clone(),
+                            ordinal: *ordinal,
+                            fallback: TerminalTitleSource::fallback(reported),
+                        });
+                    }
+                }
                 self.card_chrome.insert(card.id, chrome);
             }
         }
@@ -7458,6 +9381,9 @@ impl Cagents {
         }
         if self.card_chrome.len() != self.durable.cards.len() {
             self.card_chrome
+                .retain(|id, _| self.card_indices.contains_key(id));
+            self.chrome_ui
+                .terminal_ordinals
                 .retain(|id, _| self.card_indices.contains_key(id));
         }
         self.sync_window_title()
@@ -7483,7 +9409,38 @@ impl Cagents {
                 )),
             );
         }
-        (Cow::Borrowed(self.card_display_title(card)), None)
+        let title = self.card_display_title(card);
+        if let CardKind::Terminal(session) = &card.kind
+            && !self.chrome_ui.user_titles.contains_key(&card.id)
+        {
+            let directory = self
+                .terminal_working_directories
+                .get(&card.id)
+                .unwrap_or(&session.launch.working_directory);
+            if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+                && let Some(chrome) = self.card_chrome.get(&card.id)
+                && chrome.terminal_title_source.as_ref().is_some_and(|source| {
+                    source.describes(title, directory, &session.launch.program, *ordinal)
+                })
+            {
+                return (Cow::Borrowed(chrome.title.as_str()), None);
+            }
+            let basename = directory.file_name().unwrap_or_default().to_string_lossy();
+            let title = if TerminalTitleSource::fallback(title) {
+                let process = Path::new(&session.launch.program)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                Cow::Owned(format!("{process} · {basename}"))
+            } else {
+                Cow::Borrowed(title)
+            };
+            if let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id) {
+                return (Cow::Owned(format!("{title} ({ordinal})")), None);
+            }
+            return (title, None);
+        }
+        (Cow::Borrowed(title), None)
     }
 
     /// Provider activity belongs in the status icon, including restored titles.
@@ -7493,6 +9450,18 @@ impl Cagents {
         }
         if matches!(card.kind, CardKind::Browser(_)) {
             return browser_host::TITLE;
+        }
+        if let CardKind::Chat(session) = &card.kind
+            && let Some(channel) = self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty())
+            && (card.title == chat_ui::chat_card_title(session.launch.provider)
+                || (channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && channel.cards.first() == Some(&card.id)))
+        {
+            return &channel.title;
         }
         let title = crate::agent::codex_title_without_status(&card.title);
         // Provider recognition can only change an empty or status-prefixed
@@ -7542,22 +9511,29 @@ impl Cagents {
                 .durable
                 .focused
                 .and_then(|id| self.card_state(id))
-                .map(|card| self.card_display_title(card).trim())
-                .filter(|title| !title.is_empty())
-                .unwrap_or(APPLICATION_NAME);
-            if self.core.window.header_title == showing {
+                .map(|card| self.repository_chrome(card).0)
+                .unwrap_or(Cow::Borrowed(APPLICATION_NAME));
+            let showing = showing.trim();
+            let showing = if showing.is_empty() {
+                APPLICATION_NAME
+            } else {
+                showing
+            };
+            if self.core.window.header_title == showing
+                && self.window_waiting_count == self.sidebar_state.waiting_count()
+            {
                 return Task::none();
             }
             showing.to_owned()
         };
-        let mut window_title = if header == APPLICATION_NAME {
-            header.clone()
-        } else {
-            format!("{header}{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
-        };
-        if let Some(device) = crate::device::selected() {
-            window_title = format!("{} · {}", device.name, window_title);
-        }
+        let waiting = self.sidebar_state.waiting_count();
+        self.window_waiting_count = waiting;
+        let device = crate::device::selected();
+        let window_title = format_window_title(
+            &header,
+            device.as_ref().map(|device| device.name.as_str()),
+            waiting,
+        );
         self.set_header_title(header);
         match self.core.main_window_id() {
             Some(id) => self.set_window_title(window_title, id),
@@ -8075,6 +10051,9 @@ impl Cagents {
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
         let focus_changed = self.durable.focused != focused;
+        if focus_changed {
+            self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
+        }
         let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
         if focus_changed || exposure_changed {
             apply_durable_viewport_update(
@@ -8115,6 +10094,18 @@ impl Cagents {
                 Some(CardRuntime::Chat(runtime)) => {
                     let _ = runtime
                         .set_visible(transition.to == VisibilityClass::Visible && surfaces_visible);
+                }
+                Some(CardRuntime::Repository(runtime)) => {
+                    tasks.push(repository_task(runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
+                }
+                Some(CardRuntime::PullRequests(pane)) => {
+                    tasks.push(repository_task(pane.runtime.refresh_diff_visibility(
+                        transition.id,
+                        transition.to == VisibilityClass::Visible && surfaces_visible,
+                    )))
                 }
                 #[cfg(feature = "integrated-browser")]
                 Some(CardRuntime::Browser(browser)) => {
@@ -10051,9 +12042,57 @@ impl Cagents {
         }
     }
 
-    /// Rebinds the source-control panel to whatever worktree is now focused,
-    /// and loads a snapshot when that is a different worktree.
-    ///
+    /// Retires the old binding off the UI thread and releases large free arenas.
+    fn release_source_control(&mut self) -> Task<Message> {
+        let previous = self.sidebar_model.source_control.take();
+        let cache = self.refresh_ui.source_cache.take();
+        if previous.is_none() && cache.is_none() {
+            return Task::none();
+        }
+        // Old cancelled readers retain the old binding's invalidation flag.
+        self.refresh_ui.source_invalidated = Arc::new(std::sync::atomic::AtomicU8::new(0));
+        let large = previous.as_ref().is_some_and(|source| {
+            source.files.len() > 8192
+                || source
+                    .groups()
+                    .iter()
+                    .map(|group| group.rows().len())
+                    .sum::<usize>()
+                    > 8192
+        });
+        cosmic::task::future(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                // Wait for a cancelled old reader to drop its temporary model.
+                if let Some((_, cache)) = &cache {
+                    drop(
+                        cache
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+                    );
+                }
+                drop(previous);
+                drop(cache);
+            })
+            .await;
+            #[cfg(all(target_os = "linux", target_env = "gnu"))]
+            if large {
+                // Give the native view a frame to release its old widget tree.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let _ = tokio::task::spawn_blocking(|| {
+                    // SAFETY: glibc's allocator trimming is thread-safe and
+                    // takes no application pointers. It never runs on the UI.
+                    unsafe {
+                        libc::malloc_trim(0);
+                    }
+                })
+                .await;
+            }
+            #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+            let _ = large;
+            Message::SourceControlReleased
+        })
+    }
+
     /// Runs at the tail of every update, beside the selection sync, because
     /// focus changes for reasons that are not sidebar actions: a card closing,
     /// a session restoring, a project list arriving. Rebinding drops the
@@ -10073,9 +12112,9 @@ impl Cagents {
                 self.history_ui.cancel();
                 self.history_ui.next_page_request();
             }
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return self.release_source_control();
         }
+        self.prioritize_git_watches();
         if !changed {
             return self.load_pending_history();
         }
@@ -10083,9 +12122,9 @@ impl Cagents {
         self.cancel_branch_changes();
         self.history_ui.cancel();
         self.history_ui.next_page_request();
+        let release = self.release_source_control();
         let Some(key) = self.sidebar_state.active_worktree().cloned() else {
-            self.sidebar_model.source_control = None;
-            return Task::none();
+            return release;
         };
         if self.folder_scope(&key)
             && matches!(
@@ -10102,7 +12141,7 @@ impl Cagents {
                 .map(|mutation| mutation.kind),
         );
         self.sidebar_model.source_control = Some(source);
-        self.source_control_snapshot_task(key)
+        Task::batch([release, self.source_control_snapshot_task(key)])
     }
 
     /// Asks for the first page of history once, and only once the `History`
@@ -10234,8 +12273,13 @@ impl Cagents {
     /// `Open` that is never drained leaves a document the server has not been
     /// told about while the application shows results for it.
     fn drain_lsp_intents(&mut self, card: CardId) -> Task<Message> {
+        let visible = self.workspace_surfaces_visible()
+            && self.durable.cards.iter().any(|state| {
+                state.id == card && state.existence.is_open() && state.exposure == Exposure::Visible
+            });
         let (intents, edits, auto_save) = match self.cards.get_mut(&card) {
             Some(CardRuntime::Repository(runtime)) => {
+                runtime.set_diff_surface_visible(visible);
                 let intents = runtime.take_lsp_intents();
                 // Strictly after `take_lsp_intents`, which is what materialises
                 // the `Change` these edits describe.
@@ -10282,9 +12326,13 @@ impl Cagents {
                     self.lsp.change(doc, version, &edits, &text);
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
+                        crate::lsp::shift_diagnostics(&mut state.context.diagnostics, &edits);
+                        state.diagnostics_version = Some(version);
                     }
                     if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                        runtime.set_editor_diagnostics(vec![]);
+                        if let Some(state) = self.lsp_contexts.get(&card) {
+                            runtime.set_editor_diagnostics(state.context.diagnostics.clone());
+                        }
                         runtime.dismiss_editor_results();
                     }
                 }
@@ -10452,14 +12500,13 @@ impl Cagents {
         };
         match event {
             LspEvent::Diagnostics { version, items, .. } => {
+                // A delayed publication must not erase the shifted standing
+                // set for a newer buffer revision.
+                if self.lsp.document_version(doc) != Some(version) {
+                    return;
+                }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
-                    runtime.set_editor_diagnostics(
-                        if self.lsp.document_version(doc) == Some(version) {
-                            items.clone()
-                        } else {
-                            vec![]
-                        },
-                    );
+                    runtime.set_editor_diagnostics(items.clone());
                 }
                 state.context.diagnostics = items;
                 state.diagnostics_version = Some(version);
@@ -10822,7 +12869,7 @@ impl Cagents {
                 }
                 task
             }
-            Action::Next(_) | Action::Dismiss => {
+            Action::Next(_) | Action::Diagnostic(_) | Action::Dismiss => {
                 if matches!(action, Action::Dismiss) {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
@@ -10888,15 +12935,42 @@ impl Cagents {
         if !self.source_control_is_bound(key) {
             return Task::none();
         }
+        if self
+            .source_control_mutations
+            .contains_key(&key.canonical_path)
+        {
+            self.refresh_ui.source_last_refresh = Instant::now();
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+            return Task::none();
+        }
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
             source.set_reloading(true);
         }
+        self.refresh_ui.source_last_refresh = Instant::now();
         self.source_control_snapshot_task(key.clone())
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
         if crate::device::is_remote() {
             return Task::none();
+        }
+        self.refresh_ui.source_last_refresh = Instant::now();
+        if self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .is_none_or(|source| source.data_state != sidebar::SidebarDataState::Ready)
+        {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
+        }
+        if self.refresh_ui.source_cancel.is_some() {
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
         }
         self.cancel_source_read();
         let request = self.refresh_ui.source_generation;
@@ -10941,10 +13015,12 @@ impl Cagents {
             });
         }
         let worktree = key.canonical_path.clone();
-        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked);
+        let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
+            || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
+            status_limit: Some(self.settings.git_status_limit),
             untracked_changes,
-            untracked_files: untracked_changes || self.context_tab == ContextTab::Files,
+            untracked_files: self.context_tab == ContextTab::Files,
         };
         let browse_files = self.context_tab == ContextTab::Files;
         let previous_errors = self
@@ -10959,16 +13035,68 @@ impl Cagents {
             .expanded_directory_paths()
             .cloned()
             .collect::<Vec<_>>();
+        if self
+            .refresh_ui
+            .source_cache
+            .as_ref()
+            .is_none_or(|(path, _)| path != &worktree)
+        {
+            self.refresh_ui.source_cache = Some((
+                worktree.clone(),
+                Arc::new(std::sync::Mutex::new(
+                    crate::repository::SnapshotCache::default(),
+                )),
+            ));
+        }
+        if browse_files
+            && (self.refresh_ui.source_expanded != expanded
+                || self.refresh_ui.source_ignored_errors != previous_errors)
+        {
+            self.refresh_ui.source_expanded = expanded.clone();
+            self.refresh_ui.source_ignored_errors = previous_errors.clone();
+            self.refresh_ui
+                .source_invalidated
+                .fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+        }
+        let cache = self.refresh_ui.source_cache.as_ref().unwrap().1.clone();
+        let invalidated = self.refresh_ui.source_invalidated.clone();
+        let model_key = key.clone();
+        let reveal_demand = self.sidebar_state.files_reveal_demand().cloned();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                let mut snapshot = service
-                    .snapshot_with_options(&worktree, options, &cancellation)
-                    .map_err(|error| error.to_string())?;
+                let mut cache = cache
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let invalidation = invalidated.swap(0, std::sync::atomic::Ordering::AcqRel);
+                if invalidation != 0 {
+                    cache.invalidate(invalidation & 2 != 0);
+                }
+                let Some(mut snapshot) = service
+                    .snapshot_cached(&worktree, options, &cancellation, &mut cache)
+                    .map_err(|error| error.to_string())?
+                else {
+                    return Ok(None);
+                };
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
+                let mut reveal_error = None;
+                let mut revealed_path = None;
                 if browse_files {
                     let ignored = service
-                        .ignored_files(&worktree, &snapshot.files.paths, &cancellation)
-                        .map_err(|error| error.to_string())?;
+                        .ignored_files_with_limit(
+                            &worktree,
+                            &snapshot.files.paths,
+                            options.status_limit,
+                            &cancellation,
+                        )
+                        .map_err(|error| {
+                            cache.invalidate(false);
+                            error.to_string()
+                        })?;
+                    snapshot.files.listing_truncated |= ignored.listing_truncated;
                     snapshot.files.ignored = ignored.ignored;
                     snapshot.files.ignored_directories = ignored.ignored_directories;
                     repository_widget::expand_ignored_directories(
@@ -10977,14 +13105,37 @@ impl Cagents {
                         &expanded,
                         &previous_errors,
                         &cancellation,
-                    )?;
+                    )
+                    .inspect_err(|_| cache.invalidate(false))?;
+                    if let Some(path) = reveal_demand.as_ref() {
+                        match crate::repository::include_revealed_path(
+                            &worktree,
+                            &mut snapshot.files,
+                            path,
+                        ) {
+                            Ok(target) => revealed_path = target,
+                            Err(error) => reveal_error = Some(error),
+                        }
+                    }
+                    cache.observe_browse(&worktree, &snapshot.files);
                 }
-                Ok(snapshot)
+                let mut model =
+                    SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                model.revealed_path = revealed_path;
+                if let Some(error) = reveal_error {
+                    model.set_error(Some(format!(
+                        "Could not reveal the requested path: {error}"
+                    )));
+                }
+                if cancellation.is_cancelled() {
+                    cache.invalidate(false);
+                    return Err("source-control read cancelled".to_owned());
+                }
+                Ok(Some(Box::new((snapshot, model))))
             })
             .await
             .map_err(|error| format!("source-control reader join failed: {error}"))
-            .and_then(|result| result)
-            .map(Box::new);
+            .and_then(|result| result);
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -11054,34 +13205,191 @@ impl Cagents {
         if source.busy() {
             return None;
         }
+        source.set_error(None);
         let id = uuid::Uuid::new_v4();
         self.source_control_mutations.insert(
             key.canonical_path.clone(),
             SourceControlMutation {
                 id,
                 kind,
+                cancellation: CancellationToken::new(),
+                pending: std::collections::VecDeque::new(),
+                rollback: Some(source.clone()),
+                request: None,
                 commit_revision,
             },
         );
         source.set_error(None);
         source.set_mutation(Some(kind));
+        if self.refresh_ui.source_cancel.is_some() {
+            self.cancel_source_read();
+        }
         Some(id)
+    }
+
+    fn enqueue_git_mutation(
+        &mut self,
+        key: ActiveWorktreeKey,
+        request: QueuedGitMutation,
+    ) -> Task<Message> {
+        if !self.source_control_is_bound(&key) || self.folder_scope(&key) {
+            return Task::none();
+        }
+        let kind = request.kind();
+        if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
+            QueuedGitMutation::append(&mut active.pending, request.clone());
+            if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                if let Some(selection) = request.optimistic_selection() {
+                    source.optimistic_mutation(kind, selection);
+                }
+            }
+            return Task::none();
+        }
+        let Some(operation) = self.begin_mutation(&key, kind, None) else {
+            return Task::none();
+        };
+        if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
+            active.request = Some(request.clone());
+        }
+        if let Some(source) = self.sidebar_model.source_control.as_mut() {
+            if let Some(selection) = request.optimistic_selection() {
+                source.optimistic_mutation(kind, selection);
+            }
+        }
+        self.queued_git_task(key, operation, request)
+    }
+
+    fn queued_git_task(
+        &self,
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        request: QueuedGitMutation,
+    ) -> Task<Message> {
+        let request = match request {
+            QueuedGitMutation::Area { area, command, .. } => {
+                return self.queued_group_task(key, operation, area, command);
+            }
+            QueuedGitMutation::Stage(selection)
+            | QueuedGitMutation::StageApproved { selection, .. } => {
+                let approved = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .filter(|mutation| mutation.id == operation)
+                    .and_then(|mutation| match mutation.request.as_ref() {
+                        Some(QueuedGitMutation::StageApproved { approved, .. }) => {
+                            Some(approved.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+                let cancellation = self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .filter(|mutation| mutation.id == operation)
+                    .map(|mutation| mutation.cancellation.clone())
+                    .unwrap_or_default();
+                return cosmic::task::future(async move {
+                    let request = StageRequest {
+                        worktree: key.canonical_path.clone(),
+                        selection: selection.clone(),
+                    };
+                    let result = tokio::task::spawn_blocking(move || {
+                        let service = RepositoryService::system("git");
+                        match service.check_stage_markers(&request, &approved, &cancellation) {
+                            Ok(Some(markers)) => Ok(markers),
+                            Ok(None) => Err(mutation_report(
+                                "Stage",
+                                service.stage(&request, &cancellation),
+                            )),
+                            Err(error) => Err(Some(format!("Stage could not run: {error}"))),
+                        }
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(markers)) => Message::SourceControlStageChecked {
+                            key,
+                            operation,
+                            selection,
+                            markers,
+                        },
+                        Ok(Err(report)) => Message::SourceControlMutated {
+                            key,
+                            operation,
+                            report,
+                            committed: false,
+                        },
+                        Err(error) => Message::SourceControlMutated {
+                            key,
+                            operation,
+                            report: Some(format!("Stage worker failed: {error}")),
+                            committed: false,
+                        },
+                    }
+                });
+            }
+            request => request,
+        };
+
+        let worktree = key.canonical_path.clone();
+        self.mutation_task(key, operation, move |service, cancellation| {
+            let (label, outcome) = match request {
+                QueuedGitMutation::Stage(selection)
+                | QueuedGitMutation::StageApproved { selection, .. } => (
+                    "Stage",
+                    service.stage(
+                        &StageRequest {
+                            worktree,
+                            selection,
+                        },
+                        cancellation,
+                    ),
+                ),
+                QueuedGitMutation::Unstage(selection) => (
+                    "Unstage",
+                    service.unstage(
+                        &UnstageRequest {
+                            worktree,
+                            selection,
+                        },
+                        cancellation,
+                    ),
+                ),
+                QueuedGitMutation::Discard(request) => {
+                    ("Discard", service.discard(&request, cancellation))
+                }
+                QueuedGitMutation::Area { .. } => {
+                    unreachable!("group tasks are dispatched before ordinary mutations")
+                }
+                QueuedGitMutation::Operation(operation) => (
+                    operation.label(),
+                    service.git_operation(&worktree, &operation, cancellation),
+                ),
+            };
+            (mutation_report(label, outcome), false)
+        })
     }
 
     /// The task one finished mutation turns into: report what Git did, then
     /// re-read the worktree, because the index is the only authority on what
     /// the mutation left behind.
     fn mutation_task(
+        &self,
         key: ActiveWorktreeKey,
         operation: uuid::Uuid,
         run: impl FnOnce(&RepositoryService, &CancellationToken) -> (Option<String>, bool)
         + Send
         + 'static,
     ) -> Task<Message> {
+        let cancellation = self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .filter(|mutation| mutation.id == operation)
+            .map(|mutation| mutation.cancellation.clone())
+            .unwrap_or_default();
         cosmic::task::future(async move {
             let joined = tokio::task::spawn_blocking(move || {
                 let service = RepositoryService::system("git");
-                run(&service, &CancellationToken::default())
+                run(&service, &cancellation)
             })
             .await;
             let (report, committed) = match joined {
@@ -11097,7 +13405,8 @@ impl Cagents {
         })
     }
 
-    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+    fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) -> Task<Message> {
+        let mut tasks = Vec::new();
         let visible_cards = self
             .durable
             .cards
@@ -11116,6 +13425,18 @@ impl Cagents {
                 }
                 .map_err(|error| error.to_string()),
                 CardRuntime::Chat(runtime) => runtime.set_visible(visible),
+                CardRuntime::Repository(runtime) => {
+                    tasks.push(repository_task(
+                        runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
+                CardRuntime::PullRequests(pane) => {
+                    tasks.push(repository_task(
+                        pane.runtime.refresh_diff_visibility(*id, visible),
+                    ));
+                    Ok(())
+                }
                 #[cfg(feature = "integrated-browser")]
                 CardRuntime::Browser(browser) => browser
                     .handle
@@ -11124,8 +13445,6 @@ impl Cagents {
                 CardRuntime::Loading
                 | CardRuntime::Failed(_)
                 | CardRuntime::Completed
-                | CardRuntime::Repository(_)
-                | CardRuntime::PullRequests(_)
                 | CardRuntime::Settings
                 | CardRuntime::Accounts
                 | CardRuntime::Automations => Ok(()),
@@ -11139,19 +13458,20 @@ impl Cagents {
                 "could not update workspace visibility: {error}"
             )));
         }
+        Task::batch(tasks)
     }
 
-    /// The focused card when it is a repository card showing an editable
-    /// buffer, which is the only context in which the search chord means
-    /// "find in this file" rather than "find a project".
+    /// The focused source pane that can search its own text: either an
+    /// editable buffer or a read-only worktree/PR comparison.
     fn focused_editable_repository_card(&self) -> Option<CardId> {
         let card = self.workspace.focused()?;
         match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime))
-                if runtime.editor_focus_target(card).is_some() =>
+                if runtime.editor_focus_target(card).is_some() || runtime.shows_diff() =>
             {
                 Some(card)
             }
+            Some(CardRuntime::PullRequests(pane)) if pane.runtime.shows_diff() => Some(card),
             _ => None,
         }
     }
@@ -11162,6 +13482,7 @@ impl Cagents {
         let card = self.workspace.focused()?;
         match self.cards.get(&card) {
             Some(CardRuntime::Repository(runtime)) if runtime.find_is_open() => Some(card),
+            Some(CardRuntime::PullRequests(pane)) if pane.runtime.find_is_open() => Some(card),
             _ => None,
         }
     }
@@ -11174,7 +13495,9 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
-        self.update_ui.confirmation.is_some() || self.other_modal_is_open()
+        self.chat_ui.close_dialog.is_some()
+            || self.update_ui.confirmation.is_some()
+            || self.other_modal_is_open()
     }
 
     fn other_modal_is_open(&self) -> bool {
@@ -11188,6 +13511,7 @@ impl Cagents {
             || self.worktree_dialog.is_some()
             || self.pull_request_dialog.is_some()
             || self.resume_ui.open
+            || self.chrome_ui.clone_repository.is_some()
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
@@ -11212,6 +13536,9 @@ impl Cagents {
         }
         if self.resume_ui.open {
             return self.update_resume(resume_ui::Action::Close);
+        }
+        if self.chrome_ui.clone_repository.is_some() {
+            return self.update_onboarding(onboarding_ui::Action::Cancel);
         }
         if let Some(dialog) = self.worktree_dialog.take() {
             dialog.cancel();
@@ -11272,8 +13599,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -11390,11 +13720,12 @@ impl Cagents {
         let was_overlay = self.context_inspector_overlay_active;
         let is_overlay = self.context_inspector_is_overlay();
         self.context_inspector_overlay_active = is_overlay;
-        if was_overlay != is_overlay {
-            let visible = self.workspace_surfaces_visible();
-            self.set_workspace_surfaces_visible(visible);
-        }
-        match context_overlay_change(was_overlay, is_overlay) {
+        let visibility = if was_overlay != is_overlay {
+            self.set_workspace_surfaces_visible(self.workspace_surfaces_visible())
+        } else {
+            Task::none()
+        };
+        let focus = match context_overlay_change(was_overlay, is_overlay) {
             ContextOverlayChange::Entered => self.enter_context_overlay(),
             ContextOverlayChange::Exited
                 if !self.context_inspector_open || self.workspace.focused().is_none() =>
@@ -11413,7 +13744,8 @@ impl Cagents {
                 Task::none()
             }
             ContextOverlayChange::Unchanged => Task::none(),
-        }
+        };
+        Task::batch([visibility, focus])
     }
 
     fn set_context_inspector_open(&mut self, open: bool) -> Task<Message> {
@@ -11689,6 +14021,13 @@ impl Cagents {
     /// `rust-analyzer` - and the proc-macro server it owns - from outliving the
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
+    fn cancel_source_control_mutations(&mut self) {
+        for mutation in self.source_control_mutations.values_mut() {
+            mutation.pending.clear();
+            mutation.cancellation.cancel();
+        }
+    }
+
     fn exit_after_language_servers(&mut self) -> Task<Message> {
         if self.exit.is_some() {
             return Task::none();
@@ -11698,6 +14037,7 @@ impl Cagents {
         // window is being raised, and it would open none. Refused, the
         // launcher waits for this process to release the window lease and
         // starts a fresh window.
+        self.cancel_source_control_mutations();
         self.activation_rx.close();
         // `Drop` writes the final state; this snapshot is queued now because
         // someone who has watched the window close may power off before then.
@@ -11946,6 +14286,9 @@ impl Cagents {
         if self.resume_ui.open {
             return Some(resume_ui::focus_id());
         }
+        if self.chrome_ui.clone_repository.is_some() {
+            return Some(onboarding_ui::clone_focus_id());
+        }
         if let Some(dialog) = &self.sidebar_selection_ui.dialog {
             Some(dialog.focus_target())
         } else if self.sidebar_state.pending_discard().is_some() {
@@ -12077,7 +14420,7 @@ impl Cagents {
             id,
             generation: self.durable.generation,
             title: title.clone(),
-            width_fraction: self.settings.default_native_pane_fraction,
+            width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
             exposure: Exposure::Visible,
             residency: Residency::Hot,
@@ -12469,6 +14812,47 @@ impl Cagents {
         }
     }
 
+    /// Retry refused shortcut drafts against the newly saved table. A different
+    /// row may have released the chord they were waiting for.
+    fn retry_shortcut_drafts(&mut self) {
+        loop {
+            let mut progressed = false;
+            let fields: Vec<_> = SettingsField::SHORTCUTS
+                .into_iter()
+                .filter(|field| self.settings_invalid.contains_key(field))
+                .collect();
+            for field in fields {
+                let action = field.shortcut_action().expect("shortcut field");
+                let value = self
+                    .settings_draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered shortcut")
+                    .1
+                    .to_owned();
+                match settings_update(&self.settings, field, &value) {
+                    SettingsDecision::Persist(settings) => {
+                        self.settings = settings;
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Unchanged => {
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Invalid(reason) => {
+                        self.settings_invalid.insert(field, reason);
+                    }
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+    }
+
     fn apply_setting_input(&mut self, field: SettingsField, value: String) -> Task<Message> {
         self.settings_pending.remove(&field);
         self.settings_draft.set(field, value.clone());
@@ -12480,15 +14864,26 @@ impl Cagents {
             }
             SettingsDecision::Unchanged => {
                 self.settings_invalid.remove(&field);
-                if self.settings_save_error.is_some() {
-                    return self.save_settings_task(false);
-                }
+                let previous = self.settings.clone();
+                self.retry_shortcut_drafts();
+                let changed = previous != self.settings;
+                let save = if changed || self.settings_save_error.is_some() {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
                 self.refresh_settings_feedback();
-                Task::none()
+                let effect = if changed {
+                    self.synchronize_settings(&previous)
+                } else {
+                    Task::none()
+                };
+                Task::batch([save, effect])
             }
             SettingsDecision::Persist(settings) => {
                 let previous = std::mem::replace(&mut self.settings, settings);
                 self.settings_invalid.remove(&field);
+                self.retry_shortcut_drafts();
                 let save = self.save_settings_task(false);
                 self.refresh_settings_feedback();
                 let effect = self.synchronize_settings(&previous);
@@ -12512,20 +14907,57 @@ impl Cagents {
             }
         }
         let mut tasks = Vec::new();
+        if previous.git_status_limit != self.settings.git_status_limit
+            && let Some(key) = self.sidebar_state.active_worktree().cloned()
+        {
+            tasks.push(self.reload_source_control(&key));
+        }
         if previous.editor_font_family() != self.settings.editor_font_family()
             || previous.editor_font_size() != self.settings.editor_font_size()
         {
             let font = crate::terminal::monospace_font(self.settings.editor_font_family());
             let size = self.settings.editor_font_size();
+            for (&card, runtime) in self.cards.iter_mut() {
+                let runtime = match runtime {
+                    CardRuntime::Repository(runtime) => runtime,
+                    CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                    _ => continue,
+                };
+                runtime.set_editor_font(font, size);
+                tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                tasks.push(repository_task(runtime.restore_font_viewport()));
+            }
+        }
+        if previous.editor_find_options != self.settings.editor_find_options
+            || previous.editor_replace_preserve_case != self.settings.editor_replace_preserve_case
+        {
             for runtime in self.cards.values_mut() {
                 match runtime {
-                    CardRuntime::Repository(runtime) => runtime.set_editor_font(font, size),
-                    CardRuntime::PullRequests(pane) => pane.runtime.set_editor_font(font, size),
+                    CardRuntime::Repository(runtime) => runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
+                    CardRuntime::PullRequests(pane) => pane.runtime.set_find_preferences(
+                        self.settings.editor_find_options,
+                        self.settings.editor_replace_preserve_case,
+                    ),
                     _ => {}
                 }
             }
         }
         if previous.keyboard_shortcuts != self.settings.keyboard_shortcuts {
+            let shortcuts = Arc::new(self.settings.keyboard_shortcuts.clone());
+            for runtime in self.cards.values_mut() {
+                match runtime {
+                    CardRuntime::Repository(runtime) => {
+                        runtime.set_keyboard_shortcuts(Arc::clone(&shortcuts))
+                    }
+                    CardRuntime::PullRequests(pane) => {
+                        pane.runtime.set_keyboard_shortcuts(Arc::clone(&shortcuts))
+                    }
+                    _ => {}
+                }
+            }
             self.card_chrome.clear();
         }
         if previous.worktree_sort != self.settings.worktree_sort {
@@ -12835,6 +15267,7 @@ impl Application for Cagents {
             cards: HashMap::new(),
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            search_ui: search_ui::State::default(),
             terminal_review_card: None,
             terminal_review_revision: 0,
             terminal_review_identity: None,
@@ -12906,6 +15339,9 @@ impl Application for Cagents {
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
             sidebar_state: SidebarState::default(),
+            window_waiting_count: 0,
+            attention_navigation: Vec::new(),
+            attention_focus_epoch: 0,
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
@@ -13024,6 +15460,8 @@ impl Application for Cagents {
             app.sidebar_state.restore_view(view.sidebar);
             app.worktree_offsets = view.worktree_offsets;
         }
+        app.sidebar_state
+            .restore_unread_updates(app.durable.agent_updates.clone());
         app.sidebar_model
             .apply_project_order(&app.durable.project_order);
         app.sidebar_state
@@ -13126,6 +15564,19 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let (message, _keyboard_region) = match message {
+            Message::RoutedKeyEvent {
+                event,
+                captured,
+                region,
+                widget,
+            } => (
+                Message::KeyEvent { event, captured },
+                Some(self.input_trace.scoped_keyboard_focus(region, widget)),
+            ),
+            message => (message, None),
+        };
+        self.reconcile_chat_close_backing_state();
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -13235,6 +15686,7 @@ impl Application for Cagents {
                 | Message::ChannelUi(_)
                 | Message::Sidebar(_)
                 | Message::FocusCard(_)
+                | Message::FocusAttention(_)
                 | Message::TerminalReviewMode { .. }
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
@@ -13386,6 +15838,7 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::Onboarding(action) => self.update_onboarding(action),
             Message::OpenRepository => cosmic::task::future(async {
                 let dialog = file_chooser::open::Dialog::new().title("Open project folder");
                 let result = dialog
@@ -13842,6 +16295,58 @@ impl Application for Cagents {
             Message::Repository(RepositoryAction::Language { card, action }) => {
                 self.update_editor_lsp(card, action)
             }
+            Message::Repository(RepositoryAction::OpenWorkingFileLocation { identity, line }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let (descriptor, review) = match self.cards.get(&identity.card) {
+                    Some(CardRuntime::Repository(runtime)) => {
+                        (runtime.diff_working_file_target(&identity), false)
+                    }
+                    Some(CardRuntime::PullRequests(pane)) => {
+                        (pane.runtime.diff_working_file_target(&identity), true)
+                    }
+                    _ => return Task::none(),
+                };
+                let Some(descriptor) = descriptor else {
+                    return Task::none();
+                };
+                let mut tasks = Vec::new();
+                let destination = if review {
+                    let existing = self.repository_card_for(&descriptor.worktree).filter(|card| matches!(self.cards.get(card),Some(CardRuntime::Repository(runtime)) if !(runtime.is_dirty() || runtime.is_saving()) || runtime.selected_path() == Some(identity.path.as_path())));
+                    match existing {
+                        Some(card) => card,
+                        None => {
+                            tasks.push(self.add_repository_card(
+                                descriptor.project,
+                                descriptor.repository,
+                                descriptor.worktree,
+                            ));
+                            let Some(card) = self.workspace.focused() else {
+                                return Task::batch(tasks);
+                            };
+                            card
+                        }
+                    }
+                } else {
+                    identity.card
+                };
+                // PR snapshots stay read-only in their review card. The working
+                // file opens in a repository card with normal save/LSP/close
+                // ownership, and its native coordinates are clamped on load.
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&destination) {
+                    tasks.push(repository_task(runtime.open_source_file_location(
+                        destination,
+                        identity.path,
+                        line,
+                    )));
+                }
+                if let Ok(update) = self.workspace.focus(destination) {
+                    tasks.push(self.apply_viewport(update, true, false));
+                }
+                tasks.push(self.drain_lsp_intents(destination));
+                Task::batch(tasks)
+            }
             Message::Repository(RepositoryAction::OpenExternal { card, editor_id }) => {
                 let path = match self.cards.get(&card) {
                     Some(CardRuntime::Repository(runtime)) if runtime.can_open_external() => {
@@ -13853,6 +16358,46 @@ impl Application for Cagents {
                 };
                 path.map_or_else(Task::none, |path| self.open_file_in_editor(path, editor_id))
             }
+
+            Message::Repository(RepositoryAction::ApplyDiffSelection { card, kind }) => {
+                self.start_diff_patch(card, kind, None)
+            }
+            Message::Repository(RepositoryAction::ApplyDiffHunk {
+                card,
+                kind,
+                request,
+            }) => self.start_diff_patch(card, kind, Some(request)),
+            Message::DiffPatchPrepared {
+                key,
+                identity,
+                buffer_revision,
+                result,
+            } => self.finish_diff_patch(key, identity, buffer_revision, result),
+
+            Message::Repository(RepositoryAction::RevertFile { card }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+                else {
+                    return Task::none();
+                };
+                let Some(request) = runtime.selected_discard_request() else {
+                    return Task::none();
+                };
+                self.update(Message::Sidebar(SidebarAction::RequestDiscard {
+                    key: source.key.clone(),
+                    request,
+                }))
+            }
+
             Message::Repository(RepositoryAction::StageSelected { card, stage }) => {
                 if self.modal_is_open() {
                     return Task::none();
@@ -13895,6 +16440,31 @@ impl Application for Cagents {
             }
             Message::Repository(RepositoryAction::Review { card, action }) => {
                 self.handle_pull_request_review(card, action)
+            }
+            Message::Repository(RepositoryAction::ToggleDiffWhitespace { card: origin }) => {
+                self.settings.diff_ignore_whitespace = !self.settings.diff_ignore_whitespace;
+                let enabled = self.settings.diff_ignore_whitespace;
+                let visible = self
+                    .durable
+                    .cards
+                    .iter()
+                    .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
+                    .map(|card| card.id)
+                    .collect::<HashSet<_>>();
+                let mut tasks = Vec::new();
+                for (&card, runtime) in self.cards.iter_mut() {
+                    let runtime = match runtime {
+                        CardRuntime::Repository(runtime) => runtime,
+                        CardRuntime::PullRequests(pane) => &mut pane.runtime,
+                        _ => continue,
+                    };
+                    runtime.set_diff_ignore_whitespace(enabled);
+                    if card == origin || visible.contains(&card) {
+                        tasks.push(repository_task(runtime.refresh_diff_preferences(card)));
+                    }
+                }
+                tasks.push(self.save_settings_task(false));
+                Task::batch(tasks)
             }
             Message::Repository(RepositoryAction::ZoomFont { card, delta }) => {
                 self.update(Message::ZoomFont {
@@ -13948,6 +16518,11 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
+                let find_preferences_changed = matches!(
+                    &action,
+                    RepositoryAction::FindOptionsChanged { .. }
+                        | RepositoryAction::PreserveCaseChanged { .. }
+                );
                 let completion_character = match &action {
                     RepositoryAction::EditorAction {
                         action:
@@ -13996,6 +16571,31 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                if find_preferences_changed {
+                    let preferences = match self.cards.get(&card) {
+                        Some(CardRuntime::Repository(runtime)) => Some(runtime.find_preferences()),
+                        Some(CardRuntime::PullRequests(pane)) => {
+                            Some(pane.runtime.find_preferences())
+                        }
+                        _ => None,
+                    };
+                    if let Some((options, preserve)) = preferences {
+                        self.settings.editor_find_options = options;
+                        self.settings.editor_replace_preserve_case = preserve;
+                        for runtime in self.cards.values_mut() {
+                            match runtime {
+                                CardRuntime::Repository(runtime) => {
+                                    runtime.set_find_preferences(options, preserve)
+                                }
+                                CardRuntime::PullRequests(pane) => {
+                                    pane.runtime.set_find_preferences(options, preserve)
+                                }
+                                _ => {}
+                            }
+                        }
+                        tasks.push(self.save_settings_task(false));
+                    }
+                }
                 tasks.push(self.restore_repository_editor_focus());
                 if let Some(character) = completion_character
                     && let Some(doc) = self.lsp_document(card)
@@ -14068,6 +16668,19 @@ impl Application for Cagents {
                 Task::batch(tasks)
             }
             Message::Sidebar(action) => {
+                if let SidebarAction::RunChangeCommand {
+                    command,
+                    key,
+                    row,
+                    selection_revision,
+                } = action
+                {
+                    return self.run_captured_change_command(command, key, row, selection_revision);
+                }
+
+                if let SidebarAction::RunCommand { command, action } = action {
+                    return self.run_sidebar_registered_command(command, *action);
+                }
                 // A control in the pane can still be activated while a dialog
                 // is up: the modal captures the pointer, and the focus
                 // operation the dialog issues on open cannot reach a pane
@@ -14087,7 +16700,8 @@ impl Application for Cagents {
                 if self.modal_is_open() && !answers_discard_confirmation(&action) {
                     return Task::none();
                 }
-                if matches!(&action, SidebarAction::FilesPage { key, .. }
+                if matches!(&action, SidebarAction::ChangeViewport { key, .. }
+                    | SidebarAction::FilesPage { key, .. }
                     | SidebarAction::FilesQueryChanged { key, .. }
                     | SidebarAction::ToggleFilesFilter { key }
                     | SidebarAction::CommitMessageChanged { key, .. }
@@ -14095,18 +16709,55 @@ impl Application for Cagents {
                     | SidebarAction::CommitEditorCursor { key, .. }
                     | SidebarAction::CommitSubjectEditorAction { key, .. }
                     | SidebarAction::CommitEditorAction { key, .. }
-                    | SidebarAction::AmendChanged { key, .. } if !self.source_control_is_bound(key))
+                    | SidebarAction::AmendChanged { key, .. }
+                    | SidebarAction::SelectChangeRows { key, .. }
+                    | SidebarAction::NavigateChangeRow { key, .. }
+                    | SidebarAction::RevealChangeInFiles { key, .. }
+                    | SidebarAction::IgnoreChangePath { key, .. }
+                    | SidebarAction::ClearChangeSelection { key }
+                    | SidebarAction::InvokeChangeRows { key, .. } if !self.source_control_is_bound(key))
                 {
                     return Task::none();
                 }
-                let action = if matches!(action, SidebarAction::ChangeGroup { .. }) {
+                let action = if let SidebarAction::InvokeChangeRows { key, row, command } = &action
+                {
                     let Some(source) = &self.sidebar_model.source_control else {
                         return Task::none();
                     };
-                    let Some(resolved) = sidebar::resolve_group_command(source, &action) else {
+                    let Some(resolved) = sidebar::resolve_change_command(
+                        source,
+                        &self.sidebar_state,
+                        key,
+                        row,
+                        *command,
+                    ) else {
                         return Task::none();
                     };
                     resolved
+                } else if matches!(action, SidebarAction::ChangeGroup { .. }) {
+                    let Some(source) = &self.sidebar_model.source_control else {
+                        return Task::none();
+                    };
+                    if let SidebarAction::ChangeGroup { key, area, command } = &action
+                        && let Some(row) = sidebar::selected_change_group_anchor(
+                            source,
+                            &self.sidebar_state,
+                            *area,
+                        )
+                    {
+                        let Some(resolved) = sidebar::resolve_change_command(
+                            source,
+                            &self.sidebar_state,
+                            key,
+                            &row,
+                            *command,
+                        ) else {
+                            return Task::none();
+                        };
+                        resolved
+                    } else {
+                        action
+                    }
                 } else {
                     action
                 };
@@ -14144,17 +16795,17 @@ impl Application for Cagents {
                     SidebarAction::RenameChannel(id) => self.update_chrome(chrome_ui::Action::RenameChannel(id)),
                     SidebarAction::MarkChannelRead(id) => {
                         let cards = self.durable.channels.iter().find(|channel| channel.id == id).map(|channel| channel.cards.clone()).unwrap_or_default();
-                        let tasks: Vec<_> = cards.into_iter().map(|card| {
-                            self.sidebar_state.acknowledge_agent_update(card);
-                            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
-                                && let Err(error) = handle.acknowledge_updates()
-                            {
-                                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
-                            }
-                            self.acknowledge_chat_updates(card)
-                        }).collect();
-                        self.refresh_sidebar_channels();
-                        Task::batch(tasks)
+                        self.mark_cards_read(cards)
+                    }
+                    SidebarAction::MarkAllRead => {
+                        let cards = self.durable.cards.iter().filter(|card| card.existence.is_open()).map(|card| card.id).collect();
+                        self.mark_cards_read(cards)
+                    }
+                    SidebarAction::MarkWorktreeRead(project, worktree) => {
+                        let cards = self.durable.cards.iter().filter(|card| card.existence.is_open())
+                            .filter(|card| self.agent_worktree(card.id).is_some_and(|key| key.project_id == project && key.worktree_id == worktree))
+                            .map(|card| card.id).collect();
+                        self.mark_cards_read(cards)
                     }
                     SidebarAction::ScrollProjects(y) => iced::widget::operation::scroll_by(
                         widget::Id::new("sidebar.projects.scroll"),
@@ -14195,6 +16846,20 @@ impl Application for Cagents {
                         } else { Task::none() }
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
+                    SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } => unreachable!("registered commands are validated before dispatch"),
+                    SidebarAction::DeleteRows(rows) => {
+                        if rows.len() == 1 {
+                            self.delete_sidebar_row(rows[0])
+                        } else {
+                            let visible = sidebar::visible_selection_rows(&self.sidebar_model, &self.sidebar_state, self.projects_sidebar_mode() == SidebarMode::Compact);
+                            if self.sidebar_state.selected_rows(&visible).into_iter().collect::<std::collections::BTreeSet<_>>() == rows.iter().copied().collect() {
+                                self.begin_sidebar_group_delete()
+                            } else {
+                                self.status = Some(TransientNotice::warning("The sidebar selection changed; select the rows again before deleting"));
+                                Task::none()
+                            }
+                        }
+                    }
                     SidebarAction::DeleteSelectedRows => self.begin_sidebar_group_delete(),
                     SidebarAction::ClearRowSelection => {
                         self.sidebar_state.clear_row_selection();
@@ -14361,6 +17026,42 @@ impl Application for Cagents {
                         };
                         Task::batch([Self::reset_files_scroll(&key), followup])
                     }
+                    SidebarAction::RevealChangeInFiles { key, path } => {
+                        self.sidebar_state.reveal_in_files(path);
+                        self.context_tab = ContextTab::Files;
+                        self.refresh_ui.source_invalidated.fetch_or(1, std::sync::atomic::Ordering::AcqRel);
+                        let open = self.set_context_inspector_open(true);
+                        Task::batch([open, self.reload_source_control(&key)])
+                    }
+                    SidebarAction::IgnoreChangePath { key, path } => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::IgnorePath { path } })),
+                    SidebarAction::SelectChangeRows { key, row, intent } => {
+                        let id = sidebar::change_row_focus_id(&key, &row);
+                        if let Some(source) = &self.sidebar_model.source_control {
+                            let order = sidebar::change_selection_order(source, &self.sidebar_state);
+                            self.sidebar_state.select_change_rows(row, intent, &order);
+                        }
+                        iced::widget::operation::focus(id).map(cosmic::Action::App)
+                    }
+                    SidebarAction::NavigateChangeRow { key, row, direction, extend } => {
+                        let Some(source) = &self.sidebar_model.source_control else { return Task::none(); };
+                        let order = sidebar::change_selection_order(source, &self.sidebar_state);
+                        let Some(position) = order.iter().position(|candidate| candidate == &row) else { return Task::none(); };
+                        use iced::keyboard::key::Named;
+                        let next = match direction {
+                            Named::ArrowUp => position.saturating_sub(1),
+                            Named::ArrowDown => (position + 1).min(order.len().saturating_sub(1)),
+                            Named::Home => 0,
+                            Named::End => order.len().saturating_sub(1),
+                            _ => return Task::none(),
+                        };
+                        let target = order[next].clone();
+                        self.sidebar_state.select_change_rows(target.clone(), if extend { sidebar::SelectionIntent::Range { extend: false } } else { sidebar::SelectionIntent::Navigate }, &order);
+                        let scroll = self.sidebar_state.reveal_change_row(source, &target)
+                            .map(|(id, y)| iced::widget::operation::scroll_to(id, iced::widget::operation::AbsoluteOffset { x: 0.0, y }).map(cosmic::Action::App))
+                            .unwrap_or_else(Task::none);
+                        Task::batch([scroll, iced::widget::operation::focus(sidebar::change_row_focus_id(&key, &target)).map(cosmic::Action::App)])
+                    }
+                    SidebarAction::ClearChangeSelection { .. } | SidebarAction::InvokeChangeRows { .. } => Task::none(),
                     SidebarAction::OpenSettings => self.open_utility_card(CardKind::Settings),
                     SidebarAction::OpenAutomations => self.open_automations(),
                     // The handle clamps to its own rendered bounds, and the
@@ -14409,8 +17110,7 @@ impl Application for Cagents {
                     | SidebarAction::SetChangesTab { .. }
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::SetChangeListMode { .. }
-                    | SidebarAction::ChangePage { .. }
-                    | SidebarAction::ChangeGroup { .. }
+                    | SidebarAction::ChangeViewport { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
@@ -14457,52 +17157,39 @@ impl Application for Cagents {
                         // tree like any other unstaged change.
                         self.open_working_change(key, path, area)
                     }
-                    SidebarAction::Stage { key, selection } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Stage, None) else {
-                            return Task::none();
-                        };
-                        let request = StageRequest {
-                            worktree: key.canonical_path.clone(),
-                            selection,
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Stage", service.stage(&request, cancel)),
-                                false,
-                            )
-                        })
+                    SidebarAction::GitOperation { key, operation } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.pending_stash_drop = None; }
+                        self.enqueue_git_mutation(key, QueuedGitMutation::Operation(operation))
                     }
-                    SidebarAction::Unstage { key, selection } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Unstage, None) else {
-                            return Task::none();
-                        };
-                        let request = UnstageRequest {
-                            worktree: key.canonical_path.clone(),
-                            selection,
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Unstage", service.unstage(&request, cancel)),
-                                false,
-                            )
-                        })
+                    SidebarAction::ToggleStashes { key } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.stashes_expanded = !source.stashes_expanded; }
+                        Task::none()
                     }
-                    // The only arm that destroys work, and the only one the
-                    // dialog can raise: `RequestDiscard` builds the request
-                    // with `confirmed: false`, the dialog rebuilds it with
-                    // `confirmed: true`, and the service refuses an
-                    // unconfirmed one outright.
-                    SidebarAction::ConfirmDiscard { key, request } => {
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Discard, None) else {
-                            return Task::none();
-                        };
-                        Self::mutation_task(key, operation, move |service, cancel| {
-                            (
-                                mutation_report("Discard", service.discard(&request, cancel)),
-                                false,
-                            )
-                        })
+                    SidebarAction::RequestStashDrop { key, entry } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) { source.pending_stash_drop = entry; }
+                        Task::none()
                     }
+                    SidebarAction::ConfirmStageMarkers { key, confirmed } => {
+                        let pending = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key).and_then(|source| source.pending_marker_stage.take().map(|selection| (selection, std::mem::take(&mut source.pending_marker_approval))));
+                        if confirmed && let Some((selection, approved)) = pending { self.enqueue_git_mutation(key, QueuedGitMutation::StageApproved { selection, approved }) } else { Task::none() }
+                    }
+                    SidebarAction::CancelGitMutation { key } => {
+                        if let Some(mutation) = self.source_control_mutations.get_mut(&key.canonical_path) {
+                            mutation.pending.clear();
+                            mutation.cancellation.cancel();
+                        }
+                        Task::none()
+                    }
+                    SidebarAction::ToggleGitOutput { key } => {
+                        if let Some(source) = self.sidebar_model.source_control.as_mut().filter(|source| source.key == key) {
+                            source.output_expanded = !source.output_expanded;
+                        }
+                        Task::none()
+                    }
+                    SidebarAction::ChangeGroup { key, area, command } => self.enqueue_change_group(key, area, command),
+                    SidebarAction::Stage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Stage(selection)),
+                    SidebarAction::Unstage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Unstage(selection)),
+                    SidebarAction::ConfirmDiscard { key, request } => self.enqueue_git_mutation(key, QueuedGitMutation::Discard(request)),
                     SidebarAction::Commit { key, message, amend } => {
                         let commit_revision = self.sidebar_state.submitted_commit_revision(&key, &message, amend);
                         let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, commit_revision) else {
@@ -14512,7 +17199,7 @@ impl Application for Cagents {
                             worktree: key.canonical_path.clone(),
                             message,
                         };
-                        Self::mutation_task(key, operation, move |service, cancel| {
+                        self.mutation_task(key, operation, move |service, cancel| {
                             commit_report(service.commit_with_amend(&request, amend, cancel))
                         })
                     }
@@ -14529,7 +17216,7 @@ impl Application for Cagents {
                             branch,
                             target,
                         };
-                        Self::mutation_task(key, operation, move |service, cancel| {
+                        self.mutation_task(key, operation, move |service, cancel| {
                             (push_report(service.push(&request, cancel)), false)
                         })
                     }
@@ -14589,11 +17276,33 @@ impl Application for Cagents {
                     | SidebarAction::ToggleProject(_) => Task::none(),
                 }
             }
+            Message::AcknowledgeVisiblePane { card, epoch } => {
+                if epoch == self.attention_focus_epoch && self.pane_is_active(card) {
+                    self.acknowledge_active_pane()
+                } else {
+                    Task::none()
+                }
+            }
+            Message::FocusAttention(card) => self.focus_attention_card(card),
             Message::FocusCard(id) => {
                 // Explicit activation also cancels a pending entry on this same
                 // card, even if no view has observed its acknowledgment yet.
                 self.set_terminal_review_owner(None);
                 self.focus_workspace_card(id)
+            }
+            Message::MovePaneToChannel { card, channel } => {
+                self.move_pane_to_channel(card, channel)
+            }
+            Message::PaneDropToChannel {
+                generation,
+                card,
+                channel,
+            } => {
+                if generation == self.workspace_view_generation {
+                    self.move_pane_to_channel(card, channel)
+                } else {
+                    Task::none()
+                }
             }
             Message::TerminalReviewMode {
                 card,
@@ -15010,11 +17719,11 @@ impl Application for Cagents {
             Message::CloseCard(id)
                 if self
                     .card_state(id)
-                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
-                    || self.chat_has_parked_runtime(id) =>
+                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) =>
             {
-                self.begin_chat_close(id)
+                self.request_chat_tab_close(id)
             }
+            Message::CloseCard(id) if self.chat_has_parked_runtime(id) => self.begin_chat_close(id),
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
@@ -15675,312 +18384,471 @@ impl Application for Cagents {
                 }
             },
             Message::CancelDialog => self.cancel_form_dialog(),
+            Message::ShortcutTerminalPassthrough { action, enabled } => {
+                if !KeyboardShortcuts::action_names().contains(&action.as_str()) {
+                    return Task::none();
+                }
+                let actions = &mut self
+                    .settings
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions;
+                actions.retain(|name| name != &action);
+                if enabled {
+                    actions.push(action);
+                }
+                self.settings_draft
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions = actions.clone();
+                self.save_settings_task(false)
+            }
+            Message::RoutedKeyEvent { .. } => {
+                unreachable!("native keyboard events are normalized before dispatch")
+            }
             Message::KeyEvent { event, captured } => {
-                if let Some(task) = self.automation_approval_key(&event, captured) {
-                    return task;
+                if !self.workspace_inputs_blocked()
+                    && let Some(card) = self.input_trace.keyboard_card()
+                    && !self.workspace.order().any(|candidate| candidate == card)
+                {
+                    return Task::none();
                 }
-                if let Some(task) = self.session_recovery_key_event(&event, captured) {
-                    return task;
-                }
-                if let Some(task) = self.daemon_health_key_event(&event, captured) {
-                    return task;
-                }
-                if let keyboard::Event::ModifiersChanged(modifiers) = &event {
-                    self.keyboard_modifiers = *modifiers;
-                }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
-                        match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
+                let focus_task = if !self.workspace_inputs_blocked()
+                    && let Some(card) = self.input_trace.keyboard_card()
+                    && self.workspace.focused() != Some(card)
+                    && let Ok(update) = self.workspace.focus(card)
+                {
+                    // Synchronize the action target without moving native
+                    // focus or delivering the widget's input a second time.
+                    self.apply_viewport(update, false, false)
+                } else {
+                    Task::none()
+                };
+                let route_task = (|| {
+                    if self.chat_ui.close_dialog.is_some() {
+                        return if is_escape_press(&event) {
+                            self.cancel_chat_close()
+                        } else {
+                            Task::none()
+                        };
+                    }
+                    if let Some(task) = self.automation_approval_key(&event, captured) {
+                        return task;
+                    }
+                    if let Some(task) = self.session_recovery_key_event(&event, captured) {
+                        return task;
+                    }
+                    if let Some(task) = self.daemon_health_key_event(&event, captured) {
+                        return task;
+                    }
+                    if let keyboard::Event::ModifiersChanged(modifiers) = &event {
+                        self.keyboard_modifiers = *modifiers;
+                    }
+                    if self.chat_ui.image_viewer.is_some() {
+                        if let keyboard::Event::KeyPressed { key, .. } = &event {
+                            match key {
+                                keyboard::Key::Named(keyboard::key::Named::Escape) => {
+                                    self.chat_ui.image_viewer = None
+                                }
+                                keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
+                                    self.chat_ui.image_viewer.as_mut().unwrap().next(false);
+                                }
+                                keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
+                                    self.chat_ui.image_viewer.as_mut().unwrap().next(true);
+                                }
+                                _ => {}
                             }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                            }
-                            _ => {}
+                        }
+                        return Task::none();
+                    }
+                    if !captured
+                        && !self.workspace_inputs_blocked()
+                        && !matches!(
+                            self.focused_pane(),
+                            workspace_widget::FocusedPane::TextInput
+                                | workspace_widget::FocusedPane::OutsideWorkspace
+                                | workspace_widget::FocusedPane::SidebarRows
+                                | workspace_widget::FocusedPane::SidebarFiles
+                                | workspace_widget::FocusedPane::SidebarChanges
+                        )
+                        && workspace_widget::global_shortcut(
+                            &event,
+                            &self.settings.keyboard_shortcuts,
+                            self.focused_pane(),
+                        )
+                        .is_none()
+                        && let keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Character(key),
+                            modifiers,
+                            ..
+                        } = &event
+                        && modifiers.control()
+                        && modifiers.shift()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && key.eq_ignore_ascii_case("s")
+                        && let Some(card) = self.workspace.focused()
+                        && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
+                    {
+                        let stage = runtime.selected_staging_selection(true).is_some();
+                        if stage || runtime.selected_staging_selection(false).is_some() {
+                            return cosmic::task::message(Message::Repository(
+                                RepositoryAction::StageSelected { card, stage },
+                            ));
                         }
                     }
-                    return Task::none();
-                }
-                if !captured
-                    && !self.workspace_inputs_blocked()
-                    && workspace_widget::global_shortcut(
+                    if let Some(task) = self.project_search_key_event(&event) {
+                        return task;
+                    }
+                    if let Some(task) = self.palette_key_event(&event) {
+                        return task;
+                    }
+                    if crate::tab_history::released(&event) {
+                        self.tab_history.finish(self.workspace.focused());
+                    }
+                    if crate::tab_history::modifiers_released(
                         &event,
-                        &self.settings.keyboard_shortcuts,
-                        self.focused_pane(),
-                    )
-                    .is_none()
-                    && let keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Character(key),
-                        modifiers,
-                        ..
-                    } = &event
-                    && modifiers.control()
-                    && modifiers.shift()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && key.eq_ignore_ascii_case("s")
-                    && let Some(card) = self.workspace.focused()
-                    && let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card)
-                {
-                    let stage = runtime.selected_staging_selection(true).is_some();
-                    if stage || runtime.selected_staging_selection(false).is_some() {
-                        return cosmic::task::message(Message::Repository(
-                            RepositoryAction::StageSelected { card, stage },
-                        ));
-                    }
-                }
-                if crate::tab_history::released(&event) {
-                    self.tab_history.finish(self.workspace.focused());
-                }
-                if crate::tab_history::modifiers_released(&event, self.workspace_cycle_modifiers)
-                    && let Some(since) = self.chrome_ui.workspace_preview_since
-                {
-                    // A window losing focus is told its modifiers are released
-                    // just before it is told about the focus. Deciding one
-                    // message later lets that cancel instead of commit.
-                    self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
-                    return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
-                }
-                if self.chrome_ui.workspace_preview.is_some() {
-                    return self.workspace_switcher_key(&event);
-                }
-                if !self.workspace_inputs_blocked()
-                    && !self.focused_repository_is_saving()
-                    && let Some(backwards) = crate::tab_history::step_direction(&event)
-                {
-                    let available: Vec<_> = self.workspace.order().collect();
-                    self.tab_history.retain(|id| {
-                        self.durable
-                            .cards
-                            .iter()
-                            .any(|card| card.id == id && card.existence.is_open())
-                    });
-                    if let Some(id) =
-                        self.tab_history
-                            .step(&available, self.workspace.focused(), backwards)
-                        && let Ok(update) = self.workspace.focus(id)
+                        self.workspace_cycle_modifiers,
+                    ) && let Some(since) = self.chrome_ui.workspace_preview_since
                     {
-                        return self.apply_viewport(update, true, false);
+                        // A window losing focus is told its modifiers are released
+                        // just before it is told about the focus. Deciding one
+                        // message later lets that cancel instead of commit.
+                        self.workspace_cycle_modifiers = keyboard::Modifiers::empty();
+                        return cosmic::task::message(Message::WorkspaceSwitcherReleased(since));
                     }
-                    return Task::none();
-                }
-                if let Some(task) = self.palette_key_event(&event) {
-                    return task;
-                }
-                if let Some(task) = self.chrome_key_event(&event) {
-                    return task;
-                }
-                if let Some(task) = self.account_key_event(&event) {
-                    return task;
-                }
-                if !self.workspace_inputs_blocked()
-                    && let Some(task) = self.chat_find_key(&event)
-                {
-                    return task;
-                }
-                // A widget that consumed Escape has already answered it - a
-                // focused terminal clearing its selection, for one. Running the
-                // chain anyway would close the inspector behind it in the same
-                // keystroke. Global shortcuts below are deliberately exempt:
-                // `WorkspaceSurface` captures those chords itself, before any
-                // child sees them, and relies on this message to act on them.
-                // A form dialog on top answers Escape before anything under
-                // it, such as a find bar or picker, and even when its focused
-                // field captured the key to blur itself: otherwise closing it
-                // would take a second press.
-                if is_escape_press(&event) && self.form_dialog_on_top() {
-                    return self.cancel_form_dialog();
-                }
-                if self.form_dialog_on_top()
-                    && let Some(task) = self.resume_key_event(&event)
-                {
-                    return task;
-                }
-                if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
-                    return self.update_device(device_ui::Action::Menu(false));
-                }
-                // The model search field captures Escape to blur itself. Close
-                // its picker in the same press, while dialogs retain priority.
-                if is_escape_press(&event)
-                    && !self.workspace_inputs_blocked()
-                    && self.dismiss_chat_picker()
-                {
-                    return self.workspace.focused().map_or_else(Task::none, |card| {
-                        iced::widget::operation::focus(card_control_id(card, "chat-composer"))
-                            .map(cosmic::Action::App)
-                    });
-                }
-                if self.settings_reset_on_top() {
-                    if is_escape_press(&event) {
-                        return self.close_settings_reset();
+                    if self.chrome_ui.workspace_preview.is_some() {
+                        return self.workspace_switcher_key(&event);
                     }
-                    if is_tab_press(&event).is_some() {
-                        self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
-                        let target = if self.settings_reset_focus_confirm {
-                            "dialog.reset-settings.confirm"
-                        } else {
-                            "dialog.reset-settings.cancel"
+                    if !self.workspace_inputs_blocked()
+                        && !self.focused_repository_is_saving()
+                        && let Some(backwards) = crate::tab_history::step_direction(&event)
+                    {
+                        let available: Vec<_> = self.workspace.order().collect();
+                        self.tab_history.retain(|id| {
+                            self.durable
+                                .cards
+                                .iter()
+                                .any(|card| card.id == id && card.existence.is_open())
+                        });
+                        if let Some(id) =
+                            self.tab_history
+                                .step(&available, self.workspace.focused(), backwards)
+                            && let Ok(update) = self.workspace.focus(id)
+                        {
+                            return self.apply_viewport(update, true, false);
+                        }
+                        return Task::none();
+                    }
+                    if !captured
+                        && !self.workspace_inputs_blocked()
+                        && matches!(
+                            self.focused_pane(),
+                            workspace_widget::FocusedPane::Review
+                                | workspace_widget::FocusedPane::WorkingDiff
+                        )
+                        && let Some(card) = self.workspace.focused()
+                        && let Some(runtime) = match self.cards.get(&card) {
+                            Some(CardRuntime::Repository(runtime)) => Some(runtime.as_ref()),
+                            Some(CardRuntime::PullRequests(pane)) => Some(&pane.runtime),
+                            _ => None,
+                        }
+                        && runtime.shows_diff()
+                        && !runtime.find_input_is_focused()
+                        && let keyboard::Event::KeyPressed { key, modifiers, .. } = &event
+                    {
+                        let action = match key {
+                            keyboard::Key::Named(keyboard::key::Named::ArrowUp)
+                                if !modifiers.command() && !modifiers.alt() =>
+                            {
+                                Some(RepositoryAction::MoveDiffSelection {
+                                    card,
+                                    delta: -1,
+                                    extend: modifiers.shift(),
+                                })
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::ArrowDown)
+                                if !modifiers.command() && !modifiers.alt() =>
+                            {
+                                Some(RepositoryAction::MoveDiffSelection {
+                                    card,
+                                    delta: 1,
+                                    extend: modifiers.shift(),
+                                })
+                            }
+                            keyboard::Key::Named(keyboard::key::Named::Escape)
+                                if !runtime.find_is_open() && runtime.has_diff_selection() =>
+                            {
+                                Some(RepositoryAction::ClearDiffSelection { card })
+                            }
+                            _ => None,
                         };
-                        return iced::widget::operation::focus(widget::Id::new(target))
-                            .map(cosmic::Action::App);
+                        if let Some(action) = action {
+                            return cosmic::task::message(Message::Repository(action));
+                        }
                     }
-                }
-                if is_escape_press(&event) && !captured {
-                    if self.transient_work_close.is_some() {
-                        return cosmic::task::message(Message::CancelTransientWorkClose);
+                    if let Some(task) = self.chrome_key_event(&event) {
+                        return task;
                     }
-                    if let Some(action) = self.automation_ui.keep_draft_action() {
-                        return self.update_automation_ui(action);
+                    if let Some(task) = self.account_key_event(&event) {
+                        return task;
                     }
-                    if let Some((card, _)) = &self.terminal_paste {
-                        return self
-                            .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
+                    if !self.workspace_inputs_blocked()
+                        && let Some(task) = self.chat_find_key(&event)
+                    {
+                        return task;
                     }
-                    if self.update_ui.confirmation.is_some() {
-                        return self.update_update_ui(update_ui::Action::CancelApply);
+                    // A widget that consumed Escape has already answered it - a
+                    // focused terminal clearing its selection, for one. Running the
+                    // chain anyway would close the inspector behind it in the same
+                    // keystroke. Global shortcuts below are deliberately exempt:
+                    // `WorkspaceSurface` captures those chords itself, before any
+                    // child sees them, and relies on this message to act on them.
+                    // A form dialog on top answers Escape before anything under
+                    // it, such as a find bar or picker, and even when its focused
+                    // field captured the key to blur itself: otherwise closing it
+                    // would take a second press.
+                    if is_escape_press(&event) && self.form_dialog_on_top() {
+                        return self.cancel_form_dialog();
                     }
-                    if self.terminal_close_dialog_visible() {
-                        return self.cancel_terminal_close();
+                    if self.form_dialog_on_top()
+                        && let Some(task) = self.resume_key_event(&event)
+                    {
+                        return task;
                     }
-                    if self.sidebar_state.pending_discard().is_some() {
-                        return cosmic::task::message(Message::Sidebar(
-                            SidebarAction::CancelDiscard,
-                        ));
+                    if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open()
+                    {
+                        return self.update_device(device_ui::Action::Menu(false));
                     }
-                    if self.project_ui.modal_open() {
-                        return self.handle_project_action(project_ui::Action::Dismiss);
+                    // The model search field captures Escape to blur itself. Close
+                    // its picker in the same press, while dialogs retain priority.
+                    if is_escape_press(&event)
+                        && !self.workspace_inputs_blocked()
+                        && self.dismiss_chat_picker()
+                    {
+                        return self.workspace.focused().map_or_else(Task::none, |card| {
+                            iced::widget::operation::focus(card_control_id(card, "chat-composer"))
+                                .map(cosmic::Action::App)
+                        });
                     }
-                    if self.sidebar_selection_ui.dialog.is_some() {
-                        return self
-                            .update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
+                    if self.settings_reset_on_top() {
+                        if is_escape_press(&event) {
+                            return self.close_settings_reset();
+                        }
+                        if is_tab_press(&event).is_some() {
+                            self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
+                            let target = if self.settings_reset_focus_confirm {
+                                "dialog.reset-settings.confirm"
+                            } else {
+                                "dialog.reset-settings.cancel"
+                            };
+                            return iced::widget::operation::focus(widget::Id::new(target))
+                                .map(cosmic::Action::App);
+                        }
                     }
-                    if self.dirty_repository_close.is_some() {
-                        if self.dirty_repository_close.as_ref().is_some_and(|close| {
+                    if is_escape_press(&event) && !captured {
+                        if self.transient_work_close.is_some() {
+                            return cosmic::task::message(Message::CancelTransientWorkClose);
+                        }
+                        if let Some(action) = self.automation_ui.keep_draft_action() {
+                            return self.update_automation_ui(action);
+                        }
+                        if let Some((card, _)) = &self.terminal_paste {
+                            return self.handle_terminal_find(terminal_ui::Action::ConfirmPaste(
+                                *card, false,
+                            ));
+                        }
+                        if self.update_ui.confirmation.is_some() {
+                            return self.update_update_ui(update_ui::Action::CancelApply);
+                        }
+                        if self.terminal_close_dialog_visible() {
+                            return self.cancel_terminal_close();
+                        }
+                        if self.sidebar_state.pending_discard().is_some() {
+                            return cosmic::task::message(Message::Sidebar(
+                                SidebarAction::CancelDiscard,
+                            ));
+                        }
+                        if self.project_ui.modal_open() {
+                            return self.handle_project_action(project_ui::Action::Dismiss);
+                        }
+                        if self.sidebar_selection_ui.dialog.is_some() {
+                            return self
+                                .update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
+                        }
+                        if self.dirty_repository_close.is_some() {
+                            if self.dirty_repository_close.as_ref().is_some_and(|close| {
                             matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
                         }) {
                             return Task::none();
                         }
-                        return cosmic::task::message(Message::CancelRepositoryClose);
+                            return cosmic::task::message(Message::CancelRepositoryClose);
+                        }
+                        // Ahead of the inspector and the sidebar because the find
+                        // bar is the innermost thing the user is looking at, and
+                        // behind the confirmations above because those are modal.
+                        if let Some(card) = self.focused_repository_card_with_find() {
+                            return cosmic::task::message(Message::Repository(
+                                RepositoryAction::CloseFind { card },
+                            ));
+                        }
+                        if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
+                            return cosmic::task::message(Message::CancelDialog);
+                        }
+                        if self.sidebar_state.controls_expanded() {
+                            return self.update(Message::Sidebar(SidebarAction::ToggleControls));
+                        }
+                        if self.context_inspector_is_overlay() {
+                            return cosmic::task::message(Message::ContextInspector(
+                                InspectorAction::Close,
+                            ));
+                        }
                     }
-                    // Ahead of the inspector and the sidebar because the find
-                    // bar is the innermost thing the user is looking at, and
-                    // behind the confirmations above because those are modal.
-                    if let Some(card) = self.focused_repository_card_with_find() {
-                        return cosmic::task::message(Message::Repository(
-                            RepositoryAction::CloseFind { card },
-                        ));
+                    if let Some(backwards) = is_tab_press(&event)
+                        && self.terminal_close_dialog_visible()
+                    {
+                        return self.cycle_terminal_close_focus(backwards);
                     }
-                    if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                        return cosmic::task::message(Message::CancelDialog);
+                    if let Some(backwards) = is_tab_press(&event)
+                        && self.dirty_repository_close.is_some()
+                    {
+                        return self.cycle_dirty_close_focus(backwards);
                     }
-                    if self.sidebar_state.controls_expanded() {
-                        return self.update(Message::Sidebar(SidebarAction::ToggleControls));
+                    // A chord typed at a dialog is not the workspace's to act on:
+                    // the close chord must not close the card behind the dialog.
+                    // The dialog is an overlay, so it has already seen the
+                    // keystroke by the time this runs, and what it does with one
+                    // is its own affair.
+                    if self.workspace_inputs_blocked() {
+                        return Task::none();
                     }
-                    if self.context_inspector_is_overlay() {
-                        return cosmic::task::message(Message::ContextInspector(
-                            InspectorAction::Close,
-                        ));
+                    if let Some(task) = self.chat_picker_key(&event) {
+                        return task;
                     }
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.terminal_close_dialog_visible()
-                {
-                    return self.cycle_terminal_close_focus(backwards);
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.dirty_repository_close.is_some()
-                {
-                    return self.cycle_dirty_close_focus(backwards);
-                }
-                // A chord typed at a dialog is not the workspace's to act on:
-                // the close chord must not close the card behind the dialog.
-                // The dialog is an overlay, so it has already seen the
-                // keystroke by the time this runs, and what it does with one
-                // is its own affair.
-                if self.workspace_inputs_blocked() {
-                    return Task::none();
-                }
-                if let Some(task) = self.chat_picker_key(&event) {
-                    return task;
-                }
-                if let Some(card) = self.workspace.focused()
-                    && self.terminal_find.get(&card).is_some_and(|find| find.open)
-                    && let keyboard::Event::KeyPressed {
-                        key: keyboard::Key::Named(key),
+                    if let Some(card) = self.workspace.focused()
+                        && self.terminal_find.get(&card).is_some_and(|find| find.open)
+                        && let keyboard::Event::KeyPressed {
+                            key: keyboard::Key::Named(key),
+                            modifiers,
+                            ..
+                        } = &event
+                    {
+                        if *key == keyboard::key::Named::Escape && !captured {
+                            return self.handle_terminal_find(terminal_ui::Action::Close(card));
+                        }
+                        if *key == keyboard::key::Named::Enter
+                            && self
+                                .terminal_find
+                                .get(&card)
+                                .is_some_and(|find| find.focused)
+                        {
+                            return self.handle_terminal_find(terminal_ui::Action::Next(
+                                card,
+                                modifiers.shift(),
+                            ));
+                        }
+                    }
+                    if let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::F3),
                         modifiers,
                         ..
                     } = &event
-                {
-                    if *key == keyboard::key::Named::Escape && !captured {
-                        return self.handle_terminal_find(terminal_ui::Action::Close(card));
-                    }
-                    if *key == keyboard::key::Named::Enter
-                        && self
-                            .terminal_find
-                            .get(&card)
-                            .is_some_and(|find| find.focused)
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && let Some(card) = self.focused_repository_card_with_find()
                     {
-                        return self.handle_terminal_find(terminal_ui::Action::Next(
+                        return cosmic::task::message(Message::Repository(if modifiers.shift() {
+                            RepositoryAction::FindPrevious { card }
+                        } else {
+                            RepositoryAction::FindNext { card }
+                        }));
+                    }
+                    if let keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                        modifiers,
+                        ..
+                    } = &event
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && let Some(card) = self.workspace.focused()
+                        && match self.cards.get(&card) {
+                            Some(CardRuntime::Repository(runtime)) => {
+                                runtime.find_input_is_focused()
+                            }
+                            Some(CardRuntime::PullRequests(pane)) => {
+                                pane.runtime.find_input_is_focused()
+                            }
+                            _ => false,
+                        }
+                    {
+                        return cosmic::task::message(Message::Repository(if modifiers.shift() {
+                            RepositoryAction::FindPrevious { card }
+                        } else {
+                            RepositoryAction::FindNext { card }
+                        }));
+                    }
+                    #[cfg(feature = "integrated-browser")]
+                    if !captured
+                        && let Some(card) = self.workspace.focused()
+                        && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
+                        && let Some(message) = browser_shortcut(card, &event)
+                    {
+                        return cosmic::task::message(message);
+                    }
+                    if !captured && let Some(task) = self.chat_scroll_key(&event) {
+                        return task;
+                    }
+                    if !captured
+                        && matches!(
+                            self.focused_pane(),
+                            workspace_widget::FocusedPane::Review
+                                | workspace_widget::FocusedPane::WorkingDiff
+                        )
+                        && let keyboard::Event::KeyPressed {
+                            key,
+                            physical_key,
+                            modifiers,
+                            ..
+                        } = &event
+                        && let Some(card) = self.workspace.focused()
+                        && match self.cards.get(&card) {
+                            Some(CardRuntime::Repository(runtime)) => runtime.shows_diff(),
+                            Some(CardRuntime::PullRequests(pane)) => pane.runtime.shows_diff(),
+                            _ => false,
+                        }
+                        && let Some(delta) =
+                            crate::interaction::font_zoom_chord(key, *physical_key, *modifiers)
+                    {
+                        return self.update(Message::ZoomFont {
                             card,
-                            modifiers.shift(),
-                        ));
+                            delta,
+                            editor: true,
+                        });
                     }
-                }
-                if let keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(keyboard::key::Named::Enter),
-                    modifiers,
-                    ..
-                } = &event
-                    && !modifiers.control()
-                    && !modifiers.alt()
-                    && !modifiers.logo()
-                    && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.find_input_is_focused())
-                {
-                    return cosmic::task::message(Message::Repository(if modifiers.shift() {
-                        RepositoryAction::FindPrevious { card }
-                    } else {
-                        RepositoryAction::FindNext { card }
-                    }));
-                }
-                #[cfg(feature = "integrated-browser")]
-                if !captured
-                    && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Browser(_)))
-                    && let Some(message) = browser_shortcut(card, &event)
-                {
-                    return cosmic::task::message(message);
-                }
-                if !captured && let Some(task) = self.chat_scroll_key(&event) {
-                    return task;
-                }
-                if is_save_press(&event)
-                    && let Some(card) = self.workspace.focused()
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
-                {
-                    return cosmic::task::message(Message::Repository(RepositoryAction::Save {
-                        card,
-                        overwrite: false,
-                    }));
-                }
-                match workspace_widget::global_shortcut(
-                    &event,
-                    &self.settings.keyboard_shortcuts,
-                    self.focused_pane(),
-                ) {
-                    Some(command) => {
-                        let modifiers = match event {
-                            keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
-                            _ => keyboard::Modifiers::empty(),
-                        };
-                        self.run_workspace_command(command, modifiers)
+                    match workspace_widget::global_shortcut(
+                        &event,
+                        &self.settings.keyboard_shortcuts,
+                        self.focused_pane(),
+                    ) {
+                        Some(command) => {
+                            if captured
+                                && self.focused_pane() == workspace_widget::FocusedPane::Editor
+                                && workspace_widget::shortcut_descriptor(command)
+                                    .scope
+                                    .is_native_editor()
+                            {
+                                return Task::none();
+                            }
+                            let modifiers = match event {
+                                keyboard::Event::KeyPressed { modifiers, .. } => modifiers,
+                                _ => keyboard::Modifiers::empty(),
+                            };
+                            self.run_workspace_command(command, modifiers)
+                        }
+                        None => Task::none(),
                     }
-                    None => Task::none(),
-                }
+                })();
+                Task::batch([focus_task, route_task])
             }
             #[cfg(feature = "latency-harness")]
             Message::LatencyRedraw { generation, at } => {
@@ -16043,10 +18911,14 @@ impl Application for Cagents {
             }
             Message::ToggleContextInspector if self.modal_is_open() => Task::none(),
             Message::TerminalFind(action) => self.handle_terminal_find(action),
+            Message::ProjectSearch(action) => self.update_project_search(action),
             Message::ToggleContextInspector => {
                 self.set_context_inspector_open(!self.context_inspector_open)
             }
             Message::SelectContextTab(tab) => {
+                if tab == ContextTab::Search {
+                    return self.update_project_search(search_ui::Action::Open);
+                }
                 if self.active_folder_scope()
                     && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
                 {
@@ -16141,6 +19013,9 @@ impl Application for Cagents {
                     }
                     _ => None,
                 };
+                if account_focus.is_some_and(|(focused, _)| focused != self.refresh_ui.focused) {
+                    self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
+                }
                 // A colour-only theme change reaches the hook but not the mode
                 // watch, so the periodic refresh is where that one is caught.
                 let refresh = self.update_refresh(action);
@@ -16152,7 +19027,24 @@ impl Application for Cagents {
                 } else {
                     self.reconcile_shared_views()
                 };
-                Task::batch([refresh, self.flush_document_tone(), accounts, shared])
+                let acknowledge = if account_focus.is_some_and(|(_, regained)| regained) {
+                    let epoch = self.attention_focus_epoch;
+                    self.workspace.focused().map_or_else(Task::none, |card| {
+                        cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_millis(400)).await;
+                            Message::AcknowledgeVisiblePane { card, epoch }
+                        })
+                    })
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    refresh,
+                    self.flush_document_tone(),
+                    accounts,
+                    shared,
+                    acknowledge,
+                ])
             }
             Message::DocumentToneStale => {
                 if self.settings.terminal_theme == crate::terminal::TerminalTheme::Auto {
@@ -16163,6 +19055,7 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::ChatClose(action) => self.update_chat_close(action),
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -16242,7 +19135,9 @@ impl Application for Cagents {
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
                 self.daemon_health_ui.health = health;
-                if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
+                if !self.daemon_health_ui.health.unavailable()
+                    && self.daemon_health_ui.confirmation
+                    && !self.daemon_health_ui.requested_restart
                 {
                     self.update_daemon_health_ui(daemon_health_ui::Action::Cancel)
                 } else {
@@ -16295,6 +19190,14 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
+            Message::SourceControlGroupSelection {
+                key,
+                operation,
+                area,
+                command,
+                result,
+            } => self.finish_group_selection(key, operation, area, command, result),
+            Message::SourceControlReleased => Task::none(),
             Message::SourceControlLoaded {
                 key,
                 request,
@@ -16306,7 +19209,13 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.source_cancel = None;
-                if let Ok(snapshot) = &result
+                if matches!(result, Ok(None)) {
+                    if let Some(source) = self.sidebar_model.source_control.as_mut() {
+                        source.set_reloading(false);
+                    }
+                    return Task::none();
+                }
+                if let Ok(Some(prepared)) = &result
                     && let Some(worktree) = self
                         .sidebar_model
                         .projects
@@ -16319,22 +19228,41 @@ impl Application for Cagents {
                                 .find(|worktree| worktree.id == key.worktree_id)
                         })
                 {
-                    worktree.apply_status(&snapshot.status);
+                    worktree.apply_status(&prepared.0.status);
                 }
-                let mut next = match &result {
-                    Ok(snapshot) => SourceControlModel::ready(key, snapshot),
-                    Err(error) => SourceControlModel::failed(key, error.clone()),
+                let (snapshot, mut next) = match result {
+                    Ok(Some(prepared)) => {
+                        let (snapshot, model) = *prepared;
+                        (Some(snapshot), model)
+                    }
+                    Ok(None) => unreachable!(),
+                    Err(error) => (None, SourceControlModel::failed(key.clone(), error)),
                 };
+                if let Some(snapshot) = snapshot.as_ref() {
+                    self.sidebar_state.prefill_operation_message(
+                        &key,
+                        snapshot
+                            .operation
+                            .as_ref()
+                            .and_then(|operation| operation.message.as_deref()),
+                    );
+                }
                 // The reload replaces the rows and nothing else: an in-flight
                 // mutation, its last failure, and the history already walked
                 // belong to the binding, not to the page of Git output.
                 if let Some(previous) = self.sidebar_model.source_control.as_ref() {
                     previous.carry_mutation_into(&mut next);
                 }
+                self.sidebar_state.reconcile_change_rows(&next);
+                let reveal = self
+                    .sidebar_state
+                    .finish_reveal_in_files(&next)
+                    .map(|id| iced::widget::operation::focus(id).map(cosmic::Action::App))
+                    .unwrap_or_else(Task::none);
                 self.sidebar_model.source_control = Some(next);
-                match result {
-                    Ok(snapshot) => self.refresh_branch_changes(&snapshot),
-                    Err(_) => {
+                match snapshot {
+                    Some(snapshot) => Task::batch([self.refresh_branch_changes(&snapshot), reveal]),
+                    None => {
                         self.cancel_branch_changes();
                         Task::none()
                     }
@@ -16377,23 +19305,136 @@ impl Application for Cagents {
                 }
                 Task::none()
             }
+            Message::SourceControlStageChecked {
+                key,
+                operation,
+                selection,
+                markers,
+            } => {
+                if !self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .is_some_and(|mutation| mutation.id == operation)
+                {
+                    return Task::none();
+                }
+                let task = self.update(Message::SourceControlMutated {
+                    key: key.clone(),
+                    operation,
+                    report: Some("Stage needs confirmation because conflict markers remain".into()),
+                    committed: false,
+                });
+                if let Some(source) = self
+                    .sidebar_model
+                    .source_control
+                    .as_mut()
+                    .filter(|source| source.key.canonical_path == key.canonical_path)
+                {
+                    let pending = source.pending_marker_stage.get_or_insert_with(Vec::new);
+                    let mut seen = pending
+                        .iter()
+                        .map(|entry| entry.path.clone())
+                        .collect::<HashSet<_>>();
+                    pending.extend(
+                        selection
+                            .iter()
+                            .filter(|entry| seen.insert(entry.path.clone()))
+                            .cloned(),
+                    );
+                    source.pending_marker_approval.extend(markers.clone());
+                }
+                if let Some(rollback) = self
+                    .source_control_mutations
+                    .get_mut(&key.canonical_path)
+                    .and_then(|mutation| mutation.rollback.as_mut())
+                {
+                    let pending = rollback.pending_marker_stage.get_or_insert_with(Vec::new);
+                    let mut seen = pending
+                        .iter()
+                        .map(|entry| entry.path.clone())
+                        .collect::<HashSet<_>>();
+                    pending.extend(
+                        selection
+                            .into_iter()
+                            .filter(|entry| seen.insert(entry.path.clone())),
+                    );
+                    rollback.pending_marker_approval.extend(markers);
+                }
+                task
+            }
             Message::SourceControlMutated {
                 key,
                 operation,
                 report,
                 committed,
             } => {
-                let Some(mutation) = self
+                if !self
                     .source_control_mutations
                     .get(&key.canonical_path)
-                    .copied()
-                    .filter(|mutation| mutation.id == operation)
+                    .is_some_and(|mutation| mutation.id == operation)
+                {
+                    return Task::none();
+                }
+                let Some(mut mutation) = self.source_control_mutations.remove(&key.canonical_path)
                 else {
                     return Task::none();
                 };
-                self.source_control_mutations.remove(&key.canonical_path);
+                if self.exit.is_some() {
+                    return Task::none();
+                }
+                let failed = report.is_some();
+                if !failed
+                    && let Some(rollback) = mutation.rollback.as_mut()
+                    && let Some(selection) = mutation
+                        .request
+                        .as_ref()
+                        .and_then(QueuedGitMutation::optimistic_selection)
+                {
+                    rollback.optimistic_mutation(mutation.kind, selection);
+                }
+                if failed
+                    && let Some(rollback) = mutation.rollback.as_ref()
+                    && let Some(source) = self
+                        .sidebar_model
+                        .source_control
+                        .as_mut()
+                        .filter(|source| source.key.canonical_path == key.canonical_path)
+                {
+                    *source = rollback.clone();
+                    for pending in &mutation.pending {
+                        if let Some(selection) = pending.optimistic_selection() {
+                            source.optimistic_mutation(pending.kind(), selection);
+                        }
+                    }
+                }
                 if committed && let Some(revision) = mutation.commit_revision {
                     self.sidebar_state.clear_submitted_commit(&key, revision);
+                }
+                if let Some(next) = mutation.pending.pop_front() {
+                    let operation = uuid::Uuid::new_v4();
+                    mutation.id = operation;
+                    mutation.kind = next.kind();
+                    mutation.request = Some(next.clone());
+                    mutation.cancellation = CancellationToken::new();
+                    if let Some(report) = report.as_ref() {
+                        let summary = report.split("\n\nGit output:\n").next().unwrap_or(report);
+                        self.notices.record(TransientNotice::error(format!(
+                            "{}: {summary}",
+                            display_path(&key.canonical_path)
+                        )));
+                    }
+                    if let Some(source) = self
+                        .sidebar_model
+                        .source_control
+                        .as_mut()
+                        .filter(|source| source.key.canonical_path == key.canonical_path)
+                    {
+                        source.set_mutation(Some(mutation.kind));
+                        source.set_error(report.clone());
+                    }
+                    self.source_control_mutations
+                        .insert(key.canonical_path.clone(), mutation);
+                    return self.queued_git_task(key, operation, next);
                 }
                 let mut refreshes = Vec::new();
                 for (&card, runtime) in &mut self.cards {
@@ -16414,14 +19455,19 @@ impl Application for Cagents {
                         source.key.clone()
                     });
                 if let Some(report) = report {
+                    let report = report.split("\n\nGit output:\n").next().unwrap_or(&report);
                     self.status = Some(TransientNotice::error(format!(
                         "{}: {report}",
                         display_path(&key.canonical_path)
                     )));
                 }
+                refreshes.push(self.start_git_reads());
                 // Navigation does not cancel Git. Only this exact completion
                 // releases the worktree, then the index is read afresh.
                 if let Some(bound) = bound {
+                    self.refresh_ui
+                        .source_invalidated
+                        .fetch_or(3, std::sync::atomic::Ordering::AcqRel);
                     refreshes.push(self.reload_source_control(&bound));
                 }
                 Task::batch(refreshes)
@@ -16466,6 +19512,7 @@ impl Application for Cagents {
         }
         self.refresh_sidebar_worktree_panes();
         let binding = self.rebind_source_control();
+        let search_binding = self.rebind_project_search();
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
                 .workspace
@@ -16488,6 +19535,7 @@ impl Application for Cagents {
         Task::batch([
             task,
             binding,
+            search_binding,
             chrome,
             deferred,
             pull_request,
@@ -16544,11 +19592,8 @@ impl Application for Cagents {
                     },
                 },
             }),
-            event::listen_with(|event, status, event_window| match event {
-                iced::Event::Keyboard(event) => Some(Message::KeyEvent {
-                    event,
-                    captured: matches!(status, event::Status::Captured),
-                }),
+            event::listen_with(|event, _status, event_window| match event {
+                iced::Event::Keyboard(_) => None,
                 iced::Event::Window(window::Event::Rescaled(scale_factor)) => {
                     Some(Message::WindowScaleFactorChanged(scale_factor))
                 }
@@ -16612,6 +19657,9 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
+        if let Some(dialog) = self.chat_close_dialog() {
+            return Some(dialog);
+        }
         if let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);
         }
@@ -16862,6 +19910,10 @@ impl Application for Cagents {
             return Some(dialog_ui::overlay(surface, dismiss, 1.0));
         }
 
+        if let Some(dialog) = self.clone_repository_dialog() {
+            return Some(dialog);
+        }
+
         if let Some(dialog) = self.resume_dialog() {
             return Some(dialog);
         }
@@ -17014,142 +20066,7 @@ impl Application for Cagents {
         let has_multiple_panes = self.workspace.cards().len() > 1;
 
         let workspace: Element<'_, Message> = if self.workspace.cards().is_empty() {
-            let directory = self
-                .terminal_directory()
-                .unwrap_or_else(|| STARTING_DIRECTORY.clone());
-            let scoped = self.active_workspace.is_some() || self.durable.active_channel.is_some();
-            let scope_name = self
-                .durable
-                .active_channel
-                .and_then(|id| {
-                    self.durable
-                        .channels
-                        .iter()
-                        .find(|channel| channel.id == id)
-                        .map(|channel| channel.title.clone())
-                })
-                .or_else(|| {
-                    directory
-                        .file_name()
-                        .map(|name| name.to_string_lossy().into_owned())
-                })
-                .unwrap_or_else(|| "Workspace".into());
-            let quick = |glyph, label, id, message| {
-                Element::from(
-                    crate::ui_controls::icon_button(glyph, label)
-                        .on_press(message)
-                        .id(widget::Id::new(id)),
-                )
-            };
-            let mut actions: Vec<Element<'_, Message>> = vec![
-                crate::interaction::tooltip(
-                    crate::ui_controls::button::primary("New conversation")
-                        .icon(Icon::Chat)
-                        .on_press(Message::ChromeUi(chrome_ui::Action::Launch(
-                            chrome_ui::NewTab::Thread,
-                        ))),
-                    workspace_widget::shortcut_tooltip(
-                        workspace_widget::GlobalShortcut::NewThread,
-                        &self.settings.keyboard_shortcuts,
-                    ),
-                ),
-                quick(
-                    Icon::History,
-                    "Resume conversation".to_owned(),
-                    "empty.resume-conversation",
-                    Message::ResumeConversation(resume_ui::Action::Open),
-                ),
-                quick(
-                    Icon::Terminal,
-                    workspace_widget::shortcut_tooltip(
-                        workspace_widget::GlobalShortcut::NewTerminal,
-                        &self.settings.keyboard_shortcuts,
-                    ),
-                    "empty.new-terminal",
-                    Message::NewTerminal,
-                ),
-                quick(
-                    Icon::Browser,
-                    if cfg!(feature = "integrated-browser") {
-                        "New browser"
-                    } else {
-                        "Open in system browser"
-                    }
-                    .to_owned(),
-                    "empty.new-browser",
-                    Message::NewBrowser,
-                ),
-                quick(
-                    Icon::Avatar,
-                    "Agent accounts".to_owned(),
-                    "empty.accounts",
-                    Message::AccountUi(account_ui::Action::OpenPane),
-                ),
-            ];
-            if !scoped {
-                actions.pop();
-            }
-            let primary = actions.remove(0);
-            let actions = widget::column::with_children(vec![
-                primary,
-                widget::row::with_children(actions)
-                    .align_y(Alignment::Center)
-                    .spacing(space::S)
-                    .into(),
-            ])
-            .spacing(space::M);
-            let mut content: Vec<Element<'_, Message>> = vec![
-                crate::ui_controls::passive_icon(Icon::Chat, 32),
-                design::display(if scoped {
-                    scope_name
-                } else {
-                    "Workspace".into()
-                })
-                .into(),
-                crate::interaction::tooltip(
-                    design::caption(display_path(&directory).into_owned())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            EllipsizeHeightLimit::Lines(1),
-                        ))
-                        .width(Length::Fill),
-                    directory.display().to_string(),
-                ),
-                actions.into(),
-            ];
-            if !scoped {
-                content.push(
-                    widget::row::with_children(
-                        crate::agent::Provider::ALL
-                            .into_iter()
-                            .map(|provider| {
-                                let status = self.account_ui.provider_status(provider);
-                                let control = crate::ui_controls::icon_button(
-                                    crate::ui_controls::provider_icon(provider),
-                                    format!("{} · {status} · Manage accounts", provider.label()),
-                                )
-                                .on_press(Message::AccountUi(account_ui::Action::OpenPane));
-                                Element::from(if status == "Account available" {
-                                    control.tone(design::Tone::Themed(design::success_color))
-                                } else {
-                                    control
-                                })
-                            })
-                            .collect::<Vec<_>>(),
-                    )
-                    .spacing(space::M)
-                    .into(),
-                );
-            }
-            let surface =
-                widget::container(widget::column::with_children(content).spacing(space::L))
-                    .padding(space::XL)
-                    .width(Length::Fill)
-                    .max_width(440);
-            widget::container(surface)
-                .center(Length::Fill)
-                .padding(space::XL)
-                .into()
+            self.empty_workspace_view()
         } else {
             workspace_widget::view(
                 &self.workspace,
@@ -17291,7 +20208,13 @@ impl Application for Cagents {
                         .align_x(Alignment::End)
                         .width(Length::Fill)
                         .height(Length::Fill);
-                    let foreground = crate::interaction::layer(dismiss, aligned.into());
+                    let overlay_content = widget::column::with_children(vec![
+                        self.overlay_window_header(),
+                        aligned.into(),
+                    ])
+                    .width(Length::Fill)
+                    .height(Length::Fill);
+                    let foreground = crate::interaction::layer(dismiss, overlay_content.into());
                     inspector::ModalOverlay::new(background, foreground).into()
                 }
             }
@@ -17345,8 +20268,100 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
-        let surface = crate::input_trace::observe(surface, &self.input_trace);
+        let mut focus_regions = Vec::new();
+        for row in sidebar::visible_selection_rows(
+            &self.sidebar_model,
+            &self.sidebar_state,
+            self.projects_sidebar_mode() == SidebarMode::Compact,
+        ) {
+            focus_regions.push((
+                sidebar::selection_row_focus_id(row),
+                workspace_widget::FocusedPane::SidebarRows.into(),
+            ));
+        }
+        focus_regions.push((
+            sidebar::file_panel_focus_id(),
+            workspace_widget::FocusedPane::SidebarFiles.into(),
+        ));
+        focus_regions.push((
+            sidebar::change_panel_focus_id(),
+            workspace_widget::FocusedPane::SidebarChanges.into(),
+        ));
+        let projection = self.workspace.projection(self.workspace.viewport_width());
+        for mounted in &projection.mounted {
+            let card = mounted.id;
+            let kind = self.pane_kind(card);
+            let container_kind = if matches!(
+                kind,
+                workspace_widget::FocusedPane::Review
+                    | workspace_widget::FocusedPane::WorkingDiff
+                    | workspace_widget::FocusedPane::ChatPane
+                    | workspace_widget::FocusedPane::RepositoryPane
+            ) {
+                kind
+            } else {
+                workspace_widget::FocusedPane::Other
+            };
+            let region = |pane| crate::input_trace::KeyboardRegion {
+                pane,
+                card: Some(card),
+            };
+            focus_regions.push((
+                workspace_widget::card_widget_id(card),
+                region(container_kind),
+            ));
+            if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {
+                focus_regions.push((self.card_keyboard_focus(card), region(kind)));
+            }
+            focus_regions.push((self.card_header_widget_id(card), region(container_kind)));
+            if let Some(chrome) = self.card_chrome.get(&card) {
+                focus_regions.push((chrome.close_id.clone(), region(container_kind)));
+                focus_regions.push((chrome.resize_id.clone(), region(container_kind)));
+                focus_regions.push((
+                    chrome.browser_address_id.clone(),
+                    region(workspace_widget::FocusedPane::TextInput),
+                ));
+            }
+            if matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) {
+                focus_regions.push((
+                    repository_widget::editor_focus_id(card),
+                    region(workspace_widget::FocusedPane::Editor),
+                ));
+            }
+            if matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
+                focus_regions.push((
+                    card_control_id(card, "chat-composer"),
+                    region(workspace_widget::FocusedPane::Chat),
+                ));
+            }
+        }
+        let surface = crate::input_trace::observe_keyboard_events(
+            surface,
+            &self.input_trace,
+            focus_regions,
+            |event, captured, region, widget| Message::RoutedKeyEvent {
+                event,
+                captured,
+                region,
+                widget,
+            },
+        );
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
+        let surface = crate::reorder::channel_scope(
+            surface,
+            widget::Id::new("workspace.tabs"),
+            self.workspace_view_generation,
+            !self.workspace_inputs_blocked(),
+            |card, channel| {
+                self.workspace.order().any(|id| id == card)
+                    && self.can_move_pane_to_channel(card, channel)
+            },
+            |card, channel| Message::PaneDropToChannel {
+                generation: self.workspace_view_generation,
+                card,
+                channel,
+            },
+        );
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,
@@ -17362,6 +20377,7 @@ impl Application for Cagents {
 
 impl Drop for Cagents {
     fn drop(&mut self) {
+        self.cancel_source_control_mutations();
         self.latency.abandon_pending();
         self.persist();
         self.fold_settings_drafts();
@@ -17530,7 +20546,12 @@ fn load_repository(
             let status = (!worktree.bare)
                 .then(|| {
                     service
-                        .status_with_untracked(&worktree.path, false, &cancellation)
+                        .status_projection(
+                            &worktree.path,
+                            true,
+                            git_ui::SIDEBAR_STATUS_LIMIT,
+                            &cancellation,
+                        )
                         .ok()
                 })
                 .flatten();
@@ -17764,6 +20785,88 @@ fn unix_millis() -> i64 {
 }
 #[cfg(test)]
 mod tests {
+    #[test]
+
+    fn git_mutation_queue_coalesces_neighbors_and_keeps_destructive_order() {
+        use super::QueuedGitMutation as Queued;
+        let selection = |name: &str| {
+            vec![crate::repository::PathSelection::new(
+                crate::repository::RepoPath::parse(name).unwrap(),
+            )]
+        };
+        let mut queue = std::collections::VecDeque::new();
+        Queued::append(&mut queue, Queued::Stage(selection("one")));
+        Queued::append(&mut queue, Queued::Stage(selection("two")));
+        Queued::append(&mut queue, Queued::Stage(selection("one")));
+        Queued::append(&mut queue, Queued::Unstage(selection("three")));
+        let discard = crate::repository::DiscardRequest {
+            worktree: "/fixture".into(),
+            tracked: selection("one"),
+            untracked: Vec::new(),
+            confirmed: true,
+        };
+        Queued::append(&mut queue, Queued::Discard(discard.clone()));
+        Queued::append(&mut queue, Queued::Discard(discard));
+        Queued::append(&mut queue, Queued::Stage(selection("four")));
+        assert_eq!(queue.len(), 5);
+        assert!(matches!(&queue[0], Queued::Stage(paths) if paths.len() == 2));
+        assert!(matches!(&queue[1], Queued::Unstage(_)));
+        assert!(matches!(&queue[2], Queued::Discard(_)));
+        assert!(matches!(&queue[3], Queued::Discard(_)));
+        assert!(matches!(&queue[4], Queued::Stage(_)));
+    }
+
+    #[test]
+    fn mutation_error_mapping_keeps_full_hook_output() {
+        let failure = crate::repository::ProcessOutput {
+            stdout_truncated: false,
+            exit_code: Some(1),
+            signal: None,
+            success: false,
+            stdout: b"hook output\n".to_vec(),
+            stderr: b"lint: bad variable\nsecond detail\n".to_vec(),
+        }
+        .require_success(std::path::Path::new("git"))
+        .unwrap_err();
+        let report = super::mutation_report(
+            "Stage",
+            Ok(crate::repository::MutationOutcome::NotApplied {
+                failure: failure.into(),
+            }),
+        )
+        .unwrap();
+        assert!(report.contains("lint: bad variable"));
+        assert!(report.contains("\n\nGit output:\n"));
+        assert!(report.contains("hook output"));
+        assert!(!report.contains("Some("));
+    }
+
+    #[test]
+
+    fn diff_find_completions_and_drag_cleanup_survive_modal_guards() {
+        let card = CardId::new();
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::DiffFindLoaded {
+                card,
+                ticket: uuid::Uuid::new_v4(),
+                result: Ok(Some(Vec::new()))
+            }
+        ));
+        assert!(repository_action_allowed_while_modal(
+            &RepositoryAction::EndDiffSelection { card }
+        ));
+        assert!(!repository_action_allowed_while_modal(
+            &RepositoryAction::DiffCommand {
+                card,
+                generation: 0,
+                revision: 0,
+                mode: crate::diff_view::DiffMode::Inline,
+                sources: [(0, 0); 2],
+                command: crate::diff_interaction::Command::Copy
+            }
+        ));
+    }
+
     #[test]
     fn completed_push_observation_warning_preserves_known_completion() {
         let notice = super::push_report(Ok(crate::repository::PushOutcome::OutcomeUnknown {
@@ -18529,6 +21632,24 @@ mod tests {
             arguments: Vec::new(),
             working_directory: working_directory.into(),
             environment: Default::default(),
+        }
+    }
+
+    #[test]
+    fn new_pane_width_adapts_without_rewriting_existing_panes() {
+        let mut app = context_inspector_test_app(true);
+        let existing = app.workspace.focused().unwrap();
+        let width = app.card_state(existing).unwrap().width_fraction;
+        for (viewport, expected) in [(900.0, 1.0), (1100.0, 0.5), (1600.0, 0.5)] {
+            app.workspace.resize_viewport(viewport);
+            assert_eq!(app.new_pane_fraction(0.5), expected);
+            drop(app.add_utility_card(CardKind::Settings));
+            let added = app.workspace.focused().unwrap();
+            assert_eq!(
+                app.card_state(added).unwrap().width_fraction,
+                app.new_pane_fraction(app.settings.default_native_pane_fraction)
+            );
+            assert_eq!(app.card_state(existing).unwrap().width_fraction, width);
         }
     }
 
@@ -19457,6 +22578,19 @@ mod tests {
     }
 
     #[test]
+    fn settings_releasing_a_conflict_retries_the_other_rows_refused_draft() {
+        let mut app = context_inspector_test_app(false);
+        let chord = app.settings.keyboard_shortcuts.command_palette[0].clone();
+        let field = SettingsField::ShortcutToggleProjects;
+        drop(app.apply_setting_input(field, chord.clone()));
+        assert!(app.settings_invalid.contains_key(&field));
+        drop(app.apply_setting_input(SettingsField::ShortcutCommandPalette, String::new()));
+        assert!(app.settings_invalid.is_empty());
+        assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
+        assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
+    }
+
+    #[test]
     fn invalid_autosaved_draft_survives_dismissal_and_other_valid_edits() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
@@ -19929,9 +23063,12 @@ mod tests {
                 .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
         for provider in crate::agent::Provider::ALL {
             let expected = format!(
-                "{} · {} · Manage accounts",
+                "{} · {} · {}",
                 provider.label(),
-                app.account_ui.provider_status(provider)
+                app.account_ui.provider_status(provider),
+                app.account_ui
+                    .onboarding_action(provider)
+                    .map_or("Checking…", |(label, _)| label)
             );
             assert!(
                 nodes.root().iter().chain(nodes.children()).any(|node| {
@@ -20766,6 +23903,7 @@ mod tests {
                 "https://example.com".into(),
             )),
             Message::FocusCard(CardId::new()),
+            Message::Palette(palette_ui::Action::FocusPane(focused)),
             Message::FocusAdjacent(crate::workspace::FocusDirection::Right),
             Message::ToggleContextInspector,
             Message::Repository(RepositoryAction::NewTerminal { card: focused }),
@@ -24652,6 +27790,134 @@ mod tests {
     }
 
     #[test]
+    fn diff_working_location_keeps_focus_and_card_count_during_an_active_save() {
+        let (mut app, saving) = editing_repository_app();
+        let (origin, task) = app.add_pull_requests_card(PathBuf::from("/repo"));
+        drop(task);
+        let (runtime, identity) =
+            RepositoryRuntime::diff_snapshot_fixture(origin, "source.rs", "old\n", "new\n");
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else {
+            panic!("review card")
+        };
+        pane.runtime = runtime;
+        let (saving_runtime, _) = RepositoryRuntime::post_persist_failure_fixture(saving);
+        app.cards
+            .insert(saving, CardRuntime::Repository(Box::new(saving_runtime)));
+        let update = app.workspace.focus(saving).unwrap();
+        drop(app.apply_viewport(update, false, false));
+        assert!(app.focused_repository_is_saving());
+        let count = app.cards.len();
+        drop(app.update(Message::Repository(
+            RepositoryAction::OpenWorkingFileLocation { identity, line: 0 },
+        )));
+        assert_eq!(app.workspace.focused(), Some(saving));
+        assert_eq!(app.cards.len(), count);
+        assert!(workspace_navigation_blocked_during_save(
+            &Message::Repository(RepositoryAction::DiffCommand {
+                card: origin,
+                generation: 0,
+                revision: 0,
+                mode: crate::diff_view::DiffMode::Inline,
+                sources: [(0, 0); 2],
+                command: crate::diff_interaction::Command::OpenInEditor {
+                    row: 0,
+                    side: crate::diff_interaction::Side::New
+                },
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn opening_pr_diff_working_file_preserves_review_and_uses_editor_owned_card() {
+        let (mut app, _) = pull_request_test_app(&[]);
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(
+            directory.path().join("source.rs"),
+            "first\rcontinued\nsecond\r\nthird\n",
+        )
+        .unwrap();
+        let (origin, task) = app.add_pull_requests_card(directory.path().to_path_buf());
+        drop(task);
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&origin) else {
+            panic!("review card")
+        };
+        let (mut runtime, mut identity) = RepositoryRuntime::diff_snapshot_fixture(
+            origin,
+            "source.rs",
+            "old\nkept\n",
+            "new\nkept\n",
+        );
+        runtime.descriptor.worktree = directory.path().to_path_buf();
+        runtime.descriptor.repository = directory.path().to_path_buf();
+        identity.worktree = directory.path().to_path_buf();
+        pane.runtime = runtime;
+        let mut stale = identity.clone();
+        stale.generation += 1;
+        drop(app.update(Message::Repository(
+            RepositoryAction::OpenWorkingFileLocation {
+                identity: stale,
+                line: 1,
+            },
+        )));
+        assert_eq!(app.workspace.focused(), Some(origin));
+        let load = app.update(Message::Repository(
+            RepositoryAction::OpenWorkingFileLocation { identity, line: 1 },
+        ));
+        let target = app.workspace.focused().unwrap();
+        assert_ne!(target, origin);
+        assert!(
+            matches!(app.cards.get(&origin),Some(CardRuntime::PullRequests(pane)) if pane.runtime.shows_diff() && pane.runtime.selected_path() == Some(Path::new("source.rs")))
+        );
+        let mut stream = iced::runtime::task::into_stream(load).expect("working file load");
+        let mut loaded = false;
+        while let Ok(Some(action)) =
+            tokio::time::timeout(Duration::from_secs(5), stream.next()).await
+        {
+            if let iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::Repository(RepositoryAction::FileLoaded { .. }),
+            )) = action
+            {
+                drop(app.update(message));
+                loaded = true;
+                break;
+            }
+        }
+        assert!(
+            loaded,
+            "the actual working file must load before source-line mapping is checked"
+        );
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get(&target) else {
+            panic!("working source belongs to a repository editor")
+        };
+        assert_eq!(runtime.selected_path(), Some(Path::new("source.rs")));
+        assert_eq!(runtime.navigation().unwrap().editor.unwrap().caret.line, 2);
+    }
+
+    #[test]
+    fn viewport_transitions_hide_and_reveal_diff_work_without_a_repository_action() {
+        use crate::workspace::VisibilityTransition;
+        let (mut app, card) = editing_repository_app();
+        for (from, to, expected) in [
+            (VisibilityClass::Visible, VisibilityClass::Overscan, false),
+            (VisibilityClass::Overscan, VisibilityClass::Offscreen, false),
+            (VisibilityClass::Offscreen, VisibilityClass::Visible, true),
+        ] {
+            drop(app.apply_viewport(
+                ViewportUpdate {
+                    offset_changed: false,
+                    transitions: vec![VisibilityTransition { id: card, from, to }],
+                },
+                false,
+                false,
+            ));
+            let Some(CardRuntime::Repository(runtime)) = app.cards.get(&card) else {
+                panic!("repository fixture")
+            };
+            assert_eq!(runtime.diff_surface_is_visible(), expected);
+        }
+    }
+
+    #[test]
     fn restored_editor_startup_focus_follows_the_loaded_surface() {
         let (mut app, pane) = editing_repository_app();
         let update = app.workspace.resize_viewport(1200.0);
@@ -25107,6 +28373,7 @@ mod tests {
             durable,
             terminal_working_directories: HashMap::new(),
             terminal_find: HashMap::new(),
+            search_ui: search_ui::State::default(),
             terminal_context: None,
             terminal_paste: None,
             cards: card_id
@@ -25195,6 +28462,9 @@ mod tests {
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, Vec::new()),
             sidebar_state: SidebarState::default(),
+            window_waiting_count: 0,
+            attention_navigation: Vec::new(),
+            attention_focus_epoch: 0,
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
@@ -25273,9 +28543,319 @@ mod tests {
     }
 
     #[test]
+    fn attention_window_title_tracks_count_without_renaming_the_pane() {
+        let base = format!("Review{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}");
+        assert_eq!(format_window_title("Review", None, 0), base);
+        assert_eq!(
+            format_window_title("Review", Some("fw16"), 2),
+            format!("(2) fw16 · {base}")
+        );
+        assert_eq!(format_window_title("Review", None, 0), base);
+        let mut app = context_inspector_test_app(true);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        drop(app.sync_window_title());
+        let header = app.core.window.header_title.clone();
+        let window_title = app.title(window::Id::RESERVED).to_owned();
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_state.set_card_activity(
+            card,
+            crate::agent::Activity {
+                provider: crate::agent::Provider::Claude,
+                state: crate::agent::ActivityState::Waiting,
+            },
+        );
+        drop(app.sync_window_title());
+        assert_eq!(
+            app.title(window::Id::RESERVED),
+            format!("(1) {window_title}")
+        );
+        assert_eq!(app.window_waiting_count, 1);
+        assert_eq!(app.core.window.header_title, header);
+        app.sidebar_state.clear_agent_activity(card);
+        drop(app.sync_window_title());
+        assert_eq!(app.title(window::Id::RESERVED), window_title);
+        assert_eq!(app.window_waiting_count, 0);
+    }
+
+    #[test]
+    fn stale_visible_acknowledgement_cannot_read_an_update_from_a_later_focus_cycle() {
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        let stale_epoch = app.attention_focus_epoch;
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        app.observe_agent_update_for_card(card);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        assert_ne!(stale_epoch, app.attention_focus_epoch);
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: stale_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        let epoch = app.attention_focus_epoch;
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
+    fn attention_shortcut_switches_projects_focuses_exact_pane_and_acknowledges_it() {
+        use crate::model::{ChannelId, ProjectChannel};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        let first = app.workspace.focused().unwrap();
+        let second = terminal_card_state();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        let projects = [ProjectId::new(), ProjectId::new()];
+        let channels = [ChannelId::new(), ChannelId::new()];
+        for (index, card) in [first, second_id].into_iter().enumerate() {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                projects[index],
+                RepositoryId::new(),
+                format!("Project{index}"),
+                "/tmp".into(),
+                Vec::new(),
+                Vec::new(),
+            ));
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(ProjectChannel {
+                    title_source: Default::default(),
+                    id: channels[index],
+                    project_id: projects[index],
+                    title: format!("Channel{index}"),
+                    ordinal: index as u32,
+                    shared: false,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
+        }
+        drop(app.select_channel(channels[0]));
+        app.sidebar_state.observe_card_update(first);
+        app.sidebar_state.observe_card_update(second_id);
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.durable.active_channel, Some(channels[1]));
+        assert_eq!(app.workspace.focused(), Some(second_id));
+        assert!(!app.sidebar_state.has_card_update(second_id));
+        assert!(app.sidebar_state.has_card_update(first));
+        drop(app.update(Message::RunCommand(
+            workspace_widget::GlobalShortcut::NextAttention,
+        )));
+        assert_eq!(app.durable.active_channel, Some(channels[0]));
+        assert_eq!(app.workspace.focused(), Some(first));
+        assert!(!app.sidebar_state.has_card_update(first));
+    }
+
+    #[test]
+    fn channel_attention_rolls_into_launch_worktree_and_bulk_reads_keep_other_worktrees_unread() {
+        use crate::agent::{Activity, ActivityState};
+        use crate::model::{ChannelId, ProjectChannel};
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let project = ProjectId::new();
+        let primary = WorktreeId::new();
+        let linked = WorktreeId::new();
+        let roots = [
+            (primary, "/repo", "main"),
+            (linked, "/repo/.worktrees/login", "feature/login"),
+        ];
+        let mut cards = Vec::new();
+        for directory in [
+            "/repo/.worktrees/login/src",
+            "/repo/.worktrees/login/tests",
+            "/repo/src",
+        ] {
+            let mut card = terminal_card_state();
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!()
+            };
+            session.launch.working_directory = directory.into();
+            app.cards.insert(card.id, CardRuntime::Loading);
+            cards.push(card);
+        }
+        let ids: Vec<_> = cards.iter().map(|card| card.id).collect();
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend(cards);
+        durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
+            id: channel,
+            project_id: project,
+            title: "Login".into(),
+            ordinal: 0,
+            shared: false,
+            cards: ids[..2].to_vec(),
+            focused: Some(ids[0]),
+        });
+        app.observe_agent_activity_for_card(
+            ids[0],
+            Some(Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Working,
+            }),
+        );
+        app.observe_agent_activity_for_card(
+            ids[1],
+            Some(Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Waiting,
+            }),
+        );
+        assert!(app.agent_worktree(ids[0]).is_none());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Repository".into(),
+            "/repo".into(),
+            roots
+                .into_iter()
+                .map(|(id, path, branch)| {
+                    SidebarWorktree::new(
+                        id,
+                        path.into(),
+                        Some(branch.into()),
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            Vec::new(),
+        ));
+        app.known_worktree_roots = roots
+            .into_iter()
+            .map(|(_, path, _)| PathBuf::from(path))
+            .collect();
+        assert!(app.reconcile_agent_attention_owners());
+        app.refresh_sidebar_channels();
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, linked),
+            Some(ActivityState::Waiting)
+        );
+        assert_eq!(
+            app.sidebar_state.worktree_attention(project, linked),
+            Some(sidebar::AttentionState::Waiting)
+        );
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert_eq!(row.worktree, Some((linked, "feature/login".into())));
+        assert!(row.tooltip.contains("feature/login"));
+        for id in &ids {
+            app.observe_agent_update_for_card(*id);
+        }
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+            project, linked,
+        ))));
+        assert!(!app.sidebar_state.has_card_update(ids[0]));
+        assert!(!app.sidebar_state.has_card_update(ids[1]));
+        assert!(app.sidebar_state.has_card_update(ids[2]));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(!app.sidebar_state.has_card_update(ids[2]));
+        assert_eq!(
+            app.sidebar_state.worktree_attention(project, linked),
+            Some(sidebar::AttentionState::Waiting)
+        );
+    }
+
+    #[test]
+    fn attention_shortcut_does_not_leave_a_repository_with_an_active_save_or_acknowledge_target() {
+        use crate::model::{ChannelId, ProjectChannel};
+        let (mut app, first) = editing_repository_app();
+        app.context_inspector_open = false;
+        let other = terminal_card_state();
+        let target = other.id;
+        let project = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Attention".into(),
+            "/tmp".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let channels = [ChannelId::new(), ChannelId::new()];
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(other);
+        for (index, card) in [first, target].into_iter().enumerate() {
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
+                id: channels[index],
+                project_id: project,
+                title: format!("Channel{index}"),
+                ordinal: index as u32,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
+        }
+        drop(app.select_channel(channels[0]));
+        app.sidebar_state.observe_card_update(target);
+        drop(app.update(Message::Repository(RepositoryAction::Save {
+            card: first,
+            overwrite: false,
+        })));
+        assert!(app.focused_repository_is_saving());
+        for command in [
+            workspace_widget::GlobalShortcut::NextAttention,
+            workspace_widget::GlobalShortcut::PreviousAttention,
+        ] {
+            drop(app.update(Message::RunCommand(command)));
+            assert_eq!(app.workspace.focused(), Some(first));
+            assert_eq!(app.durable.active_channel, Some(channels[0]));
+            assert!(app.sidebar_state.has_card_update(target));
+        }
+    }
+
+    #[test]
+    fn focused_pane_finishing_in_background_is_unread_until_visible_acknowledgement() {
+        use crate::agent::{Activity, ActivityState, Provider};
+        let mut app = context_inspector_test_app(true);
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = false;
+        let card = app.workspace.focused().unwrap();
+        let activity = |state| {
+            Some(Activity {
+                provider: Provider::Omp,
+                state,
+            })
+        };
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Working));
+        app.observe_agent_activity_for_card(card, activity(ActivityState::Idle));
+        assert!(app.sidebar_state.has_card_update(card));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
+        assert!(app.sidebar_state.has_card_update(card));
+        app.refresh_ui.focused = true;
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
+        assert!(!app.sidebar_state.has_card_update(card));
+    }
+
+    #[test]
     fn pane_attention_tracks_semantic_events_and_a_rested_hover_acknowledges_only_its_pane() {
         use crate::agent::{Activity, ActivityState, Provider};
         let mut app = context_inspector_test_app(true);
+        app.refresh_ui.focused = true;
         app.context_inspector_open = false;
         app.settings.focus_follows_mouse = true;
         let first = app.workspace.focused().unwrap();
@@ -27198,6 +30778,62 @@ mod tests {
         (app, project)
     }
 
+    #[test]
+    fn review_palette_availability_follows_loaded_targets_and_file_boundaries() {
+        use crate::pull_request_review::tests as review_fixtures;
+        use workspace_widget::GlobalShortcut as Command;
+        let (mut app, _) = pull_request_test_app(&[1]);
+        let (card, task) = app.add_pull_requests_card(PathBuf::from("/repo"));
+        drop(task);
+        for command in [
+            Command::ReviewToggleViewed,
+            Command::ReviewNextUnviewed,
+            Command::ReviewNextFile,
+            Command::ReviewPreviousFile,
+            Command::ReviewNextChange,
+            Command::ReviewPreviousChange,
+        ] {
+            assert!(!app.command_available(command), "empty review {command:?}");
+        }
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+            panic!("review pane");
+        };
+        let (mut review, _) = review_fixtures::state();
+        drop(
+            review.update(pull_request_review::Action::Open(review_fixtures::target(
+                1,
+            ))),
+        );
+        review_fixtures::finish_load(
+            &mut review,
+            review_fixtures::loaded(
+                vec![
+                    review_fixtures::entry("a.rs", crate::repository::ChangeKind::Modified),
+                    review_fixtures::entry("b.rs", crate::repository::ChangeKind::Modified),
+                ],
+                Vec::new(),
+            ),
+        );
+        drop(review.update(pull_request_review::Action::SelectFile(
+            crate::repository::RepoPath::parse("a.rs").unwrap(),
+        )));
+        pane.review = review;
+        assert!(app.command_available(Command::ReviewNextFile));
+        assert!(!app.command_available(Command::ReviewPreviousFile));
+        assert!(app.command_available(Command::ReviewToggleViewed));
+        assert!(!app.command_available(Command::ReviewNextChange));
+        drop(app.update(Message::RunCommand(Command::ReviewNextFile)));
+        let Some(CardRuntime::PullRequests(pane)) = app.cards.get(&card) else {
+            panic!("review pane");
+        };
+        assert_eq!(
+            pane.review.selected(),
+            Some(&crate::repository::RepoPath::parse("b.rs").unwrap())
+        );
+        assert!(!app.command_available(Command::ReviewNextFile));
+        assert!(app.command_available(Command::ReviewPreviousFile));
+    }
+
     fn pull_request_cards(app: &Cagents) -> Vec<(CardId, Option<u64>)> {
         app.durable
             .cards
@@ -27568,5 +31204,150 @@ mod tests {
             "closing the review forgets the pull request"
         );
         let _ = project;
+    }
+    #[test]
+    fn git_mutation_queue_keeps_ten_clicks_and_refreshes_once_at_drain() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let generation = app.refresh_ui.source_generation;
+        for index in 0..10 {
+            let path = crate::repository::RepoPath::parse(format!("file-{index}.txt")).unwrap();
+            drop(app.enqueue_git_mutation(
+                key.clone(),
+                super::QueuedGitMutation::Stage(vec![crate::repository::PathSelection::new(path)]),
+            ));
+        }
+        let active = &app.source_control_mutations[&key.canonical_path];
+        assert_eq!(active.pending.len(), 1);
+        assert!(
+            matches!(&active.pending[0], super::QueuedGitMutation::Stage(selection) if selection.len() == 9)
+        );
+        let first = active.id;
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: None,
+            committed: false,
+        }));
+        assert_eq!(
+            app.refresh_ui.source_generation, generation,
+            "no read while a queued batch remains"
+        );
+        let active = &app.source_control_mutations[&key.canonical_path];
+        assert!(active.pending.is_empty());
+        assert!(
+            matches!(&active.request, Some(super::QueuedGitMutation::Stage(selection)) if selection.len() == 9)
+        );
+        let second = active.id;
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: second,
+            report: None,
+            committed: false,
+        }));
+        assert!(
+            !app.source_control_mutations
+                .contains_key(&key.canonical_path)
+        );
+        assert_eq!(app.refresh_ui.source_generation, generation + 1);
+    }
+
+    #[test]
+    fn git_mutation_failure_rolls_back_only_failed_intent_and_keeps_pending_rows() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        let failed = source
+            .group(crate::repository::ChangeArea::Unstaged)
+            .unwrap()
+            .rows()[0]
+            .selection();
+        let pending = source
+            .group(crate::repository::ChangeArea::Untracked)
+            .unwrap()
+            .rows()[0]
+            .selection();
+        drop(app.enqueue_git_mutation(
+            key.clone(),
+            super::QueuedGitMutation::Stage(vec![failed.clone()]),
+        ));
+        let first = app.source_control_mutations[&key.canonical_path].id;
+        drop(app.enqueue_git_mutation(
+            key.clone(),
+            super::QueuedGitMutation::Stage(vec![pending.clone()]),
+        ));
+        drop(app.update(Message::SourceControlMutated {
+            key: key.clone(),
+            operation: first,
+            report: Some("Stage failed: fixture refusal".into()),
+            committed: false,
+        }));
+        let source = app.sidebar_model.source_control.as_ref().unwrap();
+        assert!(
+            source
+                .group(crate::repository::ChangeArea::Unstaged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == failed.path)
+        );
+        assert!(
+            source
+                .group(crate::repository::ChangeArea::Staged)
+                .unwrap()
+                .rows()
+                .iter()
+                .any(|row| row.entry.path == pending.path)
+        );
+        assert!(source.busy());
+        let next = app.source_control_mutations[&key.canonical_path].id;
+        drop(app.update(Message::SourceControlMutated {
+            key,
+            operation: next,
+            report: None,
+            committed: false,
+        }));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .is_none(),
+            "the next successful mutation clears the inline error"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_git_on_exit_clears_pending_and_wakes_active_process() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        for index in 0..2 {
+            let path = crate::repository::RepoPath::parse(format!("exit-{index}.txt")).unwrap();
+            drop(app.enqueue_git_mutation(
+                key.clone(),
+                super::QueuedGitMutation::Stage(vec![crate::repository::PathSelection::new(path)]),
+            ));
+        }
+        let cancel = app.source_control_mutations[&key.canonical_path]
+            .cancellation
+            .clone();
+        drop(app.exit_after_language_servers());
+        assert!(app.exit.is_some());
+        assert!(cancel.is_cancelled());
+        assert!(
+            app.source_control_mutations[&key.canonical_path]
+                .pending
+                .is_empty()
+        );
     }
 }

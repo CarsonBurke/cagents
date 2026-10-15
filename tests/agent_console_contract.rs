@@ -427,3 +427,201 @@ fn an_owner_drives_its_agent_by_short_handles() {
         true
     );
 }
+
+#[test]
+fn active_native_chat_moves_without_restarting_and_accepts_followups() {
+    use cagents::{
+        control::{ControlClient, ControlError},
+        model::{CardId, CardKind, ChannelId},
+        terminal::ipc::ProtocolErrorCode,
+        workspace_model::{
+            ModelEdit,
+            views::{Change, Pane, Scope},
+        },
+    };
+
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "claude",
+        "--repository",
+        project,
+        "--surface",
+        "chat",
+        "--prompt",
+        "first",
+        "--idempotency-key",
+        "native-move",
+    ]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    let run = accepted["run"]["id"].as_str().unwrap();
+    let waiting = fixture.cli(&["agent", "wait", run, "--timeout", "10"]);
+    assert_eq!(waiting["run"]["state"], "Waiting", "{waiting}");
+    let requests = fixture.cli(&["agent", "requests", agent]);
+    let destination = fixture.cli(&["channel", "spawn", "--repository", project]);
+    let destination = destination["channel"]["id"].as_str().unwrap();
+    let status = fixture.cli(&["daemon", "status"]);
+    let socket = Path::new(status["socket"].as_str().unwrap());
+    let mut client = ControlClient::connect(socket).unwrap();
+    let session = client.list_chats().unwrap().into_iter().next().unwrap();
+    let model = client.read_workspace_model().unwrap();
+    let placement = model
+        .agents
+        .iter()
+        .find(|entry| entry.id.to_string() == agent)
+        .unwrap()
+        .placement
+        .clone();
+    let pane = Pane {
+        id: CardId::from_uuid(agent.parse().unwrap()),
+        title: "Native chat".into(),
+        user_title: Some("Keep this identity".into()),
+        pending_terminal_start: false,
+        width_fraction: 0.6,
+        scope: Some(project.into()),
+        kind: CardKind::Chat(session.clone()),
+    };
+    client
+        .edit_workspace_model(ModelEdit::SeedView {
+            scope: placement.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    // Exercise actual framed control requests against this private daemon:
+    // invalid membership must be refused, leave every field unchanged, and
+    // keep the connection usable for the valid move that follows.
+    let foreign_project = fixture.root.path().join("other-project");
+    fs::create_dir(&foreign_project).unwrap();
+    let foreign_project = foreign_project.to_str().unwrap();
+    fixture.cli(&["project", "open", foreign_project]);
+    let foreign = fixture.cli(&["channel", "spawn", "--repository", foreign_project]);
+    let foreign: ChannelId = foreign["channel"]["id"].as_str().unwrap().parse().unwrap();
+    let before = client.read_workspace_model().unwrap();
+    let revision = before
+        .views
+        .iter()
+        .find(|view| view.scope == placement)
+        .unwrap()
+        .revision;
+    for (scope, id, target) in [
+        (
+            Scope::Channel(ChannelId::new()),
+            pane.id,
+            destination.parse().unwrap(),
+        ),
+        (placement.clone(), pane.id, ChannelId::new()),
+        (
+            placement.clone(),
+            CardId::new(),
+            destination.parse().unwrap(),
+        ),
+        (placement.clone(), pane.id, foreign),
+    ] {
+        let error = client
+            .edit_workspace_model(ModelEdit::ChangeView {
+                scope,
+                expected_revision: revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer {
+                    id,
+                    destination: Scope::Channel(target),
+                    before: None,
+                },
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ControlError::Remote {
+                code: ProtocolErrorCode::InvalidRequest,
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(client.read_workspace_model().unwrap(), before);
+    }
+    let moved = fixture.cli(&[
+        "channel",
+        "move",
+        &session.id.to_string(),
+        "--to",
+        destination,
+    ]);
+    assert_eq!(
+        moved["placement"],
+        serde_json::to_value(Scope::Channel(destination.parse().unwrap())).unwrap()
+    );
+    assert_eq!(moved["pane"], serde_json::to_value(&pane).unwrap());
+    let no_op = fixture.cli(&[
+        "channel",
+        "move",
+        &session.id.to_string(),
+        "--to",
+        destination,
+    ]);
+    assert_eq!(no_op["placement"], moved["placement"]);
+    let still_waiting = fixture.cli(&["agent", "status", agent]);
+    assert_eq!(
+        still_waiting["run"], waiting["run"],
+        "moving must not change the active run"
+    );
+    assert_eq!(
+        still_waiting["agent"]["session"],
+        waiting["agent"]["session"]
+    );
+    assert_eq!(still_waiting["agent"]["spec"], waiting["agent"]["spec"]);
+    assert_eq!(fixture.cli(&["agent", "requests", agent]), requests);
+    // A fresh client reads the committed placement and exact descriptor.
+    drop(client);
+    let mut client = ControlClient::connect(socket).unwrap();
+    let model = client.read_workspace_model().unwrap();
+    let target = Scope::Channel(destination.parse().unwrap());
+    assert!(
+        model
+            .views
+            .iter()
+            .find(|view| view.scope == placement)
+            .unwrap()
+            .panes
+            .is_empty()
+    );
+    assert_eq!(
+        model
+            .views
+            .iter()
+            .find(|view| view.scope == target)
+            .unwrap()
+            .panes,
+        vec![pane]
+    );
+    assert_eq!(client.list_chats().unwrap(), vec![session]);
+    fixture.cli(&["agent", "answer", agent, "console-approval", "allow"]);
+    let completed = fixture.cli(&["agent", "wait", run, "--timeout", "10"]);
+    assert_eq!(completed["run"]["state"], "Succeeded");
+    assert_eq!(completed["run"]["result"]["text"], "CONSOLE_RESULT_1");
+    let followed = fixture.cli(&[
+        "agent",
+        "send",
+        agent,
+        "second",
+        "--wait",
+        "--timeout",
+        "10",
+    ]);
+    assert_eq!(followed["run"]["state"], "Succeeded", "{followed}");
+    assert_eq!(followed["run"]["result"]["text"], "CONSOLE_RESULT_2");
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("spawns")).unwrap(),
+        "spawn\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("prompts")).unwrap(),
+        "prompt\nprompt\n"
+    );
+    fixture.cli(&["agent", "close", agent]);
+}

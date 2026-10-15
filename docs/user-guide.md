@@ -50,6 +50,14 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.
+- Drag a pane's tab title onto a channel in the same project to move it there.
+  Eligible channel rows highlight while dragging. The existing terminal or chat
+  session keeps running; opening the destination channel shows the same pane.
+  The pane stays in its source until the move succeeds. If the destination no
+  longer exists, the source stays open and the app shows the refusal.
+  The tab's context menu also lists eligible channels; with many destinations,
+  **Move to channel…** opens a searchable picker. The command palette lists
+  the focused pane's channel destinations too.
 - Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
@@ -83,19 +91,22 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Toggle Projects / inspector | `Ctrl+Shift+B` / `Ctrl+Shift+I` |
 | Rename focused pane | `F2` |
 | Move pane left / right | `Alt+Shift+Left` / `Alt+Shift+Right` |
-| Reopen closed pane | `Ctrl+Shift+Z` |
+| Reopen closed pane outside text controls | `Ctrl+Shift+Z` |
 | Focus pane 1–9 | `Alt+1` through `Alt+9` |
+| Focus last pane | `Alt+0` |
 | New channel | `Ctrl+Shift+G` |
 | Clone focused pane | `Ctrl+Shift+D` |
-| Close focused pane | `Ctrl+W` |
-| Find in the focused pane / search projects | `Ctrl+F` |
+| Close focused pane | `Ctrl+Shift+W` |
+| Find in editor/chat / otherwise search projects | `Ctrl+F` |
+| Search projects / find in terminal | `Ctrl+Shift+F` |
+| Search file contents in the active project | `Ctrl+Alt+F` |
 | Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
 | Cycle pane width | `Alt+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
 | Next unviewed review file | `Alt+Shift+Down` |
-| Next / previous changed hunk in a diff | `Alt+J` / `Alt+K` |
+| Next / previous changed hunk in a diff | `Alt+J` or `F7` / `Alt+K` or `Shift+F7` |
 | Stage / unstage the open file | `Ctrl+Shift+S` |
 
 Workspace, native chat, and review shortcuts are configurable; see
@@ -107,19 +118,20 @@ to close. The model picker supports search and Enter to select a result. Account
 selection is available before starting a conversation; provider capabilities
 determine which models and permission modes are available.
 
-- Workspace shortcuts work while a terminal has focus: **Ctrl+W** closes
-  its pane, **Alt+R** cycles its width, and **Ctrl+T** creates a native thread
-  tab. These chords are withheld from the terminal program. Other shell keys
-  reach the program unless you bind them to workspace actions.
-  **Ctrl+F** finds in the focused terminal,
-  chat transcript or editor, and otherwise searches projects. The
-  review chords act in pull request and local diff panes.
-  `Ctrl+PageUp`/`Ctrl+PageDown` and configured `Ctrl+Shift` letters
-  also belong to the workspace.
-- Earlier versions changed close and width cycling to `Ctrl+Shift+W` and
-  `Ctrl+Shift+R`. Those defaults now return to **Ctrl+W** and **Alt+R**;
-  customized shortcuts are kept. Older navigation and creation defaults also
-  upgrade where they remain unchanged. See
+- Shell editing keys reach a focused terminal: **Ctrl+F**, **Ctrl+T**,
+  **Ctrl+W**, **Alt+1–9**, **Alt+R**, and **F2** remain available to shells
+  and terminal applications. **Ctrl+Shift+F** searches terminal output;
+  **Ctrl+Shift+W** closes its pane. Keyboard settings expose **Send to terminal**
+  for each action, including customized chords.
+- Shortcut routing follows keyboard focus. Editor, composer, sidebar and
+  inspector text controls keep undo, redo, selection and word-navigation keys.
+  **Ctrl+Shift+Z** redoes text while editing and reopens a closed pane outside
+  text controls. **Ctrl+F** in an editor or chat opens that pane's find; on a
+  pane without a find target it opens project search. Typing it in sidebar or
+  inspector fields does not act on the pane behind them.
+- Revision 6 moves an unchanged close default from **Ctrl+W** to
+  **Ctrl+Shift+W**; customized bindings stay intact. Older navigation and
+  creation defaults upgrade where they remain unchanged. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
 - Hold the pane shortcuts to move repeatedly. Navigation scrolls only far
@@ -127,6 +139,20 @@ determine which models and permission modes are available.
 - **Ctrl+Tab** previews recently used panes. Release **Ctrl** to focus the
   highlighted pane, or press **Escape** to cancel.
 - Use the command palette to search commands, panes, channels and workspaces.
+  Prefix the query with `>` for commands, `@` for panes, or `#` for workspaces.
+  Exact and prefix matches lead looser matches; matching characters are
+  highlighted. With an empty query, recent actions appear first and survive
+  restarts. Panes include inactive workspaces, show their activity status, and
+  switch to their workspace when selected.
+- Git commands such as **Fetch**, **Push**, **Sync**, **Stash changes** and
+  **Commit changes** are also available in the palette and Keyboard settings,
+  unbound by default. **Apply stash**, **Pop stash** and **Drop stash** open a
+  searchable list of stashes from the captured worktree; dropping still asks
+  for confirmation. Changing the worktree or branch retires the old selection.
+- Pane actions such as **Copy path**, **Close other panes**, **Close panes to
+  the right**, **Fork conversation**, and **Reveal in Projects** are available
+  in the palette and **Settings → Keyboard**. Their context menus use the same
+  labels and configured shortcuts. Actions appear only where they apply.
   Keyboard settings let you record a chord, remove it, or reset a command;
   conflicts name the command that already uses the chord.
 - **Alt+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
@@ -540,7 +566,7 @@ settings cover font family and size, line spacing, padding, cursor shape
 appears on the focused terminal when it has scrollback. The file format and
 every key are documented in [Configuration](configuration.md).
 
-Press Ctrl+F in a terminal to search its output, including scrollback. Completed
+Press Ctrl+Shift+F in a terminal to search its output, including scrollback. Completed
 terminals keep read-only search, scrolling, selection and copying without keeping
 their process alive. Completed history is bounded to 8 MiB per terminal, including
 text, cell coordinates, colors and links. If older rows exceed this limit, a
@@ -613,19 +639,45 @@ or repeat an alert: desktop delivery and local persistence are not one transacti
   logical pixels; a terminal font size you already saved is kept.
 - Editor settings can override the terminal font family and size. **Ctrl+=**,
   **Ctrl+-**, and **Ctrl+0** zoom or reset the focused editor or terminal.
-- **Ctrl+F** finds in the open file, highlighting all matches. **Enter** and
-  **Shift+Enter** move forward and backward; replacement controls offer one
-  match or all matches.
+- **Ctrl+F** opens Find and focuses its query. Click the buffer to keep editing,
+  undoing and redoing with Find open; the match count updates without moving
+  your caret. **Enter** / **Shift+Enter** in the query and **F3** / **Shift+F3**
+  in the buffer move between matches. **Escape** closes Find and focuses the buffer.
+- Find offers **Aa** (match case), **Word** (whole words), and `.*` (regular
+  expressions). Invalid expressions show an inline error. **Selection** searches
+  only the selection captured when enabled. Matching preferences persist for
+  the user; the selection scope lasts only for this open strip.
+- Replace or Replace all uses the same matching options. Regular expressions
+  expand captures such as `$1`; plain replacements can **Preserve case** for
+  upper, lower and title case matches. Replace all is one undo step.
 - With a language server running, diagnostics appear in the gutter and under
-  the affected text. **Ctrl+Space** requests completion; arrow keys choose a
+  the affected text. **F8** and **Shift+F8** move to the next and previous
+  diagnostic; these bindings can be changed or cleared in Keyboard settings. **Ctrl+Space** requests completion; arrow keys choose a
   result and **Tab** or **Enter** applies it. Hover over a symbol for details,
   use **Ctrl+click** or **F12** for its definition, and **Shift+F12** for references.
 - Images open as previews. File, view, edit, and diff controls sit in a toolbar
   above the content.
-- Working-tree diffs edit the real file buffer with the same selection, IME,
-  and safe-save behavior; removed content is selectable read-only context.
-  Staged and historical content are read-only. Syntax highlighting is kept in
-  file and diff views.
+- Diffs are read-only comparisons. Working diffs follow unsaved edits in the
+  real file buffer; use **Edit** to change that buffer. Diff and Edit keep the
+  same source line at the top and share editor font settings and zoom.
+- The diff toolbar shows labelled **Stage**, **Unstage**, **Revert**, comparison
+  basis, **Unified** / **Split**, and previous/next hunk controls. Narrow panes
+  collect these under **Diff actions**. **Ignore whitespace** hides reindents
+  across comparisons and is remembered when you restart. Reverting unsaved
+  edits returns to Edit so **Ctrl+Z** can restore them; reverting saved file
+  changes asks for confirmation.
+- Click, Shift-click, or drag to select diff rows; Up/Down moves the selection
+  and Shift extends it. In Split, selection stays on the chosen side. **Ctrl+C**
+  copies original source text. Right-click for **Copy**, **Copy line reference**
+  (`path:line`), and **Open in editor at line**. Historical and PR snapshots
+  offer **Open working file in editor at line**: it opens the current file at a
+  clamped location, which can differ from the snapshot. PR review stays open.
+  Unified also offers **Copy old side**, **Copy new side**, and **Copy as patch**
+  for selected changes.
+- **Ctrl+F** searches working, staged, branch, history, and pull request diffs.
+  The same case, whole-word, and regex controls apply. Enter / Shift+Enter
+  navigate highlighted results and reveal matches inside folded context.
+  Replacement is available in the editable source only.
 - Comparisons load on demand and cancelled jobs stop. Switching files or modes
   keeps bounded in-memory viewport positions without duplicating buffers or
   writing every scroll to disk.
@@ -896,7 +948,7 @@ the source for resumed history.
 
 ## Terminals and agent status
 
-- **Ctrl+F** searches retained terminal scrollback. **Enter** and **Shift+Enter**
+- **Ctrl+Shift+F** searches retained terminal scrollback. **Enter** and **Shift+Enter**
   navigate matches; the search controls can match case. The current match has
   a stronger highlight than the other matches.
 - Right-click for copy, paste, select all, clear scrollback and link actions.
@@ -920,9 +972,10 @@ the source for resumed history.
 - Closing an idle shell needs no confirmation. A running agent, foreground
   child, background job, or uncertain process state asks first, with Close
   focused; Cancel or Escape keeps the pane. The close button and
-  `Ctrl+W` follow the same rule. The decision uses the process tree, not prompt
-  instrumentation, so a shell builtin with no child process closes without
-  asking. **Don't ask me again** turns confirmation off; Settings → **Confirm
+  `Ctrl+Shift+W` follow the same rule. An unfinished command also asks when
+  the shell supplies OSC 133 prompt markers; interactive fish receives this
+  integration automatically. Clearing that command restores an unconfirmed
+  idle close. Shells without prompt integration ask conservatively because an idle process alone cannot prove that the prompt is empty. **Don't ask me again** turns confirmation off; Settings → **Confirm
   closing active processes** turns it back on.
 - Every close, confirmed or not, first rechecks the terminal's identity with
   the daemon. If the daemon is unreachable, the pane is kept.

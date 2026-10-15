@@ -261,6 +261,10 @@ pub struct WorkspaceManifest {
     pub active_channel: Option<ChannelId>,
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
+    pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
+    pub conversation_drafts: HashMap<String, String>,
+    pub conversation_models: HashMap<String, String>,
+    pub conversation_channels: HashMap<String, ChannelId>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
@@ -1743,6 +1747,10 @@ impl StateStore {
             active_channel: manifest.active_channel,
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
+            agent_updates: manifest.agent_updates,
+            conversation_drafts: manifest.conversation_drafts,
+            conversation_models: manifest.conversation_models,
+            conversation_channels: manifest.conversation_channels,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
             workspace_model_identity: manifest.workspace_model_identity,
@@ -3290,8 +3298,28 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:agent_updates"),
+        &to_json(&state.agent_updates)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:chat_drafts"),
         &to_json(&state.chat_drafts)?,
+    )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:conversation_drafts"),
+        &to_json(&state.conversation_drafts)?,
+    )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:conversation_models"),
+        &to_json(&state.conversation_models)?,
+    )?;
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:conversation_channels"),
+        &to_json(&state.conversation_channels)?,
     )?;
     set_metadata(
         transaction,
@@ -4636,11 +4664,39 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace editor navigation", &value))
         .transpose()?
         .unwrap_or_default(),
+        agent_updates: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:agent_updates"),
+        )?
+        .map(|value| from_json("workspace unread agent updates", &value))
+        .transpose()?
+        .unwrap_or_default(),
         chat_drafts: metadata(
             connection,
             &format!("workspace:{id}:navigation:chat_drafts"),
         )?
         .map(|value| from_json("workspace chat drafts", &value))
+        .transpose()?
+        .unwrap_or_default(),
+        conversation_drafts: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:conversation_drafts"),
+        )?
+        .map(|value| from_json("workspace chat drafts", &value))
+        .transpose()?
+        .unwrap_or_default(),
+        conversation_models: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:conversation_models"),
+        )?
+        .map(|value| from_json("workspace conversation models", &value))
+        .transpose()?
+        .unwrap_or_default(),
+        conversation_channels: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:conversation_channels"),
+        )?
+        .map(|value| from_json("workspace conversation channels", &value))
         .transpose()?
         .unwrap_or_default(),
         local_only_cards: metadata(
@@ -5264,6 +5320,10 @@ mod tests {
             active_channel: None,
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
+            agent_updates: BTreeMap::new(),
+            conversation_drafts: HashMap::new(),
+            conversation_models: HashMap::new(),
+            conversation_channels: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
             workspace_model_identity: None,
@@ -6189,6 +6249,95 @@ mod tests {
                 .workspace_history
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn unread_agent_updates_survive_autosave_restore_and_read() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("state.db");
+        let boot_id = boot("unread");
+        let store = StateStore::open(&database, boot_id.clone()).unwrap();
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let card = workspace.cards[0].id;
+        workspace
+            .agent_updates
+            .insert(card, Some((ProjectId::new(), WorktreeId::new())));
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        assert_eq!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates,
+            workspace.agent_updates
+        );
+        workspace.agent_updates.clear();
+        lane.save(&store, &workspace).unwrap();
+        assert!(
+            store
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .agent_updates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn provider_session_drafts_survive_closed_cards_and_restart() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("conversation-drafts.sqlite3");
+        let boot_id = boot("conversation-drafts");
+        let mut workspace = workspace_with_terminal(&boot_id);
+        workspace
+            .conversation_drafts
+            .insert("Codex:session-id".into(), "retained prompt".into());
+        workspace
+            .conversation_models
+            .insert("Codex:session-id".into(), "recorded-model".into());
+        workspace
+            .conversation_channels
+            .insert("Codex:session-id".into(), ChannelId::new());
+        let store = StateStore::open(&database, boot_id).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        drop(store);
+        let store = StateStore::open(&database, boot("new-process")).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(restored.conversation_drafts, workspace.conversation_drafts);
+        assert_eq!(restored.conversation_models, workspace.conversation_models);
+        assert_eq!(
+            restored.conversation_channels,
+            workspace.conversation_channels
+        );
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_drafts,
+            workspace.conversation_drafts
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_drafts");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_models");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_channels");
+        let legacy = serde_json::from_value::<WorkspaceState>(legacy).unwrap();
+        assert!(legacy.conversation_drafts.is_empty());
+        assert!(legacy.conversation_models.is_empty());
+        assert!(legacy.conversation_channels.is_empty());
     }
 
     #[test]

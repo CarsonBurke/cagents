@@ -145,6 +145,12 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        if self.pane_transfer_pending(card) {
+            self.status = Some(TransientNotice::warning(
+                "This pane is moving to a channel. Wait for the move to finish before closing it.",
+            ));
+            return Task::none();
+        }
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
             if !self.terminal_close_attempts.insert(session.id) {
                 return Task::none();
@@ -652,13 +658,13 @@ impl Cagents {
             crate::design::title(if intent.detail.is_some() {
                 "Terminal kept open"
             } else {
-                "Close active processes?"
+                "Close terminal?"
             })
             .into(),
             crate::design::body(intent.detail.as_deref().unwrap_or(if intent.pending {
                 "Checking terminal identity and closing…"
             } else {
-                "This terminal or its paired conversation still owns running processes. Closing stops them."
+                "This terminal has running processes or an unfinished command. Closing stops its processes and discards any unsent input."
             }))
             .into(),
         ];
