@@ -9,6 +9,7 @@ pub mod coordination;
 pub mod original;
 pub mod presentation;
 pub mod pricing;
+pub mod turn_outcomes;
 
 pub const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
 
@@ -989,6 +990,9 @@ pub struct Snapshot {
     /// authority/acceptance/latest changes, independently of presentation noise.
     #[serde(default)]
     pub original_revision: u64,
+    /// Qualified terminal results joined only to this transcript window.
+    #[serde(default)]
+    pub turn_outcomes: std::sync::Arc<turn_outcomes::TurnOutcomeProjection>,
 }
 
 /// When a provider takes a message it is holding.
