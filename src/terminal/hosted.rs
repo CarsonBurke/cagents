@@ -1186,6 +1186,9 @@ impl ConnectionIo {
                     read_credit.notified().await;
                 }
                 if closed { return; }
+                // A peer with buffered snapshots must return the shared I/O
+                // executor between frames, even while every read is ready.
+                tokio::task::yield_now().await;
             }
         });
         Ok(Self { writer, codec: FrameCodec::new(MAX_FRAME_BYTES), incoming: Some(incoming_rx), credit, reader: Some(reader) })
