@@ -1138,6 +1138,11 @@ impl Cagents {
                     }
                     ProjectCommand::NewChannel => {
                         self.project_ui.dialog = None;
+                        if worktree_id.is_some() {
+                            let select = self.select_worktree(target.path.clone(), false);
+                            let thread = self.new_native_thread_at(target.path);
+                            return Task::batch([select, thread]);
+                        }
                         return cosmic::task::message(Message::Sidebar(
                             SidebarAction::NewChannel { project_id },
                         ));
@@ -2341,6 +2346,38 @@ mod tests {
             .iter()
             .flat_map(|project| &project.worktrees)
             .find(|worktree| worktree.id == id)
+    }
+
+    #[test]
+    fn worktree_context_new_thread_uses_the_linked_worktree_directory() {
+        let repository = tempfile::tempdir().unwrap();
+        let linked_directory = tempfile::tempdir().unwrap();
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.path().to_owned(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            linked_directory.path().to_owned(),
+            Some("feature/login".into()),
+        );
+        let (mut app, _state, project) = deletable_app(repository.path(), &linked, &primary);
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::NewChannel,
+        }));
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(linked_directory.path())
+        );
+        assert!(
+            app.durable.channels.is_empty(),
+            "a worktree action opens a thread directly"
+        );
+        assert!(app.durable.cards.iter().any(|card| matches!(&card.kind,
+            CardKind::Chat(session) if session.launch.recipe.working_directory == linked_directory.path())));
     }
 
     #[test]

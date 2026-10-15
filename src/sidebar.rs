@@ -7166,6 +7166,14 @@ impl widget::menu::Action for ContextCommand<'_> {
     }
 }
 
+fn new_conversation_label(worktree_id: Option<WorktreeId>) -> &'static str {
+    if worktree_id.is_some() {
+        "New thread"
+    } else {
+        "New channel"
+    }
+}
+
 fn context_controls<'a>(
     content: impl Into<Element<'a, SidebarAction>>,
     project_id: ProjectId,
@@ -7189,7 +7197,11 @@ fn context_controls<'a>(
         let mut commands = vec![
             ("Open folder".to_owned(), None, ProjectCommand::Reveal),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
-            ("New thread".to_owned(), None, ProjectCommand::NewChannel),
+            (
+                new_conversation_label(worktree_id).to_owned(),
+                None,
+                ProjectCommand::NewChannel,
+            ),
         ];
         if git {
             commands.push(("New worktree".to_owned(), None, ProjectCommand::NewWorktree));
@@ -12570,6 +12582,12 @@ mod row_interaction {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[test]
+    fn context_conversation_labels_match_the_created_scope() {
+        assert_eq!(new_conversation_label(None), "New channel");
+        assert_eq!(new_conversation_label(Some(WorktreeId::new())), "New thread");
+    }
+
     #[test]
     fn optimistic_rows_move_to_pending_target_group() {
         let mut source = SourceControlModel::ready(main_key(), &snapshot());

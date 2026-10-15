@@ -4102,6 +4102,10 @@ impl Cagents {
         self.new_native_chat(self.preferred_chat_provider(), None)
     }
 
+    pub(super) fn new_native_thread_at(&mut self, directory: PathBuf) -> Task<Message> {
+        self.new_native_chat(self.preferred_chat_provider(), Some(directory))
+    }
+
     fn preferred_chat_provider(&self) -> Provider {
         self.workspace
             .focused()
