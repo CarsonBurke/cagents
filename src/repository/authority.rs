@@ -9,6 +9,9 @@ pub struct WorktreeAuthority {
     identity: (u64, u64),
     git_dir: Arc<fs_safety::Root>,
     common_dir: Arc<fs_safety::Root>,
+    child_root: Arc<fs::File>,
+    child_git: Arc<fs::File>,
+    child_common: Arc<fs::File>,
 }
 
 impl fmt::Debug for WorktreeAuthority {
@@ -18,8 +21,8 @@ impl fmt::Debug for WorktreeAuthority {
 }
 
 impl WorktreeAuthority {
-    /// Strong Git mutation authority currently uses Linux's parent-owned
-    /// descriptor namespace. Basic Git reads and ordinary file editing do not
+    /// Strong Git mutation authority currently uses Linux descriptor
+    /// namespaces with owned directory handles inherited by Git. Basic Git reads and ordinary file editing do not
     /// require this capability and must not substitute an unpinned mutation.
     pub const fn supported() -> bool { cfg!(target_os = "linux") }
 
@@ -31,12 +34,9 @@ impl WorktreeAuthority {
         if let Some(reason) = Self::unsupported_reason() { return Err(ValidationError::Io(reason.into()).into()); }
         if !path.is_absolute() { return Err(ValidationError::InvalidWorktree(path.display().to_string()).into()); }
         let root = fs_safety::Root::open(path).map_err(|error| ValidationError::Io(error.to_string()))?;
-        let metadata = root.metadata().map_err(|error| ValidationError::Io(error.to_string()))?;
         let git_dir = open_metadata_root(&resolve_private_git_dir(&descriptor_path(&root))?)?;
         let common_dir = open_metadata_root(&resolve_common_git_dir(&descriptor_path(&git_dir))?)?;
-        let authority = Self { root: Arc::new(root), identity: (metadata.dev(), metadata.ino()), git_dir: Arc::new(git_dir), common_dir: Arc::new(common_dir) };
-        authority.validate()?;
-        Ok(authority)
+        Self::from_retained_roots(root, git_dir, common_dir)
     }
 
     pub fn path(&self) -> &Path { self.root.path() }
@@ -74,7 +74,10 @@ impl WorktreeAuthority {
     /// match the worktree's named metadata before publishing destination scope.
     pub(super) fn from_retained_roots(root: fs_safety::Root, git_dir: fs_safety::Root, common_dir: fs_safety::Root) -> Result<Self, RepositoryError> {
         let metadata = root.metadata().map_err(|error| ValidationError::Io(error.to_string()))?;
-        let authority = Self { root: Arc::new(root), identity: (metadata.dev(), metadata.ino()), git_dir: Arc::new(git_dir), common_dir: Arc::new(common_dir) };
+        let (_, child_root) = inherited_directory_scope(&root)?;
+        let (_, child_git) = inherited_directory_scope(&git_dir)?;
+        let child_common = if same_directory(&git_dir, &common_dir)? { child_git.clone() } else { inherited_directory_scope(&common_dir)?.1 };
+        let authority = Self { root: Arc::new(root), identity: (metadata.dev(), metadata.ino()), git_dir: Arc::new(git_dir), common_dir: Arc::new(common_dir), child_root, child_git, child_common };
         authority.validate()?;
         Ok(authority)
     }
@@ -87,13 +90,27 @@ impl WorktreeAuthority {
 
     fn anchored_path(&self) -> PathBuf {
         // The executor owns the descriptor throughout execute, including any
-        // blocking launch delay. A path replacement cannot redirect Git -C.
+        // blocking parent-side filesystem work. Child Git uses its own inherited
+        // directory descriptors, so parent FD reuse cannot retarget a survivor.
         descriptor_path(&self.root)
     }
 }
 
 fn descriptor_path(root: &fs_safety::Root) -> PathBuf {
     PathBuf::from(format!("/proc/{}/fd/{}/.", std::process::id(), root.descriptor()))
+}
+
+/// The same owned file must be passed to CommandSpec::inherit_file. Journal
+/// callers keep durable canonical names separately from this active operand.
+pub(super) fn inherited_directory_scope(root: &fs_safety::Root) -> Result<(PathBuf, Arc<fs::File>), RepositoryError> {
+    if let Some(reason) = WorktreeAuthority::unsupported_reason() { return Err(ValidationError::Io(reason.into()).into()); }
+    let file = Arc::new(root.retained_directory().map_err(metadata_error)?);
+    Ok((child_directory_path(&file)?, file))
+}
+
+fn child_directory_path(file: &fs::File) -> Result<PathBuf, RepositoryError> {
+    if let Some(reason) = WorktreeAuthority::unsupported_reason() { return Err(ValidationError::Io(reason.into()).into()); }
+    Ok(PathBuf::from(format!("/proc/self/fd/{}/.", file.as_raw_fd())))
 }
 
 fn metadata_error(error: io::Error) -> RepositoryError { ValidationError::Io(error.to_string()).into() }
@@ -195,6 +212,12 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
             stdout: Vec::new(), stderr: Vec::new(), message, started: false,
         };
         self.authority.validate().map_err(|error| refuse(error.to_string()))?;
+        let inherited_root = self.authority.child_root.clone();
+        let inherited_git = self.authority.child_git.clone();
+        let inherited_common = self.authority.child_common.clone();
+        let child_root = child_directory_path(&inherited_root).map_err(|error| refuse(error.to_string()))?;
+        let child_git = child_directory_path(&inherited_git).map_err(|error| refuse(error.to_string()))?;
+        let child_common = child_directory_path(&inherited_common).map_err(|error| refuse(error.to_string()))?;
         let mut scoped = command.clone();
         let mut anchored = false;
         let mut index = 0;
@@ -205,7 +228,7 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
                 "-C" => {
                     let Some(path) = scoped.arguments.get_mut(index + 1) else { return Err(refuse("Missing worktree argument".into())); };
                     if Path::new(path.as_os_str()) != self.authority.path() { return Err(refuse("The command no longer names the captured worktree".into())); }
-                    *path = self.authority.anchored_path().into_os_string();
+                    *path = child_root.clone().into_os_string();
                     anchored = true;
                     index += 2;
                 }
@@ -221,17 +244,21 @@ impl<E: ProcessExecutor> ProcessExecutor for WorktreeExecutor<E> {
         }
         if let Some(path) = scoped.current_dir.as_mut() {
             if path.as_path() != self.authority.path() { return Err(refuse("The command no longer names the captured worktree".into())); }
-            *path = self.authority.anchored_path();
+            *path = child_root.clone();
             anchored = true;
         }
         if !anchored { return Err(refuse("The command has no captured worktree scope".into())); }
         // Explicit scopes prevent Git from rediscovering .git/commondir after
-        // validation, including a delayed launch inside the executor.
+        // validation, including a delayed launch inside the executor. Child
+        // scopes use owned inherited FDs, not a reusable parent FD number.
+        // The authority also retains these exact duplicates, so Git --git-path
+        // output using /proc/self/fd remains valid for subsequent parent IO.
         scoped.arguments.splice(0..0, [
-            OsString::from(format!("--git-dir={}", self.authority.private_metadata_path().display())),
-            OsString::from(format!("--work-tree={}", self.authority.anchored_path().display())),
+            OsString::from(format!("--git-dir={}", child_git.display())),
+            OsString::from(format!("--work-tree={}", child_root.display())),
         ]);
-        scoped.environment.insert(OsString::from("GIT_COMMON_DIR"), self.authority.common_metadata_path().into_os_string());
+        scoped.environment.insert(OsString::from("GIT_COMMON_DIR"), child_common.into_os_string());
+        scoped = scoped.inherit_file(inherited_root).and_then(|spec| spec.inherit_file(inherited_git)).and_then(|spec| spec.inherit_file(inherited_common)).map_err(|error| refuse(error.to_string()))?;
         self.inner.execute(&scoped, cancellation)
     }
 }
@@ -325,7 +352,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod authority_tests {
     use super::*;
     use std::sync::Mutex;
@@ -352,7 +379,11 @@ mod authority_tests {
             let commands = inner.0.lock().unwrap();
             let scoped = commands.last().unwrap();
             assert_eq!(scoped.arguments[2], "-C");
-            assert_eq!(Path::new(&scoped.arguments[3]), authority.anchored_path());
+            let child_root = Path::new(&scoped.arguments[3]);
+            assert!(child_root.starts_with("/proc/self/fd"));
+            let scoped_identity = fs::metadata(child_root).unwrap();
+            let expected_identity = authority.root.metadata().unwrap();
+            assert_eq!((scoped_identity.dev(), scoped_identity.ino()), (expected_identity.dev(), expected_identity.ino()));
             assert_eq!(&scoped.arguments[4..], &command.arguments[2..]);
         }
     }
@@ -534,4 +565,55 @@ mod authority_tests {
         assert!(authority.validate().is_err(), "durable metadata names must never name foreign directories even if the locator still resolves to the retained inode");
     }
 
+    #[test]
+    fn captured_authority_prepared_child_command_survives_parent_authority_drop_and_fd_reuse() {
+        #[derive(Default)]
+        struct CaptureCommand(Mutex<Option<CommandSpec>>);
+        impl ProcessExecutor for CaptureCommand {
+            fn execute(&self, command: &CommandSpec, _: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                *self.0.lock().unwrap() = Some(command.clone());
+                Ok(ProcessOutput { exit_code: Some(0), signal: None, success: true, stdout: vec![], stdout_truncated: false, stderr: vec![] })
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("worktree");
+        let parked = directory.path().join("original");
+        let foreign = directory.path().join("foreign");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(&foreign).unwrap();
+        actual_git(&root, &["init", "-b", "main"]);
+        actual_git(&foreign, &["init", "-b", "main"]);
+        std::fs::write(root.join("new.txt"), "original\n").unwrap();
+        std::fs::write(foreign.join("new.txt"), "foreign\n").unwrap();
+        actual_git(&foreign, &["add", "new.txt"]);
+        let foreign_index = std::fs::read(foreign.join(".git/index")).unwrap();
+        let inner = Arc::new(CaptureCommand::default());
+        let executor = WorktreeExecutor { inner: inner.clone(), authority: WorktreeAuthority::capture(&root).unwrap() };
+        executor.execute(&CommandSpec::new("git").arg("-C").arg(&root).args(["add", "--", "new.txt"]), &CancellationToken::default()).unwrap();
+        let command = inner.0.lock().unwrap().take().unwrap();
+        drop(executor);
+        drop(inner);
+        std::fs::rename(&root, &parked).unwrap();
+        std::fs::rename(&foreign, &root).unwrap();
+        // Reoccupy released parent descriptor numbers; only the invocation's
+        // owned descriptor copies must remain authoritative in its child.
+        let reused = (0..32).map(|_| fs::File::open("/dev/null").unwrap()).collect::<Vec<_>>();
+        let result = SystemProcessExecutor.execute(&isolated_spec(command), &CancellationToken::default()).unwrap();
+        assert!(result.success, "{}", String::from_utf8_lossy(&result.stderr));
+        assert_eq!(actual_git(&parked, &["ls-files", "-z"]).stdout, b"new.txt\0");
+        assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), foreign_index);
+        drop(reused);
+    }
+
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod portable_authority_tests {
+    use super::*;
+    #[test]
+    fn unsupported_mutation_authority_fails_before_opening_a_proc_path() {
+        assert!(!WorktreeAuthority::supported());
+        let reason = WorktreeAuthority::unsupported_reason().unwrap();
+        assert!(WorktreeAuthority::capture(Path::new("/nonexistent-worktree")).unwrap_err().to_string().contains(reason));
+    }
 }

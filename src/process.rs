@@ -941,6 +941,7 @@ fn failure_excerpt(mut output: Vec<u8>) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn inherited_directory_survives_spec_drop_and_path_replacement() {
         use std::os::unix::fs::MetadataExt;
