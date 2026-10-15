@@ -7,6 +7,7 @@ pub(super) struct CloseIntent {
     pub terminal: TerminalId,
     pub proof: HostSessionProof,
     completed_source: Option<TerminalSession>,
+    live_source: Option<TerminalSession>,
     pub generation: u64,
     pub restore_card: Option<CardId>,
     pub pending: bool,
@@ -177,6 +178,14 @@ impl Cagents {
                 }
             });
         }
+        // A previous refusal is diagnostic state, not a permanent close lock.
+        // Another explicit click retries current authenticated reconciliation.
+        if self.terminal_close.as_ref().is_some_and(|intent| intent.card == card && !intent.pending && intent.detail.is_some()) {
+            if let Some(intent) = self.terminal_close.take() {
+                self.terminal_close_attempts.remove(&intent.terminal);
+                self.core.set_keyboard_nav(intent.restore_keyboard_nav);
+            }
+        }
         if let Some(intent) = &self.terminal_close {
             // A silent close is still in flight. Preserve subsequent close
             // clicks until that card is settled, instead of dropping them.
@@ -214,6 +223,7 @@ impl Cagents {
                 terminal: session.id,
                 proof,
                 completed_source: None,
+                live_source: Some(session.clone()),
                 generation: 0,
                 restore_card: self.workspace.focused(),
                 pending: false,
@@ -264,6 +274,7 @@ impl Cagents {
                     card,
                     terminal: session.id,
                     proof,
+                    live_source: None,
                     completed_source: Some(session),
                     generation: 0,
                     restore_card: self.workspace.focused(),
@@ -1008,6 +1019,18 @@ fn revalidate_and_close(intent: &CloseIntent, allow_active: bool) -> CloseOutcom
                     TerminalCloseResult::Active => CloseOutcome::Active,
                     TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
                 })
+        };
+        return run().unwrap_or_else(CloseOutcome::Unreachable);
+    }
+    if let Some(source) = &intent.live_source {
+        let run = || -> Result<CloseOutcome, String> {
+            let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+            let mut client = ControlClient::connect(&path).map_err(|error| error.to_string())?;
+            client.reconcile_terminal_close(source.clone(), allow_active).map_err(|error| error.to_string()).map(|outcome| match outcome {
+                TerminalCloseResult::Closed => CloseOutcome::Closed,
+                TerminalCloseResult::Active => CloseOutcome::Active,
+                TerminalCloseResult::Unknown(error) => CloseOutcome::Unreachable(error),
+            })
         };
         return run().unwrap_or_else(CloseOutcome::Unreachable);
     }

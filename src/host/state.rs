@@ -1,4 +1,5 @@
 mod presentation;
+pub(super) mod terminal_reconcile;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -3433,6 +3434,11 @@ fn start_terminal_view_owned(
     pending_pane: Option<crate::model::CardId>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
+    if adoption.is_none() && !fs::metadata(&session.launch.working_directory).is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(ProtocolError::new(ProtocolErrorCode::TerminalUnavailable,
+            format!("{}: The saved terminal folder {} is unavailable. Locate or restore that folder before launching this terminal.",
+                crate::terminal_ipc::WORKING_DIRECTORY_UNAVAILABLE, session.launch.working_directory.display()), false));
+    }
     validate_spawn_options(&options)?;
     if let Some(environment) = &mut execution_environment {
         session.launch.remove_unset_environment(&mut environment.0);

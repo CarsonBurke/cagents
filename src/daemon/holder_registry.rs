@@ -238,6 +238,17 @@ pub(crate) fn retirement_pending(expected: &Record) -> io::Result<bool> {
     read_file(file, true).map(|actual| actual == *expected)
 }
 
+/// Browserless and full are presentations of the same production terminal
+/// service. Development and native-provider identity stay strictly separate.
+pub(crate) fn application_matches(kind: Kind, application: &str) -> bool {
+    application_matches_for(kind, application, crate::instance::APPLICATION_ID, crate::instance::IS_DEVELOPMENT)
+}
+fn application_matches_for(kind: Kind, application: &str, current: &str, development: bool) -> bool {
+    application == current || (kind == Kind::Terminal && !development
+        && matches!(current, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless")
+        && matches!(application, "dev.cagents.Cagents" | "dev.cagents.Cagents.Browserless"))
+}
+
 pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, String> {
     let path = socket.with_extension("json");
     let record = match read(&path) {
@@ -248,7 +259,7 @@ pub(crate) fn evidence(socket: &Path, kind: Kind) -> Result<Option<Record>, Stri
     let boot = crate::daemon::read_boot_id().map_err(|error| error.to_string())?;
     if !record.supported_version()
         || record.kind != kind
-        || record.application != crate::instance::APPLICATION_ID
+        || !application_matches(kind, &record.application)
         || record.boot != boot
         || socket.file_name() != Some(std::ffi::OsStr::new(&record.terminal.to_string()))
     {
@@ -280,7 +291,7 @@ pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Ve
         };
         if !record.supported_version()
             || record.kind != kind
-            || record.application != crate::instance::APPLICATION_ID
+            || !application_matches(kind, &record.application)
             || record.path(directory) != path
             || &record.boot != boot
         {
@@ -328,6 +339,21 @@ mod tests {
         endpoint
     }
 
+    #[test]
+    fn production_terminal_presentations_share_ownership_but_development_and_native_do_not() {
+        let full = "dev.cagents.Cagents";
+        let browserless = "dev.cagents.Cagents.Browserless";
+        let dev = "dev.cagents.Cagents.Development";
+        for current in [full, browserless] {
+            for previous in [full, browserless] { assert!(application_matches_for(Kind::Terminal, previous, current, false)); }
+            for foreign in [dev, "other.application", "dev.cagents.Cagents.Browserless2"] { assert!(!application_matches_for(Kind::Terminal, foreign, current, false)); }
+        }
+        assert!(!application_matches_for(Kind::Native, browserless, full, false));
+        assert!(!application_matches_for(Kind::Native, full, browserless, false));
+        assert!(!application_matches_for(Kind::Terminal, full, dev, true));
+        assert!(!application_matches_for(Kind::Terminal, browserless, dev, true));
+        assert!(application_matches_for(Kind::Terminal, dev, dev, true));
+    }
     #[test]
     fn unix_address_boundary_preserves_full_endpoint_and_discovery_identity() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();

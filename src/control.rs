@@ -1011,6 +1011,24 @@ impl ControlClient {
         }
     }
 
+    pub fn reconcile_terminal(&mut self, session: crate::model::TerminalSession) -> Result<TerminalDescriptor, ControlError> {
+        let id = session.id;
+        match self.request_strict(ClientRequest::ReconcileTerminal { session })? {
+            ServerResponse::Spawned { terminal } if terminal.session.id == id => Ok(terminal),
+            response => Err(unexpected_response("authenticated terminal reconciliation", &response)),
+        }
+    }
+
+    pub fn reconcile_terminal_close(
+        &mut self, session: crate::model::TerminalSession, allow_active: bool,
+    ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
+        let id = session.id;
+        match self.request_with_deadline(ClientRequest::ReconcileTerminalClose { session, allow_active }, Instant::now() + CHAT_CLOSE_TIMEOUT)? {
+            ServerResponse::TerminalCloseChecked { terminal_id, outcome } if terminal_id == id => Ok(outcome),
+            response => Err(unexpected_response("reconciled terminal close", &response)),
+        }
+    }
+
     pub fn close_terminal_checked(
         &mut self,
         terminal_id: TerminalId,

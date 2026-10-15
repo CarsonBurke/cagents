@@ -386,7 +386,9 @@ pub(super) fn process_request(
     // effects, including provider closes that finish outside HostState.
     let exclusive = matches!(
         &request,
-        ClientRequest::PrepareUpgrade { .. }
+        ClientRequest::ReconcileTerminal { .. }
+            | ClientRequest::ReconcileTerminalClose { .. }
+            | ClientRequest::PrepareUpgrade { .. }
             | ClientRequest::PrepareConfirmedUpgrade { .. }
             | ClientRequest::Shutdown
             | ClientRequest::ShutdownV1 { .. }
@@ -735,6 +737,36 @@ pub(super) fn process_request(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .edit_model(client_id, edit)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
+        ClientRequest::ReconcileTerminal { session } => {
+            let terminal = super::state::terminal_reconcile::reconcile(host, client_id, &session)?;
+            let snapshot = super::state::client_snapshot(host, client_id, session.id, 0)?;
+            let mut extras = snapshot.map(|snapshot| ServerMessage::Snapshot { terminal_id: session.id, snapshot }).into_iter().collect::<Vec<_>>();
+            extras.push(ServerMessage::Synchronized { terminal_id: session.id, generation: terminal.generation, event_sequence: terminal.event_sequence });
+            host.lock().unwrap_or_else(|p| p.into_inner()).announce_created(client_id, session.id);
+            Ok((ServerResponse::Spawned { terminal }, extras, false))
+        }
+        ClientRequest::ReconcileTerminalClose { session, allow_active } => {
+            match super::state::terminal_reconcile::reconcile(host, client_id, &session) {
+                Ok(_) => {}
+                Err(error) if error.code == ProtocolErrorCode::TerminalNotFound => {
+                    let proof = current_proof(host);
+                    if crate::terminal::holder::cleanup::confirmed_source(&session, &proof).map_err(|message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, false))? {
+                        return Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id, outcome: crate::terminal_ipc::TerminalCloseResult::Closed }, Vec::new(), false));
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            }
+            let handle = host.lock().unwrap_or_else(|p| p.into_inner()).history_handle(client_id, session.id)?;
+            let outcome = if handle.is_completed() {
+                handle.shutdown().map_err(send_error)?;
+                crate::terminal_ipc::TerminalCloseResult::Closed
+            } else { handle.close_checked(allow_active) };
+            if outcome == crate::terminal_ipc::TerminalCloseResult::Closed {
+                host.lock().unwrap_or_else(|p| p.into_inner()).close_terminal_attention(session.id, Some(&handle));
+            }
+            Ok((ServerResponse::TerminalCloseChecked { terminal_id: session.id, outcome }, Vec::new(), false))
         }
         ClientRequest::Spawn { session, options } => {
             super::agent_execution::terminals::adopt(host, client_id, session.id)?;

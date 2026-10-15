@@ -143,7 +143,9 @@ use crate::{
 /// and separately labeled API-equivalent Codex cost estimates.
 /// Version 76 exposes non-secret account usage through delegated execution.
 /// Version 77 carries typed delegated-agent view placement and directory scope.
-pub const PROTOCOL_VERSION: u16 = 77;
+pub const PROTOCOL_VERSION: u16 = 78;
+/// Stable failure marker while the runtime hydration transport carries strings.
+pub const WORKING_DIRECTORY_UNAVAILABLE: &str = "working_directory_unavailable";
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -472,6 +474,10 @@ pub enum ClientRequest {
         terminal_id: TerminalId,
         options: TerminalSpawnOptions,
     },
+    /// Authenticate and adopt only the original live PTY. Never relaunch.
+    ReconcileTerminal { session: TerminalSession },
+    /// Reconcile exact saved ownership, then apply the PTY owner's close policy.
+    ReconcileTerminalClose { session: TerminalSession, allow_active: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
