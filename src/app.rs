@@ -1602,10 +1602,8 @@ fn reconcile_restored_projects(
     order: &[ProjectId],
 ) {
     projects.sort_by_key(|project| {
-        order
-            .iter()
-            .position(|id| *id == project.id)
-            .unwrap_or(usize::MAX)
+        (order.iter().position(|id| *id == project.id).unwrap_or(usize::MAX),
+         project.repository.clone(), project.id)
     });
     let mut repositories = HashMap::new();
     let mut aliases = HashMap::new();
@@ -2538,6 +2536,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
         || matches!(
             message,
             Message::KeyEvent { .. }
+                | Message::ActivateProject(_)
                 | Message::Viewport { .. }
                 | Message::NewWindow
                 | Message::WindowCloseRequested(_)
@@ -2669,7 +2668,7 @@ fn context_inspector_action_navigates(action: &InspectorAction) -> bool {
 fn completion_navigates(message: &Message) -> bool {
     matches!(
         message,
-        Message::RepositoryLoaded {
+        Message::ActivateProject(_) | Message::RepositoryLoaded {
             open_cards: true,
             result: Ok(_),
             ..
@@ -4169,6 +4168,7 @@ pub enum Message {
     ActivateUi {
         token: Option<String>,
     },
+    ActivateProject(PathBuf),
     ActivateSession {
         session: TerminalId,
         token: Option<String>,
@@ -5185,6 +5185,14 @@ impl Cagents {
         self.project_load_task(path, project_id, open_cards, None)
     }
 
+    fn remember_project_opening(&mut self, path: &Path, project: ProjectId) {
+        self.project_ui.pending_loads.insert(path.to_path_buf(), project);
+        if !self.durable.project_order.contains(&project) {
+            Arc::make_mut(&mut self.durable).project_order.push(project);
+            self.persist();
+        }
+    }
+
     fn project_load_task(
         &mut self,
         path: PathBuf,
@@ -5192,14 +5200,16 @@ impl Cagents {
         open_cards: bool,
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
+        let project_id = project_id
+            .or_else(|| self.project_ui.pending_loads.get(&path).copied())
+            .unwrap_or_default();
         if crate::device::is_remote() {
-            let project_id = project_id.unwrap_or_default();
+            self.remember_project_opening(&path, project_id);
             self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
             let generation = self.repository_load_sequence;
             self.repository_generations.insert(project_id, generation);
             return self.device_project_read_task(path, project_id, generation, kind);
         }
-        let project_id = project_id.unwrap_or_default();
         if open_cards && let Ok(repository) = crate::workspace_model::canonical_repository(&path) {
             if self.project_ui.is_reopening(&repository) {
                 self.status = Some(TransientNotice::warning(
@@ -5221,6 +5231,7 @@ impl Cagents {
             self.project_ui.closed.remove(&repository);
             self.project_ui.reopening.insert(project_id, repository);
         }
+        self.remember_project_opening(&path, project_id);
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
@@ -12744,7 +12755,7 @@ impl Application for Cagents {
         #[cfg(feature = "latency-harness")]
         let latency_fixture = crate::latency_fixture::Fixture::from_env();
         let Bootstrap {
-            workspace: durable,
+            workspace: mut durable,
             session,
             mut projects,
             mut worktrees,
@@ -12757,6 +12768,11 @@ impl Application for Cagents {
             settings_warnings,
         } = startup.bootstrap;
         reconcile_restored_projects(&mut projects, &mut worktrees, &durable.project_order);
+        for project in &projects {
+            if !durable.project_order.contains(&project.id) {
+                durable.project_order.push(project.id);
+            }
+        }
         let retired = worktree_ui::retire_missing_worktrees(&mut worktrees);
         if let Some(session) = &session {
             session.save_worktrees(retired);
@@ -13199,7 +13215,9 @@ impl Application for Cagents {
             return Task::none();
         }
         if (self.focused_repository_is_saving() || self.modal_is_open())
-            && completion_navigates(&message)
+            && (completion_navigates(&message)
+                || matches!(&message, Message::RepositoryLoaded { result: Ok(loaded), .. }
+                    if self.project_ui.select_on_load.as_ref() == Some(&loaded.project.repository)))
         {
             self.deferred_navigation.push_back(message);
             return Task::none();
@@ -13432,6 +13450,7 @@ impl Application for Cagents {
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
+                self.project_ui.pending_loads.retain(|_, id| *id != project_id);
                 self.refresh_ui.projects.remove(&project_id);
                 self.refresh_ui.finished(
                     project_id,
@@ -13545,6 +13564,13 @@ impl Application for Cagents {
                                 ));
                             }
                             let existing_id = existing.id;
+                            let order = &mut Arc::make_mut(&mut self.durable).project_order;
+                            if let Some(first) = order.iter().position(|id| *id == project_id || *id == existing_id) {
+                                order.retain(|id| *id != project_id && *id != existing_id);
+                                order.insert(first.min(order.len()), existing_id);
+                            }
+                            self.sidebar_model.apply_project_order(&self.durable.project_order);
+                            self.persist();
                             self.repository_generations.remove(&project_id);
                             if let Some(previous) =
                                 self.repository_pr_cancellations.remove(&project_id)
@@ -13555,9 +13581,11 @@ impl Application for Cagents {
                             self.review_repositories.remove(&project_id);
                             self.sync_worktree_operation_rows();
                             self.sidebar_model.data_state = SidebarDataState::Ready;
-                            let task = if open_cards && !self.refuse_in_deleting_worktree(&worktree)
+                            let selecting = self.project_ui.select_on_load.as_ref() == Some(&loaded.project.repository);
+                            if selecting { self.project_ui.select_on_load = None; }
+                            let task = if (selecting || open_cards) && !self.refuse_in_deleting_worktree(&worktree)
                             {
-                                self.select_worktree(worktree, true)
+                                self.select_worktree(worktree, open_cards)
                             } else {
                                 Task::none()
                             };
@@ -13592,10 +13620,15 @@ impl Application for Cagents {
                             .worktrees
                             .iter()
                             .map(|(record, status)| {
-                                let mut row =
-                                    SidebarWorktree::from_repository(record, status.as_ref());
-                                row.head_repository =
-                                    loaded.head_repositories.get(&record.id).cloned();
+                                let mut row = self.sidebar_model.projects.iter()
+                                    .find(|project| project.id == project_id)
+                                    .and_then(|project| project.worktrees.iter().find(|row| row.id == record.id))
+                                    .cloned()
+                                    .unwrap_or_else(|| SidebarWorktree::from_repository(record, None));
+                                row.apply_repository(record, status.as_ref());
+                                let head = loaded.head_repositories.get(&record.id).cloned();
+                                if row.head_repository != head { row.clear_pull_request(); }
+                                row.head_repository = head;
                                 row
                             })
                             .collect();
@@ -13732,7 +13765,12 @@ impl Application for Cagents {
                             self.prune_pull_request_refs(project_id),
                             self.update_review_requests(review_request_ui::Action::Tick),
                         ]);
-                        if open_cards {
+                        if self.project_ui.select_on_load.as_ref() == Some(&loaded.project.repository) {
+                            self.project_ui.select_on_load = None;
+                            if !self.refuse_in_deleting_worktree(&worktree) {
+                                task = self.select_worktree(worktree.clone(), false);
+                            }
+                        } else if open_cards {
                             if !self.refuse_in_deleting_worktree(&worktree) {
                                 task = self.select_worktree(worktree, true);
                             }
@@ -15248,6 +15286,7 @@ impl Application for Cagents {
                 self.sync_context_overlay_state()
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
+            Message::ActivateProject(repository) => self.activate_project(repository),
             Message::ActivateSession { session, token } => {
                 let activation = match token {
                     Some(token) => self.activate_main_window(Some(token)),
@@ -16532,7 +16571,9 @@ impl Application for Cagents {
                 UiActivationSource(self.activation_rx.clone()),
                 ui_activation_stream,
             )
-            .map(|activation| match activation.update {
+            .map(|activation| if let Some(repository) = activation.project {
+                Message::ActivateProject(repository)
+            } else { match activation.update {
                 Some(request) => Message::UiUpdate(request),
                 None => match activation.session {
                     Some(session) => Message::ActivateSession {
@@ -16543,7 +16584,7 @@ impl Application for Cagents {
                         token: activation.token,
                     },
                 },
-            }),
+            }}),
             event::listen_with(|event, status, event_window| match event {
                 iced::Event::Keyboard(event) => Some(Message::KeyEvent {
                     event,
@@ -18838,6 +18879,7 @@ mod tests {
                 .send_blocking(instance::UiActivation {
                     token: None,
                     session: None,
+                    project: None,
                     update: None,
                 })
                 .is_err()
@@ -20788,6 +20830,7 @@ mod tests {
                 normalization_warning: None,
             }),
         }));
+        assert!(completion_navigates(&Message::ActivateProject(PathBuf::from("/repo/.git"))));
         assert!(!completion_navigates(&Message::ExternalLinkOpened(Ok(()))));
     }
 

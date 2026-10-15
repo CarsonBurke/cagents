@@ -50,7 +50,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   insertion line previews its new position; releasing the mouse saves the
   order without changing the active pane. Scroll the wheel while dragging to
   reach offscreen panes, or press **Escape** to cancel.
-- Drag a project header to reorder projects; the order survives restarts.
+- Drag a project header to reorder projects; the order survives restarts. Newly opened projects append in opening order. `cagents project list` lists shared projects by creation rank, newest first, independently of each window's custom sidebar order. `cagents project open PATH` selects its primary worktree in the most recently focused running window.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
   or name.

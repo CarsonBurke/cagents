@@ -1240,6 +1240,7 @@ impl ApplicationLease {
 pub struct UiActivation {
     pub token: Option<String>,
     pub session: Option<crate::model::TerminalId>,
+    pub project: Option<PathBuf>,
     pub update: Option<UiUpdateRequest>,
 }
 
@@ -1347,6 +1348,64 @@ impl Drop for UiActivationListener {
         }
         let _ = fs::remove_file(&self.socket_path);
     }
+}
+
+/// Keep one small, locked hint so shell activations go to the last focused
+/// window even when the shell currently owns desktop focus.
+#[cfg(feature = "ui")]
+pub(crate) fn record_focused_window() -> io::Result<()> {
+    let runtime = runtime_directory()?;
+    require_owned_runtime_directory(&runtime)?;
+    record_focused_window_in(&runtime, window_slot())
+}
+
+#[cfg(feature = "ui")]
+fn record_focused_window_in(runtime: &Path, slot: &str) -> io::Result<()> {
+    validate_window_slot(slot)?;
+    let lock = owned_lock(&runtime.join(format!("{APPLICATION_LOCK_FILE}-focus")), libc::LOCK_EX)?;
+    lock.set_len(0)?;
+    writeln!(&*lock, "{slot}")
+}
+
+/// Select a project in one running window, without starting the UI or a terminal.
+/// JSON preserves spaces and Unicode in canonical repository paths.
+pub fn activate_project(repository: &Path) -> io::Result<bool> {
+    let Some(runtime) = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_absolute()) else {
+        return Ok(false);
+    };
+    activate_project_in(&runtime, repository)
+}
+
+fn activate_project_in(runtime: &Path, repository: &Path) -> io::Result<bool> {
+    require_owned_runtime_directory(runtime)?;
+    let mut slots = Vec::new();
+    let hint = runtime.join(format!("{APPLICATION_LOCK_FILE}-focus"));
+    if hint.exists() {
+        let lock = owned_lock(&hint, libc::LOCK_SH)?;
+        let mut slot = String::new();
+        (&*lock).take(1024).read_to_string(&mut slot)?;
+        if validate_window_slot(slot.trim()).is_ok() {
+            slots.push(slot.trim().to_owned());
+        }
+    }
+    slots.push(PRIMARY_WINDOW.to_owned());
+    slots.extend(running_window_slots(&runtime)?);
+    let encoded = serde_json::to_string(repository).map_err(io::Error::other)?;
+    for slot in slots {
+        if !window_matches_selected_device(&slot)? { continue; }
+        let mut stream = match UnixStream::connect(runtime.join(slot_socket_name(&slot))) {
+            Ok(stream) => stream,
+            Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused) => continue,
+            Err(error) => return Err(error),
+        };
+        stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+        stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+        writeln!(stream, "project {encoded}")?;
+        if read_capped_line(&stream)? == "ok" {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Asks a running UI to focus its window. Returns `true` when that instance
@@ -1667,6 +1726,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                     .send_blocking(UiActivation {
                         token,
                         session: None,
+                        project: None,
                         update: None,
                     })
                     .is_err()
@@ -1681,10 +1741,23 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                     .send_blocking(UiActivation {
                         token,
                         session: Some(session),
+                        project: None,
                         update: None,
                     })
                     .is_err()
                 {
+                    let _ = writeln!(&stream, "error: window is no longer accepting activations");
+                    break;
+                }
+                let _ = writeln!(&stream, "ok");
+            }
+            Ok(ActivationRequest::Project(project)) => {
+                if events.send_blocking(UiActivation {
+                    token: None,
+                    session: None,
+                    project: Some(project),
+                    update: None,
+                }).is_err() {
                     let _ = writeln!(&stream, "error: window is no longer accepting activations");
                     break;
                 }
@@ -1696,6 +1769,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                     .send_blocking(UiActivation {
                         token: None,
                         session: None,
+                        project: None,
                         update: Some(UiUpdateRequest { action, response }),
                     })
                     .is_err()
@@ -1718,6 +1792,7 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
 enum ActivationRequest {
     Activate(Option<String>),
     Session(crate::model::TerminalId, Option<String>),
+    Project(PathBuf),
     Shutdown,
     Update(UiUpdateAction),
 }
@@ -1754,6 +1829,14 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
         None if line == "update-prepare" => Ok(ActivationRequest::Update(UiUpdateAction::Prepare)),
         None if line == "update-cancel" => Ok(ActivationRequest::Update(UiUpdateAction::Cancel)),
         None if line == "update-commit" => Ok(ActivationRequest::Update(UiUpdateAction::Commit)),
+        Some(("project", encoded)) => {
+            let path: PathBuf = serde_json::from_str(encoded)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            if !path.is_absolute() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "project path must be absolute"));
+            }
+            Ok(ActivationRequest::Project(path))
+        }
         Some(("session", identity)) => {
             let (id, token) = identity
                 .split_once(' ')
@@ -2552,6 +2635,27 @@ mod tests {
         assert!(window_matches_selected_device(PRIMARY_WINDOW).unwrap());
         assert!(window_matches_selected_device("window-2").unwrap());
         assert!(!window_matches_selected_device("device-0123456789abcdef").unwrap());
+    }
+
+    #[cfg(feature = "ui")]
+    #[test]
+    fn project_activation_preserves_paths_and_targets_only_last_focused_window() {
+        let runtime = tempdir().unwrap();
+        let (first_tx, first_rx) = async_channel::unbounded();
+        let (second_tx, second_rx) = async_channel::unbounded();
+        let _first = UiActivationListener::bind_named(runtime.path(), slot_socket_name(PRIMARY_WINDOW), first_tx).unwrap();
+        let _second = UiActivationListener::bind_named(runtime.path(), slot_socket_name("second"), second_tx).unwrap();
+        record_focused_window_in(runtime.path(), "second").unwrap();
+        let repository = Path::new("/tmp/project with spaces/λ.git");
+        assert!(activate_project_in(runtime.path(), repository).unwrap());
+        assert_eq!(second_rx.recv_blocking().unwrap().project.as_deref(), Some(repository));
+        assert!(first_rx.try_recv().is_err());
+        assert!(matches!(parse_activation_request("project \"/tmp/project with spaces\"").unwrap(), ActivationRequest::Project(path) if path == Path::new("/tmp/project with spaces")));
+        assert!(parse_activation_request("project \"relative\"").is_err());
+        assert!(parse_activation_request("project not-json").is_err());
+        drop(_second);
+        assert!(activate_project_in(runtime.path(), repository).unwrap());
+        assert_eq!(first_rx.recv_blocking().unwrap().project.as_deref(), Some(repository));
     }
 
     #[cfg(feature = "ui")]

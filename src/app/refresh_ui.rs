@@ -186,6 +186,11 @@ impl Cagents {
                 }
                 let regained = focused && !self.refresh_ui.focused;
                 self.refresh_ui.focused = focused;
+                if focused {
+                    if let Err(error) = crate::instance::record_focused_window() {
+                        tracing::debug!(%error, "could not record the focused window");
+                    }
+                }
                 if !regained {
                     return Task::none();
                 }

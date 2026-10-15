@@ -3075,6 +3075,13 @@ fn project_output(
                     "the daemon accepted the project but did not report it",
                 )
             })?;
+            // The model edit above establishes shared existence. Selection is
+            // a separate, best-effort instruction to one existing window.
+            if !crate::device::is_remote() {
+                if let Err(error) = instance::activate_project(&repository) {
+                    tracing::debug!(%error, "project opened but window selection failed");
+                }
+            }
             let human = project_line(&project);
             Ok(CommandOutput {
                 command: "project.open",
@@ -3084,8 +3091,8 @@ fn project_output(
         }
         ResolvedProject::List => {
             let model = client.read_workspace_model().map_err(protocol_error)?;
-            // Newest first, the order `channel list` answers in and the order
-            // the sidebar renders.
+            // Shared creation rank, newest first. Each window independently
+            // persists its custom sidebar order.
             let mut projects = model.projects.iter().collect::<Vec<_>>();
             projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
             let human = projects

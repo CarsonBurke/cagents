@@ -14,6 +14,10 @@ struct AutomaticAttempt {
 
 #[derive(Debug, Default)]
 pub struct State {
+    /// Last explicit CLI activation; adoption alone never changes this window's scope.
+    pub(super) select_on_load: Option<PathBuf>,
+    /// Reserve one identity while registry adoption and CLI activation race.
+    pub(super) pending_loads: HashMap<PathBuf, ProjectId>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
@@ -214,6 +218,26 @@ pub enum Action {
 }
 
 impl Cagents {
+    pub(super) fn activate_project(&mut self, repository: PathBuf) -> Task<Message> {
+        let project = self.sidebar_model.projects.iter().find(|project| project.repository == repository);
+        if let Some(project) = project {
+            let primary = project.worktrees.iter().find(|worktree| {
+                crate::sidebar::is_primary_worktree(&repository, &worktree.path)
+            }).or_else(|| project.worktrees.first()).map(|worktree| worktree.path.clone());
+            if let Some(path) = primary {
+                self.project_ui.select_on_load = None;
+                return self.select_worktree(path, false);
+            }
+        }
+        let id = project.map(|project| project.id);
+        let kind = project.map(|project| project.kind);
+        self.project_ui.select_on_load = Some(repository.clone());
+        if self.project_ui.pending_loads.contains_key(&repository) {
+            return Task::none();
+        }
+        self.project_load_task(repository, id, false, kind)
+    }
+
     pub(super) fn sync_worktree_protections(&mut self) {
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {

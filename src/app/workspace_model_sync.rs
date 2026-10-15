@@ -1702,6 +1702,7 @@ mod tests {
         let project = app.sidebar_model.projects.first().unwrap();
         assert_eq!(project.repository, repository);
         assert_eq!(project.kind, ProjectKind::Folder);
+        assert!(app.durable.project_order.contains(&project.id));
         assert!(project.worktrees.is_empty());
         assert!(app.durable.cards.is_empty());
     }
@@ -1749,6 +1750,39 @@ mod tests {
             "and it does not move the user into the repository it just heard about"
         );
         assert_eq!(app.workspace.focused(), focused);
+        let adopted = app.project_for_repository(&repository).unwrap();
+        assert_eq!(app.durable.project_order.last(), Some(&adopted));
+    }
+
+    #[test]
+    fn activation_during_adoption_reuses_the_pending_project_identity_and_rank() {
+        let (mut app, _, _) = app_with_project();
+        let repository = PathBuf::from("/pending/.git");
+        let pending = ProjectId::new();
+        app.project_ui.pending_loads.insert(repository.clone(), pending);
+        Arc::make_mut(&mut app.durable).project_order.push(pending);
+        let order = app.durable.project_order.clone();
+        assert!(first_message(app.activate_project(repository.clone())).is_none());
+        assert_eq!(app.project_ui.select_on_load, Some(repository));
+        assert_eq!(app.durable.project_order, order);
+        assert_eq!(app.project_ui.pending_loads.values().copied().collect::<Vec<_>>(), vec![pending]);
+    }
+
+    #[test]
+    fn explicit_project_activation_selects_primary_without_creating_a_terminal() {
+        let Some(checkout) = git_checkout() else { return; };
+        let root = checkout.path().canonicalize().unwrap();
+        let repository = canonical_repository(&root.join(".git")).unwrap();
+        let (mut app, project_id, _) = app_with_project();
+        let cards = app.durable.cards.len();
+        let project = app.sidebar_model.projects.iter_mut().find(|project| project.id == project_id).unwrap();
+        *project = SidebarProject::new(project_id, RepositoryId::new(), "fixture".into(), repository.clone(), vec![
+            SidebarWorktree::from_durable(crate::model::WorktreeId::new(), root.clone(), Some("main".into()))
+        ], Vec::new());
+        drop(app.activate_project(repository));
+        assert_eq!(app.active_workspace.as_deref(), Some(root.as_path()));
+        assert_eq!(app.durable.cards.len(), cards);
+        assert!(app.project_ui.select_on_load.is_none());
     }
 
     /// A channel another window created arrives as a scope, not as a
