@@ -1305,6 +1305,16 @@ fn state_reason(state: crate::agent_execution::State, reason: Option<&str>) -> S
     if matches!(state, crate::agent_execution::State::Failed | crate::agent_execution::State::Interrupted) {
         if let Some(reason) = reason {
             let reason: String = reason.chars().take(100).map(|c| if c.is_control() { ' ' } else { c }).collect();
+            for (prefix,kind) in [("Provider exited with status ","exit"),("Provider exited with signal ","signal")] {
+                if let Some(suffix)=reason.strip_prefix(prefix) {
+                    let number_end=suffix.find(|c:char| !c.is_ascii_digit()).unwrap_or(suffix.len());
+                    if number_end>0 {
+                        let number=&suffix[..number_end];
+                        let rest=suffix[number_end..].trim_start_matches(|c:char| c.is_whitespace() || matches!(c,'.'|':'));
+                        return if rest.is_empty() {format!("{label} ({kind} {number})")} else {format!("{label} ({kind} {number}): {rest}")};
+                    }
+                }
+            }
             return format!("{label} ({reason})");
         }
     }
@@ -1445,6 +1455,16 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_status_and_list_labels_preserve_numeric_exit_and_signal() {
+        use crate::agent_execution::State;
+        assert_eq!(state_reason(State::Failed,Some("Provider exited with status 3.\nAuthentication failed")),"Failed (exit 3): Authentication failed");
+        assert_eq!(state_reason(State::Failed,Some("Provider exited with status 3: auth failed")),"Failed (exit 3): auth failed");
+        assert_eq!(state_reason(State::Failed,Some("Provider exited with signal 9.\nKilled")),"Failed (signal 9): Killed");
+        assert_eq!(state_reason(State::Failed,Some("Provider exited with status 3")),"Failed (exit 3)");
+        assert_eq!(state_reason(State::Failed,Some("Provider exited with status unavailable")),"Failed (Provider exited with status unavailable)");
+    }
 
     #[test]
     fn wait_contract_has_one_shape_and_outcome_exit_codes() {
