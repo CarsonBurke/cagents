@@ -2150,6 +2150,9 @@ pub enum Event {
     InterruptMode(String),
     BranchPoints(Vec<BranchPoint>),
     Forked(String),
+    /// Parent history item aliases whose actual source records explicitly
+    /// name this native session. Missing source IDs remain unqualified.
+    HistoryOrigins { session_id: String, item_ids: Vec<String> },
 }
 
 #[cfg(test)]
