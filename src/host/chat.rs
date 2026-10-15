@@ -829,10 +829,7 @@ fn start_with_execution(
             "A terminal handoff must use the proven source environment, not a client override",
         ));
     }
-    if matches!(
-        session.native_continuity,
-        chat::NativeContinuity::Durable { .. }
-    ) || has_native_owner(&session)?
+    if session.native_continuity.retains_provider() || has_native_owner(&session)?
     {
         return native_recovery::restore(host, client, &session).map_err(unavailable);
     }
@@ -1776,10 +1773,7 @@ fn client_session(host: &SharedHost, session: Session) -> Session {
 }
 
 fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::Path) -> Session {
-    if matches!(
-        session.native_continuity,
-        chat::NativeContinuity::Durable { .. }
-    ) {
+    if session.native_continuity.retains_provider() {
         // This descriptor can only enter authenticated holder adoption, which
         // checks its full retained value. The caller's TMPDIR grants no authority.
         return session;
@@ -2778,10 +2772,7 @@ fn process_inner(
                     })?;
                 (retained, state.native_closing.contains_key(&chat_id))
             };
-            let closed_receipt = if matches!(
-                retained.native_continuity,
-                chat::NativeContinuity::Durable { .. }
-            ) {
+            let closed_receipt = if retained.native_continuity.retains_provider() {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 chat::native_holder::closed_source(&retained, state.proof())
                     .map_err(unavailable)?
@@ -3050,10 +3041,7 @@ pub(super) fn validate_upgrade_environment(
     hosted_source: bool,
     handle: &Handle,
 ) -> Result<(), String> {
-    if matches!(
-        handle.native_continuity(),
-        chat::NativeContinuity::Durable { .. }
-    ) {
+    if handle.native_continuity().retains_provider() {
         // The authenticated holder retains the original execution environment;
         // a successor reconnects and never recreates it from daemon defaults.
         return Ok(());
@@ -3076,10 +3064,7 @@ pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
 ) -> Result<(), String> {
-    if matches!(
-        saved.source.native_continuity,
-        chat::NativeContinuity::Durable { .. }
-    ) {
+    if saved.source.native_continuity.retains_provider() {
         native_recovery::restore(host, 0, &saved.source)?;
         return Ok(());
     }

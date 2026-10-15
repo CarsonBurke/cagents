@@ -441,10 +441,7 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         // checkpoint write fails. Explicit Stop/Close still tears down the
         // provider; exiting the upgrading daemon must not undo preservation.
         let closed = if upgrading
-            && matches!(
-                chat.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            ) {
+            && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
             chat.close()

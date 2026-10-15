@@ -424,10 +424,7 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
-    if matches!(
-        session.native_continuity,
-        super::NativeContinuity::Durable { .. }
-    ) {
+    if session.native_continuity.retains_provider() {
         return Err(StartFailure::from(format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
             refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
@@ -1175,10 +1172,7 @@ impl ClientHandle {
         if let Some(id) = snapshot.session_id.clone() {
             session.launch.session_id = Some(id);
         }
-        if matches!(
-            snapshot.native_continuity,
-            super::NativeContinuity::Durable { .. }
-        ) {
+        if snapshot.native_continuity.retains_provider() {
             session.native_continuity = snapshot.native_continuity.clone();
         }
         session

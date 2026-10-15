@@ -31,6 +31,8 @@ impl RestartReceipt {
             || new.launch.session_id.as_ref().is_none_or(|id| id.is_empty() || id.len() > 1024)
             || old.owned_codex_listener != new.owned_codex_listener
             || !old.has_valid_native_continuity() || !new.has_valid_native_continuity()
+            || (matches!(old.native_continuity, super::NativeContinuity::RetainedClaudeActor { .. })
+                && old.native_continuity != new.native_continuity)
         { return false; }
         match (&old.terminal, &new.terminal) {
             (None, None) => true,
@@ -100,6 +102,13 @@ mod tests {
             }
             assert!(RestartReceipt::confirm(source.clone(),changed).is_err(),"changed field {field}");
         }
+        let mut retained=source.clone();
+        retained.native_continuity=super::super::NativeContinuity::RetainedClaudeActor {protocol:1};
+        let mut retained_next=replacement.clone();
+        retained_next.native_continuity=retained.native_continuity.clone();
+        assert!(RestartReceipt::confirm(retained.clone(),retained_next.clone()).is_ok());
+        retained_next.native_continuity=super::super::NativeContinuity::ReconnectOnly;
+        assert!(RestartReceipt::confirm(retained,retained_next).is_err(),"restart cannot lose retained actor ownership");
         let mut early=source;early.launch.session_id=None;
         assert!(RestartReceipt::confirm(early,replacement).is_ok());
     }

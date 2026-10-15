@@ -2660,10 +2660,7 @@ impl Runtime {
         if observed.launch.session_id.is_some() {
             self.session.launch.session_id = observed.launch.session_id;
         }
-        if matches!(
-            observed.native_continuity,
-            chat::NativeContinuity::Durable { .. }
-        ) {
+        if observed.native_continuity.retains_provider() {
             self.session.native_continuity = observed.native_continuity;
         }
     }
@@ -4461,10 +4458,7 @@ impl Cagents {
         let skills = if session.is_unstarted() {
             self.open_chat_draft(card_id, session)
         } else {
-            let intent = if matches!(
-                session.native_continuity,
-                chat::NativeContinuity::Durable { .. }
-            ) {
+            let intent = if session.native_continuity.retains_provider() {
                 chat::Intent::Restore
             } else {
                 chat::Intent::Start
@@ -4815,10 +4809,7 @@ impl Cagents {
                 if observed.launch.session_id.is_some() {
                     session.launch.session_id = observed.launch.session_id;
                 }
-                if matches!(
-                    observed.native_continuity,
-                    chat::NativeContinuity::Durable { .. }
-                ) {
+                if observed.native_continuity.retains_provider() {
                     session.native_continuity = observed.native_continuity;
                 }
             }
@@ -4914,10 +4905,7 @@ impl Cagents {
         if !pending
             && session.proof.is_some()
             && (session.owns_codex_listener()
-                || matches!(
-                    session.native_continuity,
-                    chat::NativeContinuity::Durable { .. }
-                ))
+                || session.native_continuity.retains_provider())
         {
             let target = self.chat_ui.next_target(card);
             self.chat_ui.phases.insert(

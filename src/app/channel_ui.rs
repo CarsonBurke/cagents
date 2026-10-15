@@ -97,10 +97,7 @@ pub(super) fn close_sessions(sessions: Vec<CardKind>) -> Result<(), String> {
 
 fn may_have_retained_owner(session: &crate::chat::Session) -> bool {
     session.owned_codex_listener.is_some()
-        || matches!(
-            session.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        )
+        || session.native_continuity.retains_provider()
 }
 
 fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {

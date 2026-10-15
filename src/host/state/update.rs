@@ -47,7 +47,7 @@ pub(in crate::host) fn inspect(
                 )),
                 crate::chat::runtime::UpdateReadiness::Busy
                     if policy == Policy::WhenIdle
-                        && !matches!(handle.native_continuity(), crate::chat::NativeContinuity::Durable { .. }) => {
+                        && !handle.native_continuity().retains_provider() => {
                     blockers.push(format!("Conversation {id} has accepted work; wait for it to finish."));
                 }
                 _ => {}
@@ -182,10 +182,7 @@ impl HostState {
             let mut launch = record.session.launch.clone();
             launch.session_id = confirmed.clone();
             let aligned = crate::chat::protocol::align_resume_identity(&mut launch).is_ok();
-            let durable = matches!(
-                record.handle.native_continuity(),
-                crate::chat::NativeContinuity::Durable { .. }
-            );
+            let durable = record.handle.native_continuity().retains_provider();
             let hosted_source = !super::super::chat::owns_codex_listener(&record.session)
                 && self
                     .terminals
@@ -218,7 +215,8 @@ impl HostState {
                     Disposition::Blocked,
                     "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
                 )
-            } else if !aligned || launch.terminal_recipe().is_none() {
+            } else if !aligned || (launch.terminal_recipe().is_none()
+                && !matches!(record.handle.native_continuity(), crate::chat::NativeContinuity::RetainedClaudeActor { .. })) {
                 (
                     Disposition::Blocked,
                     "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.",

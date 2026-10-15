@@ -3750,10 +3750,7 @@ fn validate_chat_identity(
             Some("identity")
         } else if stored.launch.provider != session.launch.provider {
             Some("provider")
-        } else if matches!(
-            stored.native_continuity,
-            crate::chat::NativeContinuity::Durable { .. }
-        ) && stored.native_continuity != session.native_continuity
+        } else if stored.native_continuity.retains_provider() && stored.native_continuity != session.native_continuity
         {
             Some("native continuity")
         } else if stored.owned_codex_listener != session.owned_codex_listener
@@ -7367,6 +7364,36 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(restored.kind, CardKind::Chat(paired));
+        }
+    }
+
+    #[test]
+    fn retained_claude_before_first_result_persists_and_keeps_actor_capability() {
+        let directory = tempdir().unwrap();
+        let path=directory.path().join("claude.sqlite3");
+        let store=StateStore::open(&path,boot("chat-boot")).unwrap();
+        let (mut workspace,mut source)=agent_workspace(crate::agent::Provider::Claude);
+        source.proof=source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal=None;
+        source.launch.session_id=None;
+        source.launch.recipe.arguments=vec!["--print".into()];
+        source.native_continuity=crate::chat::NativeContinuity::RetainedClaudeActor {protocol:1};
+        let card=workspace.cards[0].id;
+        workspace.cards[0].kind=CardKind::Chat(source.clone());
+        let mut lane=SaveLane::default();
+        lane.save(&store,&workspace).unwrap();
+        drop(store);
+        let store=StateStore::open(&path,boot("chat-boot")).unwrap();
+        assert_eq!(store.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(source.clone()));
+        let mut confirmed=source.clone();
+        confirmed.launch.session_id=Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into());
+        workspace.cards[0].kind=CardKind::Chat(confirmed.clone());
+        lane.save(&store,&workspace).unwrap();
+        assert_eq!(store.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(confirmed.clone()));
+        for continuity in [crate::chat::NativeContinuity::ReconnectOnly,crate::chat::NativeContinuity::RetainedClaudeActor {protocol:2}] {
+            let mut wrong=confirmed.clone();wrong.native_continuity=continuity;
+            workspace.cards[0].kind=CardKind::Chat(wrong);
+            assert!(matches!(card_refusal(lane.save(&store,&workspace),card),StoreError::InvalidState(_)));
         }
     }
 

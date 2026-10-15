@@ -824,10 +824,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                             }
                         }
                     } else if session.owned_codex_listener.is_some()
-                        || matches!(
-                            session.native_continuity,
-                            chat::NativeContinuity::Durable { .. }
-                        )
+                        || session.native_continuity.retains_provider()
                     {
                         // Missing history can prevent actor restoration while
                         // its authenticated provider holder is still alive.
