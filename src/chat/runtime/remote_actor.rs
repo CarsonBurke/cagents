@@ -3,8 +3,8 @@
 mod journal;
 pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
-pub(crate) mod final_snapshot;
 mod deadline_io;
+pub(crate) mod final_snapshot;
 use super::{LocalHandle, Rejection, Update};
 use crate::{
     chat::{
@@ -367,7 +367,9 @@ impl RemoteActor {
             || !proof.is_complete()
             || proof.boot_id != record.boot
         {
-            return Err("Retained retirement request has incompatible actor or attachment authority".into());
+            return Err(
+                "Retained retirement request has incompatible actor or attachment authority".into(),
+            );
         }
         final_snapshot::retirement_proved_for_record(record, proof)
     }
@@ -394,10 +396,12 @@ impl RemoteActor {
     pub fn try_close_identity(&self) -> Result<super::CloseIdentity, String> {
         let state = self.0.state.try_lock()
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
-        Ok(super::CloseIdentity {session_id: state.session_id.clone(),
+        Ok(super::CloseIdentity {
+            session_id: state.session_id.clone(),
             native_continuity: state.native_continuity.clone(),
             owns_work: !self.0.preserved.load(Ordering::Acquire) && state.owns_work,
-            completed: state.completed})
+            completed: state.completed,
+        })
     }
     pub fn state(&self) -> Arc<Resident> {
         self.0
@@ -758,7 +762,7 @@ impl RemoteActor {
                         let outcome = state.outcome.clone();
                         let activity_changed = activity != old.activity || outcome != old.outcome;
                         let ready = state.ready && !old.ready;
-                        let identity_changed=state.confirmed_session != old.confirmed_session;
+                        let identity_changed = state.confirmed_session != old.confirmed_session;
                         let outcomes = (state.outbox_latest > state.outbox_ack
                             && state.outbox_latest != old.outbox_latest)
                             || (state.continuity_loss != old.continuity_loss
@@ -786,7 +790,9 @@ impl RemoteActor {
                                 outcome,
                             });
                         }
-                        if identity_changed { (actor.0.notify)(Update::Identity); }
+                        if identity_changed {
+                            (actor.0.notify)(Update::Identity);
+                        }
                         if ready {
                             (actor.0.notify)(Update::Ready);
                         }
@@ -922,12 +928,19 @@ impl RemoteActor {
         args: Value,
         deadline: Instant,
     ) -> Result<T, String> {
-        let control = registry::connect_until(&self.0.socket, deadline)
-            .map_err(|error| error.to_string())?;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|error| error.to_string())?;
         verify_peer(&control, &self.0.identity.record)?;
-        deadline_io::send_until(&control, &Invocation {
-            proof: self.0.proof.clone(), epoch: Some(self.0.epoch), method: method.into(), args,
-        }, deadline)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: method.into(),
+                args,
+            },
+            deadline,
+        )?;
         let response: Result<T, String> = deadline_io::receive_until(&control, deadline)?;
         response
     }
@@ -1250,10 +1263,14 @@ impl RemoteActor {
     /// Final proxy publication and semantic retirement follow in the separately
     /// owned finish-close phase; an IO timeout never proves provider cleanup.
     pub(crate) fn shutdown_provider_until(&self, deadline: Instant) -> Result<(), String> {
-        let remaining = deadline.checked_duration_since(Instant::now())
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
             .ok_or("Retained provider shutdown budget expired; its owner is retained")?;
-        let millis = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX).min(32_000);
-        let _publication: ClosePublication = self.call_until("close_until", json!([millis]), deadline)?;
+        let millis = u64::try_from(remaining.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(32_000);
+        let _publication: ClosePublication =
+            self.call_until("close_until", json!([millis]), deadline)?;
         Ok(())
     }
 
@@ -2567,8 +2584,10 @@ fn hold_failed_startup_for_test(
     };
     let directory = PathBuf::from(directory);
     let metadata = std::fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
-    if !metadata.is_dir() || metadata.uid() != crate::daemon::current_uid()
-        || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_dir()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.permissions().mode() & 0o077 != 0
+    {
         return Err("Startup owner fixture requires its own private directory".into());
     }
     let helper = Process::read(std::process::id() as i32).map_err(|error| error.to_string())?;
@@ -2576,13 +2595,25 @@ fn hold_failed_startup_for_test(
         "source": source,
         "helper": helper,
         "provider": provider,
-    })).map_err(|error| error.to_string())?;
-    let mut marker = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600)
+    }))
+    .map_err(|error| error.to_string())?;
+    let mut marker = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(directory.join("failed-startup.json")).map_err(|error| error.to_string())?;
-    marker.write_all(&bytes).and_then(|()| marker.sync_all()).map_err(|error| error.to_string())?;
+        .open(directory.join("failed-startup.json"))
+        .map_err(|error| error.to_string())?;
+    marker
+        .write_all(&bytes)
+        .and_then(|()| marker.sync_all())
+        .map_err(|error| error.to_string())?;
     let failure = "Fixture refuses Attached before publishing retained actor discovery".to_owned();
-    send(control, &Err::<Attached, _>(failure.clone()), Duration::from_secs(2))?;
+    send(
+        control,
+        &Err::<Attached, _>(failure.clone()),
+        Duration::from_secs(2),
+    )?;
     // The StartupAttempt cancellation is real, but cannot claim this retained
     // LocalHandle was cleaned while the test explicitly holds its owner.
     let deadline = Instant::now() + Duration::from_secs(15);
@@ -3528,7 +3559,8 @@ done"#;
         let record = actor.identity().record;
         drop(_lease);
         let mut proof = source.proof.clone().unwrap();
-        proof.host_incarnation = crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
+        proof.host_incarnation =
+            crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string());
         let _replacement_lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
         let replacement =
             RemoteActor::adopt(&record, source.clone(), proof.clone(), |_| {}).unwrap();

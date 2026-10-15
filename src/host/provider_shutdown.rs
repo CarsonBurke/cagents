@@ -5,7 +5,11 @@
 //! providers whose close admission returned uncertainty.
 use super::{SharedHost, agent_execution, chat};
 use crate::chat::{Session, runtime::Handle};
-use std::{collections::VecDeque, sync::{Arc, Mutex, OnceLock}, time::Instant};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
+};
 
 const WORKERS: usize = 2;
 // This bounds queued worker tickets, not the number of sources in one daemon.
@@ -60,28 +64,45 @@ pub(super) fn finish_until(
     ready: Vec<usize>,
     deadline: Instant,
 ) -> Result<(), String> {
-    if ready.is_empty() { return Ok(()); }
+    if ready.is_empty() {
+        return Ok(());
+    }
     let service = service().as_ref().map_err(Clone::clone)?;
-    let mut waiting = ready.iter().copied().collect::<std::collections::BTreeSet<_>>();
+    let mut waiting = ready
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
     let (replies, receive) = crossbeam_channel::bounded(ready.len());
-    let batch = Arc::new(Batch { host, providers, pending: Mutex::new(ready.into()), replies });
+    let batch = Arc::new(Batch {
+        host,
+        providers,
+        pending: Mutex::new(ready.into()),
+        replies,
+    });
     let mut admitted = 0;
     for _ in 0..WORKERS {
-        if service.try_send(batch.clone()).is_ok() { admitted += 1; }
+        if service.try_send(batch.clone()).is_ok() {
+            admitted += 1;
+        }
     }
     if admitted == 0 {
         return Err("Final provider cleanup capacity is busy; all exact session records and helper journals remain retained".into());
     }
     let mut failure = None;
     while !waiting.is_empty() {
-        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else { break; };
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            break;
+        };
         match receive.recv_timeout(remaining) {
             Ok((index, result)) => {
                 waiting.remove(&index);
                 if let Err(error) = result {
                     tracing::warn!(provider = %batch.providers[index].0.id, %error, "final provider retirement remains unconfirmed");
                     if failure.is_none() {
-                        failure = Some(format!("Provider {} final retirement remains unconfirmed: {error}", batch.providers[index].0.id));
+                        failure = Some(format!(
+                            "Provider {} final retirement remains unconfirmed: {error}",
+                            batch.providers[index].0.id
+                        ));
                     }
                 }
             }
@@ -89,10 +110,18 @@ pub(super) fn finish_until(
         }
     }
     if !waiting.is_empty() {
-        let pending = waiting.into_iter().map(|index| batch.providers[index].0.id.to_string())
-            .collect::<Vec<_>>().join(", ");
-        let error = format!("Final provider retirement is still pending for {pending}; exact cleanup owners and helper journals remain retained");
+        let pending = waiting
+            .into_iter()
+            .map(|index| batch.providers[index].0.id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let error = format!(
+            "Final provider retirement is still pending for {pending}; exact cleanup owners and helper journals remain retained"
+        );
         return Err(failure.map_or(error.clone(), |first| format!("{first}; {error}")));
     }
-    match failure { Some(error) => Err(error), None => Ok(()) }
+    match failure {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }

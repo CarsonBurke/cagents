@@ -203,11 +203,18 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
 // This same admission path is used by the constructor-failure contract test.
 // No clients, provider restoration or helper adoption runs before it returns.
 fn initialize_model(host: &SharedHost, open: impl FnOnce() -> Result<model::Registry, String>) {
-    host.lock().unwrap_or_else(|p| p.into_inner()).expect_model();
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .expect_model();
     match open() {
-        Ok(registry) => host.lock().unwrap_or_else(|p| p.into_inner()).install_model(registry),
+        Ok(registry) => host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .install_model(registry),
         Err(error) => {
-            host.lock().unwrap_or_else(|p| p.into_inner()).model_open_failed();
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .model_open_failed();
             tracing::error!(%error, "the shared workspace model is unavailable; managed native owners were retained");
         }
     }
@@ -453,7 +460,9 @@ fn finish_chat_shutdown_with_budget(
     let (chats, upgrading, pending_native_startups) = {
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
-            state.chats.values()
+            state
+                .chats
+                .values()
                 .map(|record| (record.session.clone(), record.handle.clone()))
                 .collect::<Vec<_>>(),
             state.has_committed_upgrade(),
@@ -466,7 +475,9 @@ fn finish_chat_shutdown_with_budget(
     if pending_native_startups != 0 && result.is_ok() {
         // A real helper may precede a published Record. Preserve the existing
         // startup ownership refusal; this phase never invents cleanup proof.
-        result = Err(format!("{pending_native_startups} native helper startup ownership record(s) remain unconfirmed; exact startup cleanup must settle"));
+        result = Err(format!(
+            "{pending_native_startups} native helper startup ownership record(s) remain unconfirmed; exact startup cleanup must settle"
+        ));
     }
     let deadline = std::time::Instant::now() + budget;
     let mut semantic = Vec::new();
@@ -479,7 +490,11 @@ fn finish_chat_shutdown_with_budget(
         let divisor = u32::try_from(chats.len() - index).unwrap_or(u32::MAX);
         let owner_deadline = now + remaining / divisor;
         let closed = (|| {
-            let preserving = upgrading && chat.try_close_identity()?.native_continuity.retains_provider();
+            let preserving = upgrading
+                && chat
+                    .try_close_identity()?
+                    .native_continuity
+                    .retains_provider();
             if preserving {
                 chat.preserve_for_restart_until(owner_deadline)
             } else {
@@ -493,14 +508,23 @@ fn finish_chat_shutdown_with_budget(
                 unconfirmed.push(session.id.to_string());
                 tracing::warn!(%error, provider = %session.id, "provider shutdown was not confirmed; exact owner retained");
                 if result.is_ok() {
-                    result = Err(format!("Provider {} shutdown was not confirmed: {error}", session.id));
+                    result = Err(format!(
+                        "Provider {} shutdown was not confirmed: {error}",
+                        session.id
+                    ));
                 }
             }
         }
     }
     if !unconfirmed.is_empty() {
-        let owners = format!("Unconfirmed provider owners retained: {}", unconfirmed.join(", "));
-        result = Err(match result { Ok(()) => owners, Err(error) => format!("{error}; {owners}") });
+        let owners = format!(
+            "Unconfirmed provider owners retained: {}",
+            unconfirmed.join(", ")
+        );
+        result = Err(match result {
+            Ok(()) => owners,
+            Err(error) => format!("{error}; {owners}"),
+        });
     }
     // No semantic RPC/registry wait is allowed to postpone another provider's
     // close admission. Pending work owns this complete exact snapshot.

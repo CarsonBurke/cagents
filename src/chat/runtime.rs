@@ -155,7 +155,6 @@ pub(crate) enum Update {
     /// A provider-confirmed identity changed after initial readiness. Scalar
     /// metadata only; the host reads its exact current actor under its fence.
     Identity,
-
 }
 
 #[derive(Clone)]
@@ -220,12 +219,26 @@ impl LocalHandle {
         let state = self.0.state.try_lock()
             .map_err(|_| "Provider presentation metadata is busy or unavailable; retry close after it settles".to_owned())?;
         let completed = self.is_completed();
-        let owns_work = if self.0.history_only { false }
-            else if !completed { true }
-            else { self.0.failure.try_lock()
-                .map_err(|_| "Provider close metadata is busy or unavailable; retry close after it settles".to_owned())?.is_some() };
-        Ok(CloseIdentity {session_id: state.session_id.clone(),
-            native_continuity: state.native_continuity.clone(), owns_work, completed})
+        let owns_work = if self.0.history_only {
+            false
+        } else if !completed {
+            true
+        } else {
+            self.0
+                .failure
+                .try_lock()
+                .map_err(|_| {
+                    "Provider close metadata is busy or unavailable; retry close after it settles"
+                        .to_owned()
+                })?
+                .is_some()
+        };
+        Ok(CloseIdentity {
+            session_id: state.session_id.clone(),
+            native_continuity: state.native_continuity.clone(),
+            owns_work,
+            completed,
+        })
     }
 
     #[cfg(test)]
@@ -348,7 +361,10 @@ impl LocalHandle {
         holder: super::native_holder::Holder,
         reason: String,
     ) {
-        assert!(self.is_completed(), "fixture requires an already closed local actor");
+        assert!(
+            self.is_completed(),
+            "fixture requires an already closed local actor"
+        );
         assert!(self.0.worker.lock().unwrap().is_none());
         let mut retained = self.0.retained_native.lock().unwrap();
         assert!(retained.is_none());
@@ -364,7 +380,10 @@ impl LocalHandle {
         action: impl FnOnce(),
     ) {
         let owner = self.0.retained_native.lock().unwrap();
-        assert_eq!(owner.as_ref().expect("fixture owns a real holder").record(), expected);
+        assert_eq!(
+            owner.as_ref().expect("fixture owns a real holder").record(),
+            expected
+        );
         action();
     }
 
@@ -1735,17 +1754,25 @@ impl LocalHandle {
 
     pub(crate) fn preserve_for_restart_until(&self, deadline: Instant) -> Result<(), String> {
         if Instant::now() >= deadline {
-            return Err("Provider preservation budget expired; its original owner is retained".into());
+            return Err(
+                "Provider preservation budget expired; its original owner is retained".into(),
+            );
         }
-        if !matches!(self.try_close_identity()?.native_continuity,
-            super::NativeContinuity::Durable { .. }) {
+        if !matches!(
+            self.try_close_identity()?.native_continuity,
+            super::NativeContinuity::Durable { .. }
+        ) {
             return Err("This native provider has no verified durable owner".into());
         }
         let admission = match self.0.ownership_admission.try_lock() {
             Ok(admission) => admission,
             Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
-            Err(std::sync::TryLockError::WouldBlock) => return Err(
-                "Provider ownership admission is busy; its original owner remains retained".into()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                return Err(
+                    "Provider ownership admission is busy; its original owner remains retained"
+                        .into(),
+                );
+            }
         };
         if self.0.release_native.load(Ordering::Acquire) {
             return Err("Native provider session stop already owns cleanup".into());
@@ -1864,8 +1891,11 @@ impl LocalHandle {
         if let Some(deadline) = deadline {
             // A preserved holder belongs to the successor. Never feed it into
             // ordinary retained-close reconciliation merely to meet a budget.
-            return if preserving { self.close_result() }
-                else { self.reconcile_native_until(deadline) };
+            return if preserving {
+                self.close_result()
+            } else {
+                self.reconcile_native_until(deadline)
+            };
         }
         {
             let mut retained = self
@@ -3466,11 +3496,16 @@ impl Actor {
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
         let identity_changed = if let Some(confirmed) = confirmed {
-            let mut retained=self.confirmed_session.lock().unwrap_or_else(|p| p.into_inner());
-            let changed=*retained!=confirmed;
-            *retained=confirmed;
+            let mut retained = self
+                .confirmed_session
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let changed = *retained != confirmed;
+            *retained = confirmed;
             changed
-        } else {false};
+        } else {
+            false
+        };
         // The provider's final usage/items may follow its settlement in this
         // same frame. Freeze only after applying the whole frame, then publish
         // its final outcome (which may arrive in a much later frame).
@@ -3498,7 +3533,9 @@ impl Actor {
                 let _ = reply.send(result);
             }
         }
-        if identity_changed { (self.notify)(Update::Identity); }
+        if identity_changed {
+            (self.notify)(Update::Identity);
+        }
         self.publish_activity();
         Ok(())
     }
@@ -4504,25 +4541,88 @@ mod tests {
     fn confirmed_identity_after_initial_ready_emits_a_scalar_identity_wake() {
         struct LateIdentity;
         impl Adapter for LateIdentity {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Default::default())}
-            fn command(&mut self,_:Command)->Result<Step,String> {Ok(Step {writes:vec![serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"})],..Default::default()})}
-            fn receive(&mut self,value:Value)->Result<Step,String> {Ok(Step {events:vec![Event::Session {id:value["identity"].as_str().unwrap().to_owned(),title:None}],..Default::default()})}
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Default::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![
+                        serde_json::json!({"identity":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"}),
+                    ],
+                    ..Default::default()
+                })
+            }
+            fn receive(&mut self, value: Value) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Session {
+                        id: value["identity"].as_str().unwrap().to_owned(),
+                        title: None,
+                    }],
+                    ..Default::default()
+                })
+            }
         }
-        let root=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec::from(&crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:root.path().into(),environment:Default::default(),unset_environment:Default::default()});
-        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
-        let store=preflight(&spec,&mut initial).unwrap();
-        let events=Arc::new(Mutex::new(Vec::new()));let observed=events.clone();
-        let handle=LocalHandle::start(spec,Box::new(LateIdentity),initial,store,None,move |update|observed.lock().unwrap().push(update)).unwrap();
-        until(&handle,|state|state.ready);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec::from(&crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.path().into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        });
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = events.clone();
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(LateIdentity),
+            initial,
+            store,
+            None,
+            move |update| observed.lock().unwrap().push(update),
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
         assert!(handle.confirmed_session_id().is_none());
         handle.command(Command::Refresh).unwrap();
-        until(&handle,|state|state.session_id.is_some());
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while !events.lock().unwrap().iter().any(|update|matches!(update,Update::Identity)) {assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));}
-        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Ready)).count(),1,"the provider never reinitializes just to publish its identity");
-        assert_eq!(events.lock().unwrap().iter().filter(|update|matches!(update,Update::Identity)).count(),1);
-        assert_eq!(handle.confirmed_session_id().as_deref(),Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+        until(&handle, |state| state.session_id.is_some());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|update| matches!(update, Update::Identity))
+        {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update, Update::Ready))
+                .count(),
+            1,
+            "the provider never reinitializes just to publish its identity"
+        );
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|update| matches!(update, Update::Identity))
+                .count(),
+            1
+        );
+        assert_eq!(
+            handle.confirmed_session_id().as_deref(),
+            Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        );
         handle.close().unwrap();
     }
 
