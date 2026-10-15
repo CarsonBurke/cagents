@@ -237,9 +237,13 @@ impl RegisteredHeads {
                     // An actual primary checkout needs no core.worktree. Ask
                     // only this invocation, whose private metadata is common;
                     // metadata-only invocations without a backlink refuse.
-                    service.invocation_worktree(repository, cancel).map_err(io)?
+                    service
+                        .invocation_worktree(repository, cancel)
+                        .map_err(io)?
                 } else {
-                    service.configured_primary_worktree(repository, cancel).map_err(io)?
+                    service
+                        .configured_primary_worktree(repository, cancel)
+                        .map_err(io)?
                 };
                 record.path = fs::canonicalize(common_path.join(configured)).map_err(io)?;
             }
