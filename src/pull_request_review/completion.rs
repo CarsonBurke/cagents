@@ -4,6 +4,9 @@ use super::*;
 use crate::github::review_controls::{MergeMethod, ReviewControlMutation, ReviewControls, Reviewer, ReviewerPage};
 use cosmic::iced::widget::text_editor;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumedInputs { None, MergeMessage(u64), Reviewers(u64), PublishedEdit }
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Toggle,
@@ -28,7 +31,7 @@ pub enum Action {
     PublishedBody(text_editor::Action),
     CancelPublished,
     SavePublished,
-    Finished { generation:u64, result:Result<ReviewMutationOutcome<()>,String> },
+    Finished { generation:u64, consumed:ConsumedInputs, result:Result<ReviewMutationOutcome<()>,String> },
 }
 impl Action { pub fn background(&self)->bool{matches!(self,Self::Loaded{..}|Self::Candidates{..}|Self::Finished{..}|Self::Search{..})} }
 
@@ -44,8 +47,10 @@ pub(super) struct Controls {
     title:String,
     body:text_editor::Content<cosmic::Renderer>,
     edited:bool,
+    message_revision:u64,
     reviewers_open:bool,
     reviewers_edited:bool,
+    reviewers_revision:u64,
     selected:BTreeMap<String,Reviewer>,
     teams:bool,
     query:String,
@@ -57,7 +62,7 @@ pub(super) struct Controls {
     published:Option<PublishedEdit>,
 }
 impl Default for Controls {
-    fn default()->Self{Self{open:false,loading:false,load_id:0,busy:false,data:None,error:None,uncertain:false,method:0,title:String::new(),body:text_editor::Content::new(),edited:false,reviewers_open:false,reviewers_edited:false,selected:BTreeMap::new(),teams:false,query:String::new(),request:0,candidates:Vec::new(),next:None,candidates_loading:false,cancellation:CancellationToken::new(),published:None}}
+    fn default()->Self{Self{open:false,loading:false,load_id:0,busy:false,data:None,error:None,uncertain:false,method:0,title:String::new(),body:text_editor::Content::new(),edited:false,message_revision:0,reviewers_open:false,reviewers_edited:false,reviewers_revision:0,selected:BTreeMap::new(),teams:false,query:String::new(),request:0,candidates:Vec::new(),next:None,candidates_loading:false,cancellation:CancellationToken::new(),published:None}}
 }
 struct PublishedEdit { review: bool, id: String, original: String, content: text_editor::Content<cosmic::Renderer> }
 impl Controls {
@@ -89,9 +94,9 @@ impl State {
                     Err(error)=>self.completion.error=Some(error),
                 }
             }
-            Action::Method(index)=>{if self.completion.data.as_ref().is_some_and(|data|index<data.allowed_methods.len()){self.completion.method=index;}}
-            Action::Title(title)=>{self.completion.title=title;self.completion.edited=true;}
-            Action::Body(action)=>{if action.is_edit(){self.completion.edited=true;}self.completion.body.perform(action);}
+            Action::Method(index)=>{if self.completion.data.as_ref().is_some_and(|data|index<data.allowed_methods.len()){self.completion.method=index;self.completion.edited=true;self.completion.message_revision=self.completion.message_revision.wrapping_add(1);}}
+            Action::Title(title)=>{self.completion.title=title;self.completion.edited=true;self.completion.message_revision=self.completion.message_revision.wrapping_add(1);}
+            Action::Body(action)=>{if action.is_edit(){self.completion.edited=true;self.completion.message_revision=self.completion.message_revision.wrapping_add(1);}self.completion.body.perform(action);}
             Action::Merge=>{
                 let Some(data)=self.completion.data.as_ref()else{return ActionTask::none();};
                 if data.merge_blocked.is_some() || self.context.as_ref().is_none_or(|context|context.pending.is_some() || context.head_oid != data.head_oid) || self.discussion.has_local_work(){return ActionTask::none();}
@@ -127,7 +132,7 @@ impl State {
                     Err(error)=>self.completion.error=Some(error),
                 }
             }
-            Action::Pick(reviewer)=>{if self.completion.selected.remove(&reviewer.id).is_none(){self.completion.selected.insert(reviewer.id.clone(),reviewer);}self.completion.reviewers_edited=true;}
+            Action::Pick(reviewer)=>{if self.completion.selected.remove(&reviewer.id).is_none(){self.completion.selected.insert(reviewer.id.clone(),reviewer);}self.completion.reviewers_edited=true;self.completion.reviewers_revision=self.completion.reviewers_revision.wrapping_add(1);}
             Action::SaveReviewers=>{
                 if self.completion.data.as_ref().is_none_or(|data|!data.reviewers_complete){return ActionTask::none();}
                 return self.mutate_completion(ReviewControlMutation::Reviewers(self.completion.selected.values().cloned().collect()));
@@ -148,10 +153,19 @@ impl State {
                 let mutation=if editor.review{ReviewControlMutation::EditReviewBody{review:editor.id.clone(),body:editor.content.text()}}else{ReviewControlMutation::EditIssueComment{comment:editor.id.clone(),body:editor.content.text()}};
                 return self.mutate_completion(mutation);
             }
-            Action::Finished{generation,result}=>{
+            Action::Finished{generation,consumed,result}=>{
                 if generation!=self.generation{return ActionTask::none();}self.completion.busy=false;
                 match result {
-                    Ok(ReviewMutationOutcome::Applied(()))=>{self.completion.error=None;self.completion.edited=false;self.completion.reviewers_edited=false;self.completion.published=None;self.notice=Some("Pull request updated on GitHub.".into());return ActionTask::batch([self.load_completion(),self.refresh()]);}
+                    Ok(ReviewMutationOutcome::Applied(()))=>{
+                        self.completion.error=None;
+                        match consumed {
+                            ConsumedInputs::MergeMessage(revision) if revision==self.completion.message_revision=>self.completion.edited=false,
+                            ConsumedInputs::Reviewers(revision) if revision==self.completion.reviewers_revision=>self.completion.reviewers_edited=false,
+                            ConsumedInputs::PublishedEdit=>self.completion.published=None,
+                            _=>{}
+                        }
+                        self.notice=Some("Pull request updated on GitHub.".into());return ActionTask::batch([self.load_completion(),self.refresh()]);
+                    }
                     Ok(ReviewMutationOutcome::NotApplied{failure})=>self.completion.error=Some(failure.to_string()),
                     Ok(ReviewMutationOutcome::OutcomeUnknown{failure})=>{self.completion.uncertain=true;self.completion.error=Some(format!("GitHub may have applied the change. Check GitHub, then refresh before retrying. {failure}"));}
                     Err(error)=>self.completion.error=Some(error),
@@ -188,6 +202,12 @@ impl State {
         let Some(target)=&self.target else{return ActionTask::none();};
         let key=PullRequestKey::new(target.repository.clone(),target.pull_request.number).expect("verified PR key");
         self.completion.load_id=self.completion.load_id.wrapping_add(1);self.completion.loading=false;
+        let consumed=match &mutation {
+            ReviewControlMutation::Merge{..}=>ConsumedInputs::MergeMessage(self.completion.message_revision),
+            ReviewControlMutation::Reviewers(_)=>ConsumedInputs::Reviewers(self.completion.reviewers_revision),
+            ReviewControlMutation::EditReviewBody{..}|ReviewControlMutation::EditIssueComment{..}=>ConsumedInputs::PublishedEdit,
+            _=>ConsumedInputs::None,
+        };
         let generation=self.generation;let api=Arc::clone(&self.api);let expected_context=self.context.clone();let expected_head=self.context.as_ref().map(|context|context.head_oid.clone());let original=self.completion.published.as_ref().map(|edit|edit.original.clone());let expected_reviewers=self.completion.data.as_ref().map(|data|data.requested_reviewers.iter().map(|reviewer|reviewer.id.clone()).collect::<BTreeSet<_>>());self.completion.busy=true;self.completion.error=None;
         iced::Task::perform(async move{
             let result=tokio::task::spawn_blocking(move||{
@@ -211,7 +231,7 @@ impl State {
                     _=>{}
                 }
                 api.mutate_review_control(&key.repository,&fresh.pull_request_id,&mutation,&cancellation).map_err(|error|error.to_string())
-            }).await.unwrap_or_else(|error|Err(error.to_string()));Action::Finished{generation,result}
+            }).await.unwrap_or_else(|error|Err(error.to_string()));Action::Finished{generation,consumed,result}
         },|action|super::Action::Completion(action))
     }
 
@@ -296,7 +316,7 @@ mod tests {
     #[test]
     fn stale_control_receipt_cannot_clear_a_newer_write() {
         let (mut state,_)=state();state.completion.busy=true;
-        drop(state.update_completion(Action::Finished{generation:state.generation.wrapping_add(1),result:Ok(ReviewMutationOutcome::Applied(()))}));
+        drop(state.update_completion(Action::Finished{generation:state.generation.wrapping_add(1),consumed:ConsumedInputs::None,result:Ok(ReviewMutationOutcome::Applied(()))}));
         assert!(state.completion.busy);
     }
     fn controls_fixture()->ReviewControls {
@@ -369,6 +389,65 @@ mod tests {
                 assert!(state.completion.error.as_ref().unwrap().contains("signed-in account changed"));
             }
         }
+    }
+
+    fn configured_controls() -> (State, Arc<ScriptedApi>) {
+        let (mut state,api)=state(); state.target=Some(target(1));
+        state.context=Some(loaded(Vec::new(),Vec::new()).context);
+        state.completion.data=Some(controls_fixture());
+        *api.controls.lock().unwrap()=Some(controls_fixture());
+        *api.control_context.lock().unwrap()=state.context.clone();
+        (state,api)
+    }
+    fn selected_reviewer(id:&str) -> Reviewer {
+        Reviewer { id:id.into(),label:id.into(),team:false,bot:false }
+    }
+    fn finish_controls_read(state:&mut State) {
+        let generation=state.generation; let request=state.completion.load_id;
+        drop(state.update_completion(Action::Loaded { generation,request,result:Ok(controls_fixture()) }));
+    }
+    #[test]
+    fn unrelated_success_keeps_staged_merge_text_and_requested_reviewers() {
+        for mutation in [ReviewControlMutation::Draft(true),ReviewControlMutation::AutoMerge { enabled:false,method:MergeMethod::Merge }] {
+            let (mut state,_)=configured_controls();
+            drop(state.update_completion(Action::Title("My squash title".into())));
+            drop(state.update_completion(Action::Body(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("My squash body".into()))))));
+            drop(state.update_completion(Action::Pick(selected_reviewer("U_next"))));
+            let task=state.mutate_completion(mutation); let result=receipt(task);
+            drop(state.update_completion(result)); finish_controls_read(&mut state);
+            assert_eq!(state.completion.title,"My squash title"); assert_eq!(state.completion.body.text(),"My squash body");
+            assert!(state.completion.selected.contains_key("U_next"));
+            assert!(state.completion.edited); assert!(state.completion.reviewers_edited);
+        }
+    }
+    #[test]
+    fn reviewer_success_consumes_only_the_submitted_picker_revision() {
+        for edit_while_busy in [false,true] {
+            let (mut state,api)=configured_controls();
+            drop(state.update_completion(Action::Title("Keep my merge title".into())));
+            let first=selected_reviewer("U_first");
+            drop(state.update_completion(Action::Pick(first.clone())));
+            let task=state.mutate_completion(ReviewControlMutation::Reviewers(vec![first.clone()]));
+            if edit_while_busy { drop(state.update_completion(Action::Pick(selected_reviewer("U_later")))); }
+            let result=receipt(task); drop(state.update_completion(result));
+            let mut fresh=controls_fixture(); fresh.requested_reviewers=vec![first.clone()];
+            drop(state.update_completion(Action::Loaded { generation:state.generation,request:state.completion.load_id,result:Ok(fresh) }));
+            assert_eq!(state.completion.title,"Keep my merge title"); assert!(state.completion.edited);
+            assert_eq!(state.completion.reviewers_edited,edit_while_busy);
+            assert_eq!(state.completion.selected.contains_key("U_later"),edit_while_busy);
+            assert_eq!(*api.controls_written.lock().unwrap(),vec![ReviewControlMutation::Reviewers(vec![first])]);
+        }
+    }
+    #[test]
+    fn merge_receipt_cannot_acknowledge_text_edited_after_the_request_started() {
+        let (mut state,api)=configured_controls();
+        drop(state.update_completion(Action::Title("Submitted title".into())));
+        let mutation=ReviewControlMutation::Merge { method:MergeMethod::Squash,title:state.completion.title.clone(),body:String::new(),expected_head:"a".repeat(40) };
+        let task=state.mutate_completion(mutation.clone());
+        drop(state.update_completion(Action::Title("New title typed during the write".into())));
+        let result=receipt(task); drop(state.update_completion(result)); finish_controls_read(&mut state);
+        assert_eq!(state.completion.title,"New title typed during the write"); assert!(state.completion.edited);
+        assert_eq!(*api.controls_written.lock().unwrap(),vec![mutation]);
     }
 
 }
