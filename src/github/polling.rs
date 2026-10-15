@@ -53,9 +53,12 @@ impl RateLimit {
         }
         Some(Self {
             retry_at: (if header("x-ratelimit-remaining") == Some(0) {
-                header("x-ratelimit-reset").into_iter().chain(retry_after.map(|seconds|now.saturating_add(seconds))).max()
+                header("x-ratelimit-reset")
+                    .into_iter()
+                    .chain(retry_after.map(|seconds| now.saturating_add(seconds)))
+                    .max()
             } else {
-                retry_after.map(|seconds|now.saturating_add(seconds))
+                retry_after.map(|seconds| now.saturating_add(seconds))
             })
             .or_else(|| header("x-ratelimit-reset"))
             .unwrap_or_else(|| now.saturating_add(60))
@@ -135,8 +138,24 @@ mod tests {
             );
         }
         assert_eq!(RateLimit::classify("secondary rate limit\nRetry-After: 100\nX-RateLimit-Remaining: 4000\nX-RateLimit-Reset: 3600", 100).unwrap().retry_at, 200);
-        assert_eq!(RateLimit::classify("X-RateLimit-Remaining: 0\nX-RateLimit-Reset: 105\nRetry-After: 20",100).unwrap().retry_at,120);
-        assert_eq!(RateLimit::classify("X-RateLimit-Remaining: 0\nX-RateLimit-Reset: 150\nRetry-After: 20",100).unwrap().retry_at,150);
+        assert_eq!(
+            RateLimit::classify(
+                "X-RateLimit-Remaining: 0\nX-RateLimit-Reset: 105\nRetry-After: 20",
+                100
+            )
+            .unwrap()
+            .retry_at,
+            120
+        );
+        assert_eq!(
+            RateLimit::classify(
+                "X-RateLimit-Remaining: 0\nX-RateLimit-Reset: 150\nRetry-After: 20",
+                100
+            )
+            .unwrap()
+            .retry_at,
+            150
+        );
         assert!(RateLimit::classify("network disconnected", 100).is_none());
         assert!(RateLimit::classify("Access-Control-Expose-Headers: Retry-After, X-RateLimit-Remaining, X-RateLimit-Reset\nX-RateLimit-Remaining: 4000\nX-RateLimit-Reset: 200", 100).is_none());
     }
