@@ -5766,6 +5766,22 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if is_hex_oid(name) {
             return Ok(BaseRevision::object_id(name)?);
         }
+        // Qualified dropdown identities must not be shadowed by a local
+        // branch whose literal short name happens to begin with refs/.
+        if let Some(branch) = name.strip_prefix("refs/heads/") {
+            if refs.local.iter().any(|local| local.name.as_str() == name) {
+                return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(branch)?));
+            }
+            return Err(ValidationError::InvalidBase(format!("Local base {name} disappeared")).into());
+        }
+        if name.starts_with("refs/remotes/") {
+            return Ok(BaseRevision::remote_ref(name)?);
+        }
+        if name.starts_with("refs/tags/") {
+            let oid = self.resolve_optional_revision(repository, &format!("{name}^{{commit}}"), cancellation)?
+                .ok_or_else(|| ValidationError::InvalidBase(format!("Tag base {name} disappeared")))?;
+            return Ok(BaseRevision::object_id(oid.to_string())?);
+        }
         let local_name = name.strip_prefix("refs/heads/").unwrap_or(name);
         if refs
             .local
@@ -12023,6 +12039,15 @@ mod worktree_journal_tests {
         let remote = fixture.service.resolve_worktree_request_selected(&input, Some("refs/remotes/origin/topic"), &token).unwrap();
         assert_eq!(remote.branch.as_str(), "topic"); assert!(remote.track);
         assert!(fixture.service.resolve_worktree_request_selected(&input, Some("refs/heads/disappeared"), &token).is_err());
+        fixture.git(&["branch", "refs/remotes/origin/topic"]);
+        fixture.git(&["branch", "refs/tags/v1"]);
+        fixture.git(&["tag", "v1"]);
+        let mut input = fixture.input("new-from-base");
+        input.base = "refs/remotes/origin/topic".into();
+        let request = fixture.service.resolve_worktree_request(&input, &token).unwrap();
+        assert!(matches!(request.base, BaseRevision::RemoteRef(ref reference) if reference.as_str() == "refs/remotes/origin/topic"));
+        input.base = "refs/tags/v1".into();
+        assert!(matches!(fixture.service.resolve_worktree_request(&input, &token).unwrap().base, BaseRevision::ObjectId(_)));
     }
 
     #[test]
