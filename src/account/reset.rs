@@ -1,23 +1,25 @@
 //! Provider plan allowances and earned reset credits. These observations are
 //! metadata, never permission to spend a credit or authority over a session.
 //! Conversation token counts and goal budgets deliberately have no input here.
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[cfg(feature = "host")]
 pub(crate) mod attempts;
+#[cfg(feature = "host")]
+pub(crate) mod transport;
 
 const MAX_BUCKETS: usize = 128;
 const MAX_CREDIT_ROWS: usize = 128;
 const MAX_IDENTIFIER_BYTES: usize = 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ProviderAccount {
     pub account_id: String,
     pub backend_origin: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Window {
     pub bucket: String,
     pub period: Period,
@@ -25,14 +27,14 @@ pub(crate) struct Window {
     pub resets_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Period {
     Primary,
     Secondary,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResetCredit {
     pub id: String,
     pub supported_type: bool,
@@ -40,14 +42,14 @@ pub(crate) struct ResetCredit {
     pub expires_at_ms: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResetCredits {
     /// Authoritative count; detail rows may be capped or unavailable.
     pub available_count: u64,
     pub details: Option<Vec<ResetCredit>>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Allowance {
     pub observed_at_ms: u64,
     pub account: Option<ProviderAccount>,
@@ -60,7 +62,7 @@ fn identifier(value: &Value) -> Result<String, String> {
     identifier_str(value.as_str().ok_or("Provider identifier is not a string")?).map(str::to_owned)
 }
 
-fn identifier_str(value: &str) -> Result<&str, String> {
+pub(crate) fn identifier_str(value: &str) -> Result<&str, String> {
     if value.is_empty() || value.len() > MAX_IDENTIFIER_BYTES || value.chars().any(char::is_control) {
         return Err("Provider identifier is empty, oversized or contains control characters".into());
     }

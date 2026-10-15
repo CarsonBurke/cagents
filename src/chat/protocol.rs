@@ -209,6 +209,9 @@ pub struct ServerIdentity {
 pub trait Adapter: Send {
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    fn read_allowance(&mut self, _request: crate::account::reset::transport::Read) -> Result<Step, String> {
+        Err("This provider transport has no supported read-only allowance/reset-inventory API; no provider command was sent".into())
+    }
     fn command_for_run(
         &mut self,
         _run: crate::model::RunId,
