@@ -1322,7 +1322,11 @@ impl TerminalHandle {
     }
 
     fn release_completed_holder(&self) -> Result<(), String> {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        self.release_completed_holder_until(std::time::Instant::now() + std::time::Duration::from_secs(3))
+    }
+
+    pub(crate) fn release_completed_holder_until(&self, deadline: std::time::Instant) -> Result<(), String> {
+        if std::time::Instant::now() >= deadline {return Err("Terminal family cleanup deadline expired; its exact owner remains retained".into());}
         let mut retained = self.inner.published.retained_holder.try_lock()
             .map_err(|_| "Another close retains this terminal holder; retry after its deadline".to_owned())?;
         if let Some(holder) = retained.as_mut() {holder.close_until(deadline)?;}
