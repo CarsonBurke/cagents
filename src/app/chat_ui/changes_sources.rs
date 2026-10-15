@@ -111,7 +111,7 @@ struct Entry {
     manual_pages:HashSet<usize>,
     opened:HashSet<usize>,
     suspended:HashSet<usize>,
-    suspended_paths:HashMap<usize,bool>,
+    suspended_paths:HashMap<usize,(bool,usize)>,
     patches:HashMap<usize,LoadedPatch>,
     restored:HashMap<usize,(Arc<str>,chat::source_owners::ResidentPatch)>,
     patch_requests:HashMap<usize,u64>,
@@ -135,11 +135,20 @@ pub(super) struct LoadedPatch {
     pub view:tool_text::ToolText,
     pub prefixes:Arc<Vec<[u8;32]>>,
 }
+impl LoadedPatch {
+    fn take_body(&mut self)->(Arc<str>,Arc<Vec<[u8;32]>>) {
+        let text=std::mem::replace(&mut self.text,Arc::from(""));
+        let prefixes=std::mem::take(&mut self.prefixes);
+        let view=std::mem::replace(&mut self.view,tool_text::ToolText::from_shared(None,
+            tool_text::Shared::prepare(Arc::from(""),tool_text::Language::Plain)));
+        drop(view);(text,prefixes)
+    }
+}
 impl Drop for LoadedPatch {
     fn drop(&mut self) {
-        // The canonical view owns UI-only Rc handles. Keep its pure body/index
-        // alive through field destruction, then release them off the event thread.
-        retire_copy((self.text.clone(),self.record.clone(),self.prefixes.clone()));
+        // All old UI body/index fields are empty before enqueue. A fast
+        // reclaimer therefore cannot leave the UI holding the final owner.
+        let body=self.take_body();retire_copy(body);
     }
 }
 /// Action clones share a single completion owner; a stale result is taken and
@@ -189,6 +198,7 @@ impl Entry {
         self.patch_requests.retain(|index,_|wanted.contains(index));
         self.patches.retain(|index,_|wanted.contains(index));
         self.restored.retain(|index,_|wanted.contains(index));
+        self.suspended.retain(|index|wanted.contains(index));
         let ready:Vec<_>=wanted.into_iter().filter(|index|self.file(*index).is_some()
             && self.current(*index).is_none() && !self.patch_errors.contains_key(index)).collect();
         for index in ready {self.patch_requests.entry(index).or_insert_with(attempt);}
@@ -210,8 +220,8 @@ impl State {
         for entry in self.entries.values_mut() {
             for (offset,page) in &entry.pages {
                 for file in &page.files {
-                    entry.suspended_paths.insert(file.file_index,matches!(file.kind,chat::ChangeKind::Renamed {..}));
-                    if entry.opened.contains(&file.file_index) {entry.manual_pages.insert(*offset);}
+                    entry.suspended_paths.insert(file.file_index,(matches!(file.kind,chat::ChangeKind::Renamed {..}),*offset));
+                    entry.manual_pages.insert(*offset);
                 }
             }
             for index in entry.patches.keys() {
@@ -231,7 +241,7 @@ impl State {
     pub(super) fn pending_paths(&self,item:&str)->Vec<Vec<u32>> {
         let Some(entry)=self.aliases.get(item).and_then(|key|self.entries.get(key)) else {return Vec::new();};
         let mut paths=Vec::new();
-        for (index,renamed) in &entry.suspended_paths {
+        for (index,(renamed,_offset)) in &entry.suspended_paths {
             if entry.file(*index).is_none() && let Ok(index)=u32::try_from(*index) {
                 paths.push(vec![7,index,0]);if *renamed {paths.push(vec![7,index,1]);}
             }
@@ -246,10 +256,14 @@ impl State {
     pub(super) fn suspended_paths(&self,item:&str)->Vec<Vec<u32>> {
         let Some(entry)=self.aliases.get(item).and_then(|key|self.entries.get(key)) else {return Vec::new();};
         let mut paths=Vec::new();
-        for (index,renamed) in &entry.suspended_paths {if let Ok(index)=u32::try_from(*index) {
+        for (index,(renamed,offset)) in &entry.suspended_paths {if (entry.pages.contains_key(offset) || entry.requested.contains_key(offset)) && let Ok(index)=u32::try_from(*index) {
             paths.push(vec![7,index,0]);if *renamed {paths.push(vec![7,index,1]);}
         }}
-        for index in &entry.suspended {if let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}}
+        for index in &entry.suspended {
+            let waiting=entry.current(*index).is_some() || entry.patch_requests.contains_key(index)
+                || entry.suspended_paths.get(index).is_some_and(|(_,offset)|entry.requested.contains_key(offset));
+            if waiting && let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}
+        }
         paths.sort_by_key(|path|(path[1],if path[0]==6 {2}else {path[2]}));paths
     }
     pub(super) fn reconcile_demand(&mut self,expanded:&HashSet<String>,find:bool) {
@@ -929,6 +943,28 @@ mod tests {
         state.project(Arc::new(replacement),None,&expanded,false);
         assert!(state.entries[&page.source].opened.is_empty());assert!(state.pending_paths(&page.source.source_id).is_empty(),"rewrites cannot suspend an old selection");
         state.clear();assert!(state.entries.is_empty(),"Reset/Ready/revoke forgets intent completely");
+    }
+    #[tokio::test]
+    async fn ending_find_after_eviction_does_not_leave_undemanded_patch_pending() {
+        let page=fixture("exact original patch");let(mut state,source,expanded)=open(&page,"part");
+        let request=state.entries[&page.source].patch_requests[&0];
+        assert!(state.complete_patch(&page.source,0,request,Ok(ready(&page,"exact original patch").await)));
+        // It was shown by Find, and manually closed while Find kept it exposed.
+        state.entries.get_mut(&page.source).unwrap().opened.clear();state.evict(true);
+        state.project(source,None,&expanded,true);assert!(state.entries[&page.source].suspended.contains(&0));
+        state.reconcile_demand(&expanded,false);
+        assert!(!state.entries[&page.source].suspended.contains(&0));
+        assert!(!state.suspended_paths(&page.source.source_id).contains(&vec![6,0]));
+    }
+    #[test]
+    fn patch_body_transfer_removes_ui_owners_before_a_fast_reclaimer_can_run() {
+        let page=fixture("last exact patch body");let text:Arc<str>=Arc::from("last exact patch body");let weak=Arc::downgrade(&text);
+        let prepared=tool_text::Shared::prepare(text.clone(),tool_text::Language::Diff);let prefixes=prepared.prefixes();
+        let record=chat::source_owners::ResidentPatch {source:page.source.clone(),epoch:page.epoch,file:page.files[0].clone()};
+        let mut loaded=LoadedPatch {text,record,view:tool_text::ToolText::from_shared(None,prepared),prefixes};
+        let (text,prefixes)=loaded.take_body();assert!(loaded.text.is_empty());assert!(loaded.view.text.is_empty());
+        assert_eq!(Arc::strong_count(&text),1,"UI fields no longer race the transferred body guard");
+        drop(loaded);retire_copy((text,prefixes));flush_retired();assert!(weak.upgrade().is_none());
     }
     #[test]
     fn unselected_children_never_demand_patch_bodies_and_selection_retires_parent_owners() {
