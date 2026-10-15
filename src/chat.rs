@@ -2115,6 +2115,9 @@ pub enum Event {
     },
     /// Exact historical ownership/results; never authority over current activity.
     TurnOutcome(turn_outcomes::TurnUpdate),
+    /// Parent history item aliases whose actual source records explicitly
+    /// name this native session. Missing source IDs remain unqualified.
+    HistoryOrigins { session_id: String, item_ids: Vec<String> },
 }
 
 #[cfg(test)]
