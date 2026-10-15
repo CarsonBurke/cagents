@@ -141,7 +141,27 @@ impl<'a> ManagedDisplayIndex<'a> {
         Some(ManagedDisplay { scope, pane })
     }
 
+    /// Explicit activation supplies an exact current proved counterpart. Saved
+    /// membership still owns the surface; an unpublished actor uses this typed
+    /// request rather than inferring a session from its original launch surface.
+    pub fn resolve_activation(&self, agent: &crate::agent_execution::Agent, requested: &crate::agent_execution::HostedSession) -> Option<ManagedDisplay> {
+        use crate::agent_execution::HostedSession;
+        if agent.closed { return None; }
+        let owned = agent.session.as_ref().is_some_and(|current| current.same_process(requested))
+            || agent.console.as_ref().is_some_and(|current| HostedSession::Terminal(current.clone()).same_process(requested));
+        if !owned { return None; }
+        let resource = match requested { HostedSession::Chat(session) => (0, session.id), HostedSession::Terminal(session) => (1, session.id) };
+        let scope = self.scope_with_resource(agent, Some(resource))?.clone();
+        let id = CardId::from_uuid(agent.id.as_uuid());
+        let pane = self.owners.get(&id).and_then(Option::as_ref).map(|(_, pane)| (*pane).clone());
+        Some(ManagedDisplay { scope, pane })
+    }
+
     pub fn scope<'b>(&self, agent: &'b crate::agent_execution::Agent) -> Option<&'b Scope> where 'a: 'b {
+        self.scope_with_resource(agent, None)
+    }
+
+    fn scope_with_resource<'b>(&self, agent: &'b crate::agent_execution::Agent, requested: Option<(u8, crate::model::TerminalId)>) -> Option<&'b Scope> where 'a: 'b {
         use crate::agent_execution::{HostedSession, Surface};
         let id = CardId::from_uuid(agent.id.as_uuid());
         let owner = match self.owners.get(&id) {
@@ -150,6 +170,8 @@ impl<'a> ManagedDisplayIndex<'a> {
         };
         let resource = if let Some((_, pane)) = owner {
             pane_resource(&pane.kind)?
+        } else if let Some(requested) = requested {
+            requested
         } else if agent.spec.surface == Surface::Terminal {
             (1, agent.console.as_ref()?.id)
         } else {
@@ -643,6 +665,44 @@ mod managed_display_tests {
                 assert_eq!(agent, original, "display resolution cannot rewrite accepted execution ownership");
             }
         }
+    }
+
+    #[test]
+    fn attention_explicit_counterpart_activation_preserves_saved_surface_and_proof_fences() {
+        let (agent, native, terminal) = fixture();
+        let current_native = agent.session.clone().unwrap();
+        let current_console = HostedSession::Terminal(agent.console.clone().unwrap());
+        for pane in [native.clone(), terminal.clone()] {
+            let scope = Scope::Channel(ChannelId::new());
+            let mut model = super::super::WorkspaceModel { views: vec![View { scope: scope.clone(), revision: 1, panes: vec![pane.clone()], retired: vec![] }], ..Default::default() };
+            for requested in [&current_native, &current_console] {
+                let display = ManagedDisplayIndex::new(&model).resolve_activation(&agent, requested).unwrap();
+                assert_eq!(display.scope, scope);
+                assert_eq!(display.pane.as_ref(), Some(&pane), "a current counterpart cannot change the saved surface");
+            }
+            let mut stale = current_native.clone();
+            if let HostedSession::Chat(session) = &mut stale {
+                session.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("stale-owner");
+            }
+            assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &stale).is_none());
+            if let HostedSession::Chat(session) = &mut stale { session.proof = None; }
+            assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &stale).is_none());
+            model.views.push(model.views[0].clone());
+            assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &current_native).is_none());
+            model.views.truncate(1);
+            model.views[0].panes.clear(); model.views[0].retired.push(pane.id);
+            assert!(ManagedDisplayIndex::new(&model).resolve_activation(&agent, &current_console).is_none());
+        }
+        let empty = super::super::WorkspaceModel::default();
+        let mut native_only = agent.clone();
+        native_only.spec.surface = Surface::Terminal; native_only.console = None;
+        let display = ManagedDisplayIndex::new(&empty).resolve_activation(&native_only, &current_native).unwrap();
+        assert_eq!(display.scope, agent.placement);
+        assert!(display.pane.is_none(), "unpublished activation uses exact current request, not historical spec.surface");
+        let mut alias = terminal; alias.id = CardId::new();
+        let aliases = super::super::WorkspaceModel { views: vec![View { scope: Scope::Channel(ChannelId::new()), revision: 1, panes: vec![alias], retired: vec![] }], ..Default::default() };
+        assert!(ManagedDisplayIndex::new(&aliases).resolve_activation(&agent, &current_console).is_none(),
+            "an unpublished explicit counterpart cannot duplicate an existing inventory alias");
     }
 
     #[test]

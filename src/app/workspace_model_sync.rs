@@ -741,12 +741,6 @@ impl Cagents {
         agent: &crate::agent_execution::Agent,
         display: crate::workspace_model::views::ManagedDisplay,
     ) -> Option<Task<Message>> {
-        let placement = &display.scope;
-        if agent.closed
-            || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
-        {
-            return None;
-        }
         let session = match display.pane.as_ref().map(|pane| &pane.kind) {
             Some(CardKind::Chat(session)) => crate::agent_execution::HostedSession::Chat(session.clone()),
             Some(CardKind::Terminal(session)) => crate::agent_execution::HostedSession::Terminal(session.clone()),
@@ -754,6 +748,42 @@ impl Cagents {
             None if agent.spec.surface == crate::agent_execution::Surface::Terminal => crate::agent_execution::HostedSession::Terminal(agent.console.clone()?),
             None => agent.session.clone()?,
         };
+        self.adopt_execution_agent_resolved_session(agent, display, session)
+    }
+
+    /// An explicit Session activation may name a proved current counterpart
+    /// before any pane exists. It cannot change an existing saved surface.
+    pub(super) fn adopt_execution_agent_activation_display(
+        &mut self,
+        agent: &crate::agent_execution::Agent,
+        display: crate::workspace_model::views::ManagedDisplay,
+        session: crate::agent_execution::HostedSession,
+    ) -> Option<Task<Message>> {
+        use crate::agent_execution::HostedSession;
+        let owned = agent.session.as_ref().is_some_and(|current| current.same_process(&session))
+            || agent.console.as_ref().is_some_and(|current| HostedSession::Terminal(current.clone()).same_process(&session));
+        let saved_matches = match display.pane.as_ref().map(|pane| &pane.kind) {
+            Some(CardKind::Chat(current)) => HostedSession::Chat(current.clone()).same_process(&session),
+            Some(CardKind::Terminal(current)) => HostedSession::Terminal(current.clone()).same_process(&session),
+            Some(_) => false,
+            None => true,
+        };
+        if !owned || !saved_matches { return None; }
+        self.adopt_execution_agent_resolved_session(agent, display, session)
+    }
+
+    fn adopt_execution_agent_resolved_session(
+        &mut self,
+        agent: &crate::agent_execution::Agent,
+        display: crate::workspace_model::views::ManagedDisplay,
+        session: crate::agent_execution::HostedSession,
+    ) -> Option<Task<Message>> {
+        let placement = &display.scope;
+        if agent.closed
+            || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
+        {
+            return None;
+        }
         let channel_index = match placement {
             crate::agent_execution::Placement::Channel(id) => Some(
                 self.durable
