@@ -108,6 +108,7 @@ pub fn environment_reserved(provider: Provider, name: &str) -> bool {
 impl AgentLaunchSettings {
     /// Resolve from this immutable policy capture so probes cannot pair an
     /// executable from one settings revision with arguments from another.
+    /// A provider's explicit PATH applies to discovery as it does to launch.
     #[cfg(any(feature = "ui", feature = "host"))]
     pub fn resolve_executable(
         &self,
@@ -123,6 +124,11 @@ impl AgentLaunchSettings {
             }
             return Ok(executable.into());
         }
+        let search_path = self
+            .environment
+            .get("PATH")
+            .map(|path| std::ffi::OsStr::new(path))
+            .or(search_path);
         crate::account::probe::find_executable(provider.executable(), search_path)
             .ok_or_else(|| format!("{} is not installed", provider.label()))
     }
@@ -373,6 +379,78 @@ fn remove_config_key(arguments: &mut Vec<String>, key: &str) {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn provider_path_selects_the_same_binary_for_launch_and_discovery() {
+        let directory = tempfile::tempdir().unwrap();
+        let host = directory.path().join("host");
+        let configured = directory.path().join("configured");
+        let host_program = host.join(Provider::Claude.executable());
+        let configured_program = configured.join(Provider::Claude.executable());
+        for (root, marker) in [(&host, "host"), (&configured, "configured")] {
+            std::fs::create_dir(root).unwrap();
+            let binary = root.join(Provider::Claude.executable());
+            std::fs::write(&binary, format!("#!/bin/sh\nprintf '%s\\n' '{marker}'\n"))
+                .unwrap();
+            std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let mut configuration = AgentLaunchSettings::default();
+        assert_eq!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .unwrap(),
+            host_program
+        );
+        configuration
+            .environment
+            .insert("PATH".into(), configured.to_str().unwrap().into());
+        let discovered = configuration
+            .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+            .unwrap();
+        assert_eq!(discovered, configured_program);
+        let mut recipe = LaunchRecipe {
+            program: Provider::Claude.executable().into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        configuration.apply_launch(&mut recipe);
+        for program in [Path::new(&recipe.program), discovered.as_path()] {
+            let output = std::process::Command::new(program)
+                .args(&recipe.arguments)
+                .current_dir(&recipe.working_directory)
+                .env_clear()
+                .envs(&recipe.environment)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"configured\n");
+        }
+        configuration.executable = Some(host_program.to_str().unwrap().into());
+        assert_eq!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .unwrap(),
+            host_program
+        );
+        configuration.executable = Some(
+            directory.path().join("missing").to_str().unwrap().into(),
+        );
+        assert!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .is_err()
+        );
+        configuration.executable = None;
+        configuration.environment.insert("PATH".into(), String::new());
+        assert!(
+            configuration
+                .resolve_executable(Provider::Claude, Some(host.as_os_str()))
+                .is_err()
+        );
+    }
 
     #[test]
     fn provider_tables_round_trip_and_reject_unsafe_launch_values() {
