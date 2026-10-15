@@ -71,6 +71,7 @@ pub mod file_icon;
 #[cfg(feature = "ui")]
 pub mod file_manager;
 pub mod fs_safety;
+pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod git_patch;
 #[cfg(feature = "ui")]
