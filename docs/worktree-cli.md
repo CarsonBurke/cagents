@@ -27,7 +27,10 @@ minutes for setup to succeed; if setup fails or is still running, its error name
 the retained worktree and the agent is not started.
 
 Removal refuses the primary checkout, locked worktrees and worktrees containing
-live sessions. Close their sessions before removal. It freshly checks modified,
+live sessions. Close their sessions before removal. Window cards, editor scopes
+and setup preparation also retain directory protection; close those scopes
+before using the CLI to remove their checkout. `--force` preserves these active
+protection fences. It freshly checks modified,
 untracked, notable ignored, unpushed and detached-only work. `--force` explicitly
 confirms discarding those files and commits; a detached-only head is first
 preserved on a rescue branch. `--delete-branch` runs Git's safe `branch -d` after

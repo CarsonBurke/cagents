@@ -102,7 +102,7 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
             let sessions=live_sessions(&record.path)?;
             if !sessions.is_empty() { return Err(format!("{} live session(s) use this worktree; close them before removing it",sessions.len())); }
             let _directory=crate::worktree_cleanup::removal_protection(&record.path)
-                .map_err(|error|format!("Worktree is selected, open in an editor or preparing setup; release it before removal: {error}"))?;
+                .map_err(|error|format!("Worktree is open in a window/card, editor or setup preparation; close its scopes before removal: {error}"))?;
             let safety=service.worktree_safety(&record.path,&cancellation).map_err(|error|error.to_string())?;
             if expected_fingerprint.as_ref().is_some_and(|fingerprint|fingerprint!=&safety.fingerprint) {
                 return Err("The worktree changed after confirmation; review its safety again".into());
