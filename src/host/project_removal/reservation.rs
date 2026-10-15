@@ -24,6 +24,7 @@ pub(crate) struct ReservedProject {
     protected_sessions: HashSet<TerminalId>,
     protected_sources: Vec<HostedSession>,
     infer_directory: bool,
+    operation: Mutex<Option<Arc<super::custody::Operation>>>,
 }
 pub(crate) type Reservations = Arc<Mutex<BTreeMap<uuid::Uuid, Arc<ReservedProject>>>>;
 pub(crate) struct Reservation {
@@ -31,6 +32,31 @@ pub(crate) struct Reservation {
     token: uuid::Uuid,
 }
 impl Reservation {
+    pub(super) fn saved_scope(&self,relocation:Option<crate::project_recovery::Relocation>)->Result<super::super::model::project_operations::SavedScope,ProtocolError> {
+        let entries=self.entries.lock().unwrap_or_else(|p|p.into_inner());
+        let scope=entries.get(&self.token).ok_or_else(||error("The original project reservation is unavailable"))?;
+        Ok(super::super::model::project_operations::SavedScope{project:scope.project.clone(),relocation,
+            roots:scope.roots.clone(),protected:scope.protected.clone(),channels:scope.channels.iter().copied().collect(),
+            panes:scope.panes.iter().copied().collect(),sessions:scope.sessions.iter().copied().collect()})
+    }
+    pub(super) fn bind_operation(&self,operation:Arc<super::custody::Operation>)->Result<(),ProtocolError> {
+        let entries=self.entries.lock().unwrap_or_else(|p|p.into_inner());
+        let scope=entries.get(&self.token).ok_or_else(||error("The exact project reservation changed before custody was installed"))?;
+        let mut current=scope.operation.lock().unwrap_or_else(|p|p.into_inner());
+        if current.is_some() {return Err(error("This project reservation already has an operation owner"));}
+        *current=Some(operation);Ok(())
+    }
+    pub(super) fn ensure_operation_commit(&self,edit:&ModelEdit,operation:&super::custody::Operation)->Result<(),ProtocolError> {
+        let entries=self.entries.lock().unwrap_or_else(|p|p.into_inner());
+        let scope=entries.get(&self.token).ok_or_else(||error("The original project operation lost its reservation"))?;
+        let current=scope.operation.lock().unwrap_or_else(|p|p.into_inner());
+        if scope.project!=operation.project || current.as_ref().is_none_or(|owner|!std::ptr::eq(owner.as_ref(),operation))
+            || operation.request.as_ref().is_none_or(|request|request.commit_edit()!=*edit) || operation.is_settled()
+            || entries.iter().any(|(token,scope)|*token!=self.token&&scope.edit(edit)) {
+            return Err(error("The exact project operation cannot commit over a changed reservation or original request"));
+        }
+        Ok(())
+    }
     /// Caller owns exclusive control admission through the guarded model commit.
     /// Release only this exact lease so normal final edit admission remains on.
     pub(super) fn release_for_commit(&self, project: &ProjectInstance) -> Result<(), ProtocolError> {
@@ -67,10 +93,9 @@ impl Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.entries
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.token);
+        let mut entries=self.entries.lock().unwrap_or_else(|p|p.into_inner());
+        let keep=entries.get(&self.token).is_some_and(|scope|scope.operation.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_some_and(|operation|!operation.is_settled()));
+        if !keep {entries.remove(&self.token);}
     }
 }
 impl ReservedProject {
@@ -185,6 +210,39 @@ fn entries(host: &SharedHost) -> Reservations {
         .project_removals
         .clone()
 }
+pub(super) fn live_operation_count(host:&SharedHost)->usize {
+    entries(host).lock().unwrap_or_else(|p|p.into_inner()).values().filter(|scope|
+        scope.operation.lock().unwrap_or_else(|p|p.into_inner()).as_ref().is_some_and(|owner|owner.request.is_some()&&!owner.is_settled())).count()
+}
+
+pub(super) fn retained_operation(host:&SharedHost,operation:uuid::Uuid)->Option<(Reservation,Arc<super::custody::Operation>)> {
+    let entries=entries(host);
+    let found={
+        let locked=entries.lock().unwrap_or_else(|p|p.into_inner());
+        locked.iter().find_map(|(token,scope)|scope.operation.lock().unwrap_or_else(|p|p.into_inner()).as_ref()
+            .filter(|owner|owner.operation==operation).map(|owner|(*token,owner.clone())))
+    };
+    found.map(|(token,operation)|(Reservation{entries,token},operation))
+}
+
+/// Restart restores only negative scope metadata. Lost original owners/admin
+/// FDs are never reconstructed from these paths or a fresh daemon inventory.
+pub(super) fn restore_operations(registry:&super::super::model::Registry,entries:&Reservations)->Result<(),String> {
+    let pending=registry.pending_project_operations()?;
+    let mut entries=entries.lock().unwrap_or_else(|p|p.into_inner());
+    for obligation in pending {
+        let saved=obligation.scope.as_ref().ok_or("Pending operation has no negative scope")?;
+        let operation=Arc::new(super::custody::Operation::lost(&obligation,saved)?);
+        let reserved=ReservedProject{project:saved.project.clone(),destination:saved.relocation.as_ref().map(|relocation|relocation.destination.clone()),
+            roots:saved.roots.clone(),protected:saved.protected.clone(),channels:saved.channels.iter().copied().collect(),
+            panes:saved.panes.iter().copied().collect(),sessions:saved.sessions.iter().copied().collect(),protected_sessions:HashSet::new(),
+            protected_sources:Vec::new(),infer_directory:false,operation:Mutex::new(Some(operation))};
+        if entries.contains_key(&obligation.operation) {return Err("Duplicate restored project operation identity; original custody was preserved".into());}
+        entries.insert(obligation.operation,Arc::new(reserved));
+    }
+    Ok(())
+}
+
 fn scopes(host: &SharedHost) -> Vec<Arc<ReservedProject>> {
     entries(host)
         .lock()
@@ -237,6 +295,7 @@ fn reserve_inner(host:&SharedHost, project:&ProjectInstance, selected:&[SessionC
         sessions: HashSet::new(),
         protected_sessions: HashSet::new(),
         protected_sources: Vec::new(),
+        operation: Mutex::new(None),
         infer_directory: !model.projects.iter().any(|other| {
             other.repository != project.repository && other.kind == crate::model::ProjectKind::Git
         }),
@@ -393,6 +452,8 @@ pub(crate) fn ensure_available(
     directory: Option<&Path>,
     session: Option<TerminalId>,
 ) -> Result<(), ProtocolError> {
+    if let Some(reason)=&host.lock().unwrap_or_else(|p|p.into_inner()).project_operation_startup_error {return Err(error(reason.clone()));}
+
     let scopes = scopes(host);
     if scopes.is_empty() {
         return Ok(());
@@ -440,9 +501,17 @@ pub(crate) fn ensure_prepared_edit_available(entries: &Reservations, edit: &Mode
 
 /// Called after ordinary control admission and before any public request effect.
 pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), ProtocolError> {
+    if let Some(reason)=&host.lock().unwrap_or_else(|p|p.into_inner()).project_operation_startup_error {
+        if !matches!(request,ClientRequest::List|ClientRequest::ReadWorkspaceModel|ClientRequest::WatchWorkspaceModel|ClientRequest::WatchTerminals|ClientRequest::BuildInfo|ClientRequest::Connect{..}) {
+            return Err(error(reason.clone()));
+        }
+    }
     let active = scopes(host);
     if active.is_empty() {
         return Ok(());
+    }
+    if matches!(request,ClientRequest::PrepareUpgrade{..}|ClientRequest::PrepareConfirmedUpgrade{..}|ClientRequest::Shutdown|ClientRequest::ShutdownV1{..}) {
+        return Err(ProtocolError::new(ProtocolErrorCode::Internal,"A project operation retains pending custody. Finish its exact operation before upgrading or stopping this daemon.",true));
     }
     let session = match request {
         ClientRequest::Input { terminal_id, .. }
@@ -501,7 +570,8 @@ pub(crate) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
             Some(session.id),
         )?,
         ClientRequest::ChatStart { session, .. }
-        | ClientRequest::ChatStartSelected { session, .. } => ensure_available(
+        | ClientRequest::ChatStartSelected { session, .. }
+        | ClientRequest::ChatAttach { session } => ensure_available(
             host,
             None,
             Some(&session.launch.recipe.working_directory),
@@ -561,6 +631,7 @@ mod tests {
             protected: vec!["/project/foreign".into()],
             channels: HashSet::new(), panes: HashSet::new(), sessions: HashSet::new(),
             protected_sessions: HashSet::new(), protected_sources: Vec::new(), infer_directory: true,
+            operation: Mutex::new(None),
         };
         for reopen in [false, true] {
             for (checkout, primary, blocked) in [

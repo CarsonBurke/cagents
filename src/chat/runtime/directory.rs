@@ -13,6 +13,25 @@ pub(crate) struct DirectoryProof {
 }
 
 impl DirectoryProof {
+    /// Revalidate the retained proof without replacing its process or directory
+    /// authority. A pending project operation may wait arbitrarily long; an old
+    /// sample alone cannot approve a later cwd or pathname replacement.
+    pub(crate) fn validate_current(&self)->Result<(),String> {
+        if DirectoryIdentity::from_metadata(&self.directory.metadata().map_err(|error|error.to_string())?)!=self.identity {
+            return Err("The original retained directory proof changed".into());
+        }
+        let current=cwd(&self.process)?;
+        if DirectoryIdentity::from_metadata(&current.metadata().map_err(|error|error.to_string())?)!=self.identity {
+            return Err("The original provider no longer occupies its prepared directory; the pending operation was retained".into());
+        }
+        let named=super::super::protocol::ExecutionContext::capture(&self.path)?;
+        if named.directory_identity()?!=Some(self.identity) {return Err("The prepared directory pathname was replaced; the pending operation cannot adopt its replacement".into());}
+        let after=cwd(&self.process)?;
+        if DirectoryIdentity::from_metadata(&after.metadata().map_err(|error|error.to_string())?)!=self.identity || !self.process.is_current() {
+            return Err("The original provider changed during pending-operation verification".into());
+        }
+        Ok(())
+    }
     /// The caller must have obtained this exact process from an authenticated
     /// original holder or retained child, never by rediscovering a numeric ID.
     pub(crate) fn capture_owned_process(

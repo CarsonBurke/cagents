@@ -61,6 +61,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::Spawn { session, .. } => Access::Spawn(session),
         R::ProjectCloseInventory { .. }
         | R::CloseProjectGuarded { .. }
+        | R::ProjectOperation { .. }
         | R::CompletePendingTerminal { .. }
         | R::DeviceOperation { .. }
         | R::Agent { .. }

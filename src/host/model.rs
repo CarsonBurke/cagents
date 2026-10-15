@@ -27,7 +27,7 @@ use crate::{
 mod agent_locations;
 mod session_locations;
 pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
-pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
+pub(crate) use session_locations::{Location as SessionLocation, SessionDirectoryProof, SessionMove};
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -259,6 +259,13 @@ impl Registry {
         moves: &[SessionMove],
         agent_moves: &[AgentMove],
     ) -> Result<Applied, String> {
+        self.apply_with_project_operation(edit,moves,agent_moves,None)
+    }
+
+    pub(crate) fn apply_with_project_operation(
+        &mut self,edit:&ModelEdit,moves:&[SessionMove],agent_moves:&[AgentMove],
+        operation:Option<(Uuid,&str)>,
+    )->Result<Applied,String> {
         if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
             return Err(
                 "Session directory proofs may only accompany their project relocation".into(),
@@ -271,7 +278,9 @@ impl Registry {
         {
             return Err("Session proofs do not belong to the requested destination project".into());
         }
-        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        let behavior=if operation.is_some() {rusqlite::TransactionBehavior::Immediate} else {rusqlite::TransactionBehavior::Deferred};
+        let transaction=self.db.transaction_with_behavior(behavior).map_err(|error|error.to_string())?;
+        if operation.is_some() {schema::require_current_write(&transaction)?;}
         if let ModelEdit::RelocateProject { project, relocation } = edit {
             if project.repository != relocation.repository { return Err("The located paths do not name the original project instance".into()); }
             project_instances::require_relocation(&transaction, project, relocation)?;
@@ -495,6 +504,9 @@ impl Registry {
                     [],
                 )
                 .map_err(|error| error.to_string())?;
+        }
+        if let Some((operation,request_digest))=operation {
+            project_operations::model_committed(&transaction,operation,request_digest,edit)?;
         }
         transaction.commit().map_err(|error| error.to_string())?;
         Ok(Applied {

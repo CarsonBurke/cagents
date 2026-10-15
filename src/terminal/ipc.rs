@@ -489,6 +489,11 @@ pub enum ClientRequest {
         project: crate::project_recovery::ProjectInstance,
         sessions: Vec<crate::project_recovery::SessionClose>,
     },
+    /// Future uniquely allocated matched wire; preserves one operation through
+    /// partial effects and final busy without recapturing source authority.
+    ProjectOperation {
+        request: crate::project_recovery::ProjectOperationRequest,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -798,6 +803,9 @@ pub enum ServerResponse {
     },
     ProjectCloseInventory {
         sessions: Vec<crate::project_recovery::SessionClose>,
+    },
+    ProjectOperation {
+        outcome: crate::project_recovery::ProjectOperationOutcome,
     },
 }
 

@@ -60,6 +60,55 @@ pub struct SessionClose {
     pub provider: Option<ProviderIncarnation>,
 }
 
+/// Future matched-wire operation identity. The original request is retained
+/// across busy/partial outcomes; retry never selects a new source or pathname.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectOperationRequest {
+    pub operation: uuid::Uuid,
+    pub project: ProjectInstance,
+    pub action: ProjectOperationAction,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectOperationAction {
+    Locate { relocation: Relocation },
+    Remove { sessions: Vec<SessionClose> },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectOperationPhase {
+    Preparing,
+    Repairing,
+    Closing,
+    PendingCommit,
+    ModelCommitted,
+    UnavailableAfterRestart,
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ProjectOperationOutcome {
+    Committed { operation: uuid::Uuid, model: crate::workspace_model::WorkspaceModel },
+    Pending { operation: uuid::Uuid, phase: ProjectOperationPhase, reason: String },
+}
+impl ProjectOperationRequest {
+    pub fn validate(&self)->Result<(),String> {
+        self.project.validate()?;
+        if self.operation.is_nil() {return Err("Project operation identity is required".into());}
+        match &self.action {
+            ProjectOperationAction::Locate{relocation}=> {
+                relocation.validate()?;
+                if relocation.repository!=self.project.repository {return Err("The operation no longer names its original project".into());}
+            }
+            ProjectOperationAction::Remove{sessions} if sessions.len()>4096=>return Err("Too many selected project sessions".into()),
+            ProjectOperationAction::Remove{..}=>{},
+        }
+        Ok(())
+    }
+    pub fn commit_edit(&self)->crate::workspace_model::ModelEdit {
+        match &self.action {
+            ProjectOperationAction::Locate{relocation}=>crate::workspace_model::ModelEdit::RelocateProject{project:self.project.clone(),relocation:relocation.clone()},
+            ProjectOperationAction::Remove{..}=>crate::workspace_model::ModelEdit::CloseProjectInstance{project:self.project.clone()},
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Relocation {
     pub repository: PathBuf,

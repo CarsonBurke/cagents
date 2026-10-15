@@ -110,6 +110,11 @@ pub(crate) struct RepairPlan {
     bytes: usize,
 }
 impl RepairPlan {
+    pub(crate) fn pin(relocation:&Relocation)->Result<Self,String> {
+        let root=Directory::open(&relocation.new_root)?;
+        let common=Directory::open(&relocation.destination)?;
+        Ok(Self{root,common,edits:Vec::new(),next:0,bytes:0})
+    }
     pub(crate) fn prepare(relocation:&Relocation,worktrees:&[PathBuf])->Result<Self,String> {
         if worktrees.len()>256 {return Err("Locate exceeds its retained worktree repair capacity".into());}
         let root=Directory::open(&relocation.new_root)?;

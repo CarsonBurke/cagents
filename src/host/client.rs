@@ -364,39 +364,12 @@ pub(super) fn process_request(
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
     let gate = control_gate(host);
-    if let ClientRequest::CloseProjectGuarded { project, sessions } = &request {
-        let reservation = {
-            let _admission = try_scoped_control_write(&gate)?;
-            ensure_control_open(host)?;
-            super::agent_execution::terminals::admit(host, client_id, &request)?;
-            super::project_removal::reserve(host, project, sessions)?
-        };
-        let result = super::project_removal::remove(
-            host,
-            client_id,
-            project.clone(),
-            sessions.clone(),
-            &reservation,
-        );
-        drop(reservation);
-        return result;
+    if let ClientRequest::ProjectOperation{request} = request {
+        return super::project_removal::custody::process(host,client_id,request);
     }
-    if let ClientRequest::EditWorkspaceModel {
-        edit: crate::workspace_model::ModelEdit::RelocateProject { project, relocation },
-    } = &request {
-        let reservation = {
-            let _exclusive=try_scoped_control_write(&gate)?;
-            ensure_control_open(host)?;
-            super::agent_execution::terminals::admit(host, client_id, &request)?;
-            super::project_removal::admit(host, &request)?;
-            super::project_removal::reserve_relocation(host,project,relocation)?
-        };
-        // Filesystem/holder/provider proof runs without global admission.
-        // Related starts, work and edits remain fenced by the scoped lease.
-        let result=super::session_locations::relocate(host,client_id,project.clone(),relocation.clone());
-        drop(reservation);
-        let model=result?;
-        return Ok((ServerResponse::WorkspaceModel { model },Vec::new(),false));
+    if matches!(&request,ClientRequest::CloseProjectGuarded{..}|ClientRequest::EditWorkspaceModel{edit:crate::workspace_model::ModelEdit::RelocateProject{..}}) {
+        return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+            "This project action requires an explicit retained operation identity. Refresh the matched application and retry from Projects.",false));
     }
     // The GitHub read must not monopolize the exclusive admission fence. All
     // authorizing local state is checked again only after that fence is held.
@@ -492,7 +465,7 @@ pub(super) fn process_admitted(
             Vec::new(),
             false,
         )),
-        ClientRequest::CloseProjectGuarded { .. } => Err(ProtocolError::new(
+        ClientRequest::CloseProjectGuarded { .. } | ClientRequest::ProjectOperation{..} => Err(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
             "Guarded project removal requires its scoped admission reservation",
             false,

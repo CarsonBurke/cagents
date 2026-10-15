@@ -395,6 +395,7 @@ pub struct SidebarProject {
     /// and every other project stays listed beside it.
     pub unreachable: Option<String>,
     pub missing: bool,
+    pub pending_operation: Option<ProjectOperationNotice>,
     /// The originally bound checkout needs Locate, while another verified
     /// checkout keeps this project's navigation and Git reads available.
     pub location_repair: Option<String>,
@@ -405,6 +406,13 @@ pub struct SidebarProject {
     /// it is trying rather than look untouched for several seconds.
     pub reloading: bool,
     chrome: ProjectChrome,
+}
+
+#[derive(Debug,Clone,PartialEq,Eq)]
+pub struct ProjectOperationNotice {
+    pub operation:uuid::Uuid,
+    pub running:bool,
+    pub reason:String,
 }
 
 /// One project-level channel row.
@@ -512,6 +520,7 @@ impl SidebarProject {
             avatar: None,
             unreachable: None,
             missing: false,
+            pending_operation: None,
             location_repair: None,
             missing_details: false,
             reloading: false,
@@ -5091,6 +5100,7 @@ fn operation_accessible_name(operation: &WorktreeOperationRow) -> String {
 /// running is still running, and its cancel is the only way to stop it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectRecoveryAction {
+    RetryOperation(uuid::Uuid),
     Locate,
     Remove,
     ClosePanes,
@@ -5333,6 +5343,15 @@ fn project_view<'a>(
     let entity = project.project;
     let chrome = &entity.chrome;
     let project_id = entity.id;
+    if let Some(pending)=&entity.pending_operation {
+        let header=widget::container(design::heading(entity.name.clone())).padding([space::XS,space::S]).width(Length::Fill).into();
+        let body=widget::container(widget::column::with_children(vec![
+            design::caption(pending.reason.clone()).wrapping(cosmic::iced::widget::text::Wrapping::Word).into(),
+            crate::ui_controls::button::secondary(if pending.running {"Finishing…"} else {"Retry operation"})
+                .on_press_maybe(gated(SidebarAction::RecoverProject{project_id,action:ProjectRecoveryAction::RetryOperation(pending.operation)},modal_open || pending.running)).into(),
+        ]).spacing(space::XS)).padding([space::XS,space::S]).width(Length::Fill).into();
+        return RowInteraction::group(header,body,sticky_viewport);
+    }
     if entity.missing {
         return missing_project(entity, compact, modal_open, sticky_viewport);
     }

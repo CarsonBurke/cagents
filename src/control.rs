@@ -1024,6 +1024,20 @@ impl ControlClient {
         }
     }
 
+    /// Future matched wire only. The caller retains this exact original request
+    /// on Pending and supplies it unchanged on explicit retry.
+    pub fn project_operation(&mut self,request:crate::project_recovery::ProjectOperationRequest)
+        ->Result<crate::project_recovery::ProjectOperationOutcome,ControlError> {
+        let operation=request.operation;
+        match self.request_with_deadline(ClientRequest::ProjectOperation{request},Instant::now()+Duration::from_secs(75))? {
+            ServerResponse::ProjectOperation{outcome} if match &outcome {
+                crate::project_recovery::ProjectOperationOutcome::Committed{operation:current,..}
+                |crate::project_recovery::ProjectOperationOutcome::Pending{operation:current,..}=>*current==operation,
+            }=>Ok(outcome),
+            response=>Err(unexpected_response("retained project operation",&response)),
+        }
+    }
+
     pub fn close_project_guarded(
         &mut self,
         project: crate::project_recovery::ProjectInstance,
@@ -4028,6 +4042,31 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn project_operation_pending_retries_only_the_exact_original_request_without_inventory() {
+        let (client_stream,mut server_stream)=UnixStream::pair().unwrap();
+        server_stream.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        server_stream.set_write_timeout(Some(Duration::from_secs(3))).unwrap();
+        let pinned=proof("operation-session","boot","incarnation");let peer=pinned.clone();
+        let request=crate::project_recovery::ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:crate::project_recovery::ProjectInstance{registry:uuid::Uuid::new_v4(),repository:"/original-project".into(),ordinal:7},action:crate::project_recovery::ProjectOperationAction::Remove{sessions:Vec::new()}};
+        let original=request.clone();
+        let server=thread::spawn(move || {
+            let connected:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(&mut server_stream,&connected_envelope(connected.request_id,peer.clone(),peer.clone())).unwrap();
+            for attempt in 0..2 {
+                let envelope:ClientEnvelope=read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(envelope.request,ClientRequest::ProjectOperation{request:original.clone()},"no fresh List, inventory or replacement UUID may precede retry");
+                let outcome=if attempt==0 {crate::project_recovery::ProjectOperationOutcome::Pending{operation:original.operation,phase:crate::project_recovery::ProjectOperationPhase::PendingCommit,reason:"Original effects retained".into()}}
+                else {crate::project_recovery::ProjectOperationOutcome::Committed{operation:original.operation,model:WorkspaceModel{identity:original.project.registry,..Default::default()}}};
+                write_frame(&mut server_stream,&ServerEnvelope{version:PROTOCOL_VERSION,request_id:Some(envelope.request_id),proof:peer.clone(),message:ServerMessage::Response{response:ServerResponse::ProjectOperation{outcome}}}).unwrap();
+            }
+        });
+        let mut client=ControlClient::from_stream(client_stream).unwrap();
+        assert!(matches!(client.project_operation(request.clone()).unwrap(),crate::project_recovery::ProjectOperationOutcome::Pending{..}));
+        assert!(matches!(client.project_operation(request).unwrap(),crate::project_recovery::ProjectOperationOutcome::Committed{..}));
+        server.join().unwrap();
     }
 
     /// `channel spawn` opens the project before creating the channel in it,

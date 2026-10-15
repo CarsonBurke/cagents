@@ -9,6 +9,7 @@ use crate::{
 #[derive(Default)]
 pub(super) struct State {
     checking: bool,
+    operations: HashMap<ProjectId, PendingProjectOperation>,
     locating: HashSet<ProjectId>,
     location_generations: HashMap<ProjectId,uuid::Uuid>,
     // Refusal only: the exact unresolved window capability follows this local
@@ -20,9 +21,21 @@ pub(super) struct State {
     pub(super) closing_panes: bool,
     details: HashSet<CardId>,
 }
+#[derive(Debug,Clone)]
+struct PendingProjectOperation {
+    request: crate::project_recovery::ProjectOperationRequest,
+    completion: OperationCompletion,
+    in_flight: bool,
+}
+#[derive(Debug,Clone)]
+enum OperationCompletion {
+    Locate {generation:uuid::Uuid,relocation:Relocation},
+    Remove,
+}
 #[derive(Debug, Clone)]
 pub enum Action {
     Tick,
+    OperationFinished(ProjectId,uuid::Uuid,Result<crate::project_recovery::ProjectOperationOutcome,String>),
     Checked(Vec<(ProjectId, PathBuf, PathBuf, Option<String>)>),
     AvailabilityChecked(Vec<(ProjectId, PathBuf, PathBuf, Option<String>, bool)>),
     Command(ProjectId, ProjectRecoveryAction),
@@ -57,6 +70,39 @@ fn root(project: &SidebarProject) -> PathBuf {
 }
 
 impl Cagents {
+    pub(super) fn submit_project_removal_operation(&mut self,id:ProjectId,request:crate::project_recovery::ProjectOperationRequest)->Task<Message> {
+        self.install_project_operation(id,request,OperationCompletion::Remove)
+    }
+    fn install_project_operation(&mut self,id:ProjectId,request:crate::project_recovery::ProjectOperationRequest,completion:OperationCompletion)->Task<Message> {
+        if self.project_recovery_ui.operations.contains_key(&id) {
+            self.status=Some(TransientNotice::warning("The original project operation is still retained. Use Retry operation; its sources will not be replaced."));
+            return Task::none();
+        }
+        self.project_recovery_ui.operations.insert(id,PendingProjectOperation{request,completion,in_flight:false});
+        self.retry_project_operation(id)
+    }
+    fn retry_project_operation(&mut self,id:ProjectId)->Task<Message> {
+        let Some(pending)=self.project_recovery_ui.operations.get_mut(&id) else {return Task::none();};
+        if pending.in_flight {return Task::none();}
+        if self.workspace_model.identity!=pending.request.project.registry {
+            self.status=Some(TransientNotice::warning("This retained operation belongs to its original registry. Reconnect that registry to retry; no sources were recaptured."));
+            return Task::none();
+        }
+        pending.in_flight=true;
+        let request=pending.request.clone();
+        let operation=request.operation;
+        if let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==id) {
+            row.pending_operation=Some(crate::sidebar::ProjectOperationNotice{operation,running:true,reason:"Finishing the original project operation…".into()});
+        }
+        cosmic::task::future(async move {
+            let result=tokio::task::spawn_blocking(move || {
+                let socket=crate::terminal::ensure_daemon_ready().map_err(|error|error.to_string())?;
+                crate::control::ControlClient::connect(&socket).map_err(|error|error.to_string())?
+                    .project_operation(request).map_err(|error|error.to_string())
+            }).await.map_err(|error|error.to_string()).and_then(|result|result);
+            Message::ProjectRecovery(Action::OperationFinished(id,operation,result))
+        })
+    }
     pub(super) fn remember_project_binding(
         &mut self,
         id: ProjectId,
@@ -286,6 +332,35 @@ impl Cagents {
             action=>action,
         };
         match action {
+            Action::Command(id,ProjectRecoveryAction::RetryOperation(operation)) => {
+                if self.modal_is_open() || self.project_recovery_ui.operations.get(&id).is_none_or(|pending|pending.request.operation!=operation) {return Task::none();}
+                return self.retry_project_operation(id);
+            }
+            Action::OperationFinished(id,operation,result) => {
+                let Some(pending)=self.project_recovery_ui.operations.get_mut(&id).filter(|pending|pending.request.operation==operation && pending.in_flight) else {return Task::none();};
+                pending.in_flight=false;
+                let model=match result {
+                    Ok(crate::project_recovery::ProjectOperationOutcome::Committed{operation:received,model}) if received==operation=>Some(model),
+                    result=> {
+                        let reason=match result {
+                            Ok(crate::project_recovery::ProjectOperationOutcome::Pending{operation:received,reason,..}) if received==operation=>reason,
+                            Ok(_)=>"The daemon returned a different operation identity. The original request remains retained.".into(),
+                            Err(error)=>format!("The outcome is unavailable: {error}. The original operation remains retained; Retry operation sends exactly the same request."),
+                        };
+                        if let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==id) {
+                            row.pending_operation=Some(crate::sidebar::ProjectOperationNotice{operation,running:false,reason:reason.clone()});
+                        }
+                        self.status=Some(TransientNotice::warning(reason));None
+                    }
+                };
+                let Some(model)=model else {return Task::none();};
+                let pending=self.project_recovery_ui.operations.remove(&id).unwrap();
+                if let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==id) {row.pending_operation=None;}
+                match pending.completion {
+                    OperationCompletion::Locate{generation,relocation}=>return self.update_project_recovery(Action::Applied(id,pending.request.project,generation,relocation,Ok(model))),
+                    OperationCompletion::Remove=>return self.handle_project_action(project_ui::Action::RemovedProject{repository:pending.request.project.repository.clone(),expected:pending.request.project,result:Ok(model)}),
+                }
+            }
             Action::Tick => {
                 if self.project_recovery_ui.checking {
                     return Task::none();
@@ -579,24 +654,11 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                let edit = crate::workspace_model::ModelEdit::RelocateProject {
-                    project: expected.clone(),
-                    relocation: relocation.clone(),
+                let request=crate::project_recovery::ProjectOperationRequest {
+                    operation:generation,project:expected,
+                    action:crate::project_recovery::ProjectOperationAction::Locate{relocation:relocation.clone()},
                 };
-                cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
-                        crate::control::ControlClient::connect(&socket)
-                            .map_err(|error| error.to_string())?
-                            .edit_workspace_model(edit)
-                            .map_err(|error| error.to_string())
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                    Message::ProjectRecovery(Action::Applied(id, expected, generation, relocation, result))
-                })
+                self.install_project_operation(id,request,OperationCompletion::Locate{generation,relocation})
             }
             Action::Applied(id, expected, generation, relocation, result) => {
                 if self.project_recovery_ui.location_generations.get(&id)!=Some(&generation) { return Task::none(); }
@@ -1039,6 +1101,38 @@ mod tests {
         app.workspace_model.projects.push(crate::workspace_model::ModelProject{repository:root.to_owned(),checkout:None,primary_checkout:None,name:"Fixture".into(),kind:ProjectKind::Folder,ordinal:1});
         (app, id)
     }
+    #[test]
+    fn pending_project_operation_keeps_original_request_across_explicit_retry_and_stale_reply() {
+        let fixture=tempfile::tempdir().unwrap();let (mut app,id)=app(fixture.path());
+        let expected=app.project_instance(id).unwrap();
+        let request=crate::project_recovery::ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:expected.clone(),action:crate::project_recovery::ProjectOperationAction::Remove{sessions:Vec::new()}};
+        // Dropping these actual Tasks avoids daemon startup; this is a reducer
+        // ownership/notice test, with framed request replay covered in control.
+        drop(app.submit_project_removal_operation(id,request.clone()));
+        assert!(app.project_recovery_ui.operations[&id].in_flight);
+        drop(app.update_project_recovery(Action::OperationFinished(id,request.operation,Ok(crate::project_recovery::ProjectOperationOutcome::Pending{operation:request.operation,phase:crate::project_recovery::ProjectOperationPhase::PendingCommit,reason:"Original owners closed; final commit is busy".into()}))));
+        assert!(!app.project_recovery_ui.operations[&id].in_flight);
+        let notice=app.sidebar_model.project(id).unwrap().pending_operation.as_ref().unwrap();
+        assert_eq!(notice.operation,request.operation);assert!(!notice.running);assert!(notice.reason.contains("final commit"));
+        // Even a newly observed ordinal must not become retry consent.
+        app.workspace_model.projects[0].ordinal=99;
+        drop(app.update_project_recovery(Action::Command(id,ProjectRecoveryAction::RetryOperation(request.operation))));
+        assert_eq!(app.project_recovery_ui.operations[&id].request,request);
+        assert!(app.project_recovery_ui.operations[&id].in_flight);
+        drop(app.update_project_recovery(Action::OperationFinished(id,uuid::Uuid::new_v4(),Err("unrelated reply".into()))));
+        assert!(app.project_recovery_ui.operations[&id].in_flight);
+        let mut replacement=request.clone();replacement.operation=uuid::Uuid::new_v4();
+        drop(app.submit_project_removal_operation(id,replacement));
+        assert_eq!(app.project_recovery_ui.operations[&id].request,request);
+        drop(app.update_project_recovery(Action::OperationFinished(id,request.operation,Err("reply lost".into()))));
+        assert_eq!(app.project_recovery_ui.operations[&id].request,request);
+        assert!(!app.project_recovery_ui.operations[&id].in_flight);
+        app.workspace_model.identity=uuid::Uuid::new_v4();
+        drop(app.update_project_recovery(Action::Command(id,ProjectRecoveryAction::RetryOperation(request.operation))));
+        assert!(!app.project_recovery_ui.operations[&id].in_flight,"a registry replacement cannot refresh the original retry's authority");
+        assert!(app.workspace_model.project(&expected.repository).is_some());
+    }
+
     #[tokio::test]
     async fn locate_keeps_only_its_original_window_recovery_until_exact_resolution() {
         let fixture=tempfile::tempdir().unwrap();

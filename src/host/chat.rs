@@ -30,6 +30,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Exact shared lifecycle namespace extracted from the modern restart owner
+/// (28681/1068 foundation). Final composition must retain this SAME map for
+/// every retained restart/pair transition, never create a parallel gate map.
+pub(in crate::host) fn transition_gate(host:&SharedHost,id:TerminalId)->Arc<std::sync::Mutex<()>> {
+    let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+    state.chat_transition_gates.retain(|_,gate|gate.strong_count()>0);
+    if let Some(gate)=state.chat_transition_gates.get(&id).and_then(std::sync::Weak::upgrade) {return gate;}
+    let gate=Arc::new(std::sync::Mutex::new(()));state.chat_transition_gates.insert(id,Arc::downgrade(&gate));gate
+}
+
 pub(super) struct Record {
     pub(super) execution_instance: uuid::Uuid,
     pub(super) console_recipe: Option<crate::model::LaunchRecipe>,
@@ -2721,8 +2731,11 @@ pub(super) fn close_project_session(
     provider: &crate::project_recovery::ProviderIncarnation,
     deadline: Instant,
 ) -> Result<(), ProtocolError> {
-    // Final retained-actor composition holds the per-chat transition gate
-    // across this refresh, exact process check and selected actor teardown.
+    let transition=transition_gate(host,source.id);
+    let _transition=match transition.try_lock() {
+        Ok(guard)=>guard,Err(std::sync::TryLockError::Poisoned(poison))=>poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock)=>return Err(unavailable("The selected conversation has a lifecycle transition in progress; retry its original removal after it settles")),
+    };
     actor.refresh_retained_state().map_err(unavailable)?;
     if actor
         .provider_process()

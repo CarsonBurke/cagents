@@ -41,6 +41,7 @@ pub struct State {
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,
     remove_dialog: Option<ProjectRemoval>,
+    removal_preparing: HashMap<ProjectId,uuid::Uuid>,
     /// A confirmed removal awaiting the daemon's shared-model answer.
     pub(super) removing: HashMap<PathBuf, Vec<PathBuf>>,
     /// Projects closed by the shared model but still settling their channels.
@@ -217,6 +218,7 @@ pub enum Action {
     EditorsLoaded(Result<Vec<crate::external_editor::Editor>, String>),
     ConfirmDelete,
     ConfirmRemove,
+    RemovalPrepared(ProjectId,uuid::Uuid,crate::project_recovery::ProjectInstance,Result<crate::project_recovery::ProjectOperationRequest,String>),
     RemovedProject {
         repository: PathBuf,
         expected: crate::project_recovery::ProjectInstance,
@@ -1415,29 +1417,41 @@ impl Cagents {
                     ));
                     return self.project_dialog_closed();
                 }
-                let repository = removal.repository.clone();
-                let expected = removal.expected.clone();
-                removal.project_sessions = self.project_session_ownership(removal.project);
-                self.project_ui.close_failed.remove(&removal.project);
-                self.project_ui
-                    .close_started
-                    .insert(removal.project, Instant::now());
-                self.project_ui
-                    .removing
-                    .insert(repository.clone(), removal.worktrees.clone());
-                let close = cosmic::task::future(async move {
-                    let result =
-                        tokio::task::spawn_blocking(move || remove_project_from_cagents(&removal))
-                            .await
-                            .map_err(|error| error.to_string())
-                            .and_then(|result| result);
-                    Message::ProjectUi(Action::RemovedProject {
-                        repository,
-                        expected,
-                        result,
-                    })
+                let repository=removal.repository.clone();
+                let expected=removal.expected.clone();
+                let id=removal.project;
+                let operation=uuid::Uuid::new_v4();
+                removal.project_sessions=self.project_session_ownership(id);
+                self.project_ui.removing.insert(repository,removal.worktrees.clone());
+                self.project_ui.removal_preparing.insert(id,operation);
+                if let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==id) {
+                    row.pending_operation=Some(crate::sidebar::ProjectOperationNotice{operation,running:true,reason:"Verifying the original project's session roster…".into()});
+                }
+                let close=cosmic::task::future(async move {
+                    let result=tokio::task::spawn_blocking(move || prepare_project_removal_operation(&removal,operation))
+                        .await.map_err(|error|error.to_string()).and_then(|result|result);
+                    Message::ProjectUi(Action::RemovalPrepared(id,operation,expected,result))
                 });
                 return Task::batch([close, self.project_dialog_closed()]);
+            }
+            Action::RemovalPrepared(id,operation,expected,result)=> {
+                if self.project_ui.removal_preparing.get(&id)!=Some(&operation) {return Task::none();}
+                self.project_ui.removal_preparing.remove(&id);
+                if self.project_instance(id).as_ref()!=Some(&expected) {
+                    self.project_ui.removing.remove(&expected.repository);
+                    if let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==id) {row.pending_operation=None;}
+                    self.status=Some(TransientNotice::warning("The original project changed during session inventory. No close was requested."));
+                    return Task::none();
+                }
+                match result {
+                    Ok(request) if request.operation==operation && request.project==expected=>return self.submit_project_removal_operation(id,request),
+                    result=> {
+                        self.project_ui.removing.remove(&expected.repository);
+                        if let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==id) {row.pending_operation=None;}
+                        let reason=match result {Err(reason)=>reason,Ok(_)=>"The prepared operation does not match the original removal".into()};
+                        self.status=Some(TransientNotice::error(reason));return Task::none();
+                    }
+                }
             }
             Action::RemovedProject {
                 repository,
@@ -2676,23 +2690,51 @@ fn project_session_roots(
 /// The confirmation covers live and detached sessions in every listed
 /// worktree. Close those first; the shared project edit is the final step and
 /// leaves all Git files and worktree directories untouched.
-fn remove_project_from_cagents(
-    removal: &ProjectRemoval,
-) -> Result<crate::workspace_model::WorkspaceModel, String> {
-    let roots = if removal.missing {
-        removal.worktrees.clone()
-    } else {
-        project_session_roots(&removal.repository, removal.kind, removal.worktrees.clone())
+fn prepare_project_removal_operation(removal:&ProjectRemoval,operation:uuid::Uuid)->Result<crate::project_recovery::ProjectOperationRequest,String> {
+    let roots=if removal.missing {removal.worktrees.clone()} else {project_session_roots(&removal.repository,removal.kind,removal.worktrees.clone())};
+    let socket=crate::terminal::ipc::daemon_socket_path().map_err(|error|error.to_string())?;
+    let mut client=crate::control::ControlClient::connect(&socket).map_err(|error|error.to_string())?;
+    let project_sessions=&removal.project_sessions;
+    let mut project_sessions = project_sessions.clone();
+    let scope = {
+        let project=removal.repository.as_path();
+        let model = client.read_workspace_model().map_err(|error| {
+            format!("Could not verify project ownership before closing sessions: {error}")
+        })?;
+        let scope = shared_project_session_scope(&roots, project, &model)?;
+        project_sessions.extend_model(&model, project);
+        let paths = crate::instance::window_database_paths().map_err(|error| {
+            format!("Could not locate other windows before closing sessions: {error}")
+        })?;
+        for path in paths {
+            if project_sessions.local_database.as_ref() == Some(&path) {
+                continue;
+            }
+            match std::fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "Could not inspect ownership in {}: {error}",
+                        path.display()
+                    ));
+                }
+                Ok(_) => {}
+            }
+            let owners =
+                crate::persistence::read_project_session_owners(&path).map_err(|error| {
+                    format!("Could not verify ownership in {}: {error}", path.display())
+                })?;
+            project_sessions.extend_saved(owners, project);
+        }
+        scope
     };
-    close_sessions_in_scope(
-        &roots,
-        Some(&removal.repository),
-        &removal.project_sessions,
-        None,
-        Some(&removal.expected),
-    )?
-    .removed_model
-    .ok_or_else(|| "The guarded project removal did not return its verified model".into())
+    let inventory=client.project_close_inventory(removal.expected.clone()).map_err(|error|error.to_string())?;
+    let mut sessions=Vec::new();
+    for session in inventory {
+        let directory=match &session.source {HostedSession::Chat(source)=>&source.launch.recipe.working_directory,HostedSession::Terminal(source)=>&source.launch.working_directory};
+        if project_sessions.check_source(&session.source,directory,&scope)? {sessions.push(session);}
+    }
+    Ok(crate::project_recovery::ProjectOperationRequest{operation,project:removal.expected.clone(),action:crate::project_recovery::ProjectOperationAction::Remove{sessions}})
 }
 
 /// Removes the worktree through Git once Git confirms it is the one the user

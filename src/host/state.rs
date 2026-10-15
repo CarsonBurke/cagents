@@ -301,6 +301,11 @@ pub(crate) struct HostState {
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
     pub(super) project_removals: super::project_removal::Reservations,
+    pub(super) project_operation_startup_error: Option<String>,
+    // Same actual lifecycle namespace as the modern restart owner.
+    pub(super) chat_transition_gates: BTreeMap<TerminalId,std::sync::Weak<Mutex<()>>>,
+    #[cfg(test)]
+    pub(super) project_operation_before_commit: Option<Arc<dyn Fn(uuid::Uuid)+Send+Sync>>,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
@@ -331,6 +336,10 @@ impl HostState {
         Self {
             recover_holders: false,
             project_removals: Default::default(),
+            project_operation_startup_error: Some("Project operation custody has not been loaded; project mutation and session starts are unavailable".into()),
+            chat_transition_gates: BTreeMap::new(),
+            #[cfg(test)]
+            project_operation_before_commit: None,
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -424,6 +433,7 @@ impl HostState {
     /// constructed for a test must not reach into the user's data directory, and
     /// a daemon that cannot open the store still has terminals to host.
     pub(crate) fn install_model(&mut self, registry: super::model::Registry) {
+        self.project_operation_startup_error=super::project_removal::custody::restore(&registry,&self.project_removals).err();
         self.mailbox_seal = match registry.mailbox_key() {
             Ok(key) => Some(Arc::new(crate::agent_execution::mailbox::Seal::new(key))),
             Err(error) => {
@@ -670,6 +680,7 @@ impl HostState {
             }
         }
         if !seen_operation {
+            if let Some(reason)=&self.project_operation_startup_error {return Err(model_unavailable(reason.clone()));}
             // Admission checked a separately resolved clone. Persist only final
             // prepared values that still satisfy the active scoped reservation.
             super::project_removal::ensure_prepared_edit_available(&self.project_removals, &edit)?;
@@ -677,6 +688,22 @@ impl HostState {
         let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
+        }
+        Ok(applied.model)
+    }
+
+    /// The operation's exact reservation stays installed through the SQL CAS
+    /// and its journal receipt. Only this private capability excludes its own
+    /// lease; every other reservation still fences the final prepared edit.
+    pub(super) fn apply_project_operation(&mut self,origin:ClientId,edit:&ModelEdit,
+        moves:&[super::model::SessionMove],agent_moves:&[super::model::AgentMove],
+        authority:&super::project_removal::custody::CommitAuthority<'_>)->Result<WorkspaceModel,ProtocolError> {
+        if let Some(reason)=&self.project_operation_startup_error {return Err(model_unavailable(reason.clone()));}
+        authority.ensure_reservation(edit)?;
+        let applied=self.registry()?.apply_with_project_operation(edit,moves,agent_moves,
+            Some((authority.operation(),authority.request_digest()))).map_err(model_unavailable)?;
+        if applied.changed && matches!(edit,ModelEdit::CloseProjectInstance{..}) {
+            self.announce_model_edit(origin,applied.model.sequence,edit);
         }
         Ok(applied.model)
     }

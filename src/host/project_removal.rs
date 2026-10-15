@@ -16,6 +16,7 @@ use std::{
 };
 
 mod reservation;
+pub(super) mod custody;
 mod census;
 use reservation::Reservation;
 pub(super) use reservation::{
@@ -26,6 +27,7 @@ const MAX_SESSIONS: usize = 4096;
 fn error(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
 }
+#[derive(Clone)]
 enum Owner {
     Chat(crate::chat::runtime::Handle),
     Terminal(crate::terminal::TerminalHandle),
@@ -91,13 +93,13 @@ pub(super) fn inventory(
     Ok(sessions)
 }
 
-pub(super) fn remove(
+pub(super) fn prepare_removal(
     host: &SharedHost,
     client: ClientId,
     project: ProjectInstance,
     sessions: Vec<SessionClose>,
     reservation: &Reservation,
-) -> Result<(ServerResponse, Vec<ServerMessage>, bool), ProtocolError> {
+) -> Result<PreparedRemoval, ProtocolError> {
     if sessions.len() > MAX_SESSIONS {
         return Err(error(
             "Too many project sessions to close at once; close some panes and retry",
@@ -186,13 +188,29 @@ pub(super) fn remove(
             ));
         }
     }
+    Ok(PreparedRemoval{project,sessions,owners,next:0})
+}
+
+pub(super) struct PreparedRemoval {
+    project: ProjectInstance,
+    sessions: Vec<SessionClose>,
+    owners: Vec<(Owner,HostedSession)>,
+    next: usize,
+}
+impl PreparedRemoval {
+    pub(super) fn advance(&mut self,host:&SharedHost,client:ClientId,authority:&custody::CommitAuthority<'_>)->Result<crate::workspace_model::WorkspaceModel,ProtocolError> {
+        if authority.model_is_committed(host)? {return host.lock().unwrap_or_else(|p|p.into_inner()).read_model();}
+        let registry=super::agent_execution::registry(host).map_err(error)?;
+        authority.before_close(host)?;
     let gate = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .control_gate
         .clone();
     let deadline = Instant::now() + Duration::from_secs(60);
-    for (selected, (owner, _)) in sessions.into_iter().zip(owners) {
+    while self.next<self.sessions.len() {
+        let selected=self.sessions[self.next].clone();
+        let (owner,_)=self.owners[self.next].clone();
         let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
         super::client::ensure_control_open(host)?;
         if Instant::now() >= deadline {
@@ -203,7 +221,7 @@ pub(super) fn remove(
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .require_project_instance(&project)
+            .require_project_instance(&self.project)
             .map_err(error)?;
         let id = selected.source.id();
         match (selected.source, owner) {
@@ -215,6 +233,7 @@ pub(super) fn remove(
                     .is_some_and(|record| record.handle.same_actor(&owner));
                 if !unchanged {
                     if owner.is_completed() && !state.chats.contains_key(&id) {
+                        self.next+=1;
                         continue;
                     }
                     return Err(error(
@@ -245,6 +264,7 @@ pub(super) fn remove(
                     .is_some_and(|record| record.handle.same_worker(&owner))
                 {
                     if owner.is_completed() && !state.terminals.contains_key(&id) {
+                        self.next+=1;
                         continue;
                     }
                     return Err(error(
@@ -274,19 +294,15 @@ pub(super) fn remove(
             }
             _ => unreachable!("preflight retained the selected source kind"),
         }
+        self.next+=1;
     }
+    authority.pending_commit(host)?;
+    #[cfg(test)] authority.before_final_commit(host);
     let _commit = super::client::try_scoped_control_write(&gate)?;
     super::client::ensure_control_open(host)?;
-    // No related work can pass admission until this guarded atomic edit ends.
-    // Remove only our exact lease; all other active reservations still apply.
-    reservation.release_for_commit(&project)?;
-    super::client::process_admitted(
-        host,
-        client,
-        ClientRequest::EditWorkspaceModel {
-            edit: ModelEdit::CloseProjectInstance { project },
-        },
-    )
+    let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+    state.apply_project_operation(client,&ModelEdit::CloseProjectInstance{project:self.project.clone()},&[],&[],authority)
+    }
 }
 
 #[cfg(test)]
@@ -304,6 +320,22 @@ mod tests {
         terminal::TerminalHandle,
     };
     use std::{path::PathBuf, sync::Arc};
+    fn identified(request:ClientRequest)->ClientRequest {
+        use crate::project_recovery::{ProjectOperationRequest,ProjectOperationAction};
+        match request {
+            ClientRequest::CloseProjectGuarded{project,sessions}=>ClientRequest::ProjectOperation{request:ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project,action:ProjectOperationAction::Remove{sessions}}},
+            ClientRequest::EditWorkspaceModel{edit:ModelEdit::RelocateProject{project,relocation}}=>ClientRequest::ProjectOperation{request:ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project,action:ProjectOperationAction::Locate{relocation}}},
+            request=>request,
+        }
+    }
+    fn fixture_request(host:&SharedHost,client:ClientId,request:ClientRequest)->Result<(ServerResponse,Vec<ServerMessage>,bool),ProtocolError> {
+        let (response,messages,close)=super::super::client::process_request(host,client,identified(request))?;
+        match response {
+            ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Committed{model,..}}=>Ok((ServerResponse::WorkspaceModel{model},messages,close)),
+            ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Pending{reason,..}}=>Err(ProtocolError::new(ProtocolErrorCode::Internal,reason,true)),
+            response=>Ok((response,messages,close)),
+        }
+    }
     struct Fixture {
         _directory: tempfile::TempDir,
         root: PathBuf,
@@ -403,7 +435,7 @@ mod tests {
             expected: ProjectInstance,
             sessions: Vec<SessionClose>,
         ) -> Result<(ServerResponse, Vec<ServerMessage>, bool), ProtocolError> {
-            super::super::client::process_request(
+            fixture_request(
                 &self.host,
                 1,
                 ClientRequest::CloseProjectGuarded {
@@ -413,6 +445,137 @@ mod tests {
             )
         }
     }
+    fn isolated_custody(test:&str)->bool {
+        const STAGE:&str="CAGENTS_PROJECT_CUSTODY_CHILD";
+        if std::env::var(STAGE).ok().as_deref()==Some(test) {return false;}
+        use crate::repository::{CancellationToken,CommandSpec,ProcessExecutor,SystemProcessExecutor};
+        let runtime=tempfile::tempdir().unwrap();
+        for name in ["data","config"] {std::fs::create_dir(runtime.path().join(name)).unwrap();}
+        let command=CommandSpec::new(std::env::current_exe().unwrap())
+            .args(["--exact",test,"--nocapture","--test-threads=1"])
+            .env(STAGE,test).env("XDG_RUNTIME_DIR",runtime.path())
+            .env("XDG_DATA_HOME",runtime.path().join("data")).env("XDG_CONFIG_HOME",runtime.path().join("config"))
+            .timeout(Duration::from_secs(45)).output_limits(2*1024*1024,2*1024*1024);
+        let output=SystemProcessExecutor.execute(&command,&CancellationToken::default()).unwrap();
+        let stdout=String::from_utf8_lossy(&output.stdout);
+        assert!(output.success&&stdout.contains("1 passed; 0 failed;"),"isolated actual custody case did not execute/pass: {}\n{}",stdout,String::from_utf8_lossy(&output.stderr));
+        true
+    }
+    struct HeldFinal {
+        start:crossbeam_channel::Sender<()>,
+        release:crossbeam_channel::Sender<()>,
+        thread:Option<std::thread::JoinHandle<()>>,
+    }
+    impl Drop for HeldFinal {
+        fn drop(&mut self) {
+            let _=self.start.try_send(());let _=self.release.try_send(());
+            if let Some(thread)=self.thread.take() {let _=thread.join();}
+        }
+    }
+    fn hold_final_commit(host:&SharedHost,operation:uuid::Uuid)->HeldFinal {
+        use std::sync::atomic::{AtomicBool,Ordering};
+        let gate=super::super::client::control_gate(host);
+        let (start,started)=crossbeam_channel::bounded(1);
+        let (acquired,ready)=crossbeam_channel::bounded(1);
+        let (release,released)=crossbeam_channel::bounded(1);
+        let thread=std::thread::spawn(move|| {
+            started.recv_timeout(Duration::from_secs(30)).unwrap();
+            let _reader=gate.read().unwrap();acquired.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        let signal=start.clone();let fired=AtomicBool::new(false);
+        host.lock().unwrap().project_operation_before_commit=Some(Arc::new(move|current| {
+            if current==operation && !fired.swap(true,Ordering::AcqRel) {
+                signal.send(()).unwrap();ready.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }));
+        HeldFinal{start,release,thread:Some(thread)}
+    }
+    fn operation_reply(host:&SharedHost,request:crate::project_recovery::ProjectOperationRequest)->crate::project_recovery::ProjectOperationOutcome {
+        let (ServerResponse::ProjectOperation{outcome},_,_)=super::super::client::process_request(host,1,ClientRequest::ProjectOperation{request}).unwrap() else {panic!("typed project operation reply required")};outcome
+    }
+    #[test]
+    fn repaired_git_busy_retains_exact_operation_plan_and_restart_negative_scope() {
+        if isolated_custody("host::project_removal::tests::repaired_git_busy_retains_exact_operation_plan_and_restart_negative_scope") {return;}
+        use crate::project_recovery::{ProjectOperationRequest,ProjectOperationAction,ProjectOperationOutcome,ProjectOperationPhase};
+        use crate::repository::{CancellationToken,CommandSpec,ProcessExecutor,SystemProcessExecutor};
+        use std::os::unix::fs::MetadataExt;
+        let mut fixture=Fixture::new();
+        let other=fixture._directory.path().join("other");std::fs::create_dir(&other).unwrap();
+        let unrelated=fixture.spawn_at(crate::model::TerminalId::new(),&other);
+        let old=fixture.root.clone();let moved=fixture._directory.path().join("moved");
+        let common=fixture._directory.path().join("metadata.git");
+        let git=|directory:&std::path::Path,args:Vec<String>| {
+            let command=CommandSpec::new("git").cwd(directory).args(["-c","core.fsmonitor=false","-c","core.hooksPath=/dev/null"])
+                .args(args).env_remove("GIT_DIR").env_remove("GIT_COMMON_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_NOSYSTEM","1")
+                .timeout(Duration::from_secs(5)).output_limits(1024*1024,1024*1024);
+            SystemProcessExecutor.execute(&command,&CancellationToken::default()).unwrap().require_success(&command.program).unwrap()
+        };
+        git(fixture._directory.path(),vec!["init".into(),"--separate-git-dir".into(),common.to_string_lossy().into_owned(),old.to_string_lossy().into_owned()]);
+        git(&old,vec!["config".into(),"core.worktree".into(),old.to_string_lossy().into_owned()]);
+        {
+            let mut state=fixture.host.lock().unwrap();
+            state.edit_model(1,ModelEdit::CloseProject{repository:old.clone()}).unwrap();
+            let model=state.edit_model(1,ModelEdit::OpenProject{repository:common.clone(),checkout:Some(old.clone()),primary_checkout:Some(old.clone()),name:"git".into(),kind:ProjectKind::Git}).unwrap();
+            fixture.expected=ProjectInstance{registry:model.identity,repository:common.clone(),ordinal:model.project(&common).unwrap().ordinal};
+        }
+        std::fs::rename(&old,&moved).unwrap();
+        let request=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:ProjectOperationAction::Locate{relocation:crate::project_recovery::Relocation{repository:common.clone(),destination:common.clone(),old_root:old.clone(),new_root:moved.clone()}}};
+        let held=hold_final_commit(&fixture.host,request.operation);
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::PendingCommit,..}));
+        let after=std::fs::read(common.join("config")).unwrap();let inode=std::fs::metadata(common.join("config")).unwrap().ino();
+        assert!(String::from_utf8_lossy(&after).contains(moved.to_str().unwrap()),"real Git config repair preceded final busy");
+        let model=fixture.host.lock().unwrap().read_model().unwrap();
+        assert_eq!(model.project(&common).unwrap().checkout.as_ref(),Some(&old));
+        assert_eq!(fixture.host.lock().unwrap().project_removals.lock().unwrap().len(),1);
+        assert!(ensure_available(&fixture.host,Some(&common),Some(&moved),None).is_err());
+        assert!(ensure_available(&fixture.host,None,Some(&other),None).is_ok());
+        assert!(super::super::client::process_request(&fixture.host,1,ClientRequest::Input{terminal_id:unrelated.source.id(),bytes:b"unrelated remains live\n".to_vec()}).is_ok());
+        // A new daemon can retain only the actual durable negative scope. It
+        // cannot recreate the prepared root/admin pins or replay the repair.
+        let mut restarted=HostState::new(fixture.host.lock().unwrap().proof().clone());
+        restarted.install_model(Registry::at(&fixture._directory.path().join("registry.sqlite3")).unwrap());restarted.register_client(1);
+        let restarted=Arc::new(HostLock::new(restarted));
+        assert!(matches!(operation_reply(&restarted,request.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::UnavailableAfterRestart,..}));
+        assert!(ensure_available(&restarted,Some(&common),Some(&moved),None).is_err());
+        assert!(ensure_available(&restarted,None,Some(&other),None).is_ok());drop(restarted);
+        std::fs::write(common.join("config.lock"),b"foreign lock after original repair").unwrap();
+        fixture.host.lock().unwrap().project_operation_before_commit=None;drop(held);
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Committed{..}));
+        assert_eq!(std::fs::metadata(common.join("config")).unwrap().ino(),inode,"retry cannot repeat a completed Git write");
+        assert_eq!(std::fs::read(common.join("config.lock")).unwrap(),b"foreign lock after original repair");
+        assert_eq!(std::fs::read(common.join("config")).unwrap(),after);
+        let model=fixture.host.lock().unwrap().read_model().unwrap();assert_eq!(model.project(&common).unwrap().checkout.as_ref(),Some(&moved));
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Committed{..}),"same operation has an idempotent settled reply");
+        let mut changed=request;changed.project.ordinal+=1;
+        assert!(super::super::client::process_request(&fixture.host,1,ClientRequest::ProjectOperation{request:changed}).is_err());
+        assert!(!fixture.handles[0].is_completed());
+    }
+    #[test]
+    fn closed_owner_before_final_busy_is_not_reclosed_or_reinventoried_on_same_operation_retry() {
+        if isolated_custody("host::project_removal::tests::closed_owner_before_final_busy_is_not_reclosed_or_reinventoried_on_same_operation_retry") {return;}
+        use crate::project_recovery::{ProjectOperationRequest,ProjectOperationAction,ProjectOperationOutcome,ProjectOperationPhase};
+        let mut fixture=Fixture::new();let own=fixture.spawn(crate::model::TerminalId::new());
+        let other=fixture._directory.path().join("other");std::fs::create_dir(&other).unwrap();
+        let unrelated=fixture.spawn_at(crate::model::TerminalId::new(),&other);
+        let request=ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project:fixture.expected.clone(),action:ProjectOperationAction::Remove{sessions:vec![own.clone()]}};
+        let held=hold_final_commit(&fixture.host,request.operation);
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Pending{phase:ProjectOperationPhase::PendingCommit,..}));
+        assert!(fixture.handles[0].is_completed(),"the actual selected owner closed before busy");
+        assert!(!fixture.host.lock().unwrap().terminals.contains_key(&own.source.id()));
+        assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_some());
+        assert!(ensure_available(&fixture.host,Some(&fixture.root),Some(&fixture.root),None).is_err());
+        assert!(super::super::client::process_request(&fixture.host,1,ClientRequest::Input{terminal_id:unrelated.source.id(),bytes:b"after pending close\n".to_vec()}).is_ok());
+        fixture.host.lock().unwrap().project_operation_before_commit=None;drop(held);
+        assert!(matches!(operation_reply(&fixture.host,request.clone()),ProjectOperationOutcome::Committed{..}),"original roster still contains the now-absent owner; success must use retained close progress");
+        assert!(fixture.host.lock().unwrap().read_model().unwrap().project(&fixture.root).is_none());
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        assert!(!fixture.handles[1].is_completed());
+        assert!(matches!(operation_reply(&fixture.host,request),ProjectOperationOutcome::Committed{..}));
+    }
+
     #[test]
     fn final_prepared_model_edit_refuses_an_alias_retarget_after_admission() {
         use std::os::unix::fs::symlink;
@@ -444,7 +607,7 @@ mod tests {
                 },
             };
             let before = fixture.host.lock().unwrap().read_model().unwrap();
-            let replayed = super::super::client::process_request(&fixture.host, 1, ClientRequest::EditWorkspaceModel {edit:replay}).unwrap();
+            let replayed = fixture_request(&fixture.host, 1, ClientRequest::EditWorkspaceModel {edit:replay}).unwrap();
             let ServerResponse::WorkspaceModel {model:replayed} = replayed.0 else {panic!()};
             assert_eq!(replayed.sequence, before.sequence, "seen operations remain idempotent while reserved");
             {
@@ -464,7 +627,7 @@ mod tests {
             // A genuinely foreign edit still passes with the same reservation.
             std::fs::remove_file(&alias).unwrap();
             symlink(&foreign, &alias).unwrap();
-            let result = super::super::client::process_request(&fixture.host, 1, request).unwrap();
+            let result = fixture_request(&fixture.host, 1, request).unwrap();
             let ServerResponse::WorkspaceModel { model } = result.0 else { panic!() };
             assert!(model.project(&foreign).is_some());
             assert_eq!(model.project(&fixture.root), before.project(&fixture.root));
@@ -491,12 +654,15 @@ mod tests {
         if std::env::var_os(STAGE).is_none() {
             let runtime=tempfile::tempdir().unwrap();
             for name in ["data","config"] {std::fs::create_dir(runtime.path().join(name)).unwrap();}
-            let output=std::process::Command::new(std::env::current_exe().unwrap())
+            use crate::repository::{CancellationToken,CommandSpec,ProcessExecutor,SystemProcessExecutor};
+            let command=CommandSpec::new(std::env::current_exe().unwrap())
                 .args(["--exact","host::project_removal::tests::slow_project_teardown_keeps_unrelated_input_responsive_and_releases_reservation","--nocapture","--test-threads=1"])
                 .env(STAGE,"1").env("XDG_RUNTIME_DIR",runtime.path())
                 .env("XDG_DATA_HOME",runtime.path().join("data")).env("XDG_CONFIG_HOME",runtime.path().join("config"))
-                .output().unwrap();
-            assert!(output.status.success(),"isolated scoped-writer fixture failed: {}\n{}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+                .timeout(Duration::from_secs(30)).output_limits(2*1024*1024,2*1024*1024);
+            let output=SystemProcessExecutor.execute(&command,&CancellationToken::default()).unwrap();
+            let stdout=String::from_utf8_lossy(&output.stdout);
+            assert!(output.success && stdout.contains("1 passed; 0 failed;"),"isolated scoped-writer fixture must execute exactly its selected test: {}\n{}",stdout,String::from_utf8_lossy(&output.stderr));
             return;
         }
         use crate::{
@@ -570,7 +736,7 @@ mod tests {
             fn exchange(&mut self, request: ClientRequest) -> ServerMessage {
                 use crate::terminal_ipc::{ClientEnvelope,FrameCodec,ServerEnvelope,MAX_CLIENT_FRAME_BYTES,MAX_FRAME_BYTES,PROTOCOL_VERSION};
                 let request_id=self.next;self.next+=1;
-                FrameCodec::new(MAX_CLIENT_FRAME_BYTES).write(&mut self.stream,&ClientEnvelope{version:PROTOCOL_VERSION,request_id,proof:Some(self.proof.clone()),request}).unwrap();
+                FrameCodec::new(MAX_CLIENT_FRAME_BYTES).write(&mut self.stream,&ClientEnvelope{version:PROTOCOL_VERSION,request_id,proof:Some(self.proof.clone()),request:identified(request)}).unwrap();
                 let mut codec=FrameCodec::new(MAX_FRAME_BYTES);
                 loop {
                     let envelope:ServerEnvelope=codec.read(&mut self.stream).expect("framed request must finish before held provider is released").unwrap();
@@ -582,22 +748,6 @@ mod tests {
         let mut writer=Framed::new(&fixture.host,2);
         let mut framed_input=Framed::new(&fixture.host,3);
         assert!(matches!(framed_input.exchange(ClientRequest::Attach{terminal_id:unrelated.source.id(),after_generation:0,after_event_sequence:0}),ServerMessage::Response{response:ServerResponse::Attached{..}}));
-        let (locate_project,remove_project)={
-            let mut state=fixture.host.lock().unwrap();
-            let mut projects=Vec::new();
-            for name in ["locate-final","remove-final"] {
-                let root=fixture._directory.path().join(name);std::fs::create_dir(&root).unwrap();
-                let model=state.edit_model(1,ModelEdit::OpenProject{repository:root.clone(),checkout:None,primary_checkout:None,name:name.into(),kind:ProjectKind::Folder}).unwrap();
-                projects.push(ProjectInstance{registry:model.identity,repository:root.clone(),ordinal:model.project(&root).unwrap().ordinal});
-            }
-            (projects.remove(0),projects.remove(0))
-        };
-        let same_location=crate::project_recovery::Relocation{repository:locate_project.repository.clone(),destination:locate_project.repository.clone(),old_root:locate_project.repository.clone(),new_root:locate_project.repository.clone()};
-        let (locate_lease,remove_lease)={
-            let gate=super::super::client::control_gate(&fixture.host);
-            let _admission=super::super::client::try_scoped_control_write(&gate).unwrap();
-            (reserve_relocation(&fixture.host,&locate_project,&same_location).unwrap(),reserve(&fixture.host,&remove_project,&[]).unwrap())
-        };
         let mut recipe = LaunchRecipe::shell(fixture.root.clone()).unwrap();
         recipe.program = "/bin/cat".into();
         recipe.arguments.clear();
@@ -663,7 +813,7 @@ mod tests {
         let expected = fixture.expected.clone();
         let (closed, closing) = crossbeam_channel::bounded(1);
         let close = thread::spawn(move || {
-            let result = super::super::client::process_request(
+            let result = fixture_request(
                 &host,
                 1,
                 ClientRequest::CloseProjectGuarded {
@@ -685,7 +835,7 @@ mod tests {
             .project_removals
             .lock()
             .unwrap()
-            .len() < 3
+            .len() < 1
         {
             assert!(Instant::now() < deadline, "scoped removal was not admitted");
             thread::yield_now();
@@ -717,13 +867,6 @@ mod tests {
             let ServerMessage::Error(error)=writer.exchange(request) else {panic!("scoped writer must refuse before effects while teardown is held");};
             assert!(error.retryable && error.message.contains("busy"),"{error:?}");
         }
-        // Both final scoped writer phases also refuse without enqueuing a
-        // writer. Their exact reservations were acquired before teardown began.
-        let error=super::super::session_locations::relocate(&fixture.host,2,locate_project.clone(),same_location).unwrap_err();
-        assert!(error.retryable && error.message.contains("busy"),"{error:?}");
-        let error=remove(&fixture.host,2,remove_project.clone(),Vec::new(),&remove_lease).unwrap_err();
-        assert!(error.retryable && error.message.contains("busy"),"{error:?}");
-        drop(locate_lease);drop(remove_lease);
         assert!(matches!(framed_input.exchange(ClientRequest::Input{terminal_id:unrelated.source.id(),bytes:b"after writer attempt\n".to_vec()}),ServerMessage::Response{response:ServerResponse::Accepted}));
         assert!(closing.try_recv().is_err(),"Input must complete while original provider is still held");
         assert!(!fixture.handles[0].is_completed(),"busy writer cannot close the unrelated selected worker");
@@ -731,14 +874,14 @@ mod tests {
             let mut state=fixture.host.lock().unwrap();
             assert_eq!(state.project_removals.lock().unwrap().len(),1,"refused writer cannot leave another reservation");
             let model=state.read_model().unwrap();
-            for project in [&unrelated_project,&locate_project,&remove_project] {assert!(model.project(&project.repository).is_some(),"busy final phase must preserve original project row");}
+            for project in [&unrelated_project] {assert!(model.project(&project.repository).is_some(),"busy final phase must preserve original project row");}
         }
         let host = fixture.host.clone();
         let unrelated_id = unrelated.source.id();
         let (answered, answering) = crossbeam_channel::bounded(1);
         let input = thread::spawn(move || {
-            let listed = super::super::client::process_request(&host, 1, ClientRequest::List);
-            let input = super::super::client::process_request(
+            let listed = fixture_request(&host, 1, ClientRequest::List);
+            let input = fixture_request(
                 &host,
                 1,
                 ClientRequest::Input {
@@ -754,7 +897,7 @@ mod tests {
         assert!(listed.is_ok());
         assert!(input_result.is_ok());
         input.join().unwrap();
-        let blocked = super::super::client::process_request(
+        let blocked = fixture_request(
             &fixture.host,
             1,
             ClientRequest::EditWorkspaceModel {
@@ -788,7 +931,7 @@ mod tests {
             },
         };
         assert!(
-            super::super::client::process_request(&fixture.host, 1, transfer)
+            fixture_request(&fixture.host, 1, transfer)
                 .unwrap_err()
                 .message
                 .contains("being removed")
@@ -813,7 +956,7 @@ mod tests {
             },
         };
         assert!(
-            super::super::client::process_request(&fixture.host, 1, cleanup)
+            fixture_request(&fixture.host, 1, cleanup)
                 .unwrap_err()
                 .message
                 .contains("being removed"),
@@ -828,7 +971,7 @@ mod tests {
             },
         };
         assert!(
-            super::super::client::process_request(&fixture.host, 1, save)
+            fixture_request(&fixture.host, 1, save)
                 .unwrap_err()
                 .message
                 .contains("being removed")

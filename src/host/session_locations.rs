@@ -1,7 +1,7 @@
 //! Prepare process evidence outside HostState, then atomically relocate logical
 //! ownership and its exact sessions. Caller retains a scoped project-location reservation.
 use super::{
-    model::SessionMove,
+    model::{SessionDirectoryProof, SessionMove},
     state::{ClientId, SharedHost},
 };
 use crate::{
@@ -21,14 +21,23 @@ use std::{
 
 #[derive(Clone)]
 enum Owner {
-    Chat(Handle),
+    Chat {handle:Handle,instance:uuid::Uuid},
     Terminal(TerminalHandle),
     Unavailable,
+}
+enum VerifiedDirectory {
+    Live(DirectoryProof),
+    Completed {identity:crate::agent_execution::DirectoryIdentity,context:std::sync::Arc<crate::chat::protocol::ExecutionContext>},
+}
+impl VerifiedDirectory {
+    fn evidence(&self)->SessionDirectoryProof {
+        match self {Self::Live(proof)=>SessionDirectoryProof::Live{identity:proof.identity,process:proof.process.clone()},Self::Completed{identity,..}=>SessionDirectoryProof::Completed{identity:*identity}}
+    }
 }
 struct Prepared {
     movement: SessionMove,
     owner: Owner,
-    proof: Option<DirectoryProof>,
+    proof: Option<VerifiedDirectory>,
 }
 
 fn error(message: impl Into<String>) -> ProtocolError {
@@ -138,12 +147,12 @@ pub(super) fn verified_chat_directory(
     Ok((directory, context))
 }
 
-pub(super) fn relocate(
+pub(super) fn prepare_relocation(
     host: &SharedHost,
     origin: ClientId,
     project: crate::project_recovery::ProjectInstance,
     relocation: Relocation,
-) -> Result<WorkspaceModel, ProtocolError> {
+) -> Result<PreparedRelocation, ProtocolError> {
     let edit = ModelEdit::RelocateProject { project:project.clone(), relocation }
         .canonicalized()
         .map_err(error)?;
@@ -159,7 +168,13 @@ pub(super) fn relocate(
         let worktrees=model.views.iter().filter_map(|view|match &view.scope { Scope::Worktree{repository,path} if *repository==project.repository=>Some(path.clone()),_=>None }).collect::<Vec<_>>();
         (current.kind,worktrees)
     };
-    if kind==crate::model::ProjectKind::Git && !relocation.verification_only() { crate::project_recovery::git_repair::repair(relocation,&worktrees).map_err(error)?; }
+    // Retain root/admin authority before effects. All provider/agent proofs
+    // below are prepared before this plan's first metadata publication.
+    let repair = if kind==crate::model::ProjectKind::Git && !relocation.verification_only() {
+        crate::project_recovery::git_repair::RepairPlan::prepare(relocation,&worktrees)
+    } else {
+        crate::project_recovery::git_repair::RepairPlan::pin(relocation)
+    }.map_err(error)?;
     let sources = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let model = state.read_model()?;
@@ -230,7 +245,7 @@ pub(super) fn relocate(
                     (
                         source,
                         HostedSession::Chat(current),
-                        Owner::Chat(record.handle.clone()),
+                        Owner::Chat{handle:record.handle.clone(),instance:record.execution_instance},
                     )
                 } else if let HostedSession::Terminal(_) = &source
                     && let Some(record) = state.terminals.get(&id)
@@ -251,11 +266,19 @@ pub(super) fn relocate(
             })
             .collect::<Result<Vec<_>, ProtocolError>>()?
     };
+    if sources.len()>1024 {return Err(error("Locate exceeds its retained session-proof capacity; no metadata repair started"));}
+    let chat_gates=sources.iter().filter_map(|(_,source,_)|matches!(source,HostedSession::Chat(_)).then(||super::chat::transition_gate(host,source.id())))
+        .collect::<Vec<_>>();
+    let transitions=chat_gates.iter().map(|gate|match gate.try_lock() {
+        Ok(guard)=>Ok(guard),Err(std::sync::TryLockError::Poisoned(poison))=>Ok(poison.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock)=>Err(error("A conversation lifecycle transition is in progress; no metadata repair started")),
+    }).collect::<Result<Vec<_>,ProtocolError>>()?;
     let agent_inputs = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent_relocation_inputs(relocation)
         .map_err(error)?;
+    if sources.len().saturating_add(agent_inputs.len())>1024 {return Err(error("Locate exceeds its retained owner-proof capacity; no metadata repair started"));}
     let agent_moves = agent_inputs
         .into_iter()
         .map(|input| input.verify())
@@ -293,14 +316,21 @@ pub(super) fn relocate(
         let proof = if Instant::now() >= deadline {
             Err("Locate reached its provider verification time limit; retry after these providers are responsive, or close the affected panes explicitly".into())
         } else { match &owner {
-            Owner::Chat(handle) => handle.capture_execution_directory(&candidate),
+            Owner::Chat{handle,..}=>handle.refresh_retained_state().and_then(|()| {
+                if handle.is_completed() {
+                    let expected=approved.ok_or("The completed provider has no original approved directory binding; close it explicitly instead of granting a replacement folder".to_owned())?;
+                    let context=handle.pinned_execution_directory(&candidate)?;
+                    if context.directory_identity()?!=Some(expected) {return Err("The completed provider directory differs from its original approved directory".into());}
+                    Ok(VerifiedDirectory::Completed{identity:expected,context})
+                } else {handle.capture_execution_directory(&candidate).map(VerifiedDirectory::Live)}
+            }),
             Owner::Terminal(handle) => handle.holder_identity().ok_or_else(|| "The original terminal has no authenticated holder identity; close this pane explicitly or retry after recovery".to_owned()).and_then(|holder| {
                 if !holder.holder.is_current() { return Err("The original terminal holder is no longer live; recover or close this pane before retrying Locate".into()); }
-                DirectoryProof::capture_owned_process(&holder.root, &candidate, approved)
+                DirectoryProof::capture_owned_process(&holder.root, &candidate, approved).map(VerifiedDirectory::Live)
             }),
             Owner::Unavailable => Err("The original provider is not attached to this daemon. Recover its exact holder, or close this pane and start a new session in the located folder".into()),
         }}.and_then(|proof| {
-            if approved.is_some_and(|identity| proof.identity != identity) {
+            if approved.is_some_and(|identity| proof.evidence().identity() != identity) {
                 Err("The provider directory differs from its original approved directory; close it before starting in a replacement folder".into())
             } else { Ok(proof) }
         });
@@ -310,7 +340,7 @@ pub(super) fn relocate(
             candidate,
             proof: proof
                 .as_ref()
-                .map(|proof| (proof.identity, proof.process.clone()))
+                .map(VerifiedDirectory::evidence)
                 .map_err(Clone::clone),
         };
         prepared.push(Prepared {
@@ -319,17 +349,71 @@ pub(super) fn relocate(
             proof: proof.ok(),
         });
     }
-    {
+    drop(transitions);
+    Ok(PreparedRelocation{edit,prepared,agent_moves,repair,chat_gates,model_committed:false,actor_cursor:0})
+}
+
+pub(super) struct PreparedRelocation {
+    edit: ModelEdit,
+    prepared: Vec<Prepared>,
+    agent_moves: Vec<super::model::AgentMove>,
+    repair: crate::project_recovery::git_repair::RepairPlan,
+    chat_gates:Vec<std::sync::Arc<std::sync::Mutex<()>>>,
+    model_committed: bool,
+    actor_cursor: usize,
+}
+impl PreparedRelocation {
+    pub(super) fn retained_bytes(&self)->usize {self.repair.retained_bytes()}
+    pub(super) fn retained_directories(&self)->usize {self.repair.retained_directories()+self.prepared.len()+self.agent_moves.len()}
+    pub(super) fn advance(&mut self,host:&SharedHost,origin:ClientId,authority:&super::project_removal::custody::CommitAuthority<'_>)->Result<WorkspaceModel,ProtocolError> {
+        let registry=super::agent_execution::registry(host).map_err(error)?;
+        let _transitions=self.chat_gates.iter().map(|gate|match gate.try_lock() {
+            Ok(guard)=>Ok(guard),Err(std::sync::TryLockError::Poisoned(poison))=>Ok(poison.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock)=>Err(error("The original conversation has a lifecycle transition in progress; its prepared Locate operation was retained")),
+        }).collect::<Result<Vec<_>,ProtocolError>>()?;
+        if authority.model_is_committed(host)? {self.model_committed=true;}
+        {
+        let gate=super::client::control_gate(host);
+        let _admitted=gate.read().unwrap_or_else(|p|p.into_inner());
+        super::client::ensure_control_open(host)?;
+        if !self.model_committed {
+            authority.before_repair(host)?;
+            self.repair.apply_remaining().map_err(error)?;
+            authority.pending_commit(host)?;
+        }
+        #[cfg(test)] if !self.model_committed {authority.before_final_commit(host);}
+        self.repair.require_current().map_err(error)?;
+        if !self.model_committed {
+            for item in &self.prepared {
+                match &item.proof {
+                    Some(VerifiedDirectory::Live(proof))=>proof.validate_current().map_err(error)?,
+                    Some(VerifiedDirectory::Completed{context,identity})=> {
+                        context.verify_directory(&item.movement.candidate).map_err(error)?;
+                        if context.directory_identity().map_err(error)?!=Some(*identity) {return Err(error("The pending completed provider lost its original retained directory pin"));}
+                    }
+                    None=>{},
+                }
+                if let (Some(VerifiedDirectory::Live(proof)),Owner::Chat{handle,..})=(&item.proof,&item.owner) {
+                    handle.refresh_retained_state().map_err(error)?;
+                    if handle.provider_process().as_ref()!=Some(&proof.process) {
+                        return Err(error("The prepared native backend changed; its successor and pending operation were preserved"));
+                    }
+                }
+            }
+        }
+        } // Release shared effect admission before nonblocking final writer.
+    if !self.model_committed {
         let gate=super::client::control_gate(host);
         let _exclusive=super::client::try_scoped_control_write(&gate)?;
         super::client::ensure_control_open(host)?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        for item in &prepared {
+        for item in &self.prepared {
             let id = item.movement.source.id();
             let unchanged = match (&item.owner, &item.movement.source) {
-                (Owner::Chat(handle), HostedSession::Chat(source)) => {
+                (Owner::Chat{handle,instance}, HostedSession::Chat(source)) => {
                     state.chats.get(&id).is_some_and(|record| {
-                        record.handle.same_actor(handle)
+                        record.execution_instance==*instance && record.handle.same_actor(handle)
+                            && match &item.proof {Some(VerifiedDirectory::Live(proof))=>handle.provider_process().as_ref()==Some(&proof.process),Some(VerifiedDirectory::Completed{..})=>handle.is_completed(),None=>true}
                             && HostedSession::Chat(record.session.clone())
                                 .same_process(&HostedSession::Chat(source.clone()))
                     })
@@ -355,18 +439,22 @@ pub(super) fn relocate(
                 ));
             }
         }
-        let moves = prepared
+        let moves = self.prepared
             .iter()
             .map(|item| item.movement.clone())
             .collect::<Vec<_>>();
-        state.apply_session_relocation(&edit, &moves, &agent_moves)?;
+        state.apply_project_operation(origin,&self.edit,&moves,&self.agent_moves,authority)?;
+        self.model_committed=true;
     }
     // The scoped reservation excludes related edits/starts while actor-local
     // operational paths catch up; unrelated input stays responsive. Keep failed
     // actor moves explicitly blocked.
-    for item in &mut prepared {
-        if item.proof.is_some()
-            && let Owner::Chat(handle) = &item.owner
+    while let Some(item)=self.prepared.get_mut(self.actor_cursor) {
+        let gate=super::client::control_gate(host);
+        let _admitted=gate.read().unwrap_or_else(|p|p.into_inner());
+        super::client::ensure_control_open(host)?;
+        if matches!(&item.proof,Some(VerifiedDirectory::Live(_)))
+            && let Owner::Chat{handle,..} = &item.owner
         {
             if let Err(reason) = handle.relocate_execution_directory(&item.movement.candidate) {
                 registry
@@ -380,11 +468,13 @@ pub(super) fn relocate(
                     .map_err(error)?;
             }
         }
+        self.actor_cursor+=1;
     }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let model = state.read_model()?;
-    state.announce_model_edit(origin, model.sequence, &edit);
+    state.announce_model_edit(origin, model.sequence, &self.edit);
     Ok(model)
+}
 }
 
 #[cfg(test)]
@@ -413,6 +503,18 @@ mod tests {
         sync::{Arc, Mutex},
     };
 
+    fn fixture_request(host:&SharedHost,client:ClientId,request:ClientRequest)->Result<(ServerResponse,Vec<crate::terminal_ipc::ServerMessage>,bool),ProtocolError> {
+        let request=match request {
+            ClientRequest::EditWorkspaceModel{edit:ModelEdit::RelocateProject{project,relocation}}=>ClientRequest::ProjectOperation{request:crate::project_recovery::ProjectOperationRequest{operation:uuid::Uuid::new_v4(),project,action:crate::project_recovery::ProjectOperationAction::Locate{relocation}}},
+            request=>request,
+        };
+        let (response,messages,close)=super::super::client::process_request(host,client,request)?;
+        match response {
+            ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Committed{model,..}}=>Ok((ServerResponse::WorkspaceModel{model},messages,close)),
+            ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Pending{reason,..}}=>Err(error(reason)),
+            response=>Ok((response,messages,close)),
+        }
+    }
     struct PathAware {
         directory: PathBuf,
         calls: Arc<Mutex<Vec<PathBuf>>>,
@@ -652,13 +754,85 @@ mod tests {
                 },
             },
         };
-        let response = super::super::client::process_request(&fixture.host, 1, request)
+        let response = fixture_request(&fixture.host, 1, request)
             .unwrap()
             .0;
         let ServerResponse::WorkspaceModel { model } = response else {
             panic!("expected verified model")
         };
         model
+    }
+
+    #[test]
+    fn completed_locate_uses_original_pin_without_a_live_process_or_actor_command() {
+        let fixture = fixture(0);
+        fixture.handle.close().unwrap();
+        assert!(fixture.handle.is_completed());
+        let approved = fixture.original_context.as_ref().unwrap().directory_identity().unwrap();
+        std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+        std::fs::create_dir(&fixture.old).unwrap();
+        let model = locate(&fixture);
+        assert!(model.session_location_refusals.is_empty());
+        assert_eq!(model.projects[0].repository, fixture.moved);
+        let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
+        let location = registry.lock().unwrap().session_location(&HostedSession::Chat(fixture.source.clone())).unwrap().unwrap();
+        assert_eq!(location.directory, fixture.moved);
+        assert_eq!(location.approved, approved);
+        assert!(location.process.is_none(), "a retained pin never invents a live process witness");
+        let (path, context) = verified_chat_directory(&fixture.host, &fixture.source, &fixture.handle).unwrap();
+        assert_eq!(path, fixture.moved);
+        assert_eq!(context.directory_identity().unwrap(), approved);
+        let state = fixture.host.lock().unwrap();
+        assert!(state.chats[&fixture.source.id].handle.same_actor(&fixture.handle));
+        assert_eq!(state.chats[&fixture.source.id].session, fixture.source);
+        assert!(fixture.handle.is_completed());
+        assert!(fixture.calls.lock().unwrap().is_empty(), "Locate must not enqueue new provider work");
+    }
+
+    #[test]
+    fn completed_locate_refuses_replacement_inode_and_missing_original_approval() {
+        for context_mode in [0, 1] {
+            let fixture = fixture(context_mode);
+            fixture.handle.close().unwrap();
+            if context_mode == 0 {
+                std::fs::rename(&fixture.old, fixture.old.with_extension("retained-original")).unwrap();
+            } else {
+                std::fs::rename(&fixture.old, &fixture.moved).unwrap();
+            }
+            if context_mode == 0 { std::fs::create_dir(&fixture.moved).unwrap(); }
+            let model = locate(&fixture);
+            assert!(!model.session_location_refusals.is_empty());
+            assert!(verified_chat_directory(&fixture.host, &fixture.source, &fixture.handle).is_err());
+            let state = fixture.host.lock().unwrap();
+            assert!(state.chats[&fixture.source.id].handle.same_actor(&fixture.handle));
+            assert_eq!(state.chats[&fixture.source.id].session, fixture.source);
+            assert!(fixture.handle.is_completed());
+        }
+    }
+
+    #[test]
+    fn completed_pending_locate_rechecks_original_instance_and_candidate_before_commit() {
+        for replace_instance in [false,true] {
+            let fixture=fixture(0);fixture.handle.close().unwrap();
+            std::fs::rename(&fixture.old,&fixture.moved).unwrap();
+            let gate=super::super::chat::transition_gate(&fixture.host,fixture.source.id);
+            let captured_host=fixture.host.clone();let moved=fixture.moved.clone();let id=fixture.source.id;
+            fixture.host.lock().unwrap().project_operation_before_commit=Some(Arc::new(move |_| {
+                assert!(matches!(gate.try_lock(),Err(std::sync::TryLockError::WouldBlock)));
+                if replace_instance {captured_host.lock().unwrap().chats.get_mut(&id).unwrap().execution_instance=uuid::Uuid::new_v4();}
+                else {std::fs::rename(&moved,moved.with_extension("original-pin")).unwrap();std::fs::create_dir(&moved).unwrap();}
+            }));
+            let request=crate::project_recovery::ProjectOperationRequest{operation:uuid::Uuid::new_v4(),
+                project:super::super::agent_execution::registry(&fixture.host).unwrap().lock().unwrap().project_instance(&fixture.old).unwrap(),
+                action:crate::project_recovery::ProjectOperationAction::Locate{relocation:Relocation{repository:fixture.old.clone(),destination:fixture.moved.clone(),old_root:fixture.old.clone(),new_root:fixture.moved.clone()}}};
+            let (response,_,_)=super::super::client::process_request(&fixture.host,1,ClientRequest::ProjectOperation{request}).unwrap();
+            assert!(matches!(response,ServerResponse::ProjectOperation{outcome:crate::project_recovery::ProjectOperationOutcome::Pending{..}}));
+            let mut state=fixture.host.lock().unwrap();state.project_operation_before_commit=None;
+            assert_eq!(state.read_model().unwrap().projects[0].repository,fixture.old);
+            assert_eq!(state.chats[&id].session,fixture.source);
+            drop(state);
+            assert!(super::super::project_removal::ensure_available(&fixture.host,Some(&fixture.old),None,None).is_err());
+        }
     }
 
     #[test]
@@ -778,7 +952,7 @@ mod tests {
             }
             let before = fixture.host.lock().unwrap().read_model().unwrap();
             std::fs::rename(&fixture.old, &fixture.moved).unwrap();
-            let response = super::super::client::process_request(
+            let response = fixture_request(
                 &fixture.host,
                 1,
                 ClientRequest::EditWorkspaceModel {
@@ -880,7 +1054,7 @@ mod tests {
             },
         };
         assert!(
-            super::super::client::process_request(&fixture.host, 1, request())
+            fixture_request(&fixture.host, 1, request())
                 .unwrap_err()
                 .message
                 .contains("different provider incarnation")
@@ -980,7 +1154,7 @@ mod tests {
                 },
             },
         };
-        assert!(super::super::client::process_request(&fixture.host, 1, request).is_err());
+        assert!(fixture_request(&fixture.host, 1, request).is_err());
         assert!(!fixture.handle.is_completed());
         database
             .execute_batch("DROP TRIGGER reject_session_thread")
@@ -1049,7 +1223,7 @@ mod tests {
                 .issued_chat_ids
                 .contains(&fixture.source.id)
         );
-        super::super::client::process_request(
+        fixture_request(
             &fixture.host,
             1,
             ClientRequest::ChatClose {
@@ -1067,7 +1241,7 @@ mod tests {
         );
         let mut replacement = fixture.source.clone();
         replacement.launch.session_id = None;
-        let response = super::super::client::process_request(
+        let response = fixture_request(
             &fixture.host,
             1,
             ClientRequest::ChatStart {
@@ -1298,7 +1472,7 @@ mod tests {
                 .directory,
             fixture.moved
         );
-        let response = super::super::client::process_request(
+        let response = fixture_request(
             &fixture.host,
             1,
             ClientRequest::ChatReturnTerminal {
@@ -1385,7 +1559,7 @@ mod tests {
         )
         .unwrap();
         std::fs::rename(&retained, &fixture.moved).unwrap();
-        let response = super::super::client::process_request(
+        let response = fixture_request(
             &fixture.host,
             1,
             ClientRequest::EditWorkspaceModel {
@@ -1435,7 +1609,7 @@ mod tests {
         std::fs::rename(&fixture.old,&fixture.moved).unwrap();
         let request=ClientRequest::EditWorkspaceModel{edit:ModelEdit::RelocateProject{project:expected,relocation:Relocation{repository:fixture.old.clone(),destination:fixture.moved.clone(),old_root:fixture.old.clone(),new_root:fixture.moved.clone()}}};
         let host=fixture.host.clone();
-        let locating=std::thread::spawn(move||super::super::client::process_request(&host,1,request));
+        let locating=std::thread::spawn(move||fixture_request(&host,1,request));
         let deadline=Instant::now()+Duration::from_secs(3);
         loop {
             let reserved={let state=fixture.host.lock().unwrap();let entries=state.project_removals.lock().unwrap();!entries.is_empty()};
@@ -1445,7 +1619,7 @@ mod tests {
         }
         let (done_tx,done_rx)=std::sync::mpsc::sync_channel(1);
         let host=fixture.host.clone();
-        let unrelated=std::thread::spawn(move|| { let result=super::super::client::process_request(&host,2,ClientRequest::List);done_tx.send(result.is_ok()).unwrap(); });
+        let unrelated=std::thread::spawn(move|| { let result=fixture_request(&host,2,ClientRequest::List);done_tx.send(result.is_ok()).unwrap(); });
         assert!(done_rx.recv_timeout(Duration::from_millis(500)).unwrap(),"Unrelated List must not wait for the provider's proof");
         unrelated.join().unwrap();
         assert!(super::super::project_removal::ensure_available(&fixture.host,Some(&fixture.old),None,None).is_err());
@@ -1464,7 +1638,7 @@ mod tests {
         {let mut registry=registry.lock().unwrap();registry.apply(&ModelEdit::CloseProject{repository:fixture.old.clone()}).unwrap();registry.apply(&ModelEdit::ReopenProject{repository:fixture.old.clone(),checkout:None,primary_checkout:None,name:"Replacement".into(),kind:ProjectKind::Folder}).unwrap();}
         let before=registry.lock().unwrap().model().unwrap();
         let request=ClientRequest::EditWorkspaceModel{edit:ModelEdit::RelocateProject{project:expected,relocation:Relocation{repository:fixture.old.clone(),destination:fixture.moved.clone(),old_root:fixture.old.clone(),new_root:fixture.moved.clone()}}};
-        assert!(super::super::client::process_request(&fixture.host,1,request).unwrap_err().message.contains("replaced"));
+        assert!(fixture_request(&fixture.host,1,request).unwrap_err().message.contains("replaced"));
         assert_eq!(registry.lock().unwrap().model().unwrap(),before);
         assert!(!fixture.handle.is_completed());
         assert!(fixture.calls.lock().unwrap().is_empty());
