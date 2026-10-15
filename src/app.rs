@@ -318,7 +318,12 @@ impl NoticeLog {
             repeats: 1,
         });
         while self.entries.len() > NOTICE_LOG_CAPACITY {
-            self.entries.pop_front();
+            // Keep unresolved failures visible when transient server messages
+            // arrive faster than their expiry. Within a severity, retire oldest.
+            let oldest = self.entries.iter().enumerate()
+                .min_by_key(|(_, entry)| entry.notice.severity)
+                .map(|(index, _)| index).expect("overflowing log is nonempty");
+            self.entries.remove(oldest);
         }
     }
 

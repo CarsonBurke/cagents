@@ -147,6 +147,37 @@ mod tests {
     }
 
     #[test]
+    fn server_info_flood_cannot_evict_the_unresolved_server_error() {
+        let mut app = app();
+        let card = CardId::new();
+        let doc = LspDocumentId(1);
+        app.lsp_documents.insert(doc, card);
+        drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Error, message: "server unavailable".into() })));
+        for index in 0..NOTICE_LOG_CAPACITY * 2 {
+            drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Info, message: format!("Indexed batch {index}") })));
+        }
+        assert!(app.notices.len() <= NOTICE_LOG_CAPACITY);
+        assert!(app.notices.recent().any(|entry| entry.notice.message == "server unavailable"));
+    }
+
+    #[test]
+    fn code_action_command_failures_reach_the_notice_and_success_retires_the_request() {
+        let mut app = app();
+        let card = CardId::new();
+        let doc = LspDocumentId(44);
+        let request = LspRequestId(71);
+        let operation = operation(&app, card);
+        app.editor_features.requests.insert(request, operation.clone());
+        assert!(app.editor_feature_event(&LspEvent::RequestFailed { request, doc, error: LspError::Unsupported("Quick fix command failed".into()) }).is_some());
+        assert!(app.editor_features.requests.is_empty());
+        assert_eq!(app.status.as_ref().unwrap().severity, NoticeSeverity::Error);
+        assert!(app.status.as_ref().unwrap().message.contains("Quick fix command failed"));
+        app.editor_features.requests.insert(request, operation);
+        drop(app.editor_feature_event(&LspEvent::CommandExecuted { request, doc }));
+        assert!(app.editor_features.requests.is_empty());
+    }
+
+    #[test]
     fn retired_manager_response_cannot_consume_a_new_documents_reused_request_id() {
         let mut app = app();
         let request = LspRequestId(7);
@@ -341,6 +372,18 @@ impl Cagents {
         self.editor_features.requests.remove(request)
     }
 
+    fn execute_editor_feature_command(&mut self, operation: &Operation, command: LspCommand) {
+        let request = self.lsp.execute_command(operation.doc, command);
+        let mut completion = operation.clone();
+        // An executeCommand result has no edit coordinates. Its failure still
+        // belongs to this invocation even if workspace/applyEdit advanced the
+        // buffer version before the command acknowledged completion.
+        completion.command = None;
+        completion.server_request = None;
+        completion.save_after = false;
+        self.editor_features.requests.insert(request, completion);
+    }
+
     pub(super) fn editor_feature_event(&mut self, event: &LspEvent) -> Option<Task<Message>> {
         match event {
             LspEvent::PrepareRename { request, doc, range, placeholder } => {
@@ -372,7 +415,7 @@ impl Cagents {
                 if let Some(reason) = &item.disabled { self.feature_failure(operation.card, reason.clone()); return Some(Task::none()); }
                 operation.command = item.command.clone();
                 if let Some(edit) = &item.edit { Some(self.prepare_editor_workspace_edit(operation, edit.clone())) }
-                else { if let Some(command) = operation.command { self.lsp.execute_command(operation.doc, command); } Some(Task::none()) }
+                else { if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); } Some(Task::none()) }
             }
             LspEvent::SignatureHelp { request, doc, help, .. } => {
                 let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
@@ -410,7 +453,10 @@ impl Cagents {
                     Some(self.prepare_editor_workspace_edit(operation, edit.clone()))
                 } else { self.lsp.respond_workspace_edit(*id, false, Some("The source document was closed".into())); Some(Task::none()) }
             }
-            LspEvent::CommandExecuted { .. } => Some(Task::none()),
+            LspEvent::CommandExecuted { request, doc } => {
+                self.take_editor_feature_request(request, doc);
+                Some(Task::none())
+            },
             LspEvent::RequestFailed { request, doc, error, .. } => {
                 let operation = self.take_editor_feature_request(request, doc)?;
                 if !matches!(error, LspError::Cancelled) { self.feature_failure(operation.card, error.to_string()); }
@@ -544,7 +590,7 @@ impl Cagents {
                 }
                 operation.command = item.command;
                 if let Some(edit) = item.edit { self.prepare_editor_workspace_edit(operation, edit) }
-                else if let Some(command) = operation.command { self.lsp.execute_command(operation.doc, command); Task::none() }
+                else if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); Task::none() }
                 else { Task::none() }
             }
             Action::Signature(card, trigger) => {
@@ -596,7 +642,7 @@ impl Cagents {
                     Ok(plan) => {
                         if plan.documents.iter().all(|document| document.before == document.after) {
                             if let Some(id) = operation.server_request { self.lsp.respond_workspace_edit(id, true, None); }
-                            if let Some(command) = operation.command.clone() { self.lsp.execute_command(operation.doc, command); }
+                            if let Some(command) = operation.command.clone() { self.execute_editor_feature_command(&operation, command); }
                             if !operation.save_after { self.status = Some(TransientNotice::success("No source changes were needed")); }
                             return self.save_after_feature(&operation);
                         }
@@ -701,7 +747,7 @@ impl Cagents {
                     self.feature_failure(publication.operation.card, error);
                 } else {
                     if let Some(id) = publication.operation.server_request { self.lsp.respond_workspace_edit(id, true, None); }
-                    if let Some(command) = publication.operation.command.clone() { self.lsp.execute_command(publication.operation.doc, command); }
+                    if let Some(command) = publication.operation.command.clone() { self.execute_editor_feature_command(&publication.operation, command); }
                     tasks.push(self.save_after_feature(&publication.operation));
                 }
                 Task::batch(tasks)
