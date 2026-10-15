@@ -125,6 +125,27 @@ pub(super) fn request(mut holder: Holder) {
 }
 
 #[cfg(test)]
+impl super::super::TerminalHandle {
+    /// Occupies the real fixed cleanup workers without creating extra process
+    /// owners. Scope exit and a bounded worker timeout both release the latch.
+    pub(crate) fn with_blocked_holder_cleanup_for_test<T>(run: impl FnOnce() -> T) -> T {
+        struct Unblock(Vec<crossbeam_channel::Sender<()>>);
+        impl Drop for Unblock {
+            fn drop(&mut self) { for sender in &self.0 { let _ = sender.try_send(()); } }
+        }
+        let (entered, waiting) = crossbeam_channel::bounded(2);
+        let mut unblock = Unblock(Vec::new());
+        for _ in 0..2 {
+            let (release, receiver) = crossbeam_channel::bounded(1);
+            unblock.0.push(release);
+            assert!(service().unwrap().try_send(Task::Block { entered: entered.clone(), release: receiver }).is_ok());
+        }
+        for _ in 0..2 { waiting.recv_timeout(Duration::from_secs(2)).expect("cleanup worker entered its bounded latch"); }
+        run()
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::{
