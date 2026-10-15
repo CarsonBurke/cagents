@@ -10401,6 +10401,27 @@ impl Cagents {
         self.flush_pending_lsp_jump(card, path)
     }
 
+    /// Apply only exact original IDs the manager actually closed. A retained
+    /// buffer or replacement attachment at the same path is never recaptured.
+    fn clear_removed_lsp_documents(&mut self, closed: &[LspDocumentId]) {
+        for &doc in closed {
+            let Some(card) = self.lsp_documents.remove(&doc) else {
+                continue;
+            };
+            if let Some(state) = self.lsp_contexts.get_mut(&card)
+                && state.document == Some(doc)
+            {
+                *state = LspInspectorState::default();
+                self.lsp_pending_jumps.remove(&card);
+            }
+            if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+                && runtime.lsp_document() == Some(doc)
+            {
+                runtime.set_lsp_document(None);
+            }
+        }
+    }
+
     fn close_lsp_document(&mut self, card: CardId) {
         if let Some(state) = self.lsp_contexts.get_mut(&card)
             && let Some(doc) = state.document.take()
@@ -22767,6 +22788,7 @@ mod tests {
         assert_eq!(app.restored_agent_attaches, [card]);
 
         let _ = app.update(Message::ProjectUi(project_ui::Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
             target,
             result: Err("the worktree has changes".into()),
         }));
