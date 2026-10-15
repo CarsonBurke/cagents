@@ -22,7 +22,7 @@ pub(super) struct Review {
     error: Option<String>,
     token: CancellationToken,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct ReviewSnapshot {
     creation: OperationId,
     expected: SetupIntent,
@@ -31,7 +31,7 @@ pub(super) struct ReviewSnapshot {
     active: bool,
     error: Option<String>,
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) enum ReviewCompletion {
     Local { creation: OperationId, path: PathBuf, intent: SetupIntent },
     Remote { path: PathBuf, run_id: OperationId, setup: Option<crate::worktree_control::Setup>, warnings: Vec<String>, skipped: bool },

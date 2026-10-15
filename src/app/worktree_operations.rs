@@ -158,7 +158,7 @@ fn stage_order(stage: WorktreeProgressStage) -> u8 {
         WorktreeProgressStage::Finished => 4,
     }
 }
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(super) struct Rehydrated {
     reports: Vec<WorktreeOperationReport>,
     current_setups: HashSet<OperationId>,
