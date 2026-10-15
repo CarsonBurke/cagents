@@ -14090,6 +14090,7 @@ impl Application for Cagents {
                 // than at the individual actions is what makes that true of all
                 // of them, including the ones a later action adds.
                 let mut tasks = vec![task, self.drain_lsp_intents(card)];
+                tasks.push(self.resume_waiting_editor_closes());
                 tasks.push(self.restore_repository_editor_focus());
                 if let Some(character) = completion_character
                     && let Some(doc) = self.lsp_document(card)
