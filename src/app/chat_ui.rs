@@ -6076,7 +6076,7 @@ impl Cagents {
                     Err(error) => {
                         if let Ok(mut reply) = ready.0.lock() {
                             *reply = Some(Err(chat::StartFailure::retry(format!(
-                                "The account change was not saved: {error}. The original conversation is retained."
+                                "The session change was not saved: {error}. The original conversation is retained."
                             ))));
                         }
                     }

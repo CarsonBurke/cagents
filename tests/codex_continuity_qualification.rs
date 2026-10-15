@@ -212,6 +212,15 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
                 json!({"session_id":session,"chars":"","yield_time_ms":(COMMAND_SECONDS + 15) * 1000}),
             )
         }
+        Some(output) if scenario.contains("SCENARIO orphan-reaping")
+            && !output.contains("ORPHAN_LOOP_FINISHED") => {
+            let session = output.split("session ID ").nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|id| id.parse::<u64>().ok())
+                .expect("the ongoing orphan loop reports its tool session");
+            tool_call(&format!("orphan-poll-{number}"), "write_stdin",
+                json!({"session_id":session,"chars":"","yield_time_ms":1000}))
+        }
         Some(_) => json!({
             "type":"message","role":"assistant","id":format!("message-{number}"),
             "content":[{"type":"output_text","text":"SCENARIO_COMPLETE"}]
