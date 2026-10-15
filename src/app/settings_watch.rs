@@ -3,7 +3,7 @@
 use super::*;
 use notify::{RecursiveMode, Watcher};
 
-pub(super) fn stream(path: &PathBuf) -> impl cosmic::iced::futures::Stream<Item = Result<AppSettings, String>> + Send + 'static {
+pub(super) fn stream(path: &PathBuf) -> impl cosmic::iced::futures::Stream<Item = settings::LiveSettings> + Send + 'static {
     let path = path.clone();
     cosmic::iced::stream::channel(1, move |mut output| async move {
         use cosmic::iced::futures::SinkExt;
@@ -16,18 +16,18 @@ pub(super) fn stream(path: &PathBuf) -> impl cosmic::iced::futures::Stream<Item 
         });
         let mut watcher = match watcher {
             Ok(watcher) => watcher,
-            Err(error) => { let _ = output.send(Err(format!("Could not watch settings.toml: {error}"))).await; return; }
+            Err(error) => { let _ = output.send(settings::LiveSettings::now(Err(format!("Could not watch settings.toml: {error}")))).await; return; }
         };
         if let Some(parent) = path.parent() {
             if let Err(error) = watcher.watch(parent, RecursiveMode::NonRecursive) {
-                let _ = output.send(Err(format!("Could not watch settings.toml: {error}"))).await;
+                let _ = output.send(settings::LiveSettings::now(Err(format!("Could not watch settings.toml: {error}")))).await;
                 return;
             }
         }
         // Also cover a write between bootstrap and subscription registration.
         let initial_path = path.clone();
-        let initial = tokio::task::spawn_blocking(move || settings::load_live(initial_path)).await
-            .map_err(|error| error.to_string()).and_then(|result| result);
+        let initial = tokio::task::spawn_blocking(move || settings::load_live_observed(initial_path)).await
+            .unwrap_or_else(|error| settings::LiveSettings::now(Err(error.to_string())));
         if output.send(initial).await.is_err() { return; }
         while receiver.recv().await.is_ok() {
             // Restart the quiet interval for every new write, without an unbounded queue.
@@ -38,8 +38,8 @@ pub(super) fn stream(path: &PathBuf) -> impl cosmic::iced::futures::Stream<Item 
                 }
             }
             let path = path.clone();
-            let result = tokio::task::spawn_blocking(move || settings::load_live(path)).await
-                .map_err(|error| error.to_string()).and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || settings::load_live_observed(path)).await
+                .unwrap_or_else(|error| settings::LiveSettings::now(Err(error.to_string())));
             if output.send(result).await.is_err() { break; }
         }
     })
@@ -57,12 +57,12 @@ mod tests {
         settings::save(&path, &AppSettings::default()).unwrap();
         let stream = stream(&path);
         cosmic::iced::futures::pin_mut!(stream);
-        assert!(stream.next().await.unwrap().is_ok());
+        assert!(stream.next().await.unwrap().result.is_ok());
         let updated = AppSettings { terminal_font_size: 19.0, ..AppSettings::default() };
         settings::save(&path, &updated).unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.unwrap().unwrap().unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(3), stream.next()).await.unwrap().unwrap().result.unwrap();
         assert_eq!(result.terminal_font_size, 19.0);
         std::fs::write(&path, "schema_version = 3\nterminal_font_size = -1\n").unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(3), stream.next()).await.unwrap().unwrap().is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(3), stream.next()).await.unwrap().unwrap().result.is_err());
     }
 }
