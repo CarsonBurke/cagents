@@ -14,13 +14,11 @@ use std::sync::Weak;
 pub(super) struct Key {
     log: chat::ProviderExitLog,
     turn: u64,
-    incarnation: Option<uuid::Uuid>,
     session: Option<Arc<str>>,
 }
 impl Key {
     fn matches(&self, snapshot: &Snapshot) -> bool {
         self.turn == snapshot.turn_generation
-            && self.incarnation == snapshot.source_incarnation
             && self.session.as_deref() == snapshot.session_id.as_deref()
             && snapshot.provider_exit.as_ref().and_then(|diagnostic| diagnostic.log.as_ref()) == Some(&self.log)
     }
@@ -30,16 +28,16 @@ impl Key {
         let session=snapshot.session_id.as_deref();
         if session.is_some_and(|value|value.len()>SESSION_BYTES) {return None;}
         Some(Self { log:chat::ProviderExitLog {id:log.id.as_str().to_owned(),bytes:log.bytes,omitted:log.omitted}, turn: snapshot.turn_generation,
-            incarnation: snapshot.source_incarnation, session: session.map(Arc::from) })
+            session: session.map(Arc::from) })
     }
 }
 #[derive(Clone)]
-struct Scope { handle: Weak<ClientHandle>, key: Key }
+struct Scope { handle: Weak<ClientHandle>, key: Key, proof: Option<Arc<crate::model::HostSessionProof>> }
 impl Scope {
-    fn capture(handle: &Arc<ClientHandle>, key: Key) -> Self { Self { handle: Arc::downgrade(handle), key } }
+    fn capture(handle: &Arc<ClientHandle>, key: Key) -> Self { Self { handle: Arc::downgrade(handle), key, proof: handle.diagnostic_proof().map(Arc::new) } }
     fn current(&self) -> bool {
-        self.handle.upgrade().is_some_and(|handle| handle.source_snapshot_matches(
-            self.key.incarnation, self.key.session.as_deref(), |snapshot| self.key.matches(snapshot)))
+        self.proof.as_ref().is_some_and(|proof| self.handle.upgrade().is_some_and(|handle|
+            handle.diagnostic_snapshot_matches(proof, self.key.session.as_deref(), |snapshot| self.key.matches(snapshot))))
     }
     fn matches(&self, runtime: &Runtime) -> bool {
         self.key.matches(&runtime.snapshot) && runtime.handle().is_some_and(|handle| Weak::ptr_eq(&self.handle,&Arc::downgrade(handle))) && self.current()
@@ -313,8 +311,10 @@ impl Cagents {
         let text=self.chat_runtime_mut(target).and_then(|runtime| {
             let handle=runtime.handle()?;
             let diagnostic=runtime.snapshot.provider_exit.as_ref()?;
-            if diagnostic.summary.len()>1024 || diagnostic.output.len()>RECENT_BYTES {return None;}
-            handle.source_snapshot_matches(runtime.snapshot.source_incarnation,runtime.snapshot.session_id.as_deref(),|snapshot|
+            if diagnostic.summary.len()>1024 || diagnostic.output.len()>RECENT_BYTES
+                || runtime.snapshot.session_id.as_ref().is_some_and(|session|session.len()>SESSION_BYTES) {return None;}
+            let proof=handle.diagnostic_proof()?;
+            handle.diagnostic_snapshot_matches(&proof,runtime.snapshot.session_id.as_deref(),|snapshot|
                 snapshot.turn_generation==runtime.snapshot.turn_generation && snapshot.provider_exit.as_ref()==Some(diagnostic))
                 .then(||copy_text(diagnostic))
         });
@@ -426,9 +426,9 @@ impl Cagents {
         if !request.scope.matches(runtime) {runtime.provider_exit_output.clear();return Task::none();}
         if request.job.cancelled() || !loading.copy.as_ref().is_some_and(CopyInterest::current) {return self.reload_provider_exit(target);}
         let Some(summary)=loading.formatted_summary.as_ref() else {return self.reload_provider_exit(target);};
-        let current_summary=request.scope.handle.upgrade().is_some_and(|handle|handle.source_snapshot_matches(
-            request.scope.key.incarnation,request.scope.key.session.as_deref(),|snapshot|
-                request.scope.key.matches(snapshot) && snapshot.provider_exit.as_ref().is_some_and(|diagnostic|diagnostic.summary==summary.as_str())));
+        let current_summary=request.scope.proof.as_ref().is_some_and(|proof|request.scope.handle.upgrade().is_some_and(|handle|
+            handle.diagnostic_snapshot_matches(proof,request.scope.key.session.as_deref(),|snapshot|
+                request.scope.key.matches(snapshot) && snapshot.provider_exit.as_ref().is_some_and(|diagnostic|diagnostic.summary==summary.as_str()))));
         if !current_summary {return self.reload_provider_exit(target);}
         let Some(result)=result.take_effect() else {return self.reload_provider_exit(target);};
         match result {
@@ -507,7 +507,7 @@ mod tests {
         let card=app.workspace.focused().unwrap();
         let runtime=match app.cards.get_mut(&card).unwrap() {CardRuntime::Chat(runtime)=>runtime,_=>panic!("draft chat")};
         let target=runtime.target;
-        let snapshot=Snapshot {ready:true,session_id:Some("confirmed-diagnostic-session".into()),source_incarnation:Some(uuid::Uuid::new_v4()),
+        let snapshot=Snapshot {ready:true,session_id:Some("confirmed-diagnostic-session".into()),
             turn_generation:7,provider_exit:Some(chat::ProviderExitDiagnostic {summary:"Provider exited with status 3".into(),output:"recent tail".into(),
                 log:Some(chat::ProviderExitLog {id:"saved-exit".into(),bytes:body.len() as u64,omitted:17})}),..Snapshot::default()};
         let handle=Arc::new(ClientHandle::fixture(runtime.session.clone(),snapshot));
@@ -550,6 +550,24 @@ mod tests {
         snapshot.session_id=Some("x".repeat(SESSION_BYTES));assert!(Key::from_snapshot(&snapshot).is_some());
         snapshot.session_id=Some("x".repeat(SESSION_BYTES+1));assert!(Key::from_snapshot(&snapshot).is_none());
     }
+    #[test]
+    fn diagnostic_current_tuple_refuses_wrong_host_proof_and_replacement_attachment() {
+        if isolated("diagnostic_current_tuple_refuses_wrong_host_proof_and_replacement_attachment") {return;}
+        let (mut app,target,handle)=fixture(b"saved diagnostic");
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        let scope=Scope::capture(&handle,Key::from_snapshot(&runtime.snapshot).unwrap());
+        assert!(scope.current() && scope.matches(runtime));
+        let mut wrong=handle.diagnostic_proof().unwrap();
+        wrong.host_incarnation=crate::model::HostIncarnation::new("another-host-incarnation");
+        let called=std::cell::Cell::new(false);
+        assert!(!handle.diagnostic_snapshot_matches(&wrong,scope.key.session.as_deref(),|_| {called.set(true);true}));
+        assert!(!called.get(),"a mismatched authenticated proof cannot inspect the receiver snapshot");
+        let replacement=Arc::new(ClientHandle::fixture(runtime.session.clone(),(*runtime.snapshot).clone()));
+        assert_eq!(replacement.diagnostic_proof(),handle.diagnostic_proof(),"same metadata alone is insufficient");
+        runtime.connection=Connection::Live(replacement);
+        assert!(!scope.matches(runtime),"an exact native/turn/log tuple on a replacement Runtime attachment is refused");
+    }
+
     #[test]
     fn recent_copy_requires_unchanged_current_summary_and_tail_without_wake() {
         if isolated("recent_copy_requires_unchanged_current_summary_and_tail_without_wake") {return;}
@@ -632,11 +650,14 @@ mod tests {
                     let Action::ProviderExitCopyReady(_,_,reply)=&completed else {unreachable!()};assert!(reply.contains_text_for_test("faithful old saved output"));completed
                 } else {let(request,reply)=held_read(&mut app,target,&handle,body,true);Action::ProviderExitLoaded(target,request,reply)};
                 let old=app.chat_runtime_mut(target).unwrap().snapshot.clone();
-                if mutation==3 {handle.revoke_local_history();} else {
-                    let mut current=(*handle.snapshot()).clone();current.generation+=1;
-                    match mutation {0=>current.source_incarnation=Some(uuid::Uuid::new_v4()),1=>current.provider_exit=None,_=>current.provider_exit.as_mut().unwrap().log.as_mut().unwrap().id="replacement-log".into()}
-                    handle.publish_snapshot_for_test(current);
+                let mut current=(*handle.snapshot()).clone();current.generation+=1;
+                match mutation {
+                    0=>current.session_id=Some("replacement-native-session".into()),
+                    1=>current.provider_exit=None,
+                    2=>current.provider_exit.as_mut().unwrap().log.as_mut().unwrap().id="replacement-log".into(),
+                    _=>current.turn_generation+=1,
                 }
+                handle.publish_snapshot_for_test(current);
                 assert!(Arc::ptr_eq(&old,&app.chat_runtime_mut(target).unwrap().snapshot),"do not process receiver Wake");
                 app.status=None;let task=app.handle_chat_ui(completed);assert!(iced::runtime::task::into_stream(task).is_none());
                 assert!(app.status.is_none());let state=&app.chat_runtime_mut(target).unwrap().provider_exit_output;

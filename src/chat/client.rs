@@ -1223,6 +1223,32 @@ impl ClientHandle {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
+    /// A compact authenticated identity for an explicit diagnostic operation.
+    /// Rebuild from validated borrowed text so spare input capacity is not kept.
+    pub(crate) fn diagnostic_proof(&self) -> Option<HostSessionProof> {
+        let proof = &self.inner.proof;
+        if !proof.is_complete() || [
+            proof.host_session_id.as_str(), proof.boot_id.as_str(), proof.host_incarnation.as_str(),
+        ].into_iter().any(|field| field.len() > 256) { return None; }
+        Some(HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(proof.host_session_id.as_str()),
+            boot_id: crate::model::BootId::new(proof.boot_id.as_str()),
+            host_incarnation: crate::model::HostIncarnation::new(proof.host_incarnation.as_str()),
+        })
+    }
+
+    /// Checks the current diagnostic against this original authenticated attachment.
+    /// This baseline has no global source-revocation model: exact attachment,
+    /// proof, native session, turn and opaque log identity are the real contract.
+    pub(crate) fn diagnostic_snapshot_matches(
+        &self, proof: &HostSessionProof, session: Option<&str>,
+        matches: impl FnOnce(&Snapshot) -> bool,
+    ) -> bool {
+        if &self.inner.proof != proof || !proof.is_complete() { return false; }
+        let snapshot = self.inner.snapshot.lock().unwrap_or_else(|error| error.into_inner());
+        snapshot.session_id.as_deref() == session && matches(&snapshot)
+    }
+
     pub(crate) fn snapshot_with_clock(&self) -> (Arc<Snapshot>, Option<SourceClock>) {
         let snapshot = self
             .inner
