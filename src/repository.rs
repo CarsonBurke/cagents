@@ -13151,7 +13151,8 @@ fn git_locks_present(common: &Path) -> io::Result<bool> {
 impl WorktreeJournal {
     fn restore_creation_authority(&mut self) -> Result<(), RepositoryError> {
         if let Some(evidence) = &self.creation_authority {
-            if self.live_creation.is_none() {
+            if self.live_creation.as_ref().is_none_or(|scope|
+                evidence.has_published_destination() && !scope.has_destination()) {
                 self.live_creation = Some(creation_authority::CreationSession::restore(
                     evidence, &self.request, &self.common_dir)?);
             }
@@ -14419,6 +14420,7 @@ mod worktree_journal_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scoped_creation_settles_the_owned_child_and_persists_stable_authority() {
         for existing in [false, true] {
@@ -14450,6 +14452,47 @@ mod worktree_journal_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn scoped_publication_failure_preserves_known_identity_for_restart() {
+        let fixture = Fixture::new();
+        let scoped = fixture.service.with_worktree_authority(
+            WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+        let (sender, _) = async_channel::bounded(8);
+        creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true));
+        let report = scoped.create_worktree_journaled(&fixture.store, &fixture.request,
+            7, &CancellationToken::new(), &sender);
+        creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(false));
+        assert_eq!(report.state, WorktreeOperationState::OutcomeUnknown, "{report:?}");
+        assert!(fixture.request.destination.is_dir());
+        assert!(fs::read_dir(&fixture.request.destination).unwrap().next().is_none());
+        let mut journal = fixture.journal(fixture.request.operation_id);
+        let payload = serde_json::to_value(&journal).unwrap();
+        assert!(payload["creation_authority"]["checkout"].is_object());
+        assert!(payload["creation_authority"]["parent"].is_object());
+        assert!(journal.live_creation.is_none());
+        // Reconstruct only the originally published inode, never infer its
+        // ownership merely from the now-existing destination pathname.
+        journal.restore_creation_authority().unwrap();
+        let scope = journal.live_creation.as_ref().unwrap();
+        assert!(scope.has_destination());
+        let command = scope.bind_destination_operand(CommandSpec::new("git")
+            .arg(&fixture.request.destination), 0).unwrap();
+        let held = fs::metadata(Path::new(&command.arguments[0])).unwrap();
+        let named = fs::metadata(&fixture.request.destination).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((held.dev(), held.ino()), (named.dev(), named.ino()));
+        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap();
+        assert_eq!(recovered[0].state, WorktreeOperationState::OutcomeUnknown);
+        let mut replacement_journal = fixture.journal(fixture.request.operation_id);
+        fs::rename(&fixture.request.destination, fixture.directory.path().join("original-child")).unwrap();
+        fs::create_dir(&fixture.request.destination).unwrap();
+        fs::write(fixture.request.destination.join("keep"), b"foreign\n").unwrap();
+        assert!(replacement_journal.restore_creation_authority().is_err());
+        assert_eq!(fs::read(fixture.request.destination.join("keep")).unwrap(), b"foreign\n");
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn scoped_existing_branch_advance_refuses_before_journal_or_directory_effects() {
         let fixture = Fixture::new();
@@ -14491,6 +14534,7 @@ mod worktree_journal_tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn scoped_creation_launch_delay_never_writes_replacement_directories() {
         for replacement in ["source", "parent", "destination"] {

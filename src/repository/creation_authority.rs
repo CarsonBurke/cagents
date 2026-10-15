@@ -105,6 +105,20 @@ pub(super) struct CreationEvidence {
     admin: Option<DirectoryWitness>,
 }
 
+impl CreationEvidence {
+    pub(super) fn has_published_destination(&self) -> bool { self.checkout.is_some() }
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static FAIL_AFTER_PUBLICATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct Publication {
+    known: Option<(DirectoryWitness, DirectoryWitness)>,
+    result: Result<OwnedDestination, RepositoryError>,
+}
+
 pub(super) struct CreationSession {
     source: WorktreeAuthority,
     source_roots: [fs_safety::Root; 3],
@@ -187,6 +201,10 @@ impl CreationSession {
         Ok(())
     }
 
+    pub(super) fn has_destination(&self) -> bool {
+        self.destination.lock().unwrap_or_else(|p| p.into_inner()).is_some()
+    }
+
     pub(super) fn source_authority(&self) -> Result<WorktreeAuthority, RepositoryError> {
         self.validate()?;
         Ok(self.source.clone())
@@ -206,9 +224,14 @@ impl CreationSession {
         self.validate()?;
         let mut destination = self.destination.lock().unwrap_or_else(|p| p.into_inner());
         if destination.is_some() { return Err(invalid("The creation destination was already published")); }
-        let owned = Arc::new(self.plan.publish()?);
-        evidence.parent = Some(owned.parent_witness.clone());
-        evidence.checkout = Some(owned.witness.clone());
+        let publication = self.plan.publish();
+        // A successful rename is a known effect even when a later sync or
+        // validation fails. Never erase that identity from durable recovery.
+        if let Some((parent, checkout)) = publication.known {
+            evidence.parent = Some(parent);
+            evidence.checkout = Some(checkout);
+        }
+        let owned = Arc::new(publication.result?);
         *destination = Some(owned);
         self.source.validate()
     }
@@ -408,7 +431,15 @@ impl DestinationPlan {
     /// Publish an empty, already-held directory without replacing any entry.
     /// Git may populate this owned directory; its argv never reopens the public
     /// destination name after an executor launch delay.
-    pub(super) fn publish(&self) -> Result<OwnedDestination, RepositoryError> {
+    fn publish(&self) -> Publication {
+        let mut known = None;
+        let result = self.publish_recording(&mut known);
+        Publication { known, result }
+    }
+
+    fn publish_recording(&self, known: &mut Option<(DirectoryWitness, DirectoryWitness)>)
+        -> Result<OwnedDestination, RepositoryError>
+    {
         self.witness.validate(&self.ancestor)?;
         let (parent, leaf) = durable_parent(&self.ancestor, &self.destination_relative)?;
         let parent_witness = DirectoryWitness::held(&parent)?;
@@ -432,6 +463,15 @@ impl DestinationPlan {
             parent_witness.validate(&parent)?;
             fs_safety::rename_new_between(&staging_root, OsStr::new("checkout"), &parent, &leaf)
                 .map_err(filesystem)?;
+            // Record the preheld inode immediately, before ANY fallible step
+            // after publication. Do not reopen the name to learn its identity.
+            *known = Some((parent_witness.clone(), DirectoryWitness {
+                path: self.destination.clone(), device: original.dev(), inode: original.ino(),
+            }));
+            #[cfg(test)]
+            if FAIL_AFTER_PUBLICATION.with(|failure| failure.replace(false)) {
+                return Err(invalid("Injected failure after known destination publication"));
+            }
             fs_safety::sync_directory(&staging_root).map_err(filesystem)?;
             fs_safety::sync_directory(&parent).map_err(filesystem)?;
             let public = fs_safety::Root::open(&self.destination).map_err(filesystem)?;
@@ -504,7 +544,7 @@ mod tests {
         plan.ensure_managed_root().unwrap();
         fs::create_dir_all(&destination).unwrap();
         fs::write(destination.join("keep"), "foreign work\n").unwrap();
-        assert!(plan.publish().is_err());
+        assert!(plan.publish().result.is_err());
         assert_eq!(fs::read(destination.join("keep")).unwrap(), b"foreign work\n");
         assert_eq!(fs::read_dir(destination.parent().unwrap()).unwrap().count(), 1,
             "failed no-replace publication removes only its own empty staging directory");
@@ -522,7 +562,7 @@ mod tests {
             let destination = managed.join("topic");
             let plan = DestinationPlan::capture(&source, &managed, &destination).unwrap();
             plan.ensure_managed_root().unwrap();
-            let owned = plan.publish().unwrap();
+            let owned = plan.publish().result.unwrap();
             let operand = owned.operand().unwrap();
             let replaced = if external { &managed } else { &source_path };
             let parked = fixture.path().join("parked");
@@ -552,7 +592,7 @@ mod tests {
         let destination = managed.join("topic");
         let plan = DestinationPlan::capture(&source, &managed, &destination).unwrap();
         plan.ensure_managed_root().unwrap();
-        let owned = plan.publish().unwrap();
+        let owned = plan.publish().result.unwrap();
         let parked = managed.join("original-topic");
         fs::rename(&destination, &parked).unwrap();
         fs::create_dir(&destination).unwrap();
