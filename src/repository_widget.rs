@@ -45,7 +45,7 @@ use crate::{
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
-        SaveDurability, SaveOutcome, load_file, save_file, validate_repo_path,
+        SaveDurability, SaveOutcome, load_file, save_file, validate_repo_path, PresenceSave, FileRestoration, save_document_file,
     },
     editor_history::{EditBuffer, EditKind, History, Replay, TextChange},
     lsp::{
@@ -924,6 +924,11 @@ struct EditorDocument {
     content: text_editor::Content<cosmic::Renderer>,
     saved_text: String,
     disk_hash: blake3::Hash,
+    /// Desired and last published existence; empty text never proves absence.
+    present: bool,
+    saved_present: bool,
+    deletion_mode: Option<u32>,
+    restoration: Option<Arc<FileRestoration>>,
     markdown: bool,
     markdown_items: Vec<markdown::Item>,
     /// Whether [`EditorDocument::markdown_items`] still describes the buffer.
@@ -980,6 +985,7 @@ struct SaveTicket {
     identity: AsyncIdentity,
     revision: u64,
     snapshot: String,
+    present: bool,
 }
 
 impl EditorDocument {
@@ -1005,6 +1011,10 @@ impl EditorDocument {
             content: text_editor::Content::with_text(&text),
             saved_text: text,
             disk_hash,
+            present: true,
+            saved_present: true,
+            deletion_mode: None,
+            restoration: None,
             markdown,
             // Source editing does not consume the preview AST. Parse only
             // when preview is first mounted, alongside its text snapshot.
@@ -1094,7 +1104,11 @@ impl EditorDocument {
     /// Brings the derived state up to date after the text changed.
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
-        self.dirty = !content_matches(&self.content, &self.saved_text);
+        if !self.present && !self.content.is_empty() {
+            self.present = true;
+            self.history.record_latest_presence(false, true);
+        }
+        self.dirty = self.present != self.saved_present || !content_matches(&self.content, &self.saved_text);
         self.markdown_stale = true;
         if self.conflict_editing {
             let text = self.content.text();
@@ -1118,6 +1132,12 @@ impl EditorDocument {
     /// Each entry describes one replacement in the order it was applied; an
     /// entry is `None` where the replacement had no protocol range.
     fn step_history(&mut self, redo: bool) -> Option<Vec<Option<LspTextEdit>>> {
+        let presence = self.history.replay_presence(redo);
+        if presence.is_some_and(|(expected, _)| expected != self.present) {
+            self.history.clear();
+            self.error = Some("The file existence changed outside this Undo transaction.".into());
+            return None;
+        }
         let mut buffer = ProtocolTracked {
             content: &mut self.content,
             edits: Vec::new(),
@@ -1130,12 +1150,14 @@ impl EditorDocument {
         let edits = buffer.edits;
         match replay {
             Replay::Empty => return None,
-            Replay::Applied => {}
+            Replay::Applied => {
+                if let Some((_, present)) = presence { self.present = present; }
+            }
             Replay::Diverged => {
                 tracing::warn!("editor history no longer matched its buffer and was cleared");
             }
         }
-        if !edits.is_empty() {
+        if !edits.is_empty() || presence.is_some() {
             self.text_changed();
         }
         Some(edits)
@@ -1172,11 +1194,9 @@ impl EditorDocument {
             if replaced && content_matches(&self.content, &self.saved_text) {
                 edits = replayed;
                 self.content.set_cursor(cursor);
-                self.history.record_group(
-                    vec![change],
-                    cursor,
-                    self.content.cursor(),
-                    Instant::now(),
+                self.history.record_group_with_presence(
+                    vec![change], cursor, self.content.cursor(), Instant::now(),
+                    Some((self.present, self.saved_present)),
                 );
             } else {
                 tracing::warn!(
@@ -1187,6 +1207,10 @@ impl EditorDocument {
                 edits.push(None);
             }
         }
+        if edits.is_empty() && self.present != self.saved_present {
+            self.history.record_group_with_presence(vec![], cursor, self.content.cursor(), Instant::now(), Some((self.present, self.saved_present)));
+        }
+        self.present = self.saved_present;
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
         self.markdown_stale = true;
@@ -1229,7 +1253,8 @@ impl EditorDocument {
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
         }
-        self.dirty = text != self.saved_text;
+        if !text.is_empty() { self.present = true; }
+        self.dirty = self.present != self.saved_present || text != self.saved_text;
         self.revision = self.revision.wrapping_add(1).max(1);
     }
 
@@ -2767,6 +2792,7 @@ impl RepositoryRuntime {
             identity: identity.clone(),
             revision: 1,
             snapshot: "B\n".into(),
+            present: true,
         });
         runtime.document = DocumentState::Editable(document);
         let completion = RepositoryAction::SaveFinished {
@@ -4316,7 +4342,7 @@ impl RepositoryRuntime {
     /// Undoes or redoes one step in the open buffer.
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
         // A history step edits the mounted source buffer, including while Find is open.
-        if self.source_surface != SourceSurface::Editor {
+        if self.source_surface != SourceSurface::Editor && !self.editable_working_diff() {
             return Task::none();
         }
         let DocumentState::Editable(document) = &mut self.document else {
@@ -4328,7 +4354,8 @@ impl RepositoryRuntime {
         self.push_lsp_edits(edits);
         // Undo from the context menu leaves the keyboard on the menu; the
         // restored caret is only visible in a focused buffer.
-        Task::batch([self.markdown_task(card), self.focus_editor(card)])
+        let focus = if self.source_surface == SourceSurface::Editor { self.focus_editor(card) } else { Task::none() };
+        Task::batch([self.markdown_task(card), focus])
     }
 
     /// Reports a run of replacements, in the order they were applied, and
@@ -5105,7 +5132,26 @@ impl RepositoryRuntime {
         })
     }
 
+    /// Formatters and workspace edits must not recreate an intentionally absent file.
+    pub fn desired_file_present(&self) -> bool {
+        !matches!(&self.document, DocumentState::Editable(document) if !document.present)
+    }
+    /// Reload/watch reconciliation can distinguish an owned deletion from an
+    /// external deletion without closing the document and its Undo history.
+    pub fn saved_file_present(&self) -> bool {
+        !matches!(&self.document, DocumentState::Editable(document) if !document.saved_present)
+    }
+
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
+        // Explicit Save after a completed removal means create the open file
+        // again. Debounced autosave never manufactures that user intent.
+        if let DocumentState::Editable(document) = &mut self.document
+            && !document.present && !document.saved_present && document.active_save.is_none() {
+            let cursor = document.content.cursor();
+            document.history.record_group_with_presence(vec![], cursor, cursor, Instant::now(), Some((false, true)));
+            document.present = true;
+            document.text_changed();
+        }
         self.request_save_inner(card, overwrite, true)
     }
 
@@ -5115,7 +5161,7 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
-        let (path, destination, text, disk_hash, revision) = match &self.document {
+        let (path, destination, text, disk_hash, revision, presence) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
                     && document.active_save.is_none() =>
@@ -5126,6 +5172,12 @@ impl RepositoryRuntime {
                     document.content.text(),
                     document.disk_hash,
                     document.revision,
+                    PresenceSave {
+                        expected_present: document.saved_present,
+                        desired_present: document.present,
+                        expected_mode: document.deletion_mode,
+                        restoration: document.restoration.clone(),
+                    },
                 )
             }
             _ => return Task::none(),
@@ -5139,6 +5191,7 @@ impl RepositoryRuntime {
             identity: identity.clone(),
             revision,
             snapshot: text.clone(),
+            present: presence.desired_present,
         };
         if let DocumentState::Editable(document) = &mut self.document {
             document.active_save = Some(ticket.clone());
@@ -5154,7 +5207,7 @@ impl RepositoryRuntime {
         let saved_text = text.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                save_file(&worktree, &destination, &text, disk_hash, overwrite)
+                save_document_file(&worktree, &destination, &text, disk_hash, overwrite, presence)
             })
             .await
             .map_err(|error| FileIoError::Io(format!("save worker failed: {error}")))
@@ -5812,15 +5865,16 @@ impl RepositoryRuntime {
                 }
                 let mut saved = false;
                 if let DocumentState::Editable(document) = &mut self.document {
-                    document.active_save = None;
+                    let active = document.active_save.take().expect("active save was matched above");
                     match result {
                         Ok(SaveOutcome::Saved {
                             content_hash,
                             durability,
                         }) => {
                             document.saved_text = saved_text;
+                            document.saved_present = active.present;
                             document.disk_hash = content_hash;
-                            document.dirty = document.content.text() != document.saved_text;
+                            document.dirty = document.present != document.saved_present || document.content.text() != document.saved_text;
                             document.conflict = false;
                             document.error = None;
                             document.durability_warning = match durability {
@@ -5828,6 +5882,20 @@ impl RepositoryRuntime {
                                 SaveDurability::Unconfirmed { error } => Some(format!(
                                     "The file was replaced on disk, but its durability could not be confirmed: {error}. Reload from disk or retry the save before leaving."
                                 )),
+                            };
+                            saved = true;
+                        }
+                        Ok(SaveOutcome::Absent { restoration, durability }) => {
+                            document.saved_text = saved_text;
+                            document.saved_present = false;
+                            document.disk_hash = blake3::hash(b"");
+                            document.restoration = Some(restoration);
+                            document.dirty = document.present || !document.content.is_empty();
+                            document.conflict = false;
+                            document.error = None;
+                            document.durability_warning = match durability {
+                                SaveDurability::Durable => None,
+                                SaveDurability::Unconfirmed { error } => Some(format!("The file was removed, but directory durability could not be confirmed: {error}")),
                             };
                             saved = true;
                         }
@@ -5850,6 +5918,9 @@ impl RepositoryRuntime {
                 if self.save_error().is_some() {
                     self.source_surface = SourceSurface::Editor;
                     self.markdown_mode = MarkdownMode::Edit;
+                }
+                if saved && matches!(&self.document, DocumentState::Editable(document) if !document.saved_present) {
+                    return self.refresh_after_mutation(identity.card);
                 }
                 if saved {
                     // Only here: not when the write was submitted, not on a
@@ -14073,6 +14144,7 @@ mod tests {
             identity: identity.clone(),
             revision: 1,
             snapshot: "submitted\n".into(),
+            present: true,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -14281,6 +14353,7 @@ mod tests {
             identity: identity.clone(),
             revision: 3,
             snapshot: "newest\n".into(),
+            present: true,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -14330,6 +14403,7 @@ mod tests {
             },
             revision: 1,
             snapshot: "submitted\n".into(),
+            present: true,
         });
         document.dirty = false;
         let view = RepositoryView {
@@ -14385,6 +14459,7 @@ mod tests {
             identity,
             revision: 1,
             snapshot: "submitted\n".into(),
+            present: true,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -14660,6 +14735,7 @@ mod tests {
             identity: identity.clone(),
             revision: 1,
             snapshot: "after\n".into(),
+            present: true,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -14987,6 +15063,7 @@ mod tests {
                 identity: identity.clone(),
                 revision: 1,
                 snapshot: "after\n".into(),
+                present: true,
             });
             runtime.document = DocumentState::Editable(document);
 

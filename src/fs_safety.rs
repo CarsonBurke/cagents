@@ -619,6 +619,18 @@ pub fn unlink_within(directory: &Root, name: &OsStr) -> Result<(), ResolveError>
     Ok(())
 }
 
+/// Removes an empty child directory through its held parent, without following links.
+pub fn remove_directory_within(directory: &Root, name: &OsStr) -> Result<(), ResolveError> {
+    let raw = c_component(name, &directory.path)?;
+    // SAFETY: the held directory and C string outlive unlinkat; AT_REMOVEDIR
+    // removes only an empty directory entry and never follows a symbolic link.
+    let status = unsafe { libc::unlinkat(directory.descriptor(), raw.as_ptr(), libc::AT_REMOVEDIR) };
+    if status < 0 {
+        return Err(ResolveError::io(&directory.path.join(name), &io::Error::last_os_error()));
+    }
+    Ok(())
+}
+
 /// `fsync`s a directory so a rename inside it is durable.
 ///
 /// The root's own descriptor is `O_PATH` and cannot be synced, so the directory
