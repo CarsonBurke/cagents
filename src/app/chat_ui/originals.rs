@@ -252,6 +252,12 @@ impl Runtime {
             )
             || matches!(command, Command::Answer {action,..} if cleanup_answer(action))
     }
+    /// A receiver quarantine can revoke source access without changing its
+    /// last scalar token. Retire historical proof before connection cleanup,
+    /// which intentionally preserves an independently prepared new draft.
+    pub(super) fn revoke_source_originals(&mut self) {
+        self.revoke_originals();
+    }
     fn revoke_originals(&mut self) {
         self.recovery.originals.clear();
         self.recovery.plain_copy.clear();
@@ -1279,6 +1285,66 @@ mod tests {
                 path: "/user/concurrent.png".into()
             }]
         );
+    }
+
+    #[test]
+    fn source_quarantine_retires_history_and_late_edit_without_a_token_or_actor_change() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut runtime = runtime();
+        let target = runtime.target;
+        let source = runtime.snapshot.clone();
+        let actor = runtime.handle().cloned().unwrap();
+        runtime.recovery.submitting(&runtime.snapshot, &Command::Prompt {
+            text: "accepted historical input".into(), attachments: vec![], mode: PromptMode::Send,
+        });
+        let mut historical = runtime.recovery.submitted.as_ref().unwrap().clone();
+        historical.origin_backend = true;
+        runtime.recovery.prepared_prompt = Some(Arc::new(historical.clone()));
+        runtime.recovery.branch_draft = Some(historical);
+        let weak = Arc::downgrade(runtime.recovery.prepared_prompt.as_ref().unwrap());
+        let context = Context::current(&runtime).unwrap();
+        runtime.recovery.originals.begin(target, context.clone(), actor.clone(),
+            Some("actual-user".into()), Purpose::Edit { branch: None });
+        let id = runtime.recovery.originals.query_id_for_test();
+        runtime.replace_draft(text_editor::Content::with_text("independently typed draft"));
+        runtime.attachments = vec![Attachment { path: "/typed/diagram.png".into() }];
+        runtime.revoke_source_originals();
+        runtime.forget_transcript();
+        assert!(weak.upgrade().is_none(), "quarantine retires backend-origin prepared bytes");
+        assert!(runtime.recovery.branch_draft.is_none());
+        assert!(runtime.recovery.submitted.is_none());
+        assert!(runtime.recovery.originals.query.is_none());
+        assert!(Arc::ptr_eq(&source, &runtime.snapshot));
+        assert!(Arc::ptr_eq(&actor, runtime.handle().unwrap()));
+        assert_eq!(Context::current(&runtime), Some(context.clone()),
+            "the actual explicit revocation, not token/actor inequality, cancels this read");
+        app.cards.insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let full = chat::original::OriginalText {
+            source_incarnation: context.source_incarnation,
+            session_id: context.session,
+            original: original("actual-user", "accepted historical input"),
+            text: "accepted historical input".into(),
+        };
+        drop(app.original_ready(target, id, None, 0, Reply::fixture(Ok(Value::Text(full)))));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.recovery.prepared_prompt.is_none());
+        assert!(runtime.recovery.branch_draft.is_none());
+        assert_eq!(runtime.composer.text(), "independently typed draft");
+        assert_eq!(runtime.attachments, vec![Attachment { path: "/typed/diagram.png".into() }]);
+    }
+
+    #[test]
+    fn source_quarantine_preserves_independently_prepared_new_intent() {
+        let mut runtime = runtime();
+        runtime.recovery.submitting(&runtime.snapshot, &Command::Prompt {
+            text: "prepared new intent".into(), attachments: vec![], mode: PromptMode::Send,
+        });
+        runtime.recovery.prepared_prompt = Some(Arc::new(runtime.recovery.submitted.take().unwrap()));
+        let weak = Arc::downgrade(runtime.recovery.prepared_prompt.as_ref().unwrap());
+        runtime.revoke_source_originals();
+        runtime.forget_transcript();
+        assert!(weak.upgrade().is_some());
+        assert_eq!(runtime.recovery.prepared_prompt.as_ref().unwrap().text, "prepared new intent");
     }
 
     #[test]
