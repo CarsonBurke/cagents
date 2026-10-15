@@ -443,6 +443,14 @@ mod tests {
             "the rendered trailing action must expose its configured chord: {:?}",
             texts.0
         );
+        assert!(texts.0.iter().any(|text| text == "Action 39"));
+        assert!(
+            !texts
+                .0
+                .iter()
+                .any(|text| text == "New worktree from this branch…"),
+            "operations must follow the visible scroll slice, not the hidden first row"
+        );
         for event in [
             mouse::Event::ButtonPressed(mouse::Button::Left),
             mouse::Event::ButtonReleased(mouse::Button::Left),

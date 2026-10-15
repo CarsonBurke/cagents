@@ -726,6 +726,63 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         None
     }
 
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        self.tree.inner.with_data_mut(|state| {
+            if !state.open || state.active_root.len() <= self.depth {
+                return;
+            }
+            let root = state.active_root[0];
+            let depth = if self.is_overlay { 0 } else { self.depth };
+            let mut roots = state.active_root[1..=depth]
+                .iter()
+                .fold(&self.menu_roots[root].children, |roots, next| {
+                    &roots[*next].children
+                });
+            let item_trees = &mut state.tree.children[root].children;
+            let viewport = layout.bounds();
+            let overlay_offset = Point::ORIGIN - viewport.position();
+            let end = if self.is_overlay {
+                state.menu_states.len()
+            } else {
+                depth + 1
+            };
+            // Traverse precisely the item trees and clipped layouts drawn in
+            // this frame, including the current scroll slice. The default
+            // Overlay implementation otherwise hides every menu descendant
+            // from widget operations.
+            for (menu, children_layout) in
+                state.menu_states[depth..end].iter().zip(layout.children())
+            {
+                let slice = menu.slice(viewport.size(), overlay_offset, self.item_height);
+                operation.container(None, children_layout.bounds());
+                operation.traverse(&mut |operation| {
+                    for (item, item_layout) in roots[slice.start_index..=slice.end_index]
+                        .iter()
+                        .zip(children_layout.children())
+                    {
+                        item.item.element.with_data_mut(|element| {
+                            element.as_widget_mut().operate(
+                                &mut item_trees[item.index],
+                                item_layout,
+                                renderer,
+                                operation,
+                            );
+                        });
+                    }
+                });
+                let Some(active) = menu.index else {
+                    break;
+                };
+                roots = &roots[active].children;
+            }
+        });
+    }
+
     #[allow(unused_results, clippy::too_many_lines)]
     fn draw(
         &self,
@@ -926,6 +983,15 @@ impl<Message: Clone + 'static> overlay::Overlay<Message, crate::Theme, crate::Re
         self.update(event, layout, cursor, renderer, clipboard, shell);
     }
 
+    fn operate(
+        &mut self,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        Menu::operate(self, layout, renderer, operation);
+    }
+
     fn draw(
         &self,
         renderer: &mut crate::Renderer,
@@ -981,6 +1047,16 @@ impl<Message: std::clone::Clone + 'static> Widget<Message, crate::Theme, crate::
         _viewport: &Rectangle,
     ) {
         Menu::draw(self, renderer, theme, style, layout, cursor);
+    }
+
+    fn operate(
+        &mut self,
+        _tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &crate::Renderer,
+        operation: &mut dyn iced_core::widget::Operation,
+    ) {
+        Menu::operate(self, layout, renderer, operation);
     }
 
     #[allow(clippy::too_many_lines)]
