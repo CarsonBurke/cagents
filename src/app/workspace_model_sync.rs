@@ -1034,14 +1034,24 @@ impl Cagents {
     /// Append first-seen projects in the order already presented to the user.
     /// Existing ranks, including a user's custom order, remain unchanged.
     pub(super) fn remember_sidebar_project_order(&mut self) -> bool {
-        let mut known = self.durable.project_order.iter().copied().collect::<HashSet<_>>();
-        let missing = self.sidebar_model.projects.iter()
+        let mut known = self
+            .durable
+            .project_order
+            .iter()
+            .copied()
+            .collect::<HashSet<_>>();
+        let missing = self
+            .sidebar_model
+            .projects
+            .iter()
             .filter_map(|project| known.insert(project.id).then_some(project.id))
             .collect::<Vec<_>>();
         if missing.is_empty() {
             return false;
         }
-        Arc::make_mut(&mut self.durable).project_order.extend(missing);
+        Arc::make_mut(&mut self.durable)
+            .project_order
+            .extend(missing);
         true
     }
 
@@ -1727,7 +1737,12 @@ mod tests {
     fn adopted_projects_append_to_durable_order_and_restore_after_shuffled_loading() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = super::super::tests::context_inspector_test_app(false);
-        let original = app.sidebar_model.projects.iter().map(|project| project.id).collect::<Vec<_>>();
+        let original = app
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
         Arc::make_mut(&mut app.durable).project_order = original.clone();
         let mut expected = original;
         for (index, name) in ["zeta", "alpha", "middle"].into_iter().enumerate() {
@@ -1745,17 +1760,36 @@ mod tests {
             };
             let message = first_message(task).expect("actual repository load completion");
             drop(app.update(message));
-            let id = app.sidebar_model.projects.iter().find(|project| project.repository == shared.repository).unwrap().id;
+            let id = app
+                .sidebar_model
+                .projects
+                .iter()
+                .find(|project| project.repository == shared.repository)
+                .unwrap()
+                .id;
             expected.push(id);
             assert_eq!(app.durable.project_order, expected);
         }
         let mut restored = app.sidebar_model.clone();
         restored.projects.reverse();
         restored.apply_project_order(&app.durable.project_order);
-        assert_eq!(restored.projects.iter().map(|project| project.id).collect::<Vec<_>>(), expected);
+        assert_eq!(
+            restored
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>(),
+            expected
+        );
         let before = app.durable.clone();
-        assert!(!app.remember_sidebar_project_order(), "a refresh must not append duplicates");
-        assert!(Arc::ptr_eq(&before, &app.durable), "unchanged order does not clone the workspace");
+        assert!(
+            !app.remember_sidebar_project_order(),
+            "a refresh must not append duplicates"
+        );
+        assert!(
+            Arc::ptr_eq(&before, &app.durable),
+            "unchanged order does not clone the workspace"
+        );
     }
 
     #[test]

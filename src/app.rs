@@ -5227,7 +5227,9 @@ impl Cagents {
             self.project_ui.closed.remove(&repository);
             self.project_ui.reopening.insert(project_id, repository);
         }
-        self.project_ui.pending_loads.insert(path.clone(), project_id);
+        self.project_ui
+            .pending_loads
+            .insert(path.clone(), project_id);
         self.repository_load_sequence = self.repository_load_sequence.wrapping_add(1);
         let generation = self.repository_load_sequence;
         self.repository_generations.insert(project_id, generation);
@@ -11280,8 +11282,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13588,7 +13593,10 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return Task::batch([task, cosmic::task::message(Message::ResumeProjectActivation)]);
+                            return Task::batch([
+                                task,
+                                cosmic::task::message(Message::ResumeProjectActivation),
+                            ]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -15269,14 +15277,26 @@ impl Application for Cagents {
             Message::ResumeProjectActivation => Task::none(),
             Message::NativeWindowFocused(window, hint) => {
                 let publish: Task<Message> = if self.core.main_window_id() == Some(window) {
-                    hint.map_or_else(Task::none, |hint| iced::Task::future(async move {
-                        match tokio::task::spawn_blocking(move || hint.publish()).await {
-                            Ok(Ok(())) => {},
-                            result => tracing::warn!(?result, "could not publish focused-window hint"),
-                        }
-                    }).discard())
-                } else { Task::none() };
-                Task::batch([self.update(Message::RefreshUi(refresh_ui::Action::Focused(window, true))), publish])
+                    hint.map_or_else(Task::none, |hint| {
+                        iced::Task::future(async move {
+                            match tokio::task::spawn_blocking(move || hint.publish()).await {
+                                Ok(Ok(())) => {}
+                                result => {
+                                    tracing::warn!(?result, "could not publish focused-window hint")
+                                }
+                            }
+                        })
+                        .discard()
+                    })
+                } else {
+                    Task::none()
+                };
+                Task::batch([
+                    self.update(Message::RefreshUi(refresh_ui::Action::Focused(
+                        window, true,
+                    ))),
+                    publish,
+                ])
             }
             Message::ActivateUi { token } => self.activate_main_window(token),
             Message::ActivateSession { session, token } => {
@@ -16573,16 +16593,16 @@ impl Application for Cagents {
             .map(|activation| match activation.project {
                 Some(repository) => Message::ActivateProject(repository),
                 None => match activation.update {
-                Some(request) => Message::UiUpdate(request),
-                None => match activation.session {
-                    Some(session) => Message::ActivateSession {
-                        session,
-                        token: activation.token,
+                    Some(request) => Message::UiUpdate(request),
+                    None => match activation.session {
+                        Some(session) => Message::ActivateSession {
+                            session,
+                            token: activation.token,
+                        },
+                        None => Message::ActivateUi {
+                            token: activation.token,
+                        },
                     },
-                    None => Message::ActivateUi {
-                        token: activation.token,
-                    },
-                },
                 },
             }),
             event::listen_with(|event, status, event_window| match event {
@@ -16600,7 +16620,8 @@ impl Application for Cagents {
                     Some(Message::WindowClosed(event_window))
                 }
                 iced::Event::Window(window::Event::Focused) => Some(Message::NativeWindowFocused(
-                    event_window, instance::capture_focused_window(),
+                    event_window,
+                    instance::capture_focused_window(),
                 )),
                 iced::Event::Window(window::Event::Unfocused) => Some(Message::RefreshUi(
                     refresh_ui::Action::Focused(event_window, false),

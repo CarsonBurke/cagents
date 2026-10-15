@@ -1362,12 +1362,19 @@ pub(crate) struct FocusedWindowHint {
 
 #[cfg(feature = "ui")]
 pub(crate) fn capture_focused_window() -> Option<FocusedWindowHint> {
-    if crate::device::is_remote() { return None; }
-    let runtime = env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_absolute())?;
+    if crate::device::is_remote() {
+        return None;
+    }
+    let runtime = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())?;
     Some(FocusedWindowHint {
         runtime,
         slot: window_slot().to_owned(),
-        observed: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos(),
+        observed: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()?
+            .as_nanos(),
     })
 }
 
@@ -1380,16 +1387,31 @@ impl FocusedWindowHint {
 }
 
 fn focus_hint_lock(runtime: &Path, write: bool) -> io::Result<OwnedLock> {
-    let file = OpenOptions::new().read(true).write(write).create(write)
-        .mode(PRIVATE_FILE_MODE).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+    let file = OpenOptions::new()
+        .read(true)
+        .write(write)
+        .create(write)
+        .mode(PRIVATE_FILE_MODE)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(runtime.join(format!("{APPLICATION_LOCK_FILE}-focus")))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.uid() != current_uid() || metadata.nlink() != 1 {
-        return Err(io::Error::new(io::ErrorKind::PermissionDenied, "focus hint is not a private owned regular file"));
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "focus hint is not a private owned regular file",
+        ));
     }
-    if write { file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?; }
+    if write {
+        file.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    }
     // SAFETY: the returned owner keeps the descriptor live until unlock.
-    if unsafe { libc::flock(file.as_raw_fd(), if write { libc::LOCK_EX } else { libc::LOCK_SH }) } != 0 {
+    if unsafe {
+        libc::flock(
+            file.as_raw_fd(),
+            if write { libc::LOCK_EX } else { libc::LOCK_SH },
+        )
+    } != 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(OwnedLock(file))
@@ -1410,7 +1432,9 @@ fn record_focused_window_at(runtime: &Path, slot: &str, observed: u128) -> io::R
     let lock = focus_hint_lock(runtime, true)?;
     let mut previous = String::new();
     (&*lock).take(1024).read_to_string(&mut previous)?;
-    if parse_focus_hint(&previous).is_some_and(|(stamp, _)| stamp > observed) { return Ok(()); }
+    if parse_focus_hint(&previous).is_some_and(|(stamp, _)| stamp > observed) {
+        return Ok(());
+    }
     lock.set_len(0)?;
     std::io::Seek::rewind(&mut &*lock)?;
     writeln!(&*lock, "{observed}\n{slot}")
@@ -1443,11 +1467,17 @@ pub fn activate_project(repository: &Path) -> io::Result<bool> {
 
 fn activate_project_in(runtime: &Path, repository: &Path) -> io::Result<bool> {
     if !repository.is_absolute() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "project path must be absolute"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project path must be absolute",
+        ));
     }
     let encoded = serde_json::to_string(repository).map_err(io::Error::other)?;
     if "project ".len() + encoded.len() + 1 > MAX_ACTIVATION_LINE_BYTES {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "project activation request is too large"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "project activation request is too large",
+        ));
     }
     require_owned_runtime_directory(runtime)?;
     let mut slots = Vec::new();
@@ -1832,12 +1862,15 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 let _ = writeln!(&stream, "ok");
             }
             Ok(ActivationRequest::Project(project)) => {
-                if events.send_blocking(UiActivation {
-                    project: Some(project),
-                    token: None,
-                    session: None,
-                    update: None,
-                }).is_err() {
+                if events
+                    .send_blocking(UiActivation {
+                        project: Some(project),
+                        token: None,
+                        session: None,
+                        update: None,
+                    })
+                    .is_err()
+                {
                     let _ = writeln!(&stream, "error: window is no longer accepting activations");
                     break;
                 }
@@ -2781,7 +2814,13 @@ mod tests {
         assert!(parse_activation_request("project \"relative\"").is_err());
         assert!(parse_activation_request("project not-json").is_err());
         assert!(activate_project_in(runtime.path(), Path::new("relative")).is_err());
-        assert!(activate_project_in(runtime.path(), &PathBuf::from(format!("/{}", "x".repeat(MAX_ACTIVATION_LINE_BYTES)))).is_err());
+        assert!(
+            activate_project_in(
+                runtime.path(),
+                &PathBuf::from(format!("/{}", "x".repeat(MAX_ACTIVATION_LINE_BYTES)))
+            )
+            .is_err()
+        );
         drop(_second);
         assert!(activate_project_in(runtime.path(), repository).unwrap());
         assert_eq!(
@@ -2796,13 +2835,29 @@ mod tests {
         let runtime = tempdir().unwrap();
         record_focused_window_at(runtime.path(), "newer", 2).unwrap();
         record_focused_window_at(runtime.path(), "older", 1).unwrap();
-        let hint = fs::read_to_string(runtime.path().join(format!("{APPLICATION_LOCK_FILE}-focus"))).unwrap();
+        let hint = fs::read_to_string(
+            runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}-focus")),
+        )
+        .unwrap();
         assert_eq!(parse_focus_hint(&hint), Some((2, "newer")));
         let outside = runtime.path().join("outside");
         fs::write(&outside, "keep contents").unwrap();
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
-        fs::remove_file(runtime.path().join(format!("{APPLICATION_LOCK_FILE}-focus"))).unwrap();
-        fs::hard_link(&outside, runtime.path().join(format!("{APPLICATION_LOCK_FILE}-focus"))).unwrap();
+        fs::remove_file(
+            runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}-focus")),
+        )
+        .unwrap();
+        fs::hard_link(
+            &outside,
+            runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}-focus")),
+        )
+        .unwrap();
         assert!(record_focused_window_at(runtime.path(), "newer", 3).is_err());
         assert_eq!(fs::read_to_string(&outside).unwrap(), "keep contents");
         assert_eq!(fs::metadata(&outside).unwrap().mode() & 0o777, 0o644);
