@@ -1453,7 +1453,7 @@ fn codex_terminal_view(
             return Ok(ServerResponse::ChatTerminal {
                 chat_id,
                 session: state.descriptor(client, terminal.id)?.session,
-                snapshot: handle.snapshot(None).expect("unconditional snapshot"),
+                snapshot: handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?,
             });
         }
         if record.returning_terminal {
@@ -1632,7 +1632,7 @@ fn codex_terminal_view(
         Ok(ServerResponse::ChatTerminal {
             chat_id,
             session: descriptor.session.clone(),
-            snapshot: handle.snapshot(None).expect("unconditional snapshot"),
+            snapshot: handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?,
         })
     })();
     if let Err(error) = result {
@@ -2356,7 +2356,7 @@ fn process_inner(
                 (record.handle.clone(), record.session.clone())
             };
             session.launch.session_id = handle.confirmed_session_id();
-            let snapshot = handle.snapshot(None).expect("unconditional snapshot");
+            let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?;
             let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
                 "Wait for the provider's confirmed exact conversation before returning to terminal",
             ))?;
@@ -2413,7 +2413,7 @@ fn process_inner(
             // Closing interrupts active work and waits for confirmed teardown.
             // Never start a second writer before teardown has been proved.
             handle.close().map_err(unavailable)?;
-            let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
+            let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?;
             if snapshot.session_id != session.launch.session_id {
                 return Err(unavailable(
                     "Provider identity changed during shutdown; retry the exact terminal handoff",
@@ -2536,7 +2536,7 @@ fn process_inner(
                 attached(&state, client, chat_id)?.handle.clone()
             };
             handle.close_for_resume().map_err(unavailable)?;
-            let snapshot = handle.snapshot(None).expect("unconditional final snapshot");
+            let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?;
             let (retained, pending_cleanup) = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 let retained = state

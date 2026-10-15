@@ -135,11 +135,6 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
     if inspection.identity.record != owner || inspection.source.id != requested.id
         || inspection.source.launch.provider != Provider::Claude
     { return Err("The retained Claude actor identity changed during inspection".into()); }
-    // Pair adoption is qualified independently against its retained worker;
-    // until that metadata is available, preserve ownership rather than drop it.
-    if requested.terminal.is_some() || inspection.source.terminal.is_some() {
-        return Err("The retained Claude actor has a paired terminal whose exact worker must be reconciled before attachment".into());
-    }
     let weak = Arc::downgrade(host);
     let id = requested.id;
     let handle = Handle::adopt_remote(&owner, requested.clone(), proof.clone(), move |update| changed(&weak, id, update))?;
@@ -148,7 +143,27 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
     let mut session = requested.clone();
     session.proof = Some(proof.clone());
     session.launch.session_id = handle.confirmed_session_id().or(session.launch.session_id);
-    handle.update_native_source(session.clone(), None, None)?;
+    // A presentation alias predating the console cannot release its current
+    // exact paired worker. Only authenticated helper metadata names that pair.
+    session.terminal = inspection.source.terminal.clone();
+    let paired = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        match (&mut session.terminal, inspection.paired_holder.as_ref()) {
+            (None, None) => None,
+            (Some(terminal), Some(owner)) => {
+                let current = state.terminals.get(&terminal.id).filter(|current|
+                    current.handle.holder_identity() == Some(owner)
+                    && current.session.launch == terminal.launch
+                    && current.session.owned_codex_listener == terminal.owned_codex_listener
+                    && current.session.continuity.live_proof().as_ref() == Some(proof))
+                    .ok_or("The retained Claude console's exact worker could not be recovered; provider ownership was preserved")?;
+                *terminal = current.session.clone();
+                Some(current.handle.clone())
+            }
+            _ => return Err("The retained Claude pair lacks exact worker evidence; no pair was released".into()),
+        }
+    };
+    handle.update_native_source(session.clone(), inspection.execution_console.clone(), inspection.paired_holder.clone())?;
     let mut sources = inspection.previous_sources;
     sources.push(inspection.source);
     sources.push(requested.clone());
@@ -164,7 +179,7 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
     let observation = Observation { after_generation: handle.observe_next_update(), ..Observation::default() };
     let previous_sources = super::native_recovery::retained_upgrade_sources(sources, &session);
     let record = Record {
-        execution_instance: identity.instance, console_recipe: None, paired_terminal: None,
+        execution_instance: identity.instance, console_recipe: inspection.execution_console, paired_terminal: paired.clone(),
         session, handle: handle.clone(), source_process: None,
         subscribers: if client == 0 { BTreeMap::new() } else { BTreeMap::from([(client, false)]) },
         observations: if client == 0 { BTreeMap::new() } else { BTreeMap::from([(client, observation)]) },
@@ -172,7 +187,12 @@ pub(super) fn restore(host: &SharedHost, client: ClientId, requested: &Session, 
     };
     let response = session_snapshot(&record);
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if state.shutting_down || state.proof() != proof {
+    let pair_unchanged = match (&record.session.terminal, &paired) {
+        (None, None) => true,
+        (Some(terminal), Some(handle)) => state.terminals.get(&terminal.id).is_some_and(|current| current.session == *terminal && current.handle.same_worker(handle)),
+        _ => false,
+    };
+    if state.shutting_down || state.proof() != proof || !pair_unchanged {
         return Err("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into());
     }
     let retired = state.chats.insert(id, record);
