@@ -1134,7 +1134,9 @@ impl Codex {
 
     fn page(&mut self, page: &Value, step: &mut Step, earlier: bool) -> Result<(), String> {
         let mut items = Vec::new();
+        let mut outcomes = Step::default();
         for turn in array(page, "data")?.iter().rev() {
+            let first_item = items.len();
             let turn_id = string(turn, "id")?;
             let active = turn["status"] == "inProgress";
             if active && self.busy {
@@ -1203,6 +1205,8 @@ impl Codex {
                     items.push(item);
                 }
             }
+            self.bind_turn_items(turn_id, items[first_item..].iter().map(|item| item.id.as_str()), &mut outcomes);
+            self.record_turn_outcome(turn, &mut outcomes);
         }
         if !earlier {
             self.child_history_outcome(array(page, "data")?.first(), step);
@@ -1225,6 +1229,7 @@ impl Codex {
                 has_earlier: self.cursor.is_some(),
             }
         });
+        step.events.extend(outcomes.events);
         step.events
             .push(Event::BranchPoints(self.branch_points.clone()));
         Ok(())
@@ -2637,6 +2642,7 @@ impl Adapter for Codex {
                 self.materialized = true;
                 let turn = &params["turn"];
                 if method == "turn/completed" {
+                    self.record_turn_outcome(turn, &mut step);
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
                         Some("completed") => Some(Kind::Succeeded),
@@ -3002,6 +3008,17 @@ impl Adapter for Codex {
             // requests are visibly rejected above.
             _ => {}
         }
+        // This frame explicitly names a native turn. Bind only the actual
+        // visible aliases emitted for that frame, including split text parts.
+        if let Some(turn_id) = params["turnId"].as_str().or_else(|| params["turn"]["id"].as_str()) {
+            let mut bindings = Step::default();
+            self.bind_turn_items(turn_id, step.events.iter().filter_map(|event| match event {
+                Event::Item(item) => Some(item.id.as_str()),
+                Event::TextDelta { id, .. } | Event::InputDelta { id, .. } | Event::OutputDelta { id, .. } => Some(id.as_str()),
+                _ => None,
+            }), &mut bindings);
+            step.events.extend(bindings.events);
+        }
         Ok(step)
     }
 }
@@ -3040,6 +3057,49 @@ impl Codex {
             }
             _ => {}
         }
+    }
+    fn confirmed_turn_identity(&self, turn_id: &str) -> Option<chat::turn_outcomes::TurnIdentity> {
+        if self.is_child { return None; }
+        let identity = chat::turn_outcomes::TurnIdentity {
+            session_id: self.thread.clone()?,
+            kind: chat::turn_outcomes::TurnIdentityKind::NativeTurn,
+            id: turn_id.into(),
+        };
+        identity.validate().ok()?;
+        Some(identity)
+    }
+    fn bind_turn_items<'a>(&self, turn_id: &str, ids: impl Iterator<Item=&'a str>, step: &mut Step) {
+        use chat::turn_outcomes::{TurnUpdate, MAX_TURN_ITEM_IDS, MAX_TURN_ID_BYTES};
+        let Some(identity) = self.confirmed_turn_identity(turn_id) else { return; };
+        let mut batch = Vec::new();
+        for id in ids {
+            if id.is_empty() || id.len() > MAX_TURN_ID_BYTES { continue; }
+            if batch.iter().any(|prior| prior == id) { continue; }
+            batch.push(id.to_owned());
+            if batch.len() == MAX_TURN_ITEM_IDS {
+                step.events.push(Event::TurnOutcome(TurnUpdate::Bind { identity: identity.clone(), item_ids: std::mem::take(&mut batch) }));
+            }
+        }
+        if !batch.is_empty() {
+            step.events.push(Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids: batch }));
+        }
+    }
+    fn record_turn_outcome(&self, turn: &Value, step: &mut Step) {
+        use crate::agent::ActivityOutcome;
+        use chat::turn_outcomes::{TurnUpdate, MAX_TURN_REASON_BYTES};
+        let Some(identity) = turn["id"].as_str().and_then(|id| self.confirmed_turn_identity(id)) else { return; };
+        let outcome = match turn["status"].as_str() {
+            Some("completed") => ActivityOutcome::Succeeded,
+            Some("interrupted") => ActivityOutcome::Cancelled,
+            Some("failed") => {
+                let mut reason = turn["error"]["message"].as_str().filter(|message| !message.trim().is_empty()).unwrap_or("The provider reported a failed turn").to_owned();
+                reason.truncate(reason.floor_char_boundary(MAX_TURN_REASON_BYTES));
+                ActivityOutcome::Failed { reason }
+            }
+            _ => return,
+        };
+        let finished_at = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis().min(u64::MAX as u128) as u64;
+        step.events.push(Event::TurnOutcome(TurnUpdate::Finish { identity, outcome, finished_at }));
     }
     fn thread_state(&mut self, thread: &Value, step: &mut Step) -> Result<(), String> {
         let id = string(thread, "id")?;
@@ -4037,6 +4097,51 @@ mod tests {
                 (!completed).then_some("newer-turn")
             );
         }
+    }
+
+    #[test]
+    fn historical_turn_outcomes_use_native_identity_and_exact_visible_aliases() {
+        use chat::turn_outcomes::{TurnIdentityKind, TurnUpdate};
+        let mut adapter = adapter();
+        let started = adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"A","status":"inProgress","items":[{"id":"user","type":"userMessage","content":[{"type":"text","text":"first"}]}]}}})).unwrap();
+        let alias = format!("{}/input/0", item_key("A", "user"));
+        assert!(started.events.iter().any(|event| matches!(event, Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids })
+            if identity.session_id == "thread-exact" && identity.kind == TurnIdentityKind::NativeTurn && identity.id == "A" && item_ids == &[alias.clone()])));
+        adapter.receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"B","status":"inProgress","items":[]}}})).unwrap();
+        let late = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"A","status":"interrupted","items":[]}}})).unwrap();
+        let results: Vec<_> = late.events.iter().filter_map(|event| match event {
+            Event::TurnOutcome(TurnUpdate::Finish { identity, outcome, .. }) => Some((identity.id.as_str(), outcome)),
+            _ => None,
+        }).collect();
+        assert_eq!(results, vec![("A", &crate::agent::ActivityOutcome::Cancelled)]);
+        let reasoning = adapter.receive(json!({"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread-exact","turnId":"B","itemId":"thinking","summaryIndex":2,"delta":"proof"}})).unwrap();
+        let actual = reasoning.events.iter().find_map(|event| match event { Event::TextDelta { id, .. } => Some(id), _ => None }).unwrap();
+        assert!(reasoning.events.iter().any(|event| matches!(event, Event::TurnOutcome(TurnUpdate::Bind { identity, item_ids }) if identity.id == "B" && item_ids == &[actual.clone()])));
+    }
+
+    #[test]
+    fn turn_outcome_bindings_are_bounded_and_history_requires_explicit_terminal_status() {
+        use chat::turn_outcomes::TurnUpdate;
+        let mut adapter = adapter();
+        let parts: Vec<_> = (0..130).map(|index| json!({"type":"text","text":index.to_string()})).collect();
+        let started = adapter.receive(json!({"method":"item/started","params":{"threadId":"thread-exact","turnId":"many","item":{"id":"user","type":"userMessage","content":parts}}})).unwrap();
+        let batches: Vec<_> = started.events.iter().filter_map(|event| match event {
+            Event::TurnOutcome(TurnUpdate::Bind { item_ids, .. }) => Some(item_ids.len()), _ => None,
+        }).collect();
+        assert_eq!(batches, vec![128,2]);
+        let mut page = Step::default();
+        adapter.page(&json!({"data":[
+            {"id":"unknown","status":"future","items":[]},
+            {"id":"old","status":"failed","error":{"message":"exact failure"},"items":[{"id":"answer","type":"agentMessage","text":"partial"}]}
+        ],"nextCursor":null}), &mut page, true).unwrap();
+        let terminal: Vec<_> = page.events.iter().filter_map(|event| match event { Event::TurnOutcome(TurnUpdate::Finish { identity, outcome, .. }) => Some((identity.id.as_str(), outcome)), _ => None }).collect();
+        assert_eq!(terminal, vec![("old", &crate::agent::ActivityOutcome::Failed { reason:"exact failure".into() })]);
+        let mut child = Codex { is_child: true, ..Default::default() };
+        child.thread = Some("thread-exact".into());
+        let finished = child.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"child","status":"completed","items":[]}}})).unwrap();
+        assert!(!finished.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
+        let unrelated = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"unrelated","turn":{"id":"unknown","status":"completed","items":[]}}})).unwrap();
+        assert!(!unrelated.events.iter().any(|event| matches!(event, Event::TurnOutcome(_))));
     }
 
     #[test]
