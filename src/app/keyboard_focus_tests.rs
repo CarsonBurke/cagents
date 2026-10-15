@@ -877,3 +877,154 @@ fn prepared_update_refuses_routed_sibling_reconciliation_before_any_workspace_mu
         "the update preparation acknowledgement remains active"
     );
 }
+
+#[test]
+fn native_font_zoom_stays_with_the_field_or_editor_that_owns_focus() {
+    use keyboard::key::Code;
+    let (mut app, card) = super::tests::editing_repository_app();
+    app.settings.editor_font_size = Some(19.0);
+    app.sidebar_model.projects.push(
+        sidebar::SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Keyboard fixture".into(),
+            "/keyboard-fixture".into(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .with_kind(ProjectKind::Folder),
+    );
+    app.sidebar_state.apply(&SidebarAction::ToggleControls);
+    prepare(&mut app);
+    assert!(sidebar::search_is_reachable(
+        &app.sidebar_model,
+        app.projects_sidebar_mode()
+    ));
+    let mut renderer = super::tests::headless_renderer();
+    let events = [
+        key("0", Code::Digit0, keyboard::Modifiers::CTRL, None),
+        key("=", Code::Equal, keyboard::Modifiers::CTRL, None),
+        key("-", Code::Minus, keyboard::Modifiers::CTRL, None),
+    ];
+    let mut field_events = events.to_vec();
+    field_events.push(iced::Event::InputMethod(
+        iced::advanced::input_method::Event::Commit("font-owner-query".into()),
+    ));
+    let (cache, messages) = native(
+        &app,
+        &mut renderer,
+        Cache::new(),
+        Some(sidebar::search_focus_id()),
+        &field_events,
+    );
+    assert!(!messages.iter().any(|message| matches!(
+        message,
+        Message::Repository(RepositoryAction::ZoomFont { .. }) | Message::ZoomFont { .. }
+    )));
+    assert!(messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &sidebar::search_focus_id() && region.pane == workspace_widget::FocusedPane::TextInput && region.card.is_none())));
+    dispatch(&mut app, messages);
+    assert_eq!(app.sidebar_state.query(), "font-owner-query");
+    assert_eq!(app.workspace.focused(), Some(card));
+    assert_eq!(app.settings.editor_font_size, Some(19.0));
+    let (_cache, messages) = native(
+        &app,
+        &mut renderer,
+        cache,
+        Some(repository_widget::editor_focus_id(card)),
+        &events,
+    );
+    let zoom: Vec<_> = messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Repository(RepositoryAction::ZoomFont { card, delta }) => Some((*card, *delta)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(zoom, [(card, 0), (card, 1), (card, -1)]);
+    dispatch(&mut app, messages);
+    assert_eq!(app.settings.editor_font_size(), app.settings.terminal_font_size);
+}
+
+#[test]
+fn an_earlier_mounted_inactive_editor_does_not_capture_the_terminal_font_chord() {
+    use crate::terminal::ipc::ClientRequest;
+    use keyboard::key::Code;
+    struct EditorBounds {
+        id: widget::Id,
+        bounds: Option<iced::Rectangle>,
+    }
+    impl iced::advanced::widget::Operation for EditorBounds {
+        fn traverse(
+            &mut self,
+            operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation),
+        ) {
+            operate(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: iced::Rectangle,
+            _state: &mut dyn iced::advanced::widget::operation::Focusable,
+        ) {
+            if id == Some(&self.id) {
+                self.bounds = Some(bounds);
+            }
+        }
+    }
+    let peer = crate::terminal::WidgetTestPeer::new();
+    let (mut app, repository) = super::tests::editing_repository_app();
+    let mut session = fresh_terminal_session(LaunchRecipe {
+        program: "/bin/sh".into(),
+        arguments: Vec::new(),
+        working_directory: "/".into(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    });
+    session.id = peer.handle().terminal_id();
+    let terminal = add_inactive_native_card(
+        &mut app,
+        CardKind::Terminal(session),
+        CardRuntime::Terminal(peer.handle().clone().into()),
+    );
+    let update = app.workspace.focus(terminal).unwrap();
+    app.workspace.take_widget_focus_request();
+    drop(app.apply_viewport(update, false, false));
+    app.settings.editor_font_size = Some(19.0);
+    app.settings.terminal_font_size = 18.0;
+    prepare(&mut app);
+    assert_eq!(app.workspace.order().collect::<Vec<_>>(), [repository, terminal]);
+    let mut renderer = super::tests::headless_renderer();
+    let mut ui = UserInterface::build(
+        app.view(),
+        Size::new(1600.0, 1000.0),
+        Cache::new(),
+        &mut renderer,
+    );
+    let mut editor = EditorBounds {
+        id: repository_widget::editor_focus_id(repository),
+        bounds: None,
+    };
+    ui.operate(&renderer, &mut editor);
+    let bounds = editor.bounds.expect("the earlier repository editor must actually be mounted");
+    assert!(bounds.width > 0.0 && bounds.height > 0.0);
+    assert!(bounds.x >= 0.0 && bounds.x + bounds.width <= 1600.0);
+    let terminal_id = app.card_keyboard_focus(terminal);
+    ui.operate(&renderer, &mut focusable::focus::<()>(terminal_id.clone()));
+    let mut messages = Vec::new();
+    let _ = ui.update(
+        &[key("0", Code::Digit0, keyboard::Modifiers::CTRL, None)],
+        mouse::Cursor::Unavailable,
+        &mut renderer,
+        &mut clipboard::Null,
+        &mut messages,
+    );
+    let _cache = ui.into_cache();
+    assert!(!messages.iter().any(|message| matches!(message, Message::Repository(RepositoryAction::ZoomFont { .. }))));
+    assert_eq!(messages.iter().filter(|message| matches!(message, Message::ZoomFont { card, delta: 0, editor: false } if *card == terminal)).count(), 1);
+    assert!(messages.iter().any(|message| matches!(message, Message::RoutedKeyEvent { widget: Some(id), region, .. } if id == &terminal_id && region.pane == workspace_widget::FocusedPane::Terminal && region.card == Some(terminal))));
+    dispatch(&mut app, messages);
+    assert_eq!(app.settings.terminal_font_size, AppSettings::default().terminal_font_size);
+    assert_eq!(app.settings.editor_font_size, Some(19.0));
+    let requests = peer.fence();
+    assert!(!requests.iter().any(|request| matches!(request, ClientRequest::Key { .. } | ClientRequest::Input { .. } | ClientRequest::Paste { .. })), "local zoom must not become terminal input: {requests:?}");
+}
