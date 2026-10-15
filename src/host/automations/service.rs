@@ -133,7 +133,14 @@ pub(in crate::host) fn process_under_control(
             return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .archived_automation_agents_page(scope, identity, archive_sequence, after, limit, proof)
+                .archived_automation_agents_page(
+                    scope,
+                    identity,
+                    archive_sequence,
+                    after,
+                    limit,
+                    proof,
+                )
                 .map(Response::ArchivedAgents);
         }
         Request::Show { id } => {

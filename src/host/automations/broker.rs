@@ -343,12 +343,15 @@ impl Handle {
             .history_pruned_ms
             .load(std::sync::atomic::Ordering::Relaxed);
         if last_pruned == 0 || now.saturating_sub(last_pruned) >= 60 * 60 * 1000 {
-            let archives_changed=self.0
+            let archives_changed = self
+                .0
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .prune_automation_history(now)?;
-            if archives_changed { agent_execution::announce(host,&self.0.registry); }
+            if archives_changed {
+                agent_execution::announce(host, &self.0.registry);
+            }
             self.0
                 .history_pruned_ms
                 .store(now, std::sync::atomic::Ordering::Relaxed);

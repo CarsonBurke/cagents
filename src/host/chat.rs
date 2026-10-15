@@ -384,13 +384,23 @@ fn attached_mut(
     }
     Ok(record)
 }
-pub(super) fn changed_owned(host: &Weak<HostLock>, id: TerminalId, instance: uuid::Uuid, update: Update) {
+pub(super) fn changed_owned(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: uuid::Uuid,
+    update: Update,
+) {
     changed_from(host, id, Some(instance), update);
 }
 fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     changed_from(host, id, None, update);
 }
-fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uuid>, update: Update) {
+fn changed_from(
+    host: &Weak<HostLock>,
+    id: TerminalId,
+    instance: Option<uuid::Uuid>,
+    update: Update,
+) {
     let Some(host) = host.upgrade() else {
         return;
     };
@@ -422,7 +432,12 @@ fn changed_from(host: &Weak<HostLock>, id: TerminalId, instance: Option<uuid::Uu
         }
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if instance.is_some_and(|instance| !state.chats.get(&id).is_some_and(|record| record.execution_instance == instance)) {
+    if instance.is_some_and(|instance| {
+        !state
+            .chats
+            .get(&id)
+            .is_some_and(|record| record.execution_instance == instance)
+    }) {
         return;
     }
     let proof = state.proof().clone();
@@ -1998,7 +2013,10 @@ fn reserved_automation_request_matches(
     requested: &Session,
     issued: &Session,
 ) -> bool {
-    requested.terminal.as_ref().is_none_or(|terminal| issued.terminal.as_ref() == Some(terminal))
+    requested
+        .terminal
+        .as_ref()
+        .is_none_or(|terminal| issued.terminal.as_ref() == Some(terminal))
         && reserved_automation_descriptor_matches(agent, requested, &issued.native_continuity)
 }
 
@@ -2010,11 +2028,20 @@ pub(in crate::host) fn reserved_automation_actor(
     agent: &crate::agent_execution::Agent,
     require_attached: bool,
 ) -> Result<chat::runtime::Handle, ProtocolError> {
-    if agent.closed || !matches!(agent.origin, crate::agent_execution::Origin::Automation { .. }) {
-        return Err(error("Completed scheduled conversations are saved read-only"));
+    if agent.closed
+        || !matches!(
+            agent.origin,
+            crate::agent_execution::Origin::Automation { .. }
+        )
+    {
+        return Err(error(
+            "Completed scheduled conversations are saved read-only",
+        ));
     }
     let Some(crate::agent_execution::HostedSession::Chat(issued)) = &agent.session else {
-        return Err(unavailable("The exact pending archive provider is unavailable"));
+        return Err(unavailable(
+            "The exact pending archive provider is unavailable",
+        ));
     };
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     validate_proof(issued.proof.as_ref(), state.proof())?;
@@ -2038,10 +2065,13 @@ fn subscribe_reserved_automation_reader(
     if let std::collections::btree_map::Entry::Vacant(entry) = record.subscribers.entry(client) {
         entry.insert(false);
         let current = record.handle.observe_next_update();
-        record.observations.insert(client, Observation {
-            after_generation: snapshot_generation,
-            ..Default::default()
-        });
+        record.observations.insert(
+            client,
+            Observation {
+                after_generation: snapshot_generation,
+                ..Default::default()
+            },
+        );
         (current > snapshot_generation).then_some(current)
     } else {
         None
@@ -2059,7 +2089,9 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     let handle = reserved_automation_actor(host, client, agent, false)?;
     let (mut issued, instance) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = state.chats.get(&requested.id)
+        let record = state
+            .chats
+            .get(&requested.id)
             .filter(|record| record.handle.same_actor(&handle))
             .ok_or_else(|| unavailable("The pending archive actor changed before attachment"))?;
         (record.session.clone(), record.execution_instance)
@@ -2067,27 +2099,58 @@ pub(in crate::host) fn attach_reserved_automation_actor(
     issued.launch.session_id = handle.confirmed_session_id();
     issued.native_continuity = handle.native_continuity();
     if !reserved_automation_request_matches(agent, requested, &issued) {
-        return Err(error("The pending archive attachment changed its exact native descriptor"));
+        return Err(error(
+            "The pending archive attachment changed its exact native descriptor",
+        ));
     }
-    let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The pending archive snapshot is unavailable"))?;
-    if snapshot.session_id != issued.launch.session_id || snapshot.native_continuity != issued.native_continuity {
-        return Err(unavailable("The pending archive conversation changed during hydration"));
+    let snapshot = handle
+        .snapshot(None)
+        .ok_or_else(|| unavailable("The pending archive snapshot is unavailable"))?;
+    if snapshot.session_id != issued.launch.session_id
+        || snapshot.native_continuity != issued.native_continuity
+    {
+        return Err(unavailable(
+            "The pending archive conversation changed during hydration",
+        ));
     }
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     validate_proof(requested.proof.as_ref(), state.proof())?;
-    let record = state.chats.get_mut(&requested.id)
-        .filter(|record| record.execution_instance == instance && record.handle.same_actor(&handle) && !record.handle.is_completed())
-        .filter(|record| reserved_automation_record_matches(agent, &record.session, &record.handle.native_continuity()))
-        .filter(|record| record.handle.confirmed_session_id() == issued.launch.session_id && record.handle.native_continuity() == issued.native_continuity)
+    let record = state
+        .chats
+        .get_mut(&requested.id)
+        .filter(|record| {
+            record.execution_instance == instance
+                && record.handle.same_actor(&handle)
+                && !record.handle.is_completed()
+        })
+        .filter(|record| {
+            reserved_automation_record_matches(
+                agent,
+                &record.session,
+                &record.handle.native_continuity(),
+            )
+        })
+        .filter(|record| {
+            record.handle.confirmed_session_id() == issued.launch.session_id
+                && record.handle.native_continuity() == issued.native_continuity
+        })
         .ok_or_else(|| unavailable("The pending archive actor changed during attachment"))?;
     let advanced = subscribe_reserved_automation_reader(record, client, snapshot.generation);
     drop(state);
     if let Some(generation) = advanced {
         // The client retains ChatObserved edges received before ChatAttached.
         // Use the ordinary coalescer, including its successful-delivery receipt.
-        changed_owned(&Arc::downgrade(host), requested.id, instance, Update::Observed { generation });
+        changed_owned(
+            &Arc::downgrade(host),
+            requested.id,
+            instance,
+            Update::Observed { generation },
+        );
     }
-    Ok(ServerResponse::ChatAttached { session: issued, snapshot })
+    Ok(ServerResponse::ChatAttached {
+        session: issued,
+        snapshot,
+    })
 }
 
 pub(in crate::host) fn executable_automation_sessions(
@@ -2137,8 +2200,12 @@ pub(super) fn process(
                     // An external exact attach or command is re-admitted under
                     // the owner gate below. Its reserved live path cannot enter
                     // a start/restart fallback; completed archives still refuse.
-                    if client != super::agent_execution::EXECUTION_CLIENT && matches!(&request,
-                        ClientRequest::ChatAttach { .. } | ClientRequest::ChatCommand { .. }) {
+                    if client != super::agent_execution::EXECUTION_CLIENT
+                        && matches!(
+                            &request,
+                            ClientRequest::ChatAttach { .. } | ClientRequest::ChatCommand { .. }
+                        )
+                    {
                         continue;
                     }
                     return Err(error(
@@ -3222,20 +3289,34 @@ mod tests {
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let weak = Arc::downgrade(&host);
         let (completed, seen) = crossbeam_channel::bounded(8);
-        let handle = Handle::start(spec, Box::new(Echo(false)), initial, store, None, move |update| {
-            let generation = match &update {
-                Update::Activity { generation, .. } => Some(*generation),
-                _ => None,
-            };
-            // Finish the real producer callback while no reader is subscribed.
-            changed(&weak, chat_id, update);
-            if let Some(generation) = generation { let _ = completed.try_send(generation); }
-        }).unwrap();
+        let handle = Handle::start(
+            spec,
+            Box::new(Echo(false)),
+            initial,
+            store,
+            None,
+            move |update| {
+                let generation = match &update {
+                    Update::Activity { generation, .. } => Some(*generation),
+                    _ => None,
+                };
+                // Finish the real producer callback while no reader is subscribed.
+                changed(&weak, chat_id, update);
+                if let Some(generation) = generation {
+                    let _ = completed.try_send(generation);
+                }
+            },
+        )
+        .unwrap();
         let hydrated = handle.snapshot(None).unwrap();
         handle.command(Command::Interrupt).unwrap();
         let generation = loop {
-            let generation = seen.recv_timeout(Duration::from_secs(5)).expect("provider update after snapshot");
-            if generation > hydrated.generation { break generation; }
+            let generation = seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("provider update after snapshot");
+            if generation > hydrated.generation {
+                break generation;
+            }
         };
         let (queue, advanced) = {
             let mut state = host.lock().unwrap();
@@ -3246,7 +3327,11 @@ mod tests {
                 paired_terminal: None,
                 session: Session {
                     id: chat_id,
-                    launch: chat::Launch { provider: Provider::Claude, recipe, session_id: None },
+                    launch: chat::Launch {
+                        provider: Provider::Claude,
+                        recipe,
+                        session_id: None,
+                    },
                     proof: Some(proof),
                     terminal: None,
                     owned_codex_listener: None,
@@ -3259,42 +3344,74 @@ mod tests {
                 completion_observed: false,
                 returning_terminal: false,
             };
-            let advanced = subscribe_reserved_automation_reader(&mut record,17,hydrated.generation);
-            assert_eq!(record.observations[&17].after_generation, hydrated.generation);
-            state.chats.insert(chat_id,record);
-            (queue,advanced)
+            let advanced =
+                subscribe_reserved_automation_reader(&mut record, 17, hydrated.generation);
+            assert_eq!(
+                record.observations[&17].after_generation,
+                hydrated.generation
+            );
+            state.chats.insert(chat_id, record);
+            (queue, advanced)
         };
         assert!(advanced.is_some_and(|current| current >= generation));
-        changed_owned(&Arc::downgrade(&host),chat_id,uuid::Uuid::new_v4(),Update::Observed { generation: advanced.unwrap() });
-        assert!(!host.lock().unwrap().chats[&chat_id].observations[&17].notified, "an older actor instance must not notify the replacement reader");
+        changed_owned(
+            &Arc::downgrade(&host),
+            chat_id,
+            uuid::Uuid::new_v4(),
+            Update::Observed {
+                generation: advanced.unwrap(),
+            },
+        );
+        assert!(
+            !host.lock().unwrap().chats[&chat_id].observations[&17].notified,
+            "an older actor instance must not notify the replacement reader"
+        );
         for _ in 0..2 {
-            changed_owned(&Arc::downgrade(&host),chat_id,instance,Update::Observed { generation: advanced.unwrap() });
+            changed_owned(
+                &Arc::downgrade(&host),
+                chat_id,
+                instance,
+                Update::Observed {
+                    generation: advanced.unwrap(),
+                },
+            );
         }
         queue.close_after_drain();
         let mut observations = Vec::new();
         while let Some(envelope) = queue.pop() {
             match envelope.message {
-                ServerMessage::ChatObserved { chat_id: observed, epoch } => {
-                    assert_eq!(observed,chat_id);
+                ServerMessage::ChatObserved {
+                    chat_id: observed,
+                    epoch,
+                } => {
+                    assert_eq!(observed, chat_id);
                     observations.push(epoch);
                 }
                 other => panic!("attachment requested unsolicited presentation: {other:?}"),
             }
         }
-        assert_eq!(observations, vec![0], "the consumed update must be observed once without another provider event");
+        assert_eq!(
+            observations,
+            vec![0],
+            "the consumed update must be observed once without another provider event"
+        );
         handle.close().unwrap();
     }
 
     #[test]
     fn pending_automation_archive_attachment_learns_only_the_exact_actors_native_promotion() {
-        use crate::agent_execution::{Agent, HostedSession, Origin, Placement, Spec, Surface, Target};
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
         let (_directory, _host, saved) = upgrade_fixture();
         let source = saved.source;
         let placement = Placement::Channel(crate::model::ChannelId::new());
         let mut agent = Agent {
             name: None,
             id: crate::model::AgentId::new(),
-            origin: Origin::Automation { id: uuid::Uuid::new_v4() },
+            origin: Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
             spec: Spec {
                 provider: source.launch.provider,
                 account: None,
@@ -3314,22 +3431,46 @@ mod tests {
             created_ms: 1,
             closed: false,
         };
-        let actual = chat::NativeContinuity::Durable { provider_version: "verified-1".into() };
-        assert!(reserved_automation_descriptor_matches(&agent, &source, &actual));
+        let actual = chat::NativeContinuity::Durable {
+            provider_version: "verified-1".into(),
+        };
+        assert!(reserved_automation_descriptor_matches(
+            &agent, &source, &actual
+        ));
         let mut promoted = source.clone();
         promoted.native_continuity = actual.clone();
-        assert!(reserved_automation_descriptor_matches(&agent, &promoted, &actual));
-        let Some(HostedSession::Chat(canonical)) = &mut agent.session else { unreachable!() };
+        assert!(reserved_automation_descriptor_matches(
+            &agent, &promoted, &actual
+        ));
+        let Some(HostedSession::Chat(canonical)) = &mut agent.session else {
+            unreachable!()
+        };
         canonical.native_continuity = actual.clone();
-        assert!(reserved_automation_descriptor_matches(&agent, &source, &actual));
-        assert!(!crate::automations::archive::native_descriptor_matches(&agent, &source), "closed archive readiness remains strict");
+        assert!(reserved_automation_descriptor_matches(
+            &agent, &source, &actual
+        ));
+        assert!(
+            !crate::automations::archive::native_descriptor_matches(&agent, &source),
+            "closed archive readiness remains strict"
+        );
         let mut unrelated = promoted.clone();
-        unrelated.native_continuity = chat::NativeContinuity::Durable { provider_version: "unrelated-version".into() };
-        assert!(!reserved_automation_descriptor_matches(&agent, &unrelated, &actual));
-        assert!(!reserved_automation_descriptor_matches(&agent, &promoted, &chat::NativeContinuity::ReconnectOnly));
+        unrelated.native_continuity = chat::NativeContinuity::Durable {
+            provider_version: "unrelated-version".into(),
+        };
+        assert!(!reserved_automation_descriptor_matches(
+            &agent, &unrelated, &actual
+        ));
+        assert!(!reserved_automation_descriptor_matches(
+            &agent,
+            &promoted,
+            &chat::NativeContinuity::ReconnectOnly
+        ));
         let mut unknown_thread = source.clone();
         unknown_thread.launch.session_id = None;
-        assert!(reserved_automation_descriptor_matches(&agent, &unknown_thread, &actual), "only the canonical already-confirmed thread may be learned");
+        assert!(
+            reserved_automation_descriptor_matches(&agent, &unknown_thread, &actual),
+            "only the canonical already-confirmed thread may be learned"
+        );
         let terminal = crate::model::TerminalSession {
             id: source.id,
             launch: LaunchRecipe {
@@ -3354,11 +3495,22 @@ mod tests {
         let mut paired = promoted.clone();
         paired.terminal = Some(terminal.clone());
         assert!(reserved_automation_record_matches(&agent, &paired, &actual));
-        assert!(reserved_automation_request_matches(&agent, &source, &paired), "stale None may learn the exact current actor pair");
-        assert!(!reserved_automation_request_matches(&agent, &paired, &promoted), "known pair must not disappear from the response");
-        let Some(HostedSession::Chat(canonical)) = &mut agent.session else { unreachable!() };
+        assert!(
+            reserved_automation_request_matches(&agent, &source, &paired),
+            "stale None may learn the exact current actor pair"
+        );
+        assert!(
+            !reserved_automation_request_matches(&agent, &paired, &promoted),
+            "known pair must not disappear from the response"
+        );
+        let Some(HostedSession::Chat(canonical)) = &mut agent.session else {
+            unreachable!()
+        };
         canonical.terminal = Some(terminal);
-        assert!(!reserved_automation_record_matches(&agent, &source, &actual), "a live record cannot reconstruct its missing known pair from readonly projection");
+        assert!(
+            !reserved_automation_record_matches(&agent, &source, &actual),
+            "a live record cannot reconstruct its missing known pair from readonly projection"
+        );
         assert!(reserved_automation_record_matches(&agent, &paired, &actual));
         for field in 0..5 {
             let mut changed = source.clone();
@@ -3366,13 +3518,24 @@ mod tests {
                 0 => changed.launch.session_id = Some("unrelated-native-thread".into()),
                 1 => changed.id = TerminalId::new(),
                 2 => changed.proof = None,
-                3 => changed.owned_codex_listener = Some(chat::OwnedCodexListener {
-                    socket: "/unrelated/control.sock".into(),
-                    allocator: source.proof.clone().unwrap(),
-                }),
-                _ => { changed.launch.recipe.environment.insert("DIFFERENT_ACCOUNT".into(), "other-home".into()); }
+                3 => {
+                    changed.owned_codex_listener = Some(chat::OwnedCodexListener {
+                        socket: "/unrelated/control.sock".into(),
+                        allocator: source.proof.clone().unwrap(),
+                    })
+                }
+                _ => {
+                    changed
+                        .launch
+                        .recipe
+                        .environment
+                        .insert("DIFFERENT_ACCOUNT".into(), "other-home".into());
+                }
             }
-            assert!(!reserved_automation_descriptor_matches(&agent, &changed, &actual), "different authority field {field}");
+            assert!(
+                !reserved_automation_descriptor_matches(&agent, &changed, &actual),
+                "different authority field {field}"
+            );
         }
     }
 

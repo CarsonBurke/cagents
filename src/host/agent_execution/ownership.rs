@@ -76,7 +76,10 @@ pub(in crate::host) fn interactive(
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let mut reserved = Vec::new();
         for session in executable {
-            if let Some(owner) = registry.archived_automation_owner(session).map_err(unavailable)? {
+            if let Some(owner) = registry
+                .archived_automation_owner(session)
+                .map_err(unavailable)?
+            {
                 reserved.push(owner);
             }
         }
@@ -85,11 +88,23 @@ pub(in crate::host) fn interactive(
     for owner in reserved {
         if !owner.closed {
             match &request {
-                ClientRequest::ChatAttach { session } if owner.session.as_ref().is_some_and(|issued| issued.id() == session.id) => {
-                    return super::super::chat::attach_reserved_automation_actor(host,client,&owner,session);
+                ClientRequest::ChatAttach { session }
+                    if owner
+                        .session
+                        .as_ref()
+                        .is_some_and(|issued| issued.id() == session.id) =>
+                {
+                    return super::super::chat::attach_reserved_automation_actor(
+                        host, client, &owner, session,
+                    );
                 }
-                ClientRequest::ChatCommand { chat_id, .. } if owner.session.as_ref().is_some_and(|issued| issued.id() == *chat_id) => {
-                    super::super::chat::reserved_automation_actor(host,client,&owner,true)?;
+                ClientRequest::ChatCommand { chat_id, .. }
+                    if owner
+                        .session
+                        .as_ref()
+                        .is_some_and(|issued| issued.id() == *chat_id) =>
+                {
+                    super::super::chat::reserved_automation_actor(host, client, &owner, true)?;
                     continue;
                 }
                 _ => {}
@@ -102,8 +117,11 @@ pub(in crate::host) fn interactive(
         ));
     }
     // The pre-gate lookup selected locks, not mutable control authority.
-    let agent = registry.lock().unwrap_or_else(|p| p.into_inner())
-        .agent_for_session(id).map_err(unavailable)?;
+    let agent = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(id)
+        .map_err(unavailable)?;
     if claims {
         let Some(agent) = agent else {
             return apply(request);
@@ -224,14 +242,20 @@ fn reconcile_agent_run_with_archive(
             .transpose()?;
         // Process exit does not settle provider-reported delegated work. Its
         // canonical ownership evidence must survive until explicitly resolved.
-        if retire && snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot.is_working() || snapshot.waiting || !snapshot.requests.is_empty()
-        }) {
+        if retire
+            && snapshot.as_ref().is_some_and(|snapshot| {
+                snapshot.is_working() || snapshot.waiting || !snapshot.requests.is_empty()
+            })
+        {
             return Err("The provider is not idle; automatic cleanup did not stop it".into());
         }
         let idle_generation = if !completed {
             let snapshot = snapshot.as_ref().expect("live provider snapshot");
-            let working = if retire { snapshot.is_working() } else { snapshot.busy };
+            let working = if retire {
+                snapshot.is_working()
+            } else {
+                snapshot.busy
+            };
             if !snapshot.ready || working || snapshot.waiting || !snapshot.requests.is_empty() {
                 return Err("The provider is not idle; automatic cleanup did not stop it".into());
             }

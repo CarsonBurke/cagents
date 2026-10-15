@@ -433,26 +433,68 @@ mod tests {
 
     #[test]
     fn unrelated_model_transitions_do_not_discard_a_scope_page_but_archive_changes_do() {
-        let mut app=crate::app::tests::context_inspector_test_app(true);
-        app.workspace_model.identity=uuid::Uuid::new_v4();
-        Arc::make_mut(&mut app.durable).active_channel=Some(crate::model::ChannelId::new());
-        app.workspace_model.automation_archive_sequence=7;
-        let key=app.archive_discovery_key().expect("selected fixture scope");
-        let proof=crate::model::HostSessionProof {
-            host_session_id:crate::model::HostSessionId::new("archive-page-host"),
-            boot_id:crate::model::BootId::new("archive-page-boot"),
-            host_incarnation:crate::model::HostIncarnation::new("archive-page-instance"),
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        Arc::make_mut(&mut app.durable).active_channel = Some(crate::model::ChannelId::new());
+        app.workspace_model.automation_archive_sequence = 7;
+        let key = app.archive_discovery_key().expect("selected fixture scope");
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("archive-page-host"),
+            boot_id: crate::model::BootId::new("archive-page-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("archive-page-instance"),
         };
-        app.chat_ui.archive_discovery.pending=Some(Pending{generation:1,key:key.clone(),proof:Some(proof.clone())});
-        app.workspace_model.sequence+=100;
-        let _=app.scope_automation_archives_received(1,Arc::new(Ok(ArchiveAgentPage {scope:key.scope.clone(),identity:key.identity,archive_sequence:key.archive_sequence,proof:proof.clone(),agents:vec![],next:None})));
+        app.chat_ui.archive_discovery.pending = Some(Pending {
+            generation: 1,
+            key: key.clone(),
+            proof: Some(proof.clone()),
+        });
+        app.workspace_model.sequence += 100;
+        let _ = app.scope_automation_archives_received(
+            1,
+            Arc::new(Ok(ArchiveAgentPage {
+                scope: key.scope.clone(),
+                identity: key.identity,
+                archive_sequence: key.archive_sequence,
+                proof: proof.clone(),
+                agents: vec![],
+                next: None,
+            })),
+        );
         assert!(app.chat_ui.archive_discovery.pending.is_none());
-        assert_eq!(app.chat_ui.archive_discovery.completed.as_ref(),Some(&key),"valid page must complete despite unrelated model transitions");
-        app.chat_ui.archive_discovery.pending=Some(Pending{generation:2,key:key.clone(),proof:Some(proof.clone())});
-        app.chat_ui.archive_discovery.generation=2;
-        app.workspace_model.automation_archive_sequence+=1;
-        let _=app.scope_automation_archives_received(2,Arc::new(Ok(ArchiveAgentPage {scope:key.scope,identity:key.identity,archive_sequence:key.archive_sequence,proof,agents:vec![],next:None})));
-        assert_eq!(app.chat_ui.archive_discovery.pending.as_ref().unwrap().key.archive_sequence,8,"relevant archive change must restart against current authority");
+        assert_eq!(
+            app.chat_ui.archive_discovery.completed.as_ref(),
+            Some(&key),
+            "valid page must complete despite unrelated model transitions"
+        );
+        app.chat_ui.archive_discovery.pending = Some(Pending {
+            generation: 2,
+            key: key.clone(),
+            proof: Some(proof.clone()),
+        });
+        app.chat_ui.archive_discovery.generation = 2;
+        app.workspace_model.automation_archive_sequence += 1;
+        let _ = app.scope_automation_archives_received(
+            2,
+            Arc::new(Ok(ArchiveAgentPage {
+                scope: key.scope,
+                identity: key.identity,
+                archive_sequence: key.archive_sequence,
+                proof,
+                agents: vec![],
+                next: None,
+            })),
+        );
+        assert_eq!(
+            app.chat_ui
+                .archive_discovery
+                .pending
+                .as_ref()
+                .unwrap()
+                .key
+                .archive_sequence,
+            8,
+            "relevant archive change must restart against current authority"
+        );
     }
 
     #[test]
