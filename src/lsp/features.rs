@@ -284,9 +284,10 @@ fn convert_signature(help:lsp_types::SignatureHelp)->LspSignatureHelp {
     LspSignatureHelp{signatures,active_signature,active_parameter}
 }
 
+static NEXT_SERVER_EDIT_ID:AtomicU64=AtomicU64::new(1);
+
 #[derive(Default)]
 pub(super) struct ServerEdits {
-    next:AtomicU64,
     pending:Mutex<HashMap<LspServerEditId,(LspDocumentId,tokio::sync::oneshot::Sender<lsp_types::ApplyWorkspaceEditResponse>)>>,
 }
 impl ServerEdits {
@@ -307,7 +308,7 @@ pub(super) fn apply_workspace_edit(state:&mut RouterState,params:lsp_types::Appl
         if state.retired.load(Ordering::Acquire){return Err("language server retired".to_owned());}
         let doc=state.snapshots.docs_for_session(&state.key).into_iter().next().ok_or("no open document owns this language server")?;
         let edit=convert_workspace_edit(&state.snapshots,params.edit,None).map_err(|e|e.to_string())?;
-        let id=LspServerEditId(state.server_edits.next.fetch_add(1,Ordering::Relaxed));
+        let id=LspServerEditId(NEXT_SERVER_EDIT_ID.fetch_add(1,Ordering::Relaxed));
         let (tx,rx)=tokio::sync::oneshot::channel();
         {let mut pending=state.server_edits.pending.lock().unwrap_or_else(|p|p.into_inner());if pending.len()>=64{return Err("too many pending workspace-edit previews".to_owned());}pending.insert(id,(doc,tx));}
         state.events.emit_now(LspEvent::ApplyWorkspaceEdit{doc,id,label:params.label,edit});Ok((id,rx))
