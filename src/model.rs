@@ -1183,6 +1183,46 @@ pub struct EditorNavigation {
     pub scroll_horizontal: f32,
 }
 
+/// A completed Return remains unapplied when its original UI target retired.
+/// Only an exact conversion snapshot enables its metadata-only host ACK.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SavedTerminalHandoff {
+    pub card: CardId,
+    pub receipt: crate::terminal::ipc::TerminalHandoffReceipt,
+    pub converted: bool,
+}
+pub(crate) const MAX_TERMINAL_HANDOFFS: usize = 64;
+pub(crate) const MAX_TERMINAL_HANDOFF_BYTES: usize = 64 * 1024 * 1024;
+
+/// Count encoded bytes without allocating another copy of a launch recipe.
+/// This is admission bookkeeping, never account or execution authority.
+pub(crate) fn terminal_handoff_bytes(receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> Result<usize, String> {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_add(bytes.len()).filter(|total| *total <= crate::terminal::ipc::MAX_FRAME_BYTES)
+                .ok_or_else(|| std::io::Error::other("Terminal return receipt exceeds its source frame bound"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut count = Count(0);
+    serde_json::to_writer(&mut count, receipt).map_err(|error| error.to_string())?;
+    Ok(count.0)
+}
+pub(crate) fn validate_terminal_handoffs(pending: &HashMap<uuid::Uuid, SavedTerminalHandoff>) -> Result<usize, String> {
+    if pending.len() > MAX_TERMINAL_HANDOFFS { return Err("Too many saved terminal return receipts".into()); }
+    let mut bytes = 0usize;
+    for (operation, saved) in pending {
+        if operation.is_nil() || *operation != saved.receipt.operation { return Err("Terminal return receipt operation does not match its saved key".into()); }
+        // Leave room for map keys and the card/conversion wrapper.
+        bytes = bytes.checked_add(terminal_handoff_bytes(&saved.receipt)? + 256)
+            .filter(|bytes| *bytes <= MAX_TERMINAL_HANDOFF_BYTES)
+            .ok_or("Saved terminal return receipts exceed their byte budget")?;
+    }
+    Ok(bytes)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub schema_version: u32,
@@ -1228,7 +1268,7 @@ pub struct WorkspaceState {
     /// Full host-issued return receipts awaiting an exact metadata-only ACK.
     /// Saved with the conversion so a crash never reduces authority to an ID.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub terminal_handoff_receipts: HashMap<uuid::Uuid, crate::terminal::ipc::TerminalHandoffReceipt>,
+    pub terminal_handoff_receipts: HashMap<uuid::Uuid, SavedTerminalHandoff>,
 
     /// Most recently visited workspace identities, newest first. Missing
     /// identities are pruned when navigation opens; this grants no ownership.

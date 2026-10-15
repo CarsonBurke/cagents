@@ -264,7 +264,7 @@ pub struct WorkspaceManifest {
     pub conversation_drafts: HashMap<String, String>,
     pub conversation_models: HashMap<String, String>,
     pub conversation_channels: HashMap<String, ChannelId>,
-    pub terminal_handoff_receipts: HashMap<uuid::Uuid, crate::terminal::ipc::TerminalHandoffReceipt>,
+    pub terminal_handoff_receipts: HashMap<uuid::Uuid, crate::model::SavedTerminalHandoff>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
     pub workspace_model_identity: Option<uuid::Uuid>,
@@ -3319,7 +3319,7 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:terminal_handoff_receipts"),
-        &to_json(&state.terminal_handoff_receipts)?,
+        &terminal_handoffs_json(&state.terminal_handoff_receipts)?,
     )?;
     set_metadata(
         transaction,
@@ -4696,7 +4696,7 @@ fn load_workspace_manifest_connection(
             connection,
             &format!("workspace:{id}:navigation:terminal_handoff_receipts"),
         )?
-        .map(|value| from_json("workspace terminal handoff receipts", &value))
+        .map(|value| terminal_handoffs_from_json(&value))
         .transpose()?
         .unwrap_or_default(),
         local_only_cards: metadata(
@@ -5131,6 +5131,20 @@ fn set_metadata(transaction: &Transaction<'_>, key: &str, value: &str) -> Result
 
 fn to_json(value: &impl Serialize) -> Result<String> {
     Ok(serde_json::to_string(value)?)
+}
+
+fn terminal_handoffs_json(value: &HashMap<uuid::Uuid, crate::model::SavedTerminalHandoff>) -> Result<String> {
+    crate::model::validate_terminal_handoffs(value).map_err(|error| StoreError::corrupt_row("workspace terminal handoff receipts", error))?;
+    to_json(value)
+}
+fn terminal_handoffs_from_json(value: &str) -> Result<HashMap<uuid::Uuid, crate::model::SavedTerminalHandoff>> {
+    // Reject before deserialization can allocate nested source/environment data.
+    if value.len() > crate::model::MAX_TERMINAL_HANDOFF_BYTES {
+        return Err(StoreError::corrupt_row("workspace terminal handoff receipts", "saved receipt metadata exceeds its byte budget"));
+    }
+    let receipts = from_json("workspace terminal handoff receipts", value)?;
+    crate::model::validate_terminal_handoffs(&receipts).map_err(|error| StoreError::corrupt_row("workspace terminal handoff receipts", error))?;
+    Ok(receipts)
 }
 
 fn from_json<T: DeserializeOwned>(kind: &str, value: &str) -> Result<T> {
@@ -6274,8 +6288,10 @@ mod tests {
         let mut next = first.clone();
         next.operation = uuid::Uuid::new_v4();
         next.terminal.execution_instance = uuid::Uuid::new_v4();
-        workspace.terminal_handoff_receipts.insert(first.operation, first.clone());
-        workspace.terminal_handoff_receipts.insert(next.operation, next.clone());
+        let first_saved = crate::model::SavedTerminalHandoff { card: workspace.cards[0].id, receipt: first.clone(), converted: true };
+        let next_saved = crate::model::SavedTerminalHandoff { card: CardId::new(), receipt: next.clone(), converted: false };
+        workspace.terminal_handoff_receipts.insert(first.operation, first_saved.clone());
+        workspace.terminal_handoff_receipts.insert(next.operation, next_saved.clone());
         let store = StateStore::open(&database, boot_id).unwrap();
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
@@ -6283,14 +6299,14 @@ mod tests {
         let store = StateStore::open(&database, boot("after-ui-crash")).unwrap();
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.terminal_handoff_receipts, workspace.terminal_handoff_receipts);
-        assert_eq!(restored.terminal_handoff_receipts[&first.operation], first);
-        assert_eq!(restored.terminal_handoff_receipts[&next.operation], next);
+        assert_eq!(restored.terminal_handoff_receipts[&first.operation], first_saved);
+        assert_eq!(restored.terminal_handoff_receipts[&next.operation], next_saved);
         // Acknowledging one immutable operation cannot erase another return of
         // the same terminal ID. No current inventory or recipe reconstructs it.
         workspace.terminal_handoff_receipts.remove(&first.operation);
         lane.save(&store, &workspace).unwrap();
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
-        assert_eq!(restored.terminal_handoff_receipts, HashMap::from([(next.operation, next)]));
+        assert_eq!(restored.terminal_handoff_receipts, HashMap::from([(next.operation, next_saved)]));
         let mut legacy = serde_json::to_value(&workspace).unwrap();
         legacy.as_object_mut().unwrap().remove("terminal_handoff_receipts");
         assert!(serde_json::from_value::<WorkspaceState>(legacy).unwrap().terminal_handoff_receipts.is_empty());

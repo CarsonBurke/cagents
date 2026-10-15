@@ -3939,6 +3939,15 @@ fn grouped_digits(value: usize) -> String {
     grouped
 }
 
+/// A flush acknowledges the exact retained host operation. Legacy saved
+/// terminals can only use the legacy metadata path; they never reconstruct a
+/// typed receipt from a later attachment or inventory.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TerminalHandoffAck {
+    Legacy(TerminalSession),
+    Receipt(crate::terminal::ipc::TerminalHandoffReceipt),
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     ModalSurface {
@@ -4019,7 +4028,7 @@ pub enum Message {
         result: Result<Option<StartedTerminal>, String>,
     },
     TerminalHandoffsCommitted {
-        result: Result<Vec<(TerminalSession, Result<(), String>)>, String>,
+        result: Result<Vec<(TerminalHandoffAck, Result<(), String>)>, String>,
     },
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
@@ -5617,8 +5626,9 @@ impl Cagents {
                             .live_proof()
                             .is_none_or(|stored| stored == proof)
                     });
-                    self.pending_terminal_handoffs
-                        .insert(started.session.id, started.session.clone());
+                    if !self.durable.terminal_handoff_receipts.values().any(|receipt| receipt.receipt.terminal.session.id == started.session.id) {
+                        self.pending_terminal_handoffs.insert(started.session.id, started.session.clone());
+                    }
                 }
                 self.terminal_recovery_attempts.remove(&terminal);
                 self.terminal_recovery_attempts.remove(&started.session.id);
@@ -7132,11 +7142,38 @@ impl Cagents {
         }
     }
 
+    /// Reserve worst-case response space before the Return can mutate an actor.
+    fn terminal_handoff_capacity_available(&self) -> bool {
+        let Ok(bytes) = crate::model::validate_terminal_handoffs(&self.durable.terminal_handoff_receipts) else { return false; };
+        let inflight = self.chat_ui.handoff_bindings.len();
+        self.durable.terminal_handoff_receipts.len().saturating_add(inflight) < crate::model::MAX_TERMINAL_HANDOFFS
+            && bytes.saturating_add(inflight.saturating_add(1).saturating_mul(crate::terminal::ipc::MAX_FRAME_BYTES + 256)) <= crate::model::MAX_TERMINAL_HANDOFF_BYTES
+    }
+    fn retain_terminal_handoff_receipt(&mut self, card: CardId, receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> bool {
+        if let Some(existing) = self.durable.terminal_handoff_receipts.get(&receipt.operation) {
+            return existing.card == card && existing.receipt == *receipt;
+        }
+        // The pre-IO reservation covers the entire bounded response, including
+        // an answer for a presentation which retired while Return was pending.
+        let valid = crate::model::validate_terminal_handoffs(&self.durable.terminal_handoff_receipts)
+            .and_then(|bytes| crate::model::terminal_handoff_bytes(receipt).map(|added| bytes.saturating_add(added).saturating_add(256)))
+            .is_ok_and(|bytes| bytes <= crate::model::MAX_TERMINAL_HANDOFF_BYTES);
+        if !valid || self.durable.terminal_handoff_receipts.len() >= crate::model::MAX_TERMINAL_HANDOFFS {
+            self.status = Some(TransientNotice::error("The completed terminal return could not fit its reserved receipt budget. Its original pane was kept; do not discard this window state."));
+            return false;
+        }
+        Arc::make_mut(&mut self.durable).terminal_handoff_receipts.insert(receipt.operation, crate::model::SavedTerminalHandoff { card, receipt: receipt.clone(), converted: false });
+        let saved = self.persistent_workspace();
+        if let Some(writer) = &self.session { writer.snapshot(saved); }
+        true
+    }
+
     fn finish_chat_terminal_handoff(
         &mut self,
         card: CardId,
-        session: TerminalSession,
+        receipt: crate::terminal::ipc::TerminalHandoffReceipt,
     ) -> Task<Message> {
+        let session = receipt.terminal.session.clone();
         let Some(state) = self
             .card_state(card)
             .filter(|state| state.existence.is_open())
@@ -7144,6 +7181,7 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if !self.retain_terminal_handoff_receipt(card, &receipt) { return Task::none(); }
         let residency = Residency::Hydrating {
             epoch: unix_millis().max(1) as u64,
         };
@@ -7156,18 +7194,19 @@ impl Cagents {
         self.closed_terminal_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
+        // Persist the full operation together with the returned descriptor.
+        // A process crash before ACK restores this exact metadata capability.
+        Arc::make_mut(&mut self.durable).terminal_handoff_receipts.get_mut(&receipt.operation).unwrap().converted = true;
         let saved = self.persistent_workspace();
         if let Some(writer) = &self.session {
             writer.snapshot_conversion(saved);
         }
-        self.pending_terminal_handoffs
-            .insert(session.id, session.clone());
         let commit = self.commit_terminal_handoffs();
-        let attach = self.start_terminal(
+        // The immutable worker/source is seeded before the first socket write.
+        let attach = self.start_terminal_from_handoff(
             card,
-            session,
+            receipt.terminal,
             state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
-            false,
         );
         Task::batch([commit, attach])
     }
@@ -7176,7 +7215,7 @@ impl Cagents {
     /// replay evidence based only on receiving or attaching its replacement.
     fn commit_terminal_handoffs(&mut self) -> Task<Message> {
         if self.terminal_handoff_commit_inflight
-            || self.pending_terminal_handoffs.is_empty()
+            || (self.pending_terminal_handoffs.is_empty() && self.durable.terminal_handoff_receipts.is_empty())
             || self.save_health.as_ref().is_some_and(|health| {
                 !matches!(
                     health.health,
@@ -7186,25 +7225,31 @@ impl Cagents {
         {
             return Task::none();
         }
-        let Some(writer) = &self.session else {
-            return Task::none();
-        };
-        let Ok(flush) = writer.request_flush() else {
-            return Task::none();
-        };
-        let terminals = self
-            .pending_terminal_handoffs
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
+        let receipts = self.durable.terminal_handoff_receipts.values().filter(|saved| saved.converted).map(|saved| saved.receipt.clone()).collect::<Vec<_>>();
+        let typed_ids = self.durable.terminal_handoff_receipts.values().map(|saved| saved.receipt.terminal.session.id).collect::<HashSet<_>>();
+        let terminals = self.pending_terminal_handoffs.values()
+            .filter(|terminal| !typed_ids.contains(&terminal.id)).cloned().collect::<Vec<_>>();
+        if terminals.is_empty() && receipts.is_empty() { return Task::none(); }
+        let Some(writer) = &self.session else { return Task::none(); };
+        let Ok(flush) = writer.request_flush() else { return Task::none(); };
         self.terminal_handoff_commit_inflight = true;
         cosmic::task::future(async move {
             let joined = tokio::task::spawn_blocking(move || {
                 flush
                     .recv_timeout(Duration::from_secs(30))
                     .map_err(|error| format!("session flush: {error}"))??;
-                let results = crate::chat::client::acknowledge_terminal_handoffs(&terminals);
-                Ok(terminals.into_iter().zip(results).collect())
+                let legacy_results = crate::chat::client::acknowledge_terminal_handoffs(&terminals);
+                let typed_results = crate::chat::client::acknowledge_terminal_handoff_receipts(&receipts);
+                let mut results = Vec::with_capacity(terminals.len() + receipts.len());
+                for (index, terminal) in terminals.into_iter().enumerate() {
+                    let result = legacy_results.get(index).cloned().unwrap_or_else(|| Err("Missing legacy handoff acknowledgement".into()));
+                    results.push((TerminalHandoffAck::Legacy(terminal), result));
+                }
+                for (index, receipt) in receipts.into_iter().enumerate() {
+                    let result = typed_results.get(index).cloned().unwrap_or_else(|| Err("Missing exact handoff receipt acknowledgement".into()));
+                    results.push((TerminalHandoffAck::Receipt(receipt), result));
+                }
+                Ok(results)
             })
             .await;
             let result = joined
@@ -12996,9 +13041,9 @@ impl Application for Cagents {
                 CardKind::Chat(chat) => chat.terminal.as_ref(),
                 _ => None,
             };
-            if let Some(terminal) = terminal {
-                app.pending_terminal_handoffs
-                    .insert(terminal.id, terminal.clone());
+            if let Some(terminal) = terminal
+                && !app.durable.terminal_handoff_receipts.values().any(|receipt| receipt.receipt.terminal.session.id == terminal.id) {
+                app.pending_terminal_handoffs.insert(terminal.id, terminal.clone());
             }
         }
         app.refresh_sidebar_channels();
@@ -13177,15 +13222,37 @@ impl Application for Cagents {
                 let failure = match result {
                     Ok(results) => {
                         let mut failures = Vec::new();
-                        for (terminal, result) in results {
-                            if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal) {
-                                continue;
-                            }
-                            match result {
-                                Ok(()) => {
-                                    self.pending_terminal_handoffs.remove(&terminal.id);
+                        let mut changed_receipts = false;
+                        for (pending, result) in results {
+                            match pending {
+                                TerminalHandoffAck::Legacy(terminal) => {
+                                    if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal) { continue; }
+                                    match result {
+                                        Ok(()) => { self.pending_terminal_handoffs.remove(&terminal.id); }
+                                        Err(error) => failures.push((terminal.id, error)),
+                                    }
                                 }
-                                Err(error) => failures.push((terminal.id, error)),
+                                TerminalHandoffAck::Receipt(receipt) => {
+                                    if self.durable.terminal_handoff_receipts.get(&receipt.operation).is_none_or(|saved| !saved.converted || saved.receipt != receipt) { continue; }
+                                    match result {
+                                        Ok(()) => {
+                                            Arc::make_mut(&mut self.durable).terminal_handoff_receipts.remove(&receipt.operation);
+                                            if self.pending_terminal_handoffs.get(&receipt.terminal.session.id) == Some(&receipt.terminal.session) {
+                                                self.pending_terminal_handoffs.remove(&receipt.terminal.session.id);
+                                            }
+                                            changed_receipts = true;
+                                        }
+                                        Err(error) => failures.push((receipt.terminal.session.id, error)),
+                                    }
+                                }
+                            }
+                        }
+                        if changed_receipts {
+                            let saved = self.persistent_workspace();
+                            if let Some(writer) = &self.session {
+                                // Losing this save repeats only an exact metadata
+                                // ACK after restore; it never closes a worker.
+                                writer.snapshot(saved);
                             }
                         }
                         failures.first().map(|(id, error)| {
@@ -18228,10 +18295,10 @@ mod tests {
         app.terminal_handoff_commit_inflight = true;
         let _ = app.update(Message::TerminalHandoffsCommitted {
             result: Ok(vec![
-                (accepted.clone(), Ok(())),
-                (refused.clone(), Err("receipt refused".into())),
-                (superseded_success.clone(), Ok(())),
-                (superseded_failure.clone(), Err("obsolete failure".into())),
+                (TerminalHandoffAck::Legacy(accepted.clone()), Ok(())),
+                (TerminalHandoffAck::Legacy(refused.clone()), Err("receipt refused".into())),
+                (TerminalHandoffAck::Legacy(superseded_success.clone()), Ok(())),
+                (TerminalHandoffAck::Legacy(superseded_failure.clone()), Err("obsolete failure".into())),
             ]),
         });
         assert!(!app.terminal_handoff_commit_inflight);
@@ -18258,7 +18325,7 @@ mod tests {
         // A successful retry removes only the previously failed descriptor;
         // newer receipts that arrived during the batch still need a save.
         let _ = app.update(Message::TerminalHandoffsCommitted {
-            result: Ok(vec![(refused.clone(), Ok(()))]),
+            result: Ok(vec![(TerminalHandoffAck::Legacy(refused.clone()), Ok(()))]),
         });
         assert!(!app.pending_terminal_handoffs.contains_key(&refused.id));
         assert_eq!(app.pending_terminal_handoffs.len(), 2);

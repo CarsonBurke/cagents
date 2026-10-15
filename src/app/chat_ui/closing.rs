@@ -60,6 +60,24 @@ impl EndRequest {
         } else { None };
         Some(Self { registry: app.workspace_model.identity, batch, kind, session, shared_source, paired_terminal })
     }
+    /// Called only after the exact successful return installed its descriptor.
+    /// The initial shared before-pane is never captured again from current state.
+    pub(super) fn after_terminal_handoff(mut self, app: &mut Cagents, card: CardId, receipt: &crate::terminal::ipc::TerminalHandoffReceipt) -> Option<Self> {
+        if self.registry != app.workspace_model.identity
+            || !matches!(&self.kind, CardKind::Chat(issued) if crate::workspace_model::views::handoff_chat_source_matches(issued, &receipt.source))
+            || self.session.as_ref().is_none_or(|observed| !crate::workspace_model::views::handoff_chat_source_matches(observed, &receipt.source)) {
+            return None;
+        }
+        let observed = app.chat_return_session(card);
+        self.shared_source = match self.shared_source {
+            Some(source) => Some(source.after_terminal_handoff(receipt, observed.as_ref())?),
+            None => None,
+        };
+        self.kind = CardKind::Terminal(receipt.terminal.session.clone());
+        self.session = observed;
+        self.paired_terminal = Some(app.capture_handoff_card_close_for(card, self.batch, receipt, self.shared_source.clone())?);
+        self.current(app, card).then_some(self)
+    }
     pub(super) fn archived_metadata_only(&self) -> bool {
         self.shared_source.as_ref().is_some_and(shared_views::RemovalSource::is_archived_automation)
     }
@@ -1043,6 +1061,11 @@ mod tests {
         let source = app.chat_return_session(card).unwrap();
         let local = local_error.map(|_| LocalReturn { session: source.clone(), launch: source.launch.recipe.clone(), resumes: true });
         app.chat_ui.phases.insert(card, Phase::Returning { target, local, close_requested: false });
+        if local_error.is_none() {
+            app.chat_ui.handoff_bindings.insert(target, crate::terminal::ipc::ChatSourceBinding {
+                source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4(),
+            });
+        }
         let _original_delivery = queued(app.close_cards_in_order(vec![card]));
         let batch = app.pane_close_batch_for(card);
         assert!(batch.is_some());
