@@ -397,7 +397,24 @@ impl Default for KeyboardShortcuts {
             settings_accounts: Vec::new(),
             settings_notifications: Vec::new(),
             settings_about: Vec::new(),
-            terminal_passthrough_actions: Vec::new(),
+            terminal_passthrough_actions: [
+                "rename_pane",
+                "new_native_thread",
+                "find_in_pane",
+                "cycle_pane_width",
+                "focus_pane_1",
+                "focus_pane_2",
+                "focus_pane_3",
+                "focus_pane_4",
+                "focus_pane_5",
+                "focus_pane_6",
+                "focus_pane_7",
+                "focus_pane_8",
+                "focus_pane_9",
+            ]
+            .into_iter()
+            .map(str::to_owned)
+            .collect(),
         }
     }
 }
@@ -406,7 +423,9 @@ impl Default for KeyboardShortcuts {
 pub const CHORD_SEPARATOR: &str = ", ";
 
 impl KeyboardShortcuts {
-    pub fn action_names() -> &'static [&'static str] { &SHORTCUT_ACTIONS }
+    pub fn action_names() -> &'static [&'static str] {
+        &SHORTCUT_ACTIONS
+    }
 
     /// Every action's chord list, in the order the dialog presents them.
     pub fn actions(&self) -> [&Vec<String>; 74] {
@@ -2336,6 +2355,16 @@ fn normalize_current(table: &mut toml::Table) {
         if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts") {
             adopt_shortcut_defaults(shortcuts, revision, &[]);
         }
+        if let Some(toml::Value::Table(shortcuts)) = table.get_mut("keyboard_shortcuts")
+            && !shortcuts.contains_key("terminal_passthrough_actions")
+            && shortcuts.get("close_focused_column").and_then(parsed_chords).is_some_and(|chords| chords.contains(&parse_shortcut("Ctrl+W").unwrap()))
+        {
+            // Another customized action may own Ctrl+Shift+W. Preserve its
+            // chord and release the stranded old close default to the shell.
+            let mut passthrough = KeyboardShortcuts::default().terminal_passthrough_actions;
+            passthrough.push("close_focused_column".into());
+            shortcuts.insert("terminal_passthrough_actions".into(), passthrough.into());
+        }
         table.insert(
             "shortcut_defaults_revision".to_owned(),
             i64::from(SHORTCUT_DEFAULTS_REVISION).into(),
@@ -2599,7 +2628,10 @@ fn decode_current(table: toml::Table) -> Result<Decoded, SettingsError> {
         foreign.extend(
             shortcuts
                 .keys()
-                .filter(|key| key.as_str() != "terminal_passthrough_actions" && !SHORTCUT_ACTIONS.contains(&key.as_str()))
+                .filter(|key| {
+                    key.as_str() != "terminal_passthrough_actions"
+                        && !SHORTCUT_ACTIONS.contains(&key.as_str())
+                })
                 .map(|key| Foreign {
                     path: vec![
                         Segment::Key("keyboard_shortcuts".into()),
@@ -3752,17 +3784,40 @@ next_column = ["Alt+W", "Alt+Right"]
     }
 
     #[test]
+    fn shell_safe_migration_releases_close_when_a_custom_chord_prevents_upgrading_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+        document.insert("shortcut_defaults_revision".into(), 5.into());
+        let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+        shortcuts.remove("terminal_passthrough_actions");
+        shortcuts.insert("close_focused_column".into(), vec!["Ctrl+W"].into());
+        shortcuts.insert("new_channel".into(), vec!["Ctrl+Shift+W"].into());
+        fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.keyboard_shortcuts.close_focused_column, ["Ctrl+W"]);
+        assert_eq!(loaded.keyboard_shortcuts.new_channel, ["Ctrl+Shift+W"]);
+        assert!(loaded.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|name| name == "close_focused_column"));
+    }
+
+    #[test]
     fn shell_safe_close_migration_preserves_custom_chords() {
         for (before, after) in [("Ctrl+W", "Ctrl+Shift+W"), ("Alt+X", "Alt+X")] {
             let directory = tempfile::tempdir().unwrap();
             let path = path_in(&directory);
             let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
             document.insert("shortcut_defaults_revision".into(), 5.into());
-            document["keyboard_shortcuts"].as_table_mut().unwrap().insert("close_focused_column".into(), vec![before].into());
+            document["keyboard_shortcuts"]
+                .as_table_mut()
+                .unwrap()
+                .insert("close_focused_column".into(), vec![before].into());
             fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
             let loaded = load(&path).unwrap();
             assert_eq!(loaded.keyboard_shortcuts.close_focused_column, [after]);
-            assert_eq!(loaded.shortcut_defaults_revision, SHORTCUT_DEFAULTS_REVISION);
+            assert_eq!(
+                loaded.shortcut_defaults_revision,
+                SHORTCUT_DEFAULTS_REVISION
+            );
         }
     }
 
@@ -4888,7 +4943,23 @@ new_thread = "Alt+Shift+G"
     #[test]
     fn shortcut_action_names_are_the_serialized_ones() {
         let table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
-        assert!(table.keys().filter(|name| name.as_str() != "terminal_passthrough_actions").eq(SHORTCUT_ACTIONS.iter()));
+        assert!(
+            table
+                .keys()
+                .filter(|name| name.as_str() != "terminal_passthrough_actions")
+                .eq(SHORTCUT_ACTIONS.iter())
+        );
+        let shortcuts = KeyboardShortcuts::default();
+        for (name, chords) in KeyboardShortcuts::action_names()
+            .iter()
+            .zip(shortcuts.actions())
+        {
+            let serialized: Vec<String> = table[*name].clone().try_into().unwrap();
+            assert_eq!(
+                &serialized, chords,
+                "serialized action order must match {name}"
+            );
+        }
     }
 
     /// Each shortcut action this build cannot use falls back alone, however

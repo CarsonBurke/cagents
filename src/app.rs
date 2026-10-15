@@ -4732,6 +4732,10 @@ pub enum Message {
         result: Result<PullRequestCreationOutcome, String>,
     },
     CancelDialog,
+    ShortcutTerminalPassthrough {
+        action: String,
+        enabled: bool,
+    },
     KeyEvent {
         event: keyboard::Event,
         /// Whether a widget already consumed this keystroke. The shell's
@@ -6942,6 +6946,12 @@ impl Cagents {
     /// A terminal that has ended, or is closing, is read-only and forwards
     /// nothing, so it counts as any other pane.
     fn focused_pane(&self) -> workspace_widget::FocusedPane {
+        self.input_trace
+            .keyboard_focus()
+            .unwrap_or_else(|| self.workspace_pane_kind())
+    }
+
+    fn workspace_pane_kind(&self) -> workspace_widget::FocusedPane {
         let Some(card) = self.workspace.focused() else {
             return workspace_widget::FocusedPane::Other;
         };
@@ -16462,6 +16472,20 @@ impl Application for Cagents {
                 }
             },
             Message::CancelDialog => self.cancel_form_dialog(),
+            Message::ShortcutTerminalPassthrough { action, enabled } => {
+                if !KeyboardShortcuts::action_names().contains(&action.as_str()) {
+                    return Task::none();
+                }
+                let actions = &mut self
+                    .settings
+                    .keyboard_shortcuts
+                    .terminal_passthrough_actions;
+                actions.retain(|name| name != &action);
+                if enabled {
+                    actions.push(action);
+                }
+                self.save_settings_task(false)
+            }
             Message::KeyEvent { event, captured } => {
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
@@ -18154,7 +18178,34 @@ impl Application for Cagents {
             surface,
             self.workspace.is_animating() || self.context_inspector_transition.is_some(),
         );
-        let surface = crate::input_trace::observe(surface, &self.input_trace);
+        let mut focus_regions = Vec::new();
+        if let Some(card) = self.workspace.focused() {
+            let kind = self.workspace_pane_kind();
+            let container_kind = if kind == workspace_widget::FocusedPane::Review {
+                kind
+            } else {
+                workspace_widget::FocusedPane::Other
+            };
+            focus_regions.push((workspace_widget::card_widget_id(card), container_kind));
+            if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_))) {
+                focus_regions.push((self.card_keyboard_focus(card), kind));
+            }
+            focus_regions.push((self.card_header_widget_id(card), container_kind));
+            if matches!(self.cards.get(&card), Some(CardRuntime::Repository(_))) {
+                focus_regions.push((
+                    repository_widget::editor_focus_id(card),
+                    workspace_widget::FocusedPane::Editor,
+                ));
+            }
+            if matches!(self.cards.get(&card), Some(CardRuntime::Chat(_))) {
+                focus_regions.push((
+                    card_control_id(card, "chat-composer"),
+                    workspace_widget::FocusedPane::Chat,
+                ));
+            }
+        }
+        let surface =
+            crate::input_trace::observe_keyboard_focus(surface, &self.input_trace, focus_regions);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(

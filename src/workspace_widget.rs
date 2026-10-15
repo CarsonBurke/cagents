@@ -221,6 +221,8 @@ pub enum ShortcutScope {
     /// For an action whose chord means something to a shell and the same kind
     /// of thing in every other pane, such as `Ctrl+F`.
     OutsideTerminal,
+    /// Leave editing chords to focused text controls.
+    OutsideTextInput,
     /// Only while a pull request pane has focus; a terminal or editor with
     /// focus receives the chord as ordinary input.
     Review,
@@ -235,6 +237,7 @@ impl ShortcutScope {
         match self {
             Self::Workspace => true,
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
+            Self::OutsideTextInput => !focused.is_text_editing(),
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => focused == FocusedPane::Chat,
         }
@@ -250,9 +253,21 @@ pub enum FocusedPane {
     Review,
     /// A native chat composer and transcript.
     Chat,
+    /// The native code editor.
+    Editor,
+    /// A text control outside the focused pane (sidebar, inspector, find bar).
+    TextInput,
+    /// A non-text control outside a pane.
+    OutsideWorkspace,
     /// Any other pane, or none.
     #[default]
     Other,
+}
+
+impl FocusedPane {
+    pub fn is_text_editing(self) -> bool {
+        matches!(self, Self::Editor | Self::Chat | Self::TextInput)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -426,7 +441,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::RenamePane,
         label: "Rename pane",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CommandPalette,
@@ -438,7 +453,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::NewThread,
         label: "New thread",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::ToggleInspector,
@@ -468,61 +483,61 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::ReopenPane,
         label: "Reopen closed pane",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTextInput,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane1,
         label: "Focus pane 1",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane2,
         label: "Focus pane 2",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane3,
         label: "Focus pane 3",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane4,
         label: "Focus pane 4",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane5,
         label: "Focus pane 5",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane6,
         label: "Focus pane 6",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane7,
         label: "Focus pane 7",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane8,
         label: "Focus pane 8",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusPane9,
         label: "Focus pane 9",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusLastPane,
@@ -564,7 +579,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::FindInPane,
         label: "Find in pane",
         repeatable: false,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::FocusAdjacent(FocusDirection::Left),
@@ -582,7 +597,7 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         action: GlobalShortcut::CyclePaneWidth,
         label: "Cycle pane width",
         repeatable: true,
-        scope: ShortcutScope::Workspace,
+        scope: ShortcutScope::OutsideTerminal,
     },
     ShortcutDescriptor {
         action: GlobalShortcut::CycleWorkspace(FocusDirection::Left),
@@ -1235,9 +1250,20 @@ pub fn global_shortcut(
     else {
         return None;
     };
+    if focused.is_text_editing() && text_editing_chord(key, *physical_key, *modifiers) {
+        return None;
+    }
     let descriptor = global_shortcut_descriptor(key, *physical_key, *modifiers, shortcuts)?;
-    (descriptor.scope.applies_to(focused) && (!*repeat || descriptor.repeatable))
-        .then_some(descriptor.action)
+    (shortcut_applies(descriptor, focused, shortcuts) && (!*repeat || descriptor.repeatable))
+        .then_some(
+            if focused == FocusedPane::Terminal
+                && descriptor.action == GlobalShortcut::FocusProjectSearch
+            {
+                GlobalShortcut::FindInPane
+            } else {
+                descriptor.action
+            },
+        )
 }
 
 /// Whether a chord is withheld from the process inside a card: whether it is
@@ -1251,9 +1277,94 @@ pub(crate) fn is_global_shortcut_chord(
     shortcuts: &KeyboardShortcuts,
     focused: FocusedPane,
 ) -> bool {
+    if focused.is_text_editing() && text_editing_chord(key, physical_key, modifiers) {
+        return false;
+    }
     crate::tab_history::is_chord(key, modifiers)
         || global_shortcut_descriptor(key, physical_key, modifiers, shortcuts)
-            .is_some_and(|descriptor| descriptor.scope.applies_to(focused))
+            .is_some_and(|descriptor| shortcut_applies(descriptor, focused, shortcuts))
+}
+
+/// Native text controls retain their editing vocabulary even when a global
+/// action is rebound to it. Find is context-dependent and handled by scope.
+fn text_editing_chord(
+    key: &keyboard::Key,
+    physical: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> bool {
+    use keyboard::key::Named;
+    if modifiers.control() && !modifiers.alt() && !modifiers.logo() {
+        if matches!(latin_key(key, physical), Some('z'))
+            || (!modifiers.shift()
+                && matches!(latin_key(key, physical), Some('y' | 'a' | 'c' | 'v' | 'x')))
+        {
+            return true;
+        }
+        return matches!(
+            key,
+            keyboard::Key::Named(
+                Named::ArrowLeft
+                    | Named::ArrowRight
+                    | Named::Home
+                    | Named::End
+                    | Named::Backspace
+                    | Named::Delete
+            )
+        );
+    }
+    modifiers.alt()
+        && !modifiers.control()
+        && !modifiers.logo()
+        && matches!(
+            key,
+            keyboard::Key::Named(
+                Named::ArrowLeft | Named::ArrowRight | Named::Backspace | Named::Delete
+            )
+        )
+}
+
+fn shortcut_applies(
+    descriptor: &ShortcutDescriptor,
+    focused: FocusedPane,
+    shortcuts: &KeyboardShortcuts,
+) -> bool {
+    if focused == FocusedPane::Terminal {
+        let keys = shortcut_keys(descriptor.action, shortcuts);
+        let action = shortcuts
+            .actions()
+            .iter()
+            .position(|candidate| std::ptr::eq(candidate.as_slice(), keys));
+        if action.is_some_and(|index| {
+            shortcuts
+                .terminal_passthrough_actions
+                .iter()
+                .any(|name| name == KeyboardShortcuts::action_names()[index])
+        }) {
+            return false;
+        }
+    }
+    if matches!(
+        focused,
+        FocusedPane::TextInput | FocusedPane::OutsideWorkspace
+    ) && matches!(
+        descriptor.action,
+        GlobalShortcut::FindInPane
+            | GlobalShortcut::NewThread
+            | GlobalShortcut::RenamePane
+            | GlobalShortcut::CloseFocusedCard
+            | GlobalShortcut::ClonePane
+            | GlobalShortcut::ChatAccount
+            | GlobalShortcut::ChatModel
+            | GlobalShortcut::ChatPermissions
+    ) {
+        return false;
+    }
+    // The saved list is the explicit per-action terminal policy. Removing a
+    // shell-safe default opts that action into interception intentionally.
+    if focused == FocusedPane::Terminal && descriptor.scope == ShortcutScope::OutsideTerminal {
+        return true;
+    }
+    descriptor.scope.applies_to(focused)
 }
 
 fn global_shortcut_descriptor(
@@ -1511,6 +1622,7 @@ where
         viewport_width,
         move |width: f32| on_viewport(WorkspaceViewportEvent::Resized(width)),
     )
+    .with_keyboard_trace(input)
     .with_scroll_input(scroll_input)
     .with_initial_scroll(scroll_id, workspace.camera().offset())
     .into()
@@ -2324,6 +2436,7 @@ struct WorkspaceSurface<'a, Message> {
     on_resize: Box<dyn Fn(f32) -> Message + 'a>,
     initial_scroll: Option<(widget::Id, f32)>,
     scroll_input: Option<Rc<Cell<bool>>>,
+    input: InputTrace,
 }
 
 #[derive(Default)]
@@ -2347,7 +2460,13 @@ impl<'a, Message> WorkspaceSurface<'a, Message> {
             on_resize: Box::new(on_resize),
             initial_scroll: None,
             scroll_input: None,
+            input: InputTrace::default(),
         }
+    }
+
+    fn with_keyboard_trace(mut self, input: &InputTrace) -> Self {
+        self.input = input.clone();
+        self
     }
 
     fn with_initial_scroll(mut self, id: widget::Id, offset: f32) -> Self {
@@ -2476,7 +2595,7 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
                 *physical_key,
                 *modifiers,
                 self.shortcuts,
-                self.focused_pane,
+                self.input.keyboard_focus().unwrap_or(self.focused_pane),
             ) =>
             {
                 shell.capture_event();
@@ -3660,6 +3779,119 @@ mod tests {
     }
 
     #[test]
+    fn editing_focus_preserves_redo_and_sidebar_find() {
+        use keyboard::key::Code;
+        let shortcuts = KeyboardShortcuts::default();
+        let redo = key_press(
+            "z",
+            Code::KeyZ,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        for focused in [
+            FocusedPane::Editor,
+            FocusedPane::Chat,
+            FocusedPane::TextInput,
+        ] {
+            assert_eq!(global_shortcut(&redo, &shortcuts, focused), None);
+            assert!(!is_global_shortcut_chord(
+                &keyboard::Key::Character("z".into()),
+                keyboard::key::Physical::Code(Code::KeyZ),
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                &shortcuts,
+                focused
+            ));
+        }
+        assert_eq!(
+            global_shortcut(&redo, &shortcuts, FocusedPane::Terminal),
+            Some(GlobalShortcut::ReopenPane)
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+                FocusedPane::TextInput
+            ),
+            None
+        );
+        assert_eq!(
+            global_shortcut(
+                &key_press("t", Code::KeyT, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+                FocusedPane::TextInput
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn terminal_defaults_preserve_shell_chords_and_offer_shifted_find() {
+        use keyboard::key::{Code, Named};
+        let shortcuts = KeyboardShortcuts::default();
+        for (key, code, modifiers) in [
+            ("f", Code::KeyF, keyboard::Modifiers::CTRL),
+            ("w", Code::KeyW, keyboard::Modifiers::CTRL),
+            ("t", Code::KeyT, keyboard::Modifiers::CTRL),
+            ("r", Code::KeyR, keyboard::Modifiers::ALT),
+        ] {
+            assert_eq!(
+                global_shortcut(
+                    &key_press(key, code, modifiers, false),
+                    &shortcuts,
+                    FocusedPane::Terminal
+                ),
+                None
+            );
+        }
+        for (key, code) in [
+            ("1", Code::Digit1),
+            ("2", Code::Digit2),
+            ("3", Code::Digit3),
+            ("4", Code::Digit4),
+            ("5", Code::Digit5),
+            ("6", Code::Digit6),
+            ("7", Code::Digit7),
+            ("8", Code::Digit8),
+            ("9", Code::Digit9),
+        ] {
+            assert_eq!(
+                global_shortcut(
+                    &key_press(key, code, keyboard::Modifiers::ALT, false),
+                    &shortcuts,
+                    FocusedPane::Terminal
+                ),
+                None
+            );
+        }
+        assert_eq!(
+            global_shortcut(
+                &named_key_press(Named::F2, Code::F2, keyboard::Modifiers::empty(), false),
+                &shortcuts,
+                FocusedPane::Terminal
+            ),
+            None
+        );
+        let find = key_press(
+            "f",
+            Code::KeyF,
+            keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            false,
+        );
+        assert_eq!(
+            global_shortcut(&find, &shortcuts, FocusedPane::Terminal),
+            Some(GlobalShortcut::FindInPane)
+        );
+        let mut passthrough = shortcuts;
+        passthrough
+            .terminal_passthrough_actions
+            .push("search_projects".into());
+        assert_eq!(
+            global_shortcut(&find, &passthrough, FocusedPane::Terminal),
+            None
+        );
+    }
+
+    #[test]
     fn global_shortcuts_match_configured_chords_and_repeat_presses() {
         use keyboard::key::Code;
 
@@ -3672,7 +3904,7 @@ mod tests {
             (
                 "W",
                 Code::KeyW,
-                keyboard::Modifiers::CTRL,
+                ctrl_shift,
                 GlobalShortcut::CloseFocusedCard,
             ),
         ] {
@@ -3902,12 +4134,7 @@ mod tests {
         use keyboard::key::Code;
 
         let shortcuts = KeyboardShortcuts::default();
-        for focused in [
-            FocusedPane::Terminal,
-            FocusedPane::Other,
-            FocusedPane::Review,
-            FocusedPane::Chat,
-        ] {
+        for focused in [FocusedPane::Other, FocusedPane::Review, FocusedPane::Chat] {
             for (modifiers, action) in [
                 (keyboard::Modifiers::CTRL, GlobalShortcut::FindInPane),
                 (
@@ -3959,16 +4186,12 @@ mod tests {
     fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
         use keyboard::key::Code;
         let shortcuts = KeyboardShortcuts::default();
-        for focused in [
-            FocusedPane::Terminal,
-            FocusedPane::Review,
-            FocusedPane::Other,
-        ] {
+        for focused in [FocusedPane::Review, FocusedPane::Other] {
             for (character, code, modifiers, action) in [
                 (
                     "w",
                     Code::KeyW,
-                    keyboard::Modifiers::CTRL,
+                    keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
                     GlobalShortcut::CloseFocusedCard,
                 ),
                 (
