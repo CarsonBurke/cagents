@@ -211,7 +211,9 @@ impl WindowRecoveryRoots {
             return Err(io::Error::new(io::ErrorKind::Interrupted,
                 "Recovery intake cancelled or expired before connecting to its original endpoint.").into());
         }
-        let client = RecoveryPlacementClient::connect_local(resolved.endpoint)?;
+        // Connect, handshake, catalog and intake share this ONE absolute
+        // deadline; connection setup cannot restart the operation timeout.
+        let client = RecoveryPlacementClient::connect_local_until(resolved.endpoint, deadline)?;
         client.reserve_with_candidates(inputs, source, protection, commons, payload_capacity,
             cancellation, deadline).map_err(WindowRecoveryIssueError::Intake)
     }
@@ -407,6 +409,10 @@ mod tests {
         let result = input().issue_context(source.clone(), Arc::new(None), 1,
             &cancelled, Instant::now() + Duration::from_secs(5));
         assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error)) if error.kind() == io::ErrorKind::Interrupted));
+        let result = input().issue_context(source, Arc::new(None), 1,
+            &CancellationToken::new(), Instant::now() - Duration::from_millis(1));
+        assert!(matches!(result, Err(WindowRecoveryIssueError::BeforeAdmission(error))
+            if error.kind() == io::ErrorKind::Interrupted));
         assert_eq!(std::fs::read(files.path().join("unchanged")).unwrap(), b"original");
         assert_eq!(std::fs::read_dir(files.path()).unwrap().count(), 1);
     }
