@@ -207,6 +207,16 @@ fn first_thread_learning(before: &Session, after: &Session) -> bool {
     promoted == *after
 }
 
+// Snapshot publication may own the actor state mutex across filesystem I/O.
+// A descriptor sampled under HostLock must never wait for that publication.
+fn try_source_descriptor(record: &Record) -> Result<Session, ProtocolError> {
+    let identity = record.handle.try_close_identity().map_err(unavailable)?;
+    let mut source = record.session.clone();
+    source.launch.session_id = identity.session_id;
+    source.native_continuity = identity.native_continuity;
+    Ok(source)
+}
+
 /// Must run while the caller holds the exact per-chat transition. No private
 /// helper RPC or provider inspection occurs under HostLock.
 pub(super) fn refresh(
@@ -241,7 +251,7 @@ pub(super) fn refresh(
             "Provider identity changed while authenticating its backend; retry the current pane",
         ));
     }
-    let mut source = session_descriptor(record);
+    let mut source = try_source_descriptor(record)?;
     source.launch.session_id = witness.conversation();
     validate_proof(source.proof.as_ref(), state.proof())?;
     let paired = record
@@ -743,7 +753,7 @@ pub(super) fn require(
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(expected.source.proof.as_ref(), state.proof())?;
         let record = attached(&state, client, expected.source.id)?;
-        let current = session_descriptor(record);
+        let current = try_source_descriptor(record)?;
         if current.launch.provider != expected.source.launch.provider
             || current.launch.recipe != expected.source.launch.recipe
             || expected
@@ -1056,6 +1066,51 @@ mod tests {
             owned_codex_listener: None,
         }
     }
+    #[test]
+    fn binding_refresh_and_require_refuse_busy_presentation_without_holding_host() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let owner = actor(&source);
+        let fixture = BackendFixture::new(source.clone(), owner.0.clone(), uuid::Uuid::new_v4());
+        let binding = fixture.capture().unwrap();
+        for admission in [false, true] {
+            let (held, held_rx) = crossbeam_channel::bounded(1);
+            let (release, release_rx) = crossbeam_channel::bounded(1);
+            let state_owner = owner.0.clone();
+            let holder = thread::spawn(move || {
+                state_owner.with_presentation_state_locked(|| {
+                    held.send(()).unwrap();
+                    // Bounded even if an assertion on the caller fails.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(2));
+                });
+            });
+            held_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let host = fixture.host.clone();
+            let expected = binding.clone();
+            let (result, result_rx) = crossbeam_channel::bounded(1);
+            let request = thread::spawn(move || {
+                let response = if admission {
+                    require(&host, 1, &expected)
+                } else {
+                    refresh(&host, expected.source.id, false)
+                };
+                let _ = result.send(response);
+            });
+            let response = result_rx.recv_timeout(Duration::from_millis(300));
+            // Inspect the actual global census while presentation is still held.
+            let census_available = fixture.host.try_lock().is_ok();
+            let _ = release.send(());
+            holder.join().unwrap();
+            request.join().unwrap();
+            let reason = response.expect("binding must refuse without waiting for presentation IO")
+                .expect_err("busy presentation cannot publish or admit authority");
+            assert!(reason.message.contains("presentation metadata is busy"), "{reason:?}");
+            assert!(census_available, "binding cannot retain the global host behind actor state");
+            assert!(fixture.validates(&binding), "busy sampling cannot mint or replace history");
+            assert!(!owner.0.is_completed(), "metadata contention cannot stop the provider");
+        }
+    }
+
     #[test]
     fn retired_same_id_actor_cannot_resurrect_an_earlier_backend_binding() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
