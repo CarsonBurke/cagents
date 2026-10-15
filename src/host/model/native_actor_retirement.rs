@@ -143,9 +143,10 @@ impl Registry {
     ) -> Result<(), String> {
         let receipt = NativeActorRetirement { actor, owner: owner.clone(), source: source.clone(), scope: scope.clone(), confirmed_session: confirmed_session.map(str::to_owned) };
         receipt.validate()?;
-        // Capture and revalidate the original physical home, never a later UI
-        // selection or a recipe's potentially stale spelling.
-        scope.revalidate()?;
+        // Preserve the original captured physical tuple even if its pathname
+        // was externally removed/replaced after startup. This records process
+        // retirement, not current read/delete authority. The deletion permit
+        // separately validates its selected current target under reservation.
         let encoded = serde_json::to_string(&receipt).map_err(|e| e.to_string())?;
         if encoded.len() > MAX_RECEIPT_BYTES { return Err("Retained actor retirement exceeds its metadata bound".into()); }
         let tx = self.db.transaction_with_behavior(TransactionBehavior::Immediate).map_err(|e|e.to_string())?;
@@ -237,5 +238,27 @@ mod tests {
         assert!(registry.commit_native_actor_retirement(actor,&owner,&source,&wrong,None).is_err());
         let mut wrong=owner.clone();wrong.holder.start+=1;
         assert!(registry.commit_native_actor_retirement(actor,&wrong,&source,&scope,None).is_err());
+    }
+
+    #[test]
+    fn removed_or_replaced_home_does_not_erase_proved_retirement_of_original_scope() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let home=directory.path().join("original-home");
+        std::fs::create_dir(&home).unwrap();
+        let mut registry=Registry::at(&directory.path().join("registry")).unwrap();
+        let (actor,owner,source,scope)=fixture(&home);
+        registry.register_native_actor_ownership(actor,&owner,&source,Ok(&scope)).unwrap();
+        let _old_home=std::fs::File::open(&home).unwrap();
+        std::fs::remove_dir(&home).unwrap();
+        assert!(scope.revalidate().is_err());
+        registry.commit_native_actor_retirement(actor,&owner,&source,&scope,None).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        let (_,_,_,replacement)=fixture(&home);
+        assert_ne!(replacement.inode,scope.inode);
+        assert!(scope.revalidate().is_err());
+        let receipt=registry.native_actor_retirement(actor).unwrap().unwrap();
+        assert_eq!(receipt.scope(),&scope);
+        assert!(registry.commit_native_actor_retirement(actor,&owner,&source,&replacement,None).is_err());
+        registry.commit_native_actor_retirement(actor,&owner,&source,&scope,None).unwrap();
     }
 }
