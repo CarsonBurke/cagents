@@ -98,7 +98,7 @@ pub(super) fn isolated_with_environment(exact: &str, environment: &[(&str, &str)
     if std::env::var(CHILD).as_deref() == Ok(exact) {
         return false;
     }
-    let mut evidence = Evidence(Some(
+    let evidence = Evidence(Some(
         tempfile::Builder::new()
             .prefix("cagents-backend-binding-")
             .tempdir_in("/var/tmp")
@@ -200,7 +200,10 @@ pub(super) fn isolated_with_environment(exact: &str, environment: &[(&str, &str)
         stdout.chars().take(4096).collect::<String>(),
         stderr.chars().take(4096).collect::<String>()
     );
-    drop(evidence.0.take());
+    // A named passing child and exact leader reaping do not establish every
+    // descendant has retired. Keep private HOME/XDG/receipts on success too;
+    // the owning outer gate must separately prove its full family settlement.
+    drop(evidence);
     true
 }
 pub(super) struct Completed(pub std::sync::mpsc::Sender<()>);
