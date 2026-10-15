@@ -584,6 +584,12 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if cards.iter().any(|card| self.card_has_editor_recovery(*card)) {
+            let error = "Resolve file recovery in this channel before deleting it.".to_owned();
+            self.channel_ui.failed.insert(id, error.clone());
+            self.status = Some(TransientNotice::warning(error));
+            return Task::none();
+        }
         if !self.channel_ui.deleting.insert(id) {
             return Task::none();
         }
@@ -661,6 +667,12 @@ impl Cagents {
         else {
             return Task::none();
         };
+        if !passive && self.durable.channels[index].cards.iter().any(|card| self.card_has_editor_recovery(*card)) {
+            let error = "The channel was kept because an editor now needs file recovery. Resolve recovery and retry deletion.".to_owned();
+            self.channel_ui.failed.insert(id, error.clone());
+            self.status = Some(TransientNotice::warning(error));
+            return Task::none();
+        }
         let was_active = self.durable.active_channel == Some(id);
         let (project_id, successor) = self.channel_successor(index);
         let fallback = self.project_primary_worktree(project_id);
@@ -685,7 +697,8 @@ impl Cagents {
             }
             if passive
                 && (self.shared_chat_has_local_work(card)
-                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving()))
+                    || self.card_has_editor_recovery(card)
+                    || matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving() || runtime.has_editor_recovery()))
             {
                 self.retain_local_pane(card);
                 let scope = self
@@ -1771,4 +1784,32 @@ mod tests {
             Some(CardRuntime::Settings)
         ));
     }
+    #[test]
+    fn retained_editor_recovery_blocks_only_its_channel_and_survives_late_delete_receipt() {
+        for (late, review) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (mut app, doomed, survivor, card) = channel_with_a_conversation();
+            if late { drop(app.delete_channel(doomed)); }
+            let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "clean");
+            assert!(!runtime.is_dirty()); assert!(!runtime.is_saving());
+            let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("exact live recovery".into(), || Ok(()));
+            runtime.retain_editor_recovery(authority.clone(), "retained file operation".into());
+            if review {
+                let view = crate::model::PullRequestView { repository: "/repo".into(), selected_number: None, file_panel_width: None, file_panel_collapsed: None };
+                let mut pane = app.pull_request_pane(&view); pane.runtime = runtime;
+                app.card_state_mut(card).unwrap().kind = CardKind::PullRequests(view);
+                app.cards.insert(card, CardRuntime::PullRequests(Box::new(pane)));
+            } else { app.cards.insert(card, CardRuntime::Repository(Box::new(runtime))); }
+            if late { drop(app.handle_channel_ui(Action::SessionsClosed(doomed, Ok(())))); }
+            else { drop(app.delete_channel(doomed)); }
+            assert!(app.durable.channels.iter().any(|row| row.id == doomed));
+            assert!(app.cards.contains_key(&card)); assert!(app.channel_ui.failed.contains_key(&doomed));
+            assert!(!authority.is_resolved());
+            drop(app.delete_channel(survivor));
+            assert!(!app.durable.channels.iter().any(|row| row.id == survivor));
+            drop(app.retire_peer_channel(doomed));
+            assert!(app.cards.contains_key(&card), "passive deletion keeps the authority-owning runtime");
+        }
+    }
+
+
 }

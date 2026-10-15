@@ -40,10 +40,9 @@ pub enum Action {
     ApplyPreview,
     CancelPreview,
     HidePublication(u64),
-    Published {
-        ticket: u64,
-        result: Result<workspace::PublicationReport, String>,
-    },
+    RetryPublicationRecovery(crate::editor::RecoveryAuthority),
+    PublicationRecoveryResolved { authority: crate::editor::RecoveryAuthority, result: Result<(), String> },
+    Published { ticket: u64, result: Result<workspace::PublicationReport, workspace::PublicationFailure> },
 }
 
 #[cfg(test)]
@@ -151,6 +150,19 @@ mod tests {
             })
             .collect();
         Arc::new(workspace::prepare(root, documents, &open).unwrap())
+    }
+
+    impl Cagents {
+        /// Starts the production publisher for a project-owned participant and
+        /// an unopened file. The caller owns the real project/card fixture and
+        /// retains this task until its original Published result is delivered.
+        pub(in crate::app) fn project_editor_publication_fixture(
+            &mut self, card: CardId, root: &Path, ticket: u64,
+        ) -> Task<Message> {
+            let plan = plan(self, root, &["participant.rs", "unopened.rs"]);
+            let operation = operation(self, card);
+            self.publish_editor_workspace_edit(ticket, operation, plan)
+        }
     }
 
     async fn finish(app: &mut Cagents, task: Task<Message>) {
@@ -420,6 +432,93 @@ mod tests {
                     .iter()
                     .any(|channel| channel.id == target)
             );
+        }
+    }
+
+    fn register_editor_for_close(app: &mut Cagents, card: CardId) {
+        let mut state = app.durable.cards[0].clone();
+        let CardRuntime::Repository(runtime) = &app.cards[&card] else { panic!("editor"); };
+        state.id = card; state.kind = CardKind::Repository(runtime.descriptor.clone());
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        let index = app.workspace.cards().len();
+        app.workspace.add_card(WorkspaceCard::new(card, "participant".into(), CardWidth::Fraction(0.5)).unwrap(), index, true).unwrap();
+        Arc::make_mut(&mut app.durable).focused = Some(card);
+    }
+
+    #[test]
+    fn publication_intake_refuses_an_already_owned_participant_close() {
+        let root = tempfile::tempdir().unwrap();
+        let original = "fn old() {}\n";
+        for name in ["participant.rs", "unopened.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+        let mut app = app();
+        let card = buffer(&mut app, root.path(), "participant.rs", original);
+        register_editor_for_close(&mut app, card);
+        let plan = plan(&app, root.path(), &["participant.rs", "unopened.rs"]);
+        let operation = operation(&app, card);
+        // Hold the actual original typed focus handoff before delivery.
+        let _held = app.request_card_removal(card);
+        let target = app.pending_card_removal_target(card).unwrap();
+        drop(app.publish_editor_workspace_edit(94, operation, plan));
+        assert!(!app.editor_features.publishing());
+        assert_eq!(app.pending_card_removal_target(card), Some(target));
+        assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+        assert_eq!(text(&app, card), original);
+        assert_eq!(std::fs::read_to_string(root.path().join("unopened.rs")).unwrap(), original);
+        assert!(app.status.as_ref().is_some_and(|notice| notice.message.contains("already closing")));
+    }
+
+    #[tokio::test]
+    async fn hidden_real_publisher_releases_only_the_original_waiting_close_after_success_or_failure() {
+        for fail_write in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let original = "fn old() {}\n";
+            for name in ["participant.rs", "unopened.rs"] { std::fs::write(root.path().join(name), original).unwrap(); }
+            let mut app = app();
+            let card = buffer(&mut app, root.path(), "participant.rs", original);
+            register_editor_for_close(&mut app, card);
+            let plan = plan(&app, root.path(), &["participant.rs", "unopened.rs"]);
+            let operation = operation(&app, card);
+            let publishing = app.publish_editor_workspace_edit(95, operation, plan);
+            drop(app.finish_modal_update(Task::none()));
+            let hide = dialog_key(&app, "editor-publication.hide", keyboard::key::Named::Enter,
+                |message| matches!(message, Message::EditorFeatures(Action::HidePublication(95))));
+            drop(app.update(hide));
+            // Existing internal close admission can finish after a publisher
+            // starts. Deliver its actual typed target through the real App.
+            let _held = app.request_card_removal(card);
+            let target = app.pending_card_removal_target(card).unwrap();
+            drop(app.update(Message::CommitCloseTarget(target)));
+            assert_eq!(app.pending_card_removal_target(card), Some(target));
+            assert!(app.card_removal_current(target));
+            assert!(app.workspace.order().any(|id| id == card));
+            assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if runtime.workspace_edit_pending()));
+            if fail_write { std::fs::write(root.path().join("unopened.rs"), "external change\n").unwrap(); }
+            // Poll the original publisher, not a fabricated Published result.
+            let mut retry = None;
+            let mut stream = iced::runtime::task::into_stream(publishing).unwrap();
+            while let Some(action) = stream.next().await {
+                let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::EditorFeatures(Action::Published { .. }))) = action else { continue; };
+                let result = app.update(message);
+                if let Some(mut effects) = iced::runtime::task::into_stream(result) {
+                    while let Some(effect) = effects.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(Message::CommitCloseTarget(current))) = effect {
+                            assert!(retry.replace(current).is_none());
+                        }
+                    }
+                }
+            }
+            assert!(!app.editor_features.publishing());
+            assert_eq!(retry, Some(target), "only the original nonce/source/origin may resume");
+            assert!(matches!(&app.cards[&card], CardRuntime::Repository(runtime) if !runtime.workspace_edit_pending()));
+            assert_eq!(text(&app, card), if fail_write { original } else { "fn renamed() {}\n" });
+            assert_eq!(std::fs::read_to_string(root.path().join("unopened.rs")).unwrap(), if fail_write { "external change\n" } else { "fn renamed() {}\n" });
+            drop(app.update(Message::CommitCloseTarget(retry.unwrap())));
+            if !fail_write {
+                assert!(app.card_state(card).unwrap().existence.is_open(), "publication changes need fresh save/discard consent");
+                assert!(app.workspace.order().any(|id| id == card));
+                assert_eq!(text(&app, card), "fn renamed() {}\n");
+                assert!(app.pending_card_removal_target(card).is_none());
+            }
         }
     }
 
@@ -1909,13 +2008,7 @@ mod tests {
         let mut app = app();
         let card = CardId::new();
         let operation = operation(&app, card);
-        app.editor_features.publication = Some(Publication {
-            hidden: false,
-            ticket: 8,
-            operation,
-            cards: Vec::new(),
-            server_lease: None,
-        });
+        app.editor_features.publication = Some(Publication { project: None, hidden: false, ticket: 8, operation, cards: Vec::new(), server_lease: None });
         assert!(app.window_close_transient_blocker().is_some());
         let window = window::Id::unique();
         drop(app.update(Message::WindowCloseRequested(window)));
@@ -2007,6 +2100,9 @@ pub(super) enum DialogKind {
 }
 
 struct Publication {
+    // Captured before worker dispatch; remains attributable after its readonly
+    // origin closes or the project changes its displayed root during Locate.
+    project: Option<crate::model::ProjectId>,
     hidden: bool,
     ticket: u64,
     operation: Operation,
@@ -2027,6 +2123,7 @@ pub(super) struct State {
     preview: Option<Preview>,
     publication: Option<Publication>,
     publication_saves: HashMap<CardId, (repository_widget::RepositoryMenuIdentity, PathBuf)>,
+    pub(super) recovery: Option<super::editor_feature_recovery::State>,
     pub(super) location_history: crate::editor_locations::History,
     pub(super) jump_origins: HashMap<CardId, crate::editor_locations::Location>,
     pub(super) history_restores: HashMap<
@@ -2061,6 +2158,12 @@ impl State {
         self.next_ticket = self.next_ticket.wrapping_add(1).max(1);
         self.next_ticket
     }
+    pub(super) fn publication_origin(&self, ticket: u64) -> Option<CardId> { self.publication.as_ref().filter(|publication| publication.ticket == ticket).map(|publication| publication.operation.card) }
+    pub(super) fn pending_publication_ticket_for_project(&self, project: crate::model::ProjectId, cards: &HashSet<CardId>) -> Option<u64> {
+        self.publication.as_ref().filter(|publication| publication.project == Some(project)
+            || cards.contains(&publication.operation.card) || publication.cards.iter().any(|card| cards.contains(card))).map(|publication| publication.ticket)
+    }
+
 }
 
 impl Cagents {
@@ -2717,6 +2820,7 @@ impl Cagents {
                 | Action::CodeActions(_)
                 | Action::ChooseCodeAction(..)
                 | Action::Signature(..)
+                | Action::RetryPublicationRecovery(..)
         );
         if !user_action {
             return false;
@@ -3197,34 +3301,27 @@ impl Cagents {
                 );
                 self.modal_restore_focus(self.modal_restore_fallback())
             }
+            Action::RetryPublicationRecovery(authority) => self.start_publication_recovery(authority),
+            Action::PublicationRecoveryResolved { authority, result } => {
+                self.finish_publication_recovery(authority, result);
+                // Install fresh exact timers before scanning deferred project
+                // closes. Their writes retain the existing confirmation flow.
+                let autosaves = self.resume_recovered_editor_autosaves();
+                Task::batch([autosaves, self.resume_waiting_editor_closes(), self.complete_closed_projects()])
+            }
             Action::Published { ticket, result } => {
-                let Some(mut publication) = self.editor_features.publication.take() else {
-                    return Task::none();
-                };
-                if publication.ticket != ticket {
-                    self.editor_features.publication = Some(publication);
-                    return Task::none();
-                }
-                self.notices
-                    .resolve(&format!("editor-publication:{ticket}"));
+                // Retain before ticket/owner rejection: even a late completion
+                // must keep live authority when its original card has closed.
+                self.retain_publication_result_recovery(ticket, &result);
+                let Some(mut publication) = self.editor_features.publication.take() else { return Task::none(); };
+                if publication.ticket != ticket { self.editor_features.publication = Some(publication); return Task::none(); }
+                self.notices.resolve(&format!("editor-publication:{ticket}"));
                 let report = match result {
                     Err(error) => {
-                        for card in publication.cards {
-                            if let Some(CardRuntime::Repository(runtime)) =
-                                self.cards.get_mut(&card)
-                            {
-                                runtime.cancel_workspace_edit(ticket);
-                            }
-                        }
-                        if let Some(lease) = publication.server_lease.take() {
-                            lease.respond(false, Some(error.clone()));
-                        }
-                        self.feature_failure(publication.operation.card, error);
-                        return Task::batch([
-                            self.save_after_feature(&publication.operation),
-                            self.finish_editor_publication_saves(),
-                            self.modal_restore_focus(self.modal_restore_fallback()),
-                        ]);
+                        for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
+                        if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.to_string())); }
+                        self.feature_failure(publication.operation.card, error.to_string());
+                        return Task::batch([self.save_after_feature(&publication.operation), self.finish_editor_publication_saves(), self.resume_waiting_editor_closes(), self.complete_closed_projects(), self.modal_restore_focus(self.modal_restore_fallback())]);
                     }
                     Ok(report) => report,
                 };
@@ -3277,6 +3374,8 @@ impl Cagents {
                     }
                 }
                 tasks.push(self.finish_editor_publication_saves());
+                tasks.push(self.resume_waiting_editor_closes());
+                tasks.push(self.complete_closed_projects());
                 tasks.push(self.modal_restore_focus(self.modal_restore_fallback()));
                 Task::batch(tasks)
             }
@@ -3350,6 +3449,11 @@ impl Cagents {
             return Task::none();
         };
         let worktree = owner.descriptor.worktree.clone();
+        if self.publication_recovery_blocks(&worktree) {
+            self.reject_server_edit(&operation, "Resolve retained file recovery in this worktree before preparing another edit");
+            self.feature_failure(operation.card, "Resolve retained file recovery in this worktree before preparing another edit");
+            return Task::none();
+        }
         operation.open_files = self.editor_open_files();
         let open_paths = operation
             .open_files
@@ -3447,6 +3551,11 @@ impl Cagents {
         operation: Operation,
         plan: Arc<workspace::Plan>,
     ) -> Task<Message> {
+        if self.publication_recovery_blocks(&plan.worktree) {
+            self.reject_server_edit(&operation, "Resolve retained file recovery in this worktree before publishing another edit");
+            self.feature_failure(operation.card, "Resolve retained file recovery in this worktree before publishing another edit");
+            return Task::none();
+        }
         if self.editor_features.publication.is_some() {
             self.reject_server_edit(&operation, "Another edit is being applied");
             return Task::none();
@@ -3469,6 +3578,39 @@ impl Cagents {
                 "The open file tabs changed; prepare the edit again",
             );
             return Task::none();
+        }
+        // Target-specific Locate admission runs before claiming a backend
+        // request, freezing any participant, or dispatching filesystem work.
+        let target_paths = plan.documents.iter().flat_map(|document| std::iter::once(&document.path).chain(document.open_paths.iter())).collect::<HashSet<_>>();
+        let mut participants = self.cards.iter().filter_map(|(card, runtime)| match runtime {
+            CardRuntime::Repository(runtime) if runtime.workspace_edit_candidate_source().is_some_and(|path| target_paths.contains(&path)) => Some(*card),
+            _ => None,
+        }).collect::<HashSet<_>>();
+        participants.insert(operation.card);
+        if self.project_relocation_blocks_publication(&participants) {
+            self.reject_server_edit(&operation, "Finish locating this edit's project before applying another workspace edit");
+            self.feature_failure(operation.card, "Finish locating this edit's project before applying another workspace edit");
+            return Task::none();
+        }
+        let project = match self.cards.get(&operation.card) {
+            Some(CardRuntime::Repository(runtime)) => Some(runtime.descriptor.project),
+            _ => None,
+        };
+        // A captured Close may already own this exact target while its focus
+        // handoff is waiting. Do not freeze a disappearing participant. This
+        // preflight complements the final typed Close write barrier.
+        let closing = self.workspace.pending_close().map(|pending| pending.unmounting);
+        let target_is_closing = self.cards.iter().any(|(card, runtime)| {
+            let CardRuntime::Repository(runtime) = runtime else { return false; };
+            let Some(path) = runtime.workspace_edit_candidate_source() else { return false; };
+            plan.documents.iter().any(|document| document.open_paths.contains(&path) || document.path == path)
+                && (closing == Some(*card) || self.pending_card_removal_target(*card).is_some())
+        });
+        if target_is_closing {
+            let error = "An edited buffer is already closing; cancel Close and prepare this edit again";
+            self.reject_server_edit(&operation, error);
+            self.feature_failure(operation.card, error);
+            return self.save_after_feature(&operation);
         }
         // Publication authority and the server response move together. An
         // expired/canceled preview must fail before any buffer freezes or I/O.
@@ -3563,18 +3705,9 @@ impl Cagents {
             self.feature_failure(operation.card, error);
             return Task::none();
         }
-        self.editor_features.publication = Some(Publication {
-            hidden: false,
-            ticket,
-            operation,
-            cards,
-            server_lease,
-        });
+        self.editor_features.publication = Some(Publication { project, hidden: false, ticket, operation, cards, server_lease });
         let publication = cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || workspace::publish_unopened(&plan))
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || workspace::publish_unopened(&plan)).await.map_err(|error| workspace::PublicationFailure::from(error.to_string())).and_then(|result| result);
             Message::EditorFeatures(Action::Published { ticket, result })
         });
         Task::batch([

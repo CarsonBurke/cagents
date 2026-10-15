@@ -62,12 +62,7 @@ pub struct DocumentPlan {
 }
 
 #[derive(Debug, Clone)]
-pub struct Plan {
-    pub worktree: PathBuf,
-    pub root: Arc<fs_safety::Root>,
-    pub documents: Vec<DocumentPlan>,
-    _protection: Arc<Option<crate::worktree_cleanup::Protection>>,
-}
+pub struct Plan { pub worktree: PathBuf, pub root: Arc<fs_safety::Root>, pub documents: Vec<DocumentPlan>, recovery_context: editor::RecoveryContext }
 
 #[derive(Debug, Clone)]
 pub struct ResolvedTargets {
@@ -190,6 +185,7 @@ fn prepare_at(
     open: &HashMap<PathBuf, OpenSnapshot>,
 ) -> Result<Plan, String> {
     verify_root(&root)?;
+    let recovery_context = editor::recovery_context_at(&root, protection).map_err(|error| error.to_string())?;
     let worktree = root.path().to_path_buf();
     let mut canonical_open = HashMap::new();
     let mut aliases: HashMap<PathBuf, Vec<PathBuf>> = HashMap::new();
@@ -325,12 +321,7 @@ fn prepare_at(
     }
     result.sort_by(|left, right| left.relative.cmp(&right.relative));
     verify_root(&root)?;
-    Ok(Plan {
-        worktree,
-        root,
-        documents: result,
-        _protection: protection,
-    })
+    Ok(Plan { worktree, root, documents: result, recovery_context })
 }
 
 /// Atomically publishes each unopened file. A later refusal rolls back earlier
@@ -339,33 +330,66 @@ fn prepare_at(
 #[derive(Debug, Clone, Default)]
 pub struct PublicationReport {
     pub durability_warnings: Vec<String>,
+    pub recovery: Option<editor::RecoveryAuthority>,
+    pub worktree: Option<PathBuf>,
+}
+impl PublicationReport {
+    fn retain(&mut self, authority: &editor::RecoveryAuthority) {
+        self.recovery = Some(match self.recovery.take() { Some(previous) => previous.combine(authority.clone()), None => authority.clone() });
+    }
+    fn durability(&mut self, path: &Path, durability: SaveDurability, restoring: bool) {
+        let action = if restoring { "restored" } else { "replaced" };
+        match durability {
+            SaveDurability::Durable => {},
+            SaveDurability::Unconfirmed { error } => self.durability_warnings.push(format!("{} was {action}, but crash durability is unconfirmed: {error}", path.display())),
+            SaveDurability::Recovery { error, authority } => {
+                self.retain(&authority);
+                self.durability_warnings.push(format!("{} was {action}; retained file recovery is still required: {error}", path.display()));
+            }
+        }
+    }
 }
 
-pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, String> {
+#[derive(Debug, Clone)]
+pub struct PublicationFailure {
+    pub message: String,
+    pub recovery: Option<editor::RecoveryAuthority>,
+    pub worktree: Option<PathBuf>,
+}
+impl From<String> for PublicationFailure {
+    fn from(message: String) -> Self { Self { message, recovery: None, worktree: None } }
+}
+impl From<&str> for PublicationFailure { fn from(message: &str) -> Self { message.to_owned().into() } }
+impl std::fmt::Display for PublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str(&self.message) }
+}
+impl std::error::Error for PublicationFailure {}
+impl PublicationFailure { pub fn contains(&self, pattern: &str) -> bool { self.message.contains(pattern) } }
+
+pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, PublicationFailure> {
     publish_unopened_with_before_file(plan, |_| {})
 }
 
-fn publish_unopened_with_before_file(
-    plan: &Plan,
-    before_file: impl FnMut(usize),
-) -> Result<PublicationReport, String> {
-    publish_unopened_with_writer(plan, before_file, |root, path, text, hash| {
-        editor::save_file_at(root, path, text, hash, false)
+fn publish_unopened_with_before_file(plan: &Plan, before_file: impl FnMut(usize)) -> Result<PublicationReport, PublicationFailure> {
+    publish_unopened_with_hooks(plan, before_file, |_| Ok(()))
+}
+
+fn publish_unopened_with_hooks(plan: &Plan, before_file: impl FnMut(usize), mut before_publish: impl FnMut(&DocumentPlan) -> std::io::Result<()>) -> Result<PublicationReport, PublicationFailure> {
+    publish_unopened_with_publisher(plan, before_file, |document, restoring| {
+        if restoring {
+            editor::save_file_at_in_context(&plan.root, &document.relative, &document.before,
+                blake3::hash(document.after.as_bytes()), false, &plan.recovery_context)
+        } else {
+            editor::save_file_at_with_hooks_in_context(&plan.root, &document.relative, &document.after,
+                document.before_hash, false, || before_publish(document), fs_safety::sync_directory, &plan.recovery_context)
+        }
     })
 }
 
-fn publish_unopened_with_writer(
-    plan: &Plan,
-    mut before_file: impl FnMut(usize),
-    mut write: impl FnMut(
-        &fs_safety::Root,
-        &Path,
-        &str,
-        blake3::Hash,
-    ) -> Result<SaveOutcome, editor::FileIoError>,
-) -> Result<PublicationReport, String> {
+fn publish_unopened_with_publisher(plan: &Plan, mut before_file: impl FnMut(usize),
+    mut publish: impl FnMut(&DocumentPlan, bool) -> Result<SaveOutcome, editor::FileIoError>) -> Result<PublicationReport, PublicationFailure> {
     verify_root(&plan.root)?;
-    let mut report = PublicationReport::default();
+    let mut report = PublicationReport { worktree: Some(plan.worktree.clone()), ..Default::default() };
     let mut published: Vec<&DocumentPlan> = Vec::new();
     for (index, document) in plan
         .documents
@@ -374,86 +398,46 @@ fn publish_unopened_with_writer(
         .enumerate()
     {
         before_file(index);
-        let saved = verify_root(&plan.root).and_then(|()| {
-            write(
-                &plan.root,
-                &document.relative,
-                &document.after,
-                document.before_hash,
-            )
-            .map_err(|error| error.to_string())
-        });
+        let saved = verify_root(&plan.root).map_err(editor::FileIoError::Io)
+            .and_then(|()| publish(document, false));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
-                if let SaveDurability::Unconfirmed { error } = durability {
-                    report.durability_warnings.push(format!(
-                        "{} was replaced, but durability is unconfirmed: {error}",
-                        document.relative.display()
-                    ));
-                }
-                published.push(document);
-                continue;
+                report.durability(&document.relative, durability, false);
+                published.push(document); continue;
+            },
+            Ok(SaveOutcome::Conflict { .. }) => format!("{} changed on disk", document.relative.display()),
+            Ok(SaveOutcome::Absent { durability, .. }) => {
+                report.durability(&document.relative, durability, false);
+                format!("{} unexpectedly became absent; publication was refused", document.relative.display())
+            },
+            Err(error) => {
+                if let Some(authority) = error.recovery_authority() { report.retain(authority); }
+                format!("{}: {error}", document.relative.display())
             }
-            Ok(SaveOutcome::Conflict { .. }) => {
-                format!("{} changed on disk", document.relative.display())
-            }
-            // Workspace replacement never requests deletion. Refuse an
-            // unexpected outcome through the same earlier-write rollback.
-            Ok(SaveOutcome::Absent { .. }) => format!(
-                "{} unexpectedly became absent during publication",
-                document.relative.display()
-            ),
-            Err(error) => format!("{}: {error}", document.relative.display()),
         };
         let mut unrestored = Vec::new();
-        let mut rollback_durability = Vec::new();
         for previous in published.into_iter().rev() {
-            match write(
-                &plan.root,
-                &previous.relative,
-                &previous.before,
-                blake3::hash(previous.after.as_bytes()),
-            ) {
-                Ok(SaveOutcome::Saved {
-                    durability: SaveDurability::Durable,
-                    ..
-                }) => {}
-                Ok(SaveOutcome::Saved {
-                    durability: SaveDurability::Unconfirmed { error },
-                    ..
-                }) => {
-                    rollback_durability.push(format!("{}: {error}", previous.relative.display()));
-                }
-                _ => unrestored.push(previous.relative.display().to_string()),
+            let restored = publish(previous, true);
+            match restored {
+                Ok(SaveOutcome::Saved { durability, .. }) => report.durability(&previous.relative, durability, true),
+                Err(error) => {
+                    if let Some(authority) = error.recovery_authority() { report.retain(authority); }
+                    unrestored.push(format!("{}: {error}", previous.relative.display()));
+                },
+                Ok(SaveOutcome::Absent { durability, .. }) => {
+                    report.durability(&previous.relative, durability, true);
+                    unrestored.push(previous.relative.display().to_string());
+                },
+                Ok(SaveOutcome::Conflict { .. }) => unrestored.push(previous.relative.display().to_string()),
             }
         }
-        let mut error = if unrestored.is_empty() {
-            if rollback_durability.is_empty() {
-                format!("The workspace edit was canceled: {failure}. Earlier writes were restored.")
-            } else {
-                format!(
-                    "The workspace edit was canceled: {failure}. Earlier file contents were restored."
-                )
-            }
-        } else {
-            format!(
-                "The workspace edit stopped: {failure}. These files could not be restored because they changed or could not be written: {}",
-                unrestored.join(", ")
-            )
-        };
-        if !rollback_durability.is_empty() {
-            error.push_str(&format!(
-                " Restored file contents have unconfirmed crash durability: {}",
-                rollback_durability.join("; ")
-            ));
+        let mut message = if unrestored.is_empty() {
+            if report.durability_warnings.is_empty() { format!("The workspace edit was canceled: {failure}. Earlier writes were restored.") }
+            else { format!("The workspace edit was canceled: {failure}. Earlier file contents were restored.") }
         }
-        if !unrestored.is_empty() && !report.durability_warnings.is_empty() {
-            error.push_str(&format!(
-                " Earlier publication warnings: {}",
-                report.durability_warnings.join("; ")
-            ));
-        }
-        return Err(error);
+            else { format!("The workspace edit stopped: {failure}. These files could not be restored because they changed or could not be written: {}", unrestored.join(", ")) };
+        if !report.durability_warnings.is_empty() { message.push_str("\n"); message.push_str(&report.durability_warnings.join("\n")); }
+        return Err(PublicationFailure { message, recovery: report.recovery, worktree: report.worktree });
     }
     Ok(report)
 }
@@ -486,34 +470,25 @@ mod tests {
             })
             .collect();
         let plan = prepare(directory.path(), documents, &HashMap::new()).unwrap();
-        let error = publish_unopened_with_writer(
+        let error = publish_unopened_with_publisher(
             &plan,
             |index| {
                 if index == 1 {
                     std::fs::write(directory.path().join("b.rs"), "outside writer").unwrap();
                 }
             },
-            |root, path, text, hash| {
-                if text == "old" {
-                    editor::save_file_at_with_hooks(
-                        root,
-                        path,
-                        text,
-                        hash,
-                        false,
-                        || Ok(()),
-                        |_| {
-                            Err(std::io::Error::other(
-                                "injected rollback parent sync failure",
-                            ))
-                        },
-                    )
-                } else {
-                    editor::save_file_at(root, path, text, hash, false)
-                }
+            |document, restoring| {
+                let (text, hash) = if restoring { (&document.before, blake3::hash(document.after.as_bytes())) }
+                    else { (&document.after, document.before_hash) };
+                editor::save_file_at_with_hooks_in_context(
+                    &plan.root, &document.relative, text, hash, false, || Ok(()),
+                    |_| if restoring { Err(std::io::Error::other("injected rollback parent sync failure")) }
+                        else { fs_safety::sync_directory(&plan.root) }, &plan.recovery_context,
+                )
+
             },
         )
-        .unwrap_err();
+        .unwrap_err().to_string();
         assert_eq!(
             std::fs::read_to_string(directory.path().join("a.rs")).unwrap(),
             "old"
@@ -523,9 +498,9 @@ mod tests {
             "outside writer"
         );
         assert!(error.contains("file contents were restored"), "{error}");
-        assert!(error.contains("unconfirmed crash durability"), "{error}");
+        assert!(error.contains("crash durability is unconfirmed"), "{error}");
         assert!(
-            error.contains("a.rs: injected rollback parent sync failure"),
+            error.contains("a.rs was restored, but crash durability is unconfirmed: injected rollback parent sync failure"),
             "{error}"
         );
         assert!(
@@ -601,6 +576,36 @@ mod tests {
             Ok(3)
         );
     }
+    #[test]
+    fn actual_publication_recovery_keeps_original_cleanup_lease_after_plan_drop() {
+        let directory = tempfile::tempdir().unwrap(); let runtime = tempfile::tempdir().unwrap();
+        let named = directory.path().join("worktree"); let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("a.rs"), "old").unwrap();
+        let root = Arc::new(fs_safety::Root::open(&named).unwrap());
+        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap();
+        let plan = prepare_at(root, Arc::new(Some(protection)), vec![DocumentEdits { path: "a.rs".into(), version: None, observed_version: None, observed_incarnation: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "new")] }], &HashMap::new()).unwrap();
+        let mut private = None;
+        let report = publish_unopened_with_hooks(&plan, |_| {}, |_| {
+            let path = std::fs::read_dir(&named)?.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>()?.into_iter().find(|path| path.file_name().is_some_and(|name| name.to_string_lossy().starts_with(".cagents-save-"))).expect("actual publisher holding");
+            let held = fs_safety::Root::open(&path)?;
+            std::fs::write(path.join("unresolved"), "preserve")?;
+            private = Some(held); Ok(())
+        }).unwrap();
+        assert_eq!(std::fs::read(named.join("a.rs")).unwrap(), b"new");
+        let authority = report.recovery.as_ref().expect("actual cleanup refusal retains authority").clone();
+        drop(plan); drop(report);
+        std::fs::rename(&named, &moved).unwrap(); std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("foreign"), "preserve replacement").unwrap();
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err());
+        assert!(authority.retry().is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err());
+        fs_safety::unlink_within(private.as_ref().unwrap(), std::ffi::OsStr::new("unresolved")).unwrap();
+        authority.retry().unwrap(); assert!(authority.is_resolved());
+        drop(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).unwrap());
+        assert_eq!(std::fs::read(named.join("foreign")).unwrap(), b"preserve replacement");
+        assert_eq!(std::fs::read(moved.join("a.rs")).unwrap(), b"new");
+    }
+
     #[test]
     fn multi_file_preview_fences_versions_and_publishes_unopened_files() {
         let directory = tempfile::tempdir().unwrap();

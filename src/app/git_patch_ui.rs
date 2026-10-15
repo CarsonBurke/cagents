@@ -52,7 +52,7 @@ impl Cagents {
         kind: git_patch::Kind,
         request: Option<Arc<DiffMutationRequest>>,
     ) -> Task<Message> {
-        if self.modal_is_open() {
+        if self.exit.is_some() || self.modal_is_open() {
             return Task::none();
         }
         let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
@@ -130,6 +130,7 @@ impl Cagents {
         pending: Pending,
         result: Result<Option<repository_widget::PreparedDiffMutation>, String>,
     ) -> Task<Message> {
+        if self.exit.is_some() || self.publication_recovery_blocks(&key.canonical_path) { return Task::none(); }
         if pending.buffer_only {
             if pending
                 .result

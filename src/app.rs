@@ -24,6 +24,7 @@ mod browser_host;
 mod editor_features;
 mod file_ui;
 mod git_binding;
+mod editor_feature_recovery;
 mod git_group_ui;
 mod git_patch_ui;
 mod git_ui;
@@ -2495,6 +2496,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
             | RepositoryAction::SaveFinished { .. }
+            | RepositoryAction::EditorRecoveryResolved { .. }
             // A dropped page render leaves the viewer reading "Rendering
             // page" for a page it will never draw, because the fence that
             // accepts the result is the only thing that clears it.
@@ -11465,6 +11467,10 @@ impl Cagents {
         }
     }
     fn fail_runtime(&mut self, card: CardId, message: String) {
+        if self.card_has_editor_recovery(card) {
+            self.status = Some(TransientNotice::error(format!("{message} The editor was kept because file recovery is pending.")));
+            return;
+        }
         let mut failure = self.terminal_failure_payload(card, message.clone());
         self.sidebar_state.clear_agent_activity(card);
         self.retire_lsp_card(card);
@@ -16510,6 +16516,14 @@ impl Cagents {
         }
     }
 
+    fn card_has_editor_recovery(&self, card: CardId) -> bool {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Repository(runtime)) => runtime.has_editor_recovery(),
+            Some(CardRuntime::PullRequests(pane)) => pane.runtime.has_editor_recovery(),
+            _ => false,
+        }
+    }
+
     fn focused_repository_is_saving(&self) -> bool {
         focused_save_in_flight(
             self.workspace.focused(),
@@ -16566,6 +16580,14 @@ impl Cagents {
     }
 
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        if self.publication_recovery_pending() || self.cards.values().any(|runtime| match runtime {
+            CardRuntime::Repository(runtime) => runtime.has_editor_recovery(),
+            CardRuntime::PullRequests(pane) => pane.runtime.has_editor_recovery(),
+            _ => false,
+        }) {
+            self.status = Some(TransientNotice::warning("File recovery must finish before closing this window. Retained editors were kept."));
+            return Task::none();
+        }
         let close_started = Instant::now();
         if self.exit.is_some() {
             return Task::none();
@@ -18433,6 +18455,33 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // This precedes every specialized repository arm as well as the
+        // generic reducer. Captured commands re-enter update after resolving.
+        if let Message::Repository(action) = &message
+            && matches!(action, RepositoryAction::DiskMetadata { .. } | RepositoryAction::Save { .. }
+                | RepositoryAction::AutoSaveDue { .. } | RepositoryAction::StageSelected { .. }
+                | RepositoryAction::ApplyDiffSelection { .. } | RepositoryAction::ApplyDiffHunk { .. }
+                | RepositoryAction::RevertFile { .. } | RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }) {
+            if self.exit.is_some() { return Task::none(); }
+            if !matches!(action, RepositoryAction::DiskMetadata { .. }) {
+                let worktree = match self.cards.get(&action.card()) {
+                    Some(CardRuntime::Repository(runtime)) => Some(runtime.descriptor.worktree.as_path()),
+                    Some(CardRuntime::PullRequests(pane)) => Some(pane.runtime.descriptor.worktree.as_path()),
+                    _ => None,
+                };
+                if worktree.is_some_and(|worktree| self.publication_recovery_blocks(worktree)) {
+                    if let RepositoryAction::AutoSaveDue { identity, revision, ticket } = action {
+                        match self.cards.get_mut(&identity.card) {
+                            Some(CardRuntime::Repository(runtime)) => { runtime.retire_auto_save_due(identity, *revision, *ticket); },
+                            Some(CardRuntime::PullRequests(pane)) => { pane.runtime.retire_auto_save_due(identity, *revision, *ticket); },
+                            _ => {},
+                        }
+                    }
+                    self.status = Some(TransientNotice::warning("Resolve file recovery in this worktree before another disk operation."));
+                    return Task::none();
+                }
+            }
+        }
         let Some(message) = self.admit_modal_surface_message(message) else {
             return Task::none();
         };
@@ -23660,6 +23709,9 @@ impl Application for Cagents {
             workspace
         };
         let main_content = self.workspace_chrome(workspace);
+        let main_content = if let Some(recovery) = self.publication_recovery_view() {
+            widget::column::with_children(vec![recovery, main_content]).width(Length::Fill).height(Length::Fill).into()
+        } else { main_content };
 
         let context_model = (self.context_inspector_visible()
             && self.context_tab == ContextTab::Details)
@@ -25811,6 +25863,56 @@ mod tests {
                 assert!(app.exit.unwrap().is_complete());
             });
         }
+    }
+
+    #[tokio::test]
+    async fn exit_rejects_late_pure_metadata_before_it_can_admit_effectful_capture() {
+        use cosmic::iced::futures::StreamExt;
+        let directory = tempfile::tempdir().unwrap(); std::fs::write(directory.path().join("source.rs"), "outside").unwrap();
+        let mut app = context_inspector_test_app(true); let card = app.workspace.focused().unwrap();
+        let mut runtime = RepositoryRuntime::cross_presence_observation_fixture(card, "source.rs");
+        runtime.descriptor.worktree = directory.path().into();
+        let task = runtime.refresh_open_document(card);
+        let mut stream = iced::runtime::task::into_stream(task).expect("pure metadata probe");
+        let iced::runtime::Action::Output(metadata) = stream.next().await.expect("actual metadata receipt") else { panic!("metadata output"); };
+        assert!(matches!(metadata, RepositoryAction::DiskMetadata { result: Ok(Some(_)), .. }));
+        assert!(!runtime.has_editor_recovery());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.core.set_main_window_id(Some(window::Id::unique()));
+        drop(app.exit_after_language_servers()); assert!(app.exit.is_some());
+        drop(app.update(Message::Repository(metadata)));
+        assert!(!app.card_has_editor_recovery(card), "no effectful capture nonce can be admitted after the window closes");
+    }
+
+    #[test]
+    fn exit_blocks_specialized_stage_revert_and_hunk_admission_before_dispatch() {
+        let mut app = context_inspector_test_app(true); let card = app.workspace.focused().unwrap();
+        let (runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "clean");
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.core.set_main_window_id(Some(window::Id::unique())); drop(app.exit_after_language_servers());
+        assert!(app.exit.is_some());
+        for action in [RepositoryAction::StageSelected { card, stage: true }, RepositoryAction::RevertFile { card },
+            RepositoryAction::ApplyDiffSelection { card, kind: crate::git_patch::Kind::Stage }] {
+            assert!(app.update(Message::Repository(action)).is_none());
+            assert!(app.source_control_mutations.is_empty());
+        }
+    }
+
+    #[test]
+    fn live_editor_recovery_rejects_final_exit_and_card_failure_replacement() {
+        let mut app = context_inspector_test_app(true); let card = app.workspace.focused().unwrap();
+        let window = window::Id::unique(); app.core.set_main_window_id(Some(window));
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "clean");
+        assert!(!runtime.is_dirty()); assert!(!runtime.is_saving());
+        let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("original held files".into(), || Ok(()));
+        runtime.retain_editor_recovery(authority.clone(), "needs actual recovery".into());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        drop(app.exit_after_language_servers());
+        assert!(app.exit.is_none()); assert_eq!(app.core.main_window_id(), Some(window));
+        app.fail_runtime(card, "unrelated runtime failure".into());
+        assert!(app.card_has_editor_recovery(card)); assert!(!authority.is_resolved());
+        assert!(app.commit_card_removal(card, None).is_none());
+        assert!(app.cards.contains_key(&card));
     }
 
     /// Only the window the exit closed can finish it.

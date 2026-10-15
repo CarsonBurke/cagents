@@ -139,26 +139,15 @@ impl LineMap {
 }
 
 #[derive(Debug, Clone)]
-pub struct Version {
-    pub text: String,
-    pub content_hash: blake3::Hash,
-    pub source: std::path::PathBuf,
-    pub markdown: bool,
-    pub mapping: LineMap,
-    pub restoration: Option<std::sync::Arc<crate::editor::FileRestoration>>,
-}
-pub fn load(worktree: &Path, path: &Path, before: &str, tone: PdfTone) -> Result<Version, String> {
+pub struct Version { pub text: String, pub content_hash: blake3::Hash, pub source: std::path::PathBuf, pub markdown: bool, pub mapping: LineMap, pub restoration: Option<std::sync::Arc<crate::editor::FileRestoration>> }
+pub fn load(worktree: &Path, path: &Path, before: &str, tone: PdfTone) -> Result<Version, crate::editor::FileIoError> {
     load_with_restoration(worktree, path, before, tone, false)
 }
 
-pub fn load_with_restoration(
-    worktree: &Path,
-    path: &Path,
-    before: &str,
-    tone: PdfTone,
-    capture: bool,
-) -> Result<Version, String> {
-    let root = crate::editor::worktree_root(worktree).map_err(|error| error.to_string())?;
+pub fn load_with_restoration(worktree: &Path, path: &Path, before: &str, tone: PdfTone, capture: bool) -> Result<Version, crate::editor::FileIoError> {
+    let protection = std::sync::Arc::new(crate::worktree_cleanup::protect(worktree).map_err(|error| crate::editor::FileIoError::Io(error.to_string()))?);
+    let root = crate::editor::worktree_root(worktree)?;
+    let context = capture.then(|| crate::editor::recovery_context_at(&root, protection)).transpose()?;
     match crate::editor::load_file_at(&root, path, tone) {
         Ok(LoadedFile {
             source,
@@ -170,23 +159,11 @@ pub fn load_with_restoration(
                 },
         }) => {
             let mapping = LineMap::between(before, &text);
-            let restoration = capture
-                .then(|| crate::editor::capture_restoration_at(&root, &source, content_hash))
-                .transpose()
-                .map_err(|error| error.to_string())?;
-            Ok(Version {
-                text,
-                content_hash,
-                source,
-                markdown,
-                mapping,
-                restoration,
-            })
+            let restoration = context.as_ref().map(|context| crate::editor::capture_restoration_at_in_context(&root, &source, content_hash, context)).transpose()?;
+            Ok(Version { text, content_hash, source, markdown, mapping, restoration })
         }
-        Ok(_) => {
-            Err("The file on disk is no longer editable text. Your buffer has been kept.".into())
-        }
-        Err(error) => Err(error.to_string()),
+        Ok(_) => Err(crate::editor::FileIoError::Io("The file on disk is no longer editable text. Your buffer has been kept.".into())),
+        Err(error) => Err(error),
     }
 }
 

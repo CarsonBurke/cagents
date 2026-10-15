@@ -310,6 +310,16 @@ impl PartialEq for RepositoryMenuIdentity {
 }
 impl Eq for RepositoryMenuIdentity {}
 
+/// O(1) external-disk observation for emitted controls. Hashes and metadata
+/// stamps are copied; no text, native snapshot or path is cloned for this proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RepositoryDiskObservation {
+    external_hash: Option<blake3::Hash>,
+    external_deleted: bool,
+    baseline_hash: blake3::Hash,
+    stamp: Option<Option<crate::editor_reload::Stamp>>,
+}
+
 /// A palette action names the displayed document and native selection. Shared
 /// model ownership prevents pointer reuse from accepting a replacement source;
 /// equality compares the Arc identity without traversing diff text or rows.
@@ -319,6 +329,7 @@ pub struct RepositoryCommandTarget {
     identity: AsyncIdentity,
     editor_revision: Option<u64>,
     external_editors_generation: u64,
+    disk_observation: Option<RepositoryDiskObservation>,
     editor_selection: Option<((usize, usize), (usize, usize))>,
     cursor: Option<(usize, usize, Option<(usize, usize)>)>,
     surface: SourceSurface,
@@ -343,6 +354,7 @@ impl PartialEq for RepositoryCommandTarget {
         Arc::ptr_eq(&self.incarnation, &other.incarnation)
             && self.identity == other.identity
             && self.external_editors_generation == other.external_editors_generation
+            && self.disk_observation == other.disk_observation
             && self.editor_selection == other.editor_selection
             && self.editor_revision == other.editor_revision
             && self.cursor == other.cursor
@@ -739,65 +751,21 @@ pub enum RepositoryAction {
         saved_text: String,
         result: Result<SaveOutcome, FileIoError>,
     },
-    OpenLocation {
-        card: CardId,
-        path: PathBuf,
-        line: usize,
-        column: usize,
-    },
-    OpenGoToLine {
-        card: CardId,
-    },
-    GoToLineChanged {
-        card: CardId,
-        value: String,
-    },
-    SubmitGoToLine {
-        card: CardId,
-    },
-    CloseGoToLine {
-        card: CardId,
-    },
-    NavigateLocation {
-        card: CardId,
-        forward: bool,
-    },
-    DiskMetadata {
-        identity: AsyncIdentity,
-        ticket: u64,
-        result: Result<Option<crate::editor_reload::Stamp>, String>,
-    },
-    ComparisonMetadata {
-        identity: AsyncIdentity,
-        ticket: u64,
-        basis: DiffBasis,
-        result: Result<crate::repository::RepositoryMetadataStamp, String>,
-    },
-    DiskLoaded {
-        identity: AsyncIdentity,
-        ticket: u64,
-        stamp: crate::editor_reload::Stamp,
-        baseline: blake3::Hash,
-        result: Result<crate::editor_reload::Version, String>,
-    },
-    CompareDisk {
-        card: CardId,
-    },
-    DiskComparisonLoaded {
-        identity: AsyncIdentity,
-        revision: u64,
-        disk_hash: blake3::Hash,
-        model: Option<DiffModel>,
-    },
-    KeepMine {
-        card: CardId,
-    },
-    BranchBasisRefreshed {
-        identity: AsyncIdentity,
-        request: u64,
-        previous: DiffBasis,
-        result: Result<ResolvedBasis, String>,
-    },
+    ResolveEditorRecovery { card: CardId, authority: crate::editor::RecoveryAuthority },
+    EditorRecoveryResolved { card: CardId, authority: crate::editor::RecoveryAuthority, result: Result<(), String> },
+    OpenLocation { card: CardId, path: PathBuf, line: usize, column: usize },
+    OpenGoToLine { card: CardId },
+    GoToLineChanged { card: CardId, value: String },
+    SubmitGoToLine { card: CardId },
+    CloseGoToLine { card: CardId },
+    NavigateLocation { card: CardId, forward: bool },
+    DiskMetadata { identity: AsyncIdentity, ticket: u64, result: Result<Option<crate::editor_reload::Stamp>, String> },
+    ComparisonMetadata { identity: AsyncIdentity, ticket: u64, basis: DiffBasis, result: Result<crate::repository::RepositoryMetadataStamp, String> },
+    DiskLoaded { identity: AsyncIdentity, ticket: u64, capture: Option<uuid::Uuid>, stamp: crate::editor_reload::Stamp, baseline: blake3::Hash, result: Result<crate::editor_reload::Version, FileIoError> },
+    CompareDisk { card: CardId },
+    DiskComparisonLoaded { identity: AsyncIdentity, request: uuid::Uuid, revision: u64, disk_hash: blake3::Hash, model: Option<DiffModel> },
+    KeepMine { card: CardId },
+    BranchBasisRefreshed { identity: AsyncIdentity, request: u64, previous: DiffBasis, result: Result<ResolvedBasis, String> },
     Reload {
         card: CardId,
     },
@@ -1120,6 +1088,8 @@ impl RepositoryAction {
             | Self::PdfPage { card, .. }
             | Self::PdfTone { card, .. }
             | Self::PdfZoom { card, .. }
+            | Self::ResolveEditorRecovery { card, .. }
+            | Self::EditorRecoveryResolved { card, .. }
             | Self::PdfPageRendered { card, .. } => *card,
             Self::ReviewLine { identity, .. }
             | Self::DiffAnnotations { identity, .. }
@@ -2531,6 +2501,11 @@ impl Drop for FindJob {
     }
 }
 
+#[path = "repository_widget/editor_recovery.rs"]
+mod editor_recovery;
+#[path = "repository_widget/disk_comparison.rs"]
+mod disk_comparison;
+
 pub struct RepositoryRuntime {
     pub descriptor: RepositoryView,
     /// Retained command targets distinguish reconstruction under the same
@@ -2559,6 +2534,8 @@ pub struct RepositoryRuntime {
     comparison_refresh_queued: bool,
     comparison_metadata: ComparisonMetadataRefresh,
     disk_comparison: Option<DiffState>,
+    disk_comparison_job: Option<disk_comparison::Job>,
+    disk_comparison_applied: Option<disk_comparison::Key>,
     keyboard_shortcuts: Arc<crate::settings::KeyboardShortcuts>,
     git_mutation_unavailable_reason: Option<Arc<str>>,
     /// Epoch for selected-document, diff, and save work. File-list refreshes
@@ -2687,6 +2664,8 @@ pub struct RepositoryRuntime {
     restored_navigation: Option<crate::model::RepositoryNavigation>,
     pending_editor_navigation: Option<(PathBuf, crate::model::EditorNavigation)>,
     pending_editor_focus: Option<AsyncIdentity>,
+    recovery: Option<editor_recovery::State>,
+    recovery_capture_ticket: Option<uuid::Uuid>,
     next_save_ticket: u64,
     next_diff_request: u64,
     /// Identity the application gave the open buffer at the LSP boundary, or
@@ -2898,6 +2877,8 @@ impl RepositoryRuntime {
             comparison_refresh_queued: false,
             comparison_metadata: ComparisonMetadataRefresh::default(),
             disk_comparison: None,
+            disk_comparison_job: None,
+            disk_comparison_applied: None,
             keyboard_shortcuts: Arc::new(crate::settings::KeyboardShortcuts::default()),
             git_mutation_unavailable_reason: None,
             generation: 0,
@@ -2976,6 +2957,8 @@ impl RepositoryRuntime {
             restored_navigation: None,
             pending_editor_navigation: None,
             pending_editor_focus: None,
+            recovery: None,
+            recovery_capture_ticket: None,
             next_save_ticket: 0,
             lsp_document: None,
             language: EditorLanguageState::default(),
@@ -3268,7 +3251,7 @@ impl RepositoryRuntime {
     }
 
     pub fn refresh_diff_preferences(&mut self, card: CardId) -> Task<RepositoryAction> {
-        self.ensure_current_diff(card)
+        if self.disk_comparison.is_some() { self.compare_disk(card) } else { self.ensure_current_diff(card) }
     }
 
     #[cfg(test)]
@@ -4071,16 +4054,9 @@ impl RepositoryRuntime {
     /// serialized or re-read. The source stamp includes inode/ctime so atomic
     /// replacement and no-op touches are distinguished by the later hash.
     pub fn refresh_open_document(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let DocumentState::Editable(document) = &self.document else {
-            return Task::none();
-        };
-        if self.is_read_only_source()
-            || document.workspace_edit.is_some()
-            || document.active_save.is_some()
-            || self.disk_poll.is_some()
-        {
-            return Task::none();
-        }
+        if self.has_editor_recovery() { return Task::none(); }
+        let DocumentState::Editable(document) = &self.document else { return Task::none(); };
+        if self.is_read_only_source() || document.workspace_edit.is_some() || document.active_save.is_some() || self.disk_poll.is_some() { return Task::none(); }
         let source = document.source.clone();
         let identity = self.current_identity(card, document.path.clone());
         let worktree = identity.worktree.clone();
@@ -4336,19 +4312,10 @@ impl RepositoryRuntime {
         }
     }
 
-    fn reload_disk_version(
-        &mut self,
-        card: CardId,
-        version: crate::editor_reload::Version,
-    ) -> Task<RepositoryAction> {
-        if self.is_read_only_source() || self.workspace_edit_pending() {
-            return Task::none();
-        }
-        let DocumentState::Editable(document) = &mut self.document else {
-            return Task::none();
-        };
-        let cursor = document.content.cursor();
-        let scroll = document.content.scroll_position();
+    fn reload_disk_version(&mut self, card: CardId, version: crate::editor_reload::Version) -> Task<RepositoryAction> {
+        if self.is_read_only_source() || self.workspace_edit_pending() || self.has_editor_recovery() { return Task::none(); }
+        let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+        let cursor = document.content.cursor(); let scroll = document.content.scroll_position();
         if !document.present || !document.saved_present {
             let Some(restoration) = version.restoration else {
                 document.error = Some(
@@ -4377,78 +4344,17 @@ impl RepositoryRuntime {
         let edits = document.discard_edits();
         document.saved_history_revision = document.history.revision();
         document.saved_snapshot = document.content.text_snapshot();
-        document
-            .content
-            .configure_indentation(crate::editor_indent::Indentation::detect(
-                &document.saved_text,
-                self.editor_tab_width,
-                document.indentation,
-            ));
-        let map = |mut position: text_editor::Position| {
-            position.line = version.mapping.map(position.line);
-            position
-        };
-        document.content.set_cursor(text_editor::Cursor {
-            position: map(cursor.position),
-            selection: cursor.selection.map(map),
-        });
-        document
-            .content
-            .restore_scroll_position(text_editor::ScrollPosition {
-                line: version.mapping.map(scroll.line),
-                ..scroll
-            });
-        document.external_version = None;
-        document.external_deleted = false;
-        document.external_check_pending = false;
-        document.recreate_missing = false;
-        self.disk_comparison = None;
+        document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, document.indentation));
+        let map = |mut position: text_editor::Position| { position.line = version.mapping.map(position.line); position };
+        document.content.set_cursor(text_editor::Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
+        document.content.restore_scroll_position(text_editor::ScrollPosition { line: version.mapping.map(scroll.line), ..scroll });
+        document.external_version = None; document.external_deleted = false; document.external_check_pending = false; document.recreate_missing = false;
+        self.dismiss_disk_comparison();
         // The index baseline is unchanged by a file write. Keep it for the
         // revision-aware working-diff worker instead of discarding the gutter.
         self.working_diff.applied = None;
         self.push_lsp_edits(edits);
         Task::batch([self.markdown_task(card), self.ensure_current_diff(card)])
-    }
-
-    fn compare_disk(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let DocumentState::Editable(document) = &self.document else {
-            return Task::none();
-        };
-        let Some(disk) = &document.external_version else {
-            return Task::none();
-        };
-        let before: Arc<str> = Arc::from(disk.text.as_str());
-        let after = document.content.text();
-        let revision = document.revision;
-        let disk_hash = disk.content_hash;
-        let identity = self.current_identity(card, document.path.clone());
-        let path = document.source.clone();
-        let theme = self.syntax_theme;
-        self.source_surface = SourceSurface::Diff;
-        self.disk_comparison = Some(DiffState::Loading {
-            request: 0,
-            cancellation: CancellationToken::new(),
-        });
-        cosmic::task::future(async move {
-            let model = tokio::task::spawn_blocking(move || {
-                crate::diff_view::build_document_diff(
-                    before,
-                    &after,
-                    &path,
-                    theme,
-                    &CancellationToken::new(),
-                )
-            })
-            .await
-            .ok()
-            .flatten();
-            RepositoryAction::DiskComparisonLoaded {
-                identity,
-                revision,
-                disk_hash,
-                model,
-            }
-        })
     }
 
     /// Whether a file-list read is genuinely still in flight.
@@ -5590,26 +5496,12 @@ impl RepositoryRuntime {
                 };
                 self.editor_command_capabilities() & bit != 0
             }
-            RepositoryAction::OpenExternal { editor_id, .. } => {
-                self.can_open_external()
-                    && self
-                        .external_editors
-                        .iter()
-                        .any(|editor| editor.id == *editor_id)
-            }
-            RepositoryAction::Save { overwrite, .. } => self
-                .editor_surface_command_action(
-                    card,
-                    if *overwrite {
-                        EditorSurfaceCommand::Overwrite
-                    } else {
-                        EditorSurfaceCommand::Save
-                    },
-                )
-                .is_some(),
-            RepositoryAction::Reload { .. } => self
-                .editor_surface_command_action(card, EditorSurfaceCommand::Reload)
-                .is_some(),
+            RepositoryAction::OpenExternal { editor_id, .. } => self.can_open_external() && self.external_editors.iter().any(|editor| editor.id == *editor_id),
+            RepositoryAction::Save { overwrite, .. } => self.editor_surface_command_action(card,
+                if *overwrite { EditorSurfaceCommand::Overwrite } else { EditorSurfaceCommand::Save }).is_some(),
+            RepositoryAction::Reload { .. } => self.editor_surface_command_action(card, EditorSurfaceCommand::Reload).is_some(),
+            RepositoryAction::CompareDisk { .. } => self.can_compare_disk(),
+            RepositoryAction::KeepMine { .. } => self.can_keep_mine(),
             RepositoryAction::DiscardEdits { .. } => self.can_discard_edits(),
             RepositoryAction::ApplyMarkdownMode { preview, .. } => {
                 self.can_apply_markdown_mode(*preview)
@@ -5723,6 +5615,7 @@ impl RepositoryRuntime {
                 self.selected_path().unwrap_or(Path::new("")).to_owned(),
             ),
             external_editors_generation: self.external_editors.generation(),
+            disk_observation: self.disk_command_observation(),
             editor_selection: match &self.document {
                 DocumentState::Editable(document) => document
                     .content
@@ -5943,21 +5836,16 @@ impl RepositoryRuntime {
                 version: document.lsp_version,
                 protocol_version: None,
                 protocol_incarnation: None,
-                writable: document.present && !self.is_saving() && !self.is_read_only_source(),
+                writable: document.present && !self.is_saving() && !self.is_read_only_source() && !self.has_editor_recovery(),
             },
         ))
     }
 
     /// Proves that the preview still addresses this exact buffer, then freezes
     /// mutations until the disk phase completes. No edit is made in this phase.
-    pub fn begin_workspace_edit(
-        &mut self,
-        ticket: u64,
-        plan: &crate::editor_workspace_edit::DocumentPlan,
-    ) -> Result<(), String> {
-        if self.is_read_only_source() {
-            return Err("Dependency sources are read-only".into());
-        }
+    pub fn begin_workspace_edit(&mut self, ticket: u64, plan: &crate::editor_workspace_edit::DocumentPlan) -> Result<(), String> {
+        if self.has_editor_recovery() { return Err("Resolve retained file recovery before applying another disk edit".into()); }
+        if self.is_read_only_source() { return Err("Dependency sources are read-only".into()); }
         self.flush_lsp_change();
         let DocumentState::Editable(document) = &mut self.document else {
             return Err("An edited buffer was closed".into());
@@ -6950,14 +6838,13 @@ impl RepositoryRuntime {
     }
 
     pub fn can_save(&self) -> bool {
-        if self.is_read_only_source() {
-            return false;
-        }
+        if self.has_editor_recovery() { return false; }
+        if self.is_read_only_source() { return false; }
         matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none() && document.workspace_edit.is_none())
     }
 
     fn can_discard_edits(&self) -> bool {
-        self.is_dirty() && !self.is_saving()
+        self.is_dirty() && !self.is_saving() && !self.has_editor_recovery()
     }
 
     pub fn external_editor_command_available(&self) -> bool {
@@ -6995,7 +6882,7 @@ impl RepositoryRuntime {
     }
 
     pub fn blocks_navigation(&self) -> bool {
-        self.is_dirty()
+        self.has_editor_recovery() || self.is_dirty()
             || self.is_saving()
             || matches!(&self.document, DocumentState::Editable(document) if document.durability_warning.is_some())
     }
@@ -7006,6 +6893,7 @@ impl RepositoryRuntime {
     /// A post-persist durability warning describes unresolved disk state, not
     /// merely unsaved editor contents. Discarding the buffer cannot resolve it.
     pub fn can_abandon_unsaved_changes(&self) -> bool {
+        if self.has_editor_recovery() { return false; }
         matches!(
             &self.document,
             DocumentState::Editable(document)
@@ -7287,6 +7175,7 @@ impl RepositoryRuntime {
     }
 
     fn auto_save_revision(&self) -> Option<u64> {
+        if self.has_editor_recovery() { return None; }
         match &self.document {
             DocumentState::Editable(document)
                 if self.auto_save
@@ -7332,21 +7221,18 @@ impl RepositoryRuntime {
         })
     }
 
-    pub fn take_auto_save_due(
-        &mut self,
-        identity: &AsyncIdentity,
-        revision: u64,
-        ticket: u64,
-    ) -> bool {
-        if ticket != self.next_auto_save_ticket
-            || !self.accepts_selected(identity)
-            || self.auto_save_pending != Some((identity.generation, revision))
-            || self.auto_save_revision() != Some(revision)
-        {
-            return false;
-        }
+    /// Retire exactly the delivered timer even when an external recovery
+    /// temporarily refuses its disk effect. A later retry can schedule anew.
+    pub fn retire_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
+        if ticket != self.next_auto_save_ticket || !self.accepts_selected(identity)
+            || self.auto_save_pending != Some((identity.generation, revision)) { return false; }
         self.auto_save_pending = None;
         true
+    }
+
+    pub fn take_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
+        let ready = self.auto_save_revision() == Some(revision);
+        self.retire_auto_save_due(identity, revision, ticket) && ready
     }
 
     /// Formatters and workspace edits must not recreate an intentionally absent file.
@@ -7360,6 +7246,7 @@ impl RepositoryRuntime {
     }
 
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
+        if self.has_editor_recovery() { return Task::none(); }
         // Explicit Save after a completed removal means create the open file
         // again. Debounced autosave never manufactures that user intent.
         if let DocumentState::Editable(document) = &mut self.document
@@ -7387,9 +7274,7 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
-        if self.is_read_only_source() || self.workspace_edit_pending() {
-            return Task::none();
-        }
+        if self.is_read_only_source() || self.workspace_edit_pending() || self.has_editor_recovery() { return Task::none(); }
         if let DocumentState::Editable(document) = &mut self.document {
             document.prune_restorations();
             if document.active_save.is_none()
@@ -7519,20 +7404,28 @@ impl RepositoryRuntime {
     }
 
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
-        if self.workspace_edit_pending()
-            && matches!(
-                &action,
-                RepositoryAction::FileLoaded { .. }
-                    | RepositoryAction::ConfiguredFileLoaded { .. }
-                    | RepositoryAction::DiskMetadata { .. }
-                    | RepositoryAction::DiskLoaded { .. }
-                    | RepositoryAction::DiskComparisonLoaded { .. }
-                    | RepositoryAction::KeepMine { .. }
-                    | RepositoryAction::CompareDisk { .. }
-            )
-        {
+        // Every owned CPU completion releases its slot before modal/freeze
+        // admission. A discarded stale result must not strand single-flight.
+        if let RepositoryAction::DiskComparisonLoaded { identity, request, revision, disk_hash, model } = action {
+            return self.finish_disk_comparison(identity, request, revision, disk_hash, model);
+        }
+        // Retain before stale-ticket/context guards: a rejected receipt must
+        // never discard its only live recovery authority.
+        let stale_capture = matches!(&action, RepositoryAction::DiskLoaded { capture, .. }
+            if *capture != self.recovery_capture_ticket && (capture.is_some() || self.recovery_capture_ticket.is_some()));
+        self.retain_action_recovery(&action);
+        if stale_capture { return Task::none(); }
+        if self.has_editor_recovery() && matches!(&action,
+            RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }
+            | RepositoryAction::DiskMetadata { .. }
+            | RepositoryAction::DiscardEdits { .. } | RepositoryAction::StageSelected { .. }) {
             return Task::none();
         }
+        if self.workspace_edit_pending() && matches!(&action,
+            RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. }
+            | RepositoryAction::DiskMetadata { .. } | RepositoryAction::DiskLoaded { .. }
+            | RepositoryAction::DiskComparisonLoaded { .. } | RepositoryAction::KeepMine { .. }
+            | RepositoryAction::CompareDisk { .. }) { return Task::none(); }
         if matches!(
             &action,
             RepositoryAction::Save { .. }
@@ -7547,6 +7440,10 @@ impl RepositoryRuntime {
             self.toolbar_overflow_open = false;
         }
         match action {
+            RepositoryAction::ResolveEditorRecovery { card, authority } => self.start_editor_recovery(card, authority),
+            RepositoryAction::EditorRecoveryResolved { authority, result, .. } => {
+                self.finish_editor_recovery(authority, result); Task::none()
+            }
             RepositoryAction::PasteCaptured { target, text } => {
                 let card = target.identity.card;
                 if text.is_empty()
@@ -7632,11 +7529,8 @@ impl RepositoryRuntime {
                     if !document.saved_present {
                         document.external_check_pending = false;
                         if document.external_version.is_some() || document.external_deleted {
-                            document.external_version = None;
-                            document.external_deleted = false;
-                            document.conflict = false;
-                            document.error = None;
-                            self.disk_comparison = None;
+                            document.external_version = None; document.external_deleted = false;
+                            document.conflict = false; document.error = None; self.dismiss_disk_comparison();
                         }
                         return Task::none();
                     }
@@ -7665,41 +7559,17 @@ impl RepositoryRuntime {
                     return Task::none();
                 }
                 document.external_check_pending = true;
-                let baseline = document.disk_hash;
-                let before = document.saved_text.clone();
-                let worktree = identity.worktree.clone();
-                let path = identity.path.clone();
-                let tone = self.document_tone;
+                let capture_nonce = capture.then(uuid::Uuid::new_v4);
+                if capture { self.recovery_capture_ticket = capture_nonce; }
+                let baseline = document.disk_hash; let before = document.saved_text.clone();
+                let worktree = identity.worktree.clone(); let path = identity.path.clone(); let tone = self.document_tone;
                 cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        crate::editor_reload::load_with_restoration(
-                            &worktree, &path, &before, tone, capture,
-                        )
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                    RepositoryAction::DiskLoaded {
-                        identity,
-                        ticket,
-                        stamp,
-                        baseline,
-                        result,
-                    }
+                    let result = tokio::task::spawn_blocking(move || crate::editor_reload::load_with_restoration(&worktree, &path, &before, tone, capture)).await.map_err(|error| FileIoError::Io(error.to_string())).and_then(|result| result);
+                    RepositoryAction::DiskLoaded { identity, ticket, capture: capture_nonce, stamp, baseline, result }
                 })
             }
-            RepositoryAction::DiskLoaded {
-                identity,
-                ticket,
-                stamp,
-                baseline,
-                result,
-            } => {
-                if !self.accepts_selected(&identity)
-                    || self.disk_poll.is_none_or(|(active, _)| active != ticket)
-                {
-                    return Task::none();
-                }
+            RepositoryAction::DiskLoaded { identity, ticket, capture: _, stamp, baseline, result } => {
+                if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
                 self.disk_poll = None;
                 let DocumentState::Editable(document) = &mut self.document else {
                     return Task::none();
@@ -7711,12 +7581,7 @@ impl RepositoryRuntime {
                 }
                 let version = match result {
                     Ok(version) => version,
-                    Err(error) => {
-                        document.conflict = true;
-                        document.error = Some(error);
-                        self.disk_stamp = Some(Some(stamp));
-                        return Task::none();
-                    }
+                    Err(error) => { document.conflict = true; document.error = Some(error.to_string()); self.disk_stamp = Some(Some(stamp)); return Task::none(); }
                 };
                 self.disk_stamp = Some(Some(stamp));
                 let decision = if !document.saved_present {
@@ -7731,11 +7596,7 @@ impl RepositoryRuntime {
                 match decision {
                     crate::editor_reload::Decision::Unchanged => {
                         if document.external_version.is_some() || document.external_deleted {
-                            document.external_version = None;
-                            document.external_deleted = false;
-                            document.conflict = false;
-                            document.error = None;
-                            self.disk_comparison = None;
+                            document.external_version = None; document.external_deleted = false; document.conflict = false; document.error = None; self.dismiss_disk_comparison();
                         }
                         Task::none()
                     }
@@ -7757,42 +7618,7 @@ impl RepositoryRuntime {
                 }
             }
             RepositoryAction::CompareDisk { card } => self.compare_disk(card),
-            RepositoryAction::DiskComparisonLoaded {
-                identity,
-                revision,
-                disk_hash,
-                model,
-            } => {
-                if self.accepts_selected(&identity)
-                    && self.disk_comparison.is_some()
-                    && matches!(&self.document, DocumentState::Editable(document) if document.revision == revision && document.external_version.as_ref().is_some_and(|disk| disk.content_hash == disk_hash))
-                {
-                    self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
-                    let mut state = DiffState::ready(match model {
-                        Some(model) => RenderedDiff::Text {
-                            model: Arc::new(model),
-                            old_label: "Disk".into(),
-                            new_label: "Unsaved buffer".into(),
-                        },
-                        None => RenderedDiff::Error(
-                            "Could not compare the buffer and disk. Your edits have been kept."
-                                .into(),
-                        ),
-                    });
-                    if let DiffState::Ready(content, layout) = &mut state {
-                        // Disk comparison is a distinct source. Keep all of its
-                        // context visible (and virtualized), without controls
-                        // whose reveal state belongs to the repository basis.
-                        if let RenderedDiff::Text { model, .. } = content {
-                            layout.set_folding(model, false);
-                        }
-                        let typography = self.diff_typography();
-                        layout.set_row_heights(typography.line_height, typography.fold_height());
-                    }
-                    self.disk_comparison = Some(state);
-                }
-                Task::none()
-            }
+            RepositoryAction::DiskComparisonLoaded { .. } => unreachable!("disk comparison completion retires its slot before admission"),
             RepositoryAction::KeepMine { card } => {
                 let DocumentState::Editable(document) = &mut self.document else {
                     return Task::none();
@@ -7842,9 +7668,9 @@ impl RepositoryRuntime {
                 } else {
                     return self.request_save(card, true);
                 }
-                document.conflict = false;
-                document.error = None;
-                self.disk_comparison = None;
+                else { return self.request_save(card, true); }
+                document.conflict = false; document.error = None;
+                self.dismiss_disk_comparison();
                 self.request_save(card, false)
             }
             RepositoryAction::BinaryPage { card, offset } => {
@@ -8623,6 +8449,7 @@ impl RepositoryRuntime {
                             document.error = None;
                             document.durability_warning = match durability {
                                 SaveDurability::Durable => None,
+                                SaveDurability::Recovery { error, .. } => Some(error),
                                 SaveDurability::Unconfirmed { error } => Some(format!(
                                     "The file was replaced on disk, but its durability could not be confirmed: {error}. Reload from disk or retry the save before leaving."
                                 )),
@@ -8649,6 +8476,7 @@ impl RepositoryRuntime {
                             document.error = None;
                             document.durability_warning = match durability {
                                 SaveDurability::Durable => None,
+                                SaveDurability::Recovery { error, .. } => Some(error),
                                 SaveDurability::Unconfirmed { error } => Some(format!(
                                     "The file was removed, but directory durability could not be confirmed: {error}"
                                 )),
@@ -8879,7 +8707,7 @@ impl RepositoryRuntime {
                 self.initial_load(card)
             }
             RepositoryAction::ApplySourceSurface { card, diff } => {
-                self.disk_comparison = None;
+                self.dismiss_disk_comparison();
                 let surface = if diff {
                     SourceSurface::Diff
                 } else {
@@ -9520,7 +9348,7 @@ impl RepositoryRuntime {
             }
             RepositoryAction::ToggleDiffWhitespace { card } => {
                 self.set_diff_ignore_whitespace(!self.diff_ignore_whitespace);
-                self.ensure_current_diff(card)
+                self.refresh_diff_preferences(card)
             }
             RepositoryAction::SelectDiffRow {
                 identity,
@@ -10129,9 +9957,7 @@ impl RepositoryRuntime {
         self.committed_selection = None;
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading;
-        self.disk_stamp = None;
-        self.disk_poll = None;
-        self.disk_comparison = None;
+        self.disk_stamp = None; self.disk_poll = None; self.dismiss_disk_comparison();
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(
@@ -11500,13 +11326,18 @@ pub fn view_with_review<'a>(
             ),
         }
     };
-    // Ordinary columns reconcile children through Tree::diff, including tag
-    // changes. The pinned keyed column directly diffs equal-length children
-    // even when keys change, which reuses incompatible placeholder state.
-    widget::column::with_children([body])
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    // Recovery belongs to the runtime, including a late receipt delivered
+    // while another file is loading or shown as a noneditable viewer.
+    let mut rows = Vec::new();
+    if let Some(recovery) = runtime.recovery.as_ref().filter(|state| !state.authority.is_resolved()) {
+        rows.push(widget::container(widget::row::with_children(vec![
+            crate::design::body(&recovery.message).width(Length::Fill).into(),
+            crate::ui_controls::button::secondary("Retry file recovery")
+                .on_press_maybe(recovery.pending.is_none().then(|| RepositoryAction::ResolveEditorRecovery { card, authority: recovery.authority.clone() })).into(),
+        ]).spacing(space::S)).padding(space::M).into());
+    }
+    rows.push(body);
+    widget::column::with_children(rows).width(Length::Fill).height(Length::Fill).into()
 }
 
 /// The focus target of the card's editable buffer.
@@ -12314,25 +12145,9 @@ fn selected_file_view<'a>(
         return content;
     }
     let actions: Vec<Element<'a, RepositoryAction>> = vec![
-        crate::ui_controls::button::secondary("Reload")
-            .on_press_maybe(
-                (!runtime.is_saving() && document.external_version.is_some())
-                    .then_some(RepositoryAction::Reload { card }),
-            )
-            .into(),
-        crate::ui_controls::button::secondary("Compare")
-            .on_press_maybe(
-                (!runtime.is_saving() && document.external_version.is_some())
-                    .then_some(RepositoryAction::CompareDisk { card }),
-            )
-            .into(),
-        crate::ui_controls::button::secondary(if document.external_deleted {
-            "Save again"
-        } else {
-            "Keep mine"
-        })
-        .on_press_maybe((!runtime.is_saving()).then_some(RepositoryAction::KeepMine { card }))
-        .into(),
+        crate::ui_controls::button::secondary("Reload").on_press_maybe((!runtime.is_saving() && document.external_version.is_some()).then_some(RepositoryAction::Reload { card })).into(),
+        crate::ui_controls::button::secondary("Compare").on_press_maybe(runtime.can_compare_disk().then_some(RepositoryAction::CompareDisk { card })).into(),
+        crate::ui_controls::button::secondary(if document.external_deleted { "Save again" } else { "Keep mine" }).on_press_maybe(runtime.can_keep_mine().then_some(RepositoryAction::KeepMine { card })).into(),
     ];
     let mut rows: Vec<Element<'a, RepositoryAction>> = vec![
         crate::design::body(if document.external_deleted {
@@ -15661,6 +15476,30 @@ fn information_state_height<'a>(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn late_recovery_has_a_real_retry_control_while_loading_and_in_a_viewer() {
+        for loading in [true, false] {
+            let card = CardId::new(); let (mut runtime, completion) = RepositoryRuntime::post_persist_failure_fixture(card);
+            let RepositoryAction::SaveFinished { mut identity, .. } = completion else { unreachable!() };
+            identity.generation += 10;
+            runtime.document = if loading { DocumentState::Loading } else { DocumentState::ReadOnly { path: "notes.txt".into(), reason: ReadOnlyReason::Binary } };
+            let directory = tempfile::tempdir().unwrap(); std::fs::write(directory.path().join("file"), "text").unwrap();
+            let stamp = crate::editor_reload::stamp(directory.path(), Path::new("file"), Path::new("file")).unwrap().unwrap();
+            let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("late source".into(), || Ok(()));
+            drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 999, capture: None, stamp, baseline: blake3::hash(b""), result: Err(FileIoError::Recovery { message: "late read cleanup".into(), authority: authority.clone() }) }));
+            let action = click_native_repository_control(view(card, &runtime), "Retry file recovery");
+            let task = runtime.update(action);
+            if loading {
+                let loaded = runtime.current_identity(card, PathBuf::from("notes.txt"));
+                drop(runtime.update(RepositoryAction::FileLoaded { identity: loaded, result: Ok(LoadedFile { source: "notes.txt".into(), content: FileContent::ReadOnly(ReadOnlyReason::Binary) }) }));
+                assert!(matches!(runtime.document, DocumentState::ReadOnly { .. }), "already admitted pure load completes while recovery remains retained");
+                assert!(runtime.has_editor_recovery());
+            }
+            finish_navigation_task(&mut runtime, task).await;
+            assert!(!runtime.has_editor_recovery()); assert!(authority.is_resolved());
+        }
+    }
+
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
         use cosmic::iced::futures::StreamExt;
         if let Some(mut stream) = iced::runtime::task::into_stream(task) {
@@ -18091,20 +17930,10 @@ mod tests {
         let path = runtime.selected_path().unwrap().to_path_buf();
         let identity = runtime.current_identity(card, path.clone());
         runtime.disk_poll = Some((1, Instant::now()));
-        drop(runtime.update(RepositoryAction::DiskLoaded {
-            identity,
-            ticket: 1,
-            stamp: disk_stamp_fixture(),
-            baseline: blake3::hash(before.as_bytes()),
-            result: Ok(crate::editor_reload::Version {
-                text: after.into(),
-                content_hash: blake3::hash(after.as_bytes()),
-                source: path,
-                markdown: false,
-                mapping: crate::editor_reload::LineMap::between(before, after),
-                restoration: None,
-            }),
-        }));
+        drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 1, capture: None, stamp: disk_stamp_fixture(), baseline: blake3::hash(before.as_bytes()), result: Ok(crate::editor_reload::Version {
+            text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
+            mapping: crate::editor_reload::LineMap::between(before, after), restoration: None,
+        }) }));
     }
 
     fn metadata_observer_fixture() -> (

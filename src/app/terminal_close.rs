@@ -827,6 +827,11 @@ impl Cagents {
         unasked: bool,
         batch: Option<uuid::Uuid>,
     ) -> Task<Message> {
+        if self.card_has_editor_recovery(card) {
+            self.status = Some(TransientNotice::warning("Resolve file recovery before closing this editor."));
+            self.stop_pane_close_batch(batch);
+            return Task::none();
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
