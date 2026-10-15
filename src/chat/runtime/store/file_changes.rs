@@ -563,8 +563,8 @@ impl Store {
         &self,
         command: &Command,
     ) -> Result<Option<crate::chat::FileChangeReply>, String> {
-        let _read = self.db.unchecked_transaction().map_err(|error| error.to_string())?;
-        self.source_guard()?;
+        self.with_source_read(|error|error, |store| {
+        store.source_guard()?;
         let requested_key = match command {
             Command::LoadFileChanges { after, .. } => after.as_ref(),
             Command::LoadFileChangePatches { key, .. } => Some(key),
@@ -577,7 +577,7 @@ impl Store {
         }
         let reply = match command {
             Command::LoadFileChanges { request_id, after } => crate::chat::FileChangeReply::Files(
-                self.files_summary(*request_id, after.as_ref())?,
+                store.files_summary(*request_id, after.as_ref())?,
             ),
             Command::LoadFileChangePatches {
                 request_id,
@@ -588,7 +588,7 @@ impl Store {
                 let mut page = FileChangePage {
                     request_id: *request_id,
                     key: key.clone(),
-                    revision: self
+                    revision: store
                         .db
                         .query_row(
                             "SELECT revision FROM file_totals WHERE source=?1 AND path=?2",
@@ -607,7 +607,7 @@ impl Store {
                         "Reported edits changed; select the file again to read its current patches"
                             .into(),
                     );
-                } else if let Err(error) = self.read_file_patches(&mut page, cursor.as_ref()) {
+                } else if let Err(error) = store.read_file_patches(&mut page, cursor.as_ref()) {
                     page.error = Some(error);
                 }
                 crate::chat::FileChangeReply::Patches(page)
@@ -615,6 +615,7 @@ impl Store {
             _ => unreachable!(),
         };
         Ok(Some(reply))
+        })
     }
     fn read_file_patches(
         &self,

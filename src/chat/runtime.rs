@@ -957,6 +957,7 @@ impl Handle {
         if let Err(error) = store.publish_source_parts(&mut state) {
             state.error = Some(format!("Cannot identify original prose: {error}"));
         }
+        store.publish_source_authority(&mut state);
         if refresh_publication {
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
@@ -1016,6 +1017,7 @@ impl Handle {
             if let Err(error) = store.publish_source_parts(&mut state) {
                 state.error = Some(format!("Cannot identify original prose: {error}"));
             }
+            store.publish_source_authority(&mut state);
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {

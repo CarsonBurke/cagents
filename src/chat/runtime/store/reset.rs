@@ -75,6 +75,7 @@ fn durable<T>(db: &mut Connection, action: impl FnOnce(&mut Connection)->Result<
 }
 impl Store {
     pub(super) fn source_guard(&self) -> Result<(), String> {
+        self.source_reads.guard_connection(&self.db)?;
         if self.reset_pending { return Err(UNAVAILABLE.into()); }
         raw::guard(&self.db, self.raw_sources.nonce)
     }
@@ -112,6 +113,7 @@ impl Store {
         self.presentation = None;
         self.presented_generation = None;
         self.presented_children.clear();
+        self.source_reads.guard_connection(&self.db).map_err(|cause|format!("Reset refused this source cache connection; no new intent was acknowledged: {cause}"))?;
         let owner=self.raw_sources.nonce;
         let result = durable(&mut self.db, |db| {
             {

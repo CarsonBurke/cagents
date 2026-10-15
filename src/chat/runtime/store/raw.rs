@@ -774,17 +774,17 @@ impl Store {
         Ok(removed)
     }
     pub(super) fn raw_parts(&self, id: &str) -> Result<Vec<RawSourcePart>, String> {
-        let _read = self.db.unchecked_transaction().map_err(err)?;
-        self.raw_guard()?;
-        if self.raw_sources.blocked.is_some() {
+        self.with_source_read(err, |store| {
+        store.raw_guard()?;
+        if store.raw_sources.blocked.is_some() {
             return Ok(Vec::new());
         }
-        let row:Option<(String,i64,usize,usize,u64)>=self.db.query_row("SELECT name,representation,input_len,command_len,epoch FROM raw_tool_sources WHERE agent='' AND id=?1 AND state=1 AND NOT EXISTS(SELECT 1 FROM raw_tool_revoked r WHERE r.agent='' AND r.id=raw_tool_sources.id)",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(err)?;
+        let row:Option<(String,i64,usize,usize,u64)>=store.db.query_row("SELECT name,representation,input_len,command_len,epoch FROM raw_tool_sources WHERE agent='' AND id=?1 AND state=1 AND NOT EXISTS(SELECT 1 FROM raw_tool_revoked r WHERE r.agent='' AND r.id=raw_tool_sources.id)",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional().map_err(err)?;
         let Some((name, rep, input, command, revision)) = row else {
             return Ok(Vec::new());
         };
         let epoch = SourceEpoch {
-            incarnation: self.source_incarnation,
+            incarnation: store.source_incarnation,
             revision,
         };
         let mut parts = vec![RawSourcePart {
@@ -818,6 +818,7 @@ impl Store {
             });
         }
         Ok(parts)
+        })
     }
     /// Called only while the parent canonical reader holds its read snapshot.
     pub(super) fn raw_command(&self, source: &SourceKey) -> Result<Option<RawCommandCall>, String> {
@@ -851,15 +852,15 @@ impl Store {
         &mut self,
         source: &SourceKey,
     ) -> Result<Option<(String, String)>, String> {
-        let _read = self.db.unchecked_transaction().map_err(err)?;
-        self.raw_guard()?;
-        if let Some(reason) = &self.raw_sources.blocked {
+        self.with_source_read(err, |store| {
+        store.raw_guard()?;
+        if let Some(reason) = &store.raw_sources.blocked {
             return Err(reason.clone());
         }
-        if self.raw_revoked(source)? {
+        if store.raw_revoked(source)? {
             return Err("Original call was removed".into());
         }
-        let row: Option<(String, usize, i64)> = self
+        let row: Option<(String, usize, i64)> = store
             .db
             .query_row(
                 "SELECT name,input_len,state FROM raw_tool_sources WHERE agent=?1 AND id=?2",
@@ -877,8 +878,9 @@ impl Store {
         if len > RAW_SOURCE_BYTES {
             return Err("Original call exceeds bounded read limit".into());
         }
-        let bytes = self.raw_owned_range(source, 0, 0, len)?;
+        let bytes = store.raw_owned_range(source, 0, 0, len)?;
         Ok(Some((name, String::from_utf8(bytes).map_err(err)?)))
+        })
     }
 
     fn raw_owned_range(
@@ -941,6 +943,7 @@ impl Store {
         &mut self,
         query: RawSourceQuery,
     ) -> Result<RawSourcePage, SourceError> {
+        self.with_source_read(source_error, |store| {
         if !valid_key(&query.source)
             || !(4..=PAGE_BYTES).contains(&query.limit)
             || (query.offset > 0 && (query.until.is_none() || query.expected_epoch.is_none()))
@@ -948,15 +951,14 @@ impl Store {
         {
             return Err(SourceError::InvalidRange);
         }
-        let _read = self.db.unchecked_transaction().map_err(source_error)?;
-        self.raw_guard().map_err(source_error)?;
-        if let Some(reason) = &self.raw_sources.blocked {
+        store.raw_guard().map_err(source_error)?;
+        if let Some(reason) = &store.raw_sources.blocked {
             return Err(source_error(reason));
         }
-        if self.raw_revoked(&query.source).map_err(source_error)? {
+        if store.raw_revoked(&query.source).map_err(source_error)? {
             return Err(SourceError::NotFound);
         }
-        let record:Option<(String,i64,usize,usize,i64,u64)>=self.db.query_row("SELECT name,representation,input_len,command_len,state,epoch FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(&query.source),query.source.source_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional().map_err(source_error)?;
+        let record:Option<(String,i64,usize,usize,i64,u64)>=store.db.query_row("SELECT name,representation,input_len,command_len,state,epoch FROM raw_tool_sources WHERE agent=?1 AND id=?2",params![agent(&query.source),query.source.source_id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional().map_err(source_error)?;
         let (name, representation, input_len, command_len, state, revision) =
             record.ok_or(SourceError::NotFound)?;
         if state != SEALED {
@@ -973,7 +975,7 @@ impl Store {
             return Err(SourceError::Unsupported);
         }
         let epoch = SourceEpoch {
-            incarnation: self.source_incarnation,
+            incarnation: store.source_incarnation,
             revision,
         };
         if query
@@ -993,7 +995,7 @@ impl Store {
             });
         }
         if until < length
-            && self
+            && store
                 .raw_owned_range(&query.source, field, until, until + 1)
                 .map_err(source_error)?
                 .first()
@@ -1002,7 +1004,7 @@ impl Store {
             return Err(SourceError::InvalidRange);
         }
         let target = query.offset.saturating_add(query.limit).min(until);
-        let bytes = self
+        let bytes = store
             .raw_owned_range(
                 &query.source,
                 field,
@@ -1043,6 +1045,7 @@ impl Store {
                 },
                 complete_call: until == length,
             },
+        })
         })
     }
 }

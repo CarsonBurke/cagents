@@ -30,7 +30,7 @@ impl CanonicalItemReader for Reader {
         if store.canonical_generation != self.generation {
             return Err("Original tool source was revoked by reset".into());
         }
-        let _read = store.db.unchecked_transaction().map_err(|error| error.to_string())?;
+        store.with_source_read(|error|error, |store| {
         store.source_guard()?;
         if key.agent_id.is_some() {
             return store.validate_child_adapter_key(key);
@@ -46,6 +46,7 @@ impl CanonicalItemReader for Reader {
             );
         }
         Ok(())
+        })
     }
     fn original_call(&self, key: &CanonicalItemKey) -> Result<Option<(String, String)>, String> {
         let store = self
@@ -123,18 +124,15 @@ impl Store {
         if key.agent_id.is_some() {
             self.flush_child_adapter_read(key)?;
         }
+        self.with_source_read(|error|error, |store| {
         // Flush before admission to the read snapshot. Owner/revocation and
         // every parent or child metadata/body/patch field must then use that
         // same SQLite view, including optional cache-hit authorization.
-        let _read = self
-            .db
-            .unchecked_transaction()
-            .map_err(|error| error.to_string())?;
-        self.raw_guard()?;
+        store.raw_guard()?;
         if key.agent_id.is_some() {
-            return self.child_adapter_item(key);
+            return store.child_adapter_item(key);
         }
-        if self.raw_revoked(&crate::chat::cache::SourceKey {
+        if store.raw_revoked(&crate::chat::cache::SourceKey {
             agent_id: None,
             source_id: key.item_id.clone(),
         })? {
@@ -143,7 +141,7 @@ impl Store {
                     .into(),
             );
         }
-        let record=self.db.query_row("SELECT CASE WHEN length(metadata)<=?2 THEN metadata ELSE NULL END,len0,len1,len2,CASE WHEN length(spans)<=?2 THEN spans ELSE NULL END,source_shortened FROM items WHERE id=?1",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<Vec<u8>>>(4)?,row.get::<_,bool>(5)?))).optional().map_err(|error|error.to_string())?;
+        let record=store.db.query_row("SELECT CASE WHEN length(metadata)<=?2 THEN metadata ELSE NULL END,len0,len1,len2,CASE WHEN length(spans)<=?2 THEN spans ELSE NULL END,source_shortened FROM items WHERE id=?1",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<Vec<u8>>>(4)?,row.get::<_,bool>(5)?))).optional().map_err(|error|error.to_string())?;
         let Some((metadata, len0, len1, len2, spans, shortened)) = record else {
             return Ok(None);
         };
@@ -162,7 +160,7 @@ impl Store {
         }
         let mut item: Item = postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
         if shortened {
-            let original = self
+            let original = store
                 .raw_command(&crate::chat::cache::SourceKey {
                     agent_id: None,
                     source_id: key.item_id.clone(),
@@ -186,9 +184,9 @@ impl Store {
         if item.id != key.item_id || len2 != 0 {
             return Err("Original tool source identity or layout changed".into());
         }
-        let body0 = String::from_utf8(self.strict_adapter_field(&key.item_id, 0, len0)?)
+        let body0 = String::from_utf8(store.strict_adapter_field(&key.item_id, 0, len0)?)
             .map_err(|error| error.to_string())?;
-        let body1 = String::from_utf8(self.strict_adapter_field(&key.item_id, 1, len1)?)
+        let body1 = String::from_utf8(store.strict_adapter_field(&key.item_id, 1, len1)?)
             .map_err(|error| error.to_string())?;
         match &mut item.content {
             ItemContent::Tool { input, output, .. } => {
@@ -222,6 +220,7 @@ impl Store {
             _ => return Err("Original source is not a canonical tool item".into()),
         }
         Ok(Some(item))
+        })
     }
 }
 #[cfg(test)]

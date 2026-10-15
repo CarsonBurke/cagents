@@ -6,6 +6,7 @@ mod file_changes;
 pub(super) use adapter_items::reader as adapter_item_reader;
 mod raw;
 mod reset;
+mod read_lease;
 mod source;
 
 use super::observed_at;
@@ -63,6 +64,7 @@ pub(crate) struct Store {
     canonical_generation: uuid::Uuid,
     /// A refused Reset keeps this Store unavailable until an atomic retry succeeds.
     reset_pending: bool,
+    source_reads: read_lease::State,
     raw_sources: raw::State,
     file_revision: u64,
     child_file_ordinal: i64,
@@ -173,6 +175,7 @@ impl Store {
                 raw_sources,
                 canonical_generation: uuid::Uuid::new_v4(),
                 reset_pending: false,
+                source_reads: Default::default(),
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,

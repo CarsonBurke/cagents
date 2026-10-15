@@ -196,10 +196,10 @@ impl Store {
         }
         self.flush_child_source().map_err(storage)?;
         self.flush_text().map_err(storage)?;
-        let _read = self.db.unchecked_transaction().map_err(storage)?;
-        self.source_guard().map_err(storage)?;
+        self.with_source_read(storage, |store| {
+        store.source_guard().map_err(storage)?;
         let (epoch, length, metadata) = if let Some(agent) = &query.source.agent_id {
-            let (epoch, length, bytes): (u64, usize, Vec<u8>) = self
+            let (epoch, length, bytes): (u64, usize, Vec<u8>) = store
                 .db
                 .query_row(
                     "SELECT epoch,len,metadata FROM child_sources WHERE agent=?1 AND id=?2",
@@ -215,13 +215,13 @@ impl Store {
                 postcard::from_bytes::<Option<SourceMetadata>>(&bytes).map_err(storage)?,
             )
         } else {
-            let (epoch,length,metadata): (u64,usize,Vec<u8>) = self.db.query_row("SELECT source_epochs.epoch,items.len0,items.metadata FROM items JOIN source_epochs USING(id) WHERE items.id=?1",[&query.source.source_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(storage)?.ok_or(SourceError::NotFound)?;
+            let (epoch,length,metadata): (u64,usize,Vec<u8>) = store.db.query_row("SELECT source_epochs.epoch,items.len0,items.metadata FROM items JOIN source_epochs USING(id) WHERE items.id=?1",[&query.source.source_id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(storage)?.ok_or(SourceError::NotFound)?;
             let item: Item = postcard::from_bytes(&metadata).map_err(storage)?;
             (epoch, length, SourceMetadata::from_item(&item))
         };
         let metadata = metadata.ok_or(SourceError::Unsupported)?;
         let epoch = SourceEpoch {
-            incarnation: self.source_incarnation,
+            incarnation: store.source_incarnation,
             revision: epoch,
         };
         if query
@@ -244,7 +244,7 @@ impl Store {
         // exact; an invalid interior-byte offset is rejected, never rounded.
         let end = query.offset.saturating_add(query.limit).min(until);
         let bytes = if let Some(agent) = &query.source.agent_id {
-            let mut statement=self.db.prepare_cached("SELECT substr(data,MAX(?3-position,0)+1,MIN(position+length(data),?4)-MAX(position,?3)) FROM child_source_chunks WHERE agent=?1 AND id=?2 AND position>=COALESCE((SELECT MAX(position) FROM child_source_chunks WHERE agent=?1 AND id=?2 AND position<=?3),?3) AND position<?4 AND position+length(data)>?3 ORDER BY position").map_err(storage)?;
+            let mut statement=store.db.prepare_cached("SELECT substr(data,MAX(?3-position,0)+1,MIN(position+length(data),?4)-MAX(position,?3)) FROM child_source_chunks WHERE agent=?1 AND id=?2 AND position>=COALESCE((SELECT MAX(position) FROM child_source_chunks WHERE agent=?1 AND id=?2 AND position<=?3),?3) AND position<?4 AND position+length(data)>?3 ORDER BY position").map_err(storage)?;
             let rows = statement
                 .query_map(
                     params![agent, query.source.source_id, query.offset, end],
@@ -257,7 +257,7 @@ impl Store {
             }
             bytes
         } else {
-            self.field(&query.source.source_id, 0, query.offset, end)
+            store.field(&query.source.source_id, 0, query.offset, end)
                 .map_err(storage)?
         };
         if bytes.len() != end - query.offset {
@@ -283,8 +283,8 @@ impl Store {
             complete: next_offset == until,
             metadata,
         })
+        })
     }
-
     fn flush_child_source(&mut self) -> Result<(), String> {
         if let Some(pending) = self.pending_child_source.take() {
             if let Err(error) = self.append_child_source(&pending) {
