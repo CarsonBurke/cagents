@@ -2199,7 +2199,11 @@ impl SourceControlModel {
         Self::ready_for_tab(key, snapshot, true)
     }
 
-    pub fn ready_for_tab(key: ActiveWorktreeKey, snapshot: &RepositorySnapshot, browse_files: bool) -> Self {
+    pub fn ready_for_tab(
+        key: ActiveWorktreeKey,
+        snapshot: &RepositorySnapshot,
+        browse_files: bool,
+    ) -> Self {
         let worktree_id = key.worktree_id;
         // The header's label and the branch a push names come from the same
         // `HEAD` and are not the same value: the label is a lossy decoding of
@@ -2248,8 +2252,13 @@ impl SourceControlModel {
             &paths
         };
         let mut files = if browse_files {
-            file_rows_from_tree(build_file_tree_with_directories(paths, &snapshot.files.ignored_directories))
-        } else { Vec::new() };
+            file_rows_from_tree(build_file_tree_with_directories(
+                paths,
+                &snapshot.files.ignored_directories,
+            ))
+        } else {
+            Vec::new()
+        };
         let ignored: BTreeSet<_> = snapshot.files.ignored.iter().collect();
         let ignored_directories: BTreeSet<_> = snapshot
             .files
@@ -3005,6 +3014,33 @@ impl SidebarState {
         visible: &[SelectionRow],
     ) {
         self.rows.select(row, intent, visible);
+    }
+
+    /// Navigation can point at another project while an editor remains active.
+    /// Keep those explicit targets live alongside the active workspace.
+    pub fn git_watch_targets(&self) -> Vec<(ProjectId, Option<WorktreeId>)> {
+        let mut targets = Vec::new();
+        if let Some(selection) = self.selection {
+            targets.push(match selection {
+                SidebarSelection::Project(project_id)
+                | SidebarSelection::PullRequest { project_id, .. } => (project_id, None),
+                SidebarSelection::Worktree {
+                    project_id,
+                    worktree_id,
+                } => (project_id, Some(worktree_id)),
+            });
+        }
+        for row in self.rows.iter() {
+            let target = match row {
+                SelectionRow::Project(project_id) => (project_id, None),
+                SelectionRow::Worktree(project_id, worktree_id) => (project_id, Some(worktree_id)),
+                SelectionRow::Channel(_) => continue,
+            };
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+        targets
     }
 
     pub fn selected_rows(&self, visible: &[SelectionRow]) -> Vec<SelectionRow> {
