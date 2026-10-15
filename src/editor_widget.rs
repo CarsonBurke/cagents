@@ -4007,6 +4007,7 @@ mod tests {
         let snapshot=content.search_snapshot();
         assert!(!snapshot.source.is_materialized());
         assert_eq!(snapshot.find_matches("target",||false).unwrap().len(),50_000);
+        assert_eq!(snapshot.find_matches_with("tar(get)",crate::editor_search::FindOptions{regex:true,..Default::default()},||false).unwrap().unwrap().len(),50_000);
         assert!(!snapshot.source.is_materialized());
         assert_eq!(take_text_call_count(),0);
     }
