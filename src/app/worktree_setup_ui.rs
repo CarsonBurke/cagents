@@ -345,6 +345,7 @@ impl Cagents {
                         return Err("Unexpected worktree setup recovery response".into());
                     };
                     if returned != path { return Err("The daemon resumed a different worktree setup".into()); }
+                    validate_resumed_setup(&path, expected.run_id, run_id, setup.as_ref())?;
                     return Ok(ReviewCompletion::Remote { path, run_id, setup, warnings, skipped: intent.skip });
                 }
                 let store = store.ok_or("The setup journal is unavailable")?;
@@ -421,6 +422,19 @@ fn setup_control_request(operation: crate::worktree_control::Operation) -> Resul
         crate::device_service::Reply::Worktree(reply) => Ok(reply),
         _ => Err("Unexpected selected-device worktree response".into()),
     }
+}
+
+fn validate_resumed_setup(path: &Path, previous: Option<OperationId>, run: OperationId, setup: Option<&crate::worktree_control::Setup>) -> Result<(), String> {
+    if previous == Some(run) { return Err("The daemon returned a stale setup run receipt".into()); }
+    if let Some(setup) = setup {
+        if setup.run_id != Some(run) { return Err("The setup result has a different run identity".into()); }
+        if let Some(terminal) = &setup.terminal {
+            let marked = terminal.launch.environment.get("CAGENTS_WORKTREE_SETUP").map(String::as_str) == Some("1")
+                && terminal.launch.environment.get("CAGENTS_WORKTREE_SETUP_ID").is_some_and(|id| id == &run.to_string());
+            if terminal.launch.working_directory != path || !marked { return Err("The setup terminal does not match its worktree and run receipt".into()); }
+        }
+    }
+    Ok(())
 }
 
 fn daemon_setup_review(repository: &Path, path: &Path) -> Result<ReviewSnapshot, String> {
@@ -803,6 +817,23 @@ mod tests {
         assert!(review.error.unwrap().contains("still active"));
         assert!(decode_daemon_setup_review(crate::worktree_control::Reply::StaleLock { unlocked: false }).is_err());
         assert!(decode_daemon_setup_review(crate::worktree_control::Reply::SetupIntent { creation_id: OperationId::new(), primary: "/repo".into(), intent: "invalid".into(), current_plan: None, plan_error: None, trusted: false, active: false }).is_err());
+    }
+
+    #[test]
+    fn resumed_terminal_receipts_must_match_the_new_run_and_destination() {
+        let path = Path::new("/repo/setup"); let previous = OperationId::new(); let current = OperationId::new();
+        let mut setup = crate::worktree_control::Setup { command: "printf setup".into(), run_id: Some(current), terminal: None, error: None };
+        assert!(validate_resumed_setup(path, Some(previous), current, Some(&setup)).is_ok());
+        assert!(validate_resumed_setup(path, Some(current), current, Some(&setup)).is_err());
+        setup.run_id = Some(previous);
+        assert!(validate_resumed_setup(path, Some(previous), current, Some(&setup)).is_err());
+        setup.run_id = Some(current);
+        let mut session = fresh_terminal_session(LaunchRecipe::shell(path.into()).unwrap());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+        session.launch.environment.insert("CAGENTS_WORKTREE_SETUP_ID".into(), current.to_string());
+        setup.terminal = Some(session);
+        assert!(validate_resumed_setup(path, Some(previous), current, Some(&setup)).is_ok());
+        assert!(validate_resumed_setup(Path::new("/repo/other"), Some(previous), current, Some(&setup)).is_err());
     }
 
     #[test]
