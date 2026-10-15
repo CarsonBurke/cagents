@@ -2618,7 +2618,7 @@ pub(super) fn resolve_upgrade(
     if sources.as_ref().is_some_and(|sources| {
         sources
             .iter()
-            .any(|previous| crate::upgrade::handoff::issued_chat_matches(&previous.source, source))
+            .any(|previous| crate::upgrade::handoff::issued_chat_source_matches(previous, source))
     }) {
         return Ok(session);
     }
@@ -2974,6 +2974,7 @@ pub(super) fn close_terminal_actor(
     };
     drop(state);
     if let Some(record) = removed {
+        super::state::retire_recovered_upgrade_chat(host, record.session.id);
         super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     Ok(())
@@ -3946,6 +3947,9 @@ for line in sys.stdin:
         let mut wrong_source = saved.source.clone();
         wrong_source.proof = restored.proof;
         assert!(resolve_upgrade(&host, &wrong_source).is_err());
+        let mut unrelated_thread = saved.source.clone();
+        unrelated_thread.launch.session_id = Some("98765432-1234-4234-8234-123456789abc".into());
+        assert!(resolve_upgrade(&host, &unrelated_thread).is_err());
         assert!(restore_upgrade(&host, &saved).is_err());
         let handle = host.lock().unwrap_or_else(|p| p.into_inner()).chats[&saved.source.id]
             .handle
@@ -3973,6 +3977,36 @@ for line in sys.stdin:
             handle.failure().is_some(),
             "the rejected session remains diagnosed"
         );
+    }
+
+    #[test]
+    fn terminal_close_retires_only_the_exact_closed_actors_recovered_pane_aliases() {
+        let (directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let replacement = resolve_upgrade(&host, &saved.source).unwrap();
+        let evidence = Arc::new(crate::upgrade::handoff::Store::open(directory.path()).unwrap());
+        evidence.record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+            evidence: saved.clone(), replacement: replacement.clone(), aliases: Vec::new(),
+        }]).unwrap();
+        let handle = {
+            let mut state = host.lock().unwrap();
+            state.upgrade_evidence = Some(evidence.clone());
+            state.chats[&saved.source.id].handle.clone()
+        };
+        assert!(evidence.recovered_sources(&saved.source, &replacement).unwrap().is_some());
+        close_terminal_actor(&host, saved.source.id, &handle).unwrap();
+        assert!(!host.lock().unwrap().chats.contains_key(&saved.source.id));
+        assert!(evidence.recovered_sources(&saved.source, &replacement).unwrap().is_none());
+        // An old close receipt must not clear evidence for another live actor.
+        restore_upgrade(&host, &saved).unwrap();
+        let replacement = resolve_upgrade(&host, &saved.source).unwrap();
+        evidence.record_recovered(&[crate::upgrade::handoff::RecoveredChat {
+            evidence: saved.clone(), replacement: replacement.clone(), aliases: Vec::new(),
+        }]).unwrap();
+        close_terminal_actor(&host, saved.source.id, &handle).unwrap();
+        assert!(evidence.recovered_sources(&saved.source, &replacement).unwrap().is_some());
+        let current = host.lock().unwrap().chats[&saved.source.id].handle.clone();
+        close_terminal_actor(&host, saved.source.id, &current).unwrap();
     }
 
     #[test]
@@ -4004,7 +4038,7 @@ for line in sys.stdin:
             );
         }
         assert_eq!(resolve_upgrade(&host, &saved.source).unwrap(), restored);
-        for mutation in 0..3 {
+        for mutation in 0..4 {
             let mut changed = saved.source.clone();
             match mutation {
                 0 => {
@@ -4018,6 +4052,7 @@ for line in sys.stdin:
                         .environment
                         .insert("HOME".into(), "/another-account".into());
                 }
+                2 => changed.launch.session_id = Some("98765432-1234-4234-8234-123456789abc".into()),
                 _ => changed
                     .launch
                     .recipe

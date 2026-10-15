@@ -872,20 +872,20 @@ pub(crate) mod handoff {
             && saved.id == source.id
             && saved.launch.provider == source.launch.provider
             && saved.launch.recipe == source.launch.recipe
+            && source.launch.session_id.as_ref().is_none_or(|id| saved.launch.session_id.as_ref() == Some(id))
             && saved.owned_codex_listener == source.owned_codex_listener
-            && saved.terminal.as_ref().map(|terminal| {
-                (
-                    &terminal.id,
-                    &terminal.launch,
-                    terminal.continuity.live_proof(),
-                )
-            }) == source.terminal.as_ref().map(|terminal| {
-                (
-                    &terminal.id,
-                    &terminal.launch,
-                    terminal.continuity.live_proof(),
-                )
-            })
+            && saved.terminal == source.terminal
+    }
+
+    /// An early pane may have learned the exact effective thread after its
+    /// immutable descriptor was issued. Only identities recorded by this
+    /// authenticated source or its effective restart qualify as that alias.
+    #[cfg(feature = "host")]
+    pub(crate) fn issued_chat_source_matches(saved: &ChatSource, source: &chat::Session) -> bool {
+        if issued_chat_matches(&saved.source, source) { return true; }
+        let mut confirmed = saved.source.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        issued_chat_matches(&confirmed, source)
     }
 
     /// Publish the descriptor windows were issued, with only its confirmed
@@ -1234,6 +1234,13 @@ pub(crate) mod handoff {
                     .iter()
                     .find(|old| old.replacement.id == entry.replacement.id)
                 {
+                    for previous in old.evidence.previous_sources.iter().chain(std::iter::once(&ChatSource {
+                        source: old.evidence.source.clone(), launch: old.evidence.launch.clone(),
+                    })) {
+                        let mut confirmed = previous.source.clone();
+                        confirmed.launch.session_id = previous.launch.session_id.clone();
+                        if !entry.aliases.contains(&confirmed) { entry.aliases.push(confirmed); }
+                    }
                     for alias in old
                         .aliases
                         .iter()
@@ -1297,7 +1304,7 @@ pub(crate) mod handoff {
                 });
                 if aliases
                     .iter()
-                    .any(|alias| issued_chat_matches(&alias.source, source))
+                    .any(|alias| issued_chat_source_matches(alias, source))
                 {
                     return Ok(Some(aliases));
                 }
