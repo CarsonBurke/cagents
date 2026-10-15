@@ -100,13 +100,29 @@ impl Cagents {
         Ok(true)
     }
 
+    /// Qualification attaches retained owners without waking their offscreen
+    /// rendering surface or replaying a terminal launch recipe.
+    pub(super) fn qualify_startup_terminals(&mut self) -> Task<Message> {
+        for card in &self.durable.cards {
+            if card.existence.is_open()
+                && matches!(&card.kind, CardKind::Terminal(session) if !terminal_ended(session))
+                && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
+                && !self.restored_agent_attaches.contains(&card.id)
+            {
+                self.restored_agent_attaches.push_back(card.id);
+            }
+        }
+        self.attach_next_restored_agent()
+    }
+
     pub(super) fn begin_startup_gate(&mut self) -> Task<Message> {
         if !instance::ui_launch_handshake_requested() {
             return report(Ok(()));
         }
         self.startup_gate.opened = Some(Instant::now());
         let count = self.startup_conversation_count();
-        cosmic::task::future(async move {
+        let attach = self.qualify_startup_terminals();
+        let progress = cosmic::task::future(async move {
             match tokio::task::spawn_blocking(move || instance::report_ui_recovery_progress(count))
                 .await
             {
@@ -114,7 +130,8 @@ impl Cagents {
                 Ok(Err(error)) => Message::StartupReported(Err(error.to_string())),
                 Err(error) => Message::StartupReported(Err(error.to_string())),
             }
-        })
+        });
+        Task::batch([progress, attach])
     }
 
     pub(super) fn verify_startup_gate(&mut self) -> Task<Message> {
