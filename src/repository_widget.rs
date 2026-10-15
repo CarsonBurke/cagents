@@ -2900,6 +2900,14 @@ impl RepositoryRuntime {
         })
     }
 
+    /// Whether a comparison reader already owns the single refresh slot.
+    pub fn comparison_refresh_pending(&self) -> bool {
+        matches!(self.basis_resolution, Some(BasisResolution::Resolving(_)))
+            || self.diffs.iter().any(|(_, state)| matches!(state, DiffState::Loading { .. }))
+            || self.working_diff.active.is_some()
+            || self.working_diff.timer.is_some()
+    }
+
     /// Called by the shared Git watcher after index/ref changes. Immutable
     /// history comparisons retain their object identities and mounted model.
     pub fn refresh_open_comparison(&mut self, card: CardId) -> Task<RepositoryAction> {

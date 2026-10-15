@@ -91,6 +91,9 @@ struct Tab {
     mutation: Option<MutationKind>,
     snapshot_loading: bool,
     snapshot_refresh_pending: bool,
+    comparison_stamp: Option<(PathBuf, DiffBasis, cagents::repository::RepositoryMetadataStamp)>,
+    comparison_probe: Option<u64>,
+    next_comparison_probe: u64,
     /// The pull request review behind the sidebar's Pull requests panel. It
     /// lists the GitHub repository the worktree's remotes name and drives
     /// `runtime` through the files of whichever pull request is open.
@@ -144,6 +147,13 @@ pub enum Message {
     WindowResized(iced::Size),
     RefreshVisible,
     RefreshDocuments,
+    ComparisonMetadata {
+        card: CardId,
+        request: u64,
+        path: PathBuf,
+        basis: DiffBasis,
+        result: Result<cagents::repository::RepositoryMetadataStamp, String>,
+    },
     /// The shell's light or dark mode changed, so a rendered document page no
     /// longer matches the surface it sits on.
     DocumentToneStale,
@@ -663,6 +673,15 @@ impl SidebarTransition {
 
 fn repository_task(task: iced::Task<RepositoryAction>) -> Task<Message> {
     task.map(Message::Repository).map(cosmic::Action::App)
+}
+
+fn same_live_comparison(left: &DiffBasis, right: &DiffBasis) -> bool {
+    match (left, right) {
+        (DiffBasis::IndexToWorktree, DiffBasis::IndexToWorktree)
+        | (DiffBasis::HeadToIndex, DiffBasis::HeadToIndex) => true,
+        (DiffBasis::MergeBaseToHead { base_ref: left, .. }, DiffBasis::MergeBaseToHead { base_ref: right, .. }) => left == right,
+        _ => false,
+    }
 }
 
 /// Whether a repository action is allowed to land while a modal is up.
@@ -1531,6 +1550,9 @@ impl Editor {
             mutation,
             snapshot_loading: false,
             snapshot_refresh_pending: false,
+            comparison_stamp: None,
+            comparison_probe: None,
+            next_comparison_probe: 0,
             review,
         });
         if self.active.is_none() || (focus && !self.modal_open()) {
@@ -2287,9 +2309,44 @@ impl Editor {
 
     fn refresh_documents(&mut self) -> Task<Message> {
         if !self.can_refresh_visible() { return Task::none(); }
-        Task::batch(self.tabs.iter_mut().map(|tab| {
-            repository_task(tab.runtime.refresh_open_document(tab.id))
-        }).collect::<Vec<_>>())
+        let mut tasks = Vec::new();
+        for tab in &mut self.tabs {
+            tasks.push(repository_task(tab.runtime.refresh_open_document(tab.id)));
+            let basis = tab.runtime.selected_diff_basis();
+            if !tab.git || matches!(basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
+                || tab.comparison_probe.is_some() { continue; }
+            let Some(path) = tab.runtime.selected_path().map(Path::to_path_buf) else { continue; };
+            let basis = basis.clone();
+            let worktree = tab.runtime.descriptor.worktree.clone();
+            let card = tab.id;
+            tab.next_comparison_probe = tab.next_comparison_probe.wrapping_add(1).max(1);
+            let request = tab.next_comparison_probe;
+            tab.comparison_probe = Some(request);
+            tasks.push(cosmic::task::future(async move {
+                let observed = basis.clone();
+                let result = tokio::task::spawn_blocking(move || cagents::repository::repository_metadata_stamp(&worktree, &observed))
+                    .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
+                Message::ComparisonMetadata { card, request, path, basis, result }
+            }));
+        }
+        Task::batch(tasks)
+    }
+
+    fn comparison_metadata(&mut self, card: CardId, request: u64, path: PathBuf, basis: DiffBasis, result: Result<cagents::repository::RepositoryMetadataStamp, String>) -> Task<Message> {
+        let Some(tab) = self.tab_mut(card) else { return Task::none(); };
+        if tab.comparison_probe != Some(request) { return Task::none(); }
+        tab.comparison_probe = None;
+        if tab.runtime.selected_path() != Some(path.as_path()) || tab.runtime.selected_diff_basis() != &basis { return Task::none(); }
+        let stamp = match result {
+            Ok(stamp) => stamp,
+            Err(error) => { self.notice = Some(format!("Could not refresh the comparison: {error}")); return Task::none(); }
+        };
+        // A changed stamp must remain unacknowledged while an earlier diff is
+        // running. The next metadata tick retries after that slot completes.
+        if tab.runtime.comparison_refresh_pending() { return Task::none(); }
+        if tab.comparison_stamp.as_ref().is_some_and(|(old_path, old_basis, old)| old_path == &path && same_live_comparison(old_basis, &basis) && old == &stamp) { return Task::none(); }
+        tab.comparison_stamp = Some((path, basis, stamp));
+        repository_task(tab.runtime.refresh_open_comparison(card))
     }
 
     fn refresh(&mut self, id: CardId) -> Task<Message> {
@@ -3180,6 +3237,7 @@ impl Application for Editor {
                     Task::batch([self.refresh_visible(), self.flush_document_tone()])
                 }
                 Message::RefreshDocuments => self.refresh_documents(),
+                Message::ComparisonMetadata { card, request, path, basis, result } => self.comparison_metadata(card, request, path, basis, result),
                 Message::DocumentToneStale => {
                     self.document_tone_stale = self.settings.app_theme == AppTheme::System;
                     self.flush_document_tone()
@@ -7486,6 +7544,100 @@ mod tests {
         drop(app.update(Message::NewTab));
         assert!(app.tabs.is_empty());
         assert!(!directory.path().join("untitled").exists());
+    }
+
+    #[test]
+    fn comparison_metadata_refreshes_staged_content_without_a_working_file_change() {
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "staged first\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        std::fs::write(root.join("tracked.txt"), "working stays\n").unwrap();
+        let mut app = editor();
+        let card = open_real_git(&mut app, root, Some("tracked.txt"));
+        app.window_focused = true;
+        let task = app.update(Message::Repository(RepositoryAction::ApplyDiffBasis { card, basis: DiffBasis::HeadToIndex }));
+        run_tasks(&mut app, task);
+        let task = app.update(Message::RefreshDocuments);
+        let probe = app.tab(card).unwrap().comparison_probe;
+        assert!(probe.is_some());
+        let repeated = app.update(Message::RefreshDocuments);
+        assert_eq!(app.tab(card).unwrap().comparison_probe, probe);
+        run_tasks(&mut app, repeated);
+        run_tasks(&mut app, task);
+        assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(1));
+        let input = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(input.path(), "staged one\nstaged two\nstaged three\n").unwrap();
+        let blob = git(root, &["hash-object", "-w", input.path().to_str().unwrap()]);
+        git(root, &["update-index", "--cacheinfo", "100644", &blob, "tracked.txt"]);
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        let tab = app.tab(card).unwrap();
+        assert_eq!(tab.runtime.inspector_context().diff_additions, Some(3));
+        assert_eq!(tab.runtime.editor_text().as_deref(), Some("working stays\n"));
+        let stamp = tab.comparison_stamp.as_ref().unwrap().2.clone();
+        app.tab_mut(card).unwrap().comparison_probe = Some(900);
+        let unchanged = app.comparison_metadata(card, 900, "tracked.txt".into(), DiffBasis::HeadToIndex, Ok(stamp.clone()));
+        assert!(iced::runtime::task::into_stream(unchanged).is_none());
+        assert!(!app.tab(card).unwrap().runtime.comparison_refresh_pending());
+        app.tab_mut(card).unwrap().comparison_probe = Some(902);
+        drop(app.comparison_metadata(card, 902, "tracked.txt".into(), DiffBasis::HeadToIndex, Err("temporary metadata error".into())));
+        assert!(app.tab(card).unwrap().comparison_probe.is_none());
+        assert_eq!(app.tab(card).unwrap().comparison_stamp.as_ref().unwrap().2, stamp);
+
+        // Do not acknowledge an observation while the previous reader owns
+        // the slot: the next tick must reconsider it after completion.
+        let pending = app.tab_mut(card).unwrap().runtime.refresh_open_comparison(card);
+        app.tab_mut(card).unwrap().comparison_stamp = None;
+        app.tab_mut(card).unwrap().comparison_probe = Some(901);
+        drop(app.comparison_metadata(card, 901, "tracked.txt".into(), DiffBasis::HeadToIndex, Ok(stamp)));
+        assert!(app.tab(card).unwrap().comparison_stamp.is_none());
+        run_tasks(&mut app, repository_task(pending));
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert!(app.tab(card).unwrap().comparison_stamp.is_some());
+    }
+
+    #[test]
+    fn comparison_metadata_refreshes_live_branch_refs_and_preserves_historical_ranges() {
+        use cagents::repository::{Oid, ValidatedRefName};
+        let directory = git_fixture();
+        let root = directory.path();
+        let initial = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
+        git(root, &["checkout", "-b", "topic"]);
+        std::fs::write(root.join("tracked.txt"), "topic one\ntopic two\n").unwrap();
+        git(root, &["add", "tracked.txt"]);
+        git(root, &["commit", "-m", "Topic"]);
+        let head = Oid::parse_object(git(root, &["rev-parse", "HEAD"])).unwrap();
+        let reference = ValidatedRefName::parse("refs/heads/main").unwrap();
+        let live = DiffBasis::MergeBaseToHead { base_ref: reference.clone(), head: head.clone(), merge_base: initial.clone() };
+        let mut app = editor();
+        let card = open_real_git(&mut app, root, Some("tracked.txt"));
+        app.window_focused = true;
+        let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("tracked.txt").unwrap(), old_path: None, basis: live }));
+        run_tasks(&mut app, task);
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &initial));
+        git(root, &["update-ref", "refs/heads/main", head.as_str()]);
+        let task = app.update(Message::RefreshDocuments);
+        run_tasks(&mut app, task);
+        assert!(matches!(app.tab(card).unwrap().runtime.selected_diff_basis(), DiffBasis::MergeBaseToHead { merge_base, .. } if merge_base == &head));
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "topic one\ntopic two\n");
+
+        for basis in [
+            DiffBasis::CommitToParent { oid: head.clone(), parent: Some(initial.clone()) },
+            DiffBasis::PullRequest { number: 1, base_ref: reference, head: head.clone(), merge_base: initial.clone() },
+        ] {
+            let task = app.update(Message::Repository(RepositoryAction::OpenCommittedFile { card, path: RepoPath::parse("tracked.txt").unwrap(), old_path: None, basis: basis.clone() }));
+            run_tasks(&mut app, task);
+            git(root, &["update-ref", "refs/heads/main", initial.as_str()]);
+            let task = app.update(Message::RefreshDocuments);
+            assert!(app.tab(card).unwrap().comparison_probe.is_none());
+            run_tasks(&mut app, task);
+            assert_eq!(app.tab(card).unwrap().runtime.selected_diff_basis(), &basis);
+            assert_eq!(app.tab(card).unwrap().runtime.inspector_context().diff_additions, Some(2));
+        }
     }
 
     #[test]
