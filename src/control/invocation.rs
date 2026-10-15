@@ -116,9 +116,12 @@ pub(crate) fn coordination(argv: &[String], stdin: Text) -> Option<Kind> {
                 action,
             }),
             AgentCommand::Interrupt { agent, .. } => Kind::Act(Act::Interrupt { agent }),
-            AgentCommand::Close { agent } => Kind::Act(Act::Close {
+            AgentCommand::Close {
+                agent: Some(agent), ..
+            } => Kind::Act(Act::Close {
                 agents: vec![agent],
             }),
+            AgentCommand::Close { agent: None, .. } => Kind::Act(Act::Cli(subcommand_path(argv))),
             AgentCommand::Console { .. } => return None,
         },
         // The rest manage the application rather than other agents, and are

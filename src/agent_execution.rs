@@ -25,9 +25,121 @@ pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 pub const MAX_CHILDREN: usize = 64;
-pub const MAX_PARENT_RUNNING: usize = 8;
-pub const MAX_RUNNING: usize = 32;
+pub const DEFAULT_CALLER_CONCURRENCY: usize = 8;
+pub const DEFAULT_GLOBAL_CONCURRENCY: usize = 32;
+/// Bound each teardown RPC so callers can display progress between batches.
+pub const INTERRUPTED_CLEANUP_BATCH: usize = 4;
 pub const MAX_PARENT_DEPTH: usize = 8;
+/// Reservations include active runs and interrupted agents whose provider ownership
+/// has not yet been explicitly closed. Limits apply to authenticated origins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConcurrencyLimits {
+    pub caller: usize,
+    pub global: usize,
+}
+impl Default for ConcurrencyLimits {
+    fn default() -> Self {
+        Self {
+            caller: DEFAULT_CALLER_CONCURRENCY,
+            global: DEFAULT_GLOBAL_CONCURRENCY,
+        }
+    }
+}
+impl ConcurrencyLimits {
+    pub fn validate(self) -> Result<(), &'static str> {
+        if self.caller == 0 || self.global == 0 || self.caller > 4096 || self.global > 4096 {
+            return Err("Agent concurrency limits must be between 1 and 4096");
+        }
+        Ok(())
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapacityScope {
+    Caller,
+    Global,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityHolder {
+    pub id: AgentId,
+    pub run: RunId,
+    pub state: State,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capacity {
+    pub running: usize,
+    pub limit: usize,
+    pub scope: CapacityScope,
+    pub holders: Vec<CapacityHolder>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapacityReport {
+    pub caller: Capacity,
+    pub global: Capacity,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LimitReached {
+    pub capacity: Capacity,
+    pub retryable: bool,
+}
+impl std::fmt::Display for LimitReached {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Agent {:?} concurrency limit reached ({}/{} reservations)",
+            self.capacity.scope, self.capacity.running, self.capacity.limit
+        )?;
+        for holder in &self.capacity.holders {
+            write!(f, "\n  {} {:?}", holder.id, holder.state)?;
+        }
+        f.write_str("\nWait for running work or close interrupted agents with `cagents agent close --interrupted`.")
+    }
+}
+#[derive(Debug, thiserror::Error)]
+pub enum AcceptanceError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
+    LimitReached(LimitReached),
+}
+impl From<String> for AcceptanceError {
+    fn from(value: String) -> Self {
+        Self::Invalid(value)
+    }
+}
+impl From<&str> for AcceptanceError {
+    fn from(value: &str) -> Self {
+        Self::Invalid(value.into())
+    }
+}
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CloseInterrupted {
+    pub closed: Vec<AgentId>,
+    pub failed: Vec<CloseFailure>,
+    pub next: Option<AgentId>,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CloseFailure {
+    pub id: AgentId,
+    pub message: String,
+}
+impl CloseFailure {
+    pub fn new(id: AgentId, message: impl Into<String>) -> Self {
+        let mut message = message.into();
+        // A maximum-size cleanup batch must still fit one bounded IPC reply.
+        if message.len() > 1024 {
+            let mut end = 1024;
+            while !message.is_char_boundary(end) {
+                end -= 1;
+            }
+            message.truncate(end);
+            message.push('…');
+        }
+        Self { id, message }
+    }
+}
+
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
 
 /// Presentation routing only. Daemon ownership additionally requires its
@@ -464,6 +576,11 @@ pub enum Operation {
     PeekInbox(mailbox::Inbox),
     /// Settle exact received IDs in the authenticated recipient's mailbox.
     AcknowledgeInbox(mailbox::Receipt),
+    Capacity,
+    CloseInterrupted {
+        all: bool,
+        after: Option<AgentId>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -528,6 +645,8 @@ pub enum Reply {
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
+    Capacity(CapacityReport),
+    InterruptedClosed(CloseInterrupted),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

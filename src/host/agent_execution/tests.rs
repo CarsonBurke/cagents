@@ -2775,3 +2775,119 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         .unwrap();
     }
 }
+
+#[test]
+fn interrupted_cleanup_preserves_caller_scope_and_refuses_live_work() {
+    if isolated("interrupted_cleanup_preserves_caller_scope_and_refuses_live_work").is_some() {
+        return;
+    }
+    let (host, mut request, _) = fixture();
+    let store = registry(&host).unwrap();
+    let own = store
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, 1)
+        .unwrap();
+    request.idempotency_key = "other".into();
+    let other_origin = Origin::Automation {
+        id: uuid::Uuid::new_v4(),
+    };
+    let other = store
+        .lock()
+        .unwrap()
+        .submit_agent(&other_origin, &request, 2)
+        .unwrap();
+    store
+        .lock()
+        .unwrap()
+        .interrupt_unproven_agent_runs(3)
+        .unwrap();
+    request.idempotency_key = "active".into();
+    let active = store
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, 4)
+        .unwrap();
+    let result = close_interrupted(&host, &Authority::default(), false, None).unwrap();
+    assert_eq!(result.closed, [own.agent.id]);
+    assert!(result.failed.is_empty());
+    assert!(!store.lock().unwrap().agent(other.agent.id).unwrap().closed);
+    assert!(!store.lock().unwrap().agent(active.agent.id).unwrap().closed);
+    let result = close_interrupted(&host, &Authority::default(), true, None).unwrap();
+    assert_eq!(result.closed, [other.agent.id]);
+    assert!(result.failed.is_empty());
+    assert!(
+        close_as_origin(&host, &Origin::User, active.agent.id, true)
+            .unwrap_err()
+            .contains("no longer interrupted")
+    );
+}
+
+#[test]
+fn interrupted_cleanup_batches_progress_without_repeating_or_crossing_scope() {
+    if isolated("interrupted_cleanup_batches_progress_without_repeating_or_crossing_scope").is_some() { return; }
+    let (host, mut request, _) = fixture();
+    let store = registry(&host).unwrap();
+    let mut expected = Vec::new();
+    for index in 0..6 {
+        request.idempotency_key = format!("cleanup-page-{index}");
+        expected.push(store.lock().unwrap().submit_agent(&Origin::User, &request, index).unwrap().agent.id);
+    }
+    request.idempotency_key = "other-page".into();
+    let other_origin = Origin::Automation { id: uuid::Uuid::new_v4() };
+    let other = store.lock().unwrap().submit_agent(&other_origin, &request, 7).unwrap();
+    store.lock().unwrap().interrupt_unproven_agent_runs(8).unwrap();
+    let first = close_interrupted(&host, &Authority::default(), false, None).unwrap();
+    assert_eq!(first.closed.len(), crate::agent_execution::INTERRUPTED_CLEANUP_BATCH);
+    assert!(first.failed.is_empty());
+    let cursor = first.next.expect("remaining interrupted agents require another bounded batch");
+    let second = close_interrupted(&host, &Authority::default(), false, Some(cursor)).unwrap();
+    assert_eq!(second.closed.len(), 2);
+    assert!(second.next.is_none());
+    assert!(second.failed.is_empty());
+    let actual: std::collections::BTreeSet<_> = first.closed.into_iter().chain(second.closed).collect();
+    assert_eq!(actual, expected.into_iter().collect());
+    assert!(!store.lock().unwrap().agent(other.agent.id).unwrap().closed);
+    assert_eq!(store.lock().unwrap().agent_capacity(&Origin::User, Default::default()).unwrap().caller.running, 0);
+}
+
+#[test]
+fn saved_concurrency_settings_change_admission_without_a_daemon_restart() {
+    if isolated("saved_concurrency_settings_change_admission_without_a_daemon_restart").is_some() {
+        return;
+    }
+    use crate::agent_execution::{AcceptanceError, ConcurrencyLimits};
+    let (host, mut request, _) = fixture();
+    let first = registry(&host).unwrap().lock().unwrap()
+        .submit_agent(&Origin::User, &request, 1).unwrap();
+    let path = crate::settings::default_path().unwrap();
+    let mut settings = crate::settings::AppSettings {
+        agent_concurrency: ConcurrencyLimits { caller: 1, global: 2 },
+        ..Default::default()
+    };
+    crate::settings::save(&path, &settings).unwrap();
+    request.idempotency_key = "saved-limits-second".into();
+    let error = process_request(&host, Authority::default(), Operation::Submit(request.clone()))
+        .unwrap_err();
+    let AcceptanceError::LimitReached(details) = error else {
+        panic!("saved one-slot limit must reject a second reservation");
+    };
+    assert!(details.retryable);
+    assert_eq!(details.capacity.running, 1);
+    assert_eq!(details.capacity.limit, 1);
+    assert_eq!(details.capacity.holders[0].id, first.agent.id);
+    settings.agent_concurrency = ConcurrencyLimits { caller: 2, global: 3 };
+    crate::settings::save(&path, &settings).unwrap();
+    let Reply::Accepted(second) = process_request(&host, Authority::default(), Operation::Submit(request)).unwrap() else {
+        panic!("raised saved cap must allow acceptance immediately");
+    };
+    assert_eq!(settled(&host, second.run.id).state, State::Succeeded);
+    let Reply::Capacity(report) = process(&host, Authority::default(), Operation::Capacity).unwrap() else {
+        panic!("capacity report");
+    };
+    assert_eq!(report.caller.limit, 2);
+    assert_eq!(report.global.limit, 3);
+    close(&host, &Authority::default(), first.agent.id).unwrap();
+    close(&host, &Authority::default(), second.agent.id).unwrap();
+    super::super::finish_chat_shutdown(&host).unwrap();
+}

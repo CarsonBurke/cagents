@@ -1165,6 +1165,7 @@ impl Registry {
         now_ms: u64,
     ) -> Result<Claimed, String> {
         use crate::automations::{SkipReason, Trigger};
+        let limits = crate::host::agent_execution::concurrency_limits()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1273,7 +1274,15 @@ impl Registry {
         insert_firing(&tx, &firing, &key)?;
         let accepted = if firing.state == FiringState::Prechecking && definition.precheck.is_none()
         {
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                limits,
+                now_ms,
+            )?
         } else {
             None
         };
@@ -1297,6 +1306,7 @@ impl Registry {
         now_ms: u64,
     ) -> Result<Option<crate::agent_execution::Accepted>, String> {
         use crate::{automations::SkipReason, host::automations::precheck::Outcome};
+        let limits = crate::host::agent_execution::concurrency_limits()?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1350,7 +1360,15 @@ impl Registry {
         } else {
             let definition = read_definition(&tx, firing.automation, firing.revision)?;
             let key = occurrence_key(firing.revision, &firing.trigger);
-            accept_firing(&tx, &mut automation, &mut firing, &definition, &key, now_ms)?
+            accept_firing(
+                &tx,
+                &mut automation,
+                &mut firing,
+                &definition,
+                &key,
+                limits,
+                now_ms,
+            )?
         };
         if !firing.state.is_active() {
             firing.finished_ms = Some(now_ms);
@@ -1374,6 +1392,7 @@ fn accept_firing(
     firing: &mut Firing,
     definition: &Definition,
     key: &str,
+    limits: crate::agent_execution::ConcurrencyLimits,
     now_ms: u64,
 ) -> Result<Option<crate::agent_execution::Accepted>, String> {
     use crate::{
@@ -1402,12 +1421,14 @@ fn accept_firing(
     // a savepoint keeps that same guarantee inside the firing transaction.
     tx.execute_batch("SAVEPOINT automation_accept")
         .map_err(|error| error.to_string())?;
-    let accepted = Registry::submit_agent_in(
+    let accepted = Registry::submit_agent_in_with_limits(
         tx,
         &Origin::Automation { id: automation.id },
         &request,
+        limits,
         now_ms,
-    );
+    )
+    .map_err(|error| error.to_string());
     match accepted {
         Ok(accepted) => {
             if automation.channel.is_none()
