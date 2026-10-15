@@ -3910,10 +3910,7 @@ impl Application for Editor {
                         .map(cosmic::Action::App);
                     let report = self.report_review_requests();
                     for tab in &mut self.tabs {
-                        tab.review.clear_external_review_requests();
-                        for (repository, snapshot) in self.review_requests.snapshots() {
-                            tab.review.apply_review_requests(repository, snapshot);
-                        }
+                        tab.review.sync_review_requests(self.review_requests.snapshots());
                     }
                     Task::batch([task, report])
                 }

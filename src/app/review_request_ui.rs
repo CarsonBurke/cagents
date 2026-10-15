@@ -89,10 +89,7 @@ impl Cagents {
         }
         for runtime in self.cards.values_mut() {
             if let CardRuntime::PullRequests(pane) = runtime {
-                pane.review.clear_external_review_requests();
-                for (repository, snapshot) in self.refresh_ui.review_requests.snapshots() {
-                    pane.review.apply_review_requests(repository, snapshot);
-                }
+                pane.review.sync_review_requests(self.refresh_ui.review_requests.snapshots());
             }
         }
         self.review_alert_focus_changed();

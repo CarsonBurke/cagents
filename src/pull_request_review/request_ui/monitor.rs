@@ -220,11 +220,17 @@ impl Monitor {
                 if applied.is_err() {
                     entry.scan.failed_history(&work);
                 }
-                entry.snapshot = Arc::new(Snapshot {
-                    viewer: entry.scan.viewer.clone(),
-                    requested: entry.scan.requested.clone(),
-                    error: applied.err(),
-                });
+                let error = applied.err();
+                if entry.snapshot.viewer != entry.scan.viewer
+                    || entry.snapshot.requested != entry.scan.requested
+                    || entry.snapshot.error != error
+                {
+                    entry.snapshot = Arc::new(Snapshot {
+                        viewer: entry.scan.viewer.clone(),
+                        requested: entry.scan.requested.clone(),
+                        error,
+                    });
+                }
                 // A pass that met a failure keeps backing off until it
                 // settles, so one timeline that always fails cannot reset the
                 // backoff through the pages read between its attempts.
@@ -329,6 +335,33 @@ mod tests {
             next_cursor: None,
         })
     }
+    #[test]
+    fn identical_completed_reads_preserve_the_shared_snapshot() {
+        let mut monitor = Monitor::default();
+        let repository = GitHubRepoKey::new("github.com", None, "o", "r").unwrap();
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        let load = |monitor: &mut Monitor, reply: Reply| {
+            let (_, generation) = monitor.busy.clone().expect("read admitted");
+            drop(monitor.update(Action::Loaded {
+                repository: repository.clone(), generation,
+                work: Work::Page { cursor: None }, result: Ok(reply),
+            }, [repository.clone()]));
+        };
+        load(&mut monitor, reply("viewer", None));
+        let original = Arc::clone(&monitor.entries[&repository].snapshot);
+        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+        monitor.paced = None;
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        load(&mut monitor, reply("viewer", None));
+        assert!(Arc::ptr_eq(&original, &monitor.entries[&repository].snapshot));
+        monitor.entries.get_mut(&repository).unwrap().due = Instant::now();
+        monitor.paced = None;
+        drop(monitor.update(Action::Tick, [repository.clone()]));
+        load(&mut monitor, reply("new-viewer", None));
+        assert!(!Arc::ptr_eq(&original, &monitor.entries[&repository].snapshot));
+        assert_eq!(monitor.entries[&repository].snapshot.viewer.as_ref().unwrap().id, "new-viewer");
+    }
+
     #[test]
     fn reads_spend_a_burst_then_one_per_pace() {
         let mut monitor = Monitor::default();
