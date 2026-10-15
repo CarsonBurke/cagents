@@ -4,6 +4,7 @@ mod automations;
 mod chat;
 mod client;
 mod delivery;
+mod deferred;
 pub(crate) mod descriptor_limit;
 mod lock;
 mod model;

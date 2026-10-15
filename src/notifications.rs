@@ -90,6 +90,22 @@ pub struct Evidence {
     pub kind: Kind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RequestType {
+    Approval,
+    Question,
+    Consent,
+}
+
+/// Opt-in semantic context captured at the authoritative event boundary.
+/// Producers bound and sanitize it; delivery applies the preview preference.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Content {
+    pub conversation: String,
+    pub preview: String,
+    pub request: Option<RequestType>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Event {
     pub target: Target,

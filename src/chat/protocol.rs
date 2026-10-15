@@ -8,7 +8,7 @@ mod claude_edits;
 mod claude_permissions;
 pub mod codex;
 pub mod omp;
-mod terminal_output;
+pub(crate) use super::terminal_output;
 
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
@@ -94,11 +94,49 @@ struct LaunchOwnership {
 #[derive(Default)]
 pub(crate) struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
+    owned_directory: std::sync::Mutex<Option<std::sync::Arc<std::fs::File>>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
+    provider_directory: std::sync::Mutex<Option<PathBuf>>,
 }
 
 impl ExecutionContext {
+    /// Pin the selected directory before an ordinary native provider starts.
+    /// The descriptor remains authoritative after a same-filesystem move;
+    /// opening a replacement at the old spelling never changes its identity.
+    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let relative = path
+            .strip_prefix("/")
+            .map_err(|_| "The selected provider directory must be absolute".to_owned())?;
+        let root = crate::fs_safety::Root::open("/".as_ref()).map_err(|error| error.to_string())?;
+        let directory = if relative.as_os_str().is_empty() {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open("/")
+                .map_err(|error| error.to_string())
+        } else {
+            crate::fs_safety::open_beneath(&root, relative).map_err(|error| error.to_string())
+        }
+        .map_err(|error| {
+            format!(
+                "Cannot pin the selected provider directory {}: {error}",
+                path.display()
+            )
+        })?;
+        if !directory
+            .metadata()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            return Err("The selected provider directory is not a folder".into());
+        }
+        let context = Self::new(Some(std::sync::Arc::new(directory)));
+        context.verify_directory(path)?;
+        Ok(context)
+    }
+
     pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
         Self {
             directory,
@@ -114,7 +152,7 @@ impl ExecutionContext {
     pub(crate) fn directory_identity(
         &self,
     ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
-        match &self.directory {
+        match self.directory_descriptor() {
             Some(directory) => directory
                 .metadata()
                 .map(|metadata| {
@@ -125,6 +163,50 @@ impl ExecutionContext {
                 .map_err(|error| error.to_string()),
             None => Ok(self.expected_directory),
         }
+    }
+    pub(crate) fn directory_descriptor(&self) -> Option<std::sync::Arc<std::fs::File>> {
+        self.directory.clone().or_else(|| {
+            self.owned_directory
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+        })
+    }
+    /// Only positive owned-process cwd evidence may add a legacy pin. Keep
+    /// this same shared context so its launch cleanup/ownership stays intact.
+    pub(crate) fn pin_owned_directory(
+        &self,
+        directory: std::sync::Arc<std::fs::File>,
+    ) -> Result<(), String> {
+        let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+            &directory.metadata().map_err(|error| error.to_string())?,
+        );
+        if self
+            .directory_identity()?
+            .is_some_and(|approved| approved != identity)
+        {
+            return Err(
+                "The owned process directory differs from its approved launch identity".into(),
+            );
+        }
+        // A fresh launch already retains this exact inode. Avoid adding a
+        // second long-lived descriptor merely because Locate verified it.
+        if self.directory.is_some() {
+            return Ok(());
+        }
+        let mut pinned = self
+            .owned_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if let Some(previous) = pinned.as_ref()
+            && crate::agent_execution::DirectoryIdentity::from_metadata(
+                &previous.metadata().map_err(|error| error.to_string())?,
+            ) != identity
+        {
+            return Err("The approved process directory changed during capture".into());
+        }
+        *pinned = Some(directory);
+        Ok(())
     }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
@@ -171,6 +253,54 @@ impl ExecutionContext {
         }
         Ok(state.outcome)
     }
+    /// Minted only after typed preparation has pinned the private launch and
+    /// updated the adapter before initialize. A process cwd alone is no proof
+    /// of a resumed provider thread's operational directory.
+    pub(crate) fn observe_provider_directory(&self, path: &std::path::Path) -> Result<(), String> {
+        if self.directory_descriptor().is_none() {
+            return Err("Provider scope requires its admitted directory descriptor".into());
+        }
+        self.verify_directory(path)?;
+        *self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(path.to_owned());
+        Ok(())
+    }
+    pub(crate) fn provider_directory_observed(
+        &self,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        if self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_deref()
+            != Some(path)
+        {
+            return Ok(false);
+        }
+        self.verify_directory(path)?;
+        Ok(true)
+    }
+    /// Preserve an existing provider scope across a verified same-inode
+    /// relocation. A newly pinned legacy process never gains scope here.
+    pub(crate) fn relocate_observed_provider_directory(
+        &self,
+        previous: &std::path::Path,
+        path: &std::path::Path,
+    ) -> Result<bool, String> {
+        let mut observed = self
+            .provider_directory
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if observed.as_deref() != Some(previous) {
+            return Ok(false);
+        }
+        self.verify_directory(path)?;
+        *observed = Some(path.to_owned());
+        Ok(true)
+    }
     pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         let Some(expected) = self.directory_identity()? else {
             return Ok(());
@@ -207,6 +337,15 @@ pub struct ServerIdentity {
 /// An adapter is confined to one daemon worker. No UI state, subprocesses,
 /// unbounded transcript storage, credentials, or global mutable state live here.
 pub trait Adapter: Send {
+    /// Deterministically exercise provider work after the last local input poll.
+    #[cfg(test)]
+    fn after_close_input_drained(&mut self) {}
+
+    /// Refresh cached operational paths after the caller verified the same
+    /// approved directory inode. This never changes provider launch provenance.
+    fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
+        Ok(())
+    }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(
@@ -217,6 +356,26 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Providers with redundant partial snapshots can avoid allocating them.
+    fn decode(&self, bytes: &[u8]) -> Result<Value, serde_json::Error> {
+        serde_json::from_slice(bytes)
+    }
+
+    /// Housekeeping must run even when a provider stops sending frames.
+    fn tick(&mut self) -> Step {
+        Step::default()
+    }
+    fn deadline(&self) -> Option<std::time::Instant> {
+        None
+    }
+    /// A command may await provider confirmation without blocking its actor.
+    fn command_ack(&mut self) -> Option<String> {
+        None
+    }
+    fn control_replies(&mut self) -> Vec<(String, Result<(), String>)> {
+        Vec::new()
+    }
+
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.
@@ -266,6 +425,36 @@ mod launch_tests {
     }
 
     #[test]
+    fn verified_provider_scope_moves_without_granting_legacy_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("original");
+        let moved = root.path().join("moved");
+        std::fs::create_dir(&original).unwrap();
+        let observed = ExecutionContext::capture(&original).unwrap();
+        let legacy = ExecutionContext::capture(&original).unwrap();
+        observed.observe_provider_directory(&original).unwrap();
+        std::fs::rename(&original, &moved).unwrap();
+        std::fs::create_dir(&original).unwrap();
+        assert!(
+            observed
+                .relocate_observed_provider_directory(&original, &moved)
+                .unwrap()
+        );
+        assert!(observed.provider_directory_observed(&moved).unwrap());
+        assert!(
+            !legacy
+                .relocate_observed_provider_directory(&original, &moved)
+                .unwrap()
+        );
+        assert!(!legacy.provider_directory_observed(&moved).unwrap());
+        assert!(
+            observed
+                .relocate_observed_provider_directory(&moved, &original)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn uncertain_cleanup_retains_owner_until_its_receipt_proves_teardown() {
         let context = ExecutionContext::default();
         assert_eq!(context.outcome(), LaunchOutcome::NoProvider);
@@ -309,4 +498,22 @@ mod launch_tests {
             LaunchOutcome::TeardownProved
         );
     }
+}
+
+/// A byte-bounded, terminal-safe preview of untrusted protocol text.
+pub(crate) fn preview(bytes: &[u8], limit: usize) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    let mut result = String::new();
+    for ch in text.chars() {
+        let escaped: String = if ch.is_control() {
+            ch.escape_default().collect()
+        } else {
+            ch.to_string()
+        };
+        if result.len() + escaped.len() > limit {
+            break;
+        }
+        result.push_str(&escaped);
+    }
+    result
 }

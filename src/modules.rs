@@ -130,3 +130,6 @@ pub mod workspace;
 pub mod workspace_model;
 #[cfg(feature = "ui")]
 pub mod workspace_widget;
+
+#[cfg(feature = "host")]
+pub mod transcript_cache;
