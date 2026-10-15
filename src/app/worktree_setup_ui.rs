@@ -4,6 +4,9 @@ use crate::{model::OperationId, sidebar::WorktreeSetupStatus, worktree_setup::{S
 
 pub(super) use crate::repository::WorktreeSetupIntent as SetupIntent;
 
+static INVENTORY_PERMITS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(2));
+
 #[derive(Debug)]
 pub(super) struct Review {
     pub request: OperationId,
@@ -47,11 +50,15 @@ pub(super) struct State {
     review_requests: HashMap<PathBuf, OperationId>,
     receipt_requests: HashMap<ProjectId, (OperationId, PathBuf, Instant)>,
     receipt_paths: HashMap<ProjectId, Vec<PathBuf>>,
+    receipt_tokens: HashMap<ProjectId, CancellationToken>,
     daemon_receipts: HashMap<PathBuf, (ProjectId, OperationId)>,
 }
 
 impl Drop for State {
-    fn drop(&mut self) { for (_, token) in self.pending.values() { token.cancel(); } }
+    fn drop(&mut self) {
+        for (_, token) in self.pending.values() { token.cancel(); }
+        for token in self.receipt_tokens.values() { token.cancel(); }
+    }
 }
 
 impl State {
@@ -479,6 +486,7 @@ impl Cagents {
 
     pub(super) fn invalidate_worktree_setup_receipts(&mut self, project: ProjectId) {
         self.setup_ui.receipt_requests.remove(&project);
+        if let Some(token) = self.setup_ui.receipt_tokens.remove(&project) { token.cancel(); }
     }
 
     pub(super) fn refresh_all_worktree_setup_receipts(&mut self) -> Task<Message> {
@@ -497,14 +505,22 @@ impl Cagents {
         let request = OperationId::new();
         self.setup_ui.receipt_requests.insert(project, (request, repository.clone(), Instant::now()));
         self.setup_ui.receipt_paths.insert(project, paths);
+        let token = CancellationToken::new();
+        if let Some(previous) = self.setup_ui.receipt_tokens.insert(project, token.clone()) { previous.cancel(); }
         cosmic::task::future(async move {
             let source = repository.clone();
-            let result = tokio::task::spawn_blocking(move || {
+            // Waiting consumes no blocking-pool thread. Superseded refreshes
+            // are discarded before starting Git or opening the journal store.
+            let permit = INVENTORY_PERMITS.acquire().await;
+            let result = if permit.is_err() || token.is_cancelled() { Err("Setup inventory refresh was superseded".into()) }
+            else { tokio::task::spawn_blocking(move || {
+                if token.is_cancelled() { return Err("Setup inventory refresh was superseded".into()); }
                 match setup_control_request(crate::worktree_control::Operation::SetupIntents { repository: source })? {
                     crate::worktree_control::Reply::SetupIntents { intents, warnings } => Ok((intents, warnings)),
                     _ => Err("Unexpected worktree setup receipt inventory response".into()),
                 }
-            }).await.map_err(|error| error.to_string()).and_then(|result| result);
+            }).await.map_err(|error| error.to_string()).and_then(|result| result) };
+            drop(permit);
             Message::WorktreeSetupReceipts { project, repository, request, result }
         })
     }
