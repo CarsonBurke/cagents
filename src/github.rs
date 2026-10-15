@@ -26,16 +26,16 @@ use crate::repository::{
 pub mod avatar;
 pub mod polling;
 pub mod review_actions;
-pub mod review_controls;
-#[cfg(feature = "ui")]
-pub mod suggested_changes;
 mod review_batches;
+pub mod review_controls;
 mod review_refresh;
 pub mod review_requests;
+#[cfg(feature = "ui")]
+pub mod suggested_changes;
 pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
-pub mod checkout;
 pub mod agent_context;
+pub mod checkout;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 const PR_VIEW_FIELDS: &str = "id,number,title,body,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,createdAt,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,additions,deletions,changedFiles,statusCheckRollup";
@@ -1075,22 +1075,62 @@ fn validate_review_path(path: &str) -> Result<(), GitHubValidationError> {
 /// return a [`ReviewMutationOutcome`] once their inputs validate.
 pub trait GitHubReviewApi: Send + Sync {
     #[cfg(feature = "ui")]
-    fn suggestion_lines(&self, _key: &PullRequestKey, _path: &str, _expected_head: &str, _start: u64, _end: u64, _cancellation: &CancellationToken) -> Result<String, GitHubError> {
-        Err(GitHubError::Inspection("Suggested changes are unavailable".into()))
+    fn suggestion_lines(
+        &self,
+        _key: &PullRequestKey,
+        _path: &str,
+        _expected_head: &str,
+        _start: u64,
+        _end: u64,
+        _cancellation: &CancellationToken,
+    ) -> Result<String, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Suggested changes are unavailable".into(),
+        ))
     }
     #[cfg(feature = "ui")]
-    fn apply_suggestion(&self, _key: &PullRequestKey, _request: &suggested_changes::SuggestionRequest, _cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
-        Err(GitHubError::Inspection("Suggested changes are unavailable".into()))
+    fn apply_suggestion(
+        &self,
+        _key: &PullRequestKey,
+        _request: &suggested_changes::SuggestionRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Suggested changes are unavailable".into(),
+        ))
     }
 
-    fn review_controls(&self, _key: &PullRequestKey, _cancellation: &CancellationToken) -> Result<review_controls::ReviewControls, GitHubError> {
-        Err(GitHubError::Inspection("Review completion controls are unavailable".into()))
+    fn review_controls(
+        &self,
+        _key: &PullRequestKey,
+        _cancellation: &CancellationToken,
+    ) -> Result<review_controls::ReviewControls, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Review completion controls are unavailable".into(),
+        ))
     }
-    fn mutate_review_control(&self, _repository: &GitHubRepoKey, _pull_request_id: &str, _mutation: &review_controls::ReviewControlMutation, _cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
-        Err(GitHubError::Inspection("Review completion mutations are unavailable".into()))
+    fn mutate_review_control(
+        &self,
+        _repository: &GitHubRepoKey,
+        _pull_request_id: &str,
+        _mutation: &review_controls::ReviewControlMutation,
+        _cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Review completion mutations are unavailable".into(),
+        ))
     }
-    fn reviewer_candidates(&self, _repository: &GitHubRepoKey, _search: &str, _cursor: Option<&str>, _teams: bool, _cancellation: &CancellationToken) -> Result<review_controls::ReviewerPage, GitHubError> {
-        Err(GitHubError::Inspection("Reviewer discovery is unavailable".into()))
+    fn reviewer_candidates(
+        &self,
+        _repository: &GitHubRepoKey,
+        _search: &str,
+        _cursor: Option<&str>,
+        _teams: bool,
+        _cancellation: &CancellationToken,
+    ) -> Result<review_controls::ReviewerPage, GitHubError> {
+        Err(GitHubError::Inspection(
+            "Reviewer discovery is unavailable".into(),
+        ))
     }
 
     fn review_context(
@@ -1259,7 +1299,9 @@ pub trait GitHubReviewApi: Send + Sync {
         _cursor: Option<&str>,
         _cancellation: &CancellationToken,
     ) -> Result<PullRequestPage, GitHubError> {
-        Err(GitHubError::Inspection("Repository search is unavailable".into()))
+        Err(GitHubError::Inspection(
+            "Repository search is unavailable".into(),
+        ))
     }
 
     fn pull_request_page(
@@ -1928,8 +1970,12 @@ impl<E: ProcessExecutor> GitHubService<E> {
         for section in ["reviewThreads", "comments", "reviews"] {
             let fields = match section {
                 "reviewThreads" => REVIEW_THREAD_FIELDS,
-                "reviews" => "id author{login} body createdAt url state viewerDidAuthor viewerCanUpdate viewerCanDelete",
-                _ => "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete",
+                "reviews" => {
+                    "id author{login} body createdAt url state viewerDidAuthor viewerCanUpdate viewerCanDelete"
+                }
+                _ => {
+                    "id author{login} body createdAt url viewerDidAuthor viewerCanUpdate viewerCanDelete"
+                }
             };
             let query = format!(
                 "query($owner:String!,$name:String!,$number:Int!,$cursor:String){{repository(owner:$owner,name:$name){{pullRequest(number:$number){{{section}(first:50,after:$cursor){{nodes{{{fields}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}"
@@ -2463,21 +2509,57 @@ impl<E: ProcessExecutor> GitHubService<E> {
 
 impl<E: ProcessExecutor + Send + Sync> GitHubReviewApi for GitHubService<E> {
     #[cfg(feature = "ui")]
-    fn suggestion_lines(&self, key: &PullRequestKey, path: &str, expected_head: &str, start: u64, end: u64, cancellation: &CancellationToken) -> Result<String, GitHubError> {
+    fn suggestion_lines(
+        &self,
+        key: &PullRequestKey,
+        path: &str,
+        expected_head: &str,
+        start: u64,
+        end: u64,
+        cancellation: &CancellationToken,
+    ) -> Result<String, GitHubError> {
         GitHubService::suggestion_lines(self, key, path, expected_head, start, end, cancellation)
     }
     #[cfg(feature = "ui")]
-    fn apply_suggestion(&self, key: &PullRequestKey, request: &suggested_changes::SuggestionRequest, cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+    fn apply_suggestion(
+        &self,
+        key: &PullRequestKey,
+        request: &suggested_changes::SuggestionRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
         GitHubService::apply_suggestion(self, key, request, cancellation)
     }
 
-    fn review_controls(&self, key: &PullRequestKey, cancellation: &CancellationToken) -> Result<review_controls::ReviewControls, GitHubError> {
+    fn review_controls(
+        &self,
+        key: &PullRequestKey,
+        cancellation: &CancellationToken,
+    ) -> Result<review_controls::ReviewControls, GitHubError> {
         GitHubService::review_controls(self, key, cancellation)
     }
-    fn mutate_review_control(&self, repository: &GitHubRepoKey, pull_request_id: &str, mutation: &review_controls::ReviewControlMutation, cancellation: &CancellationToken) -> Result<ReviewMutationOutcome<()>, GitHubError> {
-        GitHubService::mutate_review_control(self, repository, pull_request_id, mutation, cancellation)
+    fn mutate_review_control(
+        &self,
+        repository: &GitHubRepoKey,
+        pull_request_id: &str,
+        mutation: &review_controls::ReviewControlMutation,
+        cancellation: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
+        GitHubService::mutate_review_control(
+            self,
+            repository,
+            pull_request_id,
+            mutation,
+            cancellation,
+        )
     }
-    fn reviewer_candidates(&self, repository: &GitHubRepoKey, search: &str, cursor: Option<&str>, teams: bool, cancellation: &CancellationToken) -> Result<review_controls::ReviewerPage, GitHubError> {
+    fn reviewer_candidates(
+        &self,
+        repository: &GitHubRepoKey,
+        search: &str,
+        cursor: Option<&str>,
+        teams: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<review_controls::ReviewerPage, GitHubError> {
         GitHubService::reviewer_candidates(self, repository, search, cursor, teams, cancellation)
     }
 

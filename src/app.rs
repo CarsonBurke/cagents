@@ -27,8 +27,8 @@ mod latency_ui;
 mod notification_ui;
 mod palette_ui;
 mod project_ui;
-mod pull_request_ui;
 mod pull_request_cleanup;
+mod pull_request_ui;
 mod refresh_ui;
 mod resume_ui;
 mod review_request_ui;
@@ -43,8 +43,8 @@ mod terminal_close;
 mod terminal_end_ui;
 mod terminal_failure;
 mod terminal_ui;
-mod update_ui;
 mod update_tail;
+mod update_ui;
 mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_operations;
@@ -2622,7 +2622,9 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::PreviewLocalFile(_)
             | Message::ChatUi(chat_ui::Action::OpenUrl(_))
             | Message::PullRequestUi(
-                pull_request_ui::Action::OpenUrl(_) | pull_request_ui::Action::OpenMarkdownLink(_) | pull_request_ui::Action::OpenPreparedContext
+                pull_request_ui::Action::OpenUrl(_)
+                    | pull_request_ui::Action::OpenMarkdownLink(_)
+                    | pull_request_ui::Action::OpenPreparedContext
             )
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
@@ -2673,16 +2675,22 @@ fn completion_navigates(message: &Message) -> bool {
         message,
         Message::PullRequestCheckoutReady { .. }
             | Message::RepositoryLoaded {
-            open_cards: true,
-            result: Ok(_),
-            ..
-        } | Message::WorktreeCreated {
-            result: Ok(WorktreeCreationOutcome::Created { .. }),
-            ..
-        } | Message::PullRequestCreated {
-            result: Ok(PullRequestCreationOutcome::Created { .. }),
-            ..
-        } | Message::PullRequestCleanupReady { result: Ok(Some(_)), .. }
+                open_cards: true,
+                result: Ok(_),
+                ..
+            }
+            | Message::WorktreeCreated {
+                result: Ok(WorktreeCreationOutcome::Created { .. }),
+                ..
+            }
+            | Message::PullRequestCreated {
+                result: Ok(PullRequestCreationOutcome::Created { .. }),
+                ..
+            }
+            | Message::PullRequestCleanupReady {
+                result: Ok(Some(_)),
+                ..
+            }
     )
 }
 
@@ -4017,11 +4025,21 @@ pub enum Message {
     /// Hosted terminals the daemon reports, either as its full inventory on
     /// connect or as one terminal another client just created.
     HostedTerminalsObserved(Vec<crate::terminal::ipc::TerminalDescriptor>),
-    WorktreeProtectionsPrepared { generation: u64, receipt: worktree_ui::protection_sync::Receipt },
+    WorktreeProtectionsPrepared {
+        generation: u64,
+        receipt: worktree_ui::protection_sync::Receipt,
+    },
     RetryWorktreeProtections,
-    WorktreeSelectionPrepared { generation: u64, create: bool, receipt: worktree_ui::selection::Receipt },
+    WorktreeSelectionPrepared {
+        generation: u64,
+        create: bool,
+        receipt: worktree_ui::selection::Receipt,
+    },
     WorktreeOwnerPathsInvalidated,
-    WorktreeOwnerPathsResolved { generation: u64, paths: Vec<(PathBuf, PathBuf)> },
+    WorktreeOwnerPathsResolved {
+        generation: u64,
+        paths: Vec<(PathBuf, PathBuf)>,
+    },
     PersistStableTitles,
     TerminalWake {
         card: CardId,
@@ -5811,8 +5829,11 @@ impl Cagents {
         if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(session.launch.working_directory.as_path())
         {
-            return self.select_worktree_then(session.launch.working_directory.clone(), false,
-                worktree_ui::selection::Intent::Terminal(session));
+            return self.select_worktree_then(
+                session.launch.working_directory.clone(),
+                false,
+                worktree_ui::selection::Intent::Terminal(session),
+            );
         }
         self.insert_terminal_card(session, None)
     }
@@ -6556,7 +6577,11 @@ impl Cagents {
                         .project(&self.sidebar_model)
                         .map(|project| (project, target));
                 }
-                pull_request_review::Effect::CleanupMergedHead(head) => { cleanup=pane.project(&self.sidebar_model).map(|project|(project,head)); }
+                pull_request_review::Effect::CleanupMergedHead(head) => {
+                    cleanup = pane
+                        .project(&self.sidebar_model)
+                        .map(|project| (project, head));
+                }
                 pull_request_review::Effect::SelectionChanged(number) => {
                     selection = Some(number);
                 }
@@ -6573,15 +6598,30 @@ impl Cagents {
         for url in links {
             tasks.push(self.open_clicked_link(url));
         }
-        if let Some((project, head)) = cleanup { tasks.push(self.open_merged_pull_request_cleanup(card,project,head)); }
+        if let Some((project, head)) = cleanup {
+            tasks.push(self.open_merged_pull_request_cleanup(card, project, head));
+        }
         if let Some((project_id, target)) = checkout {
-            let generation=match self.cards.get(&card){Some(CardRuntime::PullRequests(pane))=>pane.review.selection_generation(),_=>return Task::batch(tasks)};
+            let generation = match self.cards.get(&card) {
+                Some(CardRuntime::PullRequests(pane)) => pane.review.selection_generation(),
+                _ => return Task::batch(tasks),
+            };
             self.status = Some(TransientNotice::success("Preparing PR checkout…"));
             tasks.push(cosmic::task::future(async move {
                 let work = target.clone();
-                let result = tokio::task::spawn_blocking(move || pull_request_review::checkout::prepare(&work, &CancellationToken::new()))
-                    .await.map_err(|error| error.to_string()).and_then(|result| result);
-                Message::PullRequestCheckoutReady { card, project: project_id, generation, target, result }
+                let result = tokio::task::spawn_blocking(move || {
+                    pull_request_review::checkout::prepare(&work, &CancellationToken::new())
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::PullRequestCheckoutReady {
+                    card,
+                    project: project_id,
+                    generation,
+                    target,
+                    result,
+                }
             }));
         }
         Task::batch(tasks)
@@ -7409,7 +7449,11 @@ impl Cagents {
         let is_agent = self.sidebar_state.card_activity(id).is_some()
             || self.card_state(id).is_some_and(|card| matches!(&card.kind,
                 CardKind::Terminal(session) if crate::agent::Provider::recognize_launch(&session.launch).is_some()));
-        let title = if is_agent { crate::agent::codex_title_without_status(&title) } else { &title };
+        let title = if is_agent {
+            crate::agent::codex_title_without_status(&title)
+        } else {
+            &title
+        };
         let Some(title) = normalize_card_name(title) else {
             return false;
         };
@@ -7422,16 +7466,27 @@ impl Cagents {
             &title
         };
         let _ = self.workspace.rename_card(id, presentation.to_owned());
-        if self.card_state(id).is_some_and(|card| matches!(card.kind, CardKind::Terminal(_))) {
+        if self
+            .card_state(id)
+            .is_some_and(|card| matches!(card.kind, CardKind::Terminal(_)))
+        {
             // OSC titles are presentation state while a provider animates or
             // replaces them. Only a stable title enters the durable snapshot.
-            let current = self.chrome_ui.reported_titles.get(&id)
+            let current = self
+                .chrome_ui
+                .reported_titles
+                .get(&id)
                 .map(|reported| reported.value.as_str())
                 .or_else(|| self.card_state(id).map(|state| state.title.as_str()));
             if current != Some(title.as_str()) {
-                self.chrome_ui.reported_titles.insert(id, chrome_ui::ReportedTitle {
-                    value: title, changed_at: Instant::now(), pending: true,
-                });
+                self.chrome_ui.reported_titles.insert(
+                    id,
+                    chrome_ui::ReportedTitle {
+                        value: title,
+                        changed_at: Instant::now(),
+                        pending: true,
+                    },
+                );
                 self.card_chrome.remove(&id);
             }
             return false;
@@ -7448,27 +7503,43 @@ impl Cagents {
     }
 
     fn persist_stable_titles(&mut self, now: Instant) -> Task<Message> {
-        let stable = self.chrome_ui.reported_titles.iter()
-            .filter(|(_, title)| title.pending && now.saturating_duration_since(title.changed_at) >= chrome_ui::TITLE_STABILITY)
-            .map(|(&card, title)| (card, title.value.clone())).collect::<Vec<_>>();
+        let stable = self
+            .chrome_ui
+            .reported_titles
+            .iter()
+            .filter(|(_, title)| {
+                title.pending
+                    && now.saturating_duration_since(title.changed_at) >= chrome_ui::TITLE_STABILITY
+            })
+            .map(|(&card, title)| (card, title.value.clone()))
+            .collect::<Vec<_>>();
         let mut changed = false;
         for (card, title) in stable {
             if !self.chrome_ui.user_titles.contains_key(&card)
-                && self.card_state(card).is_some_and(|state| state.title != title)
+                && self
+                    .card_state(card)
+                    .is_some_and(|state| state.title != title)
                 && let Some(state) = self.card_state_mut(card)
-            { state.title = title; changed = true; }
+            {
+                state.title = title;
+                changed = true;
+            }
             if let Some(reported) = self.chrome_ui.reported_titles.get_mut(&card) {
                 reported.pending = false;
             }
         }
-        if changed { self.persist(); }
+        if changed {
+            self.persist();
+        }
         Task::none()
     }
 
     /// Builds chrome for cards that appeared or were renamed, drops entries for
     /// cards the workspace no longer holds, and renames the window.
     fn sync_chrome(&mut self) -> Task<Message> {
-        self.chrome_ui.reported_titles.retain(|card, _| self.cards.contains_key(card));
+        self.chrome_ui
+            .reported_titles
+            .retain(|card, _| self.cards.contains_key(card));
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
@@ -8589,19 +8660,26 @@ impl Cagents {
                 TerminalEvent::AgentActivityChanged(activity) => {
                     if ended_terminal(self.card_state(card)).is_none() {
                         if self.sidebar_state.card_activity(card) != activity {
-                semantic_changed = true;
-                self.update_tail.mark(update_tail::Step::Channels);
-                self.observe_agent_activity_for_card(card, activity);
-            }
+                            semantic_changed = true;
+                            self.update_tail.mark(update_tail::Step::Channels);
+                            self.observe_agent_activity_for_card(card, activity);
+                        }
                     }
                 }
                 TerminalEvent::TitleChanged(title) => {
-                    let previous = self.chrome_ui.reported_titles.get(&card)
+                    let previous = self
+                        .chrome_ui
+                        .reported_titles
+                        .get(&card)
                         .map(|title| title.value.clone())
                         .or_else(|| self.card_state(card).map(|state| state.title.clone()));
                     durable_changed |= self.apply_reported_title(card, title);
-                    if self.chrome_ui.reported_titles.get(&card)
-                        .is_some_and(|title| Some(title.value.as_str()) != previous.as_deref()) {
+                    if self
+                        .chrome_ui
+                        .reported_titles
+                        .get(&card)
+                        .is_some_and(|title| Some(title.value.as_str()) != previous.as_deref())
+                    {
                         self.update_tail.mark(update_tail::Step::Chrome);
                     }
                 }
@@ -8784,8 +8862,10 @@ impl Cagents {
             self.cards.insert(card, CardRuntime::Loading);
             return (self.start_terminal(card, session, visible, false), true);
         }
-        (Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
-            semantic_changed || durable_changed)
+        (
+            Task::batch([clipboard_task, self.refresh_live_terminal_find(card)]),
+            semantic_changed || durable_changed,
+        )
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -13317,9 +13397,13 @@ impl Application for Cagents {
         {
             return Task::none();
         }
-        let prepared_navigation=match &message {
-            Message::WorktreeSelectionPrepared {generation,receipt,..}=>self.prepared_selection_navigates(*generation,receipt),
-            _=>false,
+        let prepared_navigation = match &message {
+            Message::WorktreeSelectionPrepared {
+                generation,
+                receipt,
+                ..
+            } => self.prepared_selection_navigates(*generation, receipt),
+            _ => false,
         };
         if (self.focused_repository_is_saving() || self.modal_is_open())
             && (completion_navigates(&message) || prepared_navigation)
@@ -13447,9 +13531,16 @@ impl Application for Cagents {
                     }
                 }
             }
-            Message::WorktreeProtectionsPrepared {generation,receipt} => self.window_protections_prepared(generation,receipt),
+            Message::WorktreeProtectionsPrepared {
+                generation,
+                receipt,
+            } => self.window_protections_prepared(generation, receipt),
             Message::RetryWorktreeProtections => self.sync_worktree_protections(),
-            Message::WorktreeSelectionPrepared { generation, create, receipt } => self.worktree_selection_prepared(generation, create, receipt),
+            Message::WorktreeSelectionPrepared {
+                generation,
+                create,
+                receipt,
+            } => self.worktree_selection_prepared(generation, create, receipt),
             Message::WorktreeOwnerPathsInvalidated => {
                 self.worktree_protection_sync.invalidate();
                 self.worktree_owner_paths.invalidate_watched();
@@ -16229,27 +16320,60 @@ impl Application for Cagents {
             }
             Message::ProjectUi(action) => self.handle_project_action(action),
             Message::PullRequestUi(action) => self.handle_pull_request_ui(action),
-            Message::PullRequestCheckoutReady { card, project, generation, target, result } => {
+            Message::PullRequestCheckoutReady {
+                card,
+                project,
+                generation,
+                target,
+                result,
+            } => {
                 if self.nested_modal_focus_target().is_some()
                     || !matches!(self.cards.get(&card), Some(CardRuntime::PullRequests(pane))
                         if pane.review.selection_generation()==generation && pane.review.range().is_some_and(|range| range.head == target.head)
                         && pane.review.target().is_some_and(|review| review.worktree == target.repository && review.pull_request.number == target.number))
-                { return Task::none(); }
+                {
+                    return Task::none();
+                }
                 match result {
                     Ok(plan) => {
-                        if let Some(path) = plan.existing_worktree { self.status = Some(TransientNotice::warning(plan.notice)); return self.select_worktree(path, false); }
-                        let task = self.open_worktree_dialog(project, plan.repository,
-                            WorktreeDraft { branch: plan.branch_input, base: plan.base, destination: String::new(), ..Default::default() }, None);
-                        if let Some(dialog) = &mut self.worktree_dialog { dialog.set_checkout_notice(plan.notice); }
+                        if let Some(path) = plan.existing_worktree {
+                            self.status = Some(TransientNotice::warning(plan.notice));
+                            return self.select_worktree(path, false);
+                        }
+                        let task = self.open_worktree_dialog(
+                            project,
+                            plan.repository,
+                            WorktreeDraft {
+                                branch: plan.branch_input,
+                                base: plan.base,
+                                destination: String::new(),
+                                ..Default::default()
+                            },
+                            None,
+                        );
+                        if let Some(dialog) = &mut self.worktree_dialog {
+                            dialog.set_checkout_notice(plan.notice);
+                        }
                         task
                     }
-                    Err(error) => { if let Some(CardRuntime::PullRequests(pane))=self.cards.get_mut(&card){pane.review.report_checkout_error(error);}Task::none() },
+                    Err(error) => {
+                        if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
+                            pane.review.report_checkout_error(error);
+                        }
+                        Task::none()
+                    }
                 }
             }
             Message::PullRequestReview { card, action } => {
                 self.handle_pull_request_review(card, action)
             }
-            Message::PullRequestCleanupReady { card, project, generation, head, result } => self.merged_pull_request_cleanup_ready(card,project,generation,head,result),
+            Message::PullRequestCleanupReady {
+                card,
+                project,
+                generation,
+                head,
+                result,
+            } => self.merged_pull_request_cleanup_ready(card, project, generation, head, result),
             Message::ReviewFilePanelToggle { card, collapsed } => {
                 if let Some(CardRuntime::PullRequests(pane)) = self.cards.get_mut(&card) {
                     pane.file_panel_collapsed = Some(collapsed);
@@ -16599,7 +16723,9 @@ impl Application for Cagents {
             // paint ticks still render; neither walks the workspace projection.
             return task;
         }
-        if !terminal_wake && !camera_only { self.update_tail.changed(); }
+        if !terminal_wake && !camera_only {
+            self.update_tail.changed();
+        }
         // `status` is the shell's write channel: ninety-odd call sites raise a
         // notice by assigning it. Draining it here is what makes those notices
         // survive the next assignment instead of silently replacing each other,
@@ -16611,7 +16737,9 @@ impl Application for Cagents {
         self.sync_notification_presence();
         let protections = if self.update_tail.run(update_tail::Step::Protections) {
             self.sync_worktree_protections()
-        } else {Task::none()};
+        } else {
+            Task::none()
+        };
         self.sync_popup_keyboard_nav();
         if let Some(notice) = self.status.take()
             && !crate::daemon_health::replaces_notice(&notice.message)
@@ -16663,13 +16791,17 @@ impl Application for Cagents {
         // `view` cannot rebuild the chrome cache itself, so refresh it here.
         let chrome = if self.update_tail.run(update_tail::Step::Chrome) {
             self.sync_chrome()
-        } else { Task::none() };
+        } else {
+            Task::none()
+        };
         let deferred = self.release_deferred_navigation_if_unblocked();
         self.refresh_draft_permission_previews();
         let owner_paths = self.resolve_worktree_owner_paths();
         let terminal_probes = if self.update_tail.run(update_tail::Step::TranscriptProbes) {
             self.terminal_transcript_probes()
-        } else { Task::none() };
+        } else {
+            Task::none()
+        };
         Task::batch([
             task,
             binding,
@@ -16685,12 +16817,20 @@ impl Application for Cagents {
 
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
-        let title_subscription = if self.chrome_ui.reported_titles.values().any(|title| title.pending) {
+        let title_subscription = if self
+            .chrome_ui
+            .reported_titles
+            .values()
+            .any(|title| title.pending)
+        {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::PersistStableTitles)
-        } else { Subscription::none() };
+        } else {
+            Subscription::none()
+        };
         let mut subscriptions = vec![
             self.chat_subscription(),
-            self.worktree_owner_paths.subscription(self.refresh_ui.focused),
+            self.worktree_owner_paths
+                .subscription(self.refresh_ui.focused),
             self.protection_retry_subscription(),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
@@ -27438,33 +27578,79 @@ mod tests {
             let pr = Arc::make_mut(&mut target.pull_request);
             pr.state.0 = "MERGED".into();
             pr.head_repository = Some(crate::github::GitHubHeadRepository { name: "r".into() });
-            pr.head_repository_owner = Some(crate::github::GitHubActor { login: "o".into(), name: None, is_bot: false });
+            pr.head_repository_owner = Some(crate::github::GitHubActor {
+                login: "o".into(),
+                name: None,
+                is_bot: false,
+            });
             let head = crate::pull_request_review::CleanupHead {
-                repository: target.repository.clone(), branch: pr.head_ref_name.clone(), head: Oid::parse(pr.head_ref_oid.clone()).unwrap(),
+                repository: target.repository.clone(),
+                branch: pr.head_ref_name.clone(),
+                head: Oid::parse(pr.head_ref_oid.clone()).unwrap(),
                 merged_pull_request: Arc::clone(&target.pull_request),
             };
             let record = crate::repository::WorktreeRecord {
-                id: WorktreeId::new(), path: "/repo/worktrees/feature".into(), created_at_unix_ms: None,
-                head_oid: Some(head.head.as_str().into()), branch: Some(format!("refs/heads/{}", head.branch)),
-                detached: false, bare: false, lock: Default::default(), prunable_reason: None,
+                id: WorktreeId::new(),
+                path: "/repo/worktrees/feature".into(),
+                created_at_unix_ms: None,
+                head_oid: Some(head.head.as_str().into()),
+                branch: Some(format!("refs/heads/{}", head.branch)),
+                detached: false,
+                bare: false,
+                lock: Default::default(),
+                prunable_reason: None,
             };
             let mut row = SidebarWorktree::from_repository(&record, None);
             row.head_repository = Some(head.repository.clone());
             match changed {
                 "branch" => row.branch = Some("other".into()),
                 "head" => row.head_oid = Some("b".repeat(40)),
-                "repository" => row.head_repository = Some(GitHubRepoKey::new("github.com", None, "other", "r").unwrap()),
+                "repository" => {
+                    row.head_repository =
+                        Some(GitHubRepoKey::new("github.com", None, "other", "r").unwrap())
+                }
                 "unknown" => row.head_oid = None,
-                _ => {},
+                _ => {}
             }
-            app.sidebar_model.projects.iter_mut().find(|row| row.id == project).unwrap().worktrees.push(row);
-            let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else { panic!("PR pane"); };
-            drop(pane.review.update(crate::pull_request_review::Action::Open(target)));
+            app.sidebar_model
+                .projects
+                .iter_mut()
+                .find(|row| row.id == project)
+                .unwrap()
+                .worktrees
+                .push(row);
+            let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else {
+                panic!("PR pane");
+            };
+            drop(
+                pane.review
+                    .update(crate::pull_request_review::Action::Open(target)),
+            );
             let generation = pane.review.selection_generation();
-            drop(app.merged_pull_request_cleanup_ready(card, project, generation, head, Ok(Some(record.clone()))));
-            assert_eq!(app.project_ui.modal_open(), changed=="none", "only the unchanged checkout can open deletion ({changed})");
-            let row = app.sidebar_model.project(project).unwrap().worktrees.iter().find(|row| row.id == record.id).unwrap();
-            assert_eq!(row.pull_request_state, None, "stale {changed} must not manufacture a merged badge");
+            drop(app.merged_pull_request_cleanup_ready(
+                card,
+                project,
+                generation,
+                head,
+                Ok(Some(record.clone())),
+            ));
+            assert_eq!(
+                app.project_ui.modal_open(),
+                changed == "none",
+                "only the unchanged checkout can open deletion ({changed})"
+            );
+            let row = app
+                .sidebar_model
+                .project(project)
+                .unwrap()
+                .worktrees
+                .iter()
+                .find(|row| row.id == record.id)
+                .unwrap();
+            assert_eq!(
+                row.pull_request_state, None,
+                "stale {changed} must not manufacture a merged badge"
+            );
         }
     }
 

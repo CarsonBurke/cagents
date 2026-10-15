@@ -63,7 +63,8 @@ impl Store for StateStore {
             if bytes > cache::MAX_CACHE_BYTES {
                 return Err("Cached review exceeds the size limit".into());
             }
-            let stored:StoredEntry=serde_json::from_str(&entry).map_err(|error|error.to_string())?;
+            let stored: StoredEntry =
+                serde_json::from_str(&entry).map_err(|error| error.to_string())?;
             snapshot.files.push(cache::File {
                 entry: stored.entry,
                 changed_since_viewed: stored.changed_since_viewed,
@@ -86,7 +87,12 @@ impl Store for StateStore {
         let entries = snapshot
             .files
             .iter()
-            .map(|file| serde_json::to_string(&StoredEntry{entry:file.entry.clone(),changed_since_viewed:file.changed_since_viewed}))
+            .map(|file| {
+                serde_json::to_string(&StoredEntry {
+                    entry: file.entry.clone(),
+                    changed_since_viewed: file.changed_since_viewed,
+                })
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| error.to_string())?;
         let mut inner = self.lock_inner().map_err(|error| error.to_string())?;
@@ -217,13 +223,25 @@ mod tests {
 
     #[test]
     fn changed_since_viewed_survives_sqlite_and_legacy_rows_default_to_false() {
-        let directory=tempfile::tempdir().unwrap();
-        let store=StateStore::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("boot")).unwrap();
-        let mut snapshot=cache::fixture();snapshot.files[0].changed_since_viewed=true;
-        store.save(&snapshot,&cache::WriteOrder::fixture(1)).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = StateStore::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot"),
+        )
+        .unwrap();
+        let mut snapshot = cache::fixture();
+        snapshot.files[0].changed_since_viewed = true;
+        store
+            .save(&snapshot, &cache::WriteOrder::fixture(1))
+            .unwrap();
         assert!(store.load(&snapshot.key).unwrap().unwrap().files[0].changed_since_viewed);
-        let legacy=serde_json::to_string(&snapshot.files[0].entry).unwrap();
-        store.lock_inner().unwrap().connection.execute("UPDATE review_cache_files SET entry = ?1",params![legacy]).unwrap();
+        let legacy = serde_json::to_string(&snapshot.files[0].entry).unwrap();
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute("UPDATE review_cache_files SET entry = ?1", params![legacy])
+            .unwrap();
         assert!(!store.load(&snapshot.key).unwrap().unwrap().files[0].changed_since_viewed);
     }
 

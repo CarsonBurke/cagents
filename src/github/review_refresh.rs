@@ -55,8 +55,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .has_next_page
             .then(|| next_cursor(&connection.page_info, None))
             .transpose()?;
-        let mut metadata=pr.clone();
-        metadata["headRepositoryOwner"]=pr.pointer("/headRepository/owner").cloned().unwrap_or(serde_json::Value::Null);
+        let mut metadata = pr.clone();
+        metadata["headRepositoryOwner"] = pr
+            .pointer("/headRepository/owner")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
         let metadata: PullRequest = decode_value(&metadata)?;
         validate_pull_request(&metadata, &key.repository)?;
         Ok(ReviewRefresh {
@@ -120,7 +123,10 @@ mod tests {
             .unwrap();
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert_eq!(refresh.context.viewer, "reviewer");
-        assert_eq!(refresh.metadata.as_ref().unwrap().head_repository_key(),Some(GitHubRepoKey::new("refresh-test.invalid",None,"author","fork").unwrap()));
+        assert_eq!(
+            refresh.metadata.as_ref().unwrap().head_repository_key(),
+            Some(GitHubRepoKey::new("refresh-test.invalid", None, "author", "fork").unwrap())
+        );
         assert_eq!(
             refresh.files.files[0].viewer_viewed_state,
             FileViewedState::Viewed

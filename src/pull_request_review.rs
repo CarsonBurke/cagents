@@ -43,8 +43,8 @@ use crate::{
 type ActionTask = iced::Task<Action>;
 
 pub mod cache;
-pub mod completion;
 pub mod checkout;
+pub mod completion;
 pub mod discussion;
 pub mod discussion_ui;
 pub mod file_pages;
@@ -86,11 +86,21 @@ pub struct CheckoutTarget {
 impl CheckoutTarget {
     /// A caller without a forge identity can still request a local commit checkout.
     pub fn read_only(repository: PathBuf, number: u64, head: crate::repository::Oid) -> Self {
-        Self { repository, number, head, pull_request: None, head_ref_name: String::new() }
+        Self {
+            repository,
+            number,
+            head,
+            pull_request: None,
+            head_ref_name: String::new(),
+        }
     }
 
     pub fn suggested_branch(&self) -> String {
-        if self.head_ref_name.is_empty() { format!("pr/{}", self.number) } else { self.head_ref_name.clone() }
+        if self.head_ref_name.is_empty() {
+            format!("pr/{}", self.number)
+        } else {
+            self.head_ref_name.clone()
+        }
     }
 }
 
@@ -256,11 +266,22 @@ impl Action {
                 | Self::Cached { .. }
                 | Self::CacheSaved { .. }
                 | Self::ViewedApplied { .. }
-                | Self::Discussion(discussion_ui::Action::SuggestionLines { .. } | discussion_ui::Action::SuggestionPreview { .. } | discussion_ui::Action::SuggestionApplied { .. })
-                | Self::Completion(completion::Action::Loaded { .. } | completion::Action::Candidates { .. } | completion::Action::Finished { .. } | completion::Action::Search { .. })
+                | Self::Discussion(
+                    discussion_ui::Action::SuggestionLines { .. }
+                        | discussion_ui::Action::SuggestionPreview { .. }
+                        | discussion_ui::Action::SuggestionApplied { .. }
+                )
+                | Self::Completion(
+                    completion::Action::Loaded { .. }
+                        | completion::Action::Candidates { .. }
+                        | completion::Action::Finished { .. }
+                        | completion::Action::Search { .. }
+                )
                 | Self::ViewedBatchSummary { .. }
                 | Self::Discussion(
-                    discussion_ui::Action::Loaded { .. } | discussion_ui::Action::Finished { .. } | discussion_ui::Action::Reanchored { .. }
+                    discussion_ui::Action::Loaded { .. }
+                        | discussion_ui::Action::Finished { .. }
+                        | discussion_ui::Action::Reanchored { .. }
                 )
         )
     }
@@ -739,10 +760,12 @@ impl State {
         &self.list
     }
 
-    pub fn selection_generation(&self) -> u64 { self.generation }
+    pub fn selection_generation(&self) -> u64 {
+        self.generation
+    }
 
     pub fn report_checkout_error(&mut self, error: String) {
-        self.notice=Some(format!("Could not prepare PR checkout. {error}"));
+        self.notice = Some(format!("Could not prepare PR checkout. {error}"));
     }
 
     pub fn target(&self) -> Option<&ReviewTarget> {
@@ -1246,7 +1269,13 @@ impl State {
                         repository: target.worktree.clone(),
                         number: target.pull_request.number,
                         head: range.head.clone(),
-                        pull_request: Some(PullRequestKey::new(target.repository.clone(), target.pull_request.number).expect("validated PR identity")),
+                        pull_request: Some(
+                            PullRequestKey::new(
+                                target.repository.clone(),
+                                target.pull_request.number,
+                            )
+                            .expect("validated PR identity"),
+                        ),
                         head_ref_name: target.pull_request.head_ref_name.clone(),
                     }));
                 }
@@ -1599,7 +1628,12 @@ impl State {
         let previous: HashMap<RepoPath, (bool, ViewedSync, bool)> = self
             .files
             .drain(..)
-            .map(|file| (file.entry.path, (file.viewed, file.sync, file.changed_since_viewed)))
+            .map(|file| {
+                (
+                    file.entry.path,
+                    (file.viewed, file.sync, file.changed_since_viewed),
+                )
+            })
             .collect();
         // The open file compares against the whole basis, which the base
         // moving under the pull request changes as surely as a new head.
@@ -1656,10 +1690,10 @@ impl State {
         }
         self.cache_dirty |= authority_changed
             || entries_changed
-            || self
-                .files
-                .iter()
-                .any(|file| previous.get(&file.entry.path) != Some(&(file.viewed, file.sync, file.changed_since_viewed)));
+            || self.files.iter().any(|file| {
+                previous.get(&file.entry.path)
+                    != Some(&(file.viewed, file.sync, file.changed_since_viewed))
+            });
         self.files_truncated = loaded.files.truncated;
         self.rebuild_rows();
         if authority_changed {
@@ -1721,8 +1755,10 @@ impl State {
             .map_or(0, |index| index + 1);
         let next = (0..files.len())
             .map(|offset| files[(start + offset) % files.len()])
-            .find(|index| !self.files[*index].viewed
-                && (!self.only_changed_since_viewed || self.files[*index].changed_since_viewed));
+            .find(|index| {
+                !self.files[*index].viewed
+                    && (!self.only_changed_since_viewed || self.files[*index].changed_since_viewed)
+            });
         if let Some(index) = next {
             if self.files[index].sync == ViewedSync::Unknown {
                 self.pages.wanted = Some(self.files[index].entry.path.clone());
@@ -1805,8 +1841,10 @@ impl State {
             .as_ref()
             .and_then(|path| self.file_index(path))
             .and_then(|index| files.iter().position(|file| *file == index));
-        let visible = |index: &&usize| (!self.hide_viewed || !self.files[**index].viewed)
-            && (!self.only_changed_since_viewed || self.files[**index].changed_since_viewed);
+        let visible = |index: &&usize| {
+            (!self.hide_viewed || !self.files[**index].viewed)
+                && (!self.only_changed_since_viewed || self.files[**index].changed_since_viewed)
+        };
         let next = if direction > 0 {
             files
                 .iter()
@@ -2119,7 +2157,12 @@ impl State {
                     ))
                     .width(Length::Fill)
                     .into(),
-                crate::ui_controls::button::quiet("PR actions").on_press_maybe((!modal_open && self.context.is_some()).then(||self.fenced(Action::Completion(completion::Action::Toggle)))).into(),
+                crate::ui_controls::button::quiet("PR actions")
+                    .on_press_maybe(
+                        (!modal_open && self.context.is_some())
+                            .then(|| self.fenced(Action::Completion(completion::Action::Toggle))),
+                    )
+                    .into(),
                 self.review_control(modal_open),
             ])
             .spacing(space::M)
@@ -2130,7 +2173,9 @@ impl State {
             })
             .into(),
         );
-        if self.completion.open { rows.push(self.completion_view(modal_open)); }
+        if self.completion.open {
+            rows.push(self.completion_view(modal_open));
+        }
         widget::column::with_children(rows)
             .spacing(space::XS)
             .padding(Padding::from([space::M, space::M]))
@@ -2237,18 +2282,33 @@ impl State {
                 .into(),
             icon_button(Icon::ChevronRight, "Next unviewed file")
                 .on_press_maybe(
-                    (!modal_open && self.files.iter().any(|file| !file.viewed
-                        && (!self.only_changed_since_viewed || file.changed_since_viewed)))
-                        .then_some(Action::NextUnviewed),
+                    (!modal_open
+                        && self.files.iter().any(|file| {
+                            !file.viewed
+                                && (!self.only_changed_since_viewed || file.changed_since_viewed)
+                        }))
+                    .then_some(Action::NextUnviewed),
                 )
                 .into(),
         ]);
         let viewed = self.files.iter().filter(|file| file.viewed).count();
-        let changed = self.files.iter().filter(|file| file.changed_since_viewed).count();
+        let changed = self
+            .files
+            .iter()
+            .filter(|file| file.changed_since_viewed)
+            .count();
         let toolbar = widget::row::with_children(vec![
-            design::caption(format!("{viewed}/{} viewed · {changed} changed since viewed{}", self.files.len(), if self.file_marks_incomplete() { " (incomplete)" } else { "" }))
-                .width(Length::Fill)
-                .into(),
+            design::caption(format!(
+                "{viewed}/{} viewed · {changed} changed since viewed{}",
+                self.files.len(),
+                if self.file_marks_incomplete() {
+                    " (incomplete)"
+                } else {
+                    ""
+                }
+            ))
+            .width(Length::Fill)
+            .into(),
             controls,
         ])
         .align_y(Alignment::Center)
@@ -2295,29 +2355,41 @@ impl State {
 
     fn displayed_file_rows(&self, tallies: &[(usize, usize, usize)]) -> Vec<usize> {
         let changed_paths: BTreeSet<PathBuf> = if self.only_changed_since_viewed {
-            self.files.iter().filter(|file| file.changed_since_viewed)
+            self.files
+                .iter()
+                .filter(|file| file.changed_since_viewed)
                 .flat_map(|file| file.entry.path.as_path().ancestors().map(Path::to_path_buf))
                 .collect()
-        } else { BTreeSet::new() };
+        } else {
+            BTreeSet::new()
+        };
         visible_review_rows(&self.rows, &self.collapsed_directories)
             .filter(|(index, row)| {
-                (!self.only_changed_since_viewed || changed_paths.contains(row.path.as_path())) && (!self.hide_viewed
-                    || match row.file {
-                        Some(file) => !self.files[file].viewed,
-                        None => tallies[*index].0 != tallies[*index].1,
-                    })
+                (!self.only_changed_since_viewed || changed_paths.contains(row.path.as_path()))
+                    && (!self.hide_viewed
+                        || match row.file {
+                            Some(file) => !self.files[file].viewed,
+                            None => tallies[*index].0 != tallies[*index].1,
+                        })
             })
             .map(|(index, _)| index)
             .collect()
     }
 
     fn file_marks_incomplete(&self) -> bool {
-        self.pages.cursor.is_some() || self.files.iter().any(|file| file.sync == ViewedSync::Unknown)
+        self.pages.cursor.is_some()
+            || self
+                .files
+                .iter()
+                .any(|file| file.sync == ViewedSync::Unknown)
     }
 
     fn changed_files_empty_label(&self) -> &'static str {
-        if self.file_marks_incomplete() { "Changed-file results are incomplete until all viewed states are loaded." }
-        else { "No files changed since you viewed them." }
+        if self.file_marks_incomplete() {
+            "Changed-file results are incomplete until all viewed states are loaded."
+        } else {
+            "No files changed since you viewed them."
+        }
     }
 
     fn file_scrollable(&self, modal_open: bool, height: f32) -> Element<'_, Action> {
@@ -2368,7 +2440,9 @@ impl State {
         if rows.is_empty() {
             let message = match &self.load {
                 LoadState::Loading => "",
-                LoadState::Ready if self.only_changed_since_viewed => self.changed_files_empty_label(),
+                LoadState::Ready if self.only_changed_since_viewed => {
+                    self.changed_files_empty_label()
+                }
                 LoadState::Ready if self.hide_viewed && !self.files.is_empty() => {
                     "All files viewed."
                 }
@@ -3056,7 +3130,9 @@ fn join_files(entries: &[DiffEntry], files: &PullRequestFiles) -> Vec<ReviewFile
     let mut joined: Vec<ReviewFile> = entries
         .iter()
         .map(|entry| {
-            let mark = remote.remove(entry.path.display().as_ref()).map(|file| &file.viewer_viewed_state);
+            let mark = remote
+                .remove(entry.path.display().as_ref())
+                .map(|file| &file.viewer_viewed_state);
             let viewed = mark == Some(&FileViewedState::Viewed);
             let changed_since_viewed = mark == Some(&FileViewedState::Dismissed);
             ReviewFile {
@@ -3306,7 +3382,8 @@ pub(crate) struct ScriptedApi {
     pub searches: std::sync::Mutex<Vec<(String, Option<String>)>>,
     pub controls: std::sync::Mutex<Option<crate::github::review_controls::ReviewControls>>,
     pub control_context: std::sync::Mutex<Option<ReviewContext>>,
-    pub controls_written: std::sync::Mutex<Vec<crate::github::review_controls::ReviewControlMutation>>,
+    pub controls_written:
+        std::sync::Mutex<Vec<crate::github::review_controls::ReviewControlMutation>>,
     pub control_outcome: std::sync::Mutex<ReviewMutationOutcome<()>>,
     pub context: std::sync::Mutex<Option<ReviewContext>>,
     pub context_calls: std::sync::atomic::AtomicUsize,
@@ -3364,8 +3441,27 @@ impl GitHubReviewApi for ScriptedApi {
             .pop_front()
             .expect("scripted search page"))
     }
-    fn review_controls(&self,_:&PullRequestKey,_:&CancellationToken)->Result<crate::github::review_controls::ReviewControls,crate::github::GitHubError>{self.controls.lock().unwrap().clone().ok_or_else(||crate::github::GitHubError::Inspection("No scripted controls".into()))}
-    fn mutate_review_control(&self,_:&GitHubRepoKey,_:&str,mutation:&crate::github::review_controls::ReviewControlMutation,_:&CancellationToken)->Result<ReviewMutationOutcome<()>,crate::github::GitHubError>{self.controls_written.lock().unwrap().push(mutation.clone());Ok(self.control_outcome.lock().unwrap().clone())}
+    fn review_controls(
+        &self,
+        _: &PullRequestKey,
+        _: &CancellationToken,
+    ) -> Result<crate::github::review_controls::ReviewControls, crate::github::GitHubError> {
+        self.controls
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| crate::github::GitHubError::Inspection("No scripted controls".into()))
+    }
+    fn mutate_review_control(
+        &self,
+        _: &GitHubRepoKey,
+        _: &str,
+        mutation: &crate::github::review_controls::ReviewControlMutation,
+        _: &CancellationToken,
+    ) -> Result<ReviewMutationOutcome<()>, crate::github::GitHubError> {
+        self.controls_written.lock().unwrap().push(mutation.clone());
+        Ok(self.control_outcome.lock().unwrap().clone())
+    }
 
     fn pull_request(
         &self,
@@ -3389,7 +3485,14 @@ impl GitHubReviewApi for ScriptedApi {
     ) -> Result<ReviewContext, crate::github::GitHubError> {
         self.context_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.control_context.lock().unwrap().clone().or_else(||self.context.lock().unwrap().clone()).ok_or_else(||crate::github::GitHubError::Inspection("No scripted review context".into()))
+        self.control_context
+            .lock()
+            .unwrap()
+            .clone()
+            .or_else(|| self.context.lock().unwrap().clone())
+            .ok_or_else(|| {
+                crate::github::GitHubError::Inspection("No scripted review context".into())
+            })
     }
 
     fn review_merge_base(
@@ -3481,7 +3584,10 @@ impl GitHubReviewApi for ScriptedApi {
         _cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<crate::github::PullRequestComment>, crate::github::GitHubError>
     {
-        self.updated_comments.lock().unwrap().push((comment_id.into(), body.into()));
+        self.updated_comments
+            .lock()
+            .unwrap()
+            .push((comment_id.into(), body.into()));
         Ok(ReviewMutationOutcome::Applied(serde_json::from_value(serde_json::json!({"id":comment_id,"body":body,"createdAt":"now","url":"https://github.com/o/r/pull/1#comment"})).unwrap()))
     }
 

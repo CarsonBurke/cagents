@@ -119,7 +119,8 @@ impl State {
                         && let Some(remote) = marks.get(file.entry.path.display().as_ref())
                     {
                         file.viewed = remote.viewer_viewed_state == FileViewedState::Viewed;
-                        file.changed_since_viewed = remote.viewer_viewed_state == FileViewedState::Dismissed;
+                        file.changed_since_viewed =
+                            remote.viewer_viewed_state == FileViewedState::Dismissed;
                         file.sync = ViewedSync::Settled;
                     }
                 }
@@ -270,23 +271,37 @@ mod tests {
 
     #[test]
     fn later_page_changed_badge_survives_refresh_pending_mark_and_refusal() {
-        let mut state=thousand_files();
+        let mut state = thousand_files();
         drop(state.page_action(PageAction::More));
-        let mut remote=remote_file("file-0105.rs",false);remote.viewer_viewed_state=FileViewedState::Dismissed;
-        answer(&mut state,vec![remote],"me");
+        let mut remote = remote_file("file-0105.rs", false);
+        remote.viewer_viewed_state = FileViewedState::Dismissed;
+        answer(&mut state, vec![remote], "me");
         assert!(state.files[105].changed_since_viewed);
-        let mut refresh=loaded(
-            (0..1000).map(|i|entry(&format!("file-{i:04}.rs"),ChangeKind::Modified)).collect(),
-            (0..100).map(|i|remote_file(&format!("file-{i:04}.rs"),true)).collect());
-        refresh.next_file_cursor=Some("page-2".into());
+        let mut refresh = loaded(
+            (0..1000)
+                .map(|i| entry(&format!("file-{i:04}.rs"), ChangeKind::Modified))
+                .collect(),
+            (0..100)
+                .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                .collect(),
+        );
+        refresh.next_file_cursor = Some("page-2".into());
         state.adopt(&refresh);
         assert!(state.files[105].changed_since_viewed);
-        assert_eq!(state.files[105].sync,ViewedSync::Settled);
-        drop(state.set_viewed(vec![105],true));
+        assert_eq!(state.files[105].sync, ViewedSync::Settled);
+        drop(state.set_viewed(vec![105], true));
         state.adopt(&refresh);
         assert!(state.files[105].changed_since_viewed);
-        assert_eq!(state.files[105].sync,ViewedSync::Pending);
-        drop(state.update(Action::ViewedApplied{generation:state.generation,authority_revision:state.authority_revision,results:vec![(state.files[105].entry.path.clone(),true,ViewedOutcome::NotApplied("denied".into()))]}));
+        assert_eq!(state.files[105].sync, ViewedSync::Pending);
+        drop(state.update(Action::ViewedApplied {
+            generation: state.generation,
+            authority_revision: state.authority_revision,
+            results: vec![(
+                state.files[105].entry.path.clone(),
+                true,
+                ViewedOutcome::NotApplied("denied".into()),
+            )],
+        }));
         assert!(!state.files[105].viewed);
         assert!(state.files[105].changed_since_viewed);
     }
@@ -330,25 +345,50 @@ mod tests {
         use cosmic::iced::futures::StreamExt;
         let (mut state, api) = state();
         drop(state.update(Action::Open(target(1))));
-        let mut initial = loaded((0..101).map(|i| entry(&format!("file-{i:04}.rs"), ChangeKind::Modified)).collect(),
-            (0..100).map(|i| remote_file(&format!("file-{i:04}.rs"), true)).collect());
+        let mut initial = loaded(
+            (0..101)
+                .map(|i| entry(&format!("file-{i:04}.rs"), ChangeKind::Modified))
+                .collect(),
+            (0..100)
+                .map(|i| remote_file(&format!("file-{i:04}.rs"), true))
+                .collect(),
+        );
         initial.next_file_cursor = Some("page-2".into());
         finish_load(&mut state, initial);
         assert!(!state.pages.loading);
-        let mut changed = remote_file("file-0100.rs", false); changed.viewer_viewed_state = FileViewedState::Dismissed;
+        let mut changed = remote_file("file-0100.rs", false);
+        changed.viewer_viewed_state = FileViewedState::Dismissed;
         let context = state.context.as_ref().unwrap();
-        *api.page.lock().unwrap() = Some(PullRequestFilePage { files: vec![changed], next_cursor: None,
-            viewer: context.viewer.clone(), pull_request_id: context.pull_request_id.clone(), head_oid: context.head_oid.clone(), base_oid: context.base_oid.clone() });
-        let task = state.update(Action::ToggleChangedSinceViewed);
-        assert!(state.pages.loading, "the filter must request unknown marks even when it displays no rows");
-        assert!(state.changed_files_empty_label().contains("incomplete"));
-        let receipt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
-            let mut stream = iced::runtime::task::into_stream(task).unwrap();
-            while let Some(action) = stream.next().await {
-                if let iced::runtime::Action::Output(action @ Action::FilePage(PageAction::Loaded { .. })) = action { return action; }
-            }
-            panic!("file-page worker returned no receipt");
+        *api.page.lock().unwrap() = Some(PullRequestFilePage {
+            files: vec![changed],
+            next_cursor: None,
+            viewer: context.viewer.clone(),
+            pull_request_id: context.pull_request_id.clone(),
+            head_oid: context.head_oid.clone(),
+            base_oid: context.base_oid.clone(),
         });
+        let task = state.update(Action::ToggleChangedSinceViewed);
+        assert!(
+            state.pages.loading,
+            "the filter must request unknown marks even when it displays no rows"
+        );
+        assert!(state.changed_files_empty_label().contains("incomplete"));
+        let receipt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(
+                        action @ Action::FilePage(PageAction::Loaded { .. }),
+                    ) = action
+                    {
+                        return action;
+                    }
+                }
+                panic!("file-page worker returned no receipt");
+            });
         drop(state.update(receipt));
         assert!(state.files[100].changed_since_viewed);
         assert!(!state.file_marks_incomplete());

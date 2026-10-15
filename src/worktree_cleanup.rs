@@ -425,8 +425,12 @@ pub fn protect(directory: &Path) -> io::Result<Option<Protection>> {
 }
 
 #[cfg(test)]
-pub(crate) fn fixture_protection(runtime: &Path, directory: &Path, exclusive: bool) -> io::Result<Protection> {
-    acquire(runtime,directory,exclusive)
+pub(crate) fn fixture_protection(
+    runtime: &Path,
+    directory: &Path,
+    exclusive: bool,
+) -> io::Result<Protection> {
+    acquire(runtime, directory, exclusive)
 }
 
 /// Selected scopes and restored editor descriptors remain protected even
@@ -455,7 +459,10 @@ impl WindowProtections {
     /// its scope or dependent cards become visible. This performs no I/O.
     pub(crate) fn install_prepared(&mut self, protection: Option<Protection>) {
         if let Some(protection) = protection {
-            self.directories.insert(protection.directory.clone(), std::sync::Arc::new(protection));
+            self.directories.insert(
+                protection.directory.clone(),
+                std::sync::Arc::new(protection),
+            );
         }
     }
 
@@ -468,23 +475,41 @@ impl WindowProtections {
         snapshot
     }
 
-    pub(crate) fn prepare_sync(mut self, paths: Vec<PathBuf>) -> io::Result<(Self, Option<crate::instance::PreparedLock>)> {
+    pub(crate) fn prepare_sync(
+        mut self,
+        paths: Vec<PathBuf>,
+    ) -> io::Result<(Self, Option<crate::instance::PreparedLock>)> {
         self.sync(paths)?;
-        if let Some(error) = &self.last_failure { return Err(io::Error::other(error.clone())); }
-        let ready = if crate::instance::window_is_initialized() && crate::device::selected().is_none() {
-            Some(crate::instance::prepare_window_protection_ready()?)
-        } else { None };
+        if let Some(error) = &self.last_failure {
+            return Err(io::Error::other(error.clone()));
+        }
+        let ready =
+            if crate::instance::window_is_initialized() && crate::device::selected().is_none() {
+                Some(crate::instance::prepare_window_protection_ready()?)
+            } else {
+                None
+            };
         Ok((self, ready))
     }
 
-    pub(crate) fn commit_readiness(&mut self, prepared: Option<crate::instance::PreparedLock>) -> io::Result<()> {
+    pub(crate) fn commit_readiness(
+        &mut self,
+        prepared: Option<crate::instance::PreparedLock>,
+    ) -> io::Result<()> {
         self.suppress_readiness = false;
-        self.ready = prepared.map(|prepared| prepared.lock(libc::LOCK_EX | libc::LOCK_NB)
-            .map(std::sync::Arc::new)).transpose()?;
+        self.ready = prepared
+            .map(|prepared| {
+                prepared
+                    .lock(libc::LOCK_EX | libc::LOCK_NB)
+                    .map(std::sync::Arc::new)
+            })
+            .transpose()?;
         Ok(())
     }
 
-    pub(crate) fn needs_retry(&self) -> bool { self.retry_after.is_some() }
+    pub(crate) fn needs_retry(&self) -> bool {
+        self.retry_after.is_some()
+    }
 
     /// In-memory inspection only: no path resolution runs on the UI thread.
     pub(crate) fn protects_exact(&self, directory: &Path) -> bool {
@@ -492,7 +517,9 @@ impl WindowProtections {
     }
 
     pub(crate) fn holds_within(&self, directory: &Path) -> bool {
-        self.directories.keys().any(|held| held.starts_with(directory))
+        self.directories
+            .keys()
+            .any(|held| held.starts_with(directory))
     }
 
     #[cfg(test)]
@@ -506,8 +533,10 @@ impl WindowProtections {
         if let Some(protection) = protect(directory)? {
             self.resolved
                 .insert(directory.to_owned(), protection.directory.clone());
-            self.directories
-                .insert(protection.directory.clone(), std::sync::Arc::new(protection));
+            self.directories.insert(
+                protection.directory.clone(),
+                std::sync::Arc::new(protection),
+            );
         }
         Ok(())
     }
@@ -584,7 +613,8 @@ impl WindowProtections {
             if !self.directories.contains_key(&directory) {
                 match protect(&directory) {
                     Ok(guard) => {
-                        self.directories.insert(directory.clone(), std::sync::Arc::new(guard));
+                        self.directories
+                            .insert(directory.clone(), std::sync::Arc::new(guard));
                     }
                     Err(error) if error.kind() == io::ErrorKind::NotFound => {
                         missing.insert(path.clone());
@@ -653,26 +683,42 @@ mod tests {
         let now = std::time::Instant::now();
         let mut window = WindowProtections::default();
         window.suppress_readiness = true;
-        window.sync_with(vec![original.clone()],now,|path|path.canonicalize(),
-            |path|acquire(runtime.path(),path,false), ||panic!("worker published readiness")).unwrap();
-        std::fs::rename(&original,&moved).unwrap();
+        window
+            .sync_with(
+                vec![original.clone()],
+                now,
+                |path| path.canonicalize(),
+                |path| acquire(runtime.path(), path, false),
+                || panic!("worker published readiness"),
+            )
+            .unwrap();
+        std::fs::rename(&original, &moved).unwrap();
         let mut snapshot = window.synchronization_snapshot();
-        snapshot.sync_with(vec![original.clone(),present],now,|path|path.canonicalize(),
-            |path|acquire(runtime.path(),path,false), ||panic!("worker published readiness")).unwrap();
+        snapshot
+            .sync_with(
+                vec![original.clone(), present],
+                now,
+                |path| path.canonicalize(),
+                |path| acquire(runtime.path(), path, false),
+                || panic!("worker published readiness"),
+            )
+            .unwrap();
         assert!(snapshot.ready.is_none());
         assert!(snapshot.missing.contains(&original));
         assert!(snapshot.needs_retry());
         drop(window);
-        assert!(matches!(acquire(runtime.path(),&moved,true), Err(error) if error.kind()==io::ErrorKind::WouldBlock));
+        assert!(
+            matches!(acquire(runtime.path(),&moved,true), Err(error) if error.kind()==io::ErrorKind::WouldBlock)
+        );
         drop(snapshot);
-        acquire(runtime.path(),&moved,true).unwrap();
+        acquire(runtime.path(), &moved, true).unwrap();
     }
 
     #[test]
     fn background_snapshot_keeps_old_directory_leases_until_it_retires() {
         let runtime = tempfile::tempdir().unwrap();
         let directory = tempfile::tempdir().unwrap();
-        let guard = acquire(runtime.path(),directory.path(),false).unwrap();
+        let guard = acquire(runtime.path(), directory.path(), false).unwrap();
         let mut window = WindowProtections::default();
         window.install_prepared(Some(guard));
         let snapshot = window.synchronization_snapshot();
@@ -680,7 +726,7 @@ mod tests {
         assert!(matches!(acquire(runtime.path(),directory.path(),true),
             Err(error) if error.kind()==io::ErrorKind::WouldBlock));
         drop(snapshot);
-        acquire(runtime.path(),directory.path(),true).unwrap();
+        acquire(runtime.path(), directory.path(), true).unwrap();
     }
 
     fn fixture_git(root: &Path) -> std::process::Command {

@@ -167,10 +167,13 @@ impl Snapshot {
                     .unknown
                     .as_ref()
                     .is_some_and(|receipt| receipt.len() > 65536)
-                || drafts
-                    .composer
-                    .as_ref()
-                    .is_some_and(|draft| draft.body.len() > 65536 || draft.original_body.as_ref().is_some_and(|body| body.len() > 65536))
+                || drafts.composer.as_ref().is_some_and(|draft| {
+                    draft.body.len() > 65536
+                        || draft
+                            .original_body
+                            .as_ref()
+                            .is_some_and(|body| body.len() > 65536)
+                })
         }) {
             return Err("Cached review draft exceeds its text limit".into());
         }
@@ -641,8 +644,8 @@ impl Store for JsonStore {
 
 #[cfg(test)]
 mod draft_durability_tests {
-    use crate::pull_request_review::cache;
     use super::*;
+    use crate::pull_request_review::cache;
     #[test]
     fn json_recovery_text_has_order_conflict_and_eviction_protection() {
         let directory = tempfile::tempdir().unwrap();

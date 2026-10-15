@@ -809,7 +809,9 @@ impl SidebarWorktree {
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
         row.head_oid = record.head_oid.clone();
-        if let Some(status) = status { row.apply_status(status); }
+        if let Some(status) = status {
+            row.apply_status(status);
+        }
         row
     }
 
@@ -839,11 +841,17 @@ impl SidebarWorktree {
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
         let head_oid = match &status.head {
-            HeadState::Branch { name, oid } if !self.detached && self.branch.as_ref()==Some(name) => Some(oid.as_str()),
+            HeadState::Branch { name, oid }
+                if !self.detached && self.branch.as_ref() == Some(name) =>
+            {
+                Some(oid.as_str())
+            }
             HeadState::Detached { oid } if self.detached => Some(oid.as_str()),
             _ => None,
         };
-        if self.head_oid.as_deref() != head_oid { self.head_oid = head_oid.map(str::to_owned); }
+        if self.head_oid.as_deref() != head_oid {
+            self.head_oid = head_oid.map(str::to_owned);
+        }
         let (ahead, behind) = match &status.tracking {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
@@ -4713,8 +4721,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4738,16 +4751,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4962,8 +4979,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -10482,7 +10499,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11271,58 +11290,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 
@@ -11349,20 +11371,39 @@ pub(crate) mod tests {
 
     #[test]
     fn authoritative_sidebar_reads_replace_checkout_identity_without_dirty_changes() {
-        let mut row = SidebarWorktree::from_durable(WorktreeId::new(), "/repo/feature".into(), Some("feature".into()));
+        let mut row = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            "/repo/feature".into(),
+            Some("feature".into()),
+        );
         let mut status = StatusSnapshot::default();
-        status.head = HeadState::Branch { name: "feature".into(), oid: "a".repeat(40) };
+        status.head = HeadState::Branch {
+            name: "feature".into(),
+            oid: "a".repeat(40),
+        };
         row.apply_status(&status);
         assert_eq!(row.head_oid.as_deref(), Some("a".repeat(40).as_str()));
-        status.head = HeadState::Branch { name: "feature".into(), oid: "b".repeat(40) };
+        status.head = HeadState::Branch {
+            name: "feature".into(),
+            oid: "b".repeat(40),
+        };
         row.apply_status(&status);
         assert_eq!(row.head_oid.as_deref(), Some("b".repeat(40).as_str()));
-        status.head = HeadState::Branch { name: "different".into(), oid: "b".repeat(40) };
+        status.head = HeadState::Branch {
+            name: "different".into(),
+            oid: "b".repeat(40),
+        };
         row.apply_status(&status);
-        assert!(row.head_oid.is_none(), "a newer status for a different branch cannot authorize the cached row");
+        assert!(
+            row.head_oid.is_none(),
+            "a newer status for a different branch cannot authorize the cached row"
+        );
         status.head = HeadState::Unknown;
         row.apply_status(&status);
-        assert!(row.head_oid.is_none(), "an unreadable checkout cannot retain old action authority");
+        assert!(
+            row.head_oid.is_none(),
+            "an unreadable checkout cannot retain old action authority"
+        );
     }
 
     fn worktree(id: u128, branch: &str, dirty: bool) -> SidebarWorktree {

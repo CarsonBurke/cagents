@@ -32,11 +32,34 @@ pub enum Action {
     Composer(text_editor::Action),
     Preview,
     InsertSuggestion,
-    SuggestionLines { generation: u64, composer_revision:u64, head:String, anchor: Anchor, original: String, result: Result<String, String> },
-    PreviewSuggestion { comment: String, index: usize },
-    SuggestionPreview { generation: u64, head: String, comment: String, index: usize, expected_body: String, result: Result<String,String> },
-    ApplySuggestion { comment: String, index: usize },
-    SuggestionApplied { generation: u64, outcome: Outcome },
+    SuggestionLines {
+        generation: u64,
+        composer_revision: u64,
+        head: String,
+        anchor: Anchor,
+        original: String,
+        result: Result<String, String>,
+    },
+    PreviewSuggestion {
+        comment: String,
+        index: usize,
+    },
+    SuggestionPreview {
+        generation: u64,
+        head: String,
+        comment: String,
+        index: usize,
+        expected_body: String,
+        result: Result<String, String>,
+    },
+    ApplySuggestion {
+        comment: String,
+        index: usize,
+    },
+    SuggestionApplied {
+        generation: u64,
+        outcome: Outcome,
+    },
     Cancel,
     Save,
     SaveNow,
@@ -118,7 +141,7 @@ pub(super) struct DiscussionState {
     submitting: bool,
     saving_composer: bool,
     suggestion_loading: bool,
-    suggestion_previews: BTreeMap<(String,usize),(String,String,String)>,
+    suggestion_previews: BTreeMap<(String, usize), (String, String, String)>,
     pub(super) unknown: Option<String>,
     loading: bool,
     drafts_saved: bool,
@@ -249,8 +272,9 @@ impl State {
 
     /// Local review input and write receipts must survive until explicitly resolved.
     pub fn restart_blocker(&self) -> Option<&'static str> {
-        if let Some(reason) = self.completion.blocker() { Some(reason) }
-        else if self.discussion.busy {
+        if let Some(reason) = self.completion.blocker() {
+            Some(reason)
+        } else if self.discussion.busy {
             Some("Wait for the GitHub review write to finish before closing the window.")
         } else if self.discussion.unknown.is_some() {
             Some(
@@ -271,7 +295,10 @@ impl State {
     }
 
     pub(super) fn block_discussion_navigation(&mut self) -> bool {
-        if let Some(reason) = self.completion.blocker() { self.notice=Some(reason.into()); return true; }
+        if let Some(reason) = self.completion.blocker() {
+            self.notice = Some(reason.into());
+            return true;
+        }
         let message = if self.cache.is_some() && !self.discussion.drafts_saved {
             Some("Wait for the local review draft to finish saving before leaving this review.")
         } else if self.discussion.busy {
@@ -330,7 +357,10 @@ impl State {
     }
 
     fn can_mutate_discussion(&self) -> bool {
-        self.load == LoadState::Ready && !self.discussion.busy && self.discussion.unknown.is_none() && self.completion.blocker().is_none()
+        self.load == LoadState::Ready
+            && !self.discussion.busy
+            && self.discussion.unknown.is_none()
+            && self.completion.blocker().is_none()
     }
 
     fn can_discard_draft(&self) -> bool {
@@ -389,7 +419,7 @@ impl State {
                 | Action::AcknowledgeUnknown
         ) {
             self.discussion.composer_revision = self.discussion.composer_revision.wrapping_add(1);
-            self.discussion.suggestion_loading=false;
+            self.discussion.suggestion_loading = false;
         }
         if matches!(
             &action,
@@ -568,38 +598,97 @@ impl State {
                     self.effects.push(Effect::OpenUrl(url));
                 }
             }
-            Action::SuggestionLines { generation, composer_revision, head, anchor, original, result } => {
-                if generation != self.generation || composer_revision!=self.discussion.composer_revision { return ActionTask::none(); }
+            Action::SuggestionLines {
+                generation,
+                composer_revision,
+                head,
+                anchor,
+                original,
+                result,
+            } => {
+                if generation != self.generation
+                    || composer_revision != self.discussion.composer_revision
+                {
+                    return ActionTask::none();
+                }
                 self.discussion.suggestion_loading = false;
-                if self.context.as_ref().is_none_or(|context|context.head_oid!=head){self.notice=Some("The PR head changed. Re-anchor the draft before inserting selected lines.".into());return ActionTask::none();}
+                if self
+                    .context
+                    .as_ref()
+                    .is_none_or(|context| context.head_oid != head)
+                {
+                    self.notice = Some(
+                        "The PR head changed. Re-anchor the draft before inserting selected lines."
+                            .into(),
+                    );
+                    return ActionTask::none();
+                }
                 match result {
-                    Ok(lines) => if let Some(composer) = &mut self.discussion.composer {
-                        if composer.authority.context.head_oid==head && matches!(&composer.destination, Destination::Line(current) if *current == anchor) && composer.content.text() == original {
-                            let block = crate::github::suggested_changes::suggestion_block(&lines);
-                            let body = if original.is_empty() { block } else { format!("{original}\n\n{block}") };
-                            composer.content = text_editor::Content::with_text(&body);
-                            composer.markdown = markdown::parse(&body).collect();
-                            self.discussion.composer_revision=self.discussion.composer_revision.wrapping_add(1);
-                            self.discussion.drafts_saved=false;self.cache_dirty=true;
-                        } else { self.notice = Some("The draft changed while loading the selected lines. Insert the suggestion again.".into()); }
-                    },
+                    Ok(lines) => {
+                        if let Some(composer) = &mut self.discussion.composer {
+                            if composer.authority.context.head_oid == head
+                                && matches!(&composer.destination, Destination::Line(current) if *current == anchor)
+                                && composer.content.text() == original
+                            {
+                                let block =
+                                    crate::github::suggested_changes::suggestion_block(&lines);
+                                let body = if original.is_empty() {
+                                    block
+                                } else {
+                                    format!("{original}\n\n{block}")
+                                };
+                                composer.content = text_editor::Content::with_text(&body);
+                                composer.markdown = markdown::parse(&body).collect();
+                                self.discussion.composer_revision =
+                                    self.discussion.composer_revision.wrapping_add(1);
+                                self.discussion.drafts_saved = false;
+                                self.cache_dirty = true;
+                            } else {
+                                self.notice = Some("The draft changed while loading the selected lines. Insert the suggestion again.".into());
+                            }
+                        }
+                    }
                     Err(error) => self.notice = Some(error),
                 }
             }
-            Action::SuggestionPreview { generation, head, comment, index, expected_body, result } => {
-                if generation != self.generation { return ActionTask::none(); }
+            Action::SuggestionPreview {
+                generation,
+                head,
+                comment,
+                index,
+                expected_body,
+                result,
+            } => {
+                if generation != self.generation {
+                    return ActionTask::none();
+                }
                 match result {
-                    Ok(source) => {self.discussion.suggestion_previews.insert((comment,index),(expected_body,head,source));}
-                    Err(error) => self.notice=Some(error),
+                    Ok(source) => {
+                        self.discussion
+                            .suggestion_previews
+                            .insert((comment, index), (expected_body, head, source));
+                    }
+                    Err(error) => self.notice = Some(error),
                 }
             }
-            Action::SuggestionApplied { generation, outcome } => {
-                if generation != self.generation { return ActionTask::none(); }
+            Action::SuggestionApplied {
+                generation,
+                outcome,
+            } => {
+                if generation != self.generation {
+                    return ActionTask::none();
+                }
                 self.discussion.busy = false;
                 match outcome {
-                    Outcome::Applied => self.notice = Some("Suggestion committed to the PR branch.".into()),
+                    Outcome::Applied => {
+                        self.notice = Some("Suggestion committed to the PR branch.".into())
+                    }
                     Outcome::Refused(error) => self.notice = Some(error),
-                    Outcome::Unknown(error) => {self.discussion.unknown = Some(error);self.discussion.drafts_saved=false;self.cache_dirty=true;},
+                    Outcome::Unknown(error) => {
+                        self.discussion.unknown = Some(error);
+                        self.discussion.drafts_saved = false;
+                        self.cache_dirty = true;
+                    }
                 }
                 return self.refresh();
             }
@@ -635,54 +724,222 @@ impl State {
             Action::CancelDiscard => self.discussion.discard_confirmation = None,
             _ if !self.can_mutate_discussion() => return ActionTask::none(),
             Action::InsertSuggestion => {
-                if self.discussion.suggestion_loading { return ActionTask::none(); }
-                let Some(composer) = &self.discussion.composer else { return ActionTask::none(); };
-                let Destination::Line(anchor) = &composer.destination else { return ActionTask::none(); };
-                if anchor.side != crate::github::ReviewDiffSide::Right { self.notice = Some("Suggestions can replace lines on the current right side of the diff.".into()); return ActionTask::none(); }
-                if self.context.as_ref().is_none_or(|context|context.head_oid!=composer.authority.context.head_oid){self.notice=Some("Re-anchor the draft to the current PR head before inserting selected lines.".into());return ActionTask::none();}
-                let anchor = anchor.clone(); let original = composer.content.text();
-                let authority = composer.authority.clone();let head=authority.context.head_oid.clone();
-                self.discussion.composer_revision=self.discussion.composer_revision.wrapping_add(1);let composer_revision=self.discussion.composer_revision;
-                let generation = self.generation; let api = Arc::clone(&self.api); let cancellation = self.cancellation.clone();
+                if self.discussion.suggestion_loading {
+                    return ActionTask::none();
+                }
+                let Some(composer) = &self.discussion.composer else {
+                    return ActionTask::none();
+                };
+                let Destination::Line(anchor) = &composer.destination else {
+                    return ActionTask::none();
+                };
+                if anchor.side != crate::github::ReviewDiffSide::Right {
+                    self.notice = Some(
+                        "Suggestions can replace lines on the current right side of the diff."
+                            .into(),
+                    );
+                    return ActionTask::none();
+                }
+                if self
+                    .context
+                    .as_ref()
+                    .is_none_or(|context| context.head_oid != composer.authority.context.head_oid)
+                {
+                    self.notice=Some("Re-anchor the draft to the current PR head before inserting selected lines.".into());
+                    return ActionTask::none();
+                }
+                let anchor = anchor.clone();
+                let original = composer.content.text();
+                let authority = composer.authority.clone();
+                let head = authority.context.head_oid.clone();
+                self.discussion.composer_revision =
+                    self.discussion.composer_revision.wrapping_add(1);
+                let composer_revision = self.discussion.composer_revision;
+                let generation = self.generation;
+                let api = Arc::clone(&self.api);
+                let cancellation = self.cancellation.clone();
                 self.discussion.suggestion_loading = true;
-                return iced::Task::perform(async move {
-                    let requested = anchor.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        let key = PullRequestKey::new(authority.target.repository, authority.target.pull_request.number).map_err(|error| error.to_string())?;
-                        api.suggestion_lines(&key, &requested.path, &authority.context.head_oid, requested.start_line, requested.line, &cancellation).map_err(|error| error.to_string())
-                    }).await.unwrap_or_else(|error| Err(error.to_string()));
-                    Action::SuggestionLines { generation, composer_revision, head, anchor, original, result }
-                }, |action| super::Action::Discussion(action));
+                return iced::Task::perform(
+                    async move {
+                        let requested = anchor.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let key = PullRequestKey::new(
+                                authority.target.repository,
+                                authority.target.pull_request.number,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            api.suggestion_lines(
+                                &key,
+                                &requested.path,
+                                &authority.context.head_oid,
+                                requested.start_line,
+                                requested.line,
+                                &cancellation,
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        Action::SuggestionLines {
+                            generation,
+                            composer_revision,
+                            head,
+                            anchor,
+                            original,
+                            result,
+                        }
+                    },
+                    |action| super::Action::Discussion(action),
+                );
             }
             Action::PreviewSuggestion { comment, index } => {
-                let Some(authority)=self.authority() else{return ActionTask::none();};
-                let Some((thread,body))=self.discussion.conversation.as_ref().and_then(|conversation|conversation.threads.iter().find_map(|thread|thread.comments.iter().find(|candidate|candidate.id.as_deref()==Some(&comment)).map(|comment|(thread.clone(),comment.body.clone()))))else{return ActionTask::none();};
-                let Some((start,end))=crate::github::suggested_changes::suggestions(&body).get(index).and_then(|suggestion|crate::github::suggested_changes::suggestion_range(&thread,suggestion)) else{return ActionTask::none();};
-                let generation=self.generation;let api=Arc::clone(&self.api);let cancellation=self.cancellation.clone();let head=authority.context.head_oid.clone();
-                return iced::Task::perform(async move{
-                    let result=tokio::task::spawn_blocking(move||{
-                        let key=PullRequestKey::new(authority.target.repository,authority.target.pull_request.number).map_err(|error|error.to_string())?;
-                        api.suggestion_lines(&key,&thread.path,&authority.context.head_oid,start,end,&cancellation).map_err(|error|error.to_string())
-                    }).await.unwrap_or_else(|error|Err(error.to_string()));
-                    Action::SuggestionPreview{generation,head,comment,index,expected_body:body,result}
-                },|action|super::Action::Discussion(action));
+                let Some(authority) = self.authority() else {
+                    return ActionTask::none();
+                };
+                let Some((thread, body)) =
+                    self.discussion
+                        .conversation
+                        .as_ref()
+                        .and_then(|conversation| {
+                            conversation.threads.iter().find_map(|thread| {
+                                thread
+                                    .comments
+                                    .iter()
+                                    .find(|candidate| candidate.id.as_deref() == Some(&comment))
+                                    .map(|comment| (thread.clone(), comment.body.clone()))
+                            })
+                        })
+                else {
+                    return ActionTask::none();
+                };
+                let Some((start, end)) = crate::github::suggested_changes::suggestions(&body)
+                    .get(index)
+                    .and_then(|suggestion| {
+                        crate::github::suggested_changes::suggestion_range(&thread, suggestion)
+                    })
+                else {
+                    return ActionTask::none();
+                };
+                let generation = self.generation;
+                let api = Arc::clone(&self.api);
+                let cancellation = self.cancellation.clone();
+                let head = authority.context.head_oid.clone();
+                return iced::Task::perform(
+                    async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            let key = PullRequestKey::new(
+                                authority.target.repository,
+                                authority.target.pull_request.number,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            api.suggestion_lines(
+                                &key,
+                                &thread.path,
+                                &authority.context.head_oid,
+                                start,
+                                end,
+                                &cancellation,
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        Action::SuggestionPreview {
+                            generation,
+                            head,
+                            comment,
+                            index,
+                            expected_body: body,
+                            result,
+                        }
+                    },
+                    |action| super::Action::Discussion(action),
+                );
             }
             Action::ApplySuggestion { comment, index } => {
-                if self.discussion.composer.is_some() { self.notice = Some("Save or cancel the open comment before applying a suggestion.".into()); return ActionTask::none(); }
-                let Some(authority) = self.authority() else { return ActionTask::none(); };
-                if !authority.context.viewer_is_author { return ActionTask::none(); }
-                let Some(body) = self.discussion.conversation.as_ref().and_then(|conversation| conversation.threads.iter().filter(|thread| !thread.outdated && thread.side == crate::github::ReviewDiffSide::Right).flat_map(|thread| &thread.comments).find(|candidate| candidate.id.as_deref() == Some(&comment) && !candidate.is_pending())).map(|comment| comment.body.clone()) else { return ActionTask::none(); };
-                if crate::github::suggested_changes::suggestions(&body).get(index).is_none() { return ActionTask::none(); }
-                let generation = self.generation; let api = Arc::clone(&self.api); self.discussion.busy = true;
-                self.load_generation=self.load_generation.wrapping_add(1);self.discussion.loading=false;
-                return iced::Task::perform(async move {
-                    let outcome = tokio::task::spawn_blocking(move || {
-                        let key = PullRequestKey::new(authority.target.repository, authority.target.pull_request.number).map_err(|error| error.to_string())?;
-                        api.apply_suggestion(&key, &crate::github::suggested_changes::SuggestionRequest { comment, expected_body: body, index, expected_head: authority.context.head_oid }, &CancellationToken::new()).map_err(|error| error.to_string())
-                    }).await.unwrap_or_else(|error| Err(error.to_string()));
-                    let outcome = match outcome { Ok(ReviewMutationOutcome::Applied(())) => Outcome::Applied, Ok(ReviewMutationOutcome::NotApplied { failure }) => Outcome::Refused(failure.to_string()), Ok(ReviewMutationOutcome::OutcomeUnknown { failure }) => Outcome::Unknown(failure.to_string()), Err(error) => Outcome::Refused(error) };
-                    Action::SuggestionApplied { generation, outcome }
-                }, |action| super::Action::Discussion(action));
+                if self.discussion.composer.is_some() {
+                    self.notice = Some(
+                        "Save or cancel the open comment before applying a suggestion.".into(),
+                    );
+                    return ActionTask::none();
+                }
+                let Some(authority) = self.authority() else {
+                    return ActionTask::none();
+                };
+                if !authority.context.viewer_is_author {
+                    return ActionTask::none();
+                }
+                let Some(body) = self
+                    .discussion
+                    .conversation
+                    .as_ref()
+                    .and_then(|conversation| {
+                        conversation
+                            .threads
+                            .iter()
+                            .filter(|thread| {
+                                !thread.outdated
+                                    && thread.side == crate::github::ReviewDiffSide::Right
+                            })
+                            .flat_map(|thread| &thread.comments)
+                            .find(|candidate| {
+                                candidate.id.as_deref() == Some(&comment) && !candidate.is_pending()
+                            })
+                    })
+                    .map(|comment| comment.body.clone())
+                else {
+                    return ActionTask::none();
+                };
+                if crate::github::suggested_changes::suggestions(&body)
+                    .get(index)
+                    .is_none()
+                {
+                    return ActionTask::none();
+                }
+                let generation = self.generation;
+                let api = Arc::clone(&self.api);
+                self.discussion.busy = true;
+                self.load_generation = self.load_generation.wrapping_add(1);
+                self.discussion.loading = false;
+                return iced::Task::perform(
+                    async move {
+                        let outcome = tokio::task::spawn_blocking(move || {
+                            let key = PullRequestKey::new(
+                                authority.target.repository,
+                                authority.target.pull_request.number,
+                            )
+                            .map_err(|error| error.to_string())?;
+                            api.apply_suggestion(
+                                &key,
+                                &crate::github::suggested_changes::SuggestionRequest {
+                                    comment,
+                                    expected_body: body,
+                                    index,
+                                    expected_head: authority.context.head_oid,
+                                },
+                                &CancellationToken::new(),
+                            )
+                            .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        let outcome = match outcome {
+                            Ok(ReviewMutationOutcome::Applied(())) => Outcome::Applied,
+                            Ok(ReviewMutationOutcome::NotApplied { failure }) => {
+                                Outcome::Refused(failure.to_string())
+                            }
+                            Ok(ReviewMutationOutcome::OutcomeUnknown { failure }) => {
+                                Outcome::Unknown(failure.to_string())
+                            }
+                            Err(error) => Outcome::Refused(error),
+                        };
+                        Action::SuggestionApplied {
+                            generation,
+                            outcome,
+                        }
+                    },
+                    |action| super::Action::Discussion(action),
+                );
             }
             Action::Begin(anchor) => {
                 if self
@@ -1701,17 +1958,81 @@ impl State {
                     body,
                     actions,
                 ));
-                for (index, suggestion) in crate::github::suggested_changes::suggestions(&comment.body).iter().enumerate() {
+                for (index, suggestion) in
+                    crate::github::suggested_changes::suggestions(&comment.body)
+                        .iter()
+                        .enumerate()
+                {
                     rows.push(design::caption("Suggested replacement").into());
-                    let preview=comment.id.as_ref().and_then(|id|self.discussion.suggestion_previews.get(&(id.clone(),index))).filter(|(body,head,_)|body==&comment.body&&self.context.as_ref().is_some_and(|context|&context.head_oid==head));
-                    let text=preview.map_or_else(||suggestion.replacement.lines().map(|line|format!("+ {line}")).collect::<Vec<_>>().join("\n"),|(_,_,source)|crate::github::suggested_changes::suggestion_diff(source,&suggestion.replacement));
-                    rows.push(widget::container(design::body(text)).padding(space::S).into());
-                    if preview.is_none() && let Some(id)=&comment.id && crate::github::suggested_changes::suggestion_range(thread,suggestion).is_some(){
-                        rows.push(crate::ui_controls::button::quiet("Preview change").on_press_maybe(enabled.then(||Action::PreviewSuggestion{comment:id.clone(),index})).into());
+                    let preview = comment
+                        .id
+                        .as_ref()
+                        .and_then(|id| {
+                            self.discussion
+                                .suggestion_previews
+                                .get(&(id.clone(), index))
+                        })
+                        .filter(|(body, head, _)| {
+                            body == &comment.body
+                                && self
+                                    .context
+                                    .as_ref()
+                                    .is_some_and(|context| &context.head_oid == head)
+                        });
+                    let text = preview.map_or_else(
+                        || {
+                            suggestion
+                                .replacement
+                                .lines()
+                                .map(|line| format!("+ {line}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        },
+                        |(_, _, source)| {
+                            crate::github::suggested_changes::suggestion_diff(
+                                source,
+                                &suggestion.replacement,
+                            )
+                        },
+                    );
+                    rows.push(
+                        widget::container(design::body(text))
+                            .padding(space::S)
+                            .into(),
+                    );
+                    if preview.is_none()
+                        && let Some(id) = &comment.id
+                        && crate::github::suggested_changes::suggestion_range(thread, suggestion)
+                            .is_some()
+                    {
+                        rows.push(
+                            crate::ui_controls::button::quiet("Preview change")
+                                .on_press_maybe(enabled.then(|| Action::PreviewSuggestion {
+                                    comment: id.clone(),
+                                    index,
+                                }))
+                                .into(),
+                        );
                     }
-                    if let Some(id) = &comment.id && !comment.is_pending() && !thread.outdated && thread.side == crate::github::ReviewDiffSide::Right && self.context.as_ref().is_some_and(|context| context.viewer_is_author) {
-                        rows.push(crate::ui_controls::button::secondary("Apply suggestion")
-                            .on_press_maybe((enabled && preview.is_some()).then(|| Action::ApplySuggestion { comment: id.clone(), index })).into());
+                    if let Some(id) = &comment.id
+                        && !comment.is_pending()
+                        && !thread.outdated
+                        && thread.side == crate::github::ReviewDiffSide::Right
+                        && self
+                            .context
+                            .as_ref()
+                            .is_some_and(|context| context.viewer_is_author)
+                    {
+                        rows.push(
+                            crate::ui_controls::button::secondary("Apply suggestion")
+                                .on_press_maybe((enabled && preview.is_some()).then(|| {
+                                    Action::ApplySuggestion {
+                                        comment: id.clone(),
+                                        index,
+                                    }
+                                }))
+                                .into(),
+                        );
                     }
                 }
                 if comment.viewer_did_author
@@ -1921,39 +2242,91 @@ mod tests {
 
     #[test]
     fn stale_suggestion_lines_cannot_replace_a_new_composer_at_the_same_anchor() {
-        let mut state=ready();drop(state.update_discussion(Action::Begin(anchor())));
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
         drop(state.update_discussion(Action::InsertSuggestion));
-        let revision=state.discussion.composer_revision;let head=state.context.as_ref().unwrap().head_oid.clone();
-        drop(state.update_discussion(Action::Cancel));drop(state.update_discussion(Action::Begin(anchor())));
+        let revision = state.discussion.composer_revision;
+        let head = state.context.as_ref().unwrap().head_oid.clone();
+        drop(state.update_discussion(Action::Cancel));
+        drop(state.update_discussion(Action::Begin(anchor())));
         drop(state.update_discussion(Action::InsertSuggestion));
         assert!(state.discussion.suggestion_loading);
-        drop(state.update_discussion(Action::SuggestionLines{generation:state.generation,composer_revision:revision,head,anchor:anchor(),original:String::new(),result:Ok("old selected text".into())}));
-        assert!(state.discussion.composer.as_ref().unwrap().content.text().is_empty());
-        assert!(state.discussion.suggestion_loading,"an old receipt cannot clear a newer request");
+        drop(state.update_discussion(Action::SuggestionLines {
+            generation: state.generation,
+            composer_revision: revision,
+            head,
+            anchor: anchor(),
+            original: String::new(),
+            result: Ok("old selected text".into()),
+        }));
+        assert!(
+            state
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text()
+                .is_empty()
+        );
+        assert!(
+            state.discussion.suggestion_loading,
+            "an old receipt cannot clear a newer request"
+        );
     }
 
     #[test]
     fn suggestion_lines_from_an_old_head_leave_the_draft_unchanged() {
-        let mut state=ready();drop(state.update_discussion(Action::Begin(anchor())));
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
         drop(state.update_discussion(Action::InsertSuggestion));
-        let revision=state.discussion.composer_revision;let head=state.context.as_ref().unwrap().head_oid.clone();
-        state.context.as_mut().unwrap().head_oid="d".repeat(40);
-        drop(state.update_discussion(Action::SuggestionLines{generation:state.generation,composer_revision:revision,head,anchor:anchor(),original:String::new(),result:Ok("old selected text".into())}));
-        assert!(state.discussion.composer.as_ref().unwrap().content.text().is_empty());
+        let revision = state.discussion.composer_revision;
+        let head = state.context.as_ref().unwrap().head_oid.clone();
+        state.context.as_mut().unwrap().head_oid = "d".repeat(40);
+        drop(state.update_discussion(Action::SuggestionLines {
+            generation: state.generation,
+            composer_revision: revision,
+            head,
+            anchor: anchor(),
+            original: String::new(),
+            result: Ok("old selected text".into()),
+        }));
+        assert!(
+            state
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text()
+                .is_empty()
+        );
         assert!(!state.discussion.suggestion_loading);
         assert!(state.notice.as_ref().unwrap().contains("head changed"));
     }
 
     #[test]
     fn a_fenced_reanchor_receipt_can_finish_while_an_unrelated_modal_is_open() {
-        let mut state=ready();drop(state.update_discussion(Action::Begin(anchor())));
-        let mut mapped=anchor();mapped.line=12;mapped.start_line=12;
-        let callback=crate::pull_request_review::Action::Discussion(Action::Reanchored{
-            generation:state.generation,composer_revision:state.discussion.composer_revision,
-            context:state.context.clone().unwrap(),result:Ok(mapped.clone())});
-        assert!(callback.allowed_while_modal(),"the shell must deliver this worker receipt beneath a modal");
+        let mut state = ready();
+        drop(state.update_discussion(Action::Begin(anchor())));
+        let mut mapped = anchor();
+        mapped.line = 12;
+        mapped.start_line = 12;
+        let callback = crate::pull_request_review::Action::Discussion(Action::Reanchored {
+            generation: state.generation,
+            composer_revision: state.discussion.composer_revision,
+            context: state.context.clone().unwrap(),
+            result: Ok(mapped.clone()),
+        });
+        assert!(
+            callback.allowed_while_modal(),
+            "the shell must deliver this worker receipt beneath a modal"
+        );
         drop(state.update(callback));
-        assert_eq!(state.discussion.composer.as_ref().unwrap().destination,Destination::Line(mapped));
+        assert_eq!(
+            state.discussion.composer.as_ref().unwrap().destination,
+            Destination::Line(mapped)
+        );
     }
 
     #[test]
@@ -2135,23 +2508,73 @@ mod tests {
     fn published_inline_edit_persists_its_original_text_and_keeps_refused_input() {
         let mut state = ready();
         let comment = serde_json::from_value(serde_json::json!({"id":"comment","body":"Original text","createdAt":"now","url":"https://github.com/o/r/pull/1#comment","viewerDidAuthor":true,"viewerCanUpdate":true,"commentState":"SUBMITTED"})).unwrap();
-        state.discussion.conversation = Some(Arc::new(PullRequestConversation { threads: vec![PullRequestReviewThread {
-            id:"thread".into(),path:"file.rs".into(),line:Some(1),start_line:None,side:ReviewDiffSide::Right,start_side:None,
-            outdated:false,resolved:false,collapsed:false,viewer_can_resolve:true,viewer_can_unresolve:false,truncated:false,comments:vec![comment],
-        }], ..Default::default() }));
+        state.discussion.conversation = Some(Arc::new(PullRequestConversation {
+            threads: vec![PullRequestReviewThread {
+                id: "thread".into(),
+                path: "file.rs".into(),
+                line: Some(1),
+                start_line: None,
+                side: ReviewDiffSide::Right,
+                start_side: None,
+                outdated: false,
+                resolved: false,
+                collapsed: false,
+                viewer_can_resolve: true,
+                viewer_can_unresolve: false,
+                truncated: false,
+                comments: vec![comment],
+            }],
+            ..Default::default()
+        }));
         drop(state.update_discussion(Action::Edit("comment".into())));
-        state.discussion.composer.as_mut().unwrap().content = text_editor::Content::with_text("My retained edit");
+        state.discussion.composer.as_mut().unwrap().content =
+            text_editor::Content::with_text("My retained edit");
         let serialized = serde_json::to_value(state.local_drafts()).unwrap();
-        let mut restored = ready(); restored.restore_drafts(serde_json::from_value(serialized.clone()).unwrap(),None);
+        let mut restored = ready();
+        restored.restore_drafts(serde_json::from_value(serialized.clone()).unwrap(), None);
         let composer = restored.discussion.composer.as_ref().unwrap();
-        assert_eq!(composer.original_body.as_deref(),Some("Original text"));
-        assert_eq!(composer.content.text(),"My retained edit");
-        drop(restored.update_discussion(Action::Finished { generation:restored.generation,outcome:Outcome::Refused("The comment changed on GitHub".into()) }));
-        assert_eq!(restored.discussion.composer.as_ref().unwrap().content.text(),"My retained edit");
-        let mut legacy = serialized; legacy["composer"].as_object_mut().unwrap().remove("original_body");
-        let mut restored = ready(); restored.restore_drafts(serde_json::from_value(legacy).unwrap(),None);
-        assert!(restored.discussion.composer.as_ref().unwrap().original_body.is_none());
-        assert_eq!(restored.discussion.composer.as_ref().unwrap().content.text(),"My retained edit");
+        assert_eq!(composer.original_body.as_deref(), Some("Original text"));
+        assert_eq!(composer.content.text(), "My retained edit");
+        drop(restored.update_discussion(Action::Finished {
+            generation: restored.generation,
+            outcome: Outcome::Refused("The comment changed on GitHub".into()),
+        }));
+        assert_eq!(
+            restored
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text(),
+            "My retained edit"
+        );
+        let mut legacy = serialized;
+        legacy["composer"]
+            .as_object_mut()
+            .unwrap()
+            .remove("original_body");
+        let mut restored = ready();
+        restored.restore_drafts(serde_json::from_value(legacy).unwrap(), None);
+        assert!(
+            restored
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .original_body
+                .is_none()
+        );
+        assert_eq!(
+            restored
+                .discussion
+                .composer
+                .as_ref()
+                .unwrap()
+                .content
+                .text(),
+            "My retained edit"
+        );
     }
 
     #[test]

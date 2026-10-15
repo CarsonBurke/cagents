@@ -25,7 +25,10 @@ pub(crate) enum Action {
     Destination(String),
     Resolve,
     Resolved(OperationId, Result<CreateWorktreeRequest, String>),
-    Prepared(OperationId, Result<cagents::pull_request_review::checkout::PreparedCheckout, String>),
+    Prepared(
+        OperationId,
+        Result<cagents::pull_request_review::checkout::PreparedCheckout, String>,
+    ),
     Create,
     Finished(OperationId, Result<WorktreeOperationReport, String>),
     Cancel,
@@ -187,15 +190,22 @@ impl Editor {
                 if dialog.prepared.is_none() {
                     let target = dialog.target.clone();
                     return cosmic::task::future(async move {
-                        let result = tokio::task::spawn_blocking(move || cagents::pull_request_review::checkout::prepare(&target, &cancellation))
-                            .await.map_err(|error| error.to_string()).and_then(|result| result);
+                        let result = tokio::task::spawn_blocking(move || {
+                            cagents::pull_request_review::checkout::prepare(&target, &cancellation)
+                        })
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
                         Message::Checkout(Action::Prepared(id, result))
                     });
                 }
                 let input = WorktreeInput {
                     repository: dialog.target.repository.clone(),
                     input: dialog.branch.clone(),
-                    base: dialog.prepared.as_ref().map_or_else(|| dialog.target.head.as_str().to_owned(), |plan| plan.base.clone()),
+                    base: dialog.prepared.as_ref().map_or_else(
+                        || dialog.target.head.as_str().to_owned(),
+                        |plan| plan.base.clone(),
+                    ),
                     managed_directory: self.settings.managed_worktree_directory.clone(),
                     destination: dialog.destination.clone(),
                     operation_id: id,
@@ -213,16 +223,30 @@ impl Editor {
                 });
             }
             Action::Prepared(id, result) => {
-                let Some(dialog) = self.checkout_dialog.as_mut().filter(|dialog| dialog.id == id) else { return Task::none(); };
-                let cancelled = dialog.cancellation.take().is_some_and(|token| token.is_cancelled());
-                if cancelled { dialog.error = Some("Cancelled before preparing checkout.".into()); return Task::none(); }
+                let Some(dialog) = self
+                    .checkout_dialog
+                    .as_mut()
+                    .filter(|dialog| dialog.id == id)
+                else {
+                    return Task::none();
+                };
+                let cancelled = dialog
+                    .cancellation
+                    .take()
+                    .is_some_and(|token| token.is_cancelled());
+                if cancelled {
+                    dialog.error = Some("Cancelled before preparing checkout.".into());
+                    return Task::none();
+                }
                 match result {
                     Ok(plan) => {
                         dialog.completed = plan.existing_worktree.clone();
                         dialog.branch = plan.branch_input.clone();
                         let existing = dialog.completed.is_some();
                         dialog.prepared = Some(plan);
-                        if !existing { return self.checkout_action(Action::Resolve); }
+                        if !existing {
+                            return self.checkout_action(Action::Resolve);
+                        }
                     }
                     Err(error) => dialog.error = Some(error),
                 }
@@ -391,7 +415,9 @@ impl Editor {
             ))
             .into(),
         ];
-        if let Some(plan) = &dialog.prepared { body.push(design::caption(&plan.notice).into()); }
+        if let Some(plan) = &dialog.prepared {
+            body.push(design::caption(&plan.notice).into());
+        }
         if let Some(path) = &dialog.completed {
             body.push(widget::text::body(format!("Worktree ready at {}", path.display())).into());
             body.push(
@@ -429,7 +455,9 @@ impl Editor {
                 &dialog.destination,
             );
             if !dialog.busy() {
-                if dialog.target.pull_request.is_none() { branch = branch.on_input(|v| Message::Checkout(Action::Branch(v))); }
+                if dialog.target.pull_request.is_none() {
+                    branch = branch.on_input(|v| Message::Checkout(Action::Branch(v)));
+                }
                 destination = destination.on_input(|v| Message::Checkout(Action::Destination(v)));
             }
             body.push(branch.into());

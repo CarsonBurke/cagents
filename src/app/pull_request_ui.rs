@@ -49,7 +49,13 @@ pub enum Action {
 
 impl Action {
     pub(super) fn allowed_while_modal(&self) -> bool {
-        matches!(self, Self::Resolved(..) | Self::Loaded(..) | Self::RerunFinished(..) | Self::AgentContext(..))
+        matches!(
+            self,
+            Self::Resolved(..)
+                | Self::Loaded(..)
+                | Self::RerunFinished(..)
+                | Self::AgentContext(..)
+        )
     }
 }
 
@@ -78,7 +84,6 @@ pub struct State {
     context_error: Option<String>,
     prepared_context: Option<(PathBuf, String)>,
     rerunning: std::collections::BTreeSet<u64>,
-
 }
 
 impl Target {
@@ -190,24 +195,47 @@ impl State {
     pub fn update(&mut self, action: Action) -> ActionTask {
         match action {
             Action::RerunFailed(run) => {
-                let Some(target) = self.target.clone() else { return ActionTask::none(); };
-                let actionable = self.inspection.as_ref().and_then(|inspection| inspection.checks.as_ref().ok())
-                    .is_some_and(|checks| checks.iter().any(|check| sidebar::is_check_failure(&check.bucket.0)
-                        && crate::github::agent_context::workflow_run(&target.repository, &check.link) == Some(run)));
-                if !actionable || !self.rerunning.insert(run) { return ActionTask::none(); }
+                let Some(target) = self.target.clone() else {
+                    return ActionTask::none();
+                };
+                let actionable = self
+                    .inspection
+                    .as_ref()
+                    .and_then(|inspection| inspection.checks.as_ref().ok())
+                    .is_some_and(|checks| {
+                        checks.iter().any(|check| {
+                            sidebar::is_check_failure(&check.bucket.0)
+                                && crate::github::agent_context::workflow_run(
+                                    &target.repository,
+                                    &check.link,
+                                ) == Some(run)
+                        })
+                    });
+                if !actionable || !self.rerunning.insert(run) {
+                    return ActionTask::none();
+                }
                 let generation = self.generation;
                 let cancellation = self.cancellation.clone();
                 self.context_error = None;
-                return ActionTask::perform(async move {
-                    let repo = target.repository.clone();
-                    let result = tokio::task::spawn_blocking(move || GitHubService::system("gh")
-                        .rerun_failed_workflow(&repo, run, &cancellation).map_err(|error| error.to_string()))
-                        .await.unwrap_or_else(|error| Err(format!("Workflow rerun failed: {error}")));
-                    Action::RerunFinished(target, generation, run, result)
-                }, |action| action);
+                return ActionTask::perform(
+                    async move {
+                        let repo = target.repository.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            GitHubService::system("gh")
+                                .rerun_failed_workflow(&repo, run, &cancellation)
+                                .map_err(|error| error.to_string())
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(format!("Workflow rerun failed: {error}")));
+                        Action::RerunFinished(target, generation, run, result)
+                    },
+                    |action| action,
+                );
             }
             Action::RerunFinished(target, generation, run, result) => {
-                if !self.accepts(&target, generation) { return ActionTask::none(); }
+                if !self.accepts(&target, generation) {
+                    return ActionTask::none();
+                }
                 self.rerunning.remove(&run);
                 match result {
                     Err(error) => self.context_error = Some(error),
@@ -216,7 +244,13 @@ impl State {
                             let inspection = Arc::make_mut(inspection);
                             GitHubService::<crate::repository::SystemProcessExecutor>::invalidate_checks(&target.repository, inspection.pull_request.number);
                             if let Ok(checks) = &mut inspection.checks {
-                                for check in checks.iter_mut().filter(|check| sidebar::is_check_failure(&check.bucket.0) && crate::github::agent_context::workflow_run(&target.repository, &check.link) == Some(run)) {
+                                for check in checks.iter_mut().filter(|check| {
+                                    sidebar::is_check_failure(&check.bucket.0)
+                                        && crate::github::agent_context::workflow_run(
+                                            &target.repository,
+                                            &check.link,
+                                        ) == Some(run)
+                                }) {
                                     check.bucket.0 = "pending".into();
                                     check.state.0 = "IN_PROGRESS".into();
                                 }
@@ -226,66 +260,158 @@ impl State {
                 }
             }
             Action::FixCheck(link) => {
-                if self.context_loading { return ActionTask::none(); }
-                let Some(target) = self.target.clone() else { return ActionTask::none(); };
-                let Some(inspection) = self.inspection.as_ref() else { return ActionTask::none(); };
-                let Some(check) = inspection.checks.as_ref().ok().and_then(|checks| checks.iter().find(|check| check.link == link && sidebar::is_check_failure(&check.bucket.0))).cloned() else { return ActionTask::none(); };
-                let Some(run) = crate::github::agent_context::workflow_run(&target.repository, &check.link) else { return ActionTask::none(); };
+                if self.context_loading {
+                    return ActionTask::none();
+                }
+                let Some(target) = self.target.clone() else {
+                    return ActionTask::none();
+                };
+                let Some(inspection) = self.inspection.as_ref() else {
+                    return ActionTask::none();
+                };
+                let Some(check) = inspection
+                    .checks
+                    .as_ref()
+                    .ok()
+                    .and_then(|checks| {
+                        checks.iter().find(|check| {
+                            check.link == link && sidebar::is_check_failure(&check.bucket.0)
+                        })
+                    })
+                    .cloned()
+                else {
+                    return ActionTask::none();
+                };
+                let Some(run) =
+                    crate::github::agent_context::workflow_run(&target.repository, &check.link)
+                else {
+                    return ActionTask::none();
+                };
                 let pr = inspection.pull_request.clone();
                 let cancellation = self.cancellation.clone();
                 let generation = self.generation;
                 self.context_loading = true;
                 self.context_error = None;
-                return ActionTask::perform(async move {
-                    let repo = target.repository.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        let logs = GitHubService::system("gh").failed_workflow_logs(&repo, run, &cancellation)
-                            .map_err(|error| error.to_string())?;
-                        Ok(crate::github::agent_context::failed_check_prompt(&pr, &check, &logs))
-                    }).await.unwrap_or_else(|error| Err(format!("Failed to prepare CI context: {error}")));
-                    Action::AgentContext(target, generation, result)
-                }, |action| action);
+                return ActionTask::perform(
+                    async move {
+                        let repo = target.repository.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let logs = GitHubService::system("gh")
+                                .failed_workflow_logs(&repo, run, &cancellation)
+                                .map_err(|error| error.to_string())?;
+                            Ok(crate::github::agent_context::failed_check_prompt(
+                                &pr, &check, &logs,
+                            ))
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("Failed to prepare CI context: {error}"))
+                        });
+                        Action::AgentContext(target, generation, result)
+                    },
+                    |action| action,
+                );
             }
             Action::ToggleThread(id) => {
-                if self.inspection.as_ref().and_then(|inspection| inspection.conversation.as_ref().ok())
-                    .is_some_and(|conversation| conversation.threads.iter().any(|thread| thread.id == id))
-                    && !self.selected_threads.remove(&id) { self.selected_threads.insert(id); }
+                if self
+                    .inspection
+                    .as_ref()
+                    .and_then(|inspection| inspection.conversation.as_ref().ok())
+                    .is_some_and(|conversation| {
+                        conversation.threads.iter().any(|thread| thread.id == id)
+                    })
+                    && !self.selected_threads.remove(&id)
+                {
+                    self.selected_threads.insert(id);
+                }
             }
             Action::SelectUnresolved => {
-                self.selected_threads = self.inspection.as_ref()
+                self.selected_threads = self
+                    .inspection
+                    .as_ref()
                     .and_then(|inspection| inspection.conversation.as_ref().ok())
-                    .map(|conversation| conversation.threads.iter().filter(|thread| !thread.resolved).map(|thread| thread.id.clone()).collect())
+                    .map(|conversation| {
+                        conversation
+                            .threads
+                            .iter()
+                            .filter(|thread| !thread.resolved)
+                            .map(|thread| thread.id.clone())
+                            .collect()
+                    })
                     .unwrap_or_default();
             }
             Action::SendThreads => {
-                if self.context_loading { return ActionTask::none(); }
-                let Some(target) = self.target.clone() else { return ActionTask::none(); };
-                let Some(inspection) = self.inspection.as_ref() else { return ActionTask::none(); };
-                let Some(conversation) = inspection.conversation.as_ref().ok() else { return ActionTask::none(); };
-                let threads: Vec<_> = conversation.threads.iter().filter(|thread| self.selected_threads.contains(&thread.id)).cloned().collect();
-                if threads.is_empty() { return ActionTask::none(); }
+                if self.context_loading {
+                    return ActionTask::none();
+                }
+                let Some(target) = self.target.clone() else {
+                    return ActionTask::none();
+                };
+                let Some(inspection) = self.inspection.as_ref() else {
+                    return ActionTask::none();
+                };
+                let Some(conversation) = inspection.conversation.as_ref().ok() else {
+                    return ActionTask::none();
+                };
+                let threads: Vec<_> = conversation
+                    .threads
+                    .iter()
+                    .filter(|thread| self.selected_threads.contains(&thread.id))
+                    .cloned()
+                    .collect();
+                if threads.is_empty() {
+                    return ActionTask::none();
+                }
                 let pr = inspection.pull_request.clone();
                 let cancellation = self.cancellation.clone();
                 let generation = self.generation;
                 self.context_loading = true;
                 self.context_error = None;
-                return ActionTask::perform(async move {
-                    let repo = target.repository.clone();
-                    let result = tokio::task::spawn_blocking(move || {
-                        let service = GitHubService::system("gh");
-                        let ids=threads.iter().map(|thread|thread.id.clone()).collect::<Vec<_>>();
-                        let hunks=service.review_thread_hunks(&repo,&ids,&cancellation).map_err(|error|error.to_string())?;
-                        let threads=threads.into_iter().zip(hunks).map(|(thread,hunk)| {
-                            if thread.truncated { service.complete_review_thread_comments(&repo,thread,&cancellation).map(|thread|(thread,hunk)).map_err(|error|error.to_string()) }
-                            else { Ok((thread,hunk)) }
-                        }).collect::<Result<Vec<_>,String>>()?;
-                        crate::github::agent_context::review_threads_prompt(&pr, &threads)
-                    }).await.unwrap_or_else(|error| Err(format!("Failed to prepare review context: {error}")));
-                    Action::AgentContext(target, generation, result)
-                }, |action| action);
+                return ActionTask::perform(
+                    async move {
+                        let repo = target.repository.clone();
+                        let result = tokio::task::spawn_blocking(move || {
+                            let service = GitHubService::system("gh");
+                            let ids = threads
+                                .iter()
+                                .map(|thread| thread.id.clone())
+                                .collect::<Vec<_>>();
+                            let hunks = service
+                                .review_thread_hunks(&repo, &ids, &cancellation)
+                                .map_err(|error| error.to_string())?;
+                            let threads = threads
+                                .into_iter()
+                                .zip(hunks)
+                                .map(|(thread, hunk)| {
+                                    if thread.truncated {
+                                        service
+                                            .complete_review_thread_comments(
+                                                &repo,
+                                                thread,
+                                                &cancellation,
+                                            )
+                                            .map(|thread| (thread, hunk))
+                                            .map_err(|error| error.to_string())
+                                    } else {
+                                        Ok((thread, hunk))
+                                    }
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            crate::github::agent_context::review_threads_prompt(&pr, &threads)
+                        })
+                        .await
+                        .unwrap_or_else(|error| {
+                            Err(format!("Failed to prepare review context: {error}"))
+                        });
+                        Action::AgentContext(target, generation, result)
+                    },
+                    |action| action,
+                );
             }
             Action::AgentContext(target, generation, result) => {
-                if !self.accepts(&target, generation) { return ActionTask::none(); }
+                if !self.accepts(&target, generation) {
+                    return ActionTask::none();
+                }
                 self.context_loading = false;
                 match result {
                     Ok(prompt) => self.prepared_context = Some((target.worktree, prompt)),
@@ -380,7 +506,9 @@ impl State {
                         if let Some(inspection) = &inspection
                             && let Ok(conversation) = &inspection.conversation
                         {
-                            self.selected_threads.retain(|id| conversation.threads.iter().any(|thread| thread.id == *id));
+                            self.selected_threads.retain(|id| {
+                                conversation.threads.iter().any(|thread| thread.id == *id)
+                            });
                             for comment in conversation
                                 .comments
                                 .iter()
@@ -481,8 +609,13 @@ fn check_rank(check: &crate::github::PullRequestCheck) -> u8 {
 
 fn checks_summary(checks: &[crate::github::PullRequestCheck]) -> String {
     let mut counts = [0; 4];
-    for check in checks { counts[usize::from(check_rank(check))] += 1; }
-    format!("Checks · {} failed, {} running, {} passed, {} skipped", counts[0], counts[1], counts[2], counts[3])
+    for check in checks {
+        counts[usize::from(check_rank(check))] += 1;
+    }
+    format!(
+        "Checks · {} failed, {} running, {} passed, {} skipped",
+        counts[0], counts[1], counts[2], counts[3]
+    )
 }
 
 fn link<'a>(label: &'a str, url: &Url) -> Element<'a, Action> {
@@ -944,10 +1077,10 @@ pub fn view(state: &State) -> Element<'_, Action> {
         }
     }
     if let Some(inspection) = &state.inspection {
-        let checks_label = inspection.checks.as_ref().map_or_else(
-            |_| "Checks".to_owned(),
-            |checks| checks_summary(checks),
-        );
+        let checks_label = inspection
+            .checks
+            .as_ref()
+            .map_or_else(|_| "Checks".to_owned(), |checks| checks_summary(checks));
         children.push(section_header(
             checks_label,
             Section::Checks,
@@ -1033,14 +1166,35 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         );
                         if sidebar::is_check_failure(&check.bucket.0)
                             && let Some(target) = &state.target
-                            && let Some(run) = crate::github::agent_context::workflow_run(&target.repository, &check.link)
+                            && let Some(run) = crate::github::agent_context::workflow_run(
+                                &target.repository,
+                                &check.link,
+                            )
                         {
-                            children.push(widget::row::with_children(vec![
-                                crate::ui_controls::button::secondary(if state.rerunning.contains(&run) { "Re-running…" } else { "Re-run failed" })
-                                    .on_press_maybe((!state.rerunning.contains(&run)).then_some(Action::RerunFailed(run))).into(),
-                                crate::ui_controls::button::secondary("Fix with agent")
-                                    .on_press_maybe((!state.context_loading).then(|| Action::FixCheck(check.link.clone()))).into(),
-                            ]).spacing(space::XS).into());
+                            children.push(
+                                widget::row::with_children(vec![
+                                    crate::ui_controls::button::secondary(
+                                        if state.rerunning.contains(&run) {
+                                            "Re-running…"
+                                        } else {
+                                            "Re-run failed"
+                                        },
+                                    )
+                                    .on_press_maybe(
+                                        (!state.rerunning.contains(&run))
+                                            .then_some(Action::RerunFailed(run)),
+                                    )
+                                    .into(),
+                                    crate::ui_controls::button::secondary("Fix with agent")
+                                        .on_press_maybe(
+                                            (!state.context_loading)
+                                                .then(|| Action::FixCheck(check.link.clone())),
+                                        )
+                                        .into(),
+                                ])
+                                .spacing(space::XS)
+                                .into(),
+                            );
                         }
                     }
                 }
@@ -1098,11 +1252,30 @@ pub fn view(state: &State) -> Element<'_, Action> {
                         .width(Length::Fill)
                         .into(),
                     );
-                    children.push(widget::row::with_children(vec![
-                        crate::ui_controls::button::secondary(if conversation.threads_truncated { "Select loaded unresolved" } else { "Select all unresolved" }).on_press(Action::SelectUnresolved).into(),
-                        crate::ui_controls::button::secondary(format!("Send {} to agent", state.selected_threads.len()))
-                            .on_press_maybe((!state.context_loading && !state.selected_threads.is_empty()).then_some(Action::SendThreads)).into(),
-                    ]).spacing(space::XS).into());
+                    children.push(
+                        widget::row::with_children(vec![
+                            crate::ui_controls::button::secondary(
+                                if conversation.threads_truncated {
+                                    "Select loaded unresolved"
+                                } else {
+                                    "Select all unresolved"
+                                },
+                            )
+                            .on_press(Action::SelectUnresolved)
+                            .into(),
+                            crate::ui_controls::button::secondary(format!(
+                                "Send {} to agent",
+                                state.selected_threads.len()
+                            ))
+                            .on_press_maybe(
+                                (!state.context_loading && !state.selected_threads.is_empty())
+                                    .then_some(Action::SendThreads),
+                            )
+                            .into(),
+                        ])
+                        .spacing(space::XS)
+                        .into(),
+                    );
                     let filter = state.filter.to_lowercase();
                     let mut shown = 0;
                     for thread in &conversation.threads {
@@ -1126,9 +1299,21 @@ pub fn view(state: &State) -> Element<'_, Action> {
                                         .width(Length::Fill)
                                         .into(),
                                 ];
-                                head.push(widget::button::custom(design::caption(if state.selected_threads.contains(&thread.id) { "Selected" } else { "Select" }))
-                                    .class(crate::ui_controls::control_style(state.selected_threads.contains(&thread.id), None))
-                                    .on_press(Action::ToggleThread(thread.id.clone())).into());
+                                head.push(
+                                    widget::button::custom(design::caption(
+                                        if state.selected_threads.contains(&thread.id) {
+                                            "Selected"
+                                        } else {
+                                            "Select"
+                                        },
+                                    ))
+                                    .class(crate::ui_controls::control_style(
+                                        state.selected_threads.contains(&thread.id),
+                                        None,
+                                    ))
+                                    .on_press(Action::ToggleThread(thread.id.clone()))
+                                    .into(),
+                                );
                                 if thread.outdated {
                                     head.push(crate::ui_controls::badge(
                                         "Outdated",
@@ -1222,10 +1407,18 @@ pub fn view(state: &State) -> Element<'_, Action> {
         }
     }
     if state.prepared_context.is_some() {
-        children.push(crate::ui_controls::button::secondary("Review prepared agent prompt").on_press(Action::OpenPreparedContext).into());
+        children.push(
+            crate::ui_controls::button::secondary("Review prepared agent prompt")
+                .on_press(Action::OpenPreparedContext)
+                .into(),
+        );
     }
-    if state.context_loading { children.push(design::caption("Preparing agent context…").into()); }
-    if let Some(error) = &state.context_error { children.push(design::caption(error).into()); }
+    if state.context_loading {
+        children.push(design::caption("Preparing agent context…").into());
+    }
+    if let Some(error) = &state.context_error {
+        children.push(design::caption(error).into());
+    }
     let body = widget::scrollable(
         widget::column::with_children(children)
             .spacing(space::S)
@@ -1257,7 +1450,9 @@ impl Cagents {
     pub(super) fn handle_pull_request_ui(&mut self, action: Action) -> Task<Message> {
         if matches!(action, Action::OpenPreparedContext)
             && let Some((worktree, prompt)) = self.pull_request_inspector.prepared_context.take()
-        { return self.prepare_pr_agent_context(worktree, prompt); }
+        {
+            return self.prepare_pr_agent_context(worktree, prompt);
+        }
         if let Action::AgentContext(target, generation, Ok(prompt)) = &action
             && self.nested_modal_focus_target().is_none()
             && !self.focused_repository_is_saving()
@@ -1265,7 +1460,11 @@ impl Cagents {
         {
             let worktree = target.worktree.clone();
             let prompt = prompt.clone();
-            let update = self.pull_request_inspector.update(action).map(Message::PullRequestUi).map(cosmic::Action::App);
+            let update = self
+                .pull_request_inspector
+                .update(action)
+                .map(Message::PullRequestUi)
+                .map(cosmic::Action::App);
             self.pull_request_inspector.prepared_context = None;
             let draft = self.prepare_pr_agent_context(worktree, prompt);
             return Task::batch([update, draft]);
@@ -1523,24 +1722,59 @@ mod tests {
 
     #[test]
     fn failed_checks_sort_first_and_the_header_counts_every_outcome() {
-        let make = |name: &str, bucket: &str| serde_json::from_value::<crate::github::PullRequestCheck>(serde_json::json!({
+        let make = |name: &str, bucket: &str| {
+            serde_json::from_value::<crate::github::PullRequestCheck>(serde_json::json!({
             "name":name,"bucket":bucket,"state":bucket,"link":"https://github.com/owner/repo/actions/runs/123"
-        })).unwrap();
-        let mut checks = vec![make("passed", "pass"), make("skipped", "skipping"), make("running", "pending"), make("failed", "fail")];
+        })).unwrap()
+        };
+        let mut checks = vec![
+            make("passed", "pass"),
+            make("skipped", "skipping"),
+            make("running", "pending"),
+            make("failed", "fail"),
+        ];
         checks.sort_by_key(check_rank);
-        assert_eq!(checks.iter().map(|check| check.name.as_str()).collect::<Vec<_>>(), ["failed", "running", "passed", "skipped"]);
-        assert_eq!(checks_summary(&checks), "Checks · 1 failed, 1 running, 1 passed, 1 skipped");
+        assert_eq!(
+            checks
+                .iter()
+                .map(|check| check.name.as_str())
+                .collect::<Vec<_>>(),
+            ["failed", "running", "passed", "skipped"]
+        );
+        assert_eq!(
+            checks_summary(&checks),
+            "Checks · 1 failed, 1 running, 1 passed, 1 skipped"
+        );
     }
 
     #[test]
     fn prepared_context_is_retained_for_a_modal_safe_explicit_handoff() {
         let mut state = State::default();
-        state.target = Some(target()); state.generation = 4; state.context_loading = true;
-        drop(state.update(Action::AgentContext(target(), 4, Ok("Prepared review context".into()))));
+        state.target = Some(target());
+        state.generation = 4;
+        state.context_loading = true;
+        drop(state.update(Action::AgentContext(
+            target(),
+            4,
+            Ok("Prepared review context".into()),
+        )));
         assert!(!state.context_loading);
-        assert_eq!(state.prepared_context, Some((PathBuf::from("/tmp/worktree"), "Prepared review context".into())));
-        drop(state.update(Action::AgentContext(target(), 3, Ok("Stale context".into()))));
-        assert_eq!(state.prepared_context.as_ref().unwrap().1, "Prepared review context");
+        assert_eq!(
+            state.prepared_context,
+            Some((
+                PathBuf::from("/tmp/worktree"),
+                "Prepared review context".into()
+            ))
+        );
+        drop(state.update(Action::AgentContext(
+            target(),
+            3,
+            Ok("Stale context".into()),
+        )));
+        assert_eq!(
+            state.prepared_context.as_ref().unwrap().1,
+            "Prepared review context"
+        );
     }
 
     #[test]

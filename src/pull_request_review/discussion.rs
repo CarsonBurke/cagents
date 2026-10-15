@@ -442,10 +442,18 @@ fn execute_current(
             }
             outcome(api.reply_to_thread(repository, &request, cancellation)).map(drop)
         }
-        Mutation::Edit { comment, body, expected_body } => {
+        Mutation::Edit {
+            comment,
+            body,
+            expected_body,
+        } => {
             let candidate = own_editable_comment(&conversation, comment)?;
-            let Some(expected_body) = expected_body else { return Err(Outcome::Refused("This recovered edit has no original body to compare. Copy your draft, cancel the edit, and reopen the current comment before saving.".into())); };
-            if candidate.body != *expected_body { return Err(Outcome::Refused("The comment changed on GitHub while you were editing. Your draft was kept; compare it with the current comment before saving.".into())); }
+            let Some(expected_body) = expected_body else {
+                return Err(Outcome::Refused("This recovered edit has no original body to compare. Copy your draft, cancel the edit, and reopen the current comment before saving.".into()));
+            };
+            if candidate.body != *expected_body {
+                return Err(Outcome::Refused("The comment changed on GitHub while you were editing. Your draft was kept; compare it with the current comment before saving.".into()));
+            }
             if !candidate.viewer_can_update {
                 return Err(Outcome::Refused(
                     "GitHub no longer permits editing that comment.".into(),
@@ -488,10 +496,25 @@ fn execute_current(
     }
 }
 
-fn own_editable_comment<'a>(conversation: &'a PullRequestConversation, id: &str) -> Result<&'a crate::github::PullRequestComment, Outcome> {
-    conversation.threads.iter().flat_map(|thread| &thread.comments)
-        .find(|comment| comment.id.as_deref() == Some(id) && comment.viewer_did_author && comment.viewer_can_update)
-        .ok_or_else(|| Outcome::Refused("Only your own editable comments can be changed here. Refresh before trying again.".into()))
+fn own_editable_comment<'a>(
+    conversation: &'a PullRequestConversation,
+    id: &str,
+) -> Result<&'a crate::github::PullRequestComment, Outcome> {
+    conversation
+        .threads
+        .iter()
+        .flat_map(|thread| &thread.comments)
+        .find(|comment| {
+            comment.id.as_deref() == Some(id)
+                && comment.viewer_did_author
+                && comment.viewer_can_update
+        })
+        .ok_or_else(|| {
+            Outcome::Refused(
+                "Only your own editable comments can be changed here. Refresh before trying again."
+                    .into(),
+            )
+        })
 }
 
 fn own_pending_comment<'a>(
@@ -541,21 +564,71 @@ mod tests {
 
     #[test]
     fn inline_edits_refuse_changed_or_unknown_original_text_before_writing() {
-        let api = ScriptedApi::new(); let context = context(); let repository = repository();
+        let api = ScriptedApi::new();
+        let context = context();
+        let repository = repository();
         let key = PullRequestKey::new(repository.clone(), 1).unwrap();
         let comment = serde_json::from_value(serde_json::json!({"id":"comment","body":"New remote text","createdAt":"now","url":"https://github.com/owner/repo/pull/1#comment","viewerDidAuthor":true,"viewerCanUpdate":true,"commentState":"SUBMITTED"})).unwrap();
-        api.conversation.lock().unwrap().threads.push(crate::github::PullRequestReviewThread {
-            id:"thread".into(),path:"file.rs".into(),line:Some(1),start_line:None,side:ReviewDiffSide::Right,start_side:None,
-            outdated:false,resolved:false,collapsed:false,viewer_can_resolve:true,viewer_can_unresolve:false,truncated:false,comments:vec![comment],
-        });
+        api.conversation
+            .lock()
+            .unwrap()
+            .threads
+            .push(crate::github::PullRequestReviewThread {
+                id: "thread".into(),
+                path: "file.rs".into(),
+                line: Some(1),
+                start_line: None,
+                side: ReviewDiffSide::Right,
+                start_side: None,
+                outdated: false,
+                resolved: false,
+                collapsed: false,
+                viewer_can_resolve: true,
+                viewer_can_unresolve: false,
+                truncated: false,
+                comments: vec![comment],
+            });
         for original in [None, Some("Original remote text".into())] {
-            let mutation = Mutation::Edit { comment:"comment".into(), body:"My edit".into(), expected_body:original };
-            assert!(matches!(execute_current(&api,&repository,&key,&context,&context,&mutation,&CancellationToken::new()),Err(Outcome::Refused(_))));
+            let mutation = Mutation::Edit {
+                comment: "comment".into(),
+                body: "My edit".into(),
+                expected_body: original,
+            };
+            assert!(matches!(
+                execute_current(
+                    &api,
+                    &repository,
+                    &key,
+                    &context,
+                    &context,
+                    &mutation,
+                    &CancellationToken::new()
+                ),
+                Err(Outcome::Refused(_))
+            ));
             assert!(api.updated_comments.lock().unwrap().is_empty());
         }
-        let mutation = Mutation::Edit { comment:"comment".into(), body:"My edit".into(), expected_body:Some("New remote text".into()) };
-        assert_eq!(execute_current(&api,&repository,&key,&context,&context,&mutation,&CancellationToken::new()),Ok(()));
-        assert_eq!(*api.updated_comments.lock().unwrap(),vec![("comment".into(),"My edit".into())]);
+        let mutation = Mutation::Edit {
+            comment: "comment".into(),
+            body: "My edit".into(),
+            expected_body: Some("New remote text".into()),
+        };
+        assert_eq!(
+            execute_current(
+                &api,
+                &repository,
+                &key,
+                &context,
+                &context,
+                &mutation,
+                &CancellationToken::new()
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            *api.updated_comments.lock().unwrap(),
+            vec![("comment".into(), "My edit".into())]
+        );
     }
 
     #[test]

@@ -2409,7 +2409,9 @@ impl Editor {
                 pull_request_review::Effect::CleanupMergedHead(_) => cleanup_requested = true,
             }
         }
-        if cleanup_requested { self.notice=Some("Open this worktree in Cagents and use Delete worktree to review its branch cleanup safely.".into()); }
+        if cleanup_requested {
+            self.notice=Some("Open this worktree in Cagents and use Delete worktree to review its branch cleanup safely.".into());
+        }
         if let Some(target) = checkout_target {
             self.begin_checkout(target);
         }
@@ -5353,7 +5355,11 @@ mod tests {
         let task = app.load_checkout_journal();
         run_tasks(&mut app, task);
         assert!(app.checkout_journal.is_some(), "{:?}", app.notice);
-        app.begin_checkout(CheckoutTarget::read_only(root.to_path_buf(), 17, cagents::repository::Oid::parse(&original).unwrap()));
+        app.begin_checkout(CheckoutTarget::read_only(
+            root.to_path_buf(),
+            17,
+            cagents::repository::Oid::parse(&original).unwrap(),
+        ));
         drop(app.update(Message::Checkout(checkout::Action::Destination(
             destination.display().to_string(),
         ))));
@@ -5413,7 +5419,11 @@ mod tests {
                 "journal path is not writable".into(),
             )))),
         );
-        app.begin_checkout(cagents::pull_request_review::CheckoutTarget::read_only(PathBuf::from("/review"), 1, cagents::repository::Oid::parse(&"a".repeat(40)).unwrap()));
+        app.begin_checkout(cagents::pull_request_review::CheckoutTarget::read_only(
+            PathBuf::from("/review"),
+            1,
+            cagents::repository::Oid::parse(&"a".repeat(40)).unwrap(),
+        ));
         assert_eq!(
             app.checkout_error.as_deref(),
             Some("journal path is not writable")

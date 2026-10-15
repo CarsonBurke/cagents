@@ -197,7 +197,9 @@ pub struct WorktreeDialog {
 }
 
 impl WorktreeDialog {
-    pub(super) fn set_checkout_notice(&mut self, notice: String) { self.checkout_notice = Some(notice); }
+    pub(super) fn set_checkout_notice(&mut self, notice: String) {
+        self.checkout_notice = Some(notice);
+    }
 
     pub fn new(project_id: ProjectId, repository: PathBuf, draft: WorktreeDraft) -> Self {
         Self {
@@ -224,7 +226,10 @@ impl WorktreeDialog {
     /// Edits a field. An error about that field no longer describes it; one
     /// about another field, or about the request as a whole, still does.
     pub fn edit(&mut self, field: WorktreeField, value: String) {
-        if self.resolving.is_some() || (self.checkout_notice.is_some() && matches!(field, WorktreeField::Branch | WorktreeField::Base)) {
+        if self.resolving.is_some()
+            || (self.checkout_notice.is_some()
+                && matches!(field, WorktreeField::Branch | WorktreeField::Base))
+        {
             return;
         }
         *match field {
@@ -459,7 +464,10 @@ impl Cagents {
             let mut input = crate::ui_controls::field::text(placeholder, value)
                 .id(field.focus_id())
                 .on_submit(|_| Message::SubmitWorktree);
-            if editable && !(dialog.checkout_notice.is_some() && matches!(field, WorktreeField::Branch | WorktreeField::Base)) {
+            if editable
+                && !(dialog.checkout_notice.is_some()
+                    && matches!(field, WorktreeField::Branch | WorktreeField::Base))
+            {
                 input = input.on_input(on_input);
             }
             if let Some(error) = field_error(field) {
@@ -513,7 +521,9 @@ impl Cagents {
             .on_press_maybe(editable.then_some(Message::ToggleWorktreeAdvanced))
             .into(),
         ];
-        if let Some(notice) = &dialog.checkout_notice { rows.insert(1, design::caption(notice).into()); }
+        if let Some(notice) = &dialog.checkout_notice {
+            rows.insert(1, design::caption(notice).into());
+        }
         if dialog.advanced {
             rows.push(field(
                 "Base branch (optional)",
@@ -1043,12 +1053,17 @@ mod tests {
     }
     #[test]
     fn prepared_pr_checkout_keeps_its_head_branch_and_base_while_destination_is_editable() {
-        let mut dialog=WorktreeDialog::new(ProjectId::new(),"/repo".into(),WorktreeDraft::branch("origin/feature"));
+        let mut dialog = WorktreeDialog::new(
+            ProjectId::new(),
+            "/repo".into(),
+            WorktreeDraft::branch("origin/feature"),
+        );
         dialog.set_checkout_notice("Checks out feature tracking origin/feature.".into());
-        dialog.edit(WorktreeField::Branch,"unrelated-local-branch".into());
-        dialog.edit(WorktreeField::Base,"HEAD~20".into());
-        dialog.edit(WorktreeField::Destination,"chosen-destination".into());
-        assert_eq!(dialog.draft.branch,"origin/feature");assert!(dialog.draft.base.is_empty());assert_eq!(dialog.draft.destination,"chosen-destination");
+        dialog.edit(WorktreeField::Branch, "unrelated-local-branch".into());
+        dialog.edit(WorktreeField::Base, "HEAD~20".into());
+        dialog.edit(WorktreeField::Destination, "chosen-destination".into());
+        assert_eq!(dialog.draft.branch, "origin/feature");
+        assert!(dialog.draft.base.is_empty());
+        assert_eq!(dialog.draft.destination, "chosen-destination");
     }
-
 }
