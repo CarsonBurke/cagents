@@ -15,6 +15,8 @@ static NEXT_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(super) struct State {
+    #[cfg(test)]
+    pub(super) search_paint: (Vec<std::ops::Range<usize>>,Option<std::ops::Range<usize>>),
     pub(super) identity: u64,
     pub(super) logical: Option<Logical>,
     pub(super) logical_active: bool,
@@ -42,6 +44,8 @@ pub(super) struct State {
 impl Default for State {
     fn default() -> Self {
         Self {
+            #[cfg(test)]
+            search_paint: Default::default(),
             a11y_id: iced::advanced::widget::Id::unique(),
             identity: NEXT_SELECTION.fetch_add(1, Ordering::Relaxed),
             logical: None,
@@ -409,6 +413,8 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
         state.dirty = false;
         state.target = Some(self.target);
         state.logical = self.logical.clone();
+        #[cfg(test)]
+        {state.search_paint=(self.matches.clone(),self.current.clone());}
         if state
             .spans
             .as_ref()

@@ -768,6 +768,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn indexed_find_match_crossing_two_mounted_code_chunks_paints_both_halves() {
+        use iced::advanced::{layout,Layout,widget::{Tree,Operation}};
+        let renderer=crate::app::tests::headless_renderer();
+        let identity=7;
+        let found=find::Match {turn:"t".into(),item:"i".into(),identity,range:2046..2052};
+        let paint=Arc::new(find::Paint::new(1,&[found.clone()],Some(found)));
+        let source:Arc<str>=format!("{}needle{}","a".repeat(2046),"z".repeat(2048)).into();
+        let mut element=code_text(source,Arc::from([]),design::TEXT_BODY.into(),iced::Font::MONOSPACE,
+            Target{card:CardId::new(),generation:0},Some("needle"),Some(selectable_prose::Logical{identity,start:0,paint:Some(paint)}));
+        let mut tree=Tree::new(&element);
+        let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(iced::Size::ZERO,iced::Size::new(720.0,12000.0)));
+        #[derive(Default)]
+        struct Painted(Vec<(usize,Vec<std::ops::Range<usize>>,Option<std::ops::Range<usize>>)>);
+        impl Operation for Painted {
+            fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation)) {visit(self);}
+            fn custom(&mut self,_:Option<&iced::advanced::widget::Id>,_:iced::Rectangle,state:&mut dyn std::any::Any) {
+                if let Some(prose)=state.downcast_ref::<selectable_prose::State>()
+                    && let Some(logical)=&prose.logical && !prose.search_paint.0.is_empty() {
+                    self.0.push((logical.start,prose.search_paint.0.clone(),prose.search_paint.1.clone()));
+                }
+            }
+        }
+        let mut painted=Painted::default();element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut painted);
+        painted.0.sort_by_key(|(start,_,_)|*start);
+        assert_eq!(painted.0,vec![(0,vec![2046..2048],Some(2046..2048)),(2048,vec![0..4],Some(0..4))],
+            "one indexed occurrence keeps ordinary and current paint on both actual mounted fragments");
+    }
+
+    #[test]
     fn markdown_images_keep_selectable_text_and_emit_scoped_source_actions() {
         use cosmic::iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
         use cosmic::iced::{Event, Point, Rectangle, Size, mouse};

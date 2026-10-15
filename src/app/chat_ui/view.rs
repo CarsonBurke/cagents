@@ -428,7 +428,7 @@ fn notice_entry(message: &str, target: Target, identity: u64) -> Element<'static
                 iced::Font::default(),
                 target,
                 None,
-                selectable_prose::Logical { identity, start: 0 },
+                selectable_prose::Logical { identity, start: 0, paint: None },
             ))
             .width(Length::Fill)
             .into(),
@@ -3663,7 +3663,7 @@ impl Runtime {
             widget::container(selectable_prose::logical_text(
                 vec![iced::widget::text::Span::new(queued.text.trim_end().to_owned())].into(),
                 design::TEXT_PROSE.into(), iced::Font::default(), self.target, None,
-                selectable_prose::Logical { identity: selection::logical_identity("queued-prompt", &[2]), start: 0 },
+                selectable_prose::Logical { identity: selection::logical_identity("queued-prompt", &[2]), start: 0, paint: self.find_paint.clone() },
             ))
             .class(design::surface(
                 Some(design::accent_wash),
@@ -3864,7 +3864,7 @@ impl Runtime {
                     widget::container(selectable_prose::logical_text(
                         vec![iced::widget::text::Span::new(text)].into(), design::TEXT_CAPTION.into(),
                         iced::Font::MONOSPACE, self.target, None,
-                        selectable_prose::Logical { identity: selection::logical_identity(&item.id, &[2]), start: 0 },
+                        selectable_prose::Logical { identity: selection::logical_identity(&item.id, &[2]), start: 0, paint: self.find_paint.clone() },
                     ))
                     .width(Length::Fill)
                     .into(),
