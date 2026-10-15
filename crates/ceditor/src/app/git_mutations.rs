@@ -591,6 +591,11 @@ impl Editor {
             return Task::none();
         };
         let buffer_only = capture.applies_to_buffer();
+        let read_receipt = capture.git_read_receipt().cloned();
+        if !buffer_only && !read_receipt.as_ref().is_some_and(|receipt| tab.matches_git_reader(receipt)) {
+            self.notice = Some("Reload the original Git diff before applying this change.".into());
+            return Task::none();
+        }
         if !buffer_only
             && (tab.worktree_authority.is_none()
                 || !tab
@@ -638,13 +643,14 @@ impl Editor {
                     return Err("Preparing the selected change was cancelled.".to_string());
                 }
                 if !buffer_only {
-                    authority
-                        .as_ref()
-                        .ok_or("The original worktree binding is unavailable.")?
-                        .validate()
-                        .map_err(|error| error.to_string())?;
+                    let receipt = read_receipt.as_ref().ok_or("The original Git reader is unavailable.")?;
+                    if !authority.as_ref().is_some_and(|authority| authority.same_scope(receipt.source().authority())) {
+                        return Err("The original diff and mutation authority differ.".into());
+                    }
+                    receipt.validate().map_err(|error| error.to_string())?;
                 }
                 let prepared = capture.prepare();
+                if !buffer_only { read_receipt.as_ref().unwrap().validate().map_err(|error| error.to_string())?; }
                 if cancellation.is_cancelled() {
                     return Err("Preparing the selected change was cancelled.".to_string());
                 }
@@ -708,6 +714,15 @@ impl Editor {
             return Task::none();
         };
         let applies_to_buffer = prepared.applies_to_buffer();
+        let read_receipt = prepared.git_read_receipt().cloned();
+        if !applies_to_buffer && !read_receipt.as_ref().is_some_and(|receipt| {
+            self.tab(origin.card).is_some_and(|tab| tab.matches_git_reader(receipt))
+                && origin.authority.as_ref().is_some_and(|authority| authority.same_scope(receipt.source().authority()))
+        }) {
+            self.notice = Some("The original Git reader changed before this queued action could run.".into());
+            if let Some(queue) = self.git_groups.get_mut(&root) { queue.active = None; }
+            return self.start_next_change_group(&root).unwrap_or_else(Task::none);
+        }
         let index_only_stage = prepared.stages_live_buffer();
         if !applies_to_buffer
             && self
@@ -758,11 +773,10 @@ impl Editor {
             .expect("admitted patch has cancellation");
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git").with_worktree_authority(
-                    origin
-                        .authority
-                        .expect("admitted disk patch retains its authority"),
-                )?;
+                let receipt = read_receipt.expect("admitted disk patch retains its original reader");
+                receipt.validate()?;
+                let service = RepositoryService::system("git")
+                    .with_worktree_authority(receipt.source().authority().clone())?;
                 match operation {
                     cagents::repository::GitOperation::ApplyPatch {
                         patch,

@@ -203,6 +203,13 @@ struct PendingFile {
     location_epoch: u64,
 }
 
+/// Fresh Opened authority may initialize an actor; internal navigation must
+/// retain its existing actor (including an unavailable/missing source).
+enum GitSourceOrigin {
+    Opened,
+    Inherited(Option<cagents::repository::GitReadSource>),
+}
+
 struct Tab {
     id: CardId,
     title: String,
@@ -232,6 +239,7 @@ struct Tab {
     snapshot_refresh_pending: bool,
     change_source_revision: u64,
     worktree_authority: Option<WorktreeAuthority>,
+    git_read_source: Option<cagents::repository::GitReadSource>,
     discard_authority: Option<WorktreeAuthority>,
     discard_queue_turn: Option<u64>,
     marker_authority: Option<WorktreeAuthority>,
@@ -246,6 +254,14 @@ struct Tab {
 }
 
 impl Tab {
+    /// Original logical reader/authority comparison only. Physical validation
+    /// belongs to the retained receipt's worker immediately before effects.
+    fn matches_git_reader(&self, receipt: &cagents::repository::GitReadReceipt) -> bool {
+        self.git_read_source.as_ref().is_some_and(|source| receipt.matches_source(source)
+            && self.worktree_authority.as_ref().is_some_and(|authority| authority.same_scope(source.authority()))
+            && self.runtime.git_read_source().is_some_and(|installed| source.same_source(installed)))
+    }
+
     /// The diagnostics list and native editor marks/navigation share one set.
     fn set_diagnostics(&mut self, items: Vec<LspDiagnostic>, version: Option<i32>) {
         self.runtime.set_editor_diagnostics(items.clone());
@@ -1640,6 +1656,17 @@ impl Editor {
         external: Option<PathBuf>,
         git: bool,
     ) -> Task<Message> {
+        self.add_with_git_source(opened, focus, external, git, GitSourceOrigin::Opened)
+    }
+
+    fn add_with_git_source(
+        &mut self,
+        opened: Opened,
+        focus: bool,
+        external: Option<PathBuf>,
+        git: bool,
+        source_origin: GitSourceOrigin,
+    ) -> Task<Message> {
         if let Some(file) = &opened.file {
             if let Some(owner) = self.file_owner(&opened.root.join(file)) {
                 if focus && !self.modal_open() {
@@ -1687,8 +1714,20 @@ impl Editor {
         let git_context = git;
         let git = external.is_none() && git_context;
         let needs_git_snapshot = git && opened.snapshot.is_none();
+        let git_read_source = match source_origin {
+            GitSourceOrigin::Inherited(source) => source.filter(|source| {
+                opened.authority.as_ref().is_some_and(|authority| authority.same_scope(source.authority()))
+            }),
+            GitSourceOrigin::Opened => opened.authority.as_ref().filter(|_| git_context).map(|authority| {
+                self.tabs.iter().filter_map(|tab| tab.git_read_source.as_ref())
+                    .find(|source| source.is_available() && source.authority().same_scope(authority))
+                    .cloned().unwrap_or_else(|| cagents::repository::GitReadSource::new(
+                        cagents::model::OperationId::new(), authority.clone(),
+                        Arc::new(std::sync::atomic::AtomicU64::new(0))))
+            }),
+        };
         let mut runtime = if git {
-            RepositoryRuntime::new(descriptor)
+            RepositoryRuntime::new_with_git_read_source(descriptor, git_read_source.clone())
         } else {
             RepositoryRuntime::new_directory(descriptor)
         };
@@ -1796,6 +1835,7 @@ impl Editor {
             snapshot_refresh_pending: false,
             change_source_revision: 1,
             worktree_authority: opened.authority,
+            git_read_source,
             discard_authority: None,
             discard_queue_turn: None,
             marker_authority: None,
@@ -1970,7 +2010,12 @@ impl Editor {
             .then(|| self.untitled_scratch_path(id))
             .flatten();
         self.close_document(id);
+        let source = self.tab(id).and_then(|tab| tab.git_read_source.clone());
         self.tabs.retain(|tab| tab.id != id);
+        if let Some(source) = source
+            && !self.tabs.iter().filter_map(|tab| tab.git_read_source.as_ref()).any(|other| source.same_source(other)) {
+            source.invalidate();
+        }
         if self.active == Some(id) {
             self.active = self.tabs.last().map(|tab| tab.id);
         }
@@ -3176,8 +3221,19 @@ impl Editor {
             queue.active = None;
         }
         let mut affected = Vec::new();
+        let mut advanced = BTreeSet::new();
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
+                if let Some(source) = &tab.git_read_source
+                    && advanced.insert(source.id()) {
+                    // Completion precedes every replacement read/refresh.
+                    // Saturation permanently retires this actor instead of
+                    // making any old receipt current through wrapping.
+                    if source.mutation_revision().fetch_update(
+                        std::sync::atomic::Ordering::AcqRel,
+                        std::sync::atomic::Ordering::Acquire,
+                        |revision| revision.checked_add(1)).is_err() { source.invalidate(); }
+                }
                 tab.mutation = None;
                 tab.mutation_cancel = None;
                 tab.git_mutation_revision = tab.git_mutation_revision.wrapping_add(1);
@@ -9495,6 +9551,66 @@ mod tests {
             .expect("actual Ready diff must emit a hunk action");
         let task = app.update(Message::Repository(action));
         run_tasks(app, task);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_reader_actor_is_shared_clocked_once_and_retired_after_last_tab() {
+        use cagents::{git_patch::Kind, repository::ChangeArea};
+        let directory = git_fixture(); let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+        let mut app = editor(); app.settings.editor_auto_save = false;
+        let first = open_real_git(&mut app, root, None);
+        let second = open_real_git(&mut app, root, None);
+        let source = app.tab(first).unwrap().git_read_source.clone().unwrap();
+        assert!(source.same_source(app.tab(second).unwrap().git_read_source.as_ref().unwrap()));
+        assert!(source.same_source(app.tab(first).unwrap().runtime.git_read_source().unwrap()));
+        open_real_change(&mut app, first, "tracked.txt", ChangeArea::Unstaged);
+        let (_, receipt) = source.diff(&cagents::repository::DiffRequest {
+            worktree: root.into(), basis: DiffBasis::IndexToWorktree,
+            path: RepoPath::parse("tracked.txt").unwrap(), old_path: None,
+        }, &CancellationToken::default()).unwrap();
+        assert!(receipt.is_current());
+        apply_real_hunk(&mut app, first, Kind::Stage);
+        assert_eq!(git(root, &["show", ":tracked.txt"]), "changed");
+        assert_eq!(source.mutation_revision().load(std::sync::atomic::Ordering::Acquire), 1,
+            "two sibling tabs share one source clock advance per actual completion");
+        assert!(!receipt.is_current());
+        let (_, current) = source.diff(&cagents::repository::DiffRequest {
+            worktree: root.into(), basis: DiffBasis::IndexToWorktree,
+            path: RepoPath::parse("tracked.txt").unwrap(), old_path: None,
+        }, &CancellationToken::default()).unwrap();
+        app.remove_tab(first); assert!(source.is_available());
+        app.remove_tab(second); assert!(!source.is_available()); assert!(!current.is_current());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn standalone_original_diff_cannot_borrow_a_replacement_tabs_git_reader() {
+        use cagents::{git_patch::Kind, repository::ChangeArea};
+        let directory = git_fixture(); let replacement = git_fixture(); let root = directory.path();
+        std::fs::write(root.join("tracked.txt"), "original working\n").unwrap();
+        std::fs::write(replacement.path().join("tracked.txt"), "replacement working\n").unwrap();
+        let mut app = editor(); app.settings.editor_auto_save = false;
+        let original = open_real_git(&mut app, root, None);
+        open_real_change(&mut app, original, "tracked.txt", ChangeArea::Unstaged);
+        let action = app.tab(original).unwrap().runtime.diff_hunk_mutation_action(original, Kind::Stage)
+            .expect("real original Ready model emits its actual hunk action");
+        let reader = app.tab(original).unwrap().git_read_source.clone().unwrap();
+        let parked = root.with_extension("original-diff-reader");
+        std::fs::rename(root, &parked).unwrap(); std::fs::rename(replacement.path(), root).unwrap();
+        let newer = open_real_git(&mut app, root, None);
+        let new_reader = app.tab(newer).unwrap().git_read_source.as_ref().unwrap();
+        assert!(!reader.same_source(new_reader));
+        assert!(!reader.authority().same_scope(new_reader.authority()));
+        assert!(reader.same_source(app.tab(original).unwrap().runtime.git_read_source().unwrap()),
+            "new displayed worktree never retags the old model's runtime");
+        let task = app.update(Message::Repository(action)); run_tasks(&mut app, task);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "replacement working\n");
+        std::fs::rename(root, replacement.path()).unwrap(); std::fs::rename(&parked, root).unwrap();
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original working\n");
     }
 
     #[test]

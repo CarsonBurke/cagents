@@ -343,6 +343,7 @@ impl Editor {
         };
         let root = tab.runtime.descriptor.worktree.clone();
         let authority = tab.worktree_authority.clone();
+        let read_source = tab.git_read_source.clone();
         let git = tab.git_context;
         let origin_location = self.capture_editor_location(origin);
         let existing = self
@@ -369,7 +370,7 @@ impl Editor {
             if !resolved.external && relative.is_none() {
                 return Task::none();
             }
-            tasks.push(self.add_with_source_context(
+            tasks.push(self.add_with_git_source(
                 Opened {
                     root,
                     file: relative,
@@ -379,6 +380,7 @@ impl Editor {
                 true,
                 resolved.external.then(|| resolved.path.clone()),
                 git,
+                GitSourceOrigin::Inherited(read_source),
             ));
             let Some(target) = self.active else {
                 return Task::none();
@@ -512,6 +514,7 @@ impl Editor {
             let tab = self.tab(target.location.card)?;
             let root = tab.runtime.descriptor.worktree.clone();
             let authority = tab.worktree_authority.clone();
+            let read_source = tab.git_read_source.clone();
             let git = tab.git_context;
             let relative = target
                 .location
@@ -520,7 +523,7 @@ impl Editor {
                 .ok()
                 .map(Path::to_path_buf);
             let external = relative.is_none().then(|| target.location.source.clone());
-            let task = self.add_with_source_context(
+            let task = self.add_with_git_source(
                 Opened {
                     root,
                     file: relative,
@@ -530,6 +533,7 @@ impl Editor {
                 true,
                 external,
                 git,
+                GitSourceOrigin::Inherited(read_source),
             );
             let opened = self.active?;
             let admitted = self.tab(opened).is_some_and(|tab| {
@@ -723,6 +727,8 @@ mod tests {
         let tab = app.tab(target).unwrap();
         assert!(tab.git, "an internal source remains a Git tab");
         assert_eq!(tab.worktree_authority.as_ref().unwrap().path(), root);
+        assert!(tab.git_read_source.as_ref().unwrap().same_source(app.tab(origin).unwrap().git_read_source.as_ref().unwrap()));
+        assert!(tab.runtime.git_read_source().unwrap().same_source(tab.git_read_source.as_ref().unwrap()));
         assert!(
             tab.sidebar
                 .source_control
@@ -790,6 +796,8 @@ mod tests {
         let outside = app.active.unwrap();
         assert!(!app.tab(outside).unwrap().git);
         assert!(app.tab(outside).unwrap().git_context);
+        assert!(app.tab(outside).unwrap().git_read_source.as_ref().unwrap().same_source(app.tab(origin).unwrap().git_read_source.as_ref().unwrap()));
+        assert!(app.tab(outside).unwrap().runtime.git_read_source().is_none(), "external display keeps its read-only runtime policy");
         assert!(app.tab(outside).unwrap().runtime.is_read_only_source());
         let task = app.open_navigation_target(
             outside,
@@ -806,6 +814,7 @@ mod tests {
         assert!(app.tab(target).unwrap().git);
         assert!(!app.tab(target).unwrap().runtime.is_read_only_source());
         assert!(app.tab(target).unwrap().worktree_authority.is_some());
+        assert!(app.tab(target).unwrap().git_read_source.as_ref().unwrap().same_source(app.tab(origin).unwrap().git_read_source.as_ref().unwrap()));
     }
 
     #[test]
