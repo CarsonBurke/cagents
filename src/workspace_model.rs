@@ -603,6 +603,15 @@ mod tests {
     use crate::model::ChannelTitleSource;
 
     #[test]
+    fn session_location_refusals_roundtrip_and_missing_legacy_field_defaults_empty() {
+        let model = WorkspaceModel { session_location_refusals: vec![SessionLocationRefusal { session: crate::model::TerminalId::new(), directory: "/located/project".into(), reason: "Recover the original provider or close this pane explicitly".into() }], ..Default::default() };
+        assert_eq!(serde_json::from_slice::<WorkspaceModel>(&serde_json::to_vec(&model).unwrap()).unwrap(), model);
+        let mut legacy = serde_json::to_value(&model).unwrap();
+        legacy.as_object_mut().unwrap().remove("session_location_refusals");
+        assert!(serde_json::from_value::<WorkspaceModel>(legacy).unwrap().session_location_refusals.is_empty());
+    }
+
+    #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {
         assert_eq!(
             channel_title_from_prompt(
