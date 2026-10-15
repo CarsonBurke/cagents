@@ -2864,11 +2864,15 @@ pub enum SettingsField {
     ShortcutSettingsAccounts,
     ShortcutSettingsNotifications,
     ShortcutSettingsAbout,
+    ShortcutMarkAllRead,
+    ShortcutSearchInProject,
+    ShortcutCloneRepository,
+
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 74] = [
+    const SHORTCUTS: [Self; 77] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -2943,6 +2947,10 @@ impl SettingsField {
         Self::ShortcutSettingsAccounts,
         Self::ShortcutSettingsNotifications,
         Self::ShortcutSettingsAbout,
+        Self::ShortcutMarkAllRead,
+        Self::ShortcutSearchInProject,
+        Self::ShortcutCloneRepository,
+
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3020,6 +3028,10 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => "Open settings: Accounts",
             Self::ShortcutSettingsNotifications => "Open settings: Notifications",
             Self::ShortcutSettingsAbout => "Open settings: About",
+            Self::ShortcutMarkAllRead => "Mark all as read",
+            Self::ShortcutSearchInProject => "Search in project",
+            Self::ShortcutCloneRepository => "Clone repository",
+
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3156,6 +3168,9 @@ impl SettingsField {
             | Self::ShortcutSettingsAccounts
             | Self::ShortcutSettingsNotifications
             | Self::ShortcutSettingsAbout
+            | Self::ShortcutMarkAllRead
+            | Self::ShortcutSearchInProject
+            | Self::ShortcutCloneRepository
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3252,6 +3267,10 @@ struct ShortcutDraft {
     settings_accounts: String,
     settings_notifications: String,
     settings_about: String,
+    mark_all_read: String,
+    search_in_project: String,
+    clone_repository: String,
+
 
     command_palette: String,
     new_native_thread: String,
@@ -3335,6 +3354,10 @@ impl ShortcutDraft {
             settings_accounts: settings::format_chords(&shortcuts.settings_accounts),
             settings_notifications: settings::format_chords(&shortcuts.settings_notifications),
             settings_about: settings::format_chords(&shortcuts.settings_about),
+            mark_all_read: settings::format_chords(&shortcuts.mark_all_read),
+            search_in_project: settings::format_chords(&shortcuts.search_in_project),
+            clone_repository: settings::format_chords(&shortcuts.clone_repository),
+
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -3630,6 +3653,10 @@ impl SettingsDraft {
                 self.keyboard_shortcuts.settings_notifications = value
             }
             SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
+            SettingsField::ShortcutMarkAllRead => self.keyboard_shortcuts.mark_all_read = value,
+            SettingsField::ShortcutSearchInProject => self.keyboard_shortcuts.search_in_project = value,
+            SettingsField::ShortcutCloneRepository => self.keyboard_shortcuts.clone_repository = value,
+
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -3861,6 +3888,19 @@ fn settings_update(
             next.keyboard_shortcuts.settings_about = settings::parse_chords(value);
             Ok(())
         }
+        SettingsField::ShortcutMarkAllRead => {
+            next.keyboard_shortcuts.mark_all_read = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutSearchInProject => {
+            next.keyboard_shortcuts.search_in_project = settings::parse_chords(value);
+            Ok(())
+        }
+        SettingsField::ShortcutCloneRepository => {
+            next.keyboard_shortcuts.clone_repository = settings::parse_chords(value);
+            Ok(())
+        }
+
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
             Ok(())

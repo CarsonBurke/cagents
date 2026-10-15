@@ -82,6 +82,10 @@ pub enum GlobalShortcut {
     SettingsAccounts,
     SettingsNotifications,
     SettingsAbout,
+    MarkAllRead,
+    SearchInProject,
+    CloneRepository,
+
 
     CommandPalette,
     NewThread,
@@ -164,6 +168,10 @@ impl GlobalShortcut {
             Self::SettingsAccounts => "settings_accounts",
             Self::SettingsNotifications => "settings_notifications",
             Self::SettingsAbout => "settings_about",
+            Self::MarkAllRead => "mark_all_read",
+            Self::SearchInProject => "search_in_project",
+            Self::CloneRepository => "clone_repository",
+
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
             Self::CommandPalette => "command_palette",
@@ -303,6 +311,8 @@ pub struct CommandContext {
     pub can_find: bool,
     pub daemon_can_restart: bool,
     pub can_reopen: bool,
+    pub has_unread: bool,
+    pub can_search_project: bool,
 }
 
 impl ShortcutDescriptor {
@@ -320,11 +330,17 @@ impl ShortcutDescriptor {
                     | GlobalShortcut::RestartDaemon
             )
         {
-            "Application"
+            "Navigation"
         } else if id.starts_with("focus_project_")
             || matches!(
                 self.action,
                 GlobalShortcut::OpenFolder
+                    | GlobalShortcut::CloneRepository
+                    | GlobalShortcut::SearchInProject
+                    | GlobalShortcut::MarkAllRead
+                    | GlobalShortcut::CommandPalette
+                    | GlobalShortcut::NextAttention
+                    | GlobalShortcut::PreviousAttention
                     | GlobalShortcut::NewWorktree
                     | GlobalShortcut::FocusSidebarTree
                     | GlobalShortcut::FocusProjectSearch
@@ -332,11 +348,11 @@ impl ShortcutDescriptor {
                     | GlobalShortcut::CycleWorkspace(_)
             )
         {
-            "Projects"
+            "Navigation"
         } else if self.scope == ShortcutScope::Chat
-            || self.action == GlobalShortcut::ResumeConversation
+            || matches!(self.action, GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread)
         {
-            "Conversations"
+            "Chat"
         } else if self.scope == ShortcutScope::Review {
             "Review"
         } else {
@@ -359,6 +375,8 @@ impl ShortcutDescriptor {
         let pane = context.pane_index.is_some();
         match self.action {
             GlobalShortcut::NewWorktree => context.active_git_project,
+            GlobalShortcut::MarkAllRead => context.has_unread,
+            GlobalShortcut::SearchInProject => context.can_search_project,
             GlobalShortcut::ReviewToggleViewed | GlobalShortcut::ReviewNextUnviewed => context.is_pull_request,
             GlobalShortcut::ChatAccount => context.chat_account,
             GlobalShortcut::ChatModel => context.chat_model,
@@ -859,6 +877,25 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
+    ShortcutDescriptor {
+        action: GlobalShortcut::MarkAllRead,
+        label: "Mark all as read",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::SearchInProject,
+        label: "Search in project",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+    ShortcutDescriptor {
+        action: GlobalShortcut::CloneRepository,
+        label: "Clone repository",
+        repeatable: false,
+        scope: ShortcutScope::Workspace,
+    },
+
 ];
 
 pub fn shortcut_descriptor(action: GlobalShortcut) -> &'static ShortcutDescriptor {
@@ -906,6 +943,10 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::SettingsAccounts => &shortcuts.settings_accounts,
         GlobalShortcut::SettingsNotifications => &shortcuts.settings_notifications,
         GlobalShortcut::SettingsAbout => &shortcuts.settings_about,
+        GlobalShortcut::MarkAllRead => &shortcuts.mark_all_read,
+        GlobalShortcut::SearchInProject => &shortcuts.search_in_project,
+        GlobalShortcut::CloneRepository => &shortcuts.clone_repository,
+
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,

@@ -403,8 +403,12 @@ impl Cagents {
             }
             Action::Cancel => {
                 self.chrome_ui.clone_repository = None;
-                iced::widget::operation::focus(widget::Id::new("onboarding.clone"))
-                    .map(cosmic::Action::App)
+                let target = if self.workspace.cards().is_empty() && self.active_workspace.is_none() && self.durable.active_channel.is_none() {
+                    Some(widget::Id::new("onboarding.clone"))
+                } else {
+                    self.workspace.focused().map(|card| self.card_keyboard_focus(card)).or_else(|| Some(widget::Id::new(TOOLBAR_FOCUS_ID)))
+                };
+                target.map_or_else(Task::none, |target| iced::widget::operation::focus(target).map(cosmic::Action::App))
             }
             Action::Submit => {
                 let Some(dialog) = self

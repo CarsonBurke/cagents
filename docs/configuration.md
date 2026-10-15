@@ -430,3 +430,9 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+The command registry also exposes `keyboard_shortcuts.mark_all_read` and
+`keyboard_shortcuts.clone_repository` (both unbound by default), and
+`keyboard_shortcuts.search_in_project` (`Ctrl+Alt+F`). `focus_last_pane`
+uses `Alt+0`; `next_attention` and `previous_attention` follow the configured
+attention navigation bindings. All of these appear in Keyboard settings.

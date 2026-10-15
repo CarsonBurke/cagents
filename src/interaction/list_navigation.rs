@@ -12,20 +12,21 @@ pub fn reveal_list_selection<Message: Send + 'static>(
     row_height: f32,
     spacing: f32,
 ) -> iced::Task<Message> {
-    iced::advanced::widget::operate(RevealSelection {
-        id,
-        selected,
-        row_height,
-        spacing,
-    })
+    reveal_list_region(id, selected as f32 * (row_height + spacing), row_height)
+}
+
+/// Reveal a selected region in a list that also contains section headings.
+/// The actual mounted viewport and offset decide whether any scroll is needed.
+pub fn reveal_list_region<Message: Send + 'static>(id: Id, top: f32, height: f32) -> iced::Task<Message> {
+    iced::advanced::widget::operate(RevealSelection { id, top, height })
 }
 
 struct RevealSelection {
     id: Id,
-    selected: usize,
-    row_height: f32,
-    spacing: f32,
+    top: f32,
+    height: f32,
 }
+
 impl<Message> Operation<Message> for RevealSelection {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<Message>)) {
         visit(self);
@@ -41,12 +42,11 @@ impl<Message> Operation<Message> for RevealSelection {
         if id != Some(&self.id) {
             return;
         }
-        let top = self.selected as f32 * (self.row_height + self.spacing);
         state.scroll_to(operation::scrollable::AbsoluteOffset {
             x: None,
             y: Some(selection_offset(
-                top,
-                self.row_height,
+                self.top,
+                self.height,
                 bounds.height,
                 content.height,
                 translation.y,

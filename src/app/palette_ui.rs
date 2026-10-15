@@ -38,6 +38,7 @@ pub struct MessageBox(pub Box<Message>);
 
 const ROW_HEIGHT: f32 = 40.0;
 const ROW_SPACING: f32 = space::XXS;
+const SECTION_HEIGHT: f32 = 26.0;
 
 /// Category prefixes are parsed before scoring and never participate in matching.
 fn palette_query(query: &str) -> (Option<char>, &str) {
@@ -57,7 +58,7 @@ fn search_label(label: &str) -> &str {
 
 fn entry_category(message: &Message) -> char {
     match message {
-        Message::Palette(Action::FocusPane(_)) => '@',
+        Message::Palette(Action::FocusPane(_)) | Message::FocusAttention(_) => '@',
         Message::Sidebar(
             SidebarAction::OpenWorktree { .. }
             | SidebarAction::OpenChannel { .. }
@@ -70,7 +71,7 @@ fn entry_category(message: &Message) -> char {
 fn entry_key(message: &Message) -> String {
     match message {
         Message::RunCommand(command) => format!("command:{}", command.id()),
-        Message::Palette(Action::FocusPane(id)) | Message::FocusCard(id) => format!("pane:{id}"),
+        Message::Palette(Action::FocusPane(id)) | Message::FocusCard(id) | Message::FocusAttention(id) => format!("pane:{id}"),
         Message::Sidebar(SidebarAction::OpenWorktree { worktree_id, .. }) => {
             format!("worktree:{worktree_id}")
         }
@@ -591,13 +592,33 @@ impl Cagents {
         }
     }
 
+    fn palette_section(&self, message: &Message) -> Option<&'static str> {
+        if self.palette.panes_only || !self.palette.query.as_deref().unwrap_or("").trim().is_empty() {
+            return None;
+        }
+        Some(if self.settings.palette_recents.contains(&entry_key(message)) {
+            "Recent"
+        } else { match message {
+            Message::FocusAttention(_) => "Needs attention",
+            Message::RunCommand(_) => "Commands",
+            Message::Palette(Action::FocusPane(_)) => "Panes",
+            _ => "Workspaces",
+        }})
+    }
+
     fn reveal_palette_selection(&self) -> Task<Message> {
-        crate::interaction::reveal_list_selection(
-            widget::Id::new("palette.commands"),
-            self.palette.selected,
-            ROW_HEIGHT,
-            ROW_SPACING,
-        )
+        let mut section = None;
+        let mut top = 0.0;
+        for (index, (_, _, message)) in self.palette_entries().iter().enumerate() {
+            let next = self.palette_section(message);
+            if next.is_some() && next != section {
+                top += SECTION_HEIGHT + ROW_SPACING;
+            }
+            if index == self.palette.selected { break; }
+            top += ROW_HEIGHT + ROW_SPACING;
+            section = next;
+        }
+        crate::interaction::reveal_list_region(widget::Id::new("palette.commands"), top, ROW_HEIGHT)
     }
 
     fn pane_attention_label(&self, card: CardId) -> &'static str {
@@ -645,6 +666,14 @@ impl Cagents {
             })
             .collect()
         } else { Vec::new() };
+        let attention = if !self.palette.panes_only && category.is_none() && query.is_empty() {
+            self.sidebar_state.attention_cards()
+        } else { Vec::new() };
+        for id in &attention {
+            if let Some(card) = self.card_state(*id).filter(|card| card.existence.is_open()) {
+                entries.push((format!("Focus pane: {}", self.card_display_title(card)), self.pane_attention_label(*id).to_owned(), Message::FocusAttention(*id)));
+            }
+        }
         let current_order: HashMap<_, _> = self
             .workspace
             .order()
@@ -654,6 +683,7 @@ impl Cagents {
         if category.is_none_or(|category| category == '@') {
         for card in self.durable.cards.iter().filter(|card| {
             card.existence.is_open()
+                && !attention.contains(&card.id)
                 && (!self.palette.panes_only || current_order.contains_key(&card.id))
         }) {
             let place = self
@@ -671,24 +701,13 @@ impl Cagents {
                     })
                 })
                 .unwrap_or_else(|| "Global".into());
-            let status = if self.sidebar_state.has_card_update(card.id) {
-                "● Unread"
-            } else {
-                match self
-                    .sidebar_state
-                    .card_activity(card.id)
-                    .map(|activity| activity.state)
-                {
-                    Some(crate::agent::ActivityState::Working) => "◌ Working",
-                    Some(crate::agent::ActivityState::Waiting) => "! Waiting",
-                    _ => "○ Idle",
-                }
-            };
+            let status = self.pane_attention_label(card.id);
+            let title = self.card_chrome.get(&card.id).map_or_else(|| self.card_display_title(card), |chrome| chrome.title.as_str());
             entries.push((
                 if self.palette.panes_only {
-                    self.card_display_title(card).to_owned()
+                    title.to_owned()
                 } else {
-                    format!("Focus pane: {} · {}", self.card_display_title(card), place)
+                    format!("Focus pane: {title} · {place}")
                 },
                 status.into(),
                 Message::Palette(Action::FocusPane(card.id)),
@@ -710,7 +729,7 @@ impl Cagents {
 
                 for channel in &project.channels {
                     entries.push((
-                        format!("Open channel: {} · {}", channel.title, project.name),
+                        format!("Open channel: {} · {}{}", channel.title, project.name, channel.worktree.as_ref().map_or_else(String::new, |(_, branch)| format!(" · {branch}"))),
                         String::new(),
                         Message::Sidebar(SidebarAction::OpenChannel {
                             channel_id: channel.id,
@@ -758,8 +777,18 @@ impl Cagents {
                 };
                 (
                     match_score(search_label(label), query).unwrap_or(usize::MAX),
+                    if query.is_empty() && category.is_none() {
+                        if recent != usize::MAX { 0 } else { match message {
+                            Message::FocusAttention(_) => 1,
+                            Message::RunCommand(_) => 2,
+                            Message::Palette(Action::FocusPane(_)) => 3,
+                            _ => 4,
+                        }}
+                    } else { 0 },
                     recent,
-                    common,
+                    // Attention order is authoritative: waiting, failures,
+                    // then unread. Keep that order inside its section.
+                    match message { Message::FocusAttention(id) => attention.iter().position(|card| card == id).unwrap_or(usize::MAX), _ => common },
                 )
             });
         }
@@ -807,16 +836,25 @@ impl Cagents {
         .id(widget::Id::new("palette.query"))
         .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
+        let mut section = None;
         let rows: Vec<Element<'_, Message>> = entries
             .into_iter()
             .enumerate()
-            .map(|(index, (label, chord, message))| {
+            .flat_map(|(index, (label, chord, message))| {
+                let next_section = self.palette_section(&message);
+                let heading: Option<Element<'_, Message>> = if next_section.is_some() && next_section != section {
+                    Some(widget::container(design::caption(next_section.unwrap())).height(SECTION_HEIGHT).align_y(Alignment::Center).padding([0,12]).into())
+                } else { None };
+                section = next_section;
                 let pane = match &message {
-                    Message::Palette(Action::FocusPane(id)) => Some(*id),
+                    Message::Palette(Action::FocusPane(id)) | Message::FocusAttention(id) => Some(*id),
                     _ => None,
                 };
                 let (_, needle) = palette_query(query);
-                let label = highlighted_label(&label, needle);
+                // Leading ordinals stay visible even when a long OSC title is
+                // ellipsized. Ranking continues to use the complete title.
+                let display = pane.and_then(|id| self.card_chrome.get(&id)).and_then(|chrome| chrome.compact_title.as_ref().map(|title| label.replacen(&chrome.title, title, 1))).unwrap_or_else(|| label.clone());
+                let label = highlighted_label(&display, needle);
                 let mut children = Vec::new();
                 if let Some(card) = pane {
                     children.push(
@@ -855,9 +893,9 @@ impl Cagents {
                 .height(ROW_HEIGHT)
                 .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
                 .into();
-                if self.palette.panes_only {
-                    if let Some(card) = pane {
-                        return widget::row::with_children(vec![
+                let button = if self.palette.panes_only && pane.is_some() {
+                    let card = pane.unwrap();
+                    widget::row::with_children(vec![
                             button,
                             crate::ui_controls::icon_button(Icon::Close, "Close pane")
                                 .id(widget::Id::new(format!("pane-list.close.{card}")))
@@ -865,10 +903,9 @@ impl Cagents {
                                 .into(),
                         ])
                         .align_y(Alignment::Center)
-                        .into();
-                    }
-                }
-                button
+                        .into()
+                } else { button };
+                heading.into_iter().chain(std::iter::once(button))
             })
             .collect();
         let rows = if rows.is_empty() {
@@ -947,22 +984,16 @@ impl Cagents {
             card.and_then(|id| self.workspace.order().position(|candidate| candidate == id));
         let state = card.and_then(|id| self.card_state(id));
         workspace_widget::CommandContext {
-            focused: if card == self.workspace.focused() {
-                self.focused_pane()
-            } else {
-                match card.and_then(|id| self.cards.get(&id)) {
-                    Some(CardRuntime::Terminal(_))
-                        if state.is_some_and(|state| ended_terminal(Some(state)).is_none()) =>
-                    {
-                        workspace_widget::FocusedPane::Terminal
-                    }
-                    Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
-                    Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
-                    Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => {
-                        workspace_widget::FocusedPane::Review
-                    }
-                    _ => workspace_widget::FocusedPane::Other,
-                }
+            // The palette's search field owns native keyboard focus. Command
+            // availability instead describes the originating pane's content.
+            focused: match card.and_then(|id| self.cards.get(&id)) {
+                Some(CardRuntime::Terminal(_)) if state.is_some_and(|state| ended_terminal(Some(state)).is_none()) => workspace_widget::FocusedPane::Terminal,
+                Some(CardRuntime::Chat(_)) => workspace_widget::FocusedPane::Chat,
+                Some(CardRuntime::PullRequests(_)) => workspace_widget::FocusedPane::Review,
+                Some(CardRuntime::Repository(runtime)) if runtime.shows_diff() => workspace_widget::FocusedPane::Review,
+                Some(CardRuntime::Repository(runtime)) if card.is_some_and(|card| runtime.editor_focus_target(card).is_some()) => workspace_widget::FocusedPane::Editor,
+                _ if state.is_some_and(|state| matches!(state.kind, CardKind::Chat(_))) => workspace_widget::FocusedPane::ChatPane,
+                _ => workspace_widget::FocusedPane::Other,
             },
             pane_index,
             pane_count: self.workspace.order().count(),
@@ -1001,6 +1032,8 @@ impl Cagents {
                 _ => false,
             }),
             daemon_can_restart: !crate::device::is_remote(),
+            can_search_project: self.sidebar_state.active_worktree().is_some(),
+            has_unread: self.durable.cards.iter().any(|card| card.existence.is_open() && self.sidebar_state.has_card_update(card.id)),
             can_reopen: self
                 .recently_closed
                 .iter()
@@ -1066,6 +1099,9 @@ impl Cagents {
         }
         match command {
             Command::NewBrowser => self.update(Message::NewBrowser),
+            Command::MarkAllRead => self.update(Message::Sidebar(SidebarAction::MarkAllRead)),
+            Command::SearchInProject => self.update(Message::SelectContextTab(ContextTab::Search)),
+            Command::CloneRepository => self.update(Message::Onboarding(onboarding_ui::Action::Clone)),
             Command::OpenFolder => self.update(Message::OpenRepository),
             Command::NewWorktree => {
                 let Some(project) = self.command_project() else {
@@ -1174,7 +1210,10 @@ impl Cagents {
             | Command::SettingsEditor
             | Command::SettingsAccounts
             | Command::SettingsNotifications
-            | Command::SettingsAbout => self.run_registered_command(command),
+            | Command::SettingsAbout
+            | Command::MarkAllRead
+            | Command::SearchInProject
+            | Command::CloneRepository => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
             }
@@ -1379,6 +1418,10 @@ impl SettingsField {
             Self::ShortcutSettingsAccounts => Some(Command::SettingsAccounts),
             Self::ShortcutSettingsNotifications => Some(Command::SettingsNotifications),
             Self::ShortcutSettingsAbout => Some(Command::SettingsAbout),
+            Self::ShortcutMarkAllRead => Some(Command::MarkAllRead),
+            Self::ShortcutSearchInProject => Some(Command::SearchInProject),
+            Self::ShortcutCloneRepository => Some(Command::CloneRepository),
+
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
             Self::ShortcutNewChannel => Some(Command::NewChannel),
@@ -1487,6 +1530,10 @@ impl ShortcutDraft {
                 self.settings_notifications.as_str(),
             ),
             (Command::SettingsAbout, self.settings_about.as_str()),
+            (Command::MarkAllRead, self.mark_all_read.as_str()),
+            (Command::SearchInProject, self.search_in_project.as_str()),
+            (Command::CloneRepository, self.clone_repository.as_str()),
+
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
             (Command::ClonePane, self.clone_pane.as_str()),
@@ -1625,7 +1672,7 @@ mod tests {
         drop(app.update_palette(Action::Query("pane14".into())));
         let entries = app.palette_entries();
         assert_eq!(entries.len(), 1);
-        assert!(matches!(entries[0].2, Message::FocusCard(id) if id == chosen));
+        assert!(matches!(entries[0].2, Message::Palette(Action::FocusPane(id)) if id == chosen));
         drop(app.update_palette(Action::Submit));
         assert!(!app.palette.is_open());
         assert_eq!(app.workspace.focused(), Some(chosen));
@@ -1814,6 +1861,43 @@ mod tests {
         assert!(
             matches!(entries[0].2, Message::Sidebar(SidebarAction::OpenWorktree { worktree_id: id, .. }) if id == worktree_id)
         );
+    }
+
+    #[test]
+    fn palette_recents_precede_ranked_attention_without_duplicate_panes() {
+        let mut app = settings_focus_fixture();
+        let card = app.workspace.focused().unwrap();
+        let recent = Message::RunCommand(Command::OpenSettings);
+        app.settings.palette_recents = vec![entry_key(&recent)];
+        let project = ProjectId::new();
+        let worktree = crate::model::WorktreeId::new();
+        app.sidebar_state.observe_agent_update(card, project, worktree);
+        assert!(app.command_available(Command::MarkAllRead));
+        drop(app.update_palette(Action::Open));
+        let entries = app.palette_entries();
+        assert_eq!(app.palette_section(&entries[0].2), Some("Recent"));
+        assert!(matches!(entries[1].2, Message::FocusAttention(id) if id == card));
+        assert_eq!(app.palette_section(&entries[1].2), Some("Needs attention"));
+        assert_eq!(entries.iter().filter(|(_,_, message)| entry_key(message) == format!("pane:{card}")).count(), 1);
+        assert_eq!(entry_category(&entries[1].2), '@');
+        drop(app.update_palette(Action::Close));
+        drop(app.run_workspace_command(Command::MarkAllRead, keyboard::Modifiers::empty()));
+        assert!(!app.sidebar_state.has_card_update(card));
+        assert!(!app.command_available(Command::MarkAllRead));
+    }
+
+    #[test]
+    fn all_registered_actions_have_visible_keyboard_groups_and_matching_drafts() {
+        let app = settings_focus_fixture();
+        let drafts = app.settings_draft.keyboard_shortcuts.shortcut_values();
+        assert_eq!(drafts.len(), SettingsField::SHORTCUTS.len());
+        for (index, field) in SettingsField::SHORTCUTS.into_iter().enumerate() {
+            let action = field.shortcut_action().unwrap();
+            let descriptor = workspace_widget::shortcut_descriptor(action);
+            assert!(["Panes", "Navigation", "Chat", "Review", "Editor"].contains(&descriptor.category()));
+            assert_eq!(drafts[index].0, action);
+            assert_eq!(action.id(), KeyboardShortcuts::action_names()[index]);
+        }
     }
 
     #[test]

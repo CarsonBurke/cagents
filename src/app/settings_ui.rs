@@ -1221,24 +1221,7 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
 }
 
 fn shortcut_group(field: SettingsField) -> &'static str {
-    use workspace_widget::GlobalShortcut as Action;
-    match field.shortcut_action().expect("shortcut field") {
-        Action::ChatPermissions | Action::ChatModel | Action::ChatAccount | Action::NewThread => {
-            "Chat"
-        }
-        Action::ReviewToggleViewed
-        | Action::ReviewNextFile
-        | Action::ReviewPreviousFile
-        | Action::ReviewNextUnviewed
-        | Action::ReviewNextChange
-        | Action::ReviewPreviousChange => "Review",
-        Action::CycleWorkspace(_)
-        | Action::CommandPalette
-        | Action::FocusProjectSearch
-        | Action::ToggleProjects
-        | Action::OpenSettings => "Navigation",
-        _ => "Panes",
-    }
+    workspace_widget::shortcut_descriptor(field.shortcut_action().expect("shortcut field")).category()
 }
 
 fn keyboard_groups<'a>(

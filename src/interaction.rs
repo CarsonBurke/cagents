@@ -17,7 +17,7 @@ use serde::Deserialize;
 
 mod context_menu;
 mod list_navigation;
-pub use list_navigation::reveal_list_selection;
+pub use list_navigation::{reveal_list_selection, reveal_list_region};
 
 use crate::design::space;
 

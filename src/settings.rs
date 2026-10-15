@@ -316,6 +316,10 @@ pub struct KeyboardShortcuts {
     pub settings_accounts: Vec<String>,
     pub settings_notifications: Vec<String>,
     pub settings_about: Vec<String>,
+    pub mark_all_read: Vec<String>,
+    pub search_in_project: Vec<String>,
+    pub clone_repository: Vec<String>,
+
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
 }
@@ -397,6 +401,10 @@ impl Default for KeyboardShortcuts {
             settings_accounts: Vec::new(),
             settings_notifications: Vec::new(),
             settings_about: Vec::new(),
+            mark_all_read: vec![],
+            search_in_project: vec!["Ctrl+Alt+F".into()],
+            clone_repository: vec![],
+
             terminal_passthrough_actions: [
                 "rename_pane",
                 "new_native_thread",
@@ -428,7 +436,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 74] {
+    pub fn actions(&self) -> [&Vec<String>; 77] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -504,12 +512,16 @@ impl KeyboardShortcuts {
             &self.settings_accounts,
             &self.settings_notifications,
             &self.settings_about,
+            &self.mark_all_read,
+            &self.search_in_project,
+            &self.clone_repository,
+
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 71] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 77] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -522,6 +534,8 @@ impl KeyboardShortcuts {
             &mut self.cycle_pane_width,
             &mut self.previous_workspace,
             &mut self.next_workspace,
+            &mut self.next_attention,
+            &mut self.previous_attention,
             &mut self.review_toggle_viewed,
             &mut self.review_next_file,
             &mut self.review_previous_file,
@@ -547,6 +561,7 @@ impl KeyboardShortcuts {
             &mut self.focus_pane_7,
             &mut self.focus_pane_8,
             &mut self.focus_pane_9,
+            &mut self.focus_last_pane,
             &mut self.toggle_projects,
             &mut self.rename_pane,
             &mut self.new_browser,
@@ -582,6 +597,9 @@ impl KeyboardShortcuts {
             &mut self.settings_accounts,
             &mut self.settings_notifications,
             &mut self.settings_about,
+            &mut self.mark_all_read,
+            &mut self.search_in_project,
+            &mut self.clone_repository,
         ]
     }
 
@@ -631,7 +649,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 74] = [
+const SHORTCUT_ACTIONS: [&str; 77] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -706,6 +724,10 @@ const SHORTCUT_ACTIONS: [&str; 74] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "mark_all_read",
+    "search_in_project",
+    "clone_repository",
+
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1815,7 +1837,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 69] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 72] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -1885,6 +1907,10 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 69] = [
     "settings_accounts",
     "settings_notifications",
     "settings_about",
+    "mark_all_read",
+    "search_in_project",
+    "clone_repository",
+
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
