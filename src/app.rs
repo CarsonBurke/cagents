@@ -17893,7 +17893,7 @@ fn load_repository(
             let status = (!worktree.bare)
                 .then(|| {
                     service
-                        .status_with_untracked(&worktree.path, false, &cancellation)
+                        .status_with_untracked(&worktree.path, true, &cancellation)
                         .ok()
                 })
                 .flatten();

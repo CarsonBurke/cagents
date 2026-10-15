@@ -16710,6 +16710,9 @@ pub(crate) mod tests {
     /// the four change areas and one unmeasured (binary) count.
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
+            operation: None,
+            stashes: Vec::new(),
+            last_fetch_unix_ms: None,
             status: StatusSnapshot {
                 untracked_omitted: false,
                 head: HeadState::Branch {
@@ -16950,6 +16953,9 @@ pub(crate) mod tests {
         let mut source = SourceControlModel::ready(
             main_key(),
             &RepositorySnapshot {
+                operation: None,
+                stashes: Vec::new(),
+                last_fetch_unix_ms: None,
                 status: StatusSnapshot::default(),
                 files: WorkingFiles::default(),
                 remotes: Vec::new(),

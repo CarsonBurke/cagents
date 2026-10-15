@@ -586,7 +586,11 @@ fn read_local_with_plan(
         if record.bare || (!change.topology && !change.worktrees.contains(&record.id)) {
             continue;
         }
-        let current = match git.status_with_untracked(&record.path, false, &cancellation) {
+        // A membership edge replaces the cached full count in this same
+        // coalesced status process. Tracked-only writes do not rescan untracked
+        // trees; the bounded topology fallback repairs incomplete watch coverage.
+        let include_untracked = change.topology || change.membership || change.metadata || change.untracked;
+        let current = match git.status_with_untracked(&record.path, include_untracked, &cancellation) {
             Ok(current) => current,
             // Its own removal is often the event being read, and one absent
             // checkout must not fail its siblings.
@@ -910,6 +914,35 @@ mod tests {
         let (next, _) = read_local(project, snapshot, git_watch::Change { worktrees: changed, ..Default::default() }, CancellationToken::default()).unwrap();
         assert_eq!(next.worktrees.len(), 2);
         assert!(next.worktrees.iter().find(|(record, _)| record.path == root).unwrap().1.as_ref().unwrap().dirty.is_dirty());
+    }
+
+    #[test]
+    fn full_count_edges_discover_new_untracked_files_and_clear_removed_ones() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let snapshot = fixture(&root);
+        let id = snapshot.worktrees[0].0.id;
+        let project = ProjectId::new();
+        let change = git_watch::Change { worktrees: [id].into(), untracked: true, ..Default::default() };
+        fs::write(root.join("new.txt"), "new untracked file\n").unwrap();
+        let (snapshot, plan) = read_local(project, snapshot, change.clone(), CancellationToken::default()).unwrap();
+        assert!(plan.is_none(), "file entries do not re-enumerate watch membership");
+        let status = snapshot.worktrees[0].1.as_ref().unwrap();
+        assert!(!status.untracked_omitted);
+        assert_eq!(status.dirty.untracked, 1);
+        git(&root, &["add", "new.txt"]);
+        let (snapshot, _) = read_local(project, snapshot,
+            git_watch::Change { worktrees: [id].into(), metadata: true, ..Default::default() },
+            CancellationToken::default()).unwrap();
+        let status = snapshot.worktrees[0].1.as_ref().unwrap();
+        assert_eq!(status.dirty.staged, 1);
+        assert_eq!(status.dirty.untracked, 0, "index mutations must not double count newly staged files");
+        git(&root, &["reset", "--", "new.txt"]);
+        fs::remove_file(root.join("new.txt")).unwrap();
+        let (snapshot, _) = read_local(project, snapshot, change, CancellationToken::default()).unwrap();
+        let status = snapshot.worktrees[0].1.as_ref().unwrap();
+        assert!(!status.untracked_omitted);
+        assert_eq!(status.dirty.untracked, 0);
     }
 
     #[test]
