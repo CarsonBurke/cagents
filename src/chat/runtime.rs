@@ -928,6 +928,7 @@ impl Handle {
                 }
             }
         }
+        state.source_revision = store.source_revision;
         if refresh_publication {
             store.presented_generation = Some(state.generation);
             store.presented_file_changes = Some((
@@ -978,6 +979,7 @@ impl Handle {
             } else {
                 Vec::new()
             };
+            state.source_revision = store.source_revision;
             store.presentation = baseline
                 .filter(|generation| *generation < state.generation)
                 .map(|base_generation| {
