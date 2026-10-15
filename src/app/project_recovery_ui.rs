@@ -1084,6 +1084,84 @@ mod tests {
         let worker=later.clone();tokio::task::spawn_blocking(move||worker.retry()).await.unwrap().unwrap();
     }
 
+    fn publication_card(app: &mut Cagents, project: ProjectId, root: &Path) -> CardId {
+        let original="fn old() {}\n";
+        for name in ["participant.rs","unopened.rs"] {std::fs::write(root.join(name),original).unwrap();}
+        app.settings.language_servers.clear();app.lsp=LspManager::new(Vec::new());
+        drop(app.add_terminal(root.to_owned()));let card=app.durable.cards.last().unwrap().id;
+        let (mut runtime,_)=RepositoryRuntime::open_fixture(card,"participant.rs",original);
+        runtime.descriptor.project=project;runtime.descriptor.repository=root.to_owned();runtime.descriptor.worktree=root.to_owned();
+        app.card_state_mut(card).unwrap().kind=CardKind::Repository(runtime.descriptor.clone());
+        app.cards.insert(card,CardRuntime::Repository(Box::new(runtime)));card
+    }
+
+    #[tokio::test]
+    async fn held_publisher_recovery_keeps_original_project_before_or_after_locate_applies() {
+        use cosmic::iced::futures::StreamExt;
+        for complete_before_move in [false,true] {
+            let fixture=tempfile::tempdir().unwrap();let old=fixture.path().join("original");let moved=fixture.path().join("moved");
+            std::fs::create_dir(&old).unwrap();let (mut app,project)=app(&old);
+            let card=publication_card(&mut app,project,&old);
+            let publishing=app.project_editor_publication_fixture(card,&old,543);
+            assert!(app.card_has_project_editor_write(card));
+            let expected=app.project_instance(project).unwrap();
+            drop(app.update_project_recovery(Action::Command(project,ProjectRecoveryAction::Locate)));
+            let generation=app.project_recovery_ui.location_generations[&project];
+            assert!(app.project_recovery_ui.relocation_publications[&543].contains(&project));
+            // Collect the actual held publisher's result. Recovery is a typed
+            // fixture input below; this test does not simulate FS compensation.
+            let mut stream=iced::runtime::task::into_stream(publishing).unwrap();let mut received=false;
+            while let Some(action)=stream.next().await {
+                if matches!(action,iced::runtime::Action::Output(cosmic::Action::App(Message::EditorFeatures(super::super::editor_features::Action::Published{ticket:543,..})))) {received=true;break;}
+            }
+            assert!(received);
+            // A stale/no-runtime receipt must still attribute the original
+            // project via captured ticket, never via current paths or cards.
+            app.cards.remove(&card);
+            let authority=crate::editor::RecoverySlot::reserve().unwrap().retain("late exact publisher recovery".into(),||Ok(()));
+            let result=Err(crate::editor_workspace_edit::PublicationFailure{message:"late owned cleanup".into(),recovery:Some(authority.clone()),worktree:Some(old.clone())});
+            if complete_before_move {
+                drop(app.update(Message::EditorFeatures(super::super::editor_features::Action::Published{ticket:543,result:result.clone()})));
+            }
+            std::fs::rename(&old,&moved).unwrap();std::fs::create_dir(&old).unwrap();
+            let relocation=Relocation{repository:old.clone(),destination:moved.clone(),old_root:old.clone(),new_root:moved.clone()};
+            let mut model=app.workspace_model.clone();model.sequence+=1;model.projects[0].repository=moved.clone();
+            drop(app.update_project_recovery(Action::Applied(project,expected,generation,relocation,Ok(model))));
+            if !complete_before_move {
+                drop(app.update(Message::EditorFeatures(super::super::editor_features::Action::Published{ticket:543,result})));
+            }
+            assert!(!app.project_recovery_ui.relocation_publications.contains_key(&543));
+            assert_eq!(app.project_recovery_ui.relocated_recovery[&project],authority);
+            assert!(app.project_has_publication_recovery(project));assert!(!app.cards.contains_key(&card));
+            let worker=authority.clone();tokio::task::spawn_blocking(move||worker.retry()).await.unwrap().unwrap();
+            assert!(!app.project_has_publication_recovery(project));
+        }
+    }
+
+    #[tokio::test]
+    async fn new_publication_waits_for_its_own_locate_but_unrelated_project_can_publish() {
+        use cosmic::iced::futures::StreamExt;
+        let fixture=tempfile::tempdir().unwrap();let root=fixture.path().join("locating");let other_root=fixture.path().join("other");
+        std::fs::create_dir(&root).unwrap();std::fs::create_dir(&other_root).unwrap();
+        let (mut app,project)=app(&root);let card=publication_card(&mut app,project,&root);
+        let other=ProjectId::new();app.sidebar_model.projects.push(SidebarProject::new(other,RepositoryId::new(),"Other".into(),other_root.clone(),Vec::new(),Vec::new()).with_kind(ProjectKind::Folder));
+        let other_card=publication_card(&mut app,other,&other_root);
+        drop(app.update_project_recovery(Action::Command(project,ProjectRecoveryAction::Locate)));
+        assert!(app.project_relocation_blocks_publication(&HashSet::from([card])));
+        assert!(!app.project_relocation_blocks_publication(&HashSet::from([other_card])));
+        drop(app.project_editor_publication_fixture(card,&root,544));
+        assert!(!app.editor_features.publishing());assert!(!app.card_has_project_editor_write(card));
+        assert_eq!(std::fs::read_to_string(root.join("unopened.rs")).unwrap(),"fn old() {}\n");
+        let task=app.project_editor_publication_fixture(other_card,&other_root,545);
+        assert!(app.editor_features.publishing());assert!(app.card_has_project_editor_write(other_card));
+        let mut stream=iced::runtime::task::into_stream(task).unwrap();let mut delivered=false;
+        while let Some(action)=stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::EditorFeatures(super::super::editor_features::Action::Published{ticket:545,..})))=action {delivered=true;drop(app.update(message));}
+        }
+        assert!(delivered);assert!(!app.card_has_project_editor_write(other_card));
+        assert_eq!(std::fs::read_to_string(other_root.join("unopened.rs")).unwrap(),"fn renamed() {}\n");
+    }
+
     #[test]
     fn reconnect_follows_non_reused_project_identity_even_when_old_path_is_reopened() {
         let old = Path::new("/old/project");
