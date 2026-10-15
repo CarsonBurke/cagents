@@ -21,10 +21,31 @@ pub(super) struct Bindings {
     batch:Option<uuid::Uuid>,
     selected:HashMap<CardId,uuid::Uuid>,
     completed_attempts:HashMap<TerminalId,CompletedAttempt>,
-    removal_origins:HashMap<CardId,Option<uuid::Uuid>>,
+    pending_removals:HashMap<CardId,PendingRemoval>,
 }
 
 struct CompletedAttempt { nonce:uuid::Uuid,card:CardId,batch:Option<uuid::Uuid> }
+
+/// Opaque authority for one pending UI removal, never an execution capability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemovalTarget { card:CardId,nonce:uuid::Uuid }
+impl RemovalTarget { pub(super) fn card(self)->CardId {self.card} }
+struct PendingRemoval { target:RemovalTarget,batch:Option<uuid::Uuid>,kind:CardKind,observed_chat:Option<crate::chat::Session> }
+
+pub(super) fn same_chat_removal_source(expected:&crate::chat::Session,current:&crate::chat::Session)->bool {
+    expected.id==current.id && expected.launch==current.launch && expected.proof==current.proof
+        && expected.owned_codex_listener==current.owned_codex_listener
+}
+fn same_removal_source(expected:&CardKind,current:&CardKind)->bool {
+    match (expected,current) {
+        (CardKind::Terminal(expected),CardKind::Terminal(current))=>{
+            let mut source=current.clone(); source.continuity=expected.continuity.clone();
+            source==*expected && current.continuity.live_proof().is_none_or(|proof|expected.continuity.live_proof()==Some(proof))
+        }
+        (CardKind::Chat(expected),CardKind::Chat(current))=>same_chat_removal_source(expected,current),
+        _=>expected==current,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct CloseIntent {
@@ -80,6 +101,7 @@ pub struct QueuedCardClose {
     kind: Option<CardKind>,
     captured: Option<CapturedTerminal>,
 }
+impl QueuedCardClose {pub(super) fn origin(&self)->Option<uuid::Uuid> {self.batch}}
 
 fn same_captured(expected: Option<&CapturedTerminal>, current: Option<&CapturedTerminal>) -> bool {
     match (expected, current) {
@@ -116,6 +138,10 @@ impl Cagents {
         // A successful explicit spawn invalidates old authority even when the
         // new attachment has not published authenticated metadata yet.
         if spawned {
+            if let Some(target)=self.pending_card_removal_target(card) {
+                self.retire_card_removal(target);
+                if self.workspace.pending_close().is_some_and(|handoff|handoff.unmounting==card){let _=self.workspace.cancel_close(card);}
+            }
             self.terminal_close_bindings.bound.remove(&card);
             self.terminal_close_bindings.adoptions.remove(&card);
         }
@@ -236,7 +262,10 @@ impl Cagents {
         self.terminal_close_bindings.bound.remove(&card);
         self.terminal_close_bindings.adoptions.remove(&card);
         self.terminal_close_bindings.removals.remove(&card);
-        self.terminal_close_bindings.removal_origins.remove(&card);
+        if self.terminal_close_bindings.pending_removals.remove(&card).is_some()
+            && self.workspace.pending_close().is_some_and(|pending|pending.unmounting==card) {
+            let _=self.workspace.cancel_close(card);
+        }
         self.terminal_close_bindings.local.forget(card);
     }
 
@@ -416,15 +445,28 @@ impl Cagents {
             || self.card_state(card).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(session) if self.terminal_close_attempts.contains(&session.id)))
     }
 
-    pub(super) fn begin_card_close(&mut self, card: CardId) -> Task<Message> {
-        self.close_card_as(card, !self.settings.confirm_terminal_close, false)
+    pub(super) fn begin_card_close(&mut self,card:CardId)->Task<Message> {
+        self.begin_card_close_for(card,None)
+    }
+    pub(super) fn begin_card_close_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
+        if !self.pane_close_decision_current(card,batch) {return Task::none();}
+        self.close_card_as(card,!self.settings.confirm_terminal_close,false,batch)
+    }
+    pub(super) fn resume_card_close_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
+        if !self.pane_close_decision_current(card,batch) {return Task::none();}
+        let mut queued=self.queued_card_close(card,false);queued.batch=batch;
+        cosmic::task::message(Message::CloseQueuedCard(queued))
     }
 
     /// Closes `card` without asking whether to stop what its terminal is
     /// running, for a close the reader already asked for in so many words -
     /// cancelling a sign-in, say. The daemon's identity checks still apply.
-    pub(super) fn close_card_unasked(&mut self, card: CardId) -> Task<Message> {
-        self.close_card_as(card, true, true)
+    pub(super) fn close_card_unasked(&mut self,card:CardId)->Task<Message> {
+        self.close_card_unasked_for(card,None)
+    }
+    pub(super) fn close_card_unasked_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
+        if !self.pane_close_decision_current(card,batch) {return Task::none();}
+        self.close_card_as(card,true,true,batch)
     }
 
     /// Closes `card` from outside the strip on screen, which has no widget
@@ -466,8 +508,7 @@ impl Cagents {
         Task::batch([self.delete_channels(emptied), self.sync_chrome()])
     }
 
-    fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
-        let batch=self.pane_close_batch_for(card);
+    fn close_card_as(&mut self,card:CardId,allow_active:bool,unasked:bool,batch:Option<uuid::Uuid>)->Task<Message> {
         if self.terminal_start_in_flight(card)
             || (matches!(
                 self.card_state(card).map(|state| &state.kind),
@@ -719,75 +760,106 @@ impl Cagents {
                 .is_some_and(|continuity| continuity.live_proof().is_none())
     }
 
+    pub(super) fn pending_card_removal_target(&self,card:CardId)->Option<RemovalTarget> {
+        self.terminal_close_bindings.pending_removals.get(&card).map(|pending|pending.target)
+    }
+    pub(super) fn card_removal_origin(&self,target:RemovalTarget)->Option<Option<uuid::Uuid>> {
+        self.terminal_close_bindings.pending_removals.get(&target.card).filter(|pending|pending.target==target).map(|pending|pending.batch)
+    }
+    pub(super) fn card_removal_current(&self,target:RemovalTarget)->bool {
+        let Some(pending)=self.terminal_close_bindings.pending_removals.get(&target.card).filter(|pending|pending.target==target) else{return false;};
+        self.pane_close_decision_current(target.card,pending.batch)
+            && self.workspace.pending_close().is_some_and(|handoff|handoff.unmounting==target.card)
+            && self.card_state(target.card).is_some_and(|card|card.existence.is_open() && same_removal_source(&pending.kind,&card.kind))
+            && match &pending.kind {
+                CardKind::Chat(_)=>match (&pending.observed_chat,self.chat_return_session(target.card)) {
+                    (Some(expected),Some(current))=>same_chat_removal_source(expected,&current),
+                    (None,None)=>true,
+                    _=>false,
+                },
+                CardKind::Terminal(_)=>!self.chat_has_parked_runtime(target.card) && !matches!(self.cards.get(&target.card),Some(CardRuntime::Chat(_))),
+                _=>true,
+            }
+    }
+    /// Retire only this exact operation, including stale lifecycle outcomes.
+    /// Nested Option distinguishes a direct origin from a missing operation.
+    pub(super) fn retire_card_removal(&mut self,target:RemovalTarget)->Option<Option<uuid::Uuid>> {
+        if self.pending_card_removal_target(target.card)!=Some(target) {return None;}
+        self.terminal_close_bindings.pending_removals.remove(&target.card).map(|pending|pending.batch)
+    }
+    #[cfg(test)]
+    pub(super) fn commit_close_message(&self,card:CardId)->Message {
+        self.pending_card_removal_target(card).map(Message::CommitCloseTarget).unwrap_or(Message::CommitClose(card))
+    }
+
     /// Direct callers have no batch authority. Async lifecycle consumers must
     /// pass their original token to request_card_removal_for instead.
     pub(super) fn request_card_removal(&mut self, card: CardId) -> Task<Message> {
         self.request_card_removal_for(card,None)
     }
-
     pub(super) fn request_card_removal_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
         self.reserve_card_removal_for(card,batch).map(|handoff|self.card_removal(handoff)).unwrap_or_else(Task::none)
     }
-
-    /// Reserve a synchronous lifecycle commit without relabeling a pending
-    /// handoff from another origin. Chat End uses this after source validation.
     pub(super) fn reserve_card_removal_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Option<crate::workspace::FocusHandoff> {
         if !self.pane_close_decision_current(card,batch) {return None;}
-        if self.terminal_close_bindings.removal_origins.get(&card).is_some_and(|origin|*origin!=batch) {
-            self.stop_pane_close_batch(batch);
-            self.status=Some(TransientNotice::warning("An earlier Close request still owns this pane's pending removal. This selection was kept; retry after the earlier request finishes."));
-            return None;
+        let kind=self.card_state(card).filter(|state|state.existence.is_open())?.kind.clone();
+        let observed_chat=matches!(&kind,CardKind::Chat(_)).then(||self.chat_return_session(card)).flatten();
+        if let Some(pending)=self.terminal_close_bindings.pending_removals.get(&card) {
+            if pending.batch!=batch || !self.card_removal_current(pending.target) {
+                self.stop_pane_close_batch(batch);
+                self.status=Some(TransientNotice::warning("An earlier Close request still owns this pane's pending removal. This selection was kept; retry after the earlier request finishes."));
+                return None;
+            }
         }
-        let reservation = match self.workspace.pending_close() {
-            Some(handoff) if handoff.unmounting == card => Ok(handoff),
-            _ => self.workspace.request_close(card),
+        let reservation=match self.workspace.pending_close() {
+            Some(handoff) if handoff.unmounting==card=>Ok(handoff),
+            _=>self.workspace.request_close(card),
         };
         match reservation {
-            Ok(handoff) => {
-                self.terminal_close_bindings.removal_origins.insert(card,batch);
+            Ok(handoff)=>{
+                self.terminal_close_bindings.pending_removals.entry(card).or_insert_with(||PendingRemoval {
+                    target:RemovalTarget {card,nonce:uuid::Uuid::new_v4()},batch,kind,observed_chat,
+                });
                 Some(handoff)
             }
-            Err(error) => {
+            Err(error)=>{
                 self.stop_pane_close_batch(batch);
-                self.status = Some(TransientNotice::error(error.to_string()));
+                self.status=Some(TransientNotice::error(error.to_string()));
                 None
             }
         }
     }
-
-    /// Moves focus off a card whose removal the workspace has reserved, then
-    /// commits that removal.
-    pub(super) fn card_removal(&self, handoff: crate::workspace::FocusHandoff) -> Task<Message> {
-        workspace_widget::focus_handoff_then(
-            handoff,
-            widget::Id::new(TOOLBAR_FOCUS_ID),
-            |next| self.card_keyboard_focus(next),
-            Message::CommitClose(handoff.unmounting),
-        )
-        .map(cosmic::Action::App)
+    pub(super) fn card_removal(&self,handoff:crate::workspace::FocusHandoff)->Task<Message> {
+        let Some(target)=self.pending_card_removal_target(handoff.unmounting) else{return Task::none();};
+        workspace_widget::focus_handoff_then(handoff,widget::Id::new(TOOLBAR_FOCUS_ID),|next|self.card_keyboard_focus(next),Message::CommitCloseTarget(target)).map(cosmic::Action::App)
     }
 
     /// Commits the workspace reservation before retiring any runtime or saved
     /// identity. A failed or stale reservation leaves the card untouched.
-    pub(super) fn commit_card_removal(
+    pub(super) fn commit_card_removal(&mut self,id:CardId,replacement:Option<(LaunchRecipe,(usize,usize),Option<(TerminalId,TerminalId)>)>)->Option<Task<Message>> {
+        let target=self.pending_card_removal_target(id)?;
+        self.commit_card_removal_target(target,replacement)
+    }
+    pub(super) fn commit_card_removal_target(
         &mut self,
-        id: CardId,
-        replacement: Option<(
-            LaunchRecipe,
-            (usize, usize),
-            Option<(TerminalId, TerminalId)>,
-        )>,
-    ) -> Option<Task<Message>> {
-        let origin=self.terminal_close_bindings.removal_origins.get(&id).copied().flatten();
-        if !self.pane_close_decision_current(id,origin) {
+        target:RemovalTarget,
+        replacement:Option<(LaunchRecipe,(usize,usize),Option<(TerminalId,TerminalId)>)>,
+    )->Option<Task<Message>> {
+        let id=target.card;
+        if self.pending_card_removal_target(id)!=Some(target) {return None;}
+        let origin=self.terminal_close_bindings.pending_removals.get(&id)?.batch;
+        if !self.card_removal_current(target) {
+            self.retire_card_removal(target);
             if self.workspace.pending_close().is_some_and(|pending|pending.unmounting==id){let _=self.workspace.cancel_close(id);}
-            self.terminal_close_bindings.removal_origins.remove(&id);
+            self.closed_terminal_cards.remove(&id);
+            self.stop_pane_close_batch(origin);
+            self.status=Some(TransientNotice::warning("The pending pane removal no longer matches its captured source. Its current pane and history were kept."));
             return None;
         }
         if self.card_state(id).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(_))) && !self.terminal_close_bindings.removals.contains_key(&id) {
             if self.workspace.pending_close().is_some_and(|pending|pending.unmounting==id){let _=self.workspace.cancel_close(id);}
             self.closed_terminal_cards.remove(&id);
-            self.terminal_close_bindings.removal_origins.remove(&id);
+            self.retire_card_removal(target);
             self.stop_pane_close_batch(origin);
             self.status=Some(TransientNotice::warning("No verified terminal cleanup receipt is available. Its shared pane and history were kept; reconnect and choose Close again."));
             return None;
@@ -801,7 +873,7 @@ impl Cagents {
                 let _ = self.workspace.cancel_close(id);
                 self.closed_terminal_cards.remove(&id);
                 self.terminal_close_bindings.removals.remove(&id);
-                self.terminal_close_bindings.removal_origins.remove(&id);
+                self.retire_card_removal(target);
                 self.stop_pane_close_batch(origin);
                 self.status = Some(TransientNotice::warning(
                     "The pane changed before its close was committed. Its new session was preserved.",
@@ -815,7 +887,7 @@ impl Cagents {
         let update = match self.workspace.commit_close(id) {
             Ok(update) => update,
             Err(error) => {
-                self.terminal_close_bindings.removal_origins.remove(&id);
+                self.retire_card_removal(target);
                 self.stop_pane_close_batch(origin);
                 self.status = Some(TransientNotice::error(error.to_string()));
                 return None;
@@ -1378,13 +1450,13 @@ mod tests {
             handle.join().unwrap();
             drop(app.update(Message::CompletedTerminalClosed{card,session:source,batch:None,attempt,result:outcome}));
             if resident && !successor && known {
-                drop(app.update(Message::CommitClose(card)));
+                drop(app.update(app.commit_close_message(card)));
                 assert!(!app.card_state(card).unwrap().existence.is_open(),"exact resident cleanup may commit even without published exit status");
             }else{
                 assert_eq!(app.card_state(card),Some(&before));
                 let _=app.workspace.request_close(card);
                 assert!(app.commit_card_removal(card,None).is_none(),"a stale focus handoff cannot bypass missing cleanup authority");
-                drop(app.update(Message::CommitClose(card)));
+                drop(app.update(app.commit_close_message(card)));
                 assert!(app.card_state(card).unwrap().existence.is_open());
                 assert!(app.recently_closed.is_empty());assert!(!app.closed_terminal_cards.contains(&card));
             }
@@ -1429,7 +1501,8 @@ mod tests {
     fn revoked_batch_dialog_cannot_persist_optout_or_submit_close_for_same_worker() {
         let (mut app,card,_)=bound_fixture();
         drop(app.close_cards_in_order(vec![card]));
-        drop(app.begin_card_close(card));
+        let origin=app.pane_close_batch_for(card);
+        drop(app.begin_card_close_for(card,origin));
         let intent=app.terminal_close.as_ref().unwrap().clone();
         drop(app.terminal_close_finished(card,intent.terminal,intent.proof.clone(),intent.generation,CloseOutcome::Active));
         app.terminal_close.as_mut().unwrap().dont_ask_again=true;
@@ -2000,6 +2073,31 @@ mod tests {
     }
 
     #[test]
+    fn old_focus_commit_cannot_consume_a_new_removal_of_the_same_source() {
+        let mut app=super::super::tests::context_inspector_test_app(true);
+        let _=app.open_utility_card(CardKind::Settings);
+        let card=app.utility_card(&CardKind::Settings).unwrap();
+        let _=app.request_card_removal(card);
+        let old=app.pending_card_removal_target(card).unwrap();
+        assert!(app.card_removal_current(old));
+        assert_eq!(app.retire_card_removal(old),Some(None));
+        let _=app.workspace.cancel_close(card);
+        let _=app.request_card_removal(card);
+        let current=app.pending_card_removal_target(card).unwrap();
+        assert_ne!(old,current);
+        let _=app.update(Message::CommitCloseTarget(old));
+        assert_eq!(app.pending_card_removal_target(card),Some(current));
+        assert!(app.card_removal_current(current));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.retire_card_removal(old),None);
+        // A raw CardId can neither select the new operation nor grant consent.
+        let _=app.update(Message::CommitClose(card));
+        assert!(app.card_removal_current(current));
+        let _=app.update(Message::CommitCloseTarget(current));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
     fn independent_completion_or_cancel_cannot_dequeue_a_waiting_batch_step() {
         for completed in [false,true] {
             let (mut app,independent,_)=bound_fixture();
@@ -2020,16 +2118,16 @@ mod tests {
             let Message::CloseQueuedCard(held)=super::super::tests::task_app_message(app.close_cards_in_order(vec![first,second])) else {panic!()};
             let batch=held.batch;
             assert_eq!(app.queued_card_closes.iter().map(|queued|queued.card).collect::<Vec<_>>(),vec![second]);
-            if completed {let _=app.update(Message::CommitClose(independent));}
+            if completed {let _=app.update(app.commit_close_message(independent));}
             else {let _=app.update(Message::CancelTerminalClose);}
             assert_eq!(app.card_state(independent).unwrap().existence.is_open(),!completed);
             assert_eq!(app.queued_card_closes.iter().map(|queued|queued.card).collect::<Vec<_>>(),vec![second],"independent outcome cannot pop a second batch step while its first delivery is held");
             assert!(app.pane_close_decision_current(first,batch));
             let _=app.update(Message::CloseQueuedCard(held));
             assert_eq!(app.workspace.pending_close().unwrap().unmounting,first);
-            assert_eq!(app.terminal_close_bindings.removal_origins.get(&first),Some(&batch));
+            assert_eq!(app.terminal_close_bindings.pending_removals.get(&first).map(|pending|pending.batch),Some(batch));
             assert_eq!(app.queued_card_closes.len(),1);
-            let _=app.update(Message::CommitClose(first));
+            let _=app.update(app.commit_close_message(first));
             assert!(!app.card_state(first).unwrap().existence.is_open());
             assert!(app.card_state(second).unwrap().existence.is_open());
             assert!(app.pane_close_decision_current(second,batch));
@@ -2049,9 +2147,9 @@ mod tests {
         assert!(batch.is_some());
         assert!(app.reserve_card_removal_for(card,batch).is_none());
         assert!(!app.project_recovery_ui.closing_panes);
-        assert_eq!(app.terminal_close_bindings.removal_origins.get(&card),Some(&None));
+        assert_eq!(app.terminal_close_bindings.pending_removals.get(&card).map(|pending|pending.batch),Some(None));
         assert_eq!(app.workspace.pending_close().unwrap().unmounting,card);
-        let _=app.update(Message::CommitClose(card));
+        let _=app.update(app.commit_close_message(card));
         assert!(!app.card_state(card).unwrap().existence.is_open());
 
         let _=app.open_utility_card(CardKind::Accounts);
@@ -2063,7 +2161,7 @@ mod tests {
         let new=app.utility_card(&CardKind::Automations).unwrap();
         let _=app.close_cards_in_order(vec![new]);
         let current=app.pane_close_batch_for(new);
-        let _=app.update(Message::CommitClose(old));
+        let _=app.update(app.commit_close_message(old));
         assert!(app.card_state(old).unwrap().existence.is_open(),"a revoked origin cannot commit a held focus handoff");
         assert!(app.workspace.pending_close().is_none());
         assert_eq!(app.pane_close_batch_for(new),current);

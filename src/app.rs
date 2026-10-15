@@ -2560,6 +2560,7 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::ReturnToAutomationBeforeClose
                 | Message::DiscardAutomationAndClose(_)
                 | Message::CommitClose(_)
+                | Message::CommitCloseTarget(_)
                 | Message::ConfirmTerminalClose
                 | Message::CancelTerminalClose
                 | Message::TerminalCloseDontAskChanged(_)
@@ -4113,6 +4114,7 @@ pub enum Message {
         result: Result<(), String>,
     },
     CommitClose(CardId),
+    CommitCloseTarget(terminal_close::RemovalTarget),
     ConfirmTerminalClose,
     CancelTerminalClose,
     TerminalCloseDontAskChanged(bool),
@@ -11889,15 +11891,16 @@ impl Cagents {
         }
     }
 
-    fn begin_dirty_close(
-        &mut self,
-        intent: DirtyCloseIntent,
-        mut cards: VecDeque<CardId>,
-    ) -> Task<Message> {
+    fn begin_dirty_close(&mut self,intent:DirtyCloseIntent,cards:VecDeque<CardId>)->Task<Message> {
+        self.begin_dirty_close_for(intent,cards,None)
+    }
+    fn begin_dirty_close_for(
+        &mut self,intent:DirtyCloseIntent,mut cards:VecDeque<CardId>,batch:Option<uuid::Uuid>,
+    )->Task<Message> {
         let Some(card) = cards.pop_front() else {
             return match intent {
                 DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-                DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+                DirtyCloseIntent::Card(card) => self.resume_card_close_for(card,batch),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             };
         };
@@ -11908,7 +11911,7 @@ impl Cagents {
         let restore_card = self.workspace.focused();
         let focused = self.primary_dirty_close_control(card);
         self.dirty_repository_close = Some(DirtyRepositoryClose {
-            batch:if matches!(intent,DirtyCloseIntent::Card(_)){self.pane_close_batch_for(card)}else{None},
+            batch,
             card,
             remaining: cards,
             intent,
@@ -11960,7 +11963,7 @@ impl Cagents {
         }
         match close.intent {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-            DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+            DirtyCloseIntent::Card(card) => self.resume_card_close_for(card,close.batch),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
         }
     }
@@ -13178,6 +13181,9 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        // The captured queue origin survives normalization only in this update.
+        // Independent clicks and lifecycle continuations never infer a group.
+        let pane_close_origin=match &message {Message::CloseQueuedCard(queued)=>queued.origin(),_=>None};
         let message = match message {
             Message::CloseQueuedCard(queued) => match self.resolve_queued_card_close(queued) {
                 Some(message) => message,
@@ -14755,7 +14761,7 @@ impl Application for Cagents {
             }
             Message::CloseCard(_) if self.dirty_repository_close.is_some() => Task::none(),
             Message::CloseCard(id) if matches!(self.cards.get(&id), Some(CardRuntime::Repository(runtime)) if runtime.blocks_navigation()) => {
-                self.begin_dirty_close(DirtyCloseIntent::Card(id), VecDeque::from([id]))
+                self.begin_dirty_close_for(DirtyCloseIntent::Card(id), VecDeque::from([id]),pane_close_origin)
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
             Message::StartupWindowOpened(window) => {
@@ -15080,8 +15086,8 @@ impl Application for Cagents {
             {
                 self.begin_chat_close(id)
             }
-            Message::CloseCard(id) => self.begin_card_close(id),
-            Message::CloseCardUnasked(id) => self.close_card_unasked(id),
+            Message::CloseCard(id) => self.begin_card_close_for(id,pane_close_origin),
+            Message::CloseCardUnasked(id) => self.close_card_unasked_for(id,pane_close_origin),
             Message::CloseQueuedCard(_) => unreachable!("queued close normalized before dispatch"),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
             Message::CancelTerminalClose => self.cancel_terminal_close(),
@@ -15151,7 +15157,13 @@ impl Application for Cagents {
                 self.advance_dirty_close()
             }
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
-            Message::CommitClose(id) => {
+            Message::CommitClose(_) => {
+                self.status=Some(TransientNotice::warning("This queued pane removal has no captured operation identity. Its current pane was kept."));
+                Task::none()
+            }
+            Message::CommitCloseTarget(target) => {
+                if !self.card_removal_current(target) {return self.commit_card_removal_target(target,None).unwrap_or_else(Task::none);}
+                let id=target.card();
                 if self
                     .card_state(id)
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
@@ -15159,21 +15171,7 @@ impl Application for Cagents {
                 {
                     return self.begin_chat_close(id);
                 }
-                if self
-                    .card_state(id)
-                    .is_none_or(|card| !card.existence.is_open())
-                {
-                    return Task::none();
-                }
-                if self.pending_terminal_spawn(id) {
-                    return self.begin_card_close(id);
-                }
-                if self.card_state(id).is_some_and(|state|matches!(&state.kind,CardKind::Terminal(_)))
-                    && !self.closed_terminal_cards.contains(&id)
-                {
-                    return self.begin_card_close(id);
-                }
-                self.commit_card_removal(id, None)
+                self.commit_card_removal_target(target, None)
                     .unwrap_or_else(Task::none)
             }
             Message::Viewport { generation, event } => {
@@ -19540,7 +19538,7 @@ mod tests {
             app.queue_setting_input(SettingsField::ManagedWorktreeDirectory, "../trees/".into());
         // Closing the pane commits the draft still waiting out its debounce.
         let _ = app.update(Message::CloseCard(pane));
-        let task = app.update(Message::CommitClose(pane));
+        let task = app.update(app.commit_close_message(pane));
         assert!(app.settings_pending.is_empty());
         settle_settings_task(&mut app, task);
         assert_eq!(
@@ -19571,7 +19569,7 @@ mod tests {
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         let pane = app.utility_card(&CardKind::Settings).unwrap();
         let _ = app.update(Message::CloseCard(pane));
-        let _ = app.update(Message::CommitClose(pane));
+        let _ = app.update(app.commit_close_message(pane));
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         assert_ne!(app.utility_card(&CardKind::Settings), Some(pane));
         assert_eq!(app.settings_draft.keyboard_shortcuts.new_terminal, "Ctrl+");
@@ -19699,7 +19697,7 @@ mod tests {
         let _ = app.request_card_removal(closing);
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         assert_eq!(open_settings_panes(&app), [closing], "still mid-close");
-        let _ = app.update(Message::CommitClose(closing));
+        let _ = app.update(app.commit_close_message(closing));
         let [reopened] = open_settings_panes(&app)[..] else {
             panic!("the request survives the close");
         };
@@ -20644,10 +20642,8 @@ mod tests {
             app.cards.get(&card),
             Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
         ));
-        assert!(matches!(
-            task_app_message(close),
-            Message::CloseCard(candidate) if candidate == card
-        ));
+        let Message::CloseQueuedCard(resumed)=task_app_message(close) else {panic!("dirty resolution retains its captured origin");};
+        assert!(matches!(app.resolve_queued_card_close(resumed),Some(Message::CloseCard(candidate))if candidate==card));
     }
 
     #[test]
@@ -20717,7 +20713,8 @@ mod tests {
     fn revoked_project_batch_dirty_actions_preserve_buffer_and_new_batch() {
         let (mut app,card)=editing_repository_app();
         drop(app.close_cards_in_order(vec![card]));
-        drop(app.begin_dirty_close(DirtyCloseIntent::Card(card),VecDeque::from([card])));
+        let origin=app.pane_close_batch_for(card);
+        drop(app.begin_dirty_close_for(DirtyCloseIntent::Card(card),VecDeque::from([card]),origin));
         let old=app.dirty_repository_close.as_ref().unwrap().batch;
         drop(app.close_cards_in_order(vec![card]));let current=app.pane_close_batch_for(card);
         assert_ne!(old,current);
@@ -22148,8 +22145,10 @@ mod tests {
         let _focus_close = startup.update(Message::ToggleContextInspector);
         assert!(startup.context_inspector_overlay_active);
         let final_card = startup.workspace.focused().unwrap();
-        startup.workspace.request_close(final_card).unwrap();
-        let _restore_focus = startup.update(Message::CommitClose(final_card));
+        startup.card_state_mut(final_card).unwrap().kind=CardKind::Settings;
+        startup.cards.insert(final_card,CardRuntime::Settings);
+        assert!(startup.reserve_card_removal_for(final_card,None).is_some());
+        let _restore_focus = startup.update(startup.commit_close_message(final_card));
         assert!(startup.workspace.focused().is_none());
         assert!(!startup.context_inspector_is_overlay());
         assert!(!startup.context_inspector_overlay_active);
@@ -24071,7 +24070,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        app.workspace.request_close(card).unwrap();
+        assert!(app.reserve_card_removal_for(card,None).is_some());
         let state = lsp_state(&mut app, card);
         state.document = Some(LspDocumentId(1));
         state.path = Some(PathBuf::from("/repo/a.rs"));
@@ -24085,7 +24084,7 @@ mod tests {
             },
         );
 
-        let _ = app.update(Message::CommitClose(card));
+        let _ = app.update(app.commit_close_message(card));
 
         assert!(!app.cards.contains_key(&card));
         assert!(!app.lsp_contexts.contains_key(&card));

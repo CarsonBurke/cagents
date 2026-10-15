@@ -1512,6 +1512,53 @@ mod tests {
         );
     }
     #[test]
+    fn held_focus_removal_cannot_close_a_replaced_shared_logical_source() {
+        for same_chat_id in [false,true] {
+            let (mut app,channel,_,mut pane)=fixture();
+            let recipe=LaunchRecipe::shell(PathBuf::from("/repo")).unwrap();
+            let chat=crate::chat::Session {
+                id:TerminalId::new(),launch:crate::chat::Launch {provider:crate::agent::Provider::Claude,recipe:recipe.clone(),session_id:Some(uuid::Uuid::new_v4().to_string())},
+                proof:None,terminal:None,owned_codex_listener:None,native_continuity:Default::default(),
+            };
+            pane.kind=if same_chat_id {CardKind::Chat(chat.clone())} else {CardKind::Terminal(fresh_terminal_session(recipe))};
+            let mut view=View::empty(channel);view.panes.push(pane.clone());
+            Arc::make_mut(&mut app.durable).active_channel=Some(channel);
+            app.workspace_model.views=vec![view.clone()];
+            let owned=HashSet::from([pane.id]);
+            drop(app.project_shared_view(&view,&owned));
+            assert!(app.workspace.card(pane.id).is_some());
+            drop(app.request_card_removal(pane.id));
+            let old=app.pending_card_removal_target(pane.id).unwrap();
+            let mut replacement=chat;
+            replacement.launch.session_id=Some(uuid::Uuid::new_v4().to_string());
+            view.revision+=1;view.panes[0].kind=CardKind::Chat(replacement.clone());
+            app.workspace_model.views=vec![view.clone()];
+            drop(app.project_shared_view(&view,&owned));
+            let before=app.card_state(pane.id).unwrap().clone();
+            let observed_before=app.chat_return_session(pane.id);
+            assert!(before.existence.is_open());
+            assert!(!app.card_removal_current(old));
+            drop(app.update(Message::CommitCloseTarget(old)));
+            assert_eq!(app.card_state(pane.id),Some(&before));
+            assert_eq!(app.workspace_model.views,vec![view]);
+            assert!(app.recently_closed.is_empty());
+            assert!(app.workspace.card(pane.id).is_some());
+            assert!(app.workspace.pending_close().is_none());
+            assert!(!app.closed_terminal_cards.contains(&pane.id));
+            // Even a newer explicit reservation cannot be consumed by old A.
+            assert!(app.reserve_card_removal_for(pane.id,None).is_some());
+            let current=app.pending_card_removal_target(pane.id).unwrap();
+            drop(app.update(Message::CommitCloseTarget(old)));
+            drop(app.update(Message::CommitClose(pane.id)));
+            assert_eq!(app.pending_card_removal_target(pane.id),Some(current));
+            assert!(app.card_removal_current(current));
+            assert_eq!(app.chat_return_session(pane.id),observed_before);
+            assert!(matches!(&app.card_state(pane.id).unwrap().kind,CardKind::Chat(source)if source.launch==replacement.launch));
+            assert_eq!(app.card_state(pane.id),Some(&before));
+        }
+    }
+
+    #[test]
     fn shared_layout_echo_preserves_observed_terminal_exit() {
         let (mut app, channel, _, mut pane) = fixture();
         pane.kind = CardKind::Terminal(fresh_terminal_session(
@@ -2591,7 +2638,7 @@ mod tests {
         drop(app.close_cards_in_order(vec![card,other]));
         assert!(app.project_recovery_ui.closing_panes);assert_eq!(app.queued_card_closes.len(),1);
         let batch=app.pane_close_batch_for(card);
-        drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
+        drop(app.begin_card_close_for(card,batch));let attempt=app.completed_terminal_close_attempt(card).unwrap();
         drop(app.completed_terminal_closed(card,source,batch,attempt,Ok(crate::app::terminal_close::CompletedCloseOutcome::Absent{expected_worker:None,presentation:Some(target.clone())})));
         assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
         assert!(app.status.as_ref().unwrap().message.contains("Other selected panes were kept"));
@@ -2608,7 +2655,7 @@ mod tests {
             let other=app.workspace_model.views[0].panes.iter().find(|pane|pane.id!=card).unwrap().id;
             let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
             drop(app.close_cards_in_order(vec![card]));let old=app.pane_close_batch_for(card);
-            drop(app.begin_card_close(card));let attempt=app.completed_terminal_close_attempt(card).unwrap();
+            drop(app.begin_card_close_for(card,old));let attempt=app.completed_terminal_close_attempt(card).unwrap();
             drop(app.close_cards_in_order(vec![card,other]));let current=app.pane_close_batch_for(card);
             let queued=app.queued_card_closes.len();let model=app.workspace_model.clone();
             assert_ne!(old,current);
@@ -2628,7 +2675,7 @@ mod tests {
         let CardKind::Terminal(source)=app.card_state(card).unwrap().kind.clone()else{panic!()};
         drop(app.close_cards_in_order(vec![card]));let old=app.pane_close_batch_for(card);
         // Construct the real UI asynchronous close task, held before IO.
-        drop(app.begin_card_close(card));let first=app.completed_terminal_close_attempt(card).unwrap();
+        drop(app.begin_card_close_for(card,old));let first=app.completed_terminal_close_attempt(card).unwrap();
         assert!(app.terminal_close_attempts.contains(&source.id));
         let held=super::super::tests::task_app_message(app.close_cards_in_order(vec![card,other]));
         drop(app.update(held));
@@ -2640,7 +2687,7 @@ mod tests {
         assert!(app.completed_terminal_close_attempt(card).is_none());assert!(!app.terminal_close_attempts.contains(&source.id));
         assert!(app.local_terminal_unavailable_notice(card).is_none());
         drop(app.close_cards_in_order(vec![card]));let fresh_batch=app.pane_close_batch_for(card);
-        drop(app.begin_card_close(card));let fresh=app.completed_terminal_close_attempt(card).unwrap();
+        drop(app.begin_card_close_for(card,fresh_batch));let fresh=app.completed_terminal_close_attempt(card).unwrap();
         assert_ne!(fresh,first);
         drop(app.update(Message::CompletedTerminalClosed{card,session:source.clone(),batch:old,attempt:first,result:Err("duplicate old result".into())}));
         assert_eq!(app.completed_terminal_close_attempt(card),Some(fresh));assert!(app.terminal_close_attempts.contains(&source.id));

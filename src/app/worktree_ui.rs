@@ -1195,7 +1195,7 @@ mod tests {
             )
             .unwrap();
         let _ = app.update(Message::CloseCard(id));
-        let _ = app.update(Message::CommitClose(id));
+        let _ = app.update(app.commit_close_message(id));
         assert!(
             !app.durable
                 .cards
@@ -1294,7 +1294,7 @@ mod tests {
         let _ = app.update(Message::Sidebar(SidebarAction::OpenSettings));
         assert_eq!(order(&app), [pane]);
         let _ = app.request_card_removal(pane);
-        let _ = app.update(Message::CommitClose(pane));
+        let _ = app.update(app.commit_close_message(pane));
         assert!(app.utility_card(&CardKind::Settings).is_none());
         assert!(
             app.durable
@@ -1913,7 +1913,7 @@ mod tests {
         assert_eq!(app.workspace.pending_close().unwrap().unmounting, cloned);
         // The native focus handoff publishes CommitClose after the reserved
         // pane yields focus. Drive that acknowledgement before reopening.
-        let _ = app.update(Message::CommitClose(cloned));
+        let _ = app.update(app.commit_close_message(cloned));
         assert!(!app.card_state(cloned).unwrap().existence.is_open());
         assert!(!app.durable.card_scopes.contains_key(&cloned));
         let _ = app.run_workspace_command(
