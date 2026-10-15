@@ -368,8 +368,17 @@ pub(super) fn sync(runtime: &mut Runtime) {
         .map(|item| item.id.clone())
         .collect();
     let parent = runtime.selected_subagent.is_none();
-    for (active, id, cached) in runtime.cache.iter_mut().map(|(id, cached)| (parent, id, cached))
-        .chain(runtime.child_cache.iter_mut().map(|(id, cached)| (!parent, id, cached))) {
+    for (active, id, cached) in runtime
+        .cache
+        .iter_mut()
+        .map(|(id, cached)| (parent, id, cached))
+        .chain(
+            runtime
+                .child_cache
+                .iter_mut()
+                .map(|(id, cached)| (!parent, id, cached)),
+        )
+    {
         if cached.image_item.is_none() && cached.image_source.is_none() && cached.image.is_none() {
             continue;
         }
