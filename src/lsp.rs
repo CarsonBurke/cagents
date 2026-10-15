@@ -58,6 +58,11 @@ use url::Url;
 use crate::repository::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_group};
 use crate::settings::LanguageServerSettings;
 
+mod features;
+pub use features::{LspCapabilities,LspCodeAction,LspCommand,LspDocumentEdits,LspEditKind,LspFormattingOptions,LspMessageLevel,LspParameter,LspServerEditId,LspSignature,LspSignatureHelp,LspWorkspaceEdit};
+use features::RequestArgs;
+
+
 mod commands;
 
 /// Capacity of the application event channel. Diagnostics are coalesced by
@@ -4760,6 +4765,7 @@ mod tests {
             }],
             command: vec![format!("{id}-binary")],
             root_markers: markers.iter().map(|value| (*value).to_owned()).collect(),
+            ..LanguageServerSettings::default()
         }
     }
 
@@ -7239,6 +7245,7 @@ mod tests {
                 }],
                 command: vec!["cagents-no-such-language-server".to_owned()],
                 root_markers: vec!["Cargo.toml".to_owned()],
+                ..LanguageServerSettings::default()
             }]);
             let events = manager.events();
             let doc = LspDocumentId(1);
