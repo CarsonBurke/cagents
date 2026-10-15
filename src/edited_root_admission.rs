@@ -163,14 +163,13 @@ impl AdmissionTicket {
     }
 
     /// A physical Root check still belongs to a worker. This pure getter only
-    /// exposes the successfully enrolled original lease until the last actual
-    /// Source/Doc/Undo owner drains and sealed retirement takes custody.
+    /// exposes a new pair only while the successfully enrolled original remains
+    /// open. Existing Source/Doc/Undo pairs keep their lease during retirement.
     pub fn admitted(&self) -> Option<AdmittedRoot> {
         let state = self.lock();
-        // A retirement request cannot erase the negative lease while actual
-        // Doc/Undo/Source owners still exist. New logical publication is fenced
-        // separately; late enrollment after close never sets admitted=true.
-        state.admitted.then(|| state.owner.as_ref().map(|lease| AdmittedRoot {
+        // Existing Doc/Undo/Source pairs retain their negative lease, but a
+        // closed admission cannot mint new pairs for delayed publication.
+        (state.admitted && !state.retiring).then(|| state.owner.as_ref().map(|lease| AdmittedRoot {
             ticket: self.clone(), lease: lease.clone(),
         })).flatten()
     }
