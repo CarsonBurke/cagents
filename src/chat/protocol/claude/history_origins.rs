@@ -1,5 +1,22 @@
 //! Source-qualified parent history aliases; separate from live input proof.
 use super::*;
+/// Qualified opens resolve from the pinned physical home without following any
+/// intermediate symlink. A legacy readable fallback never grants provenance.
+pub(super) fn open_resolved(home:&Path,expected:(u64,u64),path:&Path)->Result<(File,bool),String>{
+    use std::os::unix::fs::{MetadataExt,OpenOptionsExt};
+    let qualified=(||->Result<File,String>{
+        let root=crate::fs_safety::Root::open(home).map_err(|error|error.to_string())?;
+        let metadata=root.metadata().map_err(|error|error.to_string())?;
+        if !metadata.is_dir() || (metadata.dev(),metadata.ino())!=expected{return Err("Claude history account home changed".into());}
+        let relative=path.strip_prefix(home).map_err(|_|"Claude history source escapes its account home")?;
+        crate::fs_safety::open_beneath(&root,relative).map_err(|error|error.to_string())
+    })();
+    match qualified {
+        Ok(file)=>Ok((file,true)),
+        Err(_)=>std::fs::OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(path).map(|file|(file,false)).map_err(|error|format!("Cannot open exact Claude transcript: {error}")),
+    }
+}
+
 /// These are source row aliases, not accepted input or terminal outcome proof.
 pub(super) fn events(account:&crate::chat::turn_outcomes::HistoryAccountOrigin,session:&str,events:&[Event])->Vec<Event>{
     use crate::chat::turn_outcomes::{MAX_TURN_ITEM_IDS,MAX_TURN_UPDATE_BYTES,MAX_TURN_ID_BYTES,validate_history_origins};
@@ -59,6 +76,26 @@ mod tests {
         for index in [0,50,129]{assert!(!all.contains(&format!("row-{index}:0")));}
         assert!(all.contains("row-1:0"));assert!(all.contains("row-128:0"));
     }
+    #[test]
+    fn swapped_intermediate_directory_after_resolution_never_qualifies_external_history(){
+        use std::{io::Write,os::unix::fs::{MetadataExt,symlink}};
+        let (root,launch,home)=source_history_fixture();
+        let path=crate::agent::claude_transcript(&home,&launch.recipe.working_directory,SESSION).unwrap();
+        let metadata=std::fs::metadata(&home).unwrap();
+        let directory=path.parent().unwrap();let outside=root.path().join("outside");std::fs::create_dir(&outside).unwrap();
+        let mut file=File::create(outside.join(path.file_name().unwrap())).unwrap();
+        writeln!(file,"{}",json!({"type":"user","uuid":"outside-row","sessionId":SESSION,"message":{"role":"user","content":"outside account"}})).unwrap();drop(file);
+        std::fs::rename(directory,root.path().join("old-project")).unwrap();symlink(&outside,directory).unwrap();
+        // This is the exact resolution/open cut in History::open. The legacy
+        // reader still works, but a directory symlink cannot mint provenance.
+        let (file,qualified)=open_resolved(&home,(metadata.dev(),metadata.ino()),&path).unwrap();assert!(!qualified);
+        let history=History::index(file,SESSION).unwrap();
+        let mut adapter=Claude{history:Some(history),history_only:true,..Claude::default()};
+        let step=adapter.initialize().unwrap();
+        assert!(step.events.iter().any(|event|matches!(event,Event::History{items,..} if !items.is_empty())));
+        assert!(step.events.iter().all(|event|!matches!(event,Event::HistoryOrigins{..})));
+    }
+
     #[test]
     fn replaced_history_account_home_cannot_publish_old_source_provenance(){
         let (root,launch,home)=source_history_fixture();let (_,mut adapter)=create(&launch).unwrap();

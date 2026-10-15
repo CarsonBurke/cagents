@@ -4381,20 +4381,13 @@ impl History {
         let canonical_home=config.canonicalize().map_err(|error|error.to_string())?;
         let before=std::fs::metadata(&canonical_home).map_err(|error|error.to_string())?;
         let path = crate::agent::claude_transcript(&canonical_home, &cwd, id)?;
-        let mut options = std::fs::OpenOptions::new();
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        let file = options
-            .open(&path)
-            .map_err(|e| format!("Cannot open exact Claude transcript: {e}"))?;
+        let (file,qualified_open)=history_origins::open_resolved(&canonical_home,(before.dev(),before.ino()),&path)?;
         let file_metadata=file.metadata().map_err(|error|error.to_string())?;
         let mut history = Self::index(file, id)?;
         let after=std::fs::metadata(&canonical_home).map_err(|error|error.to_string())?;
         // A history project symlink outside the account may remain readable
         // under the legacy history contract, but grants no account provenance.
-        if path.starts_with(&canonical_home) && before.is_dir() && after.is_dir()
+        if qualified_open && before.is_dir() && after.is_dir()
             && (before.dev(),before.ino())==(after.dev(),after.ino()) {
             let account=crate::chat::turn_outcomes::HistoryAccountOrigin{provider:Provider::Claude,canonical_home,device:after.dev(),inode:after.ino()};
             if account.validate().is_ok(){history.account_origin=Some((account,file_metadata.dev(),file_metadata.ino()));}
