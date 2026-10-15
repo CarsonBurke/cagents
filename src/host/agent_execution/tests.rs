@@ -2775,3 +2775,91 @@ fn an_agents_connection_changes_only_the_terminals_its_lineage_controls() {
         .unwrap();
     }
 }
+
+#[test]
+fn held_agent_gates_refuse_deferred_controls_without_starving_unrelated_pty_input() {
+    const NAME:&str="held_agent_gates_refuse_deferred_controls_without_starving_unrelated_pty_input";
+    if isolated(NAME).is_some() {return;}
+    use crate::terminal_ipc::{ClientEnvelope,FrameCodec,MAX_CLIENT_FRAME_BYTES,MAX_FRAME_BYTES,PROTOCOL_VERSION,ProtocolErrorCode,ServerEnvelope,ServerMessage};
+    use std::{net::Shutdown,os::unix::net::UnixStream,thread};
+    struct Connection {stream:UnixStream,server:Option<thread::JoinHandle<()>>}
+    impl Connection {
+        fn send(&mut self,proof:&HostSessionProof,id:u64,request:ClientRequest) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES).write(&mut self.stream,&ClientEnvelope {version:PROTOCOL_VERSION,request_id:id,proof:Some(proof.clone()),request}).unwrap();
+        }
+        fn response(&mut self,id:u64)->ServerMessage {
+            loop {
+                let response=FrameCodec::new(MAX_FRAME_BYTES).read::<ServerEnvelope>(&mut self.stream).expect("deferred admission occupied the shared input pool").expect("connection closed unexpectedly");
+                if response.request_id==Some(id) {return response.message;}
+            }
+        }
+        fn connect(host:&SharedHost,client:u64,proof:&HostSessionProof)->Self {
+            let (stream,server_stream)=UnixStream::pair().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
+            let server_host=host.clone();
+            let server=thread::spawn(move||crate::host::client::serve(server_stream,client,server_host));
+            let mut connection=Self {stream,server:Some(server)};
+            connection.send(proof,1,ClientRequest::Connect {expected_host:Some(proof.clone()),resume:Vec::new()});
+            assert!(matches!(connection.response(1),ServerMessage::Response {response:ServerResponse::Connected{..}}));
+            connection
+        }
+    }
+    impl Drop for Connection {
+        fn drop(&mut self) {
+            let _=self.stream.shutdown(Shutdown::Both);
+            if let Some(server)=self.server.take() {let _=server.join();}
+        }
+    }
+    let (host,request,_)=fixture();
+    let first=submit(&host,&Authority::default(),request.clone()).unwrap();
+    assert_eq!(settled(&host,first.run.id).state,State::Succeeded);
+    let mut second_request=request;
+    second_request.idempotency_key="second".into();
+    let second=submit(&host,&Authority::default(),second_request).unwrap();
+    assert_eq!(settled(&host,second.run.id).state,State::Succeeded);
+    let first_session=registry(&host).unwrap().lock().unwrap().agent(first.agent.id).unwrap().session.unwrap().id();
+    let second_session=registry(&host).unwrap().lock().unwrap().agent(second.agent.id).unwrap().session.unwrap().id();
+    let first_gate=agent_gate(&host,first.agent.id);
+    let second_gate=agent_gate(&host,second.agent.id);
+    let proof=host.lock().unwrap().proof().clone();
+    let mut first_client=Connection::connect(&host,101,&proof);
+    let mut second_client=Connection::connect(&host,102,&proof);
+    let mut input_client=Connection::connect(&host,103,&proof);
+    {
+        let mut state=host.lock().unwrap();
+        state.chats.get_mut(&first_session).unwrap().subscribers.insert(101,false);
+        state.chats.get_mut(&second_session).unwrap().subscribers.insert(102,false);
+    }
+    let directory=std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap()).join("project");
+    let launch=crate::model::LaunchRecipe {program:"/bin/sh".into(),arguments:vec!["-c".into(),"IFS= read -r line; printf '%s' \"$line\" > input-received; exec /bin/cat".into()],working_directory:directory.clone(),environment:Default::default(),unset_environment:Default::default()};
+    let session=crate::model::TerminalSession {id:TerminalId::new(),owned_codex_listener:None,recovery_origin:None,predecessor:None,launch:launch.clone(),transcript_path:None,resume_hint:None,continuity:crate::model::TerminalContinuity::RelaunchAvailable {recipe:launch,last_exit:None}};
+    let terminal=session.id;
+    input_client.send(&proof,2,ClientRequest::Spawn {session,options:Default::default()});
+    assert!(matches!(input_client.response(2),ServerMessage::Response {response:ServerResponse::Spawned{..}}));
+    // These exact gates are also held by real close/reconcile while joining a
+    // provider. Keep both held until unrelated PTY input and replies complete.
+    let first_held=first_gate.lock().unwrap();
+    let second_held=second_gate.lock().unwrap();
+    first_client.send(&proof,2,ClientRequest::ChatCommand {chat_id:first_session,command:Command::Interrupt});
+    second_client.send(&proof,2,ClientRequest::ChatCommand {chat_id:second_session,command:Command::Interrupt});
+    input_client.send(&proof,3,ClientRequest::Input {terminal_id:terminal,bytes:b"responsive\n".to_vec()});
+    assert!(matches!(input_client.response(3),ServerMessage::Response {response:ServerResponse::Accepted}));
+    let deadline=Instant::now()+Duration::from_secs(2);
+    while std::fs::read_to_string(directory.join("input-received")).ok().as_deref()!=Some("responsive") {
+        assert!(Instant::now()<deadline,"the unrelated PTY did not receive input while both agent gates were held");
+        thread::sleep(Duration::from_millis(5));
+    }
+    for response in [first_client.response(2),second_client.response(2)] {
+        assert!(matches!(response,ServerMessage::Error(error) if error.code==ProtocolErrorCode::QueueFull && error.retryable));
+    }
+    assert!(!registry(&host).unwrap().lock().unwrap().agent_is_interactive(first.agent.id).unwrap(),"refused admission cannot claim ownership");
+    drop(second_held);drop(first_held);
+    first_client.send(&proof,3,ClientRequest::ChatCommand {chat_id:first_session,command:Command::Interrupt});
+    assert!(matches!(first_client.response(3),ServerMessage::Response {response:ServerResponse::Accepted}));
+    assert!(registry(&host).unwrap().lock().unwrap().agent_is_interactive(first.agent.id).unwrap(),"accepted admission preserves the exact ownership claim");
+    input_client.send(&proof,4,ClientRequest::ShutdownTerminal {terminal_id:terminal});
+    let _=input_client.response(4);
+    close(&host,&Authority::default(),first.agent.id).unwrap();
+    close(&host,&Authority::default(),second.agent.id).unwrap();
+}
