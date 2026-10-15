@@ -1023,6 +1023,7 @@ fn perform_update(
                     .daemon
                     .as_ref()
                     .map(|daemon| daemon.capability.proof.clone()),
+                confirmed.replaces_daemon,
             )?;
             let latest = observe_impact(
                 &staged.identity,
@@ -1104,6 +1105,7 @@ fn validate_before_close(
 pub(crate) fn inspect_source_panes(
     guard: &crate::instance::UiUpdateGuard,
     proof: Option<crate::model::HostSessionProof>,
+    require_resumable: bool,
 ) -> Result<(), UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
@@ -1114,7 +1116,7 @@ pub(crate) fn inspect_source_panes(
             "The matched source inspector is unavailable; source windows remain usable",
         ));
     }
-    let request = crate::install_guard::SourceInspectionRequest { protocol, proof };
+    let request = crate::install_guard::SourceInspectionRequest { protocol, proof, require_resumable };
     let mut command = Command::new(&helper);
     crate::install_guard::sanitize_child_environment(&mut command);
     command.args([

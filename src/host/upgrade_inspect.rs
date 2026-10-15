@@ -152,7 +152,7 @@ fn inspect(request: Request) -> Result<(), String> {
         if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
             return Err("Source inventory contains ambiguous conversation ownership".into());
         }
-        handoff::validate_chat_source(session, &session.launch)
+        validate_live_chat(session, request.require_resumable)
             .map_err(|_| "A source conversation has no qualified immutable migration; source windows remain usable")?;
     }
     for (card, kind) in saved {
@@ -169,7 +169,7 @@ fn inspect(request: Request) -> Result<(), String> {
         if source.is_unstarted() {
             continue;
         }
-        qualify(&source, &inventory, proof, |source| reader.resolve(source))
+        qualify_with_mode(&source, &inventory, proof, request.require_resumable, |source| reader.resolve(source))
             .map_err(|_| format!("Saved conversation pane {card} has no qualified exact migration. Reconnect, recover, or close that pane before updating; source windows remain usable"))?;
     }
     Ok(())
@@ -249,6 +249,15 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: NativeContinuity::ReconnectOnly,
         }
+    }
+
+    #[test]
+    fn replacing_only_the_ui_does_not_require_resuming_a_live_actor() {
+        let mut live = session();
+        live.launch.session_id = None;
+        validate_live_chat(&live, false).unwrap();
+        assert!(validate_live_chat(&live, true).is_err());
+        qualify_with_mode(&live, std::slice::from_ref(&live), live.proof.as_ref().unwrap(), false, |_| panic!("an exact current actor needs no replacement")).unwrap();
     }
 
     #[test]
@@ -361,10 +370,21 @@ mod tests {
     }
 }
 
+#[cfg(test)]
 fn qualify(
     saved: &Session,
     inventory: &[Session],
     proof: &HostSessionProof,
+    resolve: impl FnMut(&Session) -> Result<Session, String>,
+) -> Result<(), String> {
+    qualify_with_mode(saved, inventory, proof, true, resolve)
+}
+
+fn qualify_with_mode(
+    saved: &Session,
+    inventory: &[Session],
+    proof: &HostSessionProof,
+    require_resumable: bool,
     mut resolve: impl FnMut(&Session) -> Result<Session, String>,
 ) -> Result<(), String> {
     let resolved;
@@ -383,5 +403,14 @@ fn qualify(
         .iter()
         .find(|live| handoff::issued_chat_matches(source, live))
         .ok_or("Saved conversation has no exact current source owner")?;
-    handoff::validate_chat_source(source, &live.launch)
+    if require_resumable { handoff::validate_chat_source(source, &live.launch) } else { Ok(()) }
+}
+
+fn validate_live_chat(session: &Session, require_resumable: bool) -> Result<(), String> {
+    if !session.has_valid_native_continuity()
+        || session.owned_codex_listener.is_some() && !session.owns_codex_listener()
+        || session.terminal.as_ref().is_some_and(|terminal| terminal.id != session.id || terminal.continuity.live_proof().as_ref() != session.proof.as_ref()) {
+        return Err("Source conversation ownership evidence is inconsistent".into());
+    }
+    if require_resumable { handoff::validate_chat_source(session, &session.launch) } else { Ok(()) }
 }

@@ -309,6 +309,13 @@ available. Failure to establish that isolation retains the checkpoint and
 defers restoration. Saved-pane recovery reports one bounded inventory allowance
 to the launcher; an incomplete recovery keeps the visible recovery window open
 and reports failure rather than claiming the upgrade completed.
+After all source windows save and prepare, a private host inspector reads their
+saved chat and terminal descriptors without migrating or writing their databases.
+It authenticates current owners and exact upgrade lineage before the first
+window closes. Unreadable panes or unsupported source protocols defer the update.
+The protocol-77 adapter accepts only its pinned upgrade and inspection operations;
+ordinary clients still require the current protocol. Replacing only the UI does
+not require resuming a provider that remains hosted by the same daemon.
 
 Before closing windows, the reviewed updater checks the private companions of
 running Ceditor instances in the same runtime namespace. An incompatible or
