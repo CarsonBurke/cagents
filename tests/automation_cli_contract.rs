@@ -806,6 +806,30 @@ fn delayed_native_confirmation_archives_both_cold_source_aliases_without_a_provi
                 // SAFETY: the owned pidfd pins the exact start-ticks-checked
                 // indirect child recorded by this private fixture.
                 unsafe { libc::syscall(libc::SYS_pidfd_send_signal,fd as i32,libc::SIGKILL,std::ptr::null::<libc::siginfo_t>(),0); }
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut settled = false;
+                while Instant::now() < deadline {
+                    let millis = deadline.saturating_duration_since(Instant::now()).as_millis().min(i32::MAX as u128) as i32;
+                    let mut poll = libc::pollfd {fd:fd as i32,events:libc::POLLIN,revents:0};
+                    // SAFETY: one initialized pollfd retains the same owned
+                    // process handle until positive exit readiness or deadline.
+                    let ready = unsafe { libc::poll(&mut poll,1,millis) };
+                    if ready > 0 && poll.revents & libc::POLLIN != 0 {
+                        settled = true;
+                        break;
+                    }
+                    if ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        break;
+                    }
+                }
+                if !settled {
+                    unsafe { libc::close(fd as i32); }
+                    if std::thread::panicking() {
+                        eprintln!("fixture cleanup failed: exact Codex peer {pid}/{start} did not settle after pidfd signal");
+                        return;
+                    }
+                    panic!("fixture cleanup failed: exact Codex peer {pid}/{start} did not settle after pidfd signal");
+                }
             }
             unsafe { libc::close(fd as i32); }
         }
