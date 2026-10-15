@@ -408,14 +408,18 @@ impl State {
     /// Omp's accounts is named with the service it signs in to, since one
     /// address can have a login with several.
     fn display_name(&self, account: &AccountState) -> String {
+        self.display_name_from(account, &self.registry)
+    }
+
+    fn display_name_from(&self, account: &AccountState, registry: &Registry) -> String {
         if let Some(service) = account.account.brokered_service() {
             let service = omp::service_label(service);
-            return match account.email(&self.registry) {
+            return match account.email(registry) {
                 Some(email) => format!("{service} · {email}"),
                 None => format!("{service} account"),
             };
         }
-        if let Some(label) = self.registry.label(&account.account) {
+        if let Some(label) = registry.label(&account.account) {
             return label.to_owned();
         }
         let linked_hint = account.account.is_linked().then(|| {
@@ -434,7 +438,7 @@ impl State {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "existing".into())
         });
-        if let Some(email) = account.email(&self.registry) {
+        if let Some(email) = account.email(registry) {
             if let Some(hint) = linked_hint {
                 return format!("{hint} · {email}");
             }
@@ -2974,14 +2978,13 @@ impl Cagents {
                     return Task::none();
                 };
                 let cleaned = account::clean_label(&draft);
-                if let Some(label) = &cleaned
-                    && self.account_ui.of(account.provider).any(|other| {
-                        other.id != id
-                            && self
-                                .account_ui
-                                .display_name(other)
-                                .eq_ignore_ascii_case(label)
-                    })
+                let mut candidate = self.account_ui.registry.clone();
+                candidate.set_label(&account, cleaned.clone());
+                let proposed_name = cleaned.clone().or_else(|| self.account_ui.account(&id)
+                    .map(|state| self.account_ui.display_name_from(state, &candidate)));
+                if proposed_name.as_ref().is_some_and(|name|
+                    self.account_ui.of(account.provider).any(|other|
+                        other.id != id && self.account_ui.display_name(other).eq_ignore_ascii_case(name)))
                 {
                     self.account_ui.table.rename = Some((id, draft));
                     self.status = Some(TransientNotice::warning(
@@ -8029,6 +8032,19 @@ mod app_tests {
             "Work"
         );
         assert!(app.account_ui.table.rename.is_some());
+        let fallback = app.account_ui.display_name(app.account_ui.account(&second).unwrap());
+        for (id, label) in [(second.clone(), "Personal".to_owned()), (first.clone(), fallback)] {
+            drop(app.update(Message::AccountUi(Action::Rename(id))));
+            drop(app.update(Message::AccountUi(Action::RenameInput(label))));
+            drop(app.update(Message::AccountUi(Action::RenameCommit)));
+        }
+        drop(app.update(Message::AccountUi(Action::Rename(second.clone()))));
+        drop(app.update(Message::AccountUi(Action::RenameInput("   ".into()))));
+        drop(app.update(Message::AccountUi(Action::RenameCommit)));
+        assert_eq!(app.account_ui.display_name(app.account_ui.account(&second).unwrap()), "Personal",
+            "clearing a name must not introduce a duplicate fallback display name");
+        assert!(app.account_ui.table.rename.is_some());
+
     }
 
     #[test]
