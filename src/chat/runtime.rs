@@ -77,7 +77,13 @@ impl AccountSwitchOptions {
     }
 }
 
+pub(crate) mod account_continuation;
+
 enum ActorCommand {
+    CaptureContinuation {
+        deadline: Instant,
+        captured: crossbeam_channel::Sender<Result<Option<account_continuation::Options>, String>>,
+    },
     AccountNotice(String),
     AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
     CheckAccountSwitch {
@@ -3106,6 +3112,12 @@ impl Actor {
                 self.adapter.after_close_input_drained();
             }
             let (run, command) = match command {
+                ActorCommand::CaptureContinuation { deadline, captured } => {
+                    let result = account_continuation::capture_actor(self, deadline);
+                    let _ = captured.send(result);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
                 ActorCommand::CheckAccountSwitch {
                     generation,
                     admitted,

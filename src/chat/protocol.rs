@@ -347,6 +347,12 @@ pub trait Adapter: Send {
     fn relocate_directory(&mut self, _directory: &std::path::Path) -> Result<(), String> {
         Ok(())
     }
+    /// Exact policy coverage for a new conversation that may automatically
+    /// receive an unaccepted request. A UI settings projection is insufficient.
+    /// Only an adapter with a fresh provider settings response may attest it.
+    fn account_continuation_policy(&self) -> Result<crate::chat::PermissionSettings, String> {
+        Err("This provider cannot confirm its complete current permission policy for Automatic continuation; continue separately with explicit controls".into())
+    }
     /// Pending setting acknowledgments must settle before account metadata can
     /// describe an idle choice. This is not a backend conditional-close proof.
     fn account_switch_ready(&self) -> bool {

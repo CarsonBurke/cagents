@@ -14,6 +14,7 @@ const FLAG_SOURCE: &str = "flagSettings";
 #[derive(Debug, Clone)]
 pub(super) struct Snapshot {
     pub settings: PermissionSettings,
+    continuation_complete: bool,
     permissions: Map<String, Value>,
     auto_mode: Map<String, Value>,
     initial_environment: Vec<Value>,
@@ -29,6 +30,7 @@ impl Snapshot {
             .ok_or("Claude did not return permission settings sources")?;
         let mut snapshot = Self {
             settings: PermissionSettings::default(),
+            continuation_complete: continuation_is_representable(response),
             permissions: Map::new(),
             auto_mode: Map::new(),
             initial_environment: effective
@@ -107,6 +109,15 @@ impl Snapshot {
             }
         }
         Ok(snapshot)
+    }
+
+    /// Conservative coverage gate for automatic forwarding. Unrepresented
+    /// provider fields are never treated as empty or replaced by target defaults.
+    pub fn continuation_settings(&self) -> Result<PermissionSettings, String> {
+        if !self.continuation_complete {
+            return Err("Claude returned permission fields or implicit Auto context that cannot be transferred and confirmed completely; continue separately with explicit controls".into());
+        }
+        Ok(self.settings.clone())
     }
 
     /// Build a bounded patch from a fresh provider snapshot. Inherited rules
@@ -345,5 +356,87 @@ mod tests {
             }]}))
             .is_err()
         );
+    }
+}
+
+/// The existing transfer protocol can edit allow/ask/deny and explicit Auto
+/// environment entries only. In particular, additionalDirectories, defaults and
+/// future policy fields require a stronger transfer contract, never omission.
+fn continuation_is_representable(response: &Value) -> bool {
+    fn policy(settings: &Value) -> Option<(Vec<(String, String)>, Vec<String>)> {
+        let settings_object = settings.as_object()?;
+        if settings_object.keys().any(|key| !matches!(key.as_str(), "permissions" | "autoMode")) { return None; }
+        let permissions = settings.get("permissions")?.as_object()?;
+        if permissions.keys().any(|key| !matches!(key.as_str(), "allow" | "ask" | "deny")) { return None; }
+        let mut rules = Vec::new();
+        for (behavior, values) in permissions {
+            for rule in values.as_array()? {
+                if rules.len() >= MAX_ENTRIES { return None; }
+                rules.push((behavior.clone(), entry(rule).ok()?.to_owned()));
+            }
+        }
+        let auto = settings.get("autoMode")?.as_object()?;
+        if auto.keys().any(|key| key != "environment") { return None; }
+        let mut environment = Vec::new();
+        for value in auto.get("environment")?.as_array()? {
+            let value = entry(value).ok()?;
+            if value == "$defaults" { return None; }
+            if environment.len() >= MAX_ENTRIES { return None; }
+            environment.push(value.to_owned());
+        }
+        // Effective policy must explicitly cover even empty lists. Per-source
+        // callers below materialize absent policy objects as explicit empties.
+        rules.sort(); rules.dedup(); environment.sort(); environment.dedup();
+        Some((rules, environment))
+    }
+    let Some(effective) = response.get("effective").and_then(|value| policy(value)) else { return false; };
+    let Some(sources) = response.get("sources").and_then(Value::as_array) else { return false; };
+    if sources.len() > MAX_ENTRIES { return false; }
+    let mut rules = Vec::new(); let mut environment = Vec::new();
+    for source in sources {
+        let Some(settings) = source.get("settings").and_then(Value::as_object) else { return false; };
+        if settings.keys().any(|key| !matches!(key.as_str(), "permissions" | "autoMode")) { return false; }
+        let mut represented = Map::new();
+        represented.insert("permissions".into(), settings.get("permissions").cloned().unwrap_or_else(|| json!({})));
+        represented.insert("autoMode".into(), settings.get("autoMode").cloned().unwrap_or_else(|| json!({"environment":[]})));
+        let Some((source_rules, source_environment)) = policy(&Value::Object(represented)) else { return false; };
+        rules.extend(source_rules); environment.extend(source_environment);
+        if rules.len() > MAX_ENTRIES || environment.len() > MAX_ENTRIES { return false; }
+    }
+    rules.sort(); rules.dedup(); environment.sort(); environment.dedup();
+    effective == (rules, environment)
+}
+
+#[cfg(test)]
+mod continuation_coverage_tests {
+    use super::*;
+
+    fn response() -> Value {
+        json!({
+            "effective":{"permissions":{"deny":["Read(.env)"]},"autoMode":{"environment":["Disposable checkout"]}},
+            "sources":[{"source":"flagSettings","settings":{"permissions":{"deny":["Read(.env)"]},"autoMode":{"environment":["Disposable checkout"]}}}]
+        })
+    }
+
+    #[test]
+    fn continuation_requires_complete_representable_effective_policy() {
+        let known = response();
+        assert!(Snapshot::parse(&known).unwrap().continuation_settings().is_ok());
+        for change in ["extra-directory", "future-permission", "future-auto", "missing-effective-rule", "implicit-defaults", "unknown-settings-section"] {
+            let mut changed = known.clone();
+            match change {
+                "extra-directory" => changed["sources"][0]["settings"]["permissions"]["additionalDirectories"] = json!(["/another-root"]),
+                "future-permission" => changed["effective"]["permissions"]["futurePolicy"] = json!(true),
+                "future-auto" => changed["effective"]["autoMode"]["hard_deny"] = json!(["unknown"]),
+                "missing-effective-rule" => changed["effective"]["permissions"]["allow"] = json!(["Bash(*)"]),
+                "implicit-defaults" => changed["effective"]["autoMode"]["environment"] = json!(["$defaults"]),
+                "unknown-settings-section" => changed["sources"][0]["settings"]["sandbox"] = json!({"enabled":true}),
+                _ => unreachable!(),
+            }
+            assert!(Snapshot::parse(&changed).unwrap().continuation_settings().is_err(), "{change}");
+        }
+        let mut absent = known;
+        absent["effective"].as_object_mut().unwrap().remove("autoMode");
+        assert!(Snapshot::parse(&absent).unwrap().continuation_settings().is_err());
     }
 }

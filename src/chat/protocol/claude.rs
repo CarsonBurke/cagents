@@ -1677,6 +1677,11 @@ impl Claude {
 }
 
 impl Adapter for Claude {
+    fn account_continuation_policy(&self) -> Result<chat::PermissionSettings, String> {
+        let policy = self.permissions.as_ref().ok_or("Refresh Claude permission settings before Automatic continuation")?;
+        policy.continuation_settings()
+    }
+
     fn account_switch_ready(&self) -> bool {
         !self.controls.values().any(|request| {
             matches!(
@@ -10188,5 +10193,89 @@ mod tests {
         let page = history.page().unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
+    }
+}
+
+#[cfg(test)]
+mod account_continuation_capture_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn policy() -> Value {
+        json!({"effective":{"permissions":{"deny":["Read(.env)"]},"autoMode":{"environment":[]}},
+            "sources":[{"source":"flagSettings","settings":{"permissions":{"deny":["Read(.env)"]},"autoMode":{"environment":[]}}}]})
+    }
+
+    fn start(directory: &std::path::Path, label: &str, policy: Value, busy: bool) -> (chat::runtime::LocalHandle, PathBuf) {
+        let log = directory.join(format!("{label}-wire.jsonl"));
+        let recipe = crate::model::LaunchRecipe {
+            program: "/usr/bin/python3".into(),
+            arguments: vec!["-u".into(), "-c".into(), r#"import json,sys
+policy=json.loads(sys.argv[1])
+for line in sys.stdin:
+    frame=json.loads(line)
+    with open(sys.argv[2], 'a') as log: log.write(json.dumps(frame)+'\n')
+    assert frame['type']=='control_request', 'capture must never send a prompt'
+    request=frame['request']
+    assert request['subtype'] in ['get_settings','set_model','apply_flag_settings'], request
+    response=policy if request['subtype']=='get_settings' else {}
+    print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':response}}),flush=True)
+"#.into(), policy.to_string(), log.to_string_lossy().into_owned()],
+            working_directory: directory.to_path_buf(), environment: Default::default(), unset_environment: Default::default(),
+        };
+        let models:Vec<Model> = ["launch-model", "current-model"].into_iter().map(|id| Model {
+            id:id.into(),label:id.into(),reasoning:vec!["low".into(),"high".into()],
+        }).collect();
+        let adapter = Claude {ready:true,busy,models:models.clone(),selected:Some("launch-model".into()),reasoning:Some("low".into()),
+            fast_mode:Some(chat::FastMode::default()),..Default::default()};
+        let capabilities = adapter.capabilities();
+        let spec = ProcessSpec::from(&recipe);
+        let mut initial = Step {events:vec![Event::Ready(true),Event::Status {busy,detail:String::new()},
+            Event::Capabilities(capabilities),Event::Models {models,selected:Some("launch-model".into()),reasoning:Some("low".into())},
+            Event::PermissionMode(Some("plan".into())),Event::FastMode(chat::FastMode::default())],..Default::default()};
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let handle = chat::runtime::LocalHandle::start(spec,Box::new(adapter),initial,store,None,|_|{}).unwrap();
+        (handle, log)
+    }
+
+    #[test]
+    fn live_continuation_capture_reads_actual_current_controls_without_prompt_or_close() {
+        let directory = tempfile::tempdir().unwrap();
+        let (handle, log) = start(directory.path(), "known", policy(), false);
+        handle.command(Command::SetModel {model:"current-model".into(),reasoning:Some("high".into())}).unwrap();
+        let before = std::fs::read_to_string(&log).unwrap();
+        let options = handle.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap().unwrap();
+        assert_eq!(options.controls().model.as_deref(),Some("current-model"));
+        assert_eq!(options.controls().reasoning.as_deref(),Some("high"));
+        assert_eq!(options.controls().permission_mode.as_deref(),Some("plan"));
+        assert_eq!(options.controls().fast_mode,Some(false));
+        assert_eq!(options.controls().permissions.as_ref().unwrap().rules[0].rule,"Read(.env)");
+        let after = std::fs::read_to_string(log).unwrap();
+        let read:Vec<Value> = after[before.len()..].lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(read.len(),1,"capture sends only its fresh getter");
+        assert_eq!(read[0]["request"]["subtype"],"get_settings");
+        assert!(!handle.is_completed(),"metadata capture retains the original live actor");
+        handle.close().unwrap();
+    }
+
+    #[test]
+    fn live_continuation_capture_refuses_busy_unknown_policy_and_expired_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let (busy, log) = start(directory.path(),"busy",policy(),true);
+        assert!(busy.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap().is_none());
+        assert!(!log.exists(),"proved busy must not issue even the getter");
+        assert!(!busy.is_completed());
+        busy.close().unwrap();
+        let mut unsupported = policy();
+        unsupported["sources"][0]["settings"]["permissions"]["additionalDirectories"] = json!(["/other-root"]);
+        let (unknown, log) = start(directory.path(),"unsupported",unsupported,false);
+        let error = unknown.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap_err();
+        assert!(error.contains("cannot be transferred"));
+        let frames:Vec<Value> = std::fs::read_to_string(log).unwrap().lines().map(|line|serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(frames.len(),1); assert_eq!(frames[0]["request"]["subtype"],"get_settings");
+        assert!(!unknown.is_completed()); unknown.close().unwrap();
+        let (expired, log) = start(directory.path(),"expired",policy(),false);
+        assert!(expired.capture_continuation_options(Instant::now()-Duration::from_millis(1)).unwrap_err().contains("budget expired"));
+        assert!(!log.exists()); assert!(!expired.is_completed()); expired.close().unwrap();
     }
 }
