@@ -1,7 +1,7 @@
 //! Isolated test-only domain issuance. Never a production registry substitute.
 use super::*;
 use crate::fs_safety::{RecoveryRegistrationLease, RecoveryRegistryCheck, recovery_directory_stamp};
-use std::sync::Mutex;
+use std::{os::unix::fs::MetadataExt, sync::Mutex};
 
 const MAX_PAYLOADS: usize = 16;
 
@@ -23,6 +23,14 @@ impl<G: Send + Sync> RecoveryRegistrationLease for OwnedLease<G> {
     fn register_payload(&self, payload: &Root) -> io::Result<()> {
         let stamp = recovery_directory_stamp(payload)?;
         let mut payloads = self.payloads.lock().map_err(|_| io::Error::other("fixture registration lock poisoned"))?;
+        // Positively unlinked original holdings cannot enclose future payloads.
+        // Retire only those exact held identities; live/unknown obligations
+        // survive and still consume their pre-reserved descriptor capacity.
+        let mut index = 0;
+        while index < payloads.len() {
+            if payloads[index].metadata()?.nlink() == 0 { payloads.swap_remove(index); }
+            else { index += 1; }
+        }
         for held in payloads.iter() {
             if recovery_directory_stamp(held)? == stamp { return Ok(()); }
         }
@@ -63,4 +71,19 @@ fn fixture_owns_real_enrollment_and_cleanup_lease() {
     placement.register_payload_root(publication.directory()).unwrap();
     placement.register_payload_root(publication.directory()).unwrap();
     assert!(context.retained_descriptor_count() >= MAX_PAYLOADS + 3);
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn fixture_reuses_bounded_capacity_only_after_original_holdings_are_unlinked() {
+    let source_directory = tempfile::tempdir().unwrap();
+    let source = Root::open(source_directory.path()).unwrap();
+    let context = fixture_context(&source).unwrap();
+    let placement = context.placement();
+    for index in 0..MAX_PAYLOADS + 2 {
+        let name = format!("payload-{index}");
+        let crate::fs_safety::DirectoryCreation::Published(mut publication) = crate::fs_safety::create_directory_in_namespace(placement.namespace(), placement.directory(), std::path::Path::new(&name), 0o700).unwrap() else { panic!("fixture requires actual publication"); };
+        placement.register_payload_root(publication.directory()).unwrap();
+        publication.cleanup_empty().unwrap();
+    }
 }
