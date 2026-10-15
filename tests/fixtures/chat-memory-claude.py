@@ -22,6 +22,10 @@ for i, arg in enumerate(args):
         session = args[i + 1]
     elif arg.startswith(('--session-id=', '--resume=')):
         session = arg.split('=', 1)[1]
+with (pathlib.Path.home().parent / 'fixture-processes.jsonl').open('a') as output:
+    start_ticks = pathlib.Path('/proc/self/stat').read_text().rsplit(')', 1)[1].split()[19]
+    output.write(json.dumps({'role': 'fake_claude', 'pid': os.getpid(),
+                             'start_ticks': start_ticks, 'session': session}) + '\n')
 project = re.sub('[^a-zA-Z0-9]', '-', os.getcwd())
 history = pathlib.Path(os.environ.get('CLAUDE_CONFIG_DIR', str(pathlib.Path.home() / '.claude'))) / 'projects' / project / (session + '.jsonl')
 history.parent.mkdir(parents=True, exist_ok=True)

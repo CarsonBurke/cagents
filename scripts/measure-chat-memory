@@ -18,8 +18,11 @@ private UI to measure fresh restore. Record raw
 screenshots, input sequences, source SHA/dirty diff, build profile and compositor
 alongside samples. Actor counts alone do not verify actual UI attachment.
 
-Samples are process-local. Daemon/provider RSS and RAM-backed cache storage are
-separate measurements. Exposed owner instrumentation counts Arc body references,
+The fixture uses a short disk-backed /var/tmp runtime on BOTH revisions to avoid
+RAM-backed WAL pressure. This is a harness storage choice, not a product fix;
+SQLite I/O timings do not represent a production tmpfs runtime. Samples are
+process-local. Daemon/provider RSS and cache storage are separate measurements.
+Exposed owner instrumentation counts Arc body references,
 not unique heap bytes; renderer/parser allocations require additional attribution.
 """
 
@@ -54,8 +57,8 @@ def fixture_environment(root):
     if display and not display.startswith("/"):
         env["WAYLAND_DISPLAY"] = str(Path(env["XDG_RUNTIME_DIR"]) / display)
     original_home = Path.home()
-    runtime = Path("/run/user") / str(os.getuid()) / (
-        "chat-memory-" + hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
+    runtime = Path("/var/tmp") / (
+        "chat-memory-" + str(os.getuid()) + "-" + hashlib.sha256(os.fsencode(root)).hexdigest()[:12]
     )
     runtime.mkdir(mode=0o700, exist_ok=True)
     if runtime.stat().st_uid != os.getuid():
@@ -127,7 +130,22 @@ def sample(root, pid, stage, seconds):
     summary = {key: max(row[key] for row in samples) for key in (
         "rss_kib", "anonymous_pss_kib", "file_pss_kib", "swap_kib", "peak_rss_kib", "threads")}
     summary["cpu_percent"] = (samples[-1]["cpu_ticks"] - samples[0]["cpu_ticks"]) / ticks / duration * 100
+    runtime = Path(os.fsdecode(environment[b"XDG_RUNTIME_DIR"])) / "cagents-development"
+    caches = [path for path in runtime.glob("chat-*") if path.is_dir() and not path.is_symlink()]
+    sizes = []
+    for cache in caches:
+        for path in cache.rglob("*"):
+            try:
+                if path.is_file() and not path.is_symlink():
+                    stat = path.stat()
+                    sizes.append((stat.st_size, stat.st_blocks * 512))
+            except FileNotFoundError:
+                pass
     report = {"stage": stage, "pid": pid, "start_identity": start_identity,
+              "runtime_storage": "disk-backed private /var/tmp; identical before/after",
+              "transcript_caches": {"directories": len(caches),
+                  "logical_bytes": sum(size for size, _ in sizes),
+                  "allocated_bytes": sum(size for _, size in sizes)},
               "clock_ticks_per_second": ticks, "samples": samples, "summary": summary}
     path = root / (stage + ".json")
     if path.exists():
@@ -158,6 +176,11 @@ def main():
         (root / MARKER).touch(mode=0o600)
         for name in ("home", "data", "config", "cache", "state", "bin", "project"):
             (root / name).mkdir(mode=0o700)
+        settings = root / "config/cagents-development/settings.toml"
+        settings.parent.mkdir()
+        settings.write_text("schema_version = 3\ncheck_for_updates = false\n"
+                            "focus_follows_mouse = false\ndefault_column_fraction = 1.0\nui_scale = 1.0\n")
+        settings.chmod(0o600)
         provider = REPOSITORY / "tests/fixtures/chat-memory-claude.py"
         shutil.copy2(provider, root / "bin/claude")
         for name in ("codex", "omp"):
@@ -169,7 +192,10 @@ def main():
         write_json(root / "manifest.json", {
             "fixture": MARKER, "provider_sha256": hashlib.sha256(provider.read_bytes()).hexdigest(),
             "workload": {"parent_kib": 512, "children": 32, "child_kib": 64, "tool_rows": 30},
-            "stages": STAGES, "seeded_actors_are_not_proof_of_ui_attachment": True,
+            "stages": STAGES, "repeated_cycles_in_same_ui_process": 3,
+            "fresh_ui_process_for_each_before_after_phase": True,
+            "runtime_storage": "disk-backed private /var/tmp, same before and after",
+            "seeded_actors_are_not_proof_of_ui_attachment": True,
         })
         return
     env = fixture_environment(root)
