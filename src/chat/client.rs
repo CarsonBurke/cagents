@@ -583,12 +583,24 @@ impl ClientHandle {
     /// that lineage and cannot stand in for a streaming delta benchmark.
     #[cfg(test)]
     pub(crate) fn publish_presentation_for_test(&self, update: super::presentation::Presentation) {
-        let mut state = self.inner.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self
+            .inner
+            .snapshot
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let candidates = append::Lineage::candidates(&update, &state);
-        let next = update.apply(&state).expect("fixture publication obeys production fences");
-        self.inner.append_lineage.lock().unwrap_or_else(|p| p.into_inner()).record(candidates, &next);
+        let next = update
+            .apply(&state)
+            .expect("fixture publication obeys production fences");
+        self.inner
+            .append_lineage
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .record(candidates, &next);
         *state = Arc::new(next);
-        self.inner.transcript_resident.store(true, Ordering::Release);
+        self.inner
+            .transcript_resident
+            .store(true, Ordering::Release);
     }
 
     /// Queues a report as the reader thread would on its arrival, and says

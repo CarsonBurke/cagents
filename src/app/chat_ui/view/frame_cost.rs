@@ -182,7 +182,8 @@ impl Stages {
 
     fn report(&mut self) {
         if !self.preparation.0.is_empty() {
-            self.preparation.report("refresh + owned preparation + install + geometry settle (fixture wall)");
+            self.preparation
+                .report("refresh + owned preparation + install + geometry settle (fixture wall)");
         }
         let total = self.update.report("update")
             + self.view.report("view")
@@ -194,7 +195,10 @@ impl Stages {
     /// One line of medians, for a workload that reports several cases.
     fn row(&mut self, name: &str) {
         if !self.preparation.0.is_empty() {
-            println!("{name:>28}: fixture refresh+preparation+install+geometry median {:>8.3} ms (outside steady event stages)", self.preparation.median().as_secs_f64() * 1e3);
+            println!(
+                "{name:>28}: fixture refresh+preparation+install+geometry median {:>8.3} ms (outside steady event stages)",
+                self.preparation.median().as_secs_f64() * 1e3
+            );
         }
         let stages = [
             self.update.median(),
@@ -411,25 +415,46 @@ impl Pane {
         use chat::presentation::{ChildUpdate, ItemChange, Presentation};
         let previous = self.handle.snapshot();
         let changes = |old: &[Arc<chat::Item>], next: &[Arc<chat::Item>]| {
-            let previous: HashMap<_, _> = old.iter().map(|item| (item.id.as_str(), item.as_ref())).collect();
-            next.iter().filter_map(|item| {
-                let old = previous.get(item.id.as_str()).copied();
-                (old != Some(item.as_ref())).then(|| ItemChange::between(old, item))
-            }).collect()
+            let previous: HashMap<_, _> = old
+                .iter()
+                .map(|item| (item.id.as_str(), item.as_ref()))
+                .collect();
+            next.iter()
+                .filter_map(|item| {
+                    let old = previous.get(item.id.as_str()).copied();
+                    (old != Some(item.as_ref())).then(|| ItemChange::between(old, item))
+                })
+                .collect()
         };
         let order = snapshot.items.iter().map(|item| item.id.clone()).collect();
         let parent_changes = changes(&previous.items, &snapshot.items);
         snapshot.items.clear();
-        let children = snapshot.subagents.iter_mut().map(|child| {
-            let old = previous.subagents.iter().find(|old| old.id == child.id)
-                .map_or(&[][..], |old| old.items.as_slice());
-            let update = ChildUpdate { id: child.id.clone(),
-                order: child.items.iter().map(|item| item.id.clone()).collect(),
-                changes: changes(old, &child.items) };
-            child.items.clear(); update
-        }).collect();
-        self.handle.publish_presentation_for_test(Presentation { base_generation: previous.generation,
-            file_changes_unchanged: false, metadata: snapshot, order, changes: parent_changes, children });
+        let children = snapshot
+            .subagents
+            .iter_mut()
+            .map(|child| {
+                let old = previous
+                    .subagents
+                    .iter()
+                    .find(|old| old.id == child.id)
+                    .map_or(&[][..], |old| old.items.as_slice());
+                let update = ChildUpdate {
+                    id: child.id.clone(),
+                    order: child.items.iter().map(|item| item.id.clone()).collect(),
+                    changes: changes(old, &child.items),
+                };
+                child.items.clear();
+                update
+            })
+            .collect();
+        self.handle.publish_presentation_for_test(Presentation {
+            base_generation: previous.generation,
+            file_changes_unchanged: false,
+            metadata: snapshot,
+            order,
+            changes: parent_changes,
+            children,
+        });
     }
 
     /// Opens `id` the way pressing its header does.
@@ -531,11 +556,22 @@ impl Pane {
         let start = Instant::now();
         self.settle_geometry();
         let expected = self.items.last().expect("streamed item");
-        let cached = self.runtime.cache.get(&expected.id).expect("active streamed cache");
+        let cached = self
+            .runtime
+            .cache
+            .get(&expected.id)
+            .expect("active streamed cache");
         // `preparing` also keeps a running source's canonical parser alive;
         // it remains true after installing the exact current growing version.
-        assert!(!cached.placeholder, "new publication must have rendered content");
-        assert_eq!(cached.item.as_deref(), Some(expected), "cannot time a stale rendered prefix as the new body");
+        assert!(
+            !cached.placeholder,
+            "new publication must have rendered content"
+        );
+        assert_eq!(
+            cached.item.as_deref(),
+            Some(expected),
+            "cannot time a stale rendered prefix as the new body"
+        );
         start.elapsed()
     }
 
@@ -687,7 +723,10 @@ fn long_streaming_block(background: bool) {
             checkpoints.next();
         }
     }
-    println!("    all fixture refresh/preparation/install/geometry settling: {:>8.1} ms (not native scheduling)", preparing.as_secs_f64() * 1e3);
+    println!(
+        "    all fixture refresh/preparation/install/geometry settling: {:>8.1} ms (not native scheduling)",
+        preparing.as_secs_f64() * 1e3
+    );
     println!(
         "    every refresh of the stream together: {:>8.1} ms",
         refreshing.as_secs_f64() * 1e3
@@ -1139,20 +1178,35 @@ fn viewport_cost_with_a_megabyte_answer_and_three_hundred_tools() {
     }
 }
 
-
 #[test]
 fn streaming_fixture_applies_validated_deltas_and_prepares_each_visible_revision() {
-    let mut pane = Pane::new(vec![item("answer".into(), chat::Role::Assistant,
-        prose("Answer **bold** ordinary tail".into(), false, chat::Phase::Final))]);
+    let mut pane = Pane::new(vec![item(
+        "answer".into(),
+        chat::Role::Assistant,
+        prose(
+            "Answer **bold** ordinary tail".into(),
+            false,
+            chat::Phase::Final,
+        ),
+    )]);
     pane.metadata.busy = true;
     for suffix in [" more words", " and still more"] {
         let previous = pane.handle.snapshot().items[0].clone();
         pane.tail().push_str(suffix);
         pane.publish();
         let current = pane.handle.snapshot().items[0].clone();
-        assert!(pane.handle.known_append(&previous, &current), "fixture must exercise accepted append lineage");
+        assert!(
+            pane.handle.known_append(&previous, &current),
+            "fixture must exercise accepted append lineage"
+        );
         pane.prepare_publication();
-        assert!(pane.runtime.snapshot.busy, "streaming fixture must be a running parent");
-        assert!(Arc::ptr_eq(pane.runtime.cache["answer"].item.as_ref().unwrap(), &current));
+        assert!(
+            pane.runtime.snapshot.busy,
+            "streaming fixture must be a running parent"
+        );
+        assert!(Arc::ptr_eq(
+            pane.runtime.cache["answer"].item.as_ref().unwrap(),
+            &current
+        ));
     }
 }

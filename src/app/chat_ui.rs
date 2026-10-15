@@ -8083,8 +8083,13 @@ impl Cagents {
                         // Disclosure is view state for already worker-prepared
                         // prose. Rebuilding that cache here would reparse and
                         // highlight an entire long answer on the UI thread.
-                        .filter(|item| CachedItem::prose(&item.content).is_none()
-                            || runtime.cache.get(&id).is_some_and(|cached| cached.coordination.is_some()))
+                        .filter(|item| {
+                            CachedItem::prose(&item.content).is_none()
+                                || runtime
+                                    .cache
+                                    .get(&id)
+                                    .is_some_and(|cached| cached.coordination.is_some())
+                        })
                     {
                         let previous = runtime.cache.remove(&id);
                         runtime.cache.insert(

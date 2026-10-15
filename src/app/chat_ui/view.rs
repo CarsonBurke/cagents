@@ -8693,31 +8693,52 @@ mod tests {
     }
 }
 
-
 #[cfg(test)]
 mod prepared_disclosure_tests {
     use super::*;
 
     #[test]
     fn prose_disclosure_keeps_prepared_source_and_palette_owners() {
-        let item = chat::Item { id: "prepared-thought".into(), role: chat::Role::Assistant,
-            content: ItemContent::Text { text: format!("Long **thought** {}\n\n```rust\nlet answer = 42;\n```", "ordinary words ".repeat(10_000)),
-                thinking: true, phase: chat::Phase::Commentary }, at: None, started_at: None };
+        let item = chat::Item {
+            id: "prepared-thought".into(),
+            role: chat::Role::Assistant,
+            content: ItemContent::Text {
+                text: format!(
+                    "Long **thought** {}\n\n```rust\nlet answer = 42;\n```",
+                    "ordinary words ".repeat(10_000)
+                ),
+                thinking: true,
+                phase: chat::Phase::Commentary,
+            },
+            at: None,
+            started_at: None,
+        };
         let (mut live, _handle) = frame_cost::live_runtime(&[item]);
         let mut app = crate::app::tests::context_inspector_test_app(true);
         app.context_inspector_open = false;
-        let mut target = live.target; target.card = app.workspace.focused().unwrap(); live.target = target;
+        let mut target = live.target;
+        target.card = app.workspace.focused().unwrap();
+        live.target = target;
         let cached = &live.cache["prepared-thought"];
         let revision = cached.revision;
         let item = cached.item.clone().expect("prepared item owner");
-        let palettes = cached.palette_views.clone().expect("worker prepared syntax palettes");
-        app.cards.insert(target.card, CardRuntime::Chat(Box::new(live)));
+        let palettes = cached
+            .palette_views
+            .clone()
+            .expect("worker prepared syntax palettes");
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(live)));
         for expanded in [true, false, true] {
             drop(app.handle_chat_ui(Action::Toggle(target, "prepared-thought".into())));
-            let CardRuntime::Chat(runtime) = &app.cards[&target.card] else { panic!("mounted chat") };
+            let CardRuntime::Chat(runtime) = &app.cards[&target.card] else {
+                panic!("mounted chat")
+            };
             assert_eq!(runtime.expanded.contains("prepared-thought"), expanded);
             let cached = &runtime.cache["prepared-thought"];
-            assert_eq!(cached.revision, revision, "disclosure must not rebuild prepared prose");
+            assert_eq!(
+                cached.revision, revision,
+                "disclosure must not rebuild prepared prose"
+            );
             assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), &item));
             let current = cached.palette_views.as_ref().unwrap();
             assert!(Arc::ptr_eq(&current[0], &palettes[0]));
