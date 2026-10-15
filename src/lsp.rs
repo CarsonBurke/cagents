@@ -9475,6 +9475,8 @@ mod tests {
         assert_eq!(converted.documents[0].observed_version,None);
         assert_eq!(converted.documents[0].observed_incarnation,None);
         assert_eq!(converted.documents[0].coordinates,LspCoordinates::Utf16);
+        store.register(LspDocumentId(4),&Arc::new(unopened.clone()),&key,1,Arc::from("opened later"));
+        assert!(matches!(features::convert_workspace_edit(&store,edit(&unopened),Some(&observed)),Err(LspError::StaleVersion{..})));
         // An emitted edit owns its token even after conversion. A UI consumer
         // compares it before publication; the old allocation cannot be reused.
         assert_ne!(store.document_incarnation(LspDocumentId(2)),Some(old_identity));
