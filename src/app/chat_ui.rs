@@ -2289,8 +2289,6 @@ impl Runtime {
             }
         })
     }
-    /// Prepare parent grouping metadata and only the currently selected
-    /// child's presentation. Hidden children keep no Markdown/highlight cache.
     pub(super) fn memory_diagnostics(&self) -> crate::inspector::ChatMemory {
         fn payload(item: &chat::Item) -> usize {
             match &item.content {
@@ -2316,22 +2314,12 @@ impl Runtime {
         // Each transcript has its own streaming lifecycle: a child can keep
         // running after the parent finishes. Only its newest item can grow;
         // older items release their parser and highlighter continuation.
-        let newest = snapshot.items.len().wrapping_sub(1);
-        let items = snapshot
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| (item, snapshot.busy && index == newest))
-            .chain(snapshot.subagents.iter().filter(|agent| self.selected_subagent.as_ref() == Some(&agent.id)).flat_map(|agent| {
-                let newest = agent.items.len().wrapping_sub(1);
-                agent.items.iter().enumerate().map(move |(index, item)| {
-                    (
-                        item,
-                        agent.status == chat::ToolStatus::Running && index == newest,
-                    )
-                })
-            }));
-        for (item, growing) in items {
+        let selected = self.selected_subagent.as_ref().and_then(|id| snapshot.subagents.iter().find(|agent| &agent.id == id));
+        let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy),
+            |agent| (agent.items.as_slice(), agent.status == chat::ToolStatus::Running));
+        let newest = items.len().wrapping_sub(1);
+        for (index, item) in items.iter().enumerate() {
+            let growing = busy && index == newest;
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
             let append_proven = self.cache.get(&item.id).and_then(|cached| cached.item.as_ref())
@@ -2487,7 +2475,7 @@ impl Runtime {
             && old.iter().zip(new).all(|(old, new)| old.id == new.id);
         if !same_ids(&self.snapshot.items, &snapshot.items)
             || !same_ids(previous_selected.map_or(&[], |agent| agent.items.as_slice()), selected.map_or(&[], |agent| agent.items.as_slice())) {
-            self.cache.retain(|id, _| snapshot.items.iter().chain(selected.into_iter().flat_map(|agent| &agent.items)).any(|item| &item.id == id));
+            self.cache.retain(|id, _| selected.map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice()).iter().any(|item| &item.id == id));
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
         }
         // Rare disclosure-budget pruning can inspect all raw identities;
@@ -7664,15 +7652,16 @@ impl Cagents {
             }
             Action::SelectSubagent(target, id) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.selected_subagent = id.filter(|id| {
+                    let selected = id.filter(|id| {
                         runtime
                             .snapshot
                             .subagents
                             .iter()
                             .any(|agent| &agent.id == id)
                     });
+                    if runtime.selected_subagent != selected { runtime.cache.clear(); }
+                    runtime.selected_subagent = selected;
                     runtime.deferred_page = None;
-                    runtime.cache.retain(|id, _| runtime.snapshot.items.iter().any(|item| &item.id == id));
                     runtime.selection_document.get_mut().take();
                     let snapshot = runtime.snapshot.clone();
                     runtime.prepare_transcript_cache(&snapshot);
@@ -9915,17 +9904,24 @@ mod tests {
             items: vec![Arc::new(chat::Item { id: format!("body-{index}"), role: chat::Role::Assistant,
                 content: text(&"source ".repeat(20000)), started_at: None, at: None })],
         }).collect();
-        handle.publish_snapshot_for_test(Snapshot { generation: 20, ready: true, subagents: children, ..Snapshot::default() });
+        handle.publish_snapshot_for_test(Snapshot { generation: 20, ready: true, subagents: children,
+            items: vec![Arc::new(chat::Item { id: "body-2".into(), role: chat::Role::Assistant,
+                content: text("Parent source"), started_at: None, at: None })], ..Snapshot::default() });
         let runtime = app.chat_runtime_mut(target).unwrap(); runtime.visible.store(true, Ordering::Relaxed); runtime.refresh();
-        assert!(runtime.cache.is_empty(), "hidden child source has no parsed or highlighted presentation");
+        assert_eq!(runtime.cache.len(), 1, "only parent source is prepared before child selection");
+        assert!(runtime.cache["body-2"].markdown.items().len() > 0);
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-2".into()))));
         assert_eq!(chat_runtime(&app, card).cache.len(), 1);
         assert!(chat_runtime(&app, card).cache.contains_key("body-2"));
+        assert!(matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
+            ItemContent::Text { text, .. } if text.len() > 10000), "identical parent/child provider IDs cannot reuse the wrong scope");
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-3".into()))));
         assert_eq!(chat_runtime(&app, card).cache.len(), 1);
         assert!(chat_runtime(&app, card).cache.contains_key("body-3"));
         drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
-        assert!(chat_runtime(&app, card).cache.is_empty());
+        assert_eq!(chat_runtime(&app, card).cache.len(), 1);
+        assert!(matches!(&chat_runtime(&app, card).cache["body-2"].item.as_ref().unwrap().content,
+            ItemContent::Text { text, .. } if text == "Parent source"));
     }
 
     #[test]
