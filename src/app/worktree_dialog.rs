@@ -249,6 +249,8 @@ impl WorktreeDialog {
         }
         self.focused_field = Some(field);
         let value = if field == WorktreeField::Branch { super::worktree_choices::sanitize_branch(&value) } else { value };
+        self.submit_after_linear = false;
+        self.submit_after_choices = false;
         if field == WorktreeField::Branch {
             if let LinearLookup::Pending { token, .. } = &self.linear { token.cancel(); }
             self.linear = LinearLookup::None;
@@ -443,7 +445,9 @@ impl Cagents {
                 Ok(_) => LinearLookup::Unavailable("Linear suggested an invalid branch name".into()),
                 Err(reason) => LinearLookup::Unavailable(reason),
             };
-            if std::mem::take(&mut dialog.submit_after_linear) {
+            if std::mem::take(&mut dialog.submit_after_linear)
+                && matches!(dialog.linear, LinearLookup::Ready(_))
+            {
                 return self.submit_worktree_dialog();
             }
         }
