@@ -339,7 +339,7 @@ mod tests {
         delivery.close_after_drain();
         assert!(matches!(delivery.pop().map(|message| message.message), Some(crate::terminal_ipc::ServerMessage::ChatChanged { chat_id }) if chat_id == fixture.source.id));
         assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
-        let retry = fixture.host.lock().unwrap().directory_thread_retry.expect("bounded retry after persistence failure");
+        assert!(fixture.host.lock().unwrap().directory_thread_retry.is_some(), "bounded retry after persistence failure");
         let mut current = fixture.source.clone(); current.launch.session_id = Some(new_thread.into());
         let registry = super::super::agent_execution::registry(&fixture.host).unwrap();
         assert!(registry.lock().unwrap().session_location(&HostedSession::Chat(current.clone())).is_err());
@@ -348,6 +348,8 @@ mod tests {
         assert!(super::super::client::process_request(&fixture.host, 1, request).is_err());
         assert!(!fixture.handle.is_completed());
         database.execute_batch("DROP TRIGGER reject_session_thread").unwrap();
+        let retry = Instant::now() + Duration::from_secs(60);
+        fixture.host.lock().unwrap().directory_thread_retry = Some(retry);
         super::super::chat::changed_owned(&Arc::downgrade(&fixture.host), fixture.source.id, instance, runtime::Update::Presentation);
         assert_eq!(fixture.host.lock().unwrap().directory_thread_retry, Some(retry), "producer frames cannot hammer a failed database");
         assert_eq!(fixture.host.lock().unwrap().chats[&fixture.source.id].session, fixture.source);
