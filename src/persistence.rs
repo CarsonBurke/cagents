@@ -1969,25 +1969,31 @@ impl StateStore {
     }
 
     pub fn operations_requiring_reconciliation(&self) -> Result<Vec<PendingOperation>> {
-        self.operation_rows(true)
+        self.operation_rows(true, None)
     }
 
     pub fn journaled_worktree_operations(&self) -> Result<Vec<PendingOperation>> {
-        self.operation_rows(false)
+        self.operation_rows(false, None)
     }
 
-    fn operation_rows(&self, unresolved_only: bool) -> Result<Vec<PendingOperation>> {
+    /// Read one creation without loading every retained journal into memory.
+    pub fn journaled_worktree_operation(&self, id: OperationId) -> Result<Option<PendingOperation>> {
+        Ok(self.operation_rows(false, Some(id))?.into_iter().next())
+    }
+
+    fn operation_rows(&self, unresolved_only: bool, id: Option<OperationId>) -> Result<Vec<PendingOperation>> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
         let mut statement = inner.connection.prepare(
             "SELECT operation_id, entity_kind, entity_id, action, base_generation, payload_json,
                     status, created_at_unix_ms, updated_at_unix_ms
              FROM pending_operations
-             WHERE (?1 AND status IN ('pending', 'needs_reconciliation'))
-                OR (NOT ?1 AND entity_kind = 'worktree_creation')
+             WHERE ((?1 AND status IN ('pending', 'needs_reconciliation'))
+                OR (NOT ?1 AND entity_kind = 'worktree_creation'))
+                AND (?2 IS NULL OR operation_id = ?2)
              ORDER BY created_at_unix_ms, operation_id",
         )?;
-        let rows = statement.query_map([unresolved_only], |row| {
+        let rows = statement.query_map(params![unresolved_only, id.map(|id| id.to_string())], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
