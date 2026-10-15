@@ -495,7 +495,7 @@ impl Cagents {
                     _ => None,
                 };
                 let closing = match &edit {
-                    ModelEdit::CloseProject { repository } => Some(repository.clone()),
+                    ModelEdit::CloseProject { repository } | ModelEdit::CloseProjectInstance { project: crate::project_recovery::ProjectInstance { repository, .. } } => Some(repository.clone()),
                     ModelEdit::ReopenProject { repository, .. } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
