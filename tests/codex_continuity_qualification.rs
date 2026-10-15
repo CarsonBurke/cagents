@@ -234,7 +234,7 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
             "content":[{"type":"output_text","text":"SCENARIO_COMPLETE"}]
         }),
         None if scenario.contains("SCENARIO orphan-reaping") => shell(
-            "orphan-tools", "i=0; while [ \"$i\" -lt 3600 ] && [ ! -e stop-orphan-loop ]; do sh -c 'sleep 1 & echo $! >> orphan-pids'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED".into(), 1000,
+            "orphan-tools", r#"i=0; while [ "$i" -lt 3600 ] && [ ! -e stop-orphan-loop ]; do sh -c 'sleep 1 & pid=$!; if IFS= read -r stat < /proc/$pid/stat; then printf "%s %s\n" "$pid" "$stat" >> orphan-pids; fi'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED"#.into(), 1000,
         ),
         None if scenario.contains("SCENARIO long") => shell(
             "long",
@@ -1030,7 +1030,7 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
             if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
                 let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
                 if fields.get(1).and_then(|parent| parent.parse::<u64>().ok()) == Some(holder) {
-                    let identity = (pid, fields[19].parse::<u64>().unwrap());
+                    let identity = (pid.parse::<u32>().unwrap(), fields[19].parse::<u64>().unwrap());
                     witnessed_children.insert(identity.clone());
                     if fields.first() == Some(&"Z") { zombies.insert(identity); }
                 }
@@ -1073,10 +1073,17 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
         thread::sleep(Duration::from_millis(10));
     };
     drop(census);
-    let tool_pids = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap();
-    let tools = tool_pids.lines().count();
-    let tool_pids = tool_pids.lines().map(str::to_owned).collect::<BTreeSet<_>>();
-    let witnessed_adoptions = witnessed_children.iter().filter(|(pid, _)| tool_pids.contains(pid)).count();
+    let tool_records = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap();
+    let tool_identities = tool_records.lines().map(|line| {
+        let (pid, stat) = line.split_once(' ').expect("a tool launch records PID and its proc stat");
+        let pid = pid.parse::<u32>().unwrap();
+        assert_eq!(stat.split_once(' ').unwrap().0.parse::<u32>().unwrap(), pid,
+            "the launch witness must describe that exact background child");
+        let start = stat.rsplit_once(')').unwrap().1.split_whitespace().nth(19).unwrap().parse::<u64>().unwrap();
+        (pid, start)
+    }).collect::<BTreeSet<Identity>>();
+    let tools = tool_identities.len();
+    let witnessed_adoptions = witnessed_children.intersection(&tool_identities).count();
     let report = json!({"provider":fixture.version, "seconds":started.elapsed().as_secs_f64(),
         "holder":holder, "holder_start":holder_start, "provider_exited":final_provider.exited,
         "provider_ready":final_provider.ready, "samples":samples, "background_children":tools,
