@@ -5868,6 +5868,12 @@ pub enum Message {
         query: String,
         result: Result<Vec<repository_widget::RepositoryFile>, String>,
     },
+    SourceControlAmendMessage {
+        key: ActiveWorktreeKey,
+        revision: u64,
+        head: crate::repository::Oid,
+        result: Result<String, String>,
+    },
     /// One page of the bound worktree's history.
     SourceControlHistory {
         generation: u64,
@@ -17559,7 +17565,6 @@ impl Application for Cagents {
                     | SidebarAction::HistoryQueryChanged { .. }
                     | SidebarAction::HistoryBranchChanged { .. }
                     | SidebarAction::CancelHistoryBranch
-                    | SidebarAction::AmendChanged { .. }
                     | SidebarAction::CommitMessageChanged { .. }
                     | SidebarAction::CommitSubjectEditorCursor { .. }
                     | SidebarAction::CommitEditorCursor { .. }
@@ -17603,6 +17608,28 @@ impl Application for Cagents {
                         }
                     }
                     SidebarAction::CreateHistoryBranch { key, oid, name } => cosmic::task::message(Message::Sidebar(SidebarAction::GitOperation { key, operation: crate::repository::GitOperation::CreateBranch { oid, name } })),
+                    SidebarAction::AmendChanged { key, amend } => {
+                        let Some(revision) = self.sidebar_state.amend_request_revision().filter(|_| amend) else {
+                            return Task::none();
+                        };
+                        let Some(head) = self.sidebar_model.source_control.as_ref()
+                            .and_then(|source| source.head_oid.as_deref())
+                            .and_then(|oid| crate::repository::Oid::parse_object(oid).ok()) else {
+                            self.sidebar_state.finish_amend_read(&key, revision);
+                            return Task::none();
+                        };
+                        self.sidebar_state.pin_amend_head(&key, revision, head.clone());
+                        cosmic::task::future(async move {
+                            let worktree = key.canonical_path.clone();
+                            let pinned = head.clone();
+                            let result = tokio::task::spawn_blocking(move || {
+                                RepositoryService::system("git").commit_message(&worktree, &pinned, &CancellationToken::default())
+                                    .map_err(|error| error.to_string())
+                            }).await.map_err(|error| format!("amend reader join failed: {error}"))
+                                .and_then(|result| result);
+                            Message::SourceControlAmendMessage { key, revision, head, result }
+                        })
+                    }
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
                             iced::widget::operation::focus(sidebar::discard_confirm_id())
@@ -17668,8 +17695,12 @@ impl Application for Cagents {
                     SidebarAction::Unstage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Unstage(selection)),
                     SidebarAction::ConfirmDiscard { key, request } => self.enqueue_git_mutation(key, QueuedGitMutation::Discard(request)),
                     SidebarAction::Commit { key, message, amend } => {
-                        let commit_revision = self.sidebar_state.submitted_commit_revision(&key, &message, amend);
-                        let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, commit_revision) else {
+                        let Some(commit_revision) = self.sidebar_state.submitted_commit_revision(&key, &message, amend) else {
+                            return Task::none();
+                        };
+                        let expected_head = self.sidebar_state.amend_target();
+                        if amend && expected_head.is_none() { return Task::none(); }
+                        let Some(operation) = self.begin_mutation(&key, MutationKind::Commit, Some(commit_revision)) else {
                             return Task::none();
                         };
                         let request = CommitRequest {
@@ -17677,7 +17708,10 @@ impl Application for Cagents {
                             message,
                         };
                         self.mutation_task(key, operation, move |service, cancel| {
-                            commit_report(service.commit_with_amend(&request, amend, cancel))
+                            commit_report(match expected_head {
+                                Some(head) if amend => service.commit_amend_at(&request, &head, cancel),
+                                _ => service.commit_with_amend(&request, amend, cancel),
+                            })
                         })
                     }
                     SidebarAction::Push {
@@ -19705,6 +19739,45 @@ impl Application for Cagents {
                         Task::none()
                     }
                 }
+            }
+            Message::SourceControlAmendMessage {
+                key,
+                revision,
+                head,
+                result,
+            } => {
+                let bound = self.source_control_is_bound(&key);
+                let same_head = !bound
+                    || self
+                        .sidebar_model
+                        .source_control
+                        .as_ref()
+                        .is_some_and(|source| source.head_oid.as_deref() == Some(head.as_str()));
+                if same_head {
+                    match result {
+                        Ok(message) => {
+                            self.sidebar_state
+                                .load_amend_message(&key, revision, &message);
+                        }
+                        Err(error) => {
+                            if self.sidebar_state.finish_amend_read(&key, revision)
+                                && let Some(source) =
+                                    self.sidebar_model.source_control.as_mut().filter(|_| bound)
+                            {
+                                source.set_error(Some(format!(
+                                    "Could not load HEAD’s message: {error}"
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    if self.sidebar_state.finish_amend_read(&key, revision)
+                        && let Some(source) = self.sidebar_model.source_control.as_mut()
+                    {
+                        source.set_error(Some("HEAD changed while loading its message. Toggle Amend again to load the new commit.".into()));
+                    }
+                }
+                Task::none()
             }
             Message::SourceControlHistory {
                 generation,
@@ -27897,6 +27970,116 @@ mod tests {
                 .unwrap()
                 .error
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn amend_stale_read_errors_cannot_replace_later_feedback() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        let head = crate::repository::Oid::parse_object("11".repeat(20)).unwrap();
+        app.sidebar_model.source_control.as_mut().unwrap().head_oid = Some(head.as_str().into());
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = app.sidebar_state.amend_request_revision().unwrap();
+        app.sidebar_state
+            .apply(&SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Later typed message".into(),
+            });
+        for failed_head in [
+            head.clone(),
+            crate::repository::Oid::parse_object("22".repeat(20)).unwrap(),
+        ] {
+            app.sidebar_model
+                .source_control
+                .as_mut()
+                .unwrap()
+                .set_error(Some("Newer operation feedback".into()));
+            drop(app.update(Message::SourceControlAmendMessage {
+                key: key.clone(),
+                revision,
+                head: failed_head,
+                result: Err("Old reader failed".into()),
+            }));
+            assert_eq!(app.sidebar_state.commit_message(), "Later typed message");
+            assert_eq!(
+                app.sidebar_model
+                    .source_control
+                    .as_ref()
+                    .unwrap()
+                    .error
+                    .as_deref(),
+                Some("Newer operation feedback")
+            );
+        }
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: false,
+        });
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        let revision = app.sidebar_state.amend_request_revision().unwrap();
+        drop(app.update(Message::SourceControlAmendMessage {
+            key,
+            revision,
+            head,
+            result: Err("Current reader failed".into()),
+        }));
+        assert!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("Current reader failed")
+        );
+    }
+
+    #[test]
+    fn amend_loading_rejects_a_stale_commit_action_before_starting_git() {
+        let mut app = context_inspector_test_app(false);
+        app.sidebar_model = sidebar::tests::panel_model();
+        app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        app.active_workspace = Some(key.canonical_path.clone());
+        app.sidebar_state
+            .apply(&SidebarAction::CommitMessageChanged {
+                key: key.clone(),
+                message: "Original draft".into(),
+            });
+        app.sidebar_state.apply(&SidebarAction::AmendChanged {
+            key: key.clone(),
+            amend: true,
+        });
+        drop(app.update(Message::Sidebar(SidebarAction::Commit {
+            key: key.clone(),
+            message: "Original draft".into(),
+            amend: true,
+        })));
+        assert!(
+            !app.source_control_mutations
+                .contains_key(&key.canonical_path)
+        );
+        let revision = app.sidebar_state.amend_request_revision().unwrap();
+        app.sidebar_state.finish_amend_read(&key, revision);
+        drop(app.update(Message::Sidebar(SidebarAction::Commit {
+            key: key.clone(),
+            message: "Original draft".into(),
+            amend: true,
+        })));
+        assert!(
+            !app.source_control_mutations
+                .contains_key(&key.canonical_path)
         );
     }
 

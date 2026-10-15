@@ -5039,6 +5039,32 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
     }
 
+    /// Read a pinned commit message for the amend composer without walking history.
+    pub fn commit_message(
+        &self,
+        worktree: &Path,
+        oid: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<String, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            [
+                "show",
+                "--no-patch",
+                "--no-notes",
+                "--no-show-signature",
+                "--format=format:%B",
+                oid.as_str(),
+                "--",
+            ],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        String::from_utf8(output.stdout).map_err(|error| RepositoryError::InvalidOutput {
+            field: "commit_message",
+            reason: error.to_string(),
+        })
+    }
+
     /// The commit HEAD points at, or `None` on an unborn branch.
     pub fn resolve_head(
         &self,
@@ -6306,12 +6332,35 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         amend: bool,
         cancellation: &CancellationToken,
     ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, amend, None, cancellation)
+    }
+
+    /// Amend only the commit whose message the composer loaded. An earlier
+    /// queued commit or another writer must not redirect this amendment.
+    pub fn commit_amend_at(
+        &self,
+        request: &CommitRequest,
+        expected_head: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
+        self.commit_with_amend_expected(request, true, Some(expected_head), cancellation)
+    }
+
+    fn commit_with_amend_expected(
+        &self,
+        request: &CommitRequest,
+        amend: bool,
+        expected_head: Option<&Oid>,
+        cancellation: &CancellationToken,
+    ) -> Result<CommitOutcome, RepositoryError> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
         let mut command = self.commit_command(request)?;
         if amend {
-            command = command.arg("--amend");
+            // A loaded message is already an existing commit's exact content.
+            // Whitespace cleanup would silently rewrite a verbatim original.
+            command = command.arg("--amend").arg("--cleanup=verbatim");
         }
         if !amend
             && !self.has_staged_changes(&request.worktree, cancellation)?
@@ -6324,6 +6373,15 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             });
         }
         let before = self.resolve_head(&request.worktree, cancellation)?;
+        if let Some(expected) = expected_head
+            && before.as_ref() != Some(expected)
+        {
+            return Ok(CommitOutcome::NotCreated {
+                failure: MutationFailure::Rejected {
+                    reason: "HEAD changed since Amend was enabled. Toggle Amend again to load the current commit.".into(),
+                },
+            });
+        }
         let failure = match self.run(&command, cancellation) {
             Ok(output) if output.success => None,
             Ok(output) => Some(MutationFailure::from(git_failure(&command, output))),
@@ -8964,6 +9022,72 @@ mod tests {
                 command
                     .arguments
                     .contains(&OsString::from("--untracked-files=no"))
+            );
+        }
+
+        #[test]
+        fn amend_message_reader_preserves_the_original_message_and_pins_its_commit() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            git(root, &["config", "user.name", "Fixture"]);
+            git(root, &["config", "user.email", "fixture@example.invalid"]);
+            fs::write(root.join("file.txt"), "first\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            git(
+                root,
+                &[
+                    "commit",
+                    "-m",
+                    "Original subject  \n\n\nMultiline body  \nSecond line\n\n",
+                    "--cleanup=verbatim",
+                ],
+            );
+            let cancel = CancellationToken::new();
+            let service = service();
+            let original = service.resolve_head(root, &cancel).unwrap().unwrap();
+            let message = service.commit_message(root, &original, &cancel).unwrap();
+            assert_eq!(
+                message,
+                "Original subject  \n\n\nMultiline body  \nSecond line\n\n"
+            );
+            fs::write(root.join("file.txt"), "second\n").unwrap();
+            git(root, &["add", "file.txt"]);
+            let outcome = service
+                .commit_amend_at(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: message.clone(),
+                    },
+                    &original,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(outcome, CommitOutcome::Created { .. }));
+            let amended = service.resolve_head(root, &cancel).unwrap().unwrap();
+            assert_ne!(amended, original);
+            let stale = service
+                .commit_amend_at(
+                    &CommitRequest {
+                        worktree: root.to_path_buf(),
+                        message: "Wrong target".into(),
+                    },
+                    &original,
+                    &cancel,
+                )
+                .unwrap();
+            assert!(matches!(stale, CommitOutcome::NotCreated { .. }));
+            assert_eq!(
+                service.resolve_head(root, &cancel).unwrap(),
+                Some(amended.clone())
+            );
+            assert_eq!(
+                service.commit_message(root, &amended, &cancel).unwrap(),
+                message
+            );
+            assert_eq!(
+                service.commit_message(root, &original, &cancel).unwrap(),
+                message
             );
         }
 
