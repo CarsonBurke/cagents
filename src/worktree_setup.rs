@@ -67,20 +67,7 @@ struct Config {
     setup: Option<Commands>,
 }
 
-/// An immutable configuration snapshot for a trust dialog and one creation.
-/// Reload before preparation prevents approving one command and running another.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SetupPlan {
-    pub copy: Vec<String>,
-    pub commands: Vec<String>,
-    pub fingerprint: String,
-}
-
-impl SetupPlan {
-    pub fn requires_trust(&self) -> bool {
-        !self.commands.is_empty()
-    }
-}
+pub use crate::repository::WorktreeSetupPlan as SetupPlan;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SkippedCopy {

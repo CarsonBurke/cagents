@@ -5,6 +5,9 @@
 //! executed, which keeps argument handling shell-free and makes every operation
 //! straightforward to test with a fake executor.
 
+mod worktree_setup_intent;
+pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
+
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -3117,6 +3120,9 @@ pub struct CreateWorktreeRequest {
     pub base: BaseRevision,
     pub track: bool,
     pub operation_id: OperationId,
+    /// Exact setup choice retained through uncertain creation and restart.
+    #[serde(default)]
+    pub setup_intent: Option<WorktreeSetupIntent>,
 }
 
 /// User intent, resolved without creating directories or changing Git refs.
@@ -5708,6 +5714,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::DestinationOccupied.into());
         }
         Ok(CreateWorktreeRequest {
+            setup_intent: None,
             // Preserve the project identity used to restore operation rows.
             // Only relative destination resolution uses its worktree root.
             repository: input.repository.clone(),
@@ -7380,6 +7387,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let destination = root.path().join("feature; echo nope");
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: destination.clone(),
@@ -7410,6 +7418,7 @@ mod tests {
     fn tracking_is_configured_after_creation_from_the_validated_ref() {
         let root = tempfile::tempdir().unwrap();
         let request = CreateWorktreeRequest {
+            setup_intent: None,
             repository: PathBuf::from("/repo"),
             managed_root: root.path().into(),
             destination: root.path().join("feature"),
@@ -9169,6 +9178,7 @@ mod tests {
         let managed = tempfile::tempdir().unwrap();
         let plan = service
             .plan_worktree_creation(&CreateWorktreeRequest {
+                setup_intent: None,
                 repository: PathBuf::from("/repo"),
                 managed_root: managed.path().to_path_buf(),
                 destination: managed.path().join("feature"),
@@ -11650,6 +11660,7 @@ mod worktree_journal_tests {
             .unwrap();
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
+                setup_intent: None,
                 repository,
                 managed_root: root.clone(),
                 destination: root.join("feature"),
