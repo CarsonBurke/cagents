@@ -822,6 +822,34 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         .map_err(unavailable)
 }
 
+fn apply_native_execution_environment(
+    spec: &mut chat::protocol::ProcessSpec,
+    provider: Provider,
+    sourceless: bool,
+    selected: &BTreeMap<String, String>,
+    source: Option<&BTreeMap<String, String>>,
+) -> Result<(), ProtocolError> {
+    if sourceless {
+        if selected.iter().any(|(name, value)| {
+            !crate::model::agent_recovery::fresh_environment_key(provider, name, value, false)
+        }) {
+            return Err(error(
+                "Native execution environment contains an unrelated or private variable",
+            ));
+        }
+        spec.environment = sourceless_environment(
+            crate::model::agent_recovery::fresh_native_environment(provider, false),
+            selected.clone(),
+            std::mem::take(&mut spec.environment),
+        );
+    }
+    if let Some(environment) = source {
+        spec.environment = environment.clone();
+    }
+    spec.remove_unset_environment();
+    Ok(())
+}
+
 fn ensure_native_account_admission(
     host: &SharedHost,
     spec: &chat::protocol::ProcessSpec,
@@ -1150,6 +1178,21 @@ fn start_with_execution(
         ));
     }
     let process_launch = &operational_launch;
+    // Adapter construction can open/index resumed Claude history. Admit the
+    // actual operational home before that read, using the same environment
+    // overlay/unset policy as the eventual process spec. Explicit read-only
+    // history retains its independent non-executing path.
+    if !saved_history_only {
+        let mut admission = chat::protocol::ProcessSpec::from(&process_launch.recipe);
+        apply_native_execution_environment(
+            &mut admission,
+            session.launch.provider,
+            source.is_none(),
+            &execution_environment.0,
+            source_execution.as_ref(),
+        )?;
+        ensure_native_account_admission(host, &admission, execution.as_deref())?;
+    }
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1181,43 +1224,22 @@ fn start_with_execution(
     ) {
         check_launch_account(&session.launch)?;
     }
-    if source.is_none() && !matches!(spec.transport, chat::protocol::TransportSpec::History) {
-        // A conversation with no proven source has no proven environment to
-        // preserve, so it starts from the daemon's own native configuration
-        // whether or not it names a stopped terminal. Requiring the absence of
-        // a descriptor here left a conversation converted from a stopped agent
-        // terminal with nothing but that terminal's recorded recipe, which is
-        // empty for a terminal whose resume hint was discarded when its agent
-        // exited.
-        //
-        // Standalone conversations also receive transient execution
-        // configuration from the GUI, including credentials unavailable in the
-        // daemon environment. Keep these values in the process spec only,
-        // never the durable session. Explicit selected configuration takes
-        // precedence over daemon defaults, and the recipe's own environment
-        // takes precedence over both.
-        if execution_environment.0.iter().any(|(name, value)| {
-            !crate::model::agent_recovery::fresh_environment_key(
-                session.launch.provider,
-                name,
-                value,
-                false,
-            )
-        }) {
-            return Err(error(
-                "Native execution environment contains an unrelated or private variable",
-            ));
-        }
-        spec.environment = sourceless_environment(
-            crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false),
-            execution_environment.0,
-            std::mem::take(&mut spec.environment),
-        );
-    }
-    if let Some(environment) = &source_execution {
-        spec.environment = environment.clone();
-    }
-    spec.remove_unset_environment();
+    let sourceless = source.is_none()
+        && !matches!(spec.transport, chat::protocol::TransportSpec::History);
+    // A conversation with no proven source has no proven environment to
+    // preserve, so it starts from the daemon's own native configuration
+    // whether or not it names a stopped terminal. Standalone conversations
+    // also receive transient GUI configuration unavailable to the daemon.
+    // Keep these values in the spec, never the durable session. Selected
+    // configuration overrides daemon defaults; the issued recipe overrides
+    // both. The identical overlay also protects pre-construction admission.
+    apply_native_execution_environment(
+        &mut spec,
+        session.launch.provider,
+        sourceless,
+        &execution_environment.0,
+        source_execution.as_ref(),
+    )?;
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3627,6 +3649,40 @@ mod tests {
             assert!(!state.chat_spawning.contains_key(&original.id));
             assert!(!state.issued_chat_ids.contains(&original.id));
             assert_eq!(original.launch.recipe.working_directory, issued);
+        }
+        // Claude adapter construction reads resumed history synchronously.
+        // This transcript does not exist: admission must refuse the reserved
+        // physical home first, rather than trying to open/index its history.
+        assert!(!profile.join("projects").exists());
+        for transient in [false, true] {
+            let mut environment = BTreeMap::from([
+                ("HOME".into(), root.join("home").display().to_string()),
+                ("CODEX_HOME".into(), root.join("home").display().to_string()),
+            ]);
+            let mut selected = BTreeMap::new();
+            if transient {
+                selected.insert("CLAUDE_CONFIG_DIR".into(), profile.display().to_string());
+            } else {
+                environment.insert("CLAUDE_CONFIG_DIR".into(), profile.display().to_string());
+            }
+            let session = Session {
+                id: TerminalId::new(), terminal: None, proof: None,
+                owned_codex_listener: None, native_continuity: Default::default(),
+                launch: chat::Launch { provider: Provider::Claude,
+                    session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
+                    recipe: LaunchRecipe { program: executable.display().to_string(), arguments: Vec::new(),
+                        working_directory: issued.clone(), environment, unset_environment: Default::default() } },
+            };
+            let id = session.id;
+            let refusal = start_at_execution_directory(&host, 1, session,
+                crate::terminal_ipc::ChatExecutionEnvironment(selected), context.clone(), &operational).unwrap_err();
+            assert!(refusal.message.contains("being changed"), "reservation must win before missing-history errors: {refusal:?}");
+            assert!(!marker.exists());
+            assert!(!profile.join("projects").exists());
+            let state = host.lock().unwrap();
+            assert!(!state.chats.contains_key(&id));
+            assert!(!state.chat_spawning.contains_key(&id));
+            assert!(!state.issued_chat_ids.contains(&id));
         }
         // A reused original spelling cannot replace the approved inode.
         let spec = ProcessSpec::from(&LaunchRecipe { program: "/bin/false".into(), arguments: Vec::new(),
