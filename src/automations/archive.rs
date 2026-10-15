@@ -24,6 +24,10 @@ impl ArchivedPaneReadiness {
                 crate::agent_execution::Origin::Automation { .. }
             )
             || archive.agent.spec.provider != session.launch.provider
+            || session
+                .proof
+                .as_ref()
+                .is_none_or(|proof| !proof.is_complete())
             || !archive
                 .agent
                 .session
@@ -161,13 +165,18 @@ mod tests {
     fn fixture() -> (AgentId, Session, ArchivedConversation) {
         let agent = AgentId::new();
         let path = std::path::PathBuf::from("/fixture");
-        let session = crate::chat::fresh_session(
+        let mut session = crate::chat::fresh_session(
             Provider::Claude,
             TerminalId::new(),
             path.clone(),
             &crate::account::Account::system(Provider::Claude),
         )
         .unwrap();
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("archive-host"),
+            boot_id: crate::model::BootId::new("archive-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("archive-incarnation"),
+        });
         let record = Agent {
             name: None,
             id: agent,
@@ -218,6 +227,13 @@ mod tests {
         let mut changed = session.clone();
         changed.id = TerminalId::new();
         assert!(!receipt.matches(id, &changed));
+        let mut unissued = archive.clone();
+        let Some(HostedSession::Chat(unissued_session)) = unissued.agent.session.as_mut() else {
+            unreachable!()
+        };
+        unissued_session.proof = None;
+        let unissued_session = unissued_session.clone();
+        assert!(ArchivedPaneReadiness::qualify(id, &unissued_session, &unissued).is_err());
         assert!(ArchivedPaneReadiness::qualify(id, &changed, &archive).is_err());
         for field in 0..5 {
             let mut invalid = archive.clone();
