@@ -10205,7 +10205,7 @@ impl Cagents {
                     .iter()
                     .any(|row| row.path == *path && row.ignored)
             });
-        let location = crate::editor_navigation::parse_location(self.sidebar_state.files_query()).map(|(_, line, column)| (line, column));
+        let location = crate::editor_navigation::parse_location(self.sidebar_state.files_query().trim()).map(|(_, line, column)| (line, column));
         let path = path.as_path().to_path_buf();
         let task = match self.repository_card_for(&key.canonical_path) {
             Some(card) => {
