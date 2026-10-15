@@ -20,11 +20,7 @@ pub enum ModalRole {
     ProjectRemove,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ModalRequest {
-    Counter(u64),
-    Operation(crate::model::OperationId),
-}
+pub use super::modal_ui::Instance as ModalRequest;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ModalTarget {

@@ -29,6 +29,13 @@ pub(super) enum Modal {
     Approval,
 }
 
+/// Feature requests keep their original identity without lossy conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Instance {
+    Counter(u64),
+    Operation(crate::model::OperationId),
+}
+
 #[derive(Default)]
 pub(super) struct Stack {
     frames: Vec<Frame>,
@@ -39,7 +46,7 @@ pub(super) struct Stack {
 struct Frame {
     kind: Modal,
     generation: u64,
-    instance: Option<project_ui::ModalRequest>,
+    instance: Option<Instance>,
     restore: widget::Id,
     focus: crate::interaction::FocusSnapshot,
 }
@@ -72,7 +79,7 @@ impl Stack {
         &mut self,
         active: &[Modal],
         fallback: widget::Id,
-        instance: impl Fn(Modal) -> Option<project_ui::ModalRequest>,
+        instance: impl Fn(Modal) -> Option<Instance>,
     ) -> Option<(Modal, u64, bool)> {
         let previous = self.frames.last().map(|f| f.kind);
         // A removed lower dialog cannot remain the restore target of the
@@ -308,7 +315,7 @@ impl Cagents {
         let changed = self.modal_stack.reconcile_instances(&active, fallback.clone(), |kind| {
             match kind {
                 Modal::Project(role) => project_ui.modal_target(role).map(|target| target.request),
-                Modal::ChatClose => chat_close.map(|dialog| project_ui::ModalRequest::Counter(dialog.generation())),
+                Modal::ChatClose => chat_close.map(|dialog| Instance::Counter(dialog.generation())),
                 _ => None,
             }
         });
