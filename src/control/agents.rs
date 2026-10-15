@@ -50,7 +50,9 @@ pub enum AgentCommand {
         #[arg(help = "Presentation surface for the provider session.")]
         surface: String,
         #[arg(long)]
-        #[arg(help = "Provider model ID (Claude: haiku/sonnet/opus; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs.")]
+        #[arg(
+            help = "Provider model ID (Claude: haiku/sonnet/opus; Codex: exact provider catalog ID; OMP: provider/model). Omit to use the provider default; the native chat model picker lists available IDs."
+        )]
         model: Option<String>,
         #[arg(long)]
         #[arg(help = "Permission policy (Claude: default/manual/auto/acceptEdits/plan/dontAsk/bypassPermissions; Codex: untrusted/on-failure/on-request/never; OMP: always-ask/write/yolo).",

@@ -136,7 +136,10 @@ pub enum AutomationCommand {
 }
 
 fn parse_page_limit(value: &str) -> Result<usize, String> {
-    value.parse::<usize>().ok().filter(|value| (1..=100).contains(value))
+    value
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=100).contains(value))
         .ok_or_else(|| "Choose a page size from 1 through 100".into())
 }
 
