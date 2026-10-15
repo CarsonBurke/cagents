@@ -1773,7 +1773,7 @@ impl Server {
         Ok(Resident {
             backend_instance: Some(self.actor.backend_instance()),
             backend_conversation_revision: Some(backend_revision),
-            backend_confirmation_pending: backend_thread != confirmed_session,
+            backend_confirmation_pending: backend_thread != confirmed_session || (close.completed && close.owns_work),
             provider_process,
             generation,
             session_id,

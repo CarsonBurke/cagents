@@ -235,10 +235,11 @@ fn issue_terminal_handoff(
     source_binding: crate::terminal_ipc::ChatSourceBinding,
     retained_binding: Option<crate::terminal_ipc::ChatSourceBinding>,
     terminal: crate::terminal_ipc::TerminalDescriptor,
+    claim: Option<&source_binding::Continuation>,
 ) -> Result<crate::terminal_ipc::TerminalHandoffReceipt, ProtocolError> {
-    if !state
-        .native_sources
-        .validates(retained_binding.as_ref().unwrap_or(&source_binding))
+    let binding = retained_binding.as_ref().unwrap_or(&source_binding);
+    if !(state.native_sources.validates(binding)
+        || claim.is_some_and(|claim| source_binding::claimed_publication(state, binding, claim)))
         || state
             .terminals
             .get(&terminal.session.id)
@@ -1926,6 +1927,14 @@ fn codex_terminal_view_captured(
     captured_intent: Option<crate::terminal_ipc::ChatSourceBinding>,
     after_source: impl FnOnce(),
 ) -> Result<ServerResponse, ProtocolError> {
+    let pending_admitted = captured_intent.as_ref().map(|intent| source_binding::pending_admitted(host, client, intent)).transpose()?.flatten();
+    let recovering_claim = pending_admitted.is_some();
+    if let Some(pending) = &pending_admitted {
+        let intent = captured_intent.as_ref().expect("pending requires captured intent");
+        let mut continuation = source_binding::continuation(host, pending)?;
+        source_binding::claim_continuation(host, intent, pending, &mut continuation)?;
+        source_binding::restore_created_pair(host, client, intent)?;
+    }
     let (issued_source, source_instance, source_binding) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, chat_id)?;
@@ -1934,7 +1943,7 @@ fn codex_terminal_view_captured(
                 "The original chat actor changed before terminal handoff",
             ));
         }
-        let binding = record.source_binding.clone().ok_or_else(|| {
+        let binding = pending_admitted.or_else(|| record.source_binding.clone()).ok_or_else(|| {
             unavailable("This native backend has no authenticated source binding")
         })?;
         (binding.source.clone(), record.execution_instance, binding)
@@ -1974,6 +1983,45 @@ fn codex_terminal_view_captured(
                         && receipt.source_binding == original_intent
                 })
                 .cloned();
+            if recovering_claim {
+                // This exact worker was retained before the lost pair/update
+                // reply. Recover its original backend claim before touching
+                // ownership again; do not issue from a later getter.
+                let pair = live.handle.clone();
+                let mut updated = session.clone();
+                updated.terminal = Some(descriptor.session.clone());
+                drop(state);
+                source_binding::claim_continuation(host, &original_intent, &source_binding, &mut continuation)?;
+                source_binding::update_claimed_source(&continuation, updated, pair.holder_identity().cloned()).map_err(unavailable)?;
+                let retained_binding = source_binding::complete_pair(host, chat_id, &continuation)?;
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if state.terminals.get(&descriptor.session.id).is_none_or(|record| !record.handle.same_worker(&pair)) {
+                    return Err(unavailable("The retained handoff worker changed; its successor was preserved"));
+                }
+                let receipt = match receipt {
+                    Some(receipt) => {
+                        if receipt.retained_binding.as_ref() != Some(&retained_binding) {
+                            return Err(unavailable("The retained handoff source changed before its disposition; no receipt was refreshed"));
+                        }
+                        receipt
+                    }
+                    None => issue_terminal_handoff(&mut state, issued_source.clone(), source_instance, original_intent.clone(), Some(retained_binding), descriptor, Some(&continuation))?,
+                };
+                let record = state.chats.get_mut(&chat_id).filter(|record| record.handle.same_actor(handle))
+                    .ok_or_else(|| unavailable("The retained backend changed before handoff publication"))?;
+                record.handoff_receipt = Some(receipt.clone());
+                drop(state);
+                source_binding::finish_continuation(host, chat_id, &continuation)?;
+                {
+                    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    state.validate_terminal_handoff_receipt(&receipt)?;
+                    if let Some(record) = state.chats.get_mut(&chat_id).filter(|record| record.handle.same_actor(handle)) {
+                        record.returning_terminal = false;
+                    }
+                }
+                let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The retained handoff transcript is unavailable"))?;
+                return Ok(ServerResponse::ChatTerminal { chat_id, session: receipt.terminal.session.clone(), receipt, snapshot });
+            }
             let receipt = match receipt {
                 Some(receipt) => receipt,
                 None => issue_terminal_handoff(
@@ -1983,6 +2031,7 @@ fn codex_terminal_view_captured(
                     original_intent.clone(),
                     (original_intent != source_binding).then_some(source_binding.clone()),
                     descriptor,
+                    None,
                 )?,
             };
             state.validate_terminal_handoff_receipt(&receipt)?;
@@ -2000,7 +2049,7 @@ fn codex_terminal_view_captured(
                 snapshot,
             });
         }
-        if record.returning_terminal {
+        if record.returning_terminal && !recovering_claim {
             return Err(unavailable("The CLI view is already opening."));
         }
         let completed = if let Some(terminal) = state.terminals.get(&chat_id) {
@@ -2061,7 +2110,7 @@ fn codex_terminal_view_captured(
         }
         return Err(error);
     }
-    source_binding::claim_continuation(host, &source_binding, &mut continuation)?;
+    source_binding::claim_continuation(host, &original_intent, &source_binding, &mut continuation)?;
     if let Some((source, terminal, proof)) = completed {
         let release = (|| {
             if terminal.holder_identity().is_some() {
@@ -2100,6 +2149,7 @@ fn codex_terminal_view_captured(
             record.session.terminal = None;
             record.paired_terminal = None;
             source_binding::pair_changed(&mut state, chat_id);
+            source_binding::remember_released_pair(&mut state, chat_id, &continuation, &terminal)?;
             session = unpaired;
             Ok(())
         })();
@@ -2154,6 +2204,7 @@ fn codex_terminal_view_captured(
             return Err(error);
         }
     };
+    source_binding::remember_created_pair(host, chat_id, &continuation, &paired_terminal)?;
     let mut before = session.clone();
     before.launch.session_id = handle
         .confirmed_session_id()
@@ -2186,7 +2237,6 @@ fn codex_terminal_view_captured(
             .map_err(unavailable)?;
         after_source();
         let retained_binding = source_binding::complete_pair(host, chat_id, &continuation)?;
-        source_binding::finish_continuation(host, chat_id, &continuation)?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !state
             .terminals
@@ -2203,7 +2253,6 @@ fn codex_terminal_view_captured(
         // Only the canonical observer publishes confirmed thread identity;
         // pairing must preserve a newer observation made during its RPC.
         record.source_process = paired_terminal.observe_agent_process();
-        record.returning_terminal = false;
         let receipt = issue_terminal_handoff(
             &mut state,
             issued_source.clone(),
@@ -2211,6 +2260,7 @@ fn codex_terminal_view_captured(
             original_intent.clone(),
             Some(retained_binding),
             descriptor.clone(),
+            Some(&continuation),
         )?;
         state
             .chats
@@ -2219,6 +2269,13 @@ fn codex_terminal_view_captured(
             .handoff_receipt = Some(receipt.clone());
         state.inventory_generation += 1;
         drop(state);
+        source_binding::finish_continuation(host, chat_id, &continuation)?;
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(record) = state.chats.get_mut(&chat_id).filter(|record| record.handle.same_actor(handle)) {
+                record.returning_terminal = false;
+            }
+        }
         let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?;
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2231,6 +2288,11 @@ fn codex_terminal_view_captured(
         })
     })();
     if let Err(error) = result {
+        if host.lock().unwrap_or_else(|p| p.into_inner()).chats.get(&chat_id)
+            .and_then(|record| record.handoff_receipt.as_ref())
+            .is_some_and(|receipt| receipt.source_binding == original_intent && receipt.terminal.execution_instance == paired_terminal.execution_instance()) {
+            return Err(error);
+        }
         let proof = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(record) = state
@@ -2290,6 +2352,7 @@ fn codex_terminal_view_captured(
             record.session.terminal = None;
             record.paired_terminal = None;
             source_binding::pair_changed(&mut state, chat_id);
+            source_binding::remember_released_pair(&mut state, chat_id, &continuation, &paired_terminal)?;
         }
         drop(state);
         source_binding::finish_continuation(host, chat_id, &continuation)?;
@@ -3248,7 +3311,10 @@ fn process_inner(
                             .filter(|receipt| receipt.source_binding == expected)
                     })
             };
-            let admitted_binding = if let Some(receipt) = &replay {
+            let pending_admitted = source_binding::pending_admitted(host, client, &expected)?;
+            let admitted_binding = if let Some(pending) = pending_admitted {
+                pending
+            } else if let Some(receipt) = &replay {
                 if receipt.source_binding != expected {
                     return Err(unavailable(
                         "This handoff belongs to another captured backend",
@@ -3390,7 +3456,7 @@ fn process_inner(
             }
             // Closing interrupts active work and waits for confirmed teardown.
             // Never start a second writer before teardown has been proved.
-            source_binding::claim_continuation(host, &admitted_binding, &mut continuation)?;
+            source_binding::claim_continuation(host, &expected, &admitted_binding, &mut continuation)?;
             source_binding::close_continuation(host, chat_id, &continuation)?;
             let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The provider stopped but its exact final transcript could not be read; retry the retained close receipt"))?;
             if snapshot.session_id != session.launch.session_id {
@@ -3480,6 +3546,7 @@ fn process_inner(
                     expected.clone(),
                     (admitted_binding != expected).then_some(admitted_binding.clone()),
                     descriptor.clone(),
+                    None,
                 )?;
                 state.issued_chat_ids.insert(chat_id);
                 let mut record = state.chats.remove(&chat_id);

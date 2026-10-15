@@ -258,6 +258,13 @@ impl LocalHandle {
         action();
     }
 
+    pub(crate) fn backend_is_observed(&self) -> bool {
+        self.0.close_state.try_lock().is_ok_and(|close| !close.unobserved_native)
+    }
+    #[cfg(test)]
+    pub(crate) fn withdraw_backend_observation_for_test(&self) {
+        self.0.close_state.lock().unwrap().unobserved_native = true;
+    }
     pub(crate) fn has_backend_source_claim(&self) -> bool {
         self.0.source_claimed.load(Ordering::Acquire)
     }
@@ -319,6 +326,8 @@ struct Inner {
     confirmed_session: Arc<Mutex<Option<String>>>,
     backend_conversation: Arc<Mutex<BackendConversation>>,
     source_claimed: Arc<AtomicBool>,
+    #[cfg(test)]
+    lose_next_source_release_reply: AtomicBool,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -681,6 +690,8 @@ impl LocalHandle {
             confirmed_session: confirmed_session.clone(),
             backend_conversation: backend_conversation.clone(),
             source_claimed: source_claimed.clone(),
+            #[cfg(test)]
+            lose_next_source_release_reply: AtomicBool::new(false),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -719,6 +730,7 @@ impl LocalHandle {
                 let mut actor = Actor {
                     backend_instance,
                     source_claim: None,
+                    released_source_claim: None,
                     provider_process: provider_process.clone(),
                     pinned_directory,
                     launch_context: spec.execution.clone(),
@@ -1415,7 +1427,16 @@ impl LocalHandle {
         if self.is_completed() {
             return expected.matches_local(self).then_some(()).ok_or_else(|| "Completed backend changed".into());
         }
-        self.ownership_command(ActorCommand::ReleaseBackendSource { expected: expected.clone(), claim })
+        self.ownership_command(ActorCommand::ReleaseBackendSource { expected: expected.clone(), claim })?;
+        #[cfg(test)]
+        if self.0.lose_next_source_release_reply.swap(false, Ordering::AcqRel) {
+            return Err("Fixture lost the applied source-claim disposition reply; retain its exact operation".into());
+        }
+        Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn lose_next_source_release_reply_for_test(&self) {
+        self.0.lose_next_source_release_reply.store(true, Ordering::Release);
     }
     pub(crate) fn close_backend_source(&self, expected: &BackendIdentity, claim: uuid::Uuid) -> Result<(), String> {
         if self.is_completed() {
@@ -2494,6 +2515,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
 struct Actor {
     backend_instance: uuid::Uuid,
     source_claim: Option<(uuid::Uuid, BackendIdentity)>,
+    released_source_claim: Option<(uuid::Uuid, BackendIdentity)>,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
@@ -3138,7 +3160,12 @@ impl Actor {
                 ActorCommand::ReleaseBackendSource { expected, claim } => {
                     let result = if self.source_claim_matches(&expected, claim) {
                         self.source_claim = None;
+                        self.released_source_claim = Some((claim, expected));
                         self.source_claimed.store(false, Ordering::Release);
+                        Ok(())
+                    } else if self.released_source_claim.as_ref().is_some_and(|(token, original)| *token == claim && original == &expected) {
+                        // Metadata-only repetition: acknowledge this exact past
+                        // disposition without changing another current claim.
                         Ok(())
                     } else { Err("Source claim changed; its exact owner remains retained".into()) };
                     let _ = reply.send(result);

@@ -19,7 +19,8 @@ pub(crate) struct BackendIdentity {
 impl BackendIdentity {
     pub(super) fn matches_local(&self, local: &LocalHandle) -> bool {
         let (thread, revision) = local.backend_confirmation();
-        self.actor == local.backend_instance()
+        local.backend_is_observed()
+            && self.actor == local.backend_instance()
             && self.conversation == thread
             && self.conversation_revision == revision
             && local.confirmed_session_id() == thread
@@ -28,7 +29,8 @@ impl BackendIdentity {
     pub(super) fn matches_actor(&self, actor: &super::Actor) -> bool {
         let current = actor.backend_conversation.lock().unwrap_or_else(|p| p.into_inner());
         let process = actor.native_peer.clone().or_else(|| actor.provider_process.lock().unwrap_or_else(|p| p.into_inner()).clone());
-        self.actor == actor.backend_instance
+        !actor.close_state.lock().unwrap_or_else(|p| p.into_inner()).unobserved_native
+            && self.actor == actor.backend_instance
             && process.as_ref() == Some(&self.process)
             && self.conversation == current.thread
             && self.conversation_revision == current.revision
@@ -329,6 +331,9 @@ impl Handle {
                 })
             }
             Owner::Local(local) => {
+                if !local.backend_is_observed() {
+                    return Err("The retained native backend is not observed by this actor; reattach before confirming a handoff".into());
+                }
                 let process = if let Some(process) = local.provider_process() {
                     process
                 } else {
@@ -367,7 +372,8 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => {
                 let (thread, revision) = local.backend_confirmation();
-                local.backend_instance() == expected.actor
+                local.backend_is_observed()
+                    && local.backend_instance() == expected.actor
                     && thread == expected.conversation
                     && revision == expected.conversation_revision
                     && local.confirmed_session_id() == thread
@@ -393,7 +399,15 @@ impl Handle {
     }
     #[cfg(test)]
     pub(crate) fn claim_backend_source_losing_reply_for_test(&self, expected: &BackendIdentity) -> Result<(), String> {
-        self.local_actor().ok_or("fixture requires actual Local actor")?.claim_backend_source_losing_reply_for_test(expected)
+        self.local_actor()?.claim_backend_source_losing_reply_for_test(expected)
+    }
+    #[cfg(test)]
+    pub(crate) fn withdraw_backend_observation_for_test(&self) {
+        self.local_actor().expect("fixture requires actual Local actor").withdraw_backend_observation_for_test();
+    }
+    #[cfg(test)]
+    pub(crate) fn lose_next_source_release_reply_for_test(&self) {
+        self.local_actor().expect("fixture requires actual Local actor").lose_next_source_release_reply_for_test();
     }
     pub(crate) fn release_backend_source(&self, expected: &BackendIdentity, claim: uuid::Uuid) -> Result<(), String> {
         match &self.0 {
