@@ -457,16 +457,35 @@ mod tests {
         let alias = root.path().join("alias");
         std::os::unix::fs::symlink(&selected, &alias).unwrap();
         let key = uuid::Uuid::new_v4();
-        store.update(|registry| registry.link(Provider::Codex, key, selected.clone(), None, Some(&homes), 1))
-            .unwrap().1.unwrap();
+        store
+            .update(|registry| {
+                registry.link(
+                    Provider::Codex,
+                    key,
+                    selected.clone(),
+                    None,
+                    Some(&homes),
+                    1,
+                )
+            })
+            .unwrap()
+            .1
+            .unwrap();
         let account = Account::linked(Provider::Codex, key, selected);
         let host = crate::host::AccountReservation::test_host();
-        let reservation = crate::host::AccountReservation::test_install(&host, &[account.clone()], store, &homes).unwrap();
+        let reservation =
+            crate::host::AccountReservation::test_install(&host, &[account.clone()], store, &homes)
+                .unwrap();
         let invoked = Cell::new(0);
         let aliased = Account::linked(Provider::Codex, key, alias);
-        let refused = with_refresh_admission(&host, &aliased, || invoked.set(invoked.get() + 1)).unwrap_err();
+        let refused =
+            with_refresh_admission(&host, &aliased, || invoked.set(invoked.get() + 1)).unwrap_err();
         assert!(refused.contains("account home is being changed"));
-        assert_eq!(invoked.get(), 0, "a refused explicit refresh must not invoke its provider");
+        assert_eq!(
+            invoked.get(),
+            0,
+            "a refused explicit refresh must not invoke its provider"
+        );
         let other = Account::linked(Provider::Codex, uuid::Uuid::new_v4(), unrelated);
         with_refresh_admission(&host, &other, || invoked.set(invoked.get() + 1)).unwrap();
         assert_eq!(invoked.get(), 1, "an unrelated refresh is still admitted");
@@ -474,5 +493,4 @@ mod tests {
         with_refresh_admission(&host, &account, || invoked.set(invoked.get() + 1)).unwrap();
         assert_eq!(invoked.get(), 2);
     }
-
 }

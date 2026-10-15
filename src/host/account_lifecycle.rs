@@ -1353,8 +1353,17 @@ pub(crate) mod tests {
         std::fs::create_dir(&selected).unwrap();
         std::fs::create_dir(&foreign).unwrap();
         let host = host();
-        let reservation = Reservation::test_install(&host,
-            &[Account::linked(Provider::Codex, uuid::Uuid::new_v4(), selected.clone())], store, &homes).unwrap();
+        let reservation = Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Codex,
+                uuid::Uuid::new_v4(),
+                selected.clone(),
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
         let environment = BTreeMap::from([
             ("HOME".into(), foreign.display().to_string()),
             ("CODEX_HOME".into(), String::new()),
@@ -1362,23 +1371,73 @@ pub(crate) mod tests {
         assert!(ensure_launch(&host, &selected, &environment, &BTreeSet::new(), false).is_err());
         let unset = BTreeSet::from(["CODEX_HOME".into()]);
         ensure_launch(&host, &selected, &environment, &unset, false).unwrap();
-        ensure_launch(&host, &selected, &BTreeMap::from([("HOME".into(), foreign.display().to_string())]), &BTreeSet::new(), false).unwrap();
-        let launch = crate::chat::Launch {provider: Provider::Codex,
+        ensure_launch(
+            &host,
+            &selected,
+            &BTreeMap::from([("HOME".into(), foreign.display().to_string())]),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap();
+        let launch = crate::chat::Launch {
+            provider: Provider::Codex,
             session_id: Some(uuid::Uuid::new_v4().to_string()),
-            recipe: crate::model::LaunchRecipe {program: "/does-not-exist/codex".into(),
+            recipe: crate::model::LaunchRecipe {
+                program: "/does-not-exist/codex".into(),
                 arguments: vec!["--remote".into(), "unix://".into()],
-                working_directory: selected.clone(), environment: environment.clone(), unset_environment: BTreeSet::new() }};
+                working_directory: selected.clone(),
+                environment: environment.clone(),
+                unset_environment: BTreeSet::new(),
+            },
+        };
         // Private filesystem-only control: the actual constructor resolves
         // the empty selector to cwd, not the foreign HOME fallback. The
         // absent socket makes this stop before any connection/provider work.
-        let loader_error = crate::chat::protocol::codex::create(&launch).err().expect("private socket is absent");
-        assert!(loader_error.contains(&selected.join("app-server-control/app-server-control.sock").display().to_string()), "{loader_error}");
+        let loader_error = crate::chat::protocol::codex::create(&launch)
+            .err()
+            .expect("private socket is absent");
+        assert!(
+            loader_error.contains(
+                &selected
+                    .join("app-server-control/app-server-control.sock")
+                    .display()
+                    .to_string()
+            ),
+            "{loader_error}"
+        );
         let directory = File::open(&selected).unwrap();
-        assert!(ensure_launch_at_directory(&host, &selected, &environment, &BTreeSet::new(), false, Some(&directory)).is_err());
-        ensure_launch_at_directory(&host, &selected, &environment, &unset, false, Some(&directory)).unwrap();
+        assert!(
+            ensure_launch_at_directory(
+                &host,
+                &selected,
+                &environment,
+                &BTreeSet::new(),
+                false,
+                Some(&directory)
+            )
+            .is_err()
+        );
+        ensure_launch_at_directory(
+            &host,
+            &selected,
+            &environment,
+            &unset,
+            false,
+            Some(&directory),
+        )
+        .unwrap();
         // An effective unset permits HOME fallback, but the raw constructor
         // operand still needs its own refusal before that constructor runs.
-        assert!(ensure_launch(&host, &selected, &launch.recipe.environment, &BTreeSet::new(), false).is_err());
+        assert!(
+            ensure_launch(
+                &host,
+                &selected,
+                &launch.recipe.environment,
+                &BTreeSet::new(),
+                false
+            )
+            .is_err()
+        );
         drop(reservation);
         ensure_launch(&host, &selected, &environment, &BTreeSet::new(), false).unwrap();
     }
@@ -1391,10 +1450,21 @@ pub(crate) mod tests {
         let selected = root.path().join("reserved");
         let cwd = root.path().join("working");
         let foreign = root.path().join("foreign");
-        for path in [&selected, &cwd, &foreign] { std::fs::create_dir(path).unwrap(); }
+        for path in [&selected, &cwd, &foreign] {
+            std::fs::create_dir(path).unwrap();
+        }
         let host = host();
-        let reservation = Reservation::test_install(&host,
-            &[Account::linked(Provider::Claude, uuid::Uuid::new_v4(), selected)], store, &homes).unwrap();
+        let reservation = Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                selected,
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
         let mut environment = BTreeMap::from([
             ("HOME".into(), "relative-home".into()),
             ("CODEX_HOME".into(), foreign.display().to_string()),
@@ -1414,5 +1484,4 @@ pub(crate) mod tests {
         environment.insert("HOME".into(), "relative-home".into());
         ensure_launch(&host, &cwd, &environment, &unset, false).unwrap();
     }
-
 }
