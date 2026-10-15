@@ -386,6 +386,8 @@ pub(super) fn restore(
         execution_instance: identity.instance,
         console_recipe: inspection.execution_console,
         paired_terminal: paired.clone(),
+        handoff_receipt: None,
+            source_binding: None,
         session,
         handle: handle.clone(),
         source_process: None,
@@ -424,6 +426,7 @@ pub(super) fn restore(
         return Err("Daemon ownership changed before retained Claude registration; the provider remains owned by its holder".into());
     }
     state.publish_chat_observer(id, identity.instance, observer_registration.stamp());
+    state.native_sources.installed(id, record.execution_instance);
     let retired = state.chats.insert(id, record);
     state.upgrade_chats.insert(id, previous_sources);
     state.native_adoption_failures.clear(id);

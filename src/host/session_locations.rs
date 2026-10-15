@@ -730,6 +730,8 @@ mod tests {
                 execution_instance,
                 console_recipe: None,
                 paired_terminal: None,
+                handoff_receipt: None,
+            source_binding: None,
                 session: source.clone(),
                 handle: handle.clone(),
                 source_process: None,
@@ -1662,6 +1664,7 @@ mod tests {
             1,
             ClientRequest::ChatReturnTerminal {
                 chat_id: fixture.source.id,
+                expected: super::super::chat::source_binding::fixture_binding(&fixture.host, fixture.source.id),
             },
         )
         .unwrap()

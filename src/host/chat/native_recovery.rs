@@ -420,6 +420,8 @@ fn restore_authenticated(
         execution_instance,
         console_recipe: execution_console,
         paired_terminal: paired,
+        handoff_receipt: None,
+            source_binding: None,
         session,
         handle,
         source_process: None,
@@ -439,6 +441,7 @@ fn restore_authenticated(
     let response = session_snapshot(&record);
     state.issued_chat_ids.insert(id);
     state.publish_chat_observer(id,execution_instance,observer_registration.stamp());
+    state.native_sources.installed(id, record.execution_instance);
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();

@@ -308,6 +308,9 @@ pub(crate) struct HostState {
     pub(super) chat_observer_stamps: BTreeMap<TerminalId, (uuid::Uuid, uuid::Uuid)>,
     pub(super) directory_thread_observers: BTreeMap<TerminalId, std::sync::Weak<Mutex<()>>>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
+    pub(super) native_sources: super::chat::source_binding::History,
+    handoff_receipts: BTreeMap<uuid::Uuid, crate::terminal_ipc::TerminalHandoffReceipt>,
+    handoff_receipt_order: VecDeque<uuid::Uuid>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     pub(super) chat_bindings: BTreeMap<TerminalId, super::chat::PendingBinding>,
     pub(super) native_closing: BTreeMap<TerminalId, super::chat::NativeClose>,
@@ -339,6 +342,43 @@ struct PreparedUpgrade {
 }
 
 impl HostState {
+    /// Keep a bounded history after workers/actors retire. Live and pending
+    /// owners retain their one exact receipt independently of history eviction.
+    pub(super) fn remember_terminal_handoff(&mut self, receipt: crate::terminal_ipc::TerminalHandoffReceipt) {
+        const HISTORY: usize = 1024;
+        if self.handoff_receipts.contains_key(&receipt.operation) { return; }
+        while self.handoff_receipt_order.len() >= HISTORY {
+            if let Some(old) = self.handoff_receipt_order.pop_front() { self.handoff_receipts.remove(&old); }
+        }
+        self.handoff_receipt_order.push_back(receipt.operation);
+        self.handoff_receipts.insert(receipt.operation, receipt);
+    }
+
+    /// Called under the same HostLock as a conditional source/membership edit.
+    /// Neither public IDs nor a caller's descriptor can mint transition authority.
+    pub(super) fn validate_terminal_handoff_receipt(&self, receipt: &crate::terminal_ipc::TerminalHandoffReceipt) -> Result<(), ProtocolError> {
+        super::chat::source_binding::validate_receipt(self, receipt)?;
+        let id = receipt.terminal.session.id;
+        let instance = receipt.terminal.execution_instance;
+        if instance.is_nil() || self.published_terminal_workers.latest(id) != Some(instance)
+            || self.spawning.contains(&id) || self.chat_spawning.contains_key(&id)
+            || self.chats.get(&id).is_some_and(|record|
+                id != receipt.source.id || record.execution_instance != receipt.source_execution_instance)
+            || self.terminals.get(&id).is_some_and(|record| record.handle.execution_instance() != instance)
+        {
+            return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                "The returned terminal was replaced or its exact publication history is unavailable", false));
+        }
+
+        let issued = self.handoff_receipts.get(&receipt.operation)
+            .or_else(|| self.chat_handoffs.values().filter_map(|pending| pending.issued()).find(|old| old.operation == receipt.operation))
+            .or_else(|| self.chats.values().filter_map(|chat| chat.handoff_receipt.as_ref()).find(|old| old.operation == receipt.operation));
+        if issued == Some(receipt) { Ok(()) } else {
+            Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest,
+                "The exact host-issued terminal handoff is no longer retained; refresh the source without guessing a successor", false))
+        }
+    }
+
     pub(super) fn enable_holder_recovery(&mut self) {
         self.recover_holders = true;
     }
@@ -383,6 +423,9 @@ impl HostState {
             chat_observer_stamps: BTreeMap::new(),
             directory_thread_observers: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
+            native_sources: Default::default(),
+            handoff_receipts: BTreeMap::new(),
+            handoff_receipt_order: VecDeque::new(),
             chat_spawning: BTreeMap::new(),
             chat_bindings: BTreeMap::new(),
             native_closing: BTreeMap::new(),
@@ -6806,6 +6849,8 @@ for line in sys.stdin:
                 execution_instance: uuid::Uuid::new_v4(),
                 console_recipe: None,
                 paired_terminal: None,
+                handoff_receipt: None,
+            source_binding: None,
                 session,
                 handle: handle.clone(),
                 source_process: None,

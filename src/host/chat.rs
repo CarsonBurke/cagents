@@ -2,6 +2,7 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
 mod execution_directory;
+pub(in crate::host) mod source_binding;
 mod native_cleanup;
 pub(in crate::host) mod presentation_close;
 mod native_recovery;
@@ -42,6 +43,8 @@ pub(super) struct Record {
     pub(super) execution_instance: uuid::Uuid,
     pub(super) console_recipe: Option<crate::model::LaunchRecipe>,
     pub(super) paired_terminal: Option<crate::terminal::TerminalHandle>,
+    pub(super) handoff_receipt: Option<crate::terminal_ipc::TerminalHandoffReceipt>,
+    pub(super) source_binding: Option<crate::terminal_ipc::ChatSourceBinding>,
     pub session: Session,
     pub handle: Handle,
     // Retain the exact CLI/account that authorized a shared Codex attachment.
@@ -101,6 +104,7 @@ pub(super) fn matches_paired_terminal(
 // environment survives a successful replacement. Keep it until the GUI confirms
 // durable ownership of the terminal, never merely until a response or attach.
 pub(super) struct TerminalHandoff {
+    issued: Option<crate::terminal_ipc::TerminalHandoffReceipt>,
     source: Session,
     terminal: crate::model::TerminalSession,
     generation: u64,
@@ -120,6 +124,7 @@ pub(super) struct TerminalHandoff {
 pub(super) const ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(300);
 
 impl TerminalHandoff {
+    #[cfg(test)]
     pub(super) fn new(
         source: Session,
         terminal: crate::model::TerminalSession,
@@ -128,12 +133,27 @@ impl TerminalHandoff {
         acknowledgement_deadline: Instant,
     ) -> Self {
         Self {
+            issued: None,
             source,
             terminal,
             generation,
             subscribers,
             acknowledgement_deadline,
         }
+    }
+
+    fn from_receipt(
+        receipt: crate::terminal_ipc::TerminalHandoffReceipt,
+        generation: u64,
+        subscribers: BTreeMap<ClientId, bool>,
+        acknowledgement_deadline: Instant,
+    ) -> Self {
+        Self { source: receipt.source.clone(), terminal: receipt.terminal.session.clone(),
+            issued: Some(receipt), generation, subscribers, acknowledgement_deadline }
+    }
+
+    pub(super) fn issued(&self) -> Option<&crate::terminal_ipc::TerminalHandoffReceipt> {
+        self.issued.as_ref()
     }
 
     /// Whether no window can still be waiting to save this replacement.
@@ -192,6 +212,28 @@ impl TerminalHandoff {
     pub(super) fn detach(&mut self, client: ClientId) {
         self.subscribers.remove(&client);
     }
+}
+
+/// Capture only descriptors already published by this exact owned worker.
+/// Caller holds HostState and has checked the original source actor/worker.
+fn issue_terminal_handoff(
+    state: &mut HostState,
+    source: Session,
+    source_execution_instance: uuid::Uuid,
+    source_binding: crate::terminal_ipc::ChatSourceBinding,
+    terminal: crate::terminal_ipc::TerminalDescriptor,
+) -> Result<crate::terminal_ipc::TerminalHandoffReceipt, ProtocolError> {
+    if !state.native_sources.validates(&source_binding)
+        || state.terminals.get(&terminal.session.id).is_none_or(|record|
+            record.handle.execution_instance() != terminal.execution_instance)
+    {
+        return Err(unavailable("The native backend or returned worker changed before handoff publication"));
+    }
+    let receipt = crate::terminal_ipc::TerminalHandoffReceipt {
+        operation: uuid::Uuid::new_v4(), source, source_execution_instance, source_binding, terminal,
+    };
+    state.remember_terminal_handoff(receipt.clone());
+    Ok(receipt)
 }
 
 pub(super) struct PendingBinding {
@@ -429,6 +471,16 @@ fn changed_from(
         }) {
             return;
         }
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let observed = state.chats.get(&id).map(|r| (r.execution_instance, r.handle.confirmed_session_id()));
+            if let Some((actual_instance, thread)) = observed
+                && instance.is_none_or(|expected| expected == actual_instance)
+                && state.native_sources.observed(id, actual_instance, thread)
+            {
+                state.chats.get_mut(&id).expect("same lock").source_binding = None;
+            }
+        }
         super::agent_execution::retain_chat_identity(&host, id);
     }
     if matches!(&update, Update::Attention(_)) {
@@ -580,7 +632,7 @@ fn session_snapshot(record: &Record) -> ServerResponse {
     let mut session = record.session.clone();
     session.launch.session_id = snapshot.session_id.clone();
     session.native_continuity = snapshot.native_continuity.clone();
-    ServerResponse::ChatAttached { session, snapshot }
+    ServerResponse::ChatAttached { session, snapshot, execution_instance: record.execution_instance, binding: record.source_binding.clone() }
 }
 fn same_conversation(a: &chat::Launch, b: &chat::Launch) -> bool {
     a.provider == b.provider && a.session_id.is_some() && a.session_id == b.session_id
@@ -1152,6 +1204,14 @@ fn start_with_execution(
     let prepared_directory = execution_directory::prepare(&operational_launch, execution)?;
     let execution = prepared_directory.context.clone();
     let process_launch = &prepared_directory.launch;
+    // Adapter construction/initialization can cross provider boundaries. Fence
+    // prior authority before the first such call, including failure before a
+    // replacement Record can be installed. Never restore a stale old nonce.
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.native_sources.mutating(session.id);
+        if let Some(record) = state.chats.get_mut(&session.id) { record.source_binding = None; }
+    }
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener(process_launch, owned_socket)
     } else {
@@ -1364,6 +1424,7 @@ fn start_with_execution(
                 },
             );
         }
+        state.native_sources.mutating(session.id);
         state.chat_spawning.insert(session.id, session.clone());
         state.inventory_generation += 1;
         source_handle
@@ -1698,6 +1759,8 @@ fn start_with_execution(
             execution_instance,
             console_recipe: None,
             paired_terminal,
+            handoff_receipt: None,
+            source_binding: None,
             session,
             handle,
             source_process,
@@ -1712,6 +1775,7 @@ fn start_with_execution(
         if let Some(registration)=&observer_registration {
             state.publish_chat_observer(id,execution_instance,registration.stamp());
         }
+        state.native_sources.installed(id, record.execution_instance);
         state.chats.insert(id, record);
         if let Some(context) = &execution {
             context.installed();
@@ -1756,10 +1820,16 @@ pub(super) fn codex_terminal_view_with(
     recipe: crate::model::LaunchRecipe,
     after_source:impl FnOnce(),
 ) -> Result<ServerResponse, ProtocolError> {
+    let (issued_source, source_instance, source_binding) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = attached(&state, client, chat_id)?;
+        if !record.handle.same_actor(handle) { return Err(unavailable("The original chat actor changed before terminal handoff")); }
+        (session_descriptor(record), record.execution_instance, record.source_binding.clone().ok_or_else(|| unavailable("This native backend has no authenticated source binding"))?)
+    };
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, chat_id)?;
-        if !record.handle.same_actor(handle) {
+        if !record.handle.same_actor(handle) || record.execution_instance != source_instance {
             return Err(unavailable(
                 "The thread changed while opening its CLI view.",
             ));
@@ -1777,10 +1847,19 @@ pub(super) fn codex_terminal_view_with(
                     "The CLI view was replaced; it is not owned by this thread.",
                 ));
             }
+            let descriptor = state.descriptor(client, terminal.id)?;
+            let receipt = record.handoff_receipt.as_ref().filter(|receipt|
+                receipt.terminal.execution_instance == descriptor.execution_instance
+                && receipt.source_execution_instance == record.execution_instance
+                && receipt.source_binding == source_binding).cloned();
+            let receipt = match receipt { Some(receipt) => receipt,
+                None => issue_terminal_handoff(&mut state, issued_source.clone(), source_instance, source_binding.clone(), descriptor)?, };
+            state.validate_terminal_handoff_receipt(&receipt)?;
+            state.chats.get_mut(&chat_id).expect("checked original actor").handoff_receipt = Some(receipt.clone());
+            drop(state);
+            let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?;
             return Ok(ServerResponse::ChatTerminal {
-                chat_id,
-                session: state.descriptor(client, terminal.id)?.session,
-                snapshot: handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?,
+                chat_id, session: receipt.terminal.session.clone(), receipt, snapshot,
             });
         }
         if record.returning_terminal {
@@ -1973,11 +2052,14 @@ pub(super) fn codex_terminal_view_with(
         // pairing must preserve a newer observation made during its RPC.
         record.source_process = paired_terminal.observe_agent_process();
         record.returning_terminal = false;
+        let receipt = issue_terminal_handoff(&mut state, issued_source.clone(), source_instance, source_binding.clone(), descriptor.clone())?;
+        state.chats.get_mut(&chat_id).expect("checked original actor").handoff_receipt = Some(receipt.clone());
         state.inventory_generation += 1;
+        drop(state);
+        let snapshot = handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?;
+        host.lock().unwrap_or_else(|p| p.into_inner()).validate_terminal_handoff_receipt(&receipt)?;
         Ok(ServerResponse::ChatTerminal {
-            chat_id,
-            session: descriptor.session.clone(),
-            snapshot: handle.snapshot(None).ok_or_else(|| unavailable("The exact retained transcript is unavailable; ownership and saved descriptors were preserved"))?,
+            chat_id, session: descriptor.session.clone(), receipt, snapshot,
         })
     })();
     if let Err(error) = result {
@@ -2578,9 +2660,13 @@ fn process_inner(
     let transition =
         match &request {
             ClientRequest::ChatStart { session, .. }
+            | ClientRequest::ChatStartSelected { session, .. }
+            | ClientRequest::ChatAttach { session }
+            | ClientRequest::ChatRecoverAccount { source: session, .. }
             | ClientRequest::ChatCloseSession { session } => Some(session.id),
             ClientRequest::ChatClose { chat_id }
-            | ClientRequest::ChatReturnTerminal { chat_id } => Some(*chat_id),
+            | ClientRequest::ChatReturnTerminal { chat_id, .. }
+            | ClientRequest::ChatRead { chat_id, .. } => Some(*chat_id),
             _ => None,
         }
         .map(|id| restart::transition_gate(host, id));
@@ -2623,7 +2709,7 @@ fn process_inner(
         }
         request => request,
     };
-    match request {
+    let mut response = (|| match request {
         ClientRequest::ChatPrepareResume { source } => {
             let proof = host
                 .lock()
@@ -2779,6 +2865,8 @@ fn process_inner(
                 receipt.subscribers.entry(client).or_insert(false);
                 return Ok(ServerResponse::ChatAttached {
                     session: receipt.source.clone(),
+                    execution_instance: receipt.issued.as_ref().map(|r| r.source_execution_instance).unwrap_or_default(),
+                    binding: receipt.issued.as_ref().map(|r| r.source_binding.clone()),
                     snapshot: receipt.snapshot(),
                 });
             }
@@ -2913,6 +3001,8 @@ fn process_inner(
                     ));
                 }
                 return Ok(ServerResponse::ChatSnapshot {
+                    execution_instance: receipt.issued.as_ref().map(|r| r.source_execution_instance).unwrap_or_default(),
+                    binding: receipt.issued.as_ref().map(|r| r.source_binding.clone()),
                     chat_id,
                     snapshot: (!after_generation
                         .is_some_and(|generation| generation >= receipt.generation))
@@ -2929,6 +3019,7 @@ fn process_inner(
             drop(state);
             let response = handle.presentation(chat_id, after_generation).unwrap_or(
                 ServerResponse::ChatSnapshot {
+                    execution_instance: uuid::Uuid::nil(), binding: None,
                     chat_id,
                     snapshot: None,
                 },
@@ -2946,9 +3037,23 @@ fn process_inner(
             }
             Ok(response)
         }
-        ClientRequest::ChatReturnTerminal { chat_id } => {
+        ClientRequest::ChatReturnTerminal { chat_id, expected } => {
+            if expected.source.id != chat_id { return Err(error("Captured backend belongs to another conversation")); }
+            // Replay authenticates the original immutable operation, without
+            // resolving a retired actor or learning a later backend.
+            let replay = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.chat_handoffs.get(&chat_id).and_then(|h| h.issued.clone())
+            };
+            if let Some(receipt) = &replay {
+                if receipt.source_binding != expected { return Err(unavailable("This handoff belongs to another captured backend")); }
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.validate_terminal_handoff_receipt(receipt)?;
+            } else {
+                source_binding::require(host, client, &expected)?;
+            }
             restart::require_finished(host, chat_id)?;
-            let (handle, mut session) = {
+            let (handle, mut session, issued_source, source_instance) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
                 if state.shutting_down {
                     return Err(unavailable("Daemon is shutting down"));
@@ -2959,6 +3064,7 @@ fn process_inner(
                     return Ok(ServerResponse::ChatTerminal {
                         chat_id,
                         session: receipt.terminal.clone(),
+                        receipt: receipt.issued.clone().ok_or_else(|| unavailable("This legacy handoff has no exact published worker receipt; its source was retained"))?,
                         snapshot: receipt.snapshot(),
                     });
                 }
@@ -2968,7 +3074,7 @@ fn process_inner(
                     ));
                 }
                 let record = attached(&state, client, chat_id)?;
-                (record.handle.clone(), record.session.clone())
+                (record.handle.clone(), record.session.clone(), session_descriptor(record), record.execution_instance)
             };
             session.launch.session_id = handle.confirmed_session_id();
             session.native_continuity = handle.native_continuity();
@@ -3100,7 +3206,7 @@ fn process_inner(
                 // explicit recovery re-inserts a different actor under it; neither
                 // may donate its subscribers to this replacement terminal.
                 let retained = state.chats.get(&chat_id).is_some_and(|record| {
-                    record.returning_terminal && record.handle.same_actor(&handle)
+                    record.returning_terminal && record.handle.same_actor(&handle) && record.execution_instance == source_instance
                 });
                 if !retained {
                     // The replacement has no receipt to commit and no source to be
@@ -3117,14 +3223,14 @@ fn process_inner(
                         "The chat was closed while returning to terminal; the replacement terminal was retired",
                     ));
                 }
+                let receipt = issue_terminal_handoff(&mut state, issued_source, source_instance, expected.clone(), descriptor.clone())?;
                 state.issued_chat_ids.insert(chat_id);
                 let mut record = state.chats.remove(&chat_id);
                 state.chat_restarts.remove(&chat_id);
                 state.chat_handoffs.insert(
                     chat_id,
-                    TerminalHandoff::new(
-                        session,
-                        descriptor.session.clone(),
+                    TerminalHandoff::from_receipt(
+                        receipt.clone(),
                         snapshot.generation,
                         record
                             .as_mut()
@@ -3134,12 +3240,14 @@ fn process_inner(
                     ),
                 );
                 state.inventory_generation += 1;
-                record
+                (record, receipt)
             };
+            let (retired, receipt) = retired;
             drop(retired);
             Ok(ServerResponse::ChatTerminal {
                 chat_id,
                 session: descriptor.session,
+                receipt,
                 snapshot,
             })
         }
@@ -3285,7 +3393,9 @@ fn process_inner(
             Ok(ServerResponse::ChatClosed { chat_id, snapshot })
         }
         _ => Err(error("Not a native chat request")),
-    }
+    })()?;
+    source_binding::decorate(host, &mut response);
+    Ok(response)
 }
 
 pub(super) fn resolve_upgrade(
@@ -4452,9 +4562,7 @@ for line in sys.stdin:
             process(
                 &host,
                 1,
-                ClientRequest::ChatReturnTerminal {
-                    chat_id: session.id
-                }
+                ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) }
             )
             .is_err()
         );
@@ -4490,9 +4598,7 @@ for line in sys.stdin:
         } = process(
             &host,
             1,
-            ClientRequest::ChatReturnTerminal {
-                chat_id: session.id,
-            },
+            ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) },
         )
         .unwrap()
         else {
@@ -4514,9 +4620,7 @@ for line in sys.stdin:
             process(
                 &host,
                 2,
-                ClientRequest::ChatReturnTerminal {
-                    chat_id: session.id
-                }
+                ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) }
             )
             .is_err()
         );
@@ -4591,9 +4695,7 @@ for line in sys.stdin:
         } = process(
             &host,
             2,
-            ClientRequest::ChatReturnTerminal {
-                chat_id: session.id,
-            },
+            ClientRequest::ChatReturnTerminal { chat_id: session.id, expected: source_binding::fixture_binding(&host, session.id) },
         )
         .unwrap()
         else {
@@ -5023,6 +5125,8 @@ done
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
                     paired_terminal: None,
+                    handoff_receipt: None,
+            source_binding: None,
                     session: source.clone(),
                     handle: handle.clone(),
                     source_process: None,
@@ -5093,7 +5197,7 @@ done
             Default::default(),
         )
         .unwrap();
-        let ServerResponse::ChatAttached { session, snapshot } = response else {
+        let ServerResponse::ChatAttached { session, snapshot, .. } = response else {
             panic!("Expected confirmed account attachment")
         };
         assert_eq!(session.launch.session_id.as_deref(), Some(conversation));
@@ -5337,15 +5441,18 @@ done
         assert!(
             session.claim_owned_codex_listener(&std::env::temp_dir(), host.lock().unwrap().proof())
         );
+        session.proof = Some(host.lock().unwrap().proof().clone());
         {
             let mut state = host.lock().unwrap();
             state.register_client(1);
             state.chats.insert(
                 chat_id,
                 Record {
-                    execution_instance: uuid::Uuid::nil(),
+                    execution_instance: uuid::Uuid::new_v4(),
                     console_recipe: None,
                     paired_terminal: None,
+                    handoff_receipt: None,
+            source_binding: None,
                     session: session.clone(),
                     handle: handle.clone(),
                     source_process: None,
@@ -5365,6 +5472,7 @@ done
             .owned_codex_listener,
             session.owned_codex_listener
         );
+        source_binding::fixture_binding(&host, chat_id);
         let first =
             codex_terminal_view(&host, 1, chat_id, &handle, session.clone(), recipe.clone())
                 .unwrap();
@@ -5641,9 +5749,11 @@ done
         host.lock().unwrap().chats.insert(
             chat_id,
             Record {
-                execution_instance: uuid::Uuid::nil(),
+                execution_instance: uuid::Uuid::new_v4(),
                 console_recipe: None,
                 paired_terminal: None,
+                handoff_receipt: None,
+            source_binding: None,
                 session: session.clone(),
                 handle: handle.clone(),
                 source_process: None,
@@ -5675,7 +5785,7 @@ done
             host.lock().unwrap().register_client(1);
             let ServerResponse::ChatTerminal {
                 session: terminal, ..
-            } = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id }).unwrap()
+            } = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id, expected: source_binding::fixture_binding(&host, chat_id) }).unwrap()
             else {
                 panic!("chat did not return to terminal")
             };
@@ -5781,6 +5891,8 @@ done
                     execution_instance: uuid::Uuid::nil(),
                     console_recipe: None,
                     paired_terminal: None,
+                    handoff_receipt: None,
+            source_binding: None,
                     session: Session {
                         native_continuity: Default::default(),
                         owned_codex_listener: None,

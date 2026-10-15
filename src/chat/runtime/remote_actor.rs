@@ -67,6 +67,10 @@ pub(crate) struct ActorIdentity {
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Resident {
+    /// Legacy retained helpers lack concrete-incarnation evidence. They can
+    /// still render but must not authorize a destructive handoff.
+    #[serde(default)]
+    pub backend_instance: Option<uuid::Uuid>,
     pub provider_process: Option<Process>,
     pub generation: u64,
     pub session_id: Option<String>,
@@ -251,6 +255,7 @@ impl RemoteActor {
         let process = Process::read(std::process::id() as i32).unwrap();
         let boot = BootId::new("fixture-boot");
         let resident = Resident {
+            backend_instance: Some(uuid::Uuid::new_v4()),
             provider_process: Some(process.clone()),
             generation: 1,
             session_id: None,
@@ -1743,6 +1748,7 @@ impl Server {
             })
             .or(outcome);
         Ok(Resident {
+            backend_instance: Some(self.actor.backend_instance()),
             provider_process,
             generation,
             session_id,
@@ -2666,6 +2672,130 @@ mod tests {
             },
             _root: root,
         }
+    }
+    #[test]
+    fn backend_binding_survives_lost_restart_reply_without_authorizing_same_handle_successor() {
+        const CHILD: &str = "CAGENTS_BACKEND_BINDING_RESTART_FIXTURE";
+        if std::env::var_os(CHILD).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            for name in ["home", "run", "data", "config", "cache"] {
+                std::fs::create_dir(directory.path().join(name)).unwrap();
+            }
+            let output = std::fs::File::create(directory.path().join("child.log")).unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", thread::current().name().unwrap(), "--nocapture"])
+                .env_clear().env(CHILD, "1").env("HOME", directory.path().join("home"))
+                .env("XDG_RUNTIME_DIR", directory.path().join("run"))
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .env("XDG_CONFIG_HOME", directory.path().join("config"))
+                .env("XDG_CACHE_HOME", directory.path().join("cache"))
+                .env("PATH", "/usr/bin:/bin")
+                .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap();
+            let deadline = Instant::now() + Duration::from_secs(40);
+            let status = loop {
+                if let Some(status) = child.try_wait().unwrap() { break status; }
+                if Instant::now() >= deadline {
+                    let _ = child.kill(); let _ = child.wait();
+                    let root = directory.keep();
+                    panic!("backend fixture timed out; evidence retained at {}", root.display());
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let log = std::fs::read_to_string(directory.path().join("child.log")).unwrap();
+            if !status.success() {
+                let root = directory.keep();
+                panic!("backend fixture failed ({status}); evidence {}\n{log}", root.display());
+            }
+            assert!(log.contains("1 passed"), "isolated fixture did not execute: {log}");
+            return;
+        }
+        // Server::restart's orphan reconciliation is process-wide; only this
+        // private child owns its provider descendants and becomes a subreaper.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) }, 0);
+        let mut fixture = resident_fixture();
+        let source = fixture.server.source.clone();
+        let mut remote = RemoteActor::fixture();
+        let resident = fixture.server.resident().unwrap();
+        {
+            let inner = Arc::get_mut(&mut remote.0).unwrap();
+            inner.identity = fixture.server.identity.clone();
+            inner.proof = fixture.server.proof.clone();
+            inner.epoch = fixture.server.epoch;
+            inner.socket = fixture.server.socket.clone();
+            *inner.state.get_mut().unwrap() = Arc::new(resident);
+        }
+        let instance = remote.identity().instance;
+        let handle = super::super::Handle::from_remote_fixture(remote.clone());
+        let host = crate::host::BackendFixture::new(source.clone(), handle.clone(), instance);
+        let worker = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            fixture.server.listener.set_nonblocking(true).unwrap();
+            let mut lose_first_restart_reply = true;
+            while Instant::now() < deadline {
+                let (control, _) = match fixture.server.listener.accept() {
+                    Ok(pair) => pair,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(2)); continue;
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                };
+                let request: Invocation = receive(&control, Duration::from_secs(2)).unwrap();
+                if request.method == "fixture_complete_provider" {
+                    let result = fixture.server.actor.close().map(|_| Value::Null);
+                    send(&control, &result, TIMEOUT).unwrap();
+                    continue;
+                }
+                if request.method == "fixture_finish" {
+                    assert_eq!(std::fs::read_to_string(fixture._root.path().join("spawns")).unwrap(), "spawn\n");
+                    send(&control, &Ok::<_, String>(Value::Null), TIMEOUT).unwrap();
+                    return;
+                }
+                let is_restart = request.method == "restart";
+                let result = fixture.server.invoke(request);
+                if is_restart && lose_first_restart_reply {
+                    assert!(result.is_ok());
+                    lose_first_restart_reply = false;
+                    // Actual new backend is installed in Server, then the
+                    // authenticated reply stream is lost before the host sees it.
+                    drop(control);
+                } else { send(&control, &result, TIMEOUT).unwrap(); }
+            }
+            panic!("fixture server did not receive its bounded completion");
+        });
+        let a = host.capture().unwrap();
+        let original = handle.backend_identity(&source.proof.clone().unwrap()).unwrap();
+        remote.call::<()>("fixture_complete_provider", Value::Null).unwrap();
+        host.begin_restart();
+        let script = r#"printf 'spawn\n' >> spawns
+while IFS= read -r frame; do
+  case "$frame" in
+    *'"type":"control_request"'*)
+      id=${frame#*'"request_id":"'}; id=${id%%'"'*}
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
+      ;;
+  esac
+done"#;
+        let mut spec = ProcessSpec::from(&source.launch.recipe);
+        spec.program = "/bin/sh".into(); spec.arguments = vec!["-c".into(), script.into()];
+        let request = uuid::Uuid::new_v4();
+        assert!(handle.restart_remote(request, spec.clone(), source.clone(), BTreeMap::new()).is_err());
+        assert!(host.capture().is_err(), "fresh B process alone cannot resolve an ambiguous operation");
+        assert!(!host.validates(&a));
+        assert!(host.return_refuses(a.clone()).contains("captured native backend changed"));
+        let receipt = handle.restart_remote(request, spec, source.clone(), BTreeMap::new()).unwrap();
+        assert!(matches!(receipt.state, restart::RestartState::Acknowledged(Ok(_))));
+        let b = host.resolve();
+        assert_eq!(b.execution_instance, a.execution_instance, "retained Record/Handle did not change");
+        assert_ne!(b.backend, a.backend, "actual backend restart must change captured authority");
+        let replacement = handle.backend_identity(&source.proof.clone().unwrap()).unwrap();
+        assert_ne!(replacement, original);
+        assert!(!host.validates(&a));
+        remote.call::<()>("fixture_complete_provider", Value::Null).unwrap();
+        host.retire();
+        assert!(!host.validates(&a), "B fully retiring never resurrects A consent");
+        assert!(host.validates(&b));
+        remote.call::<()>("fixture_finish", Value::Null).unwrap();
+        worker.join().unwrap();
     }
     #[test]
     fn explicit_restart_reuses_the_store_and_never_repeats_a_deduplicated_launch() {

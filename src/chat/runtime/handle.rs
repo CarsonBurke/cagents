@@ -8,6 +8,18 @@ use crate::chat::{
 };
 use std::collections::BTreeMap;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BackendIdentity {
+    helper: Option<uuid::Uuid>,
+    actor: uuid::Uuid,
+    process: crate::daemon::holder_registry::Process,
+    conversation: Option<String>,
+}
+impl BackendIdentity {
+    pub(crate) fn conversation(&self) -> Option<String> { self.conversation.clone() }
+    pub(crate) fn valid(&self) -> bool { !self.actor.is_nil() && self.process.pid > 0 && self.process.start > 0 }
+}
+
 #[derive(Clone)]
 pub struct Handle(Owner);
 #[derive(Clone)]
@@ -42,6 +54,10 @@ impl Handle {
             .with_presentation_store_locked(action);
     }
 
+    #[cfg(test)]
+    pub(super) fn from_remote_fixture(remote: RemoteActor) -> Self {
+        Self(Owner::Remote(remote))
+    }
     #[cfg(test)]
     pub(crate) fn start(
         spec: ProcessSpec,
@@ -223,6 +239,45 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.provider_process(),
             Owner::Remote(remote) => remote.state().provider_process.clone(),
+        }
+    }
+    /// Fresh concrete backend evidence. This is an authenticated helper RPC for
+    /// retained actors, never the cached Record.root or presentation snapshot.
+    /// Call off HostLock while retaining the per-chat lifecycle transition.
+    pub(crate) fn backend_identity(
+        &self,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<BackendIdentity, String> {
+        match &self.0 {
+            Owner::Remote(remote) => {
+                // An impossible caller generation forces a fresh response (or
+                // conservative refusal on the exact wrap value). Unlike inspect,
+                // state is guarded by the helper's current attachment epoch.
+                let state: Option<super::remote_actor::Resident> =
+                    remote.call("state", serde_json::json!([u64::MAX]))?;
+                let state = state.ok_or("Fresh retained backend evidence is unavailable")?;
+                Ok(BackendIdentity {
+                    helper: Some(remote.identity().instance),
+                    actor: state.backend_instance.ok_or("Retained helper has no concrete backend incarnation evidence")?,
+                    conversation: state.confirmed_session,
+                    process: state.provider_process.ok_or(
+                        "Retained actor has no authenticated concrete backend identity")?,
+                })
+            }
+            Owner::Local(local) => {
+                let process = if let Some(process) = local.provider_process() {
+                    process
+                } else {
+                    let record = local.native_holder_record().ok_or(
+                        "Native actor has no concrete backend identity")?;
+                    let (recovery, _) = chat::native_holder::inspect(record, proof)?;
+                    recovery.server_process.ok_or(
+                        "Native holder has no authenticated concrete server identity")?
+                };
+                Ok(BackendIdentity { helper: None,
+                    actor: local.backend_instance(), process,
+                    conversation: local.confirmed_session_id() })
+            }
         }
     }
     pub(crate) fn actor_identity(&self) -> Option<ActorIdentity> {

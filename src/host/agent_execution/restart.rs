@@ -484,6 +484,8 @@ mod tests {
                 execution_instance: uuid::Uuid::new_v4(),
                 console_recipe: Some(terminal.launch.clone()),
                 paired_terminal: Some(worker.clone()),
+                handoff_receipt: None,
+            source_binding: None,
                 session: session.clone(),
                 handle: actor.clone(),
                 source_process: None,

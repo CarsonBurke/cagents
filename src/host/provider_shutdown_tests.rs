@@ -159,6 +159,8 @@ fn chat_record(source: crate::chat::Session, handle: crate::chat::Handle) -> sup
         execution_instance: Uuid::new_v4(),
         console_recipe: None,
         paired_terminal: None,
+        handoff_receipt: None,
+            source_binding: None,
         session: source,
         handle,
         source_process: None,

@@ -378,6 +378,7 @@ pub enum ClientRequest {
     /// Replace an attached native actor using its host-retained execution context.
     ChatReturnTerminal {
         chat_id: TerminalId,
+        expected: ChatSourceBinding,
     },
     /// GUI acknowledgement after the replacement terminal is durably saved.
     ChatCommitTerminal {
@@ -723,10 +724,14 @@ pub enum ServerResponse {
     ShutdownOutcome(ShutdownOutcome),
     ChatAttached {
         session: crate::chat::Session,
+        execution_instance: uuid::Uuid,
+        binding: Option<ChatSourceBinding>,
         snapshot: crate::chat::Snapshot,
     },
     ChatSnapshot {
         chat_id: TerminalId,
+        execution_instance: uuid::Uuid,
+        binding: Option<ChatSourceBinding>,
         snapshot: Option<crate::chat::Snapshot>,
     },
     ChatListed {
@@ -760,6 +765,7 @@ pub enum ServerResponse {
     ChatTerminal {
         chat_id: TerminalId,
         session: TerminalSession,
+        receipt: TerminalHandoffReceipt,
         snapshot: crate::chat::Snapshot,
     },
     WorkspaceModel {
@@ -780,6 +786,8 @@ pub enum ServerResponse {
         session: crate::chat::Session,
     },
     ChatUpdate {
+        execution_instance: uuid::Uuid,
+        binding: Option<ChatSourceBinding>,
         chat_id: TerminalId,
         update: crate::chat::presentation::Presentation,
     },
@@ -913,6 +921,28 @@ pub enum ProtocolErrorCode {
     PermissionDenied,
     Internal,
     ViewConflict,
+}
+
+/// Opaque authenticated authority for one concrete native backend. The host
+/// retains the process/actor witness privately; this nonce never authorizes a
+/// later backend in the same resident Handle.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChatSourceBinding {
+    pub source: crate::chat::Session,
+    pub execution_instance: uuid::Uuid,
+    pub backend: uuid::Uuid,
+}
+
+/// Host-issued evidence for one native chat to exact published terminal transition.
+/// Metadata only: transcript snapshots stay outside this retained receipt.
+/// This wire addition requires a future owner-allocated protocol after 90.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TerminalHandoffReceipt {
+    pub operation: uuid::Uuid,
+    pub source: crate::chat::Session,
+    pub source_execution_instance: uuid::Uuid,
+    pub source_binding: ChatSourceBinding,
+    pub terminal: TerminalDescriptor,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2099,6 +2129,29 @@ mod tests {
         }
     }
     #[test]
+    fn native_backend_binding_and_exact_terminal_handoff_round_trip() {
+        let proof = proof("handoff", "boot", "incarnation");
+        let recipe = LaunchRecipe { program: "/bin/cat".into(), arguments: Vec::new(),
+            working_directory: "/fixture".into(), environment: Default::default(), unset_environment: Default::default() };
+        let source = crate::chat::Session { id: TerminalId::new(),
+            launch: crate::chat::Launch { provider: crate::agent::Provider::Omp, recipe: recipe.clone(), session_id: Some("confirmed-thread".into()) },
+            proof: Some(proof.clone()), terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
+        let binding = ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
+        let mut terminal = TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
+        terminal.execution_instance = uuid::Uuid::new_v4();
+        terminal.session.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        let receipt = TerminalHandoffReceipt { operation: uuid::Uuid::new_v4(), source: source.clone(), source_execution_instance: binding.execution_instance, source_binding: binding.clone(), terminal: terminal.clone() };
+        let request = ClientRequest::ChatReturnTerminal { chat_id: source.id, expected: binding };
+        let mut bytes = Vec::new(); write_frame(&mut bytes, &request).unwrap();
+        let decoded: ClientRequest = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, request);
+        let response = ServerResponse::ChatTerminal { chat_id: source.id, session: terminal.session.clone(), receipt, snapshot: Default::default() };
+        let mut bytes = Vec::new(); write_frame(&mut bytes, &response).unwrap();
+        let decoded: ServerResponse = read_frame(&mut Cursor::new(bytes)).unwrap().unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
     fn activity_survives_full_and_unchanged_row_delta_snapshots() {
         let mut base = grid(1, &["ab"]);
         base.activity = Some(TerminalOutputActivity {
@@ -2145,7 +2198,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let response = ServerResponse::ChatSnapshot {
+        let response = ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };
@@ -2185,7 +2238,7 @@ mod tests {
             ..Default::default()
         };
         let mut bytes = Vec::new();
-        let response = ServerResponse::ChatSnapshot {
+        let response = ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };
@@ -2212,7 +2265,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let response = ServerResponse::ChatSnapshot {
+        let response = ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
             chat_id: TerminalId::new(),
             snapshot: Some(snapshot.clone()),
         };

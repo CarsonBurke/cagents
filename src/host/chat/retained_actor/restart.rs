@@ -141,6 +141,7 @@ pub(in crate::host) fn restart_completed(
             ));
         }
     }
+    if !prepared.settled { super::super::source_binding::restarting(host, source.id, &handle)?; }
     let receipt = handle
         .restart_remote(
             request,
@@ -191,6 +192,9 @@ pub(in crate::host) fn restart_completed(
         pending.settled = true;
     }
     handle.refresh_retained_state().map_err(unavailable)?;
+    // Only a positive restart receipt permits fresh concrete helper evidence
+    // to resolve Unknown. Lost/Accepted/error replies leave it fenced.
+    super::super::source_binding::refresh(host, source.id, true)?;
     if handle.is_completed()
         || handle.confirmed_session_id() != source.launch.session_id
         || !handle.update_activity().1

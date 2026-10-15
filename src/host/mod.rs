@@ -561,3 +561,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+pub(crate) use chat::source_binding::BackendFixture;

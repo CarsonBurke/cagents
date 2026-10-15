@@ -35,6 +35,7 @@ pub(crate) fn remove_actor_final_snapshot(
 }
 mod handle;
 pub use handle::Handle;
+pub(crate) use handle::BackendIdentity;
 pub(crate) use remote_actor::RestartState as RetainedRestartState;
 pub(crate) use remote_actor::{
     ActorIdentity, ActorInspection, InputIdentity, InputReceipt, InputState, OutboxEntry,
@@ -234,6 +235,7 @@ impl LocalHandle {
         action();
     }
 
+    pub(crate) fn backend_instance(&self) -> uuid::Uuid { self.0.backend_instance }
     pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
         self.0.native_holder_record.as_ref()
     }
@@ -243,6 +245,9 @@ impl LocalHandle {
     }
 }
 struct Inner {
+    // Concrete Local incarnation; retained restart may preserve close.actor_id
+    // and Store identity, but it must never overwrite this backend nonce.
+    backend_instance: uuid::Uuid,
     native_holder_record: Option<crate::daemon::holder_registry::Record>,
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
@@ -596,6 +601,7 @@ impl LocalHandle {
                 .and_then(|context| context.directory_descriptor()),
         ));
         let inner = Arc::new(Inner {
+            backend_instance: uuid::Uuid::new_v4(),
             native_holder_record: native_holder.as_ref().map(|holder| holder.record().clone()),
             pinned_directory: pinned_directory.clone(),
             provider_process: provider_process.clone(),
@@ -1552,11 +1558,11 @@ impl LocalHandle {
         {
             let mut update = presentation.clone();
             update.metadata.sampled_at = observed_at();
-            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { chat_id, update })
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { chat_id, update, execution_instance: uuid::Uuid::nil(), binding: None })
         } else {
             let mut snapshot = state.clone();
             snapshot.sampled_at = observed_at();
-            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot { execution_instance: uuid::Uuid::nil(), binding: None,
                 chat_id,
                 snapshot: Some(snapshot),
             })
