@@ -2032,7 +2032,7 @@ impl Cagents {
         let Some(source) = project.worktrees.iter().find(|row| Some(row.id) == target.worktree).and_then(|row| row.head_repository.as_ref()) else { return false; };
         let Some(branch) = snapshot.branch.as_deref() else { return false; };
         project.pull_requests.iter().any(|pr| pr.state == Some(crate::sidebar::WorktreePullRequestState::Merged)
-            && pr.head_ref == branch.strip_prefix("refs/heads/").unwrap_or(branch)
+            && pr.head_ref == branch
             && pr.head_oid.as_ref() == snapshot.head_oid.as_ref() && snapshot.head_oid.is_some()
             && pr.head_repository.as_ref() == Some(source))
     }
@@ -2985,6 +2985,14 @@ mod tests {
         pr.head_oid = snapshot.head_oid.clone(); pr.head_repository = Some(source);
         app.sidebar_model.projects[0].pull_requests.push(pr);
         assert!(app.delete_branch_default(&target, &snapshot));
+        // The safety snapshot already contains a local name, including a
+        // literal name that itself begins with refs/heads/.
+        snapshot.branch = Some("refs/heads/feature".into());
+        assert!(!app.delete_branch_default(&target, &snapshot));
+        app.sidebar_model.projects[0].pull_requests[0].head_ref = "refs/heads/feature".into();
+        assert!(app.delete_branch_default(&target, &snapshot));
+        snapshot.branch = Some("feature".into());
+        app.sidebar_model.projects[0].pull_requests[0].head_ref = "feature".into();
         snapshot.head_oid = Some("b".repeat(40));
         assert!(!app.delete_branch_default(&target, &snapshot));
         snapshot.head_oid = Some("a".repeat(40));
