@@ -18049,7 +18049,9 @@ impl Application for Cagents {
                             // row's complete metadata. Publish no new authority
                             // into that older row: explicitly read its own actor.
                             let canonical_refresh = if !superseded {
-                                self.retire_project_creation_source(existing_id);
+                                // A duplicate picker result does not replace
+                                // canonical ownership. Its verification read
+                                // retains the original source and accepted work.
                                 self.repository_load_task(existing_repository, Some(existing_id), false)
                             } else { Task::none() };
                             self.repository_generations.remove(&project_id);
