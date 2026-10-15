@@ -1426,15 +1426,17 @@ impl Claude {
                         let failed=block["is_error"].as_bool()==Some(true);
                         let original_input=if failed {correlated_call.map(|call|call["input"].to_string())} else {None};
                         let edit=self.edit_tools.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or_else(||correlated_call.and_then(|call|call["name"].as_str()));
-                        if failed && edit.is_none() && matches!(&item.content,ItemContent::Changes {..}) {
-                            step.events.push(Event::Error {message:format!("Tool failed: {}. Its original tool identity is unavailable; the failed attempted changes were preserved.",super::preview(content_text(&block["content"]).as_bytes(),512)),fatal:false});
+                        let input=self.tool_inputs.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or(original_input.as_deref());
+                        if failed && (edit.is_none()||input.is_none()) && matches!(&item.content,ItemContent::Changes {..}) {
+                            let missing=if edit.is_none(){"identity"}else{"input"};
+                            step.events.push(Event::Error {message:format!("Tool failed: {}. Its original tool {missing} is unavailable; the failed attempted changes were preserved.",super::preview(content_text(&block["content"]).as_bytes(),512)),fatal:false});
                         }
                         apply_result(
                             &mut item.content,
                             content_text(&block["content"]),
                             failed,
                             edit,
-                            self.tool_inputs.get(&CanonicalItemKey::new(child,&tool_id)).map(String::as_str).or(original_input.as_deref()),
+                            input,
                             // The structured result is the frame's, so it is
                             // this block's only when the frame has no other.
                             if content.len() == 1 {
@@ -3580,21 +3582,15 @@ fn apply_result(
         // An edit that failed changed nothing, and why it failed is the one
         // thing a reader needs: a patch has nowhere to say it, so the step
         // goes back to being the tool call it was, carrying the message.
-        ItemContent::Changes {status,..} if edit.is_none()=> {
-            // A retained patch does not prove which native edit tool created
-            // it. Preserve the attempted source and actual failure status.
-            *status=result;
-        }
-        ItemContent::Changes { changes, .. } => {
-            let input = input.map(str::to_owned).unwrap_or_else(|| {
-                format!("[Original input unavailable; known file path follows]\n{}",json!({"file_path": changes.first().map(|change| change.path.as_str())}))
-            });
-            *content = ItemContent::Tool {
-                name: edit.unwrap().into(),
-                input,
-                output: text,
-                status: result,
-            };
+        ItemContent::Changes {status,..} => {
+            if let (Some(name),Some(input))=(edit,input) {
+                *content=ItemContent::Tool{name:name.into(),input:input.into(),output:text,status:result};
+            } else {
+                // A known native name alone cannot reconstruct its arguments.
+                // Keep the complete attempted patch instead of replacing it
+                // with a filepath-shaped placeholder.
+                *status=result;
+            }
         }
         // Only a shell command's result is what a terminal was written to: a
         // file that was read is shown as the bytes it holds.
