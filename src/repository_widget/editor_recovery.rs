@@ -15,6 +15,16 @@ impl RepositoryRuntime {
         document.present = false; document.saved_present = false;
         runtime
     }
+    /// Consume a refused pure disk-probe receipt without admitting its later
+    /// template/cross-presence capture. An already-effectful capture keeps its
+    /// original nonce and retirement gate until that exact worker completes.
+    pub fn retire_disk_metadata(&mut self, identity: &AsyncIdentity, ticket: u64) -> bool {
+        if self.recovery_capture_ticket.is_some() || !self.accepts_selected(identity)
+            || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return false; }
+        self.disk_poll = None;
+        true
+    }
+
     pub fn has_editor_recovery(&self) -> bool { self.recovery.as_ref().is_some_and(|state| !state.authority.is_resolved()) || self.recovery_capture_ticket.is_some() }
 
     /// A publisher can hand an unopened-file recovery to its owning runtime.
@@ -128,6 +138,8 @@ mod tests {
         assert!(runtime.recovery.is_none(), "this is an admitted worker, not an invented error");
         let owned_nonce = runtime.recovery_capture_ticket;
         let old_identity = runtime.current_identity(card, "notes.txt".into());
+        assert!(!runtime.retire_disk_metadata(&old_identity, 7), "a refused old pure receipt cannot release the actual capture owner");
+        assert_eq!(runtime.recovery_capture_ticket, owned_nonce);
         let duplicate = runtime.update(RepositoryAction::DiskMetadata { identity: old_identity.clone(), ticket: 7, result: Ok(Some(stamp)) });
         assert!(iced::runtime::task::into_stream(duplicate).is_none(), "old metadata cannot admit a second effectful capture");
         assert_eq!(runtime.recovery_capture_ticket, owned_nonce);
@@ -143,6 +155,24 @@ mod tests {
         assert!(received); assert!(!runtime.has_editor_recovery());
         let DocumentState::Editable(document) = &runtime.document else { unreachable!() };
         assert!(document.external_version.as_ref().unwrap().restoration.is_some());
+    }
+
+    #[test]
+    fn refused_pure_disk_probe_cannot_start_cross_presence_capture_on_late_delivery() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "notes.txt", "");
+        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        document.present = false; document.saved_present = false;
+        let identity = runtime.current_identity(card, "notes.txt".into());
+        runtime.disk_poll = Some((7, Instant::now()));
+        assert!(!runtime.retire_disk_metadata(&identity, 8));
+        assert!(runtime.retire_disk_metadata(&identity, 7));
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("notes.txt"), "external").unwrap();
+        let stamp = crate::editor_reload::stamp(directory.path(), Path::new("notes.txt"), Path::new("notes.txt")).unwrap().unwrap();
+        let task = runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 7, result: Ok(Some(stamp)) });
+        assert!(iced::runtime::task::into_stream(task).is_none(), "retired pure receipt cannot admit a capture worker");
+        assert!(!runtime.has_editor_recovery());
     }
 
     #[test]

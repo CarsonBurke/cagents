@@ -18510,6 +18510,25 @@ impl Application for Cagents {
                 | RepositoryAction::AutoSaveDue { .. } | RepositoryAction::StageSelected { .. }
                 | RepositoryAction::ApplyDiffSelection { .. } | RepositoryAction::ApplyDiffHunk { .. }
                 | RepositoryAction::RevertFile { .. } | RepositoryAction::Reload { .. } | RepositoryAction::KeepMine { .. }) {
+            // A pure metadata reply can admit a new effectful cross-presence
+            // capture. Refuse and retire only that poll while window-owned
+            // recovery is unresolved, including a sibling Runtime's scope.
+            if let RepositoryAction::DiskMetadata { identity, ticket, .. } = action {
+                let blocked = self.exit.is_some() || match self.cards.get(&identity.card) {
+                    Some(CardRuntime::Repository(runtime)) => self.publication_recovery_blocks(&runtime.descriptor.worktree),
+                    Some(CardRuntime::PullRequests(pane)) => self.publication_recovery_blocks(&pane.runtime.descriptor.worktree),
+                    _ => false,
+                };
+                if blocked {
+                    match self.cards.get_mut(&identity.card) {
+                        Some(CardRuntime::Repository(runtime)) => { runtime.retire_disk_metadata(identity, *ticket); },
+                        Some(CardRuntime::PullRequests(pane)) => { pane.runtime.retire_disk_metadata(identity, *ticket); },
+                        _ => {},
+                    }
+                    self.status = Some(TransientNotice::warning("Resolve file recovery in this worktree before another disk observation."));
+                    return Task::none();
+                }
+            }
             if self.exit.is_some() { return Task::none(); }
             if !matches!(action, RepositoryAction::DiskMetadata { .. }) {
                 let worktree = match self.cards.get(&action.card()) {
@@ -25938,6 +25957,40 @@ mod tests {
         drop(app.exit_after_language_servers()); assert!(app.exit.is_some());
         drop(app.update(Message::Repository(metadata)));
         assert!(!app.card_has_editor_recovery(card), "no effectful capture nonce can be admitted after the window closes");
+    }
+
+    #[tokio::test]
+    async fn window_recovery_retires_sibling_pure_metadata_before_cross_presence_capture() {
+        use cosmic::iced::futures::StreamExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("source.rs"), "outside").unwrap();
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let mut runtime = RepositoryRuntime::cross_presence_observation_fixture(card, "source.rs");
+        runtime.descriptor.worktree = directory.path().into();
+        let task = runtime.refresh_open_document(card);
+        let mut stream = iced::runtime::task::into_stream(task).expect("original pure metadata probe");
+        let iced::runtime::Action::Output(metadata) = stream.next().await.unwrap() else { panic!("metadata receipt") };
+        let RepositoryAction::DiskMetadata { result: Ok(Some(_)), .. } = &metadata else { panic!("real disk observation") };
+        assert!(!runtime.has_editor_recovery());
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        let authority = crate::editor::RecoverySlot::reserve().unwrap().retain("orphaned original file cleanup".into(), || Ok(()));
+        drop(app.update(Message::EditorFeatures(editor_features::Action::Published {
+            ticket: u64::MAX,
+            result: Err(crate::editor_workspace_edit::PublicationFailure {
+                message: "original publication needs recovery".into(), recovery: Some(authority.clone()),
+                worktree: Some(directory.path().to_owned()),
+            }),
+        })));
+        assert!(app.publication_recovery_blocks(directory.path()));
+        assert!(iced::runtime::task::into_stream(app.update(Message::Repository(metadata.clone()))).is_none());
+        assert!(!app.card_has_editor_recovery(card), "the unrelated Runtime never admits effectful capture");
+        assert!(!authority.is_resolved());
+        // Exact duplicate delivery remains retired even after window recovery
+        // is resolved; it cannot restart the old pure poll.
+        authority.retry().unwrap();
+        drop(app.update(Message::Repository(metadata)));
+        assert!(!app.card_has_editor_recovery(card));
     }
 
     #[test]
