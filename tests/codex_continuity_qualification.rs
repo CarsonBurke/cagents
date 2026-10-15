@@ -29,6 +29,13 @@
 //! native executable, not a Node launcher: the fixture's `PATH` holds nothing
 //! but that one program. Codex itself may still reach the network for its own
 //! housekeeping; the model endpoint never leaves this process.
+//!
+//! The separate `ten_minutes_of_background_tools_leave_no_holder_zombies`
+//! filter qualifies event-driven orphan reaping. It records transient zombie
+//! observations, any same-incarnation zombie persisting for 250ms, and the
+//! settled census under the same live holder. Set
+//! `CAGENTS_QUALIFICATION_EVIDENCE` to a persistent JSON result path to retain
+//! its measurements; failed private fixture state is kept beside that path.
 
 use cagents::{
     chat::{Command as ChatCommand, NativeContinuity, Session, Snapshot},
@@ -40,12 +47,13 @@ use cagents::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     io::{BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::{
-        fs::{PermissionsExt, symlink},
+        fs::{MetadataExt, PermissionsExt, symlink},
         net::UnixStream,
     },
     path::{Path, PathBuf},
@@ -212,10 +220,22 @@ fn serve(stream: TcpStream, seen: &Mutex<Vec<ModelRequest>>) {
                 json!({"session_id":session,"chars":"","yield_time_ms":(COMMAND_SECONDS + 15) * 1000}),
             )
         }
+        Some(output) if scenario.contains("SCENARIO orphan-reaping")
+            && !output.contains("ORPHAN_LOOP_FINISHED") => {
+            let session = output.split("session ID ").nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|id| id.parse::<u64>().ok())
+                .expect("the ongoing orphan loop reports its tool session");
+            tool_call(&format!("orphan-poll-{number}"), "write_stdin",
+                json!({"session_id":session,"chars":"","yield_time_ms":1000}))
+        }
         Some(_) => json!({
             "type":"message","role":"assistant","id":format!("message-{number}"),
             "content":[{"type":"output_text","text":"SCENARIO_COMPLETE"}]
         }),
+        None if scenario.contains("SCENARIO orphan-reaping") => shell(
+            "orphan-tools", "i=0; while [ \"$i\" -lt 3600 ] && [ ! -e stop-orphan-loop ]; do sh -c 'sleep 1 & echo $! >> orphan-pids'; sleep 0.2; i=$((i+1)); done; echo ORPHAN_LOOP_FINISHED".into(), 1000,
+        ),
         None if scenario.contains("SCENARIO long") => shell(
             "long",
             format!("sleep {COMMAND_SECONDS}; echo {LONG_MARKER}"),
@@ -436,7 +456,13 @@ impl Fixture {
             })
             .to_owned();
 
-        let root = tempfile::tempdir().unwrap();
+        // Keep native binaries/transcripts off a potentially tmpfs-backed /tmp.
+        let evidence = std::env::var_os("CAGENTS_QUALIFICATION_EVIDENCE").map(PathBuf::from);
+        let directory = evidence.as_deref().and_then(Path::parent)
+            .filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("/var/tmp"));
+        fs::create_dir_all(directory).unwrap();
+        let directory = fs::canonicalize(directory).unwrap();
+        let root = tempfile::Builder::new().prefix("codex-continuity-").tempdir_in(&directory).unwrap();
         for directory in [
             "home/.codex",
             "run",
@@ -628,6 +654,10 @@ unified_exec = true
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        if thread::panicking() {
+            self.root.disable_cleanup(true);
+            eprintln!("Failed Codex qualification state retained at {}", self.root.path().display());
+        }
         let preflight = self.output(&["daemon", "preflight"]);
         if let Ok(value) = serde_json::from_slice::<Value>(&preflight.stdout)
             && let Some(capability) = value["data"].get("capability")
@@ -637,12 +667,13 @@ impl Drop for Fixture {
         let _ = self.daemon.kill();
         let _ = self.daemon.wait();
         // A failed assertion can leave the provider and its holder running:
-        // a durable holder is meant to outlive its daemon. Nothing outside
-        // this fixture runs in, or names, its directory.
-        let root = self.root.path().to_str().unwrap().to_owned();
-        for ((pid, _), command) in processes() {
-            if command.contains(&root) && pid != std::process::id() {
-                unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        // a durable holder is meant to outlive its daemon. Cleanup requires
+        // this private cwd and the same pinned process incarnation.
+        let root = self.root.path().to_path_buf();
+        for (identity, _) in processes() {
+            if let Err(error) = stop_fixture_process(identity, &root) {
+                self.root.disable_cleanup(true);
+                eprintln!("Could not clean exact fixture process {identity:?}: {error}; state retained");
             }
         }
         if thread::panicking() {
@@ -659,6 +690,72 @@ impl Drop for Fixture {
             }
         }
     }
+}
+
+/// Only private fixture processes qualify for teardown. Pin the process before
+/// a second identity/ownership check; a numeric PID from the census alone is
+/// never signal authority.
+fn stop_fixture_process(identity: Identity, root: &Path) -> std::io::Result<()> {
+    // /proc cwd links are absolute and resolve symlinks. An aliased evidence
+    // directory must still identify the same private root; failure preserves
+    // its evidence and never broadens signal authority.
+    let root = fs::canonicalize(root)?;
+    if identity.0 == std::process::id() || !fixture_process_matches(identity, &root) {
+        return Ok(());
+    }
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, identity.0, 0) as i32 };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(error) };
+    }
+    let pidfd = unsafe { fs::File::from_raw_fd(fd) };
+    if !fixture_process_matches(identity, &root) { return Ok(()); }
+    let result = unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL,
+        std::ptr::null::<libc::siginfo_t>(), 0) };
+    if result == 0 { return Ok(()); }
+    let error = std::io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::ESRCH) { Ok(()) } else { Err(error) }
+}
+
+fn fixture_process_matches((pid, start): Identity, root: &Path) -> bool {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    let start_matches = || fs::read_to_string(process.join("stat")).ok().and_then(|stat| {
+        stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse::<u64>().ok()
+    }) == Some(start);
+    if !start_matches() || !fs::metadata(&process).is_ok_and(|metadata| metadata.uid() == unsafe { libc::geteuid() }) {
+        return false;
+    }
+    // Merely naming a fixture path in argv (for example, a log reader) does
+    // not make an unrelated process ours. All fixture launches and tools use
+    // this private cwd; anything else is left untouched.
+    let private = fs::read_link(process.join("cwd")).is_ok_and(|cwd| cwd.starts_with(root));
+    private && start_matches()
+}
+
+#[test]
+fn fixture_cleanup_requires_private_cwd_and_the_same_process_incarnation() {
+    struct Probe(Child);
+    impl Drop for Probe {
+        fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); }
+    }
+    let private = tempfile::Builder::new().prefix("codex-cleanup-private-").tempdir_in("/var/tmp").unwrap();
+    let outside = tempfile::Builder::new().prefix("codex-cleanup-outside-").tempdir_in("/var/tmp").unwrap();
+    let spawn = |cwd: &Path| Probe(Command::new("/bin/sleep").arg("600").env_clear().current_dir(cwd)
+        .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap());
+    let mut owned = spawn(private.path());
+    let mut unrelated = spawn(outside.path());
+    let identities = processes();
+    let identity = |pid| identities.iter().find(|((candidate, _), _)| *candidate == pid).unwrap().0;
+    let owned_identity = identity(owned.0.id());
+    stop_fixture_process((owned_identity.0, owned_identity.1 + 1), private.path()).unwrap();
+    assert!(owned.0.try_wait().unwrap().is_none(), "a stale start time must not authorize a signal");
+    stop_fixture_process(identity(unrelated.0.id()), private.path()).unwrap();
+    assert!(unrelated.0.try_wait().unwrap().is_none(), "an exact pidfd alone must not admit an outside process");
+    let alias = outside.path().join("private-alias");
+    symlink(private.path(), &alias).unwrap();
+    stop_fixture_process(owned_identity, &alias).unwrap();
+    use std::os::unix::process::ExitStatusExt;
+    assert_eq!(owned.0.wait().unwrap().signal(), Some(libc::SIGKILL));
 }
 
 /// Every process this user can read, with its start time, and its command
@@ -888,5 +985,113 @@ fn a_pending_approval_survives_a_killed_daemon_unanswered() {
         (!snapshot.busy && snapshot.requests.is_empty()).then_some(())
     });
     assert_one_uninterrupted_turn(&fixture, "approval", &servers, 2);
+    close(&fixture, &mut window, &chat);
+}
+
+/// Runs the real provider's execution tool against a local model fixture. The
+/// parent shells exit before their background children, exercising subreaper
+/// adoption continuously rather than just checking direct child cleanup.
+#[test]
+#[ignore = "ten-minute native Codex orphan qualification; no remote model calls"]
+fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
+    let fixture = Fixture::new();
+    fixture.start("orphan-reaping", "never");
+    let mut window = fixture.window();
+    let chat = fixture.durable_chat(&mut window);
+    window.attach(chat.clone());
+    let directory = fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join("native-holders");
+    let record: Value = until(Duration::from_secs(10), "the native holder registry", || {
+        fs::read_dir(&directory).ok()?.flatten().filter(|entry| entry.path().extension().is_some_and(|extension| extension == "json"))
+            .find_map(|entry| serde_json::from_slice(&fs::read(entry.path()).ok()?).ok())
+    });
+    let holder = record["holder"]["pid"].as_u64().unwrap();
+    let holder_start = record["holder"]["start"].as_u64().unwrap();
+    // Every exit has a finite SIGCHLD delivery/reap window. Record raw Z
+    // observations honestly, and separately detect accumulation persisting
+    // across a 250ms grace period; a product polling timer is not involved.
+    let mut witnessed_children = BTreeSet::new();
+    let mut census = || {
+        let identity = || {
+            let stat = fs::read_to_string(format!("/proc/{holder}/stat")).expect("fixture holder vanished");
+            let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
+            assert!(!matches!(fields.first(), Some(&"Z") | Some(&"X") | Some(&"x")),
+                "the original holder must remain live; reparented children cannot prove reaping");
+            fields[19].parse::<u64>().unwrap()
+        };
+        assert_eq!(identity(), holder_start, "the fixture holder incarnation changed");
+        let mut children = BTreeSet::new();
+        for task in fs::read_dir(format!("/proc/{holder}/task")).unwrap().flatten() {
+            if let Ok(pids) = fs::read_to_string(task.path().join("children")) {
+                children.extend(pids.split_whitespace().map(str::to_owned));
+            }
+        }
+        let mut zombies = BTreeSet::new();
+        for pid in children {
+            if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+                let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
+                if fields.get(1).and_then(|parent| parent.parse::<u64>().ok()) == Some(holder) {
+                    let identity = (pid, fields[19].parse::<u64>().unwrap());
+                    witnessed_children.insert(identity.clone());
+                    if fields.first() == Some(&"Z") { zombies.insert(identity); }
+                }
+            }
+        }
+        assert_eq!(identity(), holder_start);
+        zombies
+    };
+    let started = Instant::now();
+    let mut samples = 0u64;
+    let mut observed = BTreeSet::new();
+    let mut pending = BTreeMap::new();
+    let mut persistent = BTreeSet::new();
+    while started.elapsed() < Duration::from_secs(10 * 60) {
+        let zombies = census();
+        pending.retain(|identity, _| zombies.contains(identity));
+        for identity in zombies {
+            observed.insert(identity.clone());
+            let since = pending.entry(identity.clone()).or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_millis(250) { persistent.insert(identity); }
+        }
+        samples += 1;
+        thread::sleep(Duration::from_millis(100));
+    }
+    // End only this fixture's tool loop, keeping its actual provider/holder
+    // alive so the final zero census cannot be caused by owner destruction.
+    fs::write(fixture.root.path().join("project/stop-orphan-loop"), b"settle").unwrap();
+    until(Duration::from_secs(30), "the fixture orphan loop to settle", || {
+        let snapshot = window.read(chat.id);
+        assert!(!snapshot.exited, "the provider exited instead of completing its fixture loop");
+        (snapshot.ready && !snapshot.busy && snapshot.requests.is_empty()).then_some(())
+    });
+    let final_provider = window.read(chat.id);
+    assert!(final_provider.ready && !final_provider.exited,
+        "the original provider must remain alive for the final holder census");
+    let settle_deadline = Instant::now() + Duration::from_secs(2);
+    let final_zombies = loop {
+        let zombies = census();
+        if zombies.is_empty() || Instant::now() >= settle_deadline { break zombies; }
+        thread::sleep(Duration::from_millis(10));
+    };
+    drop(census);
+    let tool_pids = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap();
+    let tools = tool_pids.lines().count();
+    let tool_pids = tool_pids.lines().map(str::to_owned).collect::<BTreeSet<_>>();
+    let witnessed_adoptions = witnessed_children.iter().filter(|(pid, _)| tool_pids.contains(pid)).count();
+    let report = json!({"provider":fixture.version, "seconds":started.elapsed().as_secs_f64(),
+        "holder":holder, "holder_start":holder_start, "provider_exited":final_provider.exited,
+        "provider_ready":final_provider.ready, "samples":samples, "background_children":tools,
+        "witnessed_background_adoptions":witnessed_adoptions,
+        "raw_zombie_observations":observed, "persistent_zombies_250ms":persistent, "final_zombies":final_zombies});
+    eprintln!("{report}");
+    if let Some(path) = std::env::var_os("CAGENTS_QUALIFICATION_EVIDENCE") {
+        fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+    }
+    assert!(tools >= 1000, "the provider did not repeatedly background tools: {report}");
+    assert!(witnessed_adoptions >= 100, "the fixture did not witness repeated background-child adoption by this holder: {report}");
+    assert!(persistent.is_empty(), "holder children remained unreaped across the measured grace period: {report}");
+    assert!(final_zombies.is_empty(), "the same live holder retained zombies after its tool loop settled: {report}");
+    let diagnostics = fixture.cli(&["diagnostics"]);
+    let reports = diagnostics["holders"].as_array().expect("CLI holder diagnostics are absent");
+    assert!(reports.iter().any(|report| report["pid"] == holder && report["zombie_children"] == 0));
     close(&fixture, &mut window, &chat);
 }
