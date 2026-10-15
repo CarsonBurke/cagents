@@ -58,6 +58,15 @@ fn offset(text: &str, position: LspPosition, coordinates: LspCoordinates) -> Res
 
 pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<PathBuf, OpenSnapshot>) -> Result<Plan, String> {
     let worktree = std::fs::canonicalize(worktree).map_err(|error| error.to_string())?;
+    let mut canonical_open = HashMap::new();
+    for (path, snapshot) in open {
+        let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+        if let Some(previous) = canonical_open.insert(path, snapshot) {
+            if previous.text != snapshot.text || previous.version != snapshot.version || previous.writable != snapshot.writable {
+                return Err("Two open views of the same file disagree; close the stale view before applying this edit".into());
+            }
+        }
+    }
     let root = fs_safety::Root::open(&worktree).map_err(|error| error.to_string())?;
     let mut seen = std::collections::HashSet::new();
     let mut result = Vec::with_capacity(documents.len());
@@ -68,7 +77,7 @@ pub fn prepare(worktree: &Path, documents: Vec<DocumentEdits>, open: &HashMap<Pa
         let path = std::fs::canonicalize(candidate).map_err(|error| format!("{}: {error}", document.path.display()))?;
         let relative = path.strip_prefix(&worktree).map_err(|_| "The server tried to edit a file outside this worktree")?.to_path_buf();
         if !seen.insert(path.clone()) { return Err("The server returned duplicate file edit groups".into()); }
-        let snapshot = open.get(&path);
+        let snapshot = canonical_open.get(&path).copied();
         if snapshot.is_some_and(|snapshot| !snapshot.writable) { return Err(format!("{} is read-only", path.display())); }
         for version in [document.version, document.observed_version].into_iter().flatten() {
             if snapshot.is_none_or(|snapshot| snapshot.version != version) { return Err(format!("{} changed after the server prepared its edits", path.display())); }
@@ -149,7 +158,7 @@ mod tests {
         for name in ["a.rs", "b.rs", "c.rs"] { std::fs::write(directory.path().join(name), "old()").unwrap(); }
         let path = std::fs::canonicalize(directory.path().join("a.rs")).unwrap();
         let mut open = HashMap::from([(path, OpenSnapshot { text: "old()".into(), version: 7, writable: true })]);
-        let documents = || ["a.rs", "b.rs", "c.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: (name == "a.rs").then_some(7), observed_version: None, observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "renamed")] }).collect();
+        let documents = || ["a.rs", "b.rs", "c.rs"].into_iter().map(|name| DocumentEdits { path: name.into(), version: (name == "a.rs").then_some(7), observed_version: None, coordinates: LspCoordinates::Scalar, edits: vec![edit(0, 3, "renamed")] }).collect();
         let plan = prepare(directory.path(), documents(), &open).unwrap();
         assert_eq!(plan.documents.len(), 3);
         publish_unopened(&plan).unwrap();

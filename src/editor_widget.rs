@@ -1382,6 +1382,15 @@ where
         })
     }
 
+    /// Expanded word/line selection, measured once for an explicit command.
+    pub fn selected_bounds(&self) -> Option<(Position, Position)> {
+        let cursor = self.cursor();
+        let anchor = cursor.selection?;
+        let span = self.selected_span(&self.excerpt(cursor.position.line.min(anchor.line), cursor.position.line.max(anchor.line)), cursor);
+        let anchor = span.selection?;
+        Some(if (anchor.line, anchor.column) <= (span.position.line, span.position.column) { (anchor, span.position) } else { (span.position, anchor) })
+    }
+
     /// The caret with the exact span it has selected.
     ///
     /// A word or line selection reports only the point it was anchored at,

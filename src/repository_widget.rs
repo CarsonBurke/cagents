@@ -794,6 +794,9 @@ struct EditorDocument {
     /// reporting changes.
     lsp_version: i32,
     active_save: Option<SaveTicket>,
+    /// A prepared workspace edit holds this buffer stable while unopened files
+    /// are published. The ticket fences stale publication completions.
+    workspace_edit: Option<(u64, Option<TextChange>)>,
     conflict: bool,
     error: Option<String>,
     durability_warning: Option<String>,
@@ -850,6 +853,7 @@ impl EditorDocument {
             revision: 0,
             lsp_version: 1,
             active_save: None,
+            workspace_edit: None,
             conflict: false,
             error: None,
             durability_warning: None,
@@ -3454,6 +3458,7 @@ impl RepositoryRuntime {
     /// consequently nothing to refuse on that ground, and pretending to check
     /// would only suggest the field exists.
     pub fn apply_completion(&mut self, item: &LspCompletionItem) -> bool {
+        if self.workspace_edit_pending() { return false; }
         if self.source_surface != SourceSurface::Editor {
             return false;
         }
@@ -3760,6 +3765,91 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Explicit operation snapshot, taken once for a server edit preview.
+    pub fn workspace_edit_snapshot(&self) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
+            text: document.content.text().into(), version: document.lsp_version,
+            writable: !self.is_saving(),
+        }))
+    }
+
+    /// Proves that the preview still addresses this exact buffer, then freezes
+    /// mutations until the disk phase completes. No edit is made in this phase.
+    pub fn begin_workspace_edit(&mut self, ticket: u64, plan: &crate::editor_workspace_edit::DocumentPlan) -> Result<(), String> {
+        self.flush_lsp_change();
+        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+        if document.active_save.is_some() || document.workspace_edit.is_some()
+            || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
+            return Err("An edited buffer changed after the preview was prepared".into());
+        }
+        let change = document.content.replacement_to_text(&plan.after);
+        if plan.before != plan.after && change.is_none() { return Err("This buffer cannot represent the server edit safely".into()); }
+        if let Some(change) = &change {
+            if document.content.range_end(change.start, &change.removed).is_none() {
+                return Err("The server edit does not address the native buffer".into());
+            }
+        }
+        document.workspace_edit = Some((ticket, change));
+        Ok(())
+    }
+
+    pub fn cancel_workspace_edit(&mut self, ticket: u64) {
+        if let DocumentState::Editable(document) = &mut self.document {
+            if document.workspace_edit.as_ref().is_some_and(|(current, _)| *current == ticket) {
+                document.workspace_edit = None;
+            }
+        }
+    }
+
+    /// Publishes one prepared transition as exactly one ordinary per-buffer Undo
+    /// step. The saved disk baseline is retained, so the resulting open buffer
+    /// remains dirty until the user saves it.
+    pub fn finish_workspace_edit(&mut self, ticket: u64) -> Result<(), String> {
+        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
+        if !document.workspace_edit.as_ref().is_some_and(|(current, _)| *current == ticket) {
+            return Err("The workspace-edit publication is stale".into());
+        }
+        let (_, change) = document.workspace_edit.take().unwrap();
+        let Some(change) = change else { return Ok(()); };
+        let cursor = document.content.cursor();
+        let scroll = document.content.scroll_position();
+        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
+            return Err("The prepared edit could not be applied; the buffer was preserved".into());
+        }
+        document.content.set_cursor(cursor);
+        document.content.restore_scroll_position(scroll);
+        document.history.record_group(vec![change], cursor, document.content.cursor(), Instant::now());
+        document.text_changed();
+        if let Some(version) = document.bump_lsp_version() {
+            self.lsp_edits.clear();
+            self.lsp_edits_exact = false;
+            self.lsp_intents.push(LspIntent::Change { version, text: document.content.text() });
+        }
+        self.refresh_find_matches();
+        Ok(())
+    }
+
+    pub fn editor_selection_range(&self) -> Option<LspRange> {
+        let DocumentState::Editable(document) = &self.document else { return None; };
+        let (start, end) = document.content.selected_bounds()?;
+        Some(LspRange::new(caret_position(&document.content, start)?, caret_position(&document.content, end)?))
+    }
+
+    /// Installs a worker-built, virtualized comparison in a dedicated preview
+    /// runtime. This runtime never owns an editable document or a Git baseline.
+    pub fn set_workspace_preview(&mut self, path: PathBuf, model: DiffModel) {
+        self.files = FileListState::Ready(Vec::new());
+        self.selected = Some(RepositoryFile { path, unstaged: true, ..RepositoryFile::default() });
+        self.document = DocumentState::None;
+        self.source_surface = SourceSurface::Diff;
+        self.diff_basis = DiffBasis::IndexToWorktree;
+        self.set_diff_state(self.diff_basis.clone(), DiffState::ready(RenderedDiff::Text {
+            model, old_label: "Before".into(), new_label: "After applying".into(),
+        }));
+    }
+
     pub fn selected_staging_selection(
         &self,
         stage: bool,
@@ -3944,7 +4034,7 @@ impl RepositoryRuntime {
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
         // The same gates as typing: a history step is an edit, and find
         // holds the buffer read-only while it is open.
-        if self.search_mode || self.source_surface != SourceSurface::Editor {
+        if self.search_mode || self.source_surface != SourceSurface::Editor || self.workspace_edit_pending() {
             return Task::none();
         }
         let DocumentState::Editable(document) = &mut self.document else {
@@ -4314,7 +4404,7 @@ impl RepositoryRuntime {
     }
 
     pub fn can_save(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none())
+        matches!(&self.document, DocumentState::Editable(document) if (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none() && document.workspace_edit.is_none())
     }
 
     fn can_discard_edits(&self) -> bool {
@@ -4325,8 +4415,12 @@ impl RepositoryRuntime {
         !self.standalone && self.selected.is_some() && !self.is_saving()
     }
 
+    pub fn workspace_edit_pending(&self) -> bool {
+        matches!(&self.document, DocumentState::Editable(document) if document.workspace_edit.is_some())
+    }
+
     pub fn is_saving(&self) -> bool {
-        matches!(&self.document, DocumentState::Editable(document) if document.active_save.is_some())
+        matches!(&self.document, DocumentState::Editable(document) if document.active_save.is_some() || document.workspace_edit.is_some())
     }
 
     pub fn blocks_navigation(&self) -> bool {
@@ -4345,7 +4439,7 @@ impl RepositoryRuntime {
             &self.document,
             DocumentState::Editable(document)
                 if document.dirty
-                    && document.active_save.is_none()
+                    && document.active_save.is_none() && document.workspace_edit.is_none()
                     && document.durability_warning.is_none()
         )
     }
@@ -4574,7 +4668,7 @@ impl RepositoryRuntime {
             DocumentState::Editable(document)
                 if self.auto_save
                     && document.dirty
-                    && document.active_save.is_none()
+                    && document.active_save.is_none() && document.workspace_edit.is_none()
                     && !document.conflict
                     && document.error.is_none()
                     && document.durability_warning.is_none() =>
@@ -4626,7 +4720,7 @@ impl RepositoryRuntime {
         let (path, destination, text, disk_hash, revision) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
-                    && document.active_save.is_none() =>
+                    && document.active_save.is_none() && document.workspace_edit.is_none() =>
             {
                 (
                     document.path.clone(),
@@ -5167,6 +5261,7 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::EditorAction { card, action } => {
+                if self.workspace_edit_pending() && matches!(action, text_editor::Action::Edit(_)) { return Task::none(); }
                 if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
                     return Task::none();
                 }
@@ -15879,6 +15974,32 @@ mod tests {
     }
 
     #[test]
+    fn workspace_edit_is_fenced_and_one_undo_step_per_buffer() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "fn old() {}\nold();\n");
+        let before = runtime.editor_text().unwrap();
+        let after = "fn renamed() {}\nrenamed();\n";
+        let plan = crate::editor_workspace_edit::DocumentPlan {
+            path: "/repo/main.rs".into(), relative: "main.rs".into(),
+            before: before.clone().into(), after: after.into(),
+            before_hash: blake3::hash(before.as_bytes()), version: Some(1), open: true, edits: vec![],
+        };
+        runtime.begin_workspace_edit(42, &plan).unwrap();
+        assert!(runtime.is_saving());
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        assert_eq!(runtime.editor_text().unwrap(), before);
+        assert!(runtime.finish_workspace_edit(41).is_err());
+        runtime.finish_workspace_edit(42).unwrap();
+        assert_eq!(runtime.editor_text().unwrap(), after);
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), before);
+        drop(runtime.update(RepositoryAction::Redo { card }));
+        assert_eq!(runtime.editor_text().unwrap(), after);
+        assert!(runtime.begin_workspace_edit(43, &plan).is_err());
+    }
+
+    #[test]
     fn a_completion_applies_every_edit_and_reports_one_version() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(
@@ -18223,4 +18344,9 @@ mod tests {
             assert!(adjusted.b > adjusted.r && adjusted.r > adjusted.g);
         }
     }
+}
+
+/// The virtualized diff canvas used by a language-server workspace-edit preview.
+pub fn workspace_preview_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+    diff_surface(card, runtime, None)
 }
