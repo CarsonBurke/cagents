@@ -14,24 +14,16 @@ struct LocalViews {
     panes: HashMap<Scope, Vec<Pane>>,
 }
 
-/// Observed descriptors belong to an actor, while names and widths belong to
-/// its pane. A later process at the same pane ID must keep its own descriptor.
-fn same_pane_update_target(before: &CardKind, current: &CardKind) -> bool {
-    use crate::agent_execution::HostedSession;
-    let same_process = |before: HostedSession, current: HostedSession| {
-        before.has_complete_proof() && current.has_complete_proof()
-            && before.same_process(&current)
-    };
-    match (before, current) {
-        (CardKind::Terminal(before), CardKind::Terminal(current)) =>
-            same_process(HostedSession::Terminal(before.clone()), HostedSession::Terminal(current.clone())),
-        (CardKind::Chat(before), CardKind::Chat(current)) =>
-            same_process(HostedSession::Chat(before.clone()), HostedSession::Chat(current.clone())),
-        (CardKind::Browser(before), CardKind::Browser(current)) => before.id == current.id,
-        (CardKind::Repository(before), CardKind::Repository(current)) =>
-            before.repository == current.repository && before.worktree == current.worktree,
-        (CardKind::PullRequests(before), CardKind::PullRequests(current)) =>
-            before.repository == current.repository,
+/// Whole descriptors can contain concurrently changed metadata even for the
+/// same process. Retry only while the complete base is still authoritative;
+/// the daemon must also enforce this fence when it applies the operation.
+fn can_retry_pane_kind(before: &CardKind, current: &CardKind) -> bool {
+    before == current && match before {
+        CardKind::Terminal(session) => session.continuity.live_proof()
+            .is_some_and(|proof| proof.is_complete()),
+        CardKind::Chat(session) => session.proof.as_ref()
+            .is_some_and(crate::model::HostSessionProof::is_complete),
+        CardKind::Browser(_) | CardKind::Repository(_) | CardKind::PullRequests(_) => true,
         _ => false,
     }
 }
@@ -707,7 +699,7 @@ impl Cagents {
             let Some(owner) = owners.next() else { continue; };
             if owners.next().is_some() || owner.scope == *scope { continue; }
             let current = owner.panes.iter().find(|pane| pane.id == card).unwrap();
-            if before.kind != pane.kind && !same_pane_update_target(&before.kind, &current.kind) {
+            if before.kind != pane.kind && !can_retry_pane_kind(&before.kind, &current.kind) {
                 before.kind = current.kind.clone();
                 pane.kind = current.kind.clone();
                 stale_actor = true;
@@ -1648,9 +1640,9 @@ mod tests {
     }
 
     #[test]
-    fn channel_move_keeps_replacement_actor_and_independent_user_edits() {
+    fn channel_move_keeps_current_descriptor_and_independent_user_edits() {
         use super::super::workspace_model_sync::ModelUpdate;
-        for replacement in ["session", "proof", "unproved-before", "unproved-current", "incomplete-both"] {
+        for replacement in ["session", "proof", "unproved-before", "unproved-current", "incomplete-both", "same-process-metadata", "other-current-field"] {
             let mut kind = moving_terminal_kind();
             let CardKind::Terminal(session) = &mut kind else { panic!("terminal"); };
             if replacement == "unproved-before" {
@@ -1684,7 +1676,11 @@ mod tests {
                 },
                 _ => {}
             }
-            session.resume_hint = Some("authoritative-current-session".into());
+            if replacement == "other-current-field" {
+                session.transcript_path = Some("/authoritative-current/transcript".into());
+            } else {
+                session.resume_hint = Some("authoritative-current-session".into());
+            }
             expected.kind = current.clone();
             model.sequence += 1;
             drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::ViewApplied {
