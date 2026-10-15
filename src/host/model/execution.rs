@@ -1081,7 +1081,8 @@ impl Registry {
     }
 
     /// Retire an exact process after confirmed teardown, including closes from
-    /// the UI. The run, capacity and delegated authority change atomically.
+    /// the UI. Run state, capacity, delegated authority and the exact retained
+    /// presentation change in the same transaction.
     pub(crate) fn retire_agent_process(
         &mut self,
         source: &HostedSession,
@@ -1153,6 +1154,11 @@ impl Registry {
                     tx.execute("UPDATE agent_runs SET state = 'cancelled', revision = ?2, record = ?3 WHERE id = ?1",
                         params![run.id.to_string(), run.revision, encode(&run)?]).map_err(|e| e.to_string())?;
                 }
+                // ChatClose and daemon shutdown retire through this path before
+                // the execution service can reach close_agent. Commit the pane
+                // tombstone here too, so a crash cannot publish a closed agent
+                // while leaving its exact retained presentation behind.
+                super::views::retire_agent(&tx, &agent)?;
                 agent.closed = true;
                 tx.execute(
                     "DELETE FROM agent_launches WHERE agent = ?1",
@@ -1676,6 +1682,48 @@ mod tests {
                 .is_err()
         );
         assert_eq!(registry.model().unwrap(), before);
+    }
+
+    #[test]
+    fn process_retirement_commits_closed_agent_and_moved_pane_together() {
+        use crate::workspace_model::views::{Change, Scope};
+        for reject_close in [false, true] {
+            let (mut registry, directory, accepted, pane) = closed_pane_fixture();
+            let initial = Scope::Channel(accepted.agent.channel().unwrap());
+            let moved = Scope::Worktree {
+                repository: directory.path().into(),
+                path: directory.path().into(),
+            };
+            registry.apply(&ModelEdit::SeedView {
+                scope: initial.clone(), panes: vec![pane.clone()], closed: vec![],
+            }).unwrap();
+            registry.apply(&ModelEdit::ChangeView {
+                scope: initial.clone(),
+                expected_revision: registry.view_revision(&initial).unwrap(),
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Transfer { id: pane.id, destination: moved.clone(), before: None },
+            }).unwrap();
+            let before = registry.model().unwrap();
+            let run = registry.agent_run(accepted.run.id).unwrap();
+            let retained = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+            if reject_close {
+                registry.db.execute_batch("CREATE TRIGGER reject_process_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture close failure'); END;").unwrap();
+                assert!(registry.retire_agent_process(&retained, 4).is_err());
+                assert_eq!(registry.model().unwrap(), before);
+            } else {
+                assert!(registry.retire_agent_process(&retained, 4).unwrap());
+                let view = super::super::views::read(&registry.db, &moved).unwrap();
+                assert!(view.panes.is_empty());
+                assert!(view.retired.contains(&pane.id));
+                assert!(registry.agent(accepted.agent.id).unwrap().closed);
+                assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+                drop(registry);
+                let registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+                assert_eq!(super::super::views::read(&registry.db, &moved).unwrap(), view);
+                assert!(registry.agent(accepted.agent.id).unwrap().closed);
+                assert_eq!(registry.agent_run(accepted.run.id).unwrap(), run);
+            }
+        }
     }
 
     #[test]

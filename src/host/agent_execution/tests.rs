@@ -937,8 +937,23 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
     assert!(close(&host, &Authority::default(), child.agent.id).is_err());
     assert!(close(&host, &authority, child.agent.id).unwrap().closed);
 
-    // An ordinary UI ChatClose uses the same retirement transaction as the
-    // execution CLI. Afterwards its capability cannot create another child.
+    // An ordinary UI ChatClose must publish the pane tombstone in its first
+    // retirement transaction, without requiring a later execution Close call.
+    let scope = crate::workspace_model::views::Scope::Channel(parent.channel().unwrap());
+    let pane_id = crate::model::CardId::from_uuid(parent.id.as_uuid());
+    let HostedSession::Chat(parent_chat) = parent.session.as_ref().unwrap() else {
+        unreachable!()
+    };
+    registry(&host).unwrap().lock().unwrap().apply(&ModelEdit::SeedView {
+        scope: scope.clone(),
+        panes: vec![crate::workspace_model::views::Pane {
+            id: pane_id, title: "Review".into(), user_title: None,
+            pending_terminal_start: false, width_fraction: 0.5,
+            kind: crate::model::CardKind::Chat(parent_chat.clone()), scope: None,
+        }],
+        closed: vec![],
+    }).unwrap();
+    let retained_run = registry(&host).unwrap().lock().unwrap().agent_run(accepted.run.id).unwrap();
     let parent_session = parent.session.as_ref().unwrap().id();
     super::super::chat::process(
         &host,
@@ -957,6 +972,14 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
             .unwrap()
             .closed
     );
+    // Read a separate database connection, before any service-level Close, to
+    // verify the committed state that subscribed windows receive.
+    let stored = Registry::at(&path).unwrap();
+    let model = stored.model().unwrap();
+    let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+    assert!(view.panes.iter().all(|pane| pane.id != pane_id));
+    assert!(view.retired.contains(&pane_id));
+    assert_eq!(stored.agent_run(accepted.run.id).unwrap(), retained_run);
     assert!(origin(&host, &authority).is_err());
     let Reply::Listed(agents) = process(&host, Authority::default(), Operation::List).unwrap()
     else {
