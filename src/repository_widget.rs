@@ -10645,18 +10645,74 @@ fn binary_file_view(card: CardId, path: &Path, preview: &crate::editor::BinaryPr
     }
     let modified = preview.modified.and_then(|time| jiff::Timestamp::try_from(time).ok()).map(|time| time.to_string()).unwrap_or_else(|| "unknown".into());
     let actions = widget::row::with_children(vec![
-        crate::ui_controls::button::secondary("Open with system app").on_press_maybe((!crate::device::is_remote()).then_some(RepositoryAction::OpenSystem { card })).into(),
-        crate::ui_controls::button::secondary("Reveal in file manager").on_press_maybe((!crate::device::is_remote()).then_some(RepositoryAction::RevealFile { card })).into(),
-        crate::ui_controls::button::secondary("Previous 64 KiB").on_press_maybe((preview.offset > 0).then_some(RepositoryAction::BinaryPage { card, offset: preview.offset.saturating_sub(crate::editor::BINARY_PREVIEW_BYTES) })).into(),
-        crate::ui_controls::button::secondary("Load more (next 64 KiB)").on_press_maybe((preview.offset + (preview.data.len() as u64) < preview.bytes).then_some(RepositoryAction::BinaryPage { card, offset: preview.offset + crate::editor::BINARY_PREVIEW_BYTES })).into(),
-    ]).spacing(space::S);
-    widget::container(widget::column::with_children(vec![
-        crate::design::body(format!("{} · {} bytes · {}", path.display(), preview.bytes, preview.mime)).into(),
-        crate::design::caption(format!("Modified {modified} · bytes {}–{}", preview.offset, preview.offset + preview.data.len() as u64)).into(),
-        crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
-        actions.into(),
-        widget::scrollable(widget::text(hex).font(cosmic::iced::Font::MONOSPACE)).width(Length::Fill).height(Length::Fill).into(),
-    ]).spacing(space::M)).padding(space::M).width(Length::Fill).height(Length::Fill).into()
+        crate::ui_controls::button::secondary("Open with system app")
+            .on_press_maybe(
+                (!crate::device::is_remote()).then_some(RepositoryAction::OpenSystem { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Reveal in file manager")
+            .on_press_maybe(
+                (!crate::device::is_remote()).then_some(RepositoryAction::RevealFile { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Previous 64 KiB")
+            .on_press_maybe(
+                (preview.offset > 0).then_some(RepositoryAction::BinaryPage {
+                    card,
+                    offset: preview
+                        .offset
+                        .saturating_sub(crate::editor::BINARY_PREVIEW_BYTES),
+                }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Load more (next 64 KiB)")
+            .on_press_maybe(
+                (preview.offset + (preview.data.len() as u64) < preview.bytes).then_some(
+                    RepositoryAction::BinaryPage {
+                        card,
+                        offset: preview.offset + crate::editor::BINARY_PREVIEW_BYTES,
+                    },
+                ),
+            )
+            .into(),
+    ])
+    .spacing(space::S);
+    widget::container(
+        widget::column::with_children(vec![
+            crate::design::body(format!(
+                "{} · {} bytes · {}",
+                path.display(),
+                preview.bytes,
+                preview.mime
+            ))
+            .into(),
+            crate::design::caption(format!(
+                "Modified {modified} · bytes {}–{}",
+                preview.offset,
+                preview.offset + preview.data.len() as u64
+            ))
+            .into(),
+            crate::design::caption(preview.error.clone().unwrap_or_default()).into(),
+            actions.into(),
+            widget::scrollable(
+                widget::text(hex)
+                    .font(cosmic::iced::Font::MONOSPACE)
+                    .wrapping(iced::widget::text::Wrapping::None),
+            )
+            .direction(iced::widget::scrollable::Direction::Both {
+                vertical: crate::design::scrollbar(),
+                horizontal: crate::design::scrollbar(),
+            })
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into(),
+        ])
+        .spacing(space::M),
+    )
+    .padding(space::M)
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
 }
 
 /// The sentence under the read-only title, about the file that was classified.
