@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_codex_recipe_change_is_refused_by_readonly_prestop_inspection() {
+    fn paired_codex_issued_recipe_and_exact_execution_are_qualified_separately() {
         let mut live = session();
         live.launch.provider = Provider::Codex;
         live.launch.recipe.program = "codex".into();
@@ -384,14 +384,11 @@ mod tests {
             LaunchRecipe::shell("/tmp".into()).unwrap(),
         ] {
             live.terminal.as_mut().unwrap().launch = launch;
-            assert!(validate_live_chat(&live, true).is_err());
-            assert!(
-                qualify(&live, std::slice::from_ref(&live), &proof, |_| panic!(
-                    "current pair"
-                ))
-                .is_err()
-            );
-            validate_live_chat(&live, false).unwrap();
+            validate_live_chat(&live, true).unwrap();
+            qualify(&live, std::slice::from_ref(&live), &proof, |_| panic!("current pair")).unwrap();
+            let mut changed = live.clone();
+            changed.terminal.as_mut().unwrap().launch.environment.insert("CODEX_HOME".into(), "/another".into());
+            assert!(qualify(&live, &[changed], &proof, |_| panic!("same daemon source")).is_err());
         }
     }
 

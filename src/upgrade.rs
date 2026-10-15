@@ -701,7 +701,13 @@ pub(crate) mod handoff {
                 // evidence even though its command is deliberately not safe
                 // to replay. Accept only its unchanged recipe; restore retains
                 // it for review without ever executing it.
-                let recipe_matches = if is_worktree_setup_recipe(&terminal.source.launch) {
+                let pair = self.chats.iter().find(|chat| {
+                    chat.launch.provider == crate::agent::Provider::Codex
+                        && chat.source.terminal.as_ref().is_some_and(|source| source.id == terminal.source.id)
+                });
+                let recipe_matches = if let Some(chat) = pair {
+                    paired_terminal_source(chat, terminal).is_ok()
+                } else if is_worktree_setup_recipe(&terminal.source.launch) {
                     terminal.source.launch == terminal.recipe
                 } else {
                     checkpoint_recipe(&terminal.source, &terminal.relaunches)? == terminal.recipe
@@ -762,20 +768,12 @@ pub(crate) mod handoff {
                             && chat.launch.terminal_recipe().as_ref() == Some(&terminal.recipe)
                     });
                 if paired_codex {
-                    let original = chat.source.terminal.as_ref().expect("checked pair");
                     let terminal = self
                         .terminals
                         .iter()
-                        .find(|terminal| terminal.source.id == original.id)
+                        .find(|terminal| terminal.source.id == chat.source.id)
                         .expect("checked paired terminal");
-                    let mut replacement = terminal.source.clone();
-                    replacement.launch = terminal.recipe.clone();
-                    replacement.continuity = original.continuity.clone();
-                    if &replacement != original {
-                        return Err(
-                            "Paired Codex terminal descriptor would change during restart".into(),
-                        );
-                    }
+                    paired_terminal_source(chat, terminal)?;
                 }
                 if !chat_ids.insert(chat.source.id)
                     || (!ids.insert(chat.source.id) && !paired_codex)
@@ -865,6 +863,36 @@ pub(crate) mod handoff {
         }
     }
 
+    /// Keep the descriptor already issued to the chat while validating the
+    /// separate exact execution selected by its original daemon. Older writers
+    /// stored the derived resume hint on the checkpoint's terminal copy.
+    #[cfg(any(feature = "host", test))]
+    pub(crate) fn paired_terminal_source(
+        chat: &Chat,
+        terminal: &Terminal,
+    ) -> Result<TerminalSession, String> {
+        validate_chat_source(&chat.source, &chat.launch)?;
+        let original = chat.source.terminal.as_ref().ok_or("Upgrade pair is missing")?;
+        if chat.launch.provider != crate::agent::Provider::Codex
+            || chat.launch.terminal_recipe().as_ref() != Some(&terminal.recipe)
+            || (terminal.source.resume_hint != original.resume_hint
+                && terminal.source.resume_hint.as_deref()
+                    .and_then(crate::model::agent_recovery::recipe_from_hint)
+                    .as_ref() != Some(&terminal.recipe))
+        {
+            return Err("Paired Codex execution does not match its confirmed source".into());
+        }
+        let mut owner = terminal.source.clone();
+        owner.continuity = original.continuity.clone();
+        owner.resume_hint = original.resume_hint.clone();
+        if owner != *original {
+            return Err("Paired Codex terminal descriptor would change during restart".into());
+        }
+        let mut issued = original.clone();
+        issued.continuity = terminal.source.continuity.clone();
+        Ok(issued)
+    }
+
     #[cfg(any(feature = "host", test))]
     /// Check the immutable descriptor against the separate effective restart.
     /// Call while the old provider and windows are still usable, before handoff.
@@ -895,20 +923,9 @@ pub(crate) mod handoff {
         {
             return Err("Upgrade native terminal ownership is inconsistent".into());
         }
-        // A legacy Codex attachment restarts from its paired terminal. That
-        // terminal's issued descriptor is part of the saved chat identity;
-        // normalizing fresh/shell argv to resume argv would change it after
-        // the source has stopped. Retained pairs keep their original worker.
-        if source.launch.provider == crate::agent::Provider::Codex
-            && !matches!(
-                source.native_continuity,
-                chat::NativeContinuity::Durable { .. }
-            )
-            && let Some(terminal) = &source.terminal
-            && Some(&terminal.launch) != launch.terminal_recipe().as_ref()
-        {
-            return Err("Paired Codex terminal needs a different restart recipe; close or recover its paired view before upgrading".into());
-        }
+        // Paired terminal execution is separate from its issued descriptor.
+        // Checkpoint validation binds both recipes; live preparation also
+        // rechecks the exact selected process, thread and account before stop.
         Ok(())
     }
 

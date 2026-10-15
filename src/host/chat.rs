@@ -1138,7 +1138,15 @@ fn start_with_execution(
             let handle = record.handle.clone();
             // Capture this worker's current daemon proof, not the raw launch
             // continuity retained before it was first attached.
-            session.terminal = Some(state.descriptor(client, session.id)?.session);
+            let current = state.descriptor(client, session.id)?.session;
+            session.terminal = Some(if restart_launch.is_some() {
+                restored_terminal_source(
+                    session.terminal.as_ref().ok_or_else(|| error("Upgrade pair source is missing"))?,
+                    &current,
+                ).map_err(error)?
+            } else {
+                current
+            });
             Some(handle)
         } else {
             if state.terminals.contains_key(&session.id) && !recovering {
@@ -2780,6 +2788,26 @@ pub(super) fn validate_upgrade_environment(
     Ok(())
 }
 
+/// Preserve the exact paired descriptor already issued to the saved pane.
+/// Resume hints are live observations; they do not replace that descriptor's
+/// historical metadata. The exact process/thread is checked independently.
+pub(super) fn restored_terminal_source(
+    issued: &crate::model::TerminalSession,
+    current: &crate::model::TerminalSession,
+) -> Result<crate::model::TerminalSession, String> {
+    let mut owner = current.clone();
+    owner.continuity = issued.continuity.clone();
+    owner.resume_hint = issued.resume_hint.clone();
+    if owner != *issued
+        || current.continuity.live_proof().is_none_or(|proof| !proof.is_complete())
+    {
+        return Err("The exact paired terminal owner changed during upgrade".into());
+    }
+    let mut replacement = issued.clone();
+    replacement.continuity = current.continuity.clone();
+    Ok(replacement)
+}
+
 pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
@@ -2804,10 +2832,11 @@ pub(super) fn restore_upgrade(
         session.proof = Some(state.proof().clone());
         if let Some(terminal) = session.terminal.as_mut() {
             if state.terminals.contains_key(&terminal.id) {
-                *terminal = state
+                let current = state
                     .descriptor(0, terminal.id)
                     .map_err(|error| error.message)?
                     .session;
+                *terminal = restored_terminal_source(terminal, &current)?;
             } else {
                 terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                     recipe: session
@@ -3212,7 +3241,63 @@ mod tests {
                 paired_upgrade_recipe(&other_account, &other_account, &launch, Some(SELECTED))
                     .is_err()
             );
+            for mutation in 0..5 {
+                let mut changed = process.clone();
+                match mutation {
+                    0 => changed.recovery.program = "/other/codex".into(),
+                    1 => changed.recovery.working_directory = "/other".into(),
+                    2 => changed.recovery.arguments.extend(["--model".into(), "other".into()]),
+                    3 => { changed.recovery.unset_environment.insert("CODEX_API_KEY".into()); },
+                    _ => changed.recovery.arguments.extend(["--remote".into(), "unix:///other".into()]),
+                }
+                assert!(paired_upgrade_recipe(&changed, &changed, &launch, Some(SELECTED)).is_err());
+            }
         }
+    }
+
+    #[test]
+    fn paired_upgrade_preserves_issued_metadata_and_refuses_owner_changes() {
+        let proof = |name| HostSessionProof {
+            host_session_id: HostSessionId::new(name),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new(name),
+        };
+        let continuity = |proof: HostSessionProof| crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id,
+            boot_id: proof.boot_id,
+            host_incarnation: proof.host_incarnation,
+        };
+        let mut issued = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(), LaunchRecipe::shell("/project".into()).unwrap(), None,
+        ).session;
+        issued.continuity = continuity(proof("old"));
+        issued.resume_hint = Some("original issued observation".into());
+        let mut current = issued.clone();
+        current.continuity = continuity(proof("new"));
+        current.resume_hint = Some("current worker observation".into());
+        let mut restored = restored_terminal_source(&issued, &current).unwrap();
+        assert_eq!(restored.continuity, current.continuity);
+        restored.continuity = issued.continuity.clone();
+        assert_eq!(restored, issued);
+        for mutation in 0..9 {
+            let mut changed = current.clone();
+            match mutation {
+                0 => changed.id = TerminalId::new(),
+                1 => changed.launch.program = "/another".into(),
+                2 => changed.launch.arguments.push("another".into()),
+                3 => changed.launch.working_directory = "/another".into(),
+                4 => { changed.launch.environment.insert("CODEX_HOME".into(), "/another".into()); },
+                5 => { changed.launch.unset_environment.insert("CODEX_API_KEY".into()); },
+                6 => changed.transcript_path = Some("/another".into()),
+                7 => changed.recovery_origin = Some(TerminalId::new()),
+                _ => changed.predecessor = Some(TerminalId::new()),
+            }
+            assert!(restored_terminal_source(&issued, &changed).is_err());
+        }
+        current.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: current.launch.clone(), last_exit: None,
+        };
+        assert!(restored_terminal_source(&issued, &current).is_err());
     }
 
     #[test]

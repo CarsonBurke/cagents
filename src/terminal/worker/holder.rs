@@ -1537,6 +1537,7 @@ fn hand_over(
                 .ok_or(io::ErrorKind::PermissionDenied)?,
         )?;
         if next.source.launch != current.source.launch
+            || next.execution_recipe != current.execution_recipe
             || !next.previous_sources.iter().any(|source| {
                 source.id == current.source.id
                     && source.launch == current.source.launch
@@ -2178,6 +2179,7 @@ mod tests {
                 relaunches: Vec::new(),
                 options: crate::terminal::TerminalSpawnOptions::default(),
                 execution_environment: None,
+                execution_recipe: None,
             };
             let (exits, _exited) = crossbeam_channel::bounded(1);
             assert!(

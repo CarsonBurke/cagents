@@ -17,6 +17,10 @@ use std::{
 const ID: &str = "12345678-1234-4234-8234-123456789abc";
 
 fn isolated() -> bool {
+    isolated_with_environment(&[])
+}
+
+fn isolated_with_environment(environment: &[(&str, &str)]) -> bool {
     const CHILD: &str = "CAGENTS_PAIRED_UPGRADE_CONTRACT";
     let exact = thread::current().name().unwrap().to_owned();
     if std::env::var(CHILD).as_deref() == Ok(exact.as_str()) {
@@ -35,7 +39,7 @@ fn isolated() -> bool {
         "paired upgrade owning evidence retained at {}",
         root.display()
     );
-    let command = CommandSpec::new(std::env::current_exe().unwrap())
+    let mut command = CommandSpec::new(std::env::current_exe().unwrap())
         .args(["--exact", &exact, "--nocapture", "--test-threads=1"])
         .env(CHILD, &exact)
         .env("HOME", root.join("home"))
@@ -53,6 +57,9 @@ fn isolated() -> bool {
         .env_remove("PI_CONFIG_DIR")
         .timeout(Duration::from_secs(60))
         .output_limits(128 * 1024, 128 * 1024);
+    for (name, value) in environment {
+        command = command.env(*name, *value);
+    }
     let output = SystemProcessExecutor
         .execute(&command, &CancellationToken::new())
         .unwrap();
@@ -180,7 +187,7 @@ fn executable(root: &Path) -> PathBuf {
     let executable = root.join("codex");
     // A real foreground native process accepts canonical provider argv and
     // waits on its PTY. The private Rust peer owns the exact shared thread.
-    fs::write(&source, "#include <unistd.h>\nint main(void) { char byte; while (read(0, &byte, 1) > 0) {} return 0; }\n").unwrap();
+    fs::write(&source, "#include <unistd.h>\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\nint main(int argc, char **argv) { if (argc > 1 && strcmp(argv[1], \"resume\") == 0) { if (getenv(\"CODEX_API_KEY\")) return 3; puts(\"effective-recipe-ready\"); fflush(stdout); } char byte; while (read(0, &byte, 1) > 0) {} return 0; }\n").unwrap();
     let command = CommandSpec::new("cc")
         .args([source.to_str().unwrap(), "-o", executable.to_str().unwrap()])
         .timeout(Duration::from_secs(10))
@@ -371,63 +378,100 @@ fn run_pair(mode: &str) {
     let prepared = prepare_upgrade_with_policy(&original, capability, false, None, || {
         Store::open(&store_path)
     });
+    assert_eq!(prepared.unwrap(), (1, 1));
+    let prepared = Store::open(&store_path).unwrap().load().unwrap().unwrap();
+    assert_eq!(prepared.chats[0].source, saved);
+    let mut checkpoint_source = prepared.terminals[0].source.clone();
+    checkpoint_source.continuity = saved.terminal.as_ref().unwrap().continuity.clone();
+    assert_eq!(checkpoint_source, *saved.terminal.as_ref().unwrap());
+    let expected_execution = saved.launch.terminal_recipe().unwrap();
+    assert_eq!(prepared.terminals[0].recipe, expected_execution);
     if mode != "exact" {
-        let failure = prepared.unwrap_err();
-        assert!(
-            failure
-                .message
-                .contains("Paired Codex terminal needs a different restart recipe"),
-            "{}",
-            failure.message
-        );
-        assert!(!original.lock().unwrap().shutting_down);
-        assert!(!actor.is_completed());
-        assert!(!terminal.is_completed());
-        assert!(Store::open(&store_path).unwrap().load().unwrap().is_none());
-        super::super::chat::close_for_terminal(&original, id).unwrap();
-        terminal.shutdown().unwrap();
-    } else {
-        assert_eq!(prepared.unwrap(), (1, 1));
-        let prepared = Store::open(&store_path).unwrap().load().unwrap().unwrap();
-        assert_eq!(prepared.chats[0].source, saved);
-        assert_eq!(
-            prepared.terminals[0].recipe,
-            saved.terminal.as_ref().unwrap().launch
-        );
-        finish_upgrade(&original).unwrap();
-        assert!(actor.is_completed());
-        assert!(terminal.is_completed());
-        let replacement = host("replacement");
-        let proc_root = cwd.join("empty-proc");
-        fs::create_dir(&proc_root).unwrap();
+        assert_ne!(prepared.terminals[0].source.launch, expected_execution);
+    }
+    finish_upgrade(&original).unwrap();
+    assert!(actor.is_completed());
+    assert!(terminal.is_completed());
+    if mode == "shell" {
+        // Older source daemons wrote the confirmed execution hint into the
+        // terminal checkpoint while the chat retained its issued shell tuple.
+        // Exercise that exact old encoding without changing the saved pane.
+        let store = Store::open(&store_path).unwrap();
+        let mut checkpoint = store.load().unwrap().unwrap();
+        checkpoint.terminals[0].source.resume_hint =
+            crate::model::agent_recovery::hint_from_launch(&expected_execution);
+        assert_ne!(checkpoint.terminals[0].source.resume_hint,
+            checkpoint.chats[0].source.terminal.as_ref().unwrap().resume_hint);
+        store.save(&checkpoint).unwrap();
+        for mutation in 0..5 {
+            let mut changed = checkpoint.clone();
+            match mutation {
+                0 => changed.terminals[0].source.launch.arguments.push("different".into()),
+                1 => changed.terminals[0].source.launch.working_directory = "/different".into(),
+                2 => {
+                    changed.terminals[0].source.launch.environment.insert("CODEX_HOME".into(), "/different".into());
+                }
+                3 => changed.terminals[0].source.resume_hint = Some("unqualified observation".into()),
+                _ => {
+                    let mut wrong = expected_execution.clone();
+                    wrong.arguments.extend(["--model".into(), "another".into()]);
+                    changed.terminals[0].source.resume_hint =
+                        crate::model::agent_recovery::hint_from_launch(&wrong);
+                }
+            }
+            assert!(changed.validate().is_err(), "old encoding cannot change pair identity or execution");
+        }
+    }
+    let proc_root = cwd.join("empty-proc");
+    fs::create_dir(&proc_root).unwrap();
+    let mut source = saved;
+    for generation in 1..=2 {
+        let replacement = host(&format!("replacement-{generation}"));
         restore_upgrade_from(
             &replacement,
             Store::open(&store_path).unwrap(),
             &proc_root,
             None,
-        )
-        .unwrap();
-        let resolved = super::super::chat::resolve_upgrade(&replacement, &saved).unwrap();
-        assert!(crate::chat::is_upgrade_recovery(&saved, &resolved));
+        ).unwrap();
+        let resolved = super::super::chat::resolve_upgrade(&replacement, &source).unwrap();
+        assert!(crate::chat::is_upgrade_recovery(&source, &resolved));
         assert_eq!(resolved.launch.session_id.as_deref(), Some(ID));
+        let mut paired = resolved.terminal.as_ref().unwrap().clone();
+        paired.continuity = source.terminal.as_ref().unwrap().continuity.clone();
+        assert_eq!(&paired, source.terminal.as_ref().unwrap());
         let current_terminal = replacement.lock().unwrap().terminals[&id].handle.clone();
         let current_actor = replacement.lock().unwrap().chats[&id].handle.clone();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(process) = current_terminal.observe_agent_process() {
+                assert_eq!(crate::model::agent_recovery::resume_recipe(&process.recovery).as_ref(), Some(&expected_execution));
+                break;
+            }
+            assert!(Instant::now() < deadline, "restored CLI execution was not observed");
+            thread::sleep(Duration::from_millis(10));
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         let snapshot = loop {
             let snapshot = current_actor.snapshot(None).unwrap();
             if snapshot.ready && !snapshot.history_loading {
                 break snapshot;
             }
-            assert!(
-                Instant::now() < deadline,
-                "restored paired history did not load"
-            );
+            assert!(Instant::now() < deadline, "restored paired history did not load");
             thread::sleep(Duration::from_millis(10));
         };
         assert!(snapshot.items.iter().any(|item| matches!(&item.content,
             crate::chat::ItemContent::Text { text, .. } if text == "existing paired answer")));
-        super::super::chat::close_for_terminal(&replacement, id).unwrap();
-        current_terminal.shutdown().unwrap();
+        if generation == 1 {
+            let capability = replacement.lock().unwrap().shutdown_preflight(Instant::now()).unwrap().capability;
+            prepare_upgrade_with_policy(&replacement, capability, false, None, || Store::open(&store_path)).unwrap();
+            finish_upgrade(&replacement).unwrap();
+            assert!(current_terminal.is_completed());
+            assert!(current_actor.is_completed());
+            source = resolved;
+        } else {
+            super::super::chat::close_for_terminal(&replacement, id).unwrap();
+            current_terminal.shutdown().unwrap();
+        }
     }
     let methods = peer.finish();
     assert!(methods.iter().any(|method| method == "thread/resume"));
@@ -435,7 +479,7 @@ fn run_pair(mode: &str) {
 }
 
 #[test]
-fn legacy_paired_fresh_and_shell_recipes_refuse_before_source_stop() {
+fn legacy_paired_fresh_and_shell_recipes_preserve_issued_identity_across_two_restarts() {
     if isolated() {
         return;
     }
@@ -449,4 +493,118 @@ fn legacy_paired_exact_recipe_survives_checkpoint_restore_and_strict_client_iden
         return;
     }
     run_pair("exact");
+}
+
+#[test]
+fn paired_effective_execution_survives_actual_holder_adoption_without_restarting_root() {
+    if isolated_with_environment(&[("CODEX_API_KEY", "synthetic-inherited-fixture-key")]) {
+        return;
+    }
+    let root = tempfile::Builder::new().prefix("paired-holder-").tempdir().unwrap().keep();
+    let executable = executable(&root);
+    let home = root.join("codex-home");
+    fs::create_dir(&home).unwrap();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let boot = crate::daemon::read_boot_id().unwrap();
+    let make_proof = |generation| HostSessionProof {
+        host_session_id: HostSessionId::new(format!("paired-holder-{generation}")),
+        boot_id: boot.clone(),
+        host_incarnation: HostIncarnation::new(format!("paired-holder-{generation}")),
+    };
+    let continuity = |proof: &HostSessionProof| TerminalContinuity::DetachedSameBoot {
+        host_session_id: proof.host_session_id.clone(),
+        boot_id: proof.boot_id.clone(),
+        host_incarnation: proof.host_incarnation.clone(),
+    };
+    let mut proof = make_proof(0);
+    let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+    let issued = TerminalSession {
+        id: TerminalId::new(),
+        launch: LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "printf wrong-issued-recipe; exit 4".into()],
+            working_directory: root.clone(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+        transcript_path: None,
+        resume_hint: None,
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        continuity: continuity(&proof),
+    };
+    let effective = LaunchRecipe {
+        program: executable.to_string_lossy().into_owned(),
+        arguments: vec!["resume".into(), ID.into()],
+        working_directory: root.clone(),
+        environment: [("CODEX_HOME".into(), home.to_string_lossy().into_owned())].into(),
+        unset_environment: ["CODEX_API_KEY".into()].into(),
+    };
+    let recovery = crate::terminal::holder::Recovery {
+        source: issued.clone(),
+        previous_sources: Vec::new(),
+        relaunches: Vec::new(),
+        options: Default::default(),
+        execution_environment: None,
+        execution_recipe: Some(effective.clone()),
+    };
+    let mut handle = TerminalHandle::spawn(issued.clone(), TerminalConfig {
+        execution_recipe: Some(effective.clone()),
+        holder_recovery: Some(recovery),
+        initially_visible: false,
+        ..Default::default()
+    }, |_| {}).unwrap();
+    let original = handle.holder_identity().unwrap().clone();
+    let socket = crate::terminal::holder::socket(&crate::terminal::holder::directory().unwrap(), issued.id);
+    for generation in 0..=2 {
+        assert_eq!(handle.holder_identity(), Some(&original));
+        handle.reveal().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = handle.snapshot();
+            handle.acknowledge_redraw(snapshot.generation);
+            if snapshot.lines.iter().any(|row| row.cells.iter().map(|cell| cell.text.as_str()).collect::<String>().contains("effective-recipe-ready")) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "exact execution/unset environment did not become ready");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(original.root.is_current());
+        if generation == 2 {
+            handle.shutdown().unwrap();
+            assert!(crate::terminal::holder::discover(&crate::terminal::holder::directory().unwrap(), &boot).unwrap().is_empty());
+            break;
+        }
+        handle.carry(socket.clone()).unwrap();
+        drop(handle);
+        drop(lease.take());
+        proof = make_proof(generation + 1);
+        lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        let (mut recovery, _) = crate::terminal::inspect_holder(&socket, &original, &proof).unwrap();
+        assert_eq!(recovery.execution_recipe.as_ref(), Some(&effective));
+        assert_eq!(recovery.source.launch, issued.launch);
+        assert_eq!(recovery.source.resume_hint, issued.resume_hint);
+        recovery.previous_sources.push(recovery.source.clone());
+        recovery.source.continuity = continuity(&proof);
+        let mut changed = recovery.clone();
+        changed.execution_recipe = None;
+        assert!(TerminalHandle::spawn(changed.source.clone(), TerminalConfig {
+            execution_recipe: Some(effective.clone()),
+            holder_recovery: Some(changed),
+            adoption: Some(socket.clone()),
+            initially_visible: false,
+            ..Default::default()
+        }, |_| {}).is_err(), "an older/mismatched context must not be adopted");
+        let (retained, _) = crate::terminal::inspect_holder(&socket, &original, &proof).unwrap();
+        assert_eq!(retained.execution_recipe.as_ref(), Some(&effective));
+        assert!(original.root.is_current());
+        handle = TerminalHandle::spawn(recovery.source.clone(), TerminalConfig {
+            execution_recipe: recovery.execution_recipe.clone(),
+            holder_recovery: Some(recovery),
+            adoption: Some(socket.clone()),
+            initially_visible: false,
+            ..Default::default()
+        }, |_| {}).unwrap();
+    }
 }

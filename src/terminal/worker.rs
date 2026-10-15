@@ -1569,22 +1569,25 @@ impl Worker {
             })
             .map_err(|error| format!("register working directory effect: {error}"))?;
 
+        let execution = config.execution_recipe.as_ref().unwrap_or(&session.launch).clone();
         let mut command = match &config.execution_environment {
             Some(environment) => {
-                let mut command = CommandBuilder::new(&session.launch.program);
-                command.args(&session.launch.arguments);
-                command.cwd(&session.launch.working_directory);
+                let mut command = CommandBuilder::new(&execution.program);
+                command.args(&execution.arguments);
+                command.cwd(&execution.working_directory);
                 command.env_clear();
                 for (name, value) in &environment.0 {
-                    command.env(name, value);
+                    if !execution.unset_environment.contains(name) {
+                        command.env(name, value);
+                    }
                 }
                 scrub_inherited_markers(&mut command);
                 terminal_environment(&mut command);
                 command
             }
-            None => command_from_recipe(&session.launch),
+            None => command_from_recipe(&execution),
         };
-        for name in crate::account::launch_credential_overrides(&session.launch) {
+        for name in crate::account::launch_credential_overrides(&execution) {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
@@ -1604,7 +1607,7 @@ impl Worker {
             "CAGENTS_RECOVERY_ORIGIN",
             session.recovery_origin.unwrap_or(session.id).to_string(),
         );
-        let executable = interactive_shell_launch(&session.launch)
+        let executable = interactive_shell_launch(&execution)
             .then(|| RootIdentity::launch_executable(&command))
             .flatten();
         let (child_exit_tx, child_exit_rx) = crossbeam_channel::bounded(1);
@@ -1646,9 +1649,9 @@ impl Worker {
                     skill_environment.insert("HOME".into(), home.into());
                 }
                 crate::agent_execution::bundled::install(
-                    crate::agent::Provider::from_program(&session.launch.program),
+                    crate::agent::Provider::from_program(&execution.program),
                     &skill_environment,
-                    &session.launch.working_directory,
+                    &execution.working_directory,
                 );
                 if let Some(path) = crate::agent_execution::bundled::matched_path(
                     command.get_env("PATH").and_then(|value| value.to_str()),
@@ -1724,7 +1727,7 @@ impl Worker {
 
         Ok(Self {
             terminal_id: session.id,
-            resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&session.launch),
+            resume_hint: crate::model::agent_recovery::observed_hint_from_launch(&execution),
             resume_foreground: None,
             foreground_poll: FOREGROUND_POLL_MIN,
             last_foreground_observation: std::time::Instant::now(),
@@ -1733,7 +1736,7 @@ impl Worker {
             display_title: String::new(),
             agent_exited: false,
             root_exit: None,
-            launch: session.launch,
+            launch: execution,
             terminal,
             theme,
             key_encoder,
@@ -4309,6 +4312,7 @@ mod tests {
                         relaunches: Vec::new(),
                         options: crate::terminal::TerminalSpawnOptions::default(),
                         execution_environment: None,
+                        execution_recipe: None,
                     },
                     None,
                 )

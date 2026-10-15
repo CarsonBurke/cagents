@@ -1977,11 +1977,9 @@ fn prepare_upgrade_with_carry_policy(
             super::chat::validate_upgrade_environment(&launch, hosted_source, &record.handle)
                 .map_err(upgrade_error)?;
             if launch.provider == crate::agent::Provider::Codex
-                && state.terminals.contains_key(&source.id)
-                && !matches!(
-                    source.native_continuity,
-                    crate::chat::NativeContinuity::Durable { .. }
-                )
+                && state.terminals.get(&source.id).is_some_and(|terminal| {
+                    !terminal.handle.is_completed() && !carries(&source.id, terminal)
+                })
             {
                 if source.proof.as_ref() != Some(state.proof())
                     || source
@@ -2058,10 +2056,9 @@ fn prepare_upgrade_with_carry_policy(
     ) in terminals
     {
         let snapshot = handle.prepare_upgrade().map_err(upgrade_error)?;
-        source.resume_hint = if let Some((selected, native)) = paired_codex.get(&source.id) {
-            // The worker's argv hint can be fresh or name an older TUI thread.
-            // Only the still-confirmed attachment may supersede it, and only
-            // after freezing and revalidating its exact process/account.
+        let recipe = if let Some((selected, native)) = paired_codex.get(&source.id) {
+            // Only the still-confirmed attachment can supply execution for
+            // the exact terminal descriptor already issued to its chat pane.
             let current = handle.observe_agent_process().ok_or_else(|| {
                 upgrade_error("The paired Codex source disappeared before upgrade")
             })?;
@@ -2084,25 +2081,26 @@ fn prepare_upgrade_with_carry_policy(
                 native.confirmed_session_id().as_deref(),
             )
             .map_err(upgrade_error)?;
-            Some(
-                crate::model::agent_recovery::hint_from_launch(&recipe).ok_or_else(|| {
-                    upgrade_error("The paired Codex exact recipe cannot be saved")
-                })?,
-            )
+            source = super::chat::restored_terminal_source(
+                chat.source.terminal.as_ref().expect("validated pair"),
+                &source,
+            ).map_err(upgrade_error)?;
+            recipe
         } else {
-            snapshot.hint.clone()
-        };
-        let Some(recipe) = upgrade_recipe(
-            &source,
-            &handle,
-            &snapshot,
-            &mut relaunches,
-            relaunch_agents,
-        )
-        .map_err(upgrade_error)?
-        else {
-            blockers.push(describe_upgrade_blocker(&source));
-            continue;
+            source.resume_hint = snapshot.hint.clone();
+            let Some(recipe) = upgrade_recipe(
+                &source,
+                &handle,
+                &snapshot,
+                &mut relaunches,
+                relaunch_agents,
+            )
+            .map_err(upgrade_error)?
+            else {
+                blockers.push(describe_upgrade_blocker(&source));
+                continue;
+            };
+            recipe
         };
         if !relaunches.iter().any(|accepted| accepted.source == source) {
             tracing::info!(
@@ -2824,8 +2822,19 @@ fn restore_upgrade_from(
                 chat.terminal = Some(terminal.clone());
                 continue;
             }
-            let mut session = terminal.source.clone();
-            session.launch = terminal.recipe.clone();
+            let pair = checkpoint.chats.iter().find(|chat| {
+                chat.launch.provider == crate::agent::Provider::Codex
+                    && chat.source.id == terminal.source.id
+                    && chat.source.terminal.as_ref().is_some_and(|source| source.id == terminal.source.id)
+            });
+            let mut session = if let Some(chat) = pair {
+                crate::upgrade::handoff::paired_terminal_source(chat, terminal)?
+            } else {
+                terminal.source.clone()
+            };
+            if pair.is_none() {
+                session.launch = terminal.recipe.clone();
+            }
             session.continuity = TerminalContinuity::RelaunchAvailable {
                 recipe: session.launch.clone(),
                 last_exit: None,
@@ -2840,9 +2849,14 @@ fn restore_upgrade_from(
                     true
                 })
             };
-            let descriptor =
+            let descriptor = if pair.is_some() {
+                start_terminal_view_owned(
+                    host, 0, session, terminal.options.clone(), None, paired,
+                    None, None, None, Some(terminal.recipe.clone()),
+                ).map(|(descriptor, _)| descriptor)
+            } else {
                 spawn_terminal_view(host, 0, session, terminal.options.clone(), None, paired)
-                    .map_err(|error| error.message)?;
+            }.map_err(|error| error.message)?;
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             if paired && let Some(chat) = state.chats.get_mut(&terminal.source.id) {
                 chat.returning_terminal = false;
@@ -3080,6 +3094,7 @@ fn adopt_carried_terminal(
                         relaunches: terminal.relaunches.clone(),
                         options: terminal.options.clone(),
                         execution_environment: None,
+                        execution_recipe: None,
                     },
                     false,
                 ))
@@ -3397,6 +3412,7 @@ pub(super) fn spawn_pending_terminal(
         None,
         None,
         Some(pane),
+        None,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3458,6 +3474,7 @@ pub(super) fn spawn_terminal_view_owned(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -3473,6 +3490,7 @@ fn start_terminal_view(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    let execution_recipe = previous.as_ref().and_then(|previous| previous.execution_recipe.clone());
     start_terminal_view_owned(
         shared,
         client_id,
@@ -3483,6 +3501,7 @@ fn start_terminal_view(
         adoption,
         previous,
         None,
+        execution_recipe,
     )
     .map(|(descriptor, _)| descriptor)
 }
@@ -3499,11 +3518,27 @@ fn start_terminal_view_owned(
     adoption: Option<std::path::PathBuf>,
     previous: Option<crate::terminal::holder::Recovery>,
     pending_pane: Option<crate::model::CardId>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
+    if let Some(recipe) = &execution_recipe {
+        if crate::upgrade::exact_conversation(recipe).is_none()
+            || (adoption.is_some()
+                && previous.as_ref().and_then(|previous| previous.execution_recipe.as_ref()) != Some(recipe))
+        {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Terminal restart execution does not match its authenticated source",
+                false,
+            ));
+        }
+        let mut effective = session.clone();
+        effective.launch = recipe.clone();
+        validate_launch(&effective)?;
+    }
     if let Some(environment) = &mut execution_environment {
-        session.launch.remove_unset_environment(&mut environment.0);
+        execution_recipe.as_ref().unwrap_or(&session.launch).remove_unset_environment(&mut environment.0);
     }
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
@@ -3572,6 +3607,7 @@ fn start_terminal_view_owned(
                 relaunches,
                 options: options.clone(),
                 execution_environment: retained_environment.clone(),
+                execution_recipe: execution_recipe.clone(),
             }
         })
     };
@@ -3660,6 +3696,7 @@ fn start_terminal_view_owned(
         initially_visible: options.initially_visible,
         theme: options.theme,
         execution_environment,
+        execution_recipe: execution_recipe.clone(),
         adoption,
         holder_recovery,
         ..TerminalConfig::default()
@@ -3710,7 +3747,13 @@ fn start_terminal_view_owned(
                 return Err(error);
             }
         }
-        let descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
+        let issued_hint = execution_recipe.as_ref().map(|_| session.resume_hint.clone());
+        let mut descriptor = state.finish_spawn(client_id, session, handle, options.initially_visible);
+        if let (Some(hint), Ok(descriptor)) = (issued_hint, &mut descriptor) {
+            state.terminals.get_mut(&terminal_id).expect("finished spawn")
+                .session.resume_hint = hint.clone();
+            descriptor.session.resume_hint = hint;
+        }
         if descriptor.is_ok() && pending_pane.is_some() {
             finish_pending_terminal(&mut state, terminal_id);
         }
