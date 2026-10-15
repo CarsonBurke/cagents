@@ -56,6 +56,9 @@ struct RetainedPair {
 /// Only the authenticated exact holder and current exclusive daemon lease can
 /// authorize it; disappearance alone never counts as a successful close.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
+    // Refuse a degraded installed store before even reconciling an exact
+    // startup owner, adopting a holder or requesting provider teardown.
+    super::super::agent_execution::retirement_registry(host)?;
     if retained_actor::reconcile_startup(host, source)? {
         return Ok(());
     }
@@ -79,6 +82,7 @@ pub(in crate::host) fn close_with_presentation(host: &SharedHost,
 
 fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
     consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>) -> Result<(), String> {
+    super::super::agent_execution::retirement_registry(host)?;
     if let Some((origin, target)) = consent {
         let store = super::super::agent_execution::registry(host)?;
         store.lock().unwrap_or_else(|p| p.into_inner())
@@ -415,7 +419,7 @@ fn preflight_current_retirements(
     proof: &HostSessionProof,
     consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>,
 ) -> Result<(), String> {
-    let Ok(store) = super::super::agent_execution::registry(host) else { return Ok(()); };
+    let Some(store) = super::super::agent_execution::retirement_registry(host)? else { return Ok(()); };
     let sources = store.lock().unwrap_or_else(|p| p.into_inner()).retained_agent_sources(caller.id)?;
     if sources.is_empty() { return Ok(()); }
     let mut lineage = None;
@@ -462,7 +466,7 @@ fn retire_closed_execution(
     proof: &HostSessionProof,
     consent: Option<(&crate::agent_execution::Origin, &crate::agent_execution::PresentationCloseTarget)>,
 ) -> Result<(), String> {
-    let Ok(registry) = super::super::agent_execution::registry(host) else {
+    let Some(registry) = super::super::agent_execution::retirement_registry(host)? else {
         return Ok(());
     };
     let sources = registry
