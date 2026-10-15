@@ -5107,7 +5107,7 @@ mod tests {
         // Simulate an older store lacking the new cleanup authority table.
         registry
             .db
-            .execute("DROP TABLE automation_precheck_retirements", [])
+            .execute_batch("DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;")
             .unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();

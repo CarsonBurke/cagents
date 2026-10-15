@@ -189,7 +189,13 @@ pub struct WorkspaceModel {
     pub headless_automation_agents: Vec<crate::model::AgentId>,
     #[serde(default)]
     pub archived_automation_agents: Vec<crate::agent_execution::Agent>,
-    /// Pending consent requests from every project, delivered over model watch.
+    /// Exact global count and proposal-only change clock. Unrelated execution
+    /// edits do not reset explicit paging or refetch a consent dialog.
+    #[serde(default)]
+    pub pending_automation_proposal_count: u64,
+    #[serde(default)]
+    pub automation_proposal_sequence: u64,
+    /// First bounded page of pending consent summaries from every project.
     #[serde(default)]
     pub pending_automation_proposals: Vec<crate::automations::ProposalSummary>,
 }

@@ -17,6 +17,8 @@ pub mod schedule;
 pub const MAX_NAME_BYTES: usize = 160;
 pub const MAX_PRECHECK_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_PAGE: usize = 100;
+/// Maximum summary rows in a model push or explicit global request page.
+pub const PROPOSAL_PAGE_SIZE: usize = 64;
 pub const MAX_CONCURRENT_PRECHECKS: usize = 4;
 pub const DEFAULT_PRECHECK_SECONDS: u32 = 30;
 pub const MAX_PRECHECK_SECONDS: u32 = 300;

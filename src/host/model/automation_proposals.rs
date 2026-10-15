@@ -57,18 +57,23 @@ fn read(db: &Connection, id: Uuid, owner: Option<&Origin>) -> Result<Option<Prop
 }
 
 impl Registry {
-    pub(crate) fn all_pending_automation_proposals(&self) -> Result<Vec<ProposalSummary>, String> {
-        let mut query = self
-            .db
-            .prepare("SELECT summary FROM automation_proposals WHERE pending=1 ORDER BY id")
+    pub(crate) fn pending_automation_proposal_count(&self) -> Result<u64, String> {
+        self.db.query_row("SELECT count(*) FROM automation_proposals WHERE pending=1", [], |row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn automation_proposal_sequence(&self) -> Result<u64, String> {
+        self.db.query_row("SELECT automation_proposal_sequence FROM metadata WHERE key=0", [], |row| row.get(0))
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn pending_automation_proposals_page(&self, after: Option<Uuid>, limit: usize) -> Result<Vec<ProposalSummary>, String> {
+        let mut query = self.db.prepare(
+            "SELECT summary FROM automation_proposals WHERE pending=1 AND (?1 IS NULL OR id>?1) ORDER BY id LIMIT ?2")
             .map_err(|error| error.to_string())?;
-        query
-            .query_map([], |row| row.get::<_, String>(0))
+        query.query_map(params![after.map(|id| id.to_string()), limit.clamp(1, crate::automations::PROPOSAL_PAGE_SIZE)], |row| row.get::<_, String>(0))
             .map_err(|error| error.to_string())?
-            .map(|row| {
-                serde_json::from_str(&row.map_err(|error| error.to_string())?)
-                    .map_err(|error| error.to_string())
-            })
+            .map(|row| serde_json::from_str(&row.map_err(|error| error.to_string())?).map_err(|error| error.to_string()))
             .collect()
     }
 
@@ -222,7 +227,7 @@ impl Registry {
                 },
             },
         )?;
-        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+        tx.execute("UPDATE metadata SET sequence=sequence+1,automation_proposal_sequence=automation_proposal_sequence+1 WHERE key=0", [])
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
@@ -273,7 +278,7 @@ impl Registry {
             params![current.id.to_string(), encode(&current)?],
         )
         .map_err(|error| error.to_string())?;
-        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+        tx.execute("UPDATE metadata SET sequence=sequence+1,automation_proposal_sequence=automation_proposal_sequence+1 WHERE key=0", [])
             .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(current)
@@ -652,4 +657,71 @@ mod tests {
             super::super::SCHEMA_VERSION
         );
     }
+
+    #[test]
+    fn ten_thousand_pending_requests_keep_push_bounded_and_every_page_reachable() {
+        let (_root, mut registry, original) = fixture();
+        let tx = registry.db.transaction().unwrap();
+        tx.execute("DELETE FROM automation_proposals", []).unwrap();
+        {
+            let mut insert = tx.prepare("INSERT INTO automation_proposals(id,owner,repository,pending,record,summary) VALUES(?1,?2,?3,1,?4,?5)").unwrap();
+            for index in 1..=10_000u128 {
+                let mut proposal = original.clone();
+                proposal.id = Uuid::from_u128(index);
+                proposal.owner = Origin::Child { parent: Lineage(TerminalId::new()) };
+                insert.execute(params![proposal.id.to_string(), encode(&proposal.owner).unwrap(), proposal.definition.agent.target.repository.to_str().unwrap(), encode(&proposal).unwrap(), encode(&ProposalSummary::from(&proposal)).unwrap()]).unwrap();
+            }
+        }
+        tx.execute("UPDATE metadata SET automation_proposal_sequence=automation_proposal_sequence+1,sequence=sequence+1 WHERE key=0", []).unwrap();
+        tx.commit().unwrap();
+        let model = registry.model().unwrap();
+        assert_eq!(model.pending_automation_proposal_count, 10_000);
+        assert_eq!(model.pending_automation_proposals.len(), crate::automations::PROPOSAL_PAGE_SIZE);
+        let bytes = serde_json::to_vec(&model).unwrap();
+        assert!(bytes.len() < 128 * 1024, "summary payload is bounded: {} bytes", bytes.len());
+        assert!(!String::from_utf8(bytes).unwrap().contains(&original.definition.prompt));
+        let mut seen = std::collections::HashSet::new();
+        let mut cursor = None;
+        loop {
+            let page = registry.pending_automation_proposals_page(cursor, usize::MAX).unwrap();
+            assert!(page.len() <= crate::automations::PROPOSAL_PAGE_SIZE);
+            if page.is_empty() { break; }
+            assert!(page.windows(2).all(|pair| pair[0].id < pair[1].id));
+            assert!(cursor.is_none_or(|cursor| page[0].id > cursor));
+            cursor = page.last().map(|proposal| proposal.id);
+            for proposal in page { assert!(seen.insert(proposal.id)); }
+        }
+        assert_eq!(seen.len(), 10_000);
+        assert!(seen.contains(&Uuid::from_u128(10_000)));
+    }
+
+    #[test]
+    fn proposal_clock_migrates_atomically_and_only_consent_edges_advance_it() {
+        let (root, registry, proposal) = fixture();
+        let definition = proposal.definition.clone();
+        let original_clock = registry.automation_proposal_sequence().unwrap();
+        assert_eq!(original_clock, 1);
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; PRAGMA user_version=12;").unwrap();
+        drop(registry);
+        let mut registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 0);
+        assert_eq!(registry.pending_automation_proposal_count().unwrap(), 1);
+        assert_eq!(registry.automation_proposal(proposal.id, None).unwrap(), Some(proposal.clone()));
+        assert_eq!(registry.db.pragma_query_value::<u32, _>(None,"user_version",|row| row.get(0)).unwrap(), 13);
+        registry.apply(&ModelEdit::OpenProject { repository: definition.agent.target.repository, name: "Unrelated sidebar edit".into(), kind: ProjectKind::Folder }).unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 0);
+        registry.resolve_automation_proposal(&proposal, None, 300).unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 1);
+        assert_eq!(registry.pending_automation_proposal_count().unwrap(), 0);
+        registry.resolve_automation_proposal(&proposal, None, 301).unwrap();
+        assert_eq!(registry.automation_proposal_sequence().unwrap(), 1, "an immutable receipt retry is not a new proposal edge");
+        let future = super::super::SCHEMA_VERSION + 1;
+        registry.db.pragma_update(None,"user_version",future).unwrap();
+        drop(registry);
+        assert!(Registry::at(&root.path().join("registry.sqlite3")).is_err());
+        let db = Connection::open(root.path().join("registry.sqlite3")).unwrap();
+        assert_eq!(db.pragma_query_value::<u32,_>(None,"user_version",|row| row.get(0)).unwrap(), future);
+        assert_eq!(db.query_row("SELECT pending FROM automation_proposals WHERE id=?1",[proposal.id.to_string()],|row| row.get::<_,u64>(0)).unwrap(),0);
+    }
+
 }

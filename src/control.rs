@@ -4030,6 +4030,8 @@ mod tests {
                 headless_automation_agents: Vec::new(),
                 archived_automation_agents: Vec::new(),
                 pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4287,6 +4289,8 @@ mod tests {
                 headless_automation_agents: Vec::new(),
                 archived_automation_agents: Vec::new(),
                 pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4353,6 +4357,8 @@ mod tests {
                 headless_automation_agents: Vec::new(),
                 archived_automation_agents: Vec::new(),
                 pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
             };
             write_frame(
                 &mut server_stream,
@@ -4480,6 +4486,8 @@ mod tests {
                         headless_automation_agents: Vec::new(),
                         archived_automation_agents: Vec::new(),
                         pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
                     },
                 ),
             )
@@ -4544,6 +4552,8 @@ mod tests {
             headless_automation_agents: Vec::new(),
             archived_automation_agents: Vec::new(),
             pending_automation_proposals: Vec::new(),
+                pending_automation_proposal_count: 0,
+                automation_proposal_sequence: 0,
         }
     }
 

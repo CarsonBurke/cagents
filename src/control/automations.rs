@@ -33,7 +33,7 @@ pub enum AutomationCommand {
         /// Continue after this proposal UUID from the previous page.
         #[arg(long)]
         after: Option<Uuid>,
-        /// Maximum number of pending requests to return.
+        /// Maximum number of pending requests to return, up to 64.
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },

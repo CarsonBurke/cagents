@@ -61,12 +61,7 @@ pub(in crate::host) fn process_under_control(
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .all_pending_automation_proposals()?
-                .iter()
-                .filter(|proposal| after.is_none_or(|id| proposal.id > id))
-                .take(limit.clamp(1, crate::automations::MAX_HISTORY_PAGE))
-                .cloned()
-                .collect(),
+                .pending_automation_proposals_page(after, limit)?
         ),
         Request::ResolveProposal {
             id,
