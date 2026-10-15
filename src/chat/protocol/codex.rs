@@ -4271,10 +4271,8 @@ mod tests {
                 }
             )]
         );
-        let mut child = Codex {
-            is_child: true,
-            ..Default::default()
-        };
+        let mut child = Codex::default();
+        child.is_child = true;
         child.thread = Some("thread-exact".into());
         let finished = child.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{"id":"child","status":"completed","items":[]}}})).unwrap();
         assert!(
