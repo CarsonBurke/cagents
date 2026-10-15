@@ -690,6 +690,49 @@ impl ClientHandle {
         handle
     }
 
+    /// Explicit UI-state injection only, never live Host/provider authority.
+    /// Wire admission is exercised separately through the actual connect path.
+    #[cfg(test)]
+    pub(crate) fn fixture_restarted(
+        receipt: super::RestartReceipt,
+        snapshot: Snapshot,
+        upgrade_recovery: Option<(Session, Session)>,
+    ) -> Self {
+        if let Some((original, resolved)) = &upgrade_recovery {
+            assert!(super::is_upgrade_recovery(original, resolved));
+            assert_eq!(receipt.source(), resolved);
+        }
+        let replacement = receipt.replacement().clone();
+        let proof = replacement.proof.clone().expect("complete fixture restart proof");
+        let mut handle = Self::fixture(replacement.clone(), snapshot);
+        let inner = Arc::get_mut(&mut handle.inner).unwrap();
+        inner.proof = proof.clone();
+        let binding = ipc::ChatSourceBinding {
+            source: replacement,
+            execution_instance: inner.execution_instance,
+            backend: uuid::Uuid::new_v4(),
+        };
+        assert!(valid_restart_attachment(&receipt, receipt.source(),
+            inner.snapshot.lock().unwrap().as_ref(), inner.execution_instance, Some(&binding), &proof));
+        *inner.source_binding.lock().unwrap() = Some(binding);
+        inner.restart_receipt = Some(receipt);
+        inner.upgrade_recovery = upgrade_recovery;
+        handle
+    }
+
+    /// In-process UI fixtures may exercise the real authenticated Restore
+    /// handshake without daemon discovery, a provider or a test-only Ready.
+    #[cfg(test)]
+    pub(crate) fn restore_on_for_test(
+        stream: UnixStream,
+        session: Session,
+        expected_host: Option<HostSessionProof>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(stream, session, Intent::Restore, expected_host,
+            false, None, None, wake)
+    }
+
     /// Publishes `snapshot` as the reader thread would on a presentation
     /// frame, so a test can stream a transcript into a surface.
     #[cfg(test)]
