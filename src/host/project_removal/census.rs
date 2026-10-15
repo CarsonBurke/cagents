@@ -52,6 +52,18 @@ pub(super) fn require_no_unhosted_owners(host: &SharedHost, reservation: &Reserv
             if installed.get(&(kind == Kind::Native, record.terminal)) == Some(&record) { continue; }
             if Instant::now() >= deadline { return Err(error("Retained session census reached its time limit. No project sessions were closed; retry after resolving retained sessions.")); }
             let inspected = match kind {
+                // Retained Claude actors share the native-holder namespace,
+                // but have their own authenticated read-only inspection RPC.
+                // An installed flag without a matching HostState owner never
+                // exempts this helper from orphan ownership attribution.
+                Kind::Native if crate::chat::runtime::Handle::is_remote_record(&record) => {
+                    crate::chat::runtime::Handle::inspect_remote(&record, proof.clone()).and_then(|inspection| {
+                        if inspection.identity.record != record || inspection.source.id != record.terminal {
+                            return Err("Retained actor returned another holder identity".into());
+                        }
+                        Ok(inspection.previous_sources.into_iter().chain(std::iter::once(inspection.source)).map(HostedSession::Chat).collect::<Vec<_>>())
+                    })
+                },
                 Kind::Native => crate::chat::native_holder::inspect(&record, &proof).map(|(recovery, _)| {
                     recovery.previous_sources.into_iter().chain(std::iter::once(recovery.source)).map(HostedSession::Chat).collect::<Vec<_>>()
                 }),
