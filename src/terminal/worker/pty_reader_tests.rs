@@ -159,21 +159,31 @@ fn actual_pty_output_survives_parser_backpressure_in_order_until_eof() {
 #[test]
 fn stopping_for_carry_keeps_already_read_bytes_behind_a_full_output_queue() {
     let (reader, mut slave) = private_pty();
+    let mut successor = reader.try_clone().unwrap();
     let readiness = reader.try_clone().unwrap().into();
     let (observed, read) = crossbeam_channel::bounded(1);
     let (sender, output) = crossbeam_channel::bounded(1);
     sender.send(PtyMessage::Bytes(b"previous screen".to_vec())).unwrap();
     let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
     slave.write_all(b"already read").unwrap();
-    assert!(read.recv_timeout(Duration::from_secs(2)).unwrap() > 0);
+    let consumed = read.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert!(consumed > 0 && consumed <= b"already read".len());
     // Carry closes the same original wake pipe but must collect this in-flight
     // read before the holder snapshots the screen and transfers the PTY.
     owner.stop_for_carry();
     assert!(matches!(owner.done.try_recv(), Err(TryRecvError::Empty)));
     expect_bytes(&output, b"previous screen");
-    expect_bytes(&output, b"already read");
+    expect_bytes(&output, &b"already read"[..consumed]);
     owner.finish();
     assert!(output.try_recv().is_err());
+    // The exact master duplicate keeps unread kernel output, then accepts
+    // fresh output after the old reader ends. Neither path replays bytes.
+    slave.write_all(b"successor").unwrap();
+    let expected = [
+        &b"already read"[consumed..],
+        b"successor".as_slice(),
+    ].concat();
+    assert_eq!(read_private_pty(&mut successor, expected.len()), expected);
 }
 
 struct ConsumedReadiness {
@@ -249,4 +259,38 @@ fn expect_bytes(output: &Receiver<PtyMessage>, expected: &[u8]) {
         }
     }
     assert_eq!(bytes, expected);
+}
+
+fn read_private_pty(reader: &mut File, length: usize) -> Vec<u8> {
+    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    let mut bytes = vec![0; length];
+    let mut offset = 0;
+    while offset < length {
+        let remaining = deadline.checked_duration_since(std::time::Instant::now()).unwrap();
+        let mut readiness = libc::pollfd {
+            fd: reader.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe {
+            libc::poll(&mut readiness, 1, remaining.as_millis().max(1).min(i32::MAX as u128) as i32)
+        };
+        if ready < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        assert!(ready > 0, "private successor PTY did not become readable");
+        match reader.read(&mut bytes[offset..]) {
+            Ok(0) => panic!("private successor PTY closed before expected output"),
+            Ok(count) => offset += count,
+            Err(error) if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) => continue,
+            Err(error) => panic!("read private successor PTY: {error}"),
+        }
+    }
+    bytes
 }
