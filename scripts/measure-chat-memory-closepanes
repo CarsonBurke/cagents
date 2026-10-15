@@ -12,6 +12,7 @@ This helper records ownership/close proof, not memory or presentation latency.
 """
 import argparse
 from contextlib import closing
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -84,12 +85,26 @@ def compositor_socket(path, compositor_pid):
         raise SystemExit("compositor IPC socket is not owned by the pinned private process")
 
 
+def verified_adoption(path, expected):
+    proofs = []
+    for line in path.read_text().splitlines():
+        if line.strip():
+            value = json.loads(line)
+            if "adopted_cards" in value:
+                proofs.append(value)
+    if len(proofs) != 1 or any(proofs[0].get(key) != value for key, value in expected.items()):
+        raise SystemExit("prior adoption proof does not match this exact UI/workload/control pane")
+    return proofs[0]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--pid", type=int, required=True)
     parser.add_argument("--cycle", type=int, default=1)
+    parser.add_argument("--attempt", type=int, default=1, help="new output suffix, never overwrites prior input receipts")
+    parser.add_argument("--adoption-receipt", type=Path, help="resume using this cycle's exact original adoption JSONL proof")
     parser.add_argument("--keep-card", required=True)
     parser.add_argument("--ui-database", type=Path, required=True)
     parser.add_argument("--model-database", type=Path, required=True)
@@ -129,7 +144,10 @@ def main():
     private_session.write_text(json.dumps(session, indent=2) + "\n")
     private_session.chmod(0o600)
     env["NIRI_HARNESS_STATE"] = str(private_state)
-    actors = json.loads((root / ("actors-cycle" + str(args.cycle) + ".json")).read_text())
+    if args.attempt < 1 or args.cycle < 1:
+        parser.error("cycle and attempt must be positive")
+    manifest_bytes = (root / ("actors-cycle" + str(args.cycle) + ".json")).read_bytes()
+    actors = json.loads(manifest_bytes)
     targets = {str(uuid.UUID(actor["agent"]["id"])) for actor in actors}
     names = {str(uuid.UUID(actor["agent"]["id"])): actor["agent"].get("name") for actor in actors}
     if keep in targets or len(targets) != len(actors) or not targets:
@@ -141,9 +159,17 @@ def main():
     if keep not in cards or cards[keep]["closed"]:
         raise SystemExit("control pane must be durably open")
     workspace = cards[keep]["workspace"]
-    if any(card not in cards or cards[card]["closed"] or cards[card]["workspace"] != workspace or card not in owners or card not in members for card in targets):
+    proof = {"adopted_cards": sorted(targets), "preserved_card": keep, "workspace": workspace,
+             "pid": args.pid, "start_ticks": ticks, "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest()}
+    if args.adoption_receipt:
+        previous = args.adoption_receipt.resolve(strict=True)
+        if not previous.is_relative_to(root):
+            raise SystemExit("prior adoption receipt must belong to this fixture root")
+        verified_adoption(previous, proof)
+    pending = {card for card in targets if not (args.adoption_receipt and closed(card, state))}
+    if any(card not in cards or cards[card]["closed"] or cards[card]["workspace"] != workspace or card not in owners or card not in members for card in pending):
         raise SystemExit("every minted actor must first have a live adopted UI pane in the control workspace")
-    receipt_path = root / ("pane-closes-cycle" + str(args.cycle) + ".jsonl")
+    receipt_path = root / ("pane-closes-cycle" + str(args.cycle) + "-attempt" + str(args.attempt) + ".jsonl")
     if receipt_path.exists():
         raise SystemExit("refusing to overwrite a close experiment")
 
@@ -183,10 +209,10 @@ def main():
 
     focused_ui()
     with receipt_path.open("a") as output:
-        output.write(json.dumps({"adopted_cards": sorted(targets), "preserved_card": keep,
-                                 "pid": args.pid, "start_ticks": ticks}) + "\n")
+        output.write(json.dumps(proof) + "\n")
     for actor in actors:
-        FIXTURE["cli_call"](args.cli, env, ["agent", "close", actor["agent"]["id"]], root)
+        if actor["agent"]["id"] in pending:
+            FIXTURE["cli_call"](args.cli, env, ["agent", "close", actor["agent"]["id"]], root)
     for _ in range(3 * len(targets) + 3):
         state = census()
         remaining = {card for card in targets if not closed(card, state)}

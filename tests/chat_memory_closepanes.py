@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Read-only baseline/retired schema proofs for the native pane-close fixture."""
 from contextlib import closing
+import json
 from pathlib import Path
 import runpy
 import sqlite3
@@ -60,6 +61,15 @@ class CloseProof(unittest.TestCase):
         self.assertFalse(HELPER["closed"]("minted", self.snapshot()))
         self.assertFalse(HELPER["closed"]("unknown", self.snapshot()))
         self.assertEqual(self.snapshot()[1], {"workspace": "minted"})
+
+    def test_resume_requires_the_same_exact_adoption_proof(self):
+        path = Path(self.directory.name) / "attempt1.jsonl"
+        proof = {"adopted_cards": ["minted"], "pid": 42, "start_ticks": "99", "manifest_sha256": "exact"}
+        path.write_text(json.dumps({"action": ["observe"]}) + "\n" + json.dumps(proof) + "\n")
+        self.assertEqual(HELPER["verified_adoption"](path, proof), proof)
+        for key, replacement in (("pid", 43), ("start_ticks", "100"), ("manifest_sha256", "other"), ("adopted_cards", ["other"])):
+            with self.subTest(changed=key), self.assertRaisesRegex(SystemExit, "prior adoption"):
+                HELPER["verified_adoption"](path, {**proof, key: replacement})
 
 
 if __name__ == "__main__":
