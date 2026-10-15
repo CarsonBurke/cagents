@@ -61,6 +61,18 @@ impl WorktreeAuthority {
         Ok(())
     }
 
+    /// Blocking recovery intake reuses the exact source and common directory
+    /// already held by this actor. These are Arc aliases, not new pathname
+    /// captures or a retained command executor. The caller must independently
+    /// acquire its current registry/adoption lease before moving any file.
+    ///
+    /// Once admitted, a recovery retains these roots after the originating
+    /// project closes. Requiring a fresh UI actor on retry would strand cleanup.
+    pub fn recovery_roots(&self) -> Result<(Arc<fs_safety::Root>, Arc<fs_safety::Root>), RepositoryError> {
+        self.validate()?;
+        Ok((self.root.clone(), self.common_dir.clone()))
+    }
+
     /// Journal code can retain the exact source roots without rediscovering
     /// metadata through a changed path. No executor is exposed here.
     pub(super) fn retained_roots(&self) -> Result<(fs_safety::Root, fs_safety::Root, fs_safety::Root), RepositoryError> {
@@ -386,6 +398,30 @@ mod authority_tests {
             assert_eq!((scoped_identity.dev(), scoped_identity.ino()), (expected_identity.dev(), expected_identity.ino()));
             assert_eq!(&scoped.arguments[4..], &command.arguments[2..]);
         }
+    }
+
+    #[test]
+    fn recovery_root_aliases_keep_original_objects_without_retaining_command_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let name = directory.path().join("source");
+        std::fs::create_dir(&name).unwrap();
+        actual_git(&name, &["init", "-b", "main"]);
+        let authority = WorktreeAuthority::capture(&name).unwrap();
+        let (source, common) = authority.recovery_roots().unwrap();
+        let (again, common_again) = authority.recovery_roots().unwrap();
+        assert!(Arc::ptr_eq(&source, &again));
+        assert!(Arc::ptr_eq(&common, &common_again));
+        assert!(Arc::ptr_eq(&source, &authority.root));
+        assert!(Arc::ptr_eq(&common, &authority.common_dir));
+        let expected = source.metadata().unwrap();
+        drop(authority);
+        // Dropping the actor cannot redirect already-admitted cleanup to a
+        // replacement at its old name; the registry lease remains separate.
+        std::fs::rename(&name, directory.path().join("retained-root")).unwrap();
+        std::fs::create_dir(&name).unwrap();
+        assert_eq!(source.metadata().unwrap().ino(), expected.ino());
+        assert_ne!(std::fs::metadata(&name).unwrap().ino(), expected.ino());
+        assert!(common.metadata().unwrap().is_dir());
     }
 
     #[test]

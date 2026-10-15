@@ -234,6 +234,16 @@ impl WorktreeCreationSource {
         Ok(retained)
     }
 
+    /// Worker-only physical census for filesystem recovery. Initial intake
+    /// must still refer to the displayed actor; accepted cleanup subsequently
+    /// retains only these original roots and its independent daemon lease.
+    pub(super) fn recovery_roots(&self) -> Result<(Arc<crate::fs_safety::Root>, Arc<crate::fs_safety::Root>), RepositoryError> {
+        if !self.is_available() {
+            return Err(ValidationError::Io("The displayed project source changed before recovery intake.".into()).into());
+        }
+        self.authority.recovery_roots()
+    }
+
     pub(super) fn repository(&self) -> &Path { self.authority.path() }
 
     pub(super) fn service(&self) -> Result<Arc<ScopedCreationService>, RepositoryError> {
