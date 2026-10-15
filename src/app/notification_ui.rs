@@ -29,6 +29,12 @@ pub enum Action {
     Failed(String),
 }
 
+struct ActivatedAutomation {
+    agent: crate::agent_execution::Agent,
+    display: crate::workspace_model::views::ManagedDisplay,
+    session: crate::agent_execution::HostedSession,
+}
+
 #[derive(Default)]
 struct Pending {
     presence: Option<Presence>,
@@ -663,6 +669,15 @@ impl Cagents {
         // A scheduled agent can remain headless in this window. Only this
         // explicit user activation may mount its exact authenticated descriptor.
         let automation = self.activated_automation_agent(session);
+        if automation.is_none() && self.workspace_model.agents.iter().any(|agent| {
+            !agent.closed && matches!(agent.origin, crate::agent_execution::Origin::Automation { .. })
+                && (agent.session.as_ref().is_some_and(|owner| owner.id() == session)
+                    || agent.console.as_ref().is_some_and(|owner| owner.id == session))
+        }) {
+            // Invalid authoritative membership also fences a retained local
+            // projection. It cannot silently downgrade to an unmanaged pane.
+            return Task::none();
+        }
         let existing = self
             .durable
             .cards
@@ -675,8 +690,8 @@ impl Cagents {
         }
         let mut adopted = Task::none();
         let id = if let Some(card) = existing {
-            if let Some(agent) = &automation {
-                let expected = activation_session(agent).expect("validated activation session");
+            if let Some(activation) = &automation {
+                let expected = &activation.session;
                 let current = match &card.kind {
                     CardKind::Chat(session) => {
                         crate::agent_execution::HostedSession::Chat(session.clone())
@@ -690,18 +705,24 @@ impl Cagents {
                     return Task::none();
                 }
             }
-            card.id
+            let id = card.id;
+            if let Some(activation) = &automation {
+                adopted = self.adopt_execution_agent_display(&activation.agent, activation.display.clone()).unwrap_or_else(Task::none);
+                self.refresh_sidebar_channels();
+                self.persist();
+            }
+            id
         } else {
-            let Some(agent) = automation else {
+            let Some(activation) = automation else {
                 return Task::none();
             };
-            let Some(task) = self.adopt_execution_agent(&agent) else {
+            let Some(task) = self.adopt_execution_agent_display(&activation.agent, activation.display) else {
                 return Task::none();
             };
             adopted = task;
             self.refresh_sidebar_channels();
             self.persist();
-            CardId::from_uuid(agent.id.as_uuid())
+            CardId::from_uuid(activation.agent.id.as_uuid())
         };
         if self
             .durable
@@ -723,69 +744,53 @@ impl Cagents {
     /// The model comes from the authenticated daemon watch. A session ID alone
     /// never grants launch authority: require one live owner, its proof, and a
     /// currently open exact placement. Model ambiguity is deferred, not guessed.
-    fn activated_automation_agent(
-        &self,
-        session: TerminalId,
-    ) -> Option<crate::agent_execution::Agent> {
-        use crate::agent_execution::{Origin, Placement};
+    fn activated_automation_agent(&self, session: TerminalId) -> Option<ActivatedAutomation> {
+        use crate::agent_execution::{HostedSession, Origin, Placement};
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return None;
         }
+        // Count raw owners before projection. A rejected duplicate must not
+        // disappear from the ambiguity fence merely because one pane matches.
         let mut owners = self.workspace_model.agents.iter().filter(|agent| {
-            !agent.closed && activation_session(agent).is_some_and(|owner| owner.id() == session)
+            !agent.closed && (agent.session.as_ref().is_some_and(|owner| owner.id() == session)
+                || agent.console.as_ref().is_some_and(|owner| owner.id == session))
         });
         let agent = owners.next()?;
-        if owners.next().is_some()
-            || !matches!(agent.origin, Origin::Automation { .. })
-            || self
-                .project_ui
-                .closed
-                .contains(&agent.spec.target.repository)
-            || self
-                .workspace_model
-                .closed_projects
-                .contains(&agent.spec.target.repository)
-        {
+        if owners.next().is_some() || !matches!(agent.origin, Origin::Automation { .. }) {
             return None;
         }
-        let owner = activation_session(agent)?;
-        let proven = match &owner {
-            crate::agent_execution::HostedSession::Chat(session) => session
-                .proof
-                .as_ref()
-                .is_some_and(crate::model::HostSessionProof::is_complete),
-            crate::agent_execution::HostedSession::Terminal(session) => session
-                .continuity
-                .live_proof()
-                .is_some_and(|proof| proof.is_complete()),
+        let display = crate::workspace_model::views::managed_display(&self.workspace_model, agent)?;
+        let owner = match display.pane.as_ref().map(|pane| &pane.kind) {
+            Some(CardKind::Chat(session)) => HostedSession::Chat(session.clone()),
+            Some(CardKind::Terminal(session)) => HostedSession::Terminal(session.clone()),
+            Some(_) => return None,
+            None => activation_session(agent)?,
         };
-        if !proven {
-            return None;
-        }
-        match &agent.placement {
+        let proven = match &owner {
+            HostedSession::Chat(session) => session.proof.as_ref().is_some_and(crate::model::HostSessionProof::is_complete),
+            HostedSession::Terminal(session) => session.continuity.live_proof().is_some_and(|proof| proof.is_complete()),
+        };
+        if owner.id() != session || !proven { return None; }
+        let repository = match &display.scope {
             Placement::Channel(id) => {
                 let shared = self.workspace_model.channel(*id)?;
-                let local = self
-                    .durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.id == *id)?;
+                let local = self.durable.channels.iter().find(|channel| channel.id == *id)?;
                 let project = self.sidebar_model.project(local.project_id)?;
-                if shared.repository != agent.spec.target.repository
-                    || project.repository != shared.repository
-                {
-                    return None;
-                }
+                if project.repository != shared.repository { return None; }
+                &shared.repository
             }
             Placement::Worktree { repository, path } => {
-                if repository != &agent.spec.target.repository
-                    || self.worktree_view_scope(path).as_ref() != Some(&agent.placement)
-                {
-                    return None;
-                }
+                if self.worktree_view_scope(path).as_ref() != Some(&display.scope) { return None; }
+                repository
             }
-        }
-        Some(agent.clone())
+        };
+        // A saved exact pane may have a legacy cross-project display move.
+        // Unpublished fallback still belongs to its accepted launch repository.
+        if (display.pane.is_none() && repository != &agent.spec.target.repository)
+            || self.project_ui.closed.contains(repository)
+            || self.workspace_model.closed_projects.contains(repository)
+        { return None; }
+        Some(ActivatedAutomation { agent: agent.clone(), display, session: owner })
     }
 
     pub(super) fn notification_subscription(&self) -> Subscription<Message> {
@@ -1532,6 +1537,65 @@ mod tests {
             Some(CardId::from_uuid(agent.id.as_uuid()))
         );
         assert!(app.durable.channels[0].cards.is_empty());
+    }
+
+    #[test]
+    fn attention_activation_follows_saved_surface_and_legacy_display_without_rewriting_execution() {
+        use crate::agent_execution::{HostedSession, Placement, Surface};
+        use crate::workspace_model::views::{Pane, View};
+        for saved_chat in [false, true] {
+            let (mut app, mut agent) = scheduled_attention_fixture();
+            let console = agent.console.clone().unwrap();
+            let native = crate::chat::Session {
+                native_continuity: Default::default(), id: TerminalId::new(),
+                proof: console.continuity.live_proof(), terminal: None, owned_codex_listener: None,
+                launch: crate::chat::Launch { provider: agent.spec.provider, session_id: None, recipe: console.launch.clone() },
+            };
+            agent.session = Some(HostedSession::Chat(native.clone()));
+            agent.spec.surface = if saved_chat { Surface::Terminal } else { Surface::Chat };
+            let original = agent.clone();
+            app.project_ui.closed.insert(original.spec.target.repository.clone());
+            let destination = ChannelId::new();
+            let project = ProjectId::new();
+            let repository = PathBuf::from("/legacy-display");
+            app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Legacy display".into(), repository.clone(), vec![], vec![]));
+            let mut local = app.durable.channels[0].clone();
+            local.id = destination; local.project_id = project;
+            Arc::make_mut(&mut app.durable).channels.push(local);
+            let mut shared = app.workspace_model.channels[0].clone();
+            shared.id = destination; shared.repository = repository;
+            app.workspace_model.channels.push(shared);
+            let mut card = super::super::tests::terminal_card_state();
+            card.id = CardId::from_uuid(agent.id.as_uuid());
+            card.title = "Saved moved conversation".into();
+            card.width_fraction = 0.65;
+            card.kind = if saved_chat { CardKind::Chat(native.clone()) } else { CardKind::Terminal(console.clone()) };
+            let pane = Pane::from_card(&card, Some(agent.spec.target.directory.clone())).unwrap();
+            let mut source = View::empty(agent.channel().unwrap());
+            source.retired.push(card.id);
+            app.workspace_model.views = vec![source, View { scope: Placement::Channel(destination), revision: 2, panes: vec![pane.clone()], retired: vec![] }];
+            app.workspace_model.agents.push(agent);
+            let session = if saved_chat { native.id } else { console.id };
+            drop(app.update_notifications(Action::Activated(Target::Session(session))));
+            assert_eq!(app.durable.active_channel, Some(destination));
+            assert_eq!(app.workspace.focused(), Some(card.id));
+            assert_eq!(app.card_state(card.id).unwrap().kind, card.kind);
+            assert_eq!(app.card_state(card.id).unwrap().title, card.title);
+            assert_eq!(app.card_state(card.id).unwrap().width_fraction, 0.65);
+            assert!(app.durable.channels[0].cards.is_empty());
+            assert_eq!(app.workspace_model.agents[0], original,
+                "display-only activation preserves accepted cwd/spec/placement/provider/native actor");
+            drop(app.select_channel(original.channel().unwrap()));
+            let focused = app.workspace.focused();
+            let saved_cards = app.durable.cards.clone();
+            app.workspace_model.sequence += 1;
+            app.workspace_model.views[1].panes[0].kind = super::super::tests::terminal_card_state().kind;
+            drop(app.update_notifications(Action::Activated(Target::Session(session))));
+            assert_eq!(app.workspace.focused(), focused,
+                "replaced canonical ownership cannot reactivate a stale retained local pane");
+            assert_eq!(app.durable.cards, saved_cards);
+            assert_eq!(app.workspace_model.agents[0], original);
+        }
     }
 
     #[test]
