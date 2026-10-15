@@ -502,17 +502,13 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
                 .current_dir
                 .as_ref()
                 .ok_or("repository directory unavailable")?;
-            let ignored_path = format!(".worktrees/{name}/cagents-ignore-check");
-            let ignore = CommandSpec::new("git")
-                .cwd(root)
-                .args(["check-ignore", "--quiet", "--"])
-                .arg(ignored_path);
-            let ignored = SystemProcessExecutor
-                .execute(&ignore, &CancellationToken::new())
+            crate::repository::RepositoryService::system("git")
+                .ensure_managed_directory_ignored(
+                    root,
+                    &root.join(".worktrees"),
+                    &CancellationToken::new(),
+                )
                 .map_err(|error| error.to_string())?;
-            if !ignored.success {
-                return Err("ignore .worktrees/ in .gitignore or .git/info/exclude before creating a worktree".into());
-            }
             let directory = root.join(".worktrees");
             crate::secure_file::reject_symlink_components(&directory)
                 .map_err(|error| error.to_string())?;
