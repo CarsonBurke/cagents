@@ -1851,6 +1851,7 @@ fn proven_pull_request_base(changes: &sidebar::BranchChanges, remotes: &[String]
 
 #[derive(Debug, Clone)]
 pub struct LoadedRepository {
+    creation_source: Option<worktree_dialog::WorktreeCreationSource>,
     project: ProjectState,
     repository: Option<RepositoryInfo>,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
@@ -23067,6 +23068,7 @@ fn load_project(
     std::fs::read_dir(&directory)
         .map_err(|error| format!("could not read folder {}: {error}", directory.display()))?;
     Ok(LoadedRepository {
+        creation_source: None,
         project: ProjectState {
             id: project_id.unwrap_or_default(),
             generation: 0,
@@ -23092,23 +23094,55 @@ fn load_repository(
         return Err("Use Device files for remote browsing and Git operations".into());
     }
     let service = RepositoryService::system("git");
-    // Git discovery and stable worktree identities must see the real checkout,
-    // not a spelling introduced by a picker symlink or a relative launch path.
-    let path = path
-        .canonicalize()
+    // Candidate discovery is not publication or mutation consent. In particular,
+    // a picker may name a subdirectory or the common metadata directory.
+    let path = path.canonicalize()
         .map_err(|error| format!("could not resolve repository {}: {error}", path.display()))?;
-    let repository = service
-        .discover(&path, &cancellation)
+    let candidate = service.discover(&path, &cancellation)
         .map_err(|error| error.to_string())?;
+    if !crate::repository::WorktreeAuthority::supported() || candidate.is_bare {
+        return read_loaded_repository(&service, candidate, None, project_id, &cancellation);
+    }
+    let root = candidate.worktree_root.as_ref()
+        .ok_or_else(|| "The selected repository has no worktree to retain".to_owned())?
+        .canonicalize().map_err(|error| error.to_string())?;
+    let source = worktree_dialog::WorktreeCreationSource::new(
+        crate::repository::WorktreeAuthority::capture(&root).map_err(|error| error.to_string())?);
+    let scoped = source.service().map_err(|error| error.to_string())?;
+    // Redo discovery through the original retained root/private/common handles.
+    // Descriptor spellings are active IO operands, not durable project keys.
+    let mut repository = scoped.discover(&root, &cancellation)
+        .map_err(|error| error.to_string())?;
+    repository.common_dir = scoped.common_dir(&root, &cancellation)
+        .map_err(|error| error.to_string())?;
+    if repository.common_dir != candidate.common_dir {
+        return Err("The selected repository changed during discovery; reload it before creating a worktree".into());
+    }
+    repository.id = candidate.id;
+    repository.git_dir = scoped.git_dir(&root, &cancellation)
+        .map_err(|error| error.to_string())?;
+    repository.selected_path = root.clone();
+    repository.worktree_root = Some(root);
+    read_loaded_repository(&scoped, repository, Some(source), project_id, &cancellation)
+}
+
+fn read_loaded_repository<E: crate::repository::ProcessExecutor>(
+    service: &RepositoryService<E>,
+    repository: RepositoryInfo,
+    creation_source: Option<worktree_dialog::WorktreeCreationSource>,
+    project_id: Option<ProjectId>,
+    cancellation: &CancellationToken,
+) -> Result<LoadedRepository, String> {
+    let display_service = RepositoryService::system("git");
     let worktrees = service
-        .list_worktrees(&repository.common_dir, &cancellation)
+        .list_worktrees(&repository.selected_path, cancellation)
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|worktree| worktree_ui::worktree_directory_available(&worktree.path))
         .map(|worktree| {
             let status = (!worktree.bare)
                 .then(|| {
-                    service
+                    display_service
                         .status_projection(
                             &worktree.path,
                             true,
@@ -23136,13 +23170,18 @@ fn load_repository(
             pull_request_review::ReviewSource::from_remotes(&repository.selected_path, &remotes)
         })
         .map(|source| source.repository);
-    let github_availability = load_repository_github(&repository, &cancellation);
+    let github_availability = load_repository_github_with_service(service, &repository, cancellation);
+    if cancellation.is_cancelled() { return Err("Repository loading was cancelled".into()); }
+    if let Some(source) = &creation_source {
+        source.service().map_err(|error| error.to_string())?;
+    }
     // The shared model's own derivation, not a second copy of it: a project
     // this window opened and one the CLI opened are one row in the registry,
     // and two rules for its name would make the sidebar show whichever of them
     // wrote last.
     let name = crate::workspace_model::repository_display_name(&repository.common_dir);
     Ok(LoadedRepository {
+        creation_source,
         project: ProjectState {
             kind: Default::default(),
             id: project_id.unwrap_or_default(),
@@ -23163,7 +23202,14 @@ fn load_repository_github(
     repository: &RepositoryInfo,
     cancellation: &CancellationToken,
 ) -> GitHubAvailability {
-    let service = RepositoryService::system("git");
+    load_repository_github_with_service(&RepositoryService::system("git"), repository, cancellation)
+}
+
+fn load_repository_github_with_service<E: crate::repository::ProcessExecutor>(
+    service: &RepositoryService<E>,
+    repository: &RepositoryInfo,
+    cancellation: &CancellationToken,
+) -> GitHubAvailability {
     let github = GitHubService::system("gh");
     (|| {
         let remotes = service
@@ -30015,6 +30061,7 @@ mod tests {
         app.repository_generations.insert(broken, 1);
         app.repository_generations.insert(healthy, 1);
         let loaded = LoadedRepository {
+            creation_source: None,
             project: ProjectState {
                 kind: Default::default(),
                 id: healthy,
@@ -33075,6 +33122,69 @@ mod tests {
         assert_eq!(refreshed.project.kind, ProjectKind::Folder);
         assert_eq!(refreshed.project.repository, root);
         assert!(load_project(&root, None, CancellationToken::default(), None).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn project_loader_retains_the_displayed_root_and_metadata_for_creation() {
+        const TEST: &str = "app::tests::project_loader_retains_the_displayed_root_and_metadata_for_creation";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().join("primary");
+        let linked = files.path().join("linked");
+        let git = |directory: &Path, args: &[&str]| {
+            crate::git_watch::tests::run_fixture_command(
+                crate::git_watch::tests::isolated_fixture_command(
+                    crate::repository::CommandSpec::new("git").cwd(directory)
+                        .args(["-c", "user.name=Test", "-c", "user.email=test@example.invalid"])
+                        .args(args.iter().copied())));
+        };
+        git(files.path(), &["init", "--template=", "-b", "main", "primary"]);
+        git(&root, &["commit", "--allow-empty", "-m", "Initial"]);
+        git(&root, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
+        std::fs::create_dir(root.join("subdir")).unwrap();
+        for selected in [&root.join("subdir"), &root.join(".git"), &linked] {
+            let loaded = load_repository(selected, None, CancellationToken::new()).unwrap();
+            let source = loaded.creation_source.as_ref().unwrap();
+            let expected = if *selected == linked { &linked } else { &root };
+            assert_eq!(source.repository(), expected);
+            let service = source.service().unwrap();
+            assert_eq!(service.common_dir(source.repository(), &CancellationToken::new()).unwrap(), root.join(".git"));
+            assert_eq!(loaded.repository.as_ref().unwrap().selected_path, *expected);
+            assert_eq!(loaded.project.repository, root.join(".git"));
+            assert!(loaded.worktrees.iter().any(|(row, _)| row.path == linked));
+            assert!(!loaded.project.repository.to_string_lossy().contains("/proc/"));
+        }
+        let loaded = load_repository(&linked, None, CancellationToken::new()).unwrap();
+        let retained = loaded.creation_source.unwrap();
+        let moved = files.path().join("original-linked");
+        std::fs::rename(&linked, &moved).unwrap();
+        git(files.path(), &["init", "--template=", "-b", "replacement", "linked"]);
+        assert!(retained.service().is_err(), "a displayed binding cannot adopt a replacement root");
+        let loaded = load_repository(&root, None, CancellationToken::new()).unwrap();
+        let retained = loaded.creation_source.unwrap();
+        std::fs::rename(root.join(".git"), root.join("saved-metadata")).unwrap();
+        git(&root, &["init", "--template=", "-b", "replacement"]);
+        assert!(retained.service().is_err(), "same worktree inode cannot authorize replacement Git metadata");
+    }
+
+    #[test]
+    fn project_loader_does_not_offer_strong_creation_for_bare_or_folder_projects() {
+        const TEST: &str = "app::tests::project_loader_does_not_offer_strong_creation_for_bare_or_folder_projects";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let files = tempfile::tempdir().unwrap();
+        crate::git_watch::tests::run_fixture_command(
+            crate::git_watch::tests::isolated_fixture_command(
+                crate::repository::CommandSpec::new("git").cwd(files.path())
+                    .args(["init", "--bare", "--template=", "bare.git"])));
+        let bare = load_repository(&files.path().join("bare.git"), None, CancellationToken::new()).unwrap();
+        assert!(bare.repository.unwrap().is_bare);
+        assert!(bare.creation_source.is_none());
+        let folder = load_project(files.path(), None, CancellationToken::new(), Some(ProjectKind::Folder)).unwrap();
+        assert!(folder.creation_source.is_none());
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+        assert!(load_repository(&files.path().join("bare.git"), None, cancelled).is_err());
     }
 
     #[test]

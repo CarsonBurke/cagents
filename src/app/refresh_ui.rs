@@ -361,6 +361,7 @@ impl Cagents {
         open_cards: bool,
         kind: Option<ProjectKind>,
     ) -> Task<Message> {
+        self.retire_project_creation_source(project_id);
         if crate::device::is_remote() {
             return self.device_project_read_task(path, project_id, generation, kind);
         }
