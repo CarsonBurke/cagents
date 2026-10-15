@@ -1197,6 +1197,32 @@ mod tests {
         });
     }
     #[test]
+    fn saved_copy_yields_to_actual_later_path_copy() {
+        if isolated("saved_copy_yields_to_actual_later_path_copy") {
+            return;
+        }
+        let _guard = chat::client::diagnostic_test_guard();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let body = b"successful saved output held before path copy";
+            let (mut app, target, handle) = fixture(body);
+            install(&mut app, target, &handle, body);
+            let task = app.handle_chat_ui(Action::CopyProviderExit(target));
+            let completed = prepared_copy(task).await;
+            let Action::ProviderExitCopyReady(_, request, reply) = &completed else {
+                unreachable!()
+            };
+            assert!(request.current(app.chat_runtime_mut(target).unwrap()));
+            assert!(reply.contains_text_for_test("successful saved output held before path copy"));
+            let path_copy = app.update(Message::ChromeUi(crate::app::chrome_ui::Action::CopyPath(target.card)));
+            assert_recent_copy_action(path_copy, Some("/workspace/chat-fixture"));
+            app.status = None;
+            assert_no_actions(app.handle_chat_ui(completed));
+            assert!(app.status.is_none());
+            let state = &app.chat_runtime_mut(target).unwrap().provider_exit_output;
+            assert!(state.request.is_none() && state.ready.is_some());
+        });
+    }
+    #[test]
     fn actual_held_read_and_copy_refuse_new_receiver_authority_before_wake() {
         if isolated("actual_held_read_and_copy_refuse_new_receiver_authority_before_wake") {
             return;

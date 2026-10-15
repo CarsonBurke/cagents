@@ -759,6 +759,7 @@ impl Cagents {
                 .confirmation
                 .as_ref()
                 .map_or_else(Task::none, |confirmation| {
+                    self.chat_ui.begin_clipboard_copy();
                     iced::clipboard::write(preview_details(&confirmation.preview))
                 }),
             Action::ReviewJob => {

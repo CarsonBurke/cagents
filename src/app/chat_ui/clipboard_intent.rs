@@ -15,7 +15,7 @@ struct Hub {
 #[derive(Clone, Default)]
 pub(super) struct Intents(Arc<Hub>);
 #[derive(Clone)]
-pub(super) struct Intent {
+pub(in crate::app) struct Intent {
     hub: Arc<Hub>,
     generation: u64,
 }
@@ -47,7 +47,7 @@ impl Intents {
     }
 }
 impl Intent {
-    pub(super) fn current(&self) -> bool {
+    pub(in crate::app) fn current(&self) -> bool {
         self.hub.generation.load(Ordering::Acquire) == self.generation
     }
     pub(super) fn register<T: Pending + 'static>(&self, input: &Arc<T>) {

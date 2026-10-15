@@ -29,6 +29,7 @@ mod permissions;
 mod prose;
 mod provider_exit;
 mod clipboard_intent;
+pub(super) use clipboard_intent::Intent as ClipboardIntent;
 mod clipboard_surface;
 mod retained;
 mod scroll;
@@ -510,6 +511,10 @@ pub(super) struct State {
     last_models: HashMap<Provider, (String, Option<String>)>,
 }
 impl State {
+    pub(super) fn begin_clipboard_copy(&self) -> ClipboardIntent {
+        self.copy_intents.next()
+    }
+
     pub(super) fn clipboard_surface<'a, M: 'a>(
         &self,
         content: cosmic::Element<'a, M>,

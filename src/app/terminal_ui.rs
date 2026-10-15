@@ -1,5 +1,8 @@
 use super::*;
 
+#[cfg(test)]
+mod clipboard_tests;
+
 #[derive(Clone, Debug)]
 pub enum Action {
     Open(CardId),
@@ -306,6 +309,11 @@ mod tests {
     }
 }
 
+pub(super) struct PendingCopy {
+    pub request: uuid::Uuid,
+    pub intent: chat_ui::ClipboardIntent,
+}
+
 #[derive(Default)]
 pub(super) struct Find {
     pub open: bool,
@@ -318,7 +326,7 @@ pub(super) struct Find {
     pub focused: bool,
     pub select_all_request: u64,
     pub selection_reset: u64,
-    pub pending_copy: Option<uuid::Uuid>,
+    pub pending_copy: Option<PendingCopy>,
     searched_content: Option<SearchContent>,
     refresh_generation: u64,
     refresh_pending: Option<u64>,
@@ -467,14 +475,19 @@ impl Cagents {
                 return Task::none();
             }
             Action::Copy(_, text) => {
+                self.chat_ui.begin_clipboard_copy();
                 self.terminal_context = None;
                 return iced::clipboard::write(text).map(cosmic::Action::App);
             }
             Action::CopySelection(_, selection) => {
                 self.terminal_context = None;
                 let request = uuid::Uuid::new_v4();
-                find.pending_copy = Some(request);
+                find.pending_copy = Some(PendingCopy {
+                    request,
+                    intent: self.chat_ui.begin_clipboard_copy(),
+                });
                 if let Err(error) = handle.copy_selection(request, selection) {
+                    find.pending_copy = None;
                     return cosmic::task::message(Message::TerminalError {
                         card,
                         message: error.to_string(),
