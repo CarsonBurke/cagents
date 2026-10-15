@@ -14,7 +14,8 @@ pub enum Operation {
 pub fn execute(path: &Path, operation: Operation) -> Result<Value, String> {
     if let Operation::Path { create } = operation {
         if create {
-            ensure_file(path, &AppSettings::default()).map_err(|e| e.to_string())?;
+            let settings=load_detailed(path).map_err(|e|e.to_string())?.settings;
+            ensure_file(path, &settings).map_err(|e| e.to_string())?;
         }
         return Ok(json!({"path": path}));
     }
@@ -112,6 +113,18 @@ mod tests {
         ensure_file(&path,&stale).unwrap();
         execute(&path,Operation::Path{create:true}).unwrap();
         assert_eq!(super::super::load(&path).unwrap().terminal_font_size,15.0);
+    }
+
+    #[test]
+    fn settings_open_migrates_legacy_values_before_ensuring_toml_exists() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("settings.toml");
+        let legacy=root.path().join("settings.json");
+        std::fs::write(&legacy,br#"{"terminal_font_size":18.0,"default_column_fraction":0.65}"#).unwrap();
+        execute(&path,Operation::Path{create:true}).unwrap();
+        let settings=super::super::load(&path).unwrap();
+        assert_eq!(settings.terminal_font_size,18.0);
+        assert_eq!(settings.default_column_fraction,0.65);
+        assert!(path.is_file());assert!(!legacy.exists());
     }
 
     #[test]
