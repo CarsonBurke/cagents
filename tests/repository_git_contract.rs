@@ -2323,10 +2323,25 @@ fn command_pathspecs_use_literal_nul_delimited_stdin() {
         .stage_command(Path::new("/repo"), &[path(":(top)magic.txt")])
         .expect("stage command");
     assert_eq!(command.arguments[0], OsString::from("--literal-pathspecs"));
-    assert!(command.arguments.contains(&OsString::from("--pathspec-from-file=-")));
-    assert!(command.arguments.contains(&OsString::from("--pathspec-file-nul")));
-    assert!(!command.arguments.contains(&OsString::from(":(top)magic.txt")));
-    assert_eq!(command.stdin.as_deref(), Some(b":(top)magic.txt\0".as_slice()));
+    assert!(
+        command
+            .arguments
+            .contains(&OsString::from("--pathspec-from-file=-"))
+    );
+    assert!(
+        command
+            .arguments
+            .contains(&OsString::from("--pathspec-file-nul"))
+    );
+    assert!(
+        !command
+            .arguments
+            .contains(&OsString::from(":(top)magic.txt"))
+    );
+    assert_eq!(
+        command.stdin.as_deref(),
+        Some(b":(top)magic.txt\0".as_slice())
+    );
 }
 
 /// A project remembers its Git common directory, so reopening one hands
