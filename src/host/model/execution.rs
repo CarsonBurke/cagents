@@ -1218,6 +1218,15 @@ impl Registry {
     /// Until exact live prompt evidence can be reconciled, restart records an
     /// uncertain outcome rather than authorizing another delivery of effects.
     pub(crate) fn interrupt_unproven_agent_runs(&mut self, now_ms: u64) -> Result<(), String> {
+        self.interrupt_unproven_agent_runs_except(now_ms, &[])
+    }
+
+    /// Only a currently authenticated retained actor may provide these exact
+    /// run/session pairs. A live session or a busy indicator alone is not proof
+    /// that this accepted command reached its original reducer.
+    pub(in crate::host) fn interrupt_unproven_agent_runs_except(
+        &mut self, now_ms: u64, retained: &[(RunId, HostedSession)],
+    ) -> Result<(), String> {
         let records = self
             .db
             .prepare(
@@ -1229,6 +1238,11 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         for record in records {
             let run: Run = decode(&record)?;
+            let agent = self.agent(run.agent)?;
+            if !agent.closed && retained.iter().any(|(id, source)| *id == run.id
+                && agent.session.as_ref().is_some_and(|current| current.same_process(source))) {
+                continue;
+            }
             self.update_agent_run(run.id, run.revision, Update::Finished {
                 state: State::Interrupted,
                 result: ResultSummary {
