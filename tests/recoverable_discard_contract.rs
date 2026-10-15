@@ -1,0 +1,373 @@
+#![cfg(all(target_os = "linux", feature = "host"))]
+//! Actual current service contracts. Each child owns its private runtime,
+//! desktop Trash and checkout; no developer Trash or global environment changes.
+use cagents::{
+    process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
+    repository::{
+        DiscardRequest, MutationOutcome, PathSelection, RepoPath, RepositoryService,
+        WorktreeAuthority,
+    },
+};
+use std::{
+    fs,
+    io::Read,
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    sync::Arc,
+    time::{Duration, Instant},
+};
+fn isolated(name: &str, inside_trash: bool) -> bool {
+    if std::env::var("CAGENTS_DISCARD_CASE").as_deref() == Ok(name) {
+        return false;
+    }
+    let owner = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let runtime = owner.path().join("runtime");
+    let data = owner.path().join("data");
+    let root = owner.path().join("checkout");
+    for dir in [&runtime, &data, &root] {
+        fs::create_dir(dir).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let stdout = owner.path().join("stdout");
+    let stderr = owner.path().join("stderr");
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+    command
+        .args([name, "--exact", "--nocapture", "--test-threads=1"])
+        .env("CAGENTS_DISCARD_CASE", name)
+        .env("CAGENTS_DISCARD_ROOT", &root)
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env(
+            "XDG_DATA_HOME",
+            if inside_trash {
+                root.join("inside-data")
+            } else {
+                data
+            },
+        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_AUTHOR_NAME", "Fixture")
+        .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+        .env("GIT_COMMITTER_NAME", "Fixture")
+        .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&stdout).unwrap()))
+        .stderr(Stdio::from(fs::File::create(&stderr).unwrap()));
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Child(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "discard child timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    fn read(path: &Path) -> String {
+        let mut bytes = Vec::new();
+        fs::File::open(path)
+            .unwrap()
+            .take(1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .unwrap();
+        assert!(bytes.len() <= 1024 * 1024);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+    let out = read(&stdout);
+    let err = read(&stderr);
+    assert!(status.success(), "{name}: {status}\n{out}\n{err}");
+    assert!(
+        out.contains(&format!("test {name} ... ok")),
+        "missing exact positive test: {out}\n{err}"
+    );
+    assert!(
+        out.contains("test result: ok. 1 passed; 0 failed;"),
+        "zero/incorrect selector: {out}"
+    );
+    true
+}
+fn root() -> PathBuf {
+    PathBuf::from(std::env::var_os("CAGENTS_DISCARD_ROOT").unwrap())
+}
+fn path(name: &str) -> RepoPath {
+    RepoPath::parse(name).unwrap()
+}
+fn git(root: &Path, args: &[&str]) {
+    let spec = CommandSpec::new("git")
+        .cwd(root)
+        .args(args.iter().copied())
+        .timeout(Duration::from_secs(10));
+    let out = SystemProcessExecutor
+        .execute(&spec, &CancellationToken::new())
+        .unwrap();
+    out.require_success(&spec.program).unwrap();
+}
+fn setup() -> PathBuf {
+    let root = root();
+    git(&root, &["init", "-q"]);
+    fs::write(root.join("modified"), b"base modified\n").unwrap();
+    fs::write(root.join("deleted"), b"base deleted\n").unwrap();
+    fs::write(root.join("executable"), b"#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(root.join("executable"), fs::Permissions::from_mode(0o755)).unwrap();
+    git(&root, &["add", "--all"]);
+    git(&root, &["commit", "-qm", "base"]);
+    fs::write(root.join("modified"), b"precious modified\n").unwrap();
+    fs::remove_file(root.join("deleted")).unwrap();
+    fs::write(root.join("executable"), b"#!/bin/sh\nexit 7\n").unwrap();
+    root
+}
+fn request(root: &Path, tracked: &[&str], untracked: &[&str]) -> DiscardRequest {
+    DiscardRequest {
+        worktree: root.to_owned(),
+        tracked: tracked
+            .iter()
+            .map(|s| PathSelection::new(path(s)))
+            .collect(),
+        untracked: untracked.iter().map(|s| path(s)).collect(),
+        confirmed: true,
+    }
+}
+fn service(
+    root: &Path,
+) -> RepositoryService<cagents::repository::WorktreeExecutor<SystemProcessExecutor>> {
+    RepositoryService::system("git")
+        .with_worktree_authority(WorktreeAuthority::capture(root).unwrap())
+        .unwrap()
+}
+fn applied(out: &MutationOutcome) {
+    assert!(matches!(out, MutationOutcome::Applied { .. }), "{out:?}");
+}
+fn trash() -> PathBuf {
+    PathBuf::from(std::env::var_os("XDG_DATA_HOME").unwrap()).join("Trash")
+}
+#[test]
+fn local_discard_native_mixed_roundtrip_and_empty_parent_pruning() {
+    const NAME: &str = "local_discard_native_mixed_roundtrip_and_empty_parent_pruning";
+    if isolated(NAME, false) {
+        return;
+    }
+    let root = setup();
+    fs::create_dir(root.join("new-directory")).unwrap();
+    fs::write(root.join("new-directory/new file"), b"untracked original").unwrap();
+    fs::set_permissions(
+        root.join("new-directory/new file"),
+        fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    symlink("../modified", root.join("new-link")).unwrap();
+    let original = fs::symlink_metadata(root.join("new-directory/new file")).unwrap();
+    let source = service(&root);
+    let result = source
+        .discard_recoverable(
+            &request(
+                &root,
+                &["modified", "deleted", "executable"],
+                &["new-directory/new file", "new-link"],
+            ),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    applied(&result.outcome);
+    assert!(!root.join("new-directory").exists());
+    assert!(!root.join("new-link").exists());
+    let files = fs::read_dir(trash().join("files"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(files.len(), 2);
+    let actual = files
+        .iter()
+        .map(|p| fs::symlink_metadata(p).unwrap())
+        .find(|m| m.is_file())
+        .unwrap();
+    assert_eq!(
+        (original.dev(), original.ino()),
+        (actual.dev(), actual.ino())
+    );
+    let bodies = fs::read_dir(trash().join("info"))
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        bodies
+            .iter()
+            .any(|s| s.contains("new-directory/new%20file\nDeletionDate=")),
+        "{bodies:?}"
+    );
+    let undo = source
+        .undo_discard(&result.recovery, &CancellationToken::new())
+        .unwrap();
+    applied(&undo);
+    assert_eq!(
+        fs::read(root.join("modified")).unwrap(),
+        b"precious modified\n"
+    );
+    assert!(!root.join("deleted").exists());
+    assert_eq!(
+        fs::read(root.join("new-directory/new file")).unwrap(),
+        b"untracked original"
+    );
+    assert_eq!(
+        fs::metadata(root.join("new-directory/new file"))
+            .unwrap()
+            .mode()
+            & 0o7777,
+        0o640
+    );
+    assert_eq!(
+        fs::read_link(root.join("new-link")).unwrap(),
+        Path::new("../modified")
+    );
+    let exit = Command::new(root.join("executable")).status().unwrap();
+    assert_eq!(exit.code(), Some(7));
+    assert_eq!(fs::read_dir(trash().join("files")).unwrap().count(), 0);
+    assert_eq!(fs::read_dir(trash().join("info")).unwrap().count(), 0);
+}
+#[test]
+fn local_discard_undo_preserves_newer_file_per_path() {
+    const NAME: &str = "local_discard_undo_preserves_newer_file_per_path";
+    if isolated(NAME, false) {
+        return;
+    }
+    let root = setup();
+    fs::write(root.join("new"), b"original untracked").unwrap();
+    let service = service(&root);
+    let result = service
+        .discard_recoverable(
+            &request(&root, &["modified"], &["new"]),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    applied(&result.outcome);
+    fs::write(root.join("new"), b"newer work").unwrap();
+    let undo = service
+        .undo_discard(&result.recovery, &CancellationToken::new())
+        .unwrap();
+    assert!(
+        matches!(undo, MutationOutcome::PartiallyApplied { .. }),
+        "{undo:?}"
+    );
+    assert_eq!(fs::read(root.join("new")).unwrap(), b"newer work");
+    assert_eq!(
+        fs::read(root.join("modified")).unwrap(),
+        b"precious modified\n"
+    );
+    assert_eq!(result.recovery.remaining_paths(), 1);
+    assert_eq!(fs::read_dir(trash().join("files")).unwrap().count(), 1);
+}
+#[test]
+fn local_discard_receipt_rejects_replaced_source_and_git_metadata() {
+    const NAME: &str = "local_discard_receipt_rejects_replaced_source_and_git_metadata";
+    if isolated(NAME, false) {
+        return;
+    }
+    let root = setup();
+    let service = service(&root);
+    let result = service
+        .discard_recoverable(
+            &request(&root, &["modified"], &[]),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    applied(&result.outcome);
+    fs::rename(root.join(".git"), root.join("old-git")).unwrap();
+    fs::create_dir(root.join(".git")).unwrap();
+    assert!(
+        service
+            .undo_discard(&result.recovery, &CancellationToken::new())
+            .is_err()
+    );
+    assert_eq!(fs::read(root.join("modified")).unwrap(), b"base modified\n");
+    fs::remove_dir(root.join(".git")).unwrap();
+    fs::rename(root.join("old-git"), root.join(".git")).unwrap();
+    let old = root.with_extension("original");
+    fs::rename(&root, &old).unwrap();
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join("modified"), b"foreign root").unwrap();
+    assert!(
+        service
+            .undo_discard(&result.recovery, &CancellationToken::new())
+            .is_err()
+    );
+    assert_eq!(fs::read(root.join("modified")).unwrap(), b"foreign root");
+}
+#[test]
+fn local_discard_refuses_modified_public_trash_entry() {
+    const NAME: &str = "local_discard_refuses_modified_public_trash_entry";
+    if isolated(NAME, false) {
+        return;
+    }
+    let root = setup();
+    fs::write(root.join("new"), b"original untracked").unwrap();
+    let service = service(&root);
+    let result = service
+        .discard_recoverable(
+            &request(&root, &[], &["new"]),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    applied(&result.outcome);
+    let moved = fs::read_dir(trash().join("files"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    fs::write(&moved, b"foreign changed data").unwrap();
+    let undo = service
+        .undo_discard(&result.recovery, &CancellationToken::new())
+        .unwrap();
+    assert!(
+        matches!(undo, MutationOutcome::NotApplied { .. }),
+        "{undo:?}"
+    );
+    assert!(!root.join("new").exists());
+    assert_eq!(fs::read(moved).unwrap(), b"foreign changed data");
+}
+#[test]
+fn local_discard_refuses_native_trash_inside_checkout_before_any_effect() {
+    const NAME: &str = "local_discard_refuses_native_trash_inside_checkout_before_any_effect";
+    if isolated(NAME, true) {
+        return;
+    }
+    let root = setup();
+    fs::write(root.join("new"), b"original untracked").unwrap();
+    let service = service(&root);
+    let result = service
+        .discard_recoverable(
+            &request(&root, &["modified"], &["new"]),
+            &CancellationToken::new(),
+            &[root.clone()],
+        )
+        .unwrap();
+    assert!(
+        matches!(result.outcome, MutationOutcome::NotApplied { .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(fs::read(root.join("new")).unwrap(), b"original untracked");
+    assert_eq!(
+        fs::read(root.join("modified")).unwrap(),
+        b"precious modified\n"
+    );
+    assert!(!root.join("inside-data").exists());
+}

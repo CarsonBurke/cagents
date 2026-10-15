@@ -1,6 +1,5 @@
 //! Original physical Git roots shared by creator, readers, and receiver.
 use super::*;
-use std::os::unix::fs::MetadataExt;
 mod recovery;
 mod scope;
 pub use scope::WorktreeAuthority;
@@ -245,7 +244,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::MetadataExt;
 
     // These are filesystem scope contracts, not Git command/creation evidence.
     fn checkout(parent: &Path, name: &str) -> PathBuf {
