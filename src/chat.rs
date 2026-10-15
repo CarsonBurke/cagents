@@ -2646,6 +2646,9 @@ pub(crate) fn fresh_session_configured(
             return Err("Conversation model, effort and permission choices must be non-empty names without control characters.".into());
         }
     }
+    if let Some(mode) = overrides.permission_mode {
+        crate::settings::agents::validate_permission_override(provider, mode)?;
+    }
     let mut recipe = LaunchRecipe {
         unset_environment: account
             .credential_overrides()

@@ -40,6 +40,19 @@ pub fn permission_modes(provider: Provider) -> &'static [&'static str] {
     }
 }
 
+/// Explicit CLI requests also accept provider approval policies that are not
+/// conversation presets. Keep this distinct from the saved composer choices.
+pub fn validate_permission_override(provider: Provider, mode: &str) -> Result<(), String> {
+    let supported = permission_modes(provider).contains(&mode) || match provider {
+        Provider::Claude => mode == "default",
+        // Preserve approval-policy values understood by recorded Codex recipes,
+        // including policies from older CLI versions.
+        Provider::Codex => matches!(mode, "on-request" | "on-failure" | "untrusted" | "never"),
+        Provider::Omp => matches!(mode, "always-ask" | "write" | "yolo"),
+    };
+    if supported { Ok(()) } else { Err(format!("Choose a permission mode offered by {}.", provider.label())) }
+}
+
 /// Executable paths are absolute so a launch in another worktree means the
 /// same thing. `access` checks the current user's actual execute permission.
 pub fn executable_available(path: &str) -> bool {
@@ -313,6 +326,29 @@ mod tests {
         assert!(provider_executable(Provider::Claude, Some(std::ffi::OsStr::new("/usr/bin:/bin"))).is_err());
         assert_eq!(crate::model::login_shell(), Err(crate::model::LoginShellError::ConfiguredUnavailable));
         assert!(crate::control::terminal_spawn_recipe(root, vec![]).is_err(), "a missing pinned shell cannot silently switch to the login shell");
+    }
+
+    #[cfg(any(feature = "ui", feature = "host"))]
+    #[test]
+    fn explicit_permissions_refuse_unknown_and_cross_provider_modes() {
+        let root = tempfile::tempdir().unwrap();
+        for (provider, mode) in [
+            (Provider::Claude, "readOnly"), (Provider::Claude, "future-mode"),
+            (Provider::Codex, "plan"), (Provider::Codex, "future-mode"),
+            (Provider::Omp, "workspaceWrite"), (Provider::Omp, "future-mode"),
+        ] {
+            let result = crate::chat::fresh_session_configured(provider, crate::model::TerminalId::new(), root.path().into(), &crate::account::Account::system(provider), &AgentLaunchSettings::default(), LaunchDefaults { permission_mode: Some(mode), ..Default::default() });
+            assert!(result.is_err(), "{provider:?} must refuse {mode}");
+        }
+        for (provider, modes) in [
+            (Provider::Claude, &["default", "plan"][..]),
+            (Provider::Codex, &["on-request", "on-failure", "untrusted", "never", "workspaceWrite"][..]),
+            (Provider::Omp, &["always-ask", "write", "yolo"][..]),
+        ] {
+            for mode in modes {
+                crate::chat::fresh_session_configured(provider, crate::model::TerminalId::new(), root.path().into(), &crate::account::Account::system(provider), &AgentLaunchSettings::default(), LaunchDefaults { permission_mode: Some(mode), ..Default::default() }).unwrap();
+            }
+        }
     }
 
     #[test]
