@@ -3113,12 +3113,16 @@ impl RepositoryRuntime {
         });
     }
 
-    pub fn dismiss_editor_results(&mut self) {
+    fn dismiss_editor_choices(&mut self) {
         self.language.code_actions.clear();
-        self.language.signature = None;
         self.language.completions.clear();
         self.language.hover.clear();
         self.language.hover_at = None;
+    }
+
+    pub fn dismiss_editor_results(&mut self) {
+        self.dismiss_editor_choices();
+        self.language.signature = None;
     }
 
     /// Moves the caret to a protocol position, for jump-to-location.
@@ -5410,7 +5414,11 @@ impl RepositoryRuntime {
                 if self.source_surface != SourceSurface::Editor {
                     return Task::none();
                 }
-                if !matches!(action, text_editor::Action::Scroll { .. }) {
+                if matches!(action, text_editor::Action::Edit(_)) {
+                    // Ordinary argument typing closes choices but keeps the
+                    // call signature until a trigger refresh, ')' or Escape.
+                    self.dismiss_editor_choices();
+                } else if !matches!(action, text_editor::Action::Scroll { .. }) {
                     self.dismiss_editor_results();
                 }
                 let applied = match &mut self.document {
@@ -10828,6 +10836,17 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn argument_typing_retains_signature_help_but_explicit_dismiss_closes_it() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "call.rs", "call(");
+        runtime.set_editor_signature(Some(crate::lsp::LspSignatureHelp { signatures: vec![crate::lsp::LspSignature { label: "call(argument: i32)".into(), documentation: None, parameters: Vec::new(), active_parameter: Some(0) }], active_signature: 0, active_parameter: Some(0) }));
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('1')) }));
+        assert!(runtime.language.signature.is_some());
+        drop(runtime.update(RepositoryAction::Language { card, action: EditorLspAction::Dismiss }));
+        assert!(runtime.language.signature.is_none());
     }
 
     #[tokio::test]
