@@ -556,7 +556,7 @@ pub(super) fn worktree_operation(worktree: &Path, known_git_dir: Option<&Path>) 
         let entry = worktree.join(".git");
         if entry.is_dir() { entry } else {
             let content = std::fs::read_to_string(entry).ok()?;
-            let directory = PathBuf::from(content.trim().strip_prefix("gitdir:")?.trim());
+            let directory = PathBuf::from(content.trim_end_matches(['\r', '\n']).strip_prefix("gitdir: ")?);
             if directory.is_absolute() { directory } else { worktree.join(directory) }
         }
     };
@@ -917,10 +917,10 @@ mod tests {
         use crate::repository::GitOperationKind;
         let fixture = tempfile::tempdir().unwrap();
         let worktree = fixture.path().join("worktree");
-        let admin = fixture.path().join("admin");
+        let admin = fixture.path().join("admin with spaces ");
         fs::create_dir(&worktree).unwrap();
         fs::create_dir(&admin).unwrap();
-        fs::write(worktree.join(".git"), "gitdir: ../admin\n").unwrap();
+        fs::write(worktree.join(".git"), "gitdir: ../admin with spaces \n").unwrap();
         assert_eq!(worktree_operation(&worktree, None), None);
         fs::write(admin.join("MERGE_HEAD"), "fixture-head\n").unwrap();
         assert_eq!(worktree_operation(&worktree, None), Some(GitOperationKind::Merge));
