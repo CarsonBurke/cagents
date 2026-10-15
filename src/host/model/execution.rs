@@ -1131,7 +1131,7 @@ impl Registry {
                 );
             }
         }
-        require_agent_placement(&tx, &agent)?;
+        require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
         if agent.console.is_some() {
             agent.console = receipt.replacement().terminal.clone();
         }

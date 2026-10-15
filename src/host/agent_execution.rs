@@ -1139,7 +1139,7 @@ fn create_console_with_restart(
     agent: AgentId,
     session: &chat::Session,
     handle: &chat::runtime::Handle,
-    restart: Option<(&Agent, &chat::Session, &std::path::Path, &Arc<chat::protocol::ExecutionContext>)>,
+    restart: Option<(&Agent, &chat::Session)>,
 ) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
     let program = crate::companion::Product::Cli
         .beside_current()
@@ -1151,17 +1151,6 @@ fn create_console_with_restart(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent_execution_directory(agent)?;
-    if let Some((previous, _, directory, execution)) = restart {
-        execution.verify_directory(directory)?;
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        if registry.agent(previous.id)? != *previous
-            || registry.agent_execution_directory(previous.id)?.as_path() != directory
-            || registry.agent_directory(previous.id)? != execution.directory_identity()?
-            || execution.directory_identity()?.is_none()
-        {
-            return Err("The accepted console's approved operational directory changed before restart".into());
-        }
-    }
     let recipe = crate::model::LaunchRecipe {
         program: program
             .into_os_string()
@@ -1199,25 +1188,18 @@ fn create_console_with_restart(
         recovery_origin: None,
         predecessor: None,
     };
-    let options = crate::terminal_ipc::TerminalSpawnOptions {
-        initially_visible: false,
-        ..Default::default()
-    };
-    let spawned = if let Some((_, _, _, execution)) = restart {
-        super::state::spawn_terminal_view_owned_at_directory(
-            host, EXECUTION_CLIENT, terminal, options, None, true, execution.clone(),
-        )
-    } else {
-        super::state::spawn_terminal_view_owned(
+    let (descriptor, console_handle) = super::state::spawn_terminal_view_owned(
         host,
         EXECUTION_CLIENT,
         terminal,
-        options,
+        crate::terminal_ipc::TerminalSpawnOptions {
+            initially_visible: false,
+            ..Default::default()
+        },
         None,
         true,
-        )
-    };
-    let (descriptor, console_handle) = spawned.map_err(|error| error.message)?;
+    )
+    .map_err(|error| error.message)?;
     // Publish the in-memory pair before the durable view: concurrent explicit
     // close must already know which terminal belongs to this exact actor.
     let publish = (|| {
@@ -1262,7 +1244,7 @@ fn create_console_with_restart(
             record.session.terminal = Some(descriptor.session.clone());
             record.paired_terminal = Some(console_handle.clone());
         }
-        let receipt = if let Some((_, source, _, _)) = restart {
+        let receipt = if let Some((_, source)) = restart {
             let current = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 let record = state
@@ -1280,13 +1262,7 @@ fn create_console_with_restart(
             None
         };
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((previous, _, directory, execution)) = restart {
-            execution.verify_directory(directory)?;
-            if registry.agent_execution_directory(previous.id)?.as_path() != directory
-                || registry.agent_directory(previous.id)? != execution.directory_identity()?
-            {
-                return Err("The accepted console directory changed before its restarted pair was saved".into());
-            }
+        if let Some((previous, _)) = restart {
             registry.rebind_restarted_agent(
                 previous,
                 receipt.as_ref().ok_or("The restart receipt disappeared")?,

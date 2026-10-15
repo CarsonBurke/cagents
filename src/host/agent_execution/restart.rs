@@ -8,7 +8,6 @@ pub(in crate::host) struct PairPlan {
     registry: Option<SharedRegistry>,
     agent: Option<Agent>,
     paired: Option<crate::terminal::TerminalHandle>,
-    execution: Option<(std::path::PathBuf, Arc<chat::protocol::ExecutionContext>)>,
     kind: Kind,
 }
 #[derive(Clone)]
@@ -23,39 +22,30 @@ pub(in crate::host) struct CompletedPair {
     _paired: Option<crate::terminal::TerminalHandle>,
     _registry: Option<SharedRegistry>,
     _agent: Option<Agent>,
-    _execution: Option<(std::path::PathBuf, Arc<chat::protocol::ExecutionContext>)>,
 }
 impl PairPlan {
-    pub(in crate::host) fn source(&self) -> &chat::Session { &self.source }
-    pub(in crate::host) fn execution_directory(&self) -> Result<(std::path::PathBuf, Arc<chat::protocol::ExecutionContext>), String> {
-        let (directory, execution) = self.execution.clone().ok_or_else(|| "The completed restart no longer owns a pending directory handoff".to_owned())?;
-        execution.verify_directory(&directory)?;
-        if let (Some(registry), Some(agent)) = (&self.registry, &self.agent) {
-            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            if registry.agent_execution_directory(agent.id)? != directory
-                || registry.agent_directory(agent.id)? != execution.directory_identity()?
-                || execution.directory_identity()?.is_none()
-            {
-                return Err("The accepted provider's approved operational directory changed during restart".into());
-            }
-        }
-        Ok((directory, execution))
+    pub(in crate::host) fn source(&self) -> &chat::Session {
+        &self.source
     }
     pub(in crate::host) fn release_completed(&mut self) -> CompletedPair {
         CompletedPair {
-            _paired:self.paired.take(),
-            _registry:self.registry.take(),
-            _agent:self.agent.take(),
-            _execution:self.execution.take(),
+            _paired: self.paired.take(),
+            _registry: self.registry.take(),
+            _agent: self.agent.take(),
         }
     }
 }
 
-pub(in crate::host) fn prepare_restart_pair(host: &SharedHost, source: &chat::Session) -> Result<PairPlan, String> {
-    let (paired, actor) = {
+pub(in crate::host) fn prepare_restart_pair(
+    host: &SharedHost,
+    source: &chat::Session,
+) -> Result<PairPlan, String> {
+    let paired = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = state.chats.get(&source.id).ok_or("The original provider is no longer hosted; no owner was stopped")?;
-        let recorded = record.paired_terminal.clone();
+        let recorded = state
+            .chats
+            .get(&source.id)
+            .and_then(|record| record.paired_terminal.clone());
         if let Some(terminal) = state.terminals.get(&source.id) {
             if source.terminal.is_some()
                 && recorded
@@ -68,25 +58,28 @@ pub(in crate::host) fn prepare_restart_pair(host: &SharedHost, source: &chat::Se
                 );
             }
         }
-        (recorded, record.handle.clone())
+        recorded
     };
-    // Capture an independent approved-directory FD before either owner can be
-    // stopped. Recipes retain their original spelling after Locate; execution
-    // uses this exact operational inode rather than reopening that old path.
-    let execution = super::super::session_locations::verified_chat_directory(host, source, &actor)?;
-    let registry = host.lock().unwrap_or_else(|p| p.into_inner()).execution_registry.clone();
-    let agent = registry.as_ref().map(|registry| registry.lock().unwrap_or_else(|p|p.into_inner()).agent_for_session(source.id)).transpose()?.flatten();
+    let registry = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_registry
+        .clone();
+    let agent = registry
+        .as_ref()
+        .map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_for_session(source.id)
+        })
+        .transpose()?
+        .flatten();
     if let Some(agent) = &agent {
-        execution.1.verify_directory(&execution.0)?;
-        let registry = registry.as_ref().ok_or("The accepted provider registry is unavailable")?
-            .lock().unwrap_or_else(|p| p.into_inner());
-        if registry.agent_execution_directory(agent.id)? != execution.0
-            || registry.agent_directory(agent.id)? != execution.1.directory_identity()?
-            || execution.1.directory_identity()?.is_none()
-        {
-            return Err("The accepted provider's operational directory changed before restart; no owner was stopped".into());
-        }
-        let expected = agent.session.as_ref().ok_or("The accepted agent lost its exact conversation binding")?;
+        let expected = agent
+            .session
+            .as_ref()
+            .ok_or("The accepted agent lost its exact conversation binding")?;
         if !expected.same_process(&HostedSession::Chat(source.clone())) {
             return Err("The accepted agent belongs to a different conversation owner".into());
         }
@@ -157,7 +150,13 @@ pub(in crate::host) fn prepare_restart_pair(host: &SharedHost, source: &chat::Se
             }
         }
     };
-    Ok(PairPlan { source: source.clone(), registry, agent, paired, execution: Some(execution), kind })
+    Ok(PairPlan {
+        source: source.clone(),
+        registry,
+        agent,
+        paired,
+        kind,
+    })
 }
 
 fn current(
@@ -176,10 +175,11 @@ fn current(
     Ok((session, record.handle.clone()))
 }
 
-pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::super::state::ClientId, plan: &PairPlan) -> Result<chat::RestartReceipt, String> {
-    // Applies to a reused live console as well as a recreated view. A pending
-    // handoff cannot publish readiness after its approved mapping was changed.
-    plan.execution_directory()?;
+pub(in crate::host) fn restore_restart_pair(
+    host: &SharedHost,
+    client: super::super::state::ClientId,
+    plan: &PairPlan,
+) -> Result<chat::RestartReceipt, String> {
     let (mut session, handle) = current(host, plan.source.id)?;
     if session.proof != plan.source.proof
         || session.launch.provider != plan.source.launch.provider
@@ -274,17 +274,37 @@ pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::su
         session.terminal = None;
         match &plan.kind {
             Kind::Execution => {
-                let registry = plan.registry.as_ref().ok_or("The accepted agent registry is unavailable")?;
-                let agent = plan.agent.as_ref().ok_or("The accepted console owner is unavailable")?;
-                let (directory, execution) = plan.execution_directory()?;
-                return create_console_with_restart(host, registry, agent.id, &session, &handle, Some((agent,&plan.source,&directory,&execution)))
-                    .map_err(|error| match error {ConsoleError::Known(error)|ConsoleError::Uncertain(error)=>error})?
-                    .ok_or("The paired console restart did not return its exact receipt".into());
+                let registry = plan
+                    .registry
+                    .as_ref()
+                    .ok_or("The accepted agent registry is unavailable")?;
+                let agent = plan
+                    .agent
+                    .as_ref()
+                    .ok_or("The accepted console owner is unavailable")?;
+                return create_console_with_restart(
+                    host,
+                    registry,
+                    agent.id,
+                    &session,
+                    &handle,
+                    Some((agent, &plan.source)),
+                )
+                .map_err(|error| match error {
+                    ConsoleError::Known(error) | ConsoleError::Uncertain(error) => error,
+                })?
+                .ok_or("The paired console restart did not return its exact receipt".into());
             }
             Kind::Codex(recipe) => {
-                let (directory, execution) = plan.execution_directory()?;
-                super::super::chat::codex_terminal_view_at_directory(host,client,session.id,&handle,session.clone(),recipe.clone(),&directory,execution)
-                    .map_err(|error|error.message)?;
+                super::super::chat::codex_terminal_view(
+                    host,
+                    client,
+                    session.id,
+                    &handle,
+                    session.clone(),
+                    recipe.clone(),
+                )
+                .map_err(|error| error.message)?;
             }
             Kind::None => {}
         }
@@ -294,10 +314,12 @@ pub(in crate::host) fn restore_restart_pair(host: &SharedHost, client: super::su
         return Err("The provider changed before its pair receipt was published".into());
     }
     let receipt = chat::RestartReceipt::confirm(plan.source.clone(), replacement)?;
-    plan.execution_directory()?;
-    if let (Some(registry),Some(agent)) = (&plan.registry,&plan.agent) {
-        registry.lock().unwrap_or_else(|p|p.into_inner()).rebind_restarted_agent(agent,&receipt)?;
-        announce(host,registry);
+    if let (Some(registry), Some(agent)) = (&plan.registry, &plan.agent) {
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .rebind_restarted_agent(agent, &receipt)?;
+        announce(host, registry);
     }
     Ok(receipt)
 }
@@ -471,13 +493,11 @@ mod tests {
                 returning_terminal: false,
             },
         );
-        let execution = Arc::new(chat::protocol::ExecutionContext::capture(&session.launch.recipe.working_directory).unwrap());
         let plan = PairPlan {
             source: session.clone(),
             registry: None,
             agent: None,
             paired: Some(worker.clone()),
-            execution: Some((session.launch.recipe.working_directory.clone(), execution)),
             kind: Kind::Execution,
         };
         let receipt = restore_restart_pair(&host, 1, &plan).unwrap();
@@ -510,29 +530,7 @@ mod tests {
                 .contains("worker was replaced")
         );
         assert!(!replacement.is_completed());
-        replacement.shutdown().unwrap();actor.close().unwrap();
-
-        // A located console executes in the approved inode while its issued
-        // launch keeps the original spelling. In particular, shebang launch
-        // cannot accidentally reopen the now-missing recipe directory.
-        let old = session.launch.recipe.working_directory.join("issued-console-cwd");
-        let moved = session.launch.recipe.working_directory.join("located-console-cwd");
-        std::fs::create_dir(&old).unwrap();
-        let execution = Arc::new(chat::protocol::ExecutionContext::capture(&old).unwrap());
-        std::fs::rename(&old, &moved).unwrap();
-        execution.verify_directory(&moved).unwrap();
-        let evidence = session.launch.recipe.working_directory.join("console-actual-cwd");
-        let executable = session.launch.recipe.working_directory.join("cwd-console");
-        std::fs::write(&executable, format!("#!/usr/bin/python3\nimport os,pathlib,time\npathlib.Path({}).write_text(os.getcwd())\ntime.sleep(60)\n", serde_json::to_string(&evidence.to_string_lossy()).unwrap())).unwrap();
-        std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
-        let recipe = crate::model::LaunchRecipe { program: executable.to_string_lossy().into_owned(), arguments: Vec::new(), working_directory:old.clone(), environment:Default::default(), unset_environment:Default::default() };
-        let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), recipe.clone(), None).session;
-        let (descriptor, worker) = super::super::super::state::spawn_terminal_view_owned_at_directory(&host,1,terminal,Default::default(),None,true,execution).unwrap();
-        let deadline = Instant::now()+Duration::from_secs(5);
-        while !evidence.exists() { assert!(Instant::now()<deadline); std::thread::sleep(Duration::from_millis(10)); }
-        assert_eq!(std::fs::read_to_string(evidence).unwrap(), moved.to_string_lossy());
-        assert_eq!(descriptor.session.launch, recipe);
-        assert!(!old.exists());
-        worker.shutdown().unwrap();
+        replacement.shutdown().unwrap();
+        actor.close().unwrap();
     }
 }
