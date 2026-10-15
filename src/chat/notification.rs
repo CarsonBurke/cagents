@@ -181,7 +181,17 @@ fn public_question_preview(request: &super::Request) -> Option<String> {
     if request.kind != super::RequestKind::Question {
         return None;
     }
-    let mut text = String::new();
+    // Some providers put the question in the request message and repeat its
+    // heading as the field label (OMP); those fields contain input help, not
+    // a replacement for that message. Keep the existing meaningful message
+    // first in that shape. Claude/Codex have distinct public question labels.
+    let message_first = request.fields.iter().filter(|field| !field.secret)
+        .all(|field| field.label.is_empty() || field.label == request.title);
+    let mut text = if message_first {
+        bounded(&request.description, RETAINED_BYTES)
+    } else {
+        String::new()
+    };
     for field in request.fields.iter().filter(|field| !field.secret) {
         for part in [field.label.as_str(), field.description.as_str()] {
             if part.is_empty() || text.len() == RETAINED_BYTES {
