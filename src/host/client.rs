@@ -304,12 +304,18 @@ async fn serve_async(
     retired: Option<Box<dyn FnOnce() + Send>>,
 ) {
     use crate::terminal::transport;
+    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let pid = peer_pid(&stream);
-    let mut session = match transport::dispatch(move || {
+    let registration = transport::dispatch(move || {
         let registration = Registration::new(Arc::clone(&host), client_id, retired);
         if let Some(pid) = pid { host.lock().unwrap_or_else(|p| p.into_inner()).record_client_pid(client_id, pid); }
         Session { registration, connected: false, handle }
-    }).await { Ok(session) => session, Err(error) => { tracing::warn!(%error, "could not register daemon client"); return; } };
+    });
+    let mut session = match tokio::time::timeout_at(deadline, registration).await {
+        Ok(Ok(session)) => session,
+        Ok(Err(error)) => { tracing::warn!(%error, "could not register daemon client"); return; },
+        Err(_) => return,
+    };
     let socket = match tokio::io::unix::AsyncFd::new(stream) { Ok(socket) => Arc::new(socket), Err(_) => return };
     let delivery = Arc::clone(&session.registration.delivery);
     let write_socket = Arc::clone(&socket);
@@ -317,7 +323,6 @@ async fn serve_async(
     let mut writer = transport::runtime().expect("initialized transport").spawn(async move {
         writer_loop_async(write_socket, writer_delivery).await;
     });
-    let deadline = tokio::time::Instant::now() + HANDSHAKE_TIMEOUT;
     let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
     loop {
         let frame = if session.connected {
