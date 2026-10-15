@@ -1748,7 +1748,7 @@ impl Runtime {
         {
             transcript.push(notice_entry(error, target, notice_identity(None, error)));
         }
-        if let Some(control)=self.account_switch_controls(transitioning) {
+        if let Some(control) = self.account_switch_controls(transitioning) {
             content.push(control);
         }
         content.extend(self.plan_view());
@@ -2832,8 +2832,11 @@ impl Runtime {
 
     /// Account transition controls share the exact rendered/action surface.
     /// A separate new conversation can coexist with any original actor work.
-    pub(super) fn account_switch_controls(&self, transitioning: bool) -> Option<Element<'_, Message>> {
-        let target=self.target;
+    pub(super) fn account_switch_controls(
+        &self,
+        transitioning: bool,
+    ) -> Option<Element<'_, Message>> {
+        let target = self.target;
         if let Some((_, name)) = &self.pending_account_switch {
             Some(
                 widget::row::with_children(vec![

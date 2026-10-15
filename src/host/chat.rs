@@ -859,7 +859,9 @@ fn ensure_native_account_admission(
         return Ok(());
     }
     if let Some(context) = execution {
-        context.verify_directory(&spec.working_directory).map_err(unavailable)?;
+        context
+            .verify_directory(&spec.working_directory)
+            .map_err(unavailable)?;
     }
     let directory = execution.and_then(|context| context.directory_descriptor());
     super::account_lifecycle::ensure_launch_at_directory(
@@ -873,7 +875,9 @@ fn ensure_native_account_admission(
     // Refuse a replaced operational spelling rather than authorizing the new
     // inode while the child still owns the original directory descriptor.
     if let Some(context) = execution {
-        context.verify_directory(&spec.working_directory).map_err(unavailable)?;
+        context
+            .verify_directory(&spec.working_directory)
+            .map_err(unavailable)?;
     }
     Ok(())
 }
@@ -2179,17 +2183,26 @@ fn recover_account(
     if let (Some(generation), Some(handle)) = (idle_generation, source_handle.as_ref())
         && !handle.is_completed()
     {
-        validate_proof(source.proof.as_ref(), host.lock().unwrap_or_else(|p| p.into_inner()).proof())?;
+        validate_proof(
+            source.proof.as_ref(),
+            host.lock().unwrap_or_else(|p| p.into_inner()).proof(),
+        )?;
         if handle.account_switch_generation().map_err(unavailable)? != Some(generation) {
             return Err(if explicit {
-                ProtocolError::new(ProtocolErrorCode::AccountSwitchBusy,
-                    "A newer turn is using the original account; the switch remains queued until it is idle.", false)
+                ProtocolError::new(
+                    ProtocolErrorCode::AccountSwitchBusy,
+                    "A newer turn is using the original account; the switch remains queued until it is idle.",
+                    false,
+                )
             } else {
                 unavailable("The original conversation changed before the automatic account switch")
             });
         }
-        return Err(ProtocolError::new(ProtocolErrorCode::AccountSwitchUnavailable,
-            "This provider cannot prove a safe exact account handoff while the original session is running. Continue on the selected account as a new conversation (cache lost); the original is kept.", false));
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::AccountSwitchUnavailable,
+            "This provider cannot prove a safe exact account handoff while the original session is running. Continue on the selected account as a new conversation (cache lost); the original is kept.",
+            false,
+        ));
     }
     // Keep the original approved directory pinned before stopping its actor or
     // copying history. The successor's issued recipe remains immutable.
@@ -3559,8 +3572,10 @@ mod tests {
     fn native_account_admission_uses_the_pinned_operational_directory_before_provider_start() {
         const CHILD: &str = "CAGENTS_NATIVE_ACCOUNT_ADMISSION_FIXTURE";
         if std::env::var_os(CHILD).is_none() {
-            let root = tempfile::Builder::new().prefix("cagents-native-account-")
-                .tempdir_in("/var/tmp").unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("cagents-native-account-")
+                .tempdir_in("/var/tmp")
+                .unwrap();
             for name in ["home", "config", "data", "cache", "runtime"] {
                 std::fs::create_dir(root.path().join(name)).unwrap();
             }
@@ -3578,16 +3593,25 @@ mod tests {
                 .stdout(output.try_clone().unwrap()).stderr(output).spawn().unwrap();
             let deadline = Instant::now() + Duration::from_secs(30);
             let status = loop {
-                if let Some(status) = child.try_wait().unwrap() { break status; }
+                if let Some(status) = child.try_wait().unwrap() {
+                    break status;
+                }
                 if Instant::now() >= deadline {
-                    let _ = child.kill(); let _ = child.wait();
-                    panic!("native admission fixture timed out: {}", root.keep().display());
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!(
+                        "native admission fixture timed out: {}",
+                        root.keep().display()
+                    );
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
             let evidence = std::fs::read_to_string(&log).unwrap();
             if !status.success() {
-                panic!("native admission fixture failed: {}\n{evidence}", root.keep().display());
+                panic!(
+                    "native admission fixture failed: {}\n{evidence}",
+                    root.keep().display()
+                );
             }
             assert!(evidence.contains("1 passed; 0 failed"), "{evidence}");
             return;
@@ -3604,40 +3628,97 @@ mod tests {
         std::fs::create_dir(&profile).unwrap();
         let marker = root.join("provider-started");
         let executable = root.join("provider-wrapper");
-        std::fs::write(&executable, format!("#!/bin/sh\nprintf started > '{}'\n", marker.display())).unwrap();
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf started > '{}'\n", marker.display()),
+        )
+        .unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new("native-account-admission"),
-            boot_id: BootId::new("fixture"), host_incarnation: HostIncarnation::new("fixture"),
-        })));
+        let host = Arc::new(crate::host::state::HostLock::new(HostState::new(
+            HostSessionProof {
+                host_session_id: HostSessionId::new("native-account-admission"),
+                boot_id: BootId::new("fixture"),
+                host_incarnation: HostIncarnation::new("fixture"),
+            },
+        )));
         host.lock().unwrap().register_client(1);
-        let account = crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), profile.clone());
-        let _reservation = super::super::account_lifecycle::Reservation::install(&host, &[account]).unwrap();
-        for relative in ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME", "absolute-reserved"] {
+        let account =
+            crate::account::Account::linked(Provider::Codex, uuid::Uuid::new_v4(), profile.clone());
+        let _reservation =
+            super::super::account_lifecycle::Reservation::install(&host, &[account]).unwrap();
+        for relative in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "HOME",
+            "absolute-reserved",
+        ] {
             let mut environment = BTreeMap::from([
                 ("HOME".into(), root.join("home").display().to_string()),
-                ("CLAUDE_CONFIG_DIR".into(), root.join("home").display().to_string()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    root.join("home").display().to_string(),
+                ),
                 ("CODEX_HOME".into(), root.join("home").display().to_string()),
             ]);
             if relative == "absolute-reserved" {
                 environment.insert("CODEX_HOME".into(), profile.display().to_string());
             } else {
                 environment.insert(relative.into(), "profile".into());
-                if relative == "HOME" { environment.remove("CODEX_HOME"); }
+                if relative == "HOME" {
+                    environment.remove("CODEX_HOME");
+                }
                 // The obsolete cwd would admit this recipe and miss operational/profile.
-                super::super::account_lifecycle::ensure_launch(&host, &issued, &environment, &Default::default(), false).unwrap();
+                super::super::account_lifecycle::ensure_launch(
+                    &host,
+                    &issued,
+                    &environment,
+                    &Default::default(),
+                    false,
+                )
+                .unwrap();
             }
             let session = Session {
-                id: TerminalId::new(), terminal: None, proof: None,
-                owned_codex_listener: None, native_continuity: Default::default(),
-                launch: chat::Launch { provider: Provider::Claude, session_id: None,
-                    recipe: LaunchRecipe { program: executable.display().to_string(), arguments: Vec::new(),
-                        working_directory: issued.clone(), environment, unset_environment: Default::default() } },
+                id: TerminalId::new(),
+                terminal: None,
+                proof: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+                launch: chat::Launch {
+                    provider: Provider::Claude,
+                    session_id: None,
+                    recipe: LaunchRecipe {
+                        program: executable.display().to_string(),
+                        arguments: Vec::new(),
+                        working_directory: issued.clone(),
+                        environment,
+                        unset_environment: Default::default(),
+                    },
+                },
             };
             let original = session.clone();
-            let refusal = start_at_execution_directory(&host, 1, session, Default::default(), context.clone(), &operational).unwrap_err();
-            assert!(refusal.message.contains(if relative == "absolute-reserved" { "being changed" } else { relative }), "{refusal:?}");
-            assert!(!marker.exists(), "refusal must precede provider creation/input");
+            let refusal = start_at_execution_directory(
+                &host,
+                1,
+                session,
+                Default::default(),
+                context.clone(),
+                &operational,
+            )
+            .unwrap_err();
+            assert!(
+                refusal
+                    .message
+                    .contains(if relative == "absolute-reserved" {
+                        "being changed"
+                    } else {
+                        relative
+                    }),
+                "{refusal:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "refusal must precede provider creation/input"
+            );
             let state = host.lock().unwrap();
             assert!(!state.chats.contains_key(&original.id));
             assert!(!state.chat_spawning.contains_key(&original.id));
@@ -3660,17 +3741,37 @@ mod tests {
                 environment.insert("CLAUDE_CONFIG_DIR".into(), profile.display().to_string());
             }
             let session = Session {
-                id: TerminalId::new(), terminal: None, proof: None,
-                owned_codex_listener: None, native_continuity: Default::default(),
-                launch: chat::Launch { provider: Provider::Claude,
+                id: TerminalId::new(),
+                terminal: None,
+                proof: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+                launch: chat::Launch {
+                    provider: Provider::Claude,
                     session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
-                    recipe: LaunchRecipe { program: executable.display().to_string(), arguments: Vec::new(),
-                        working_directory: issued.clone(), environment, unset_environment: Default::default() } },
+                    recipe: LaunchRecipe {
+                        program: executable.display().to_string(),
+                        arguments: Vec::new(),
+                        working_directory: issued.clone(),
+                        environment,
+                        unset_environment: Default::default(),
+                    },
+                },
             };
             let id = session.id;
-            let refusal = start_at_execution_directory(&host, 1, session,
-                crate::terminal_ipc::ChatExecutionEnvironment(selected), context.clone(), &operational).unwrap_err();
-            assert!(refusal.message.contains("being changed"), "reservation must win before missing-history errors: {refusal:?}");
+            let refusal = start_at_execution_directory(
+                &host,
+                1,
+                session,
+                crate::terminal_ipc::ChatExecutionEnvironment(selected),
+                context.clone(),
+                &operational,
+            )
+            .unwrap_err();
+            assert!(
+                refusal.message.contains("being changed"),
+                "reservation must win before missing-history errors: {refusal:?}"
+            );
             assert!(!marker.exists());
             assert!(!profile.join("projects").exists());
             let state = host.lock().unwrap();
@@ -3685,21 +3786,49 @@ mod tests {
         let config_a = home_a.join(".claude");
         let home_b = root.join("selected-home");
         std::fs::create_dir_all(&home_b).unwrap();
-        let slug: String = operational.to_str().unwrap().chars().map(|character| {
-            if character.is_ascii_alphanumeric() { character } else { '-' }
-        }).collect();
-        let saved = config_a.join("projects").join(slug)
+        let slug: String = operational
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect();
+        let saved = config_a
+            .join("projects")
+            .join(slug)
             .join("12345678-1234-4234-8234-123456789abc.jsonl");
         std::fs::create_dir_all(saved.parent().unwrap()).unwrap();
         std::fs::write(&saved, "{}\n").unwrap();
-        let source_account = crate::account::Account::linked(Provider::Claude, uuid::Uuid::new_v4(), config_a.clone());
-        let _source_reservation = super::super::account_lifecycle::Reservation::install(&host, &[source_account]).unwrap();
-        use std::os::{fd::{AsRawFd, FromRawFd, OwnedFd}, unix::ffi::OsStrExt};
+        let source_account = crate::account::Account::linked(
+            Provider::Claude,
+            uuid::Uuid::new_v4(),
+            config_a.clone(),
+        );
+        let _source_reservation =
+            super::super::account_lifecycle::Reservation::install(&host, &[source_account])
+                .unwrap();
+        use std::os::{
+            fd::{AsRawFd, FromRawFd, OwnedFd},
+            unix::ffi::OsStrExt,
+        };
         let notify = unsafe { libc::inotify_init1(libc::IN_NONBLOCK | libc::IN_CLOEXEC) };
         assert!(notify >= 0, "{}", std::io::Error::last_os_error());
         let notify = unsafe { OwnedFd::from_raw_fd(notify) };
         let watched = std::ffi::CString::new(saved.as_os_str().as_bytes()).unwrap();
-        assert!(unsafe { libc::inotify_add_watch(notify.as_raw_fd(), watched.as_ptr(), libc::IN_OPEN | libc::IN_ACCESS) } >= 0);
+        assert!(
+            unsafe {
+                libc::inotify_add_watch(
+                    notify.as_raw_fd(),
+                    watched.as_ptr(),
+                    libc::IN_OPEN | libc::IN_ACCESS,
+                )
+            } >= 0
+        );
         for explicit_unset in [false, true] {
             let mut environment = BTreeMap::from([
                 ("HOME".into(), home_a.display().to_string()),
@@ -3712,32 +3841,76 @@ mod tests {
                 environment.insert("CLAUDE_CONFIG_DIR".into(), config_a.display().to_string());
                 unset.insert("CLAUDE_CONFIG_DIR".into());
             } else {
-                selected.insert("CLAUDE_CONFIG_DIR".into(), home_b.join(".claude").display().to_string());
+                selected.insert(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    home_b.join(".claude").display().to_string(),
+                );
             }
             let session = Session {
-                id: TerminalId::new(), terminal: None, proof: None,
-                owned_codex_listener: None, native_continuity: Default::default(),
-                launch: chat::Launch { provider: Provider::Claude,
+                id: TerminalId::new(),
+                terminal: None,
+                proof: None,
+                owned_codex_listener: None,
+                native_continuity: Default::default(),
+                launch: chat::Launch {
+                    provider: Provider::Claude,
                     session_id: Some("12345678-1234-4234-8234-123456789abc".into()),
-                    recipe: LaunchRecipe { program: executable.display().to_string(), arguments: Vec::new(),
-                        working_directory: issued.clone(), environment, unset_environment: unset } },
+                    recipe: LaunchRecipe {
+                        program: executable.display().to_string(),
+                        arguments: Vec::new(),
+                        working_directory: issued.clone(),
+                        environment,
+                        unset_environment: unset,
+                    },
+                },
             };
             let original = session.clone();
-            let failure = start_at_execution_directory(&host, 1, session,
-                crate::terminal_ipc::ChatExecutionEnvironment(selected), context.clone(), &operational).unwrap_err();
-            assert!(!failure.message.contains("being changed"), "effective B must not inherit A's reservation: {failure:?}");
-            assert!(!marker.exists(), "missing B history must fail before provider startup");
+            let failure = start_at_execution_directory(
+                &host,
+                1,
+                session,
+                crate::terminal_ipc::ChatExecutionEnvironment(selected),
+                context.clone(),
+                &operational,
+            )
+            .unwrap_err();
+            assert!(
+                !failure.message.contains("being changed"),
+                "effective B must not inherit A's reservation: {failure:?}"
+            );
+            assert!(
+                !marker.exists(),
+                "missing B history must fail before provider startup"
+            );
             let mut events = [0_u8; 4096];
-            let read = unsafe { libc::read(notify.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
-            assert_eq!(read, -1, "the reserved A transcript must not be opened or read");
-            assert_eq!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::WouldBlock);
-            assert!(!host.lock().unwrap().chat_spawning.contains_key(&original.id));
+            let read =
+                unsafe { libc::read(notify.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+            assert_eq!(
+                read, -1,
+                "the reserved A transcript must not be opened or read"
+            );
+            assert_eq!(
+                std::io::Error::last_os_error().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            assert!(
+                !host
+                    .lock()
+                    .unwrap()
+                    .chat_spawning
+                    .contains_key(&original.id)
+            );
             assert!(!host.lock().unwrap().chats.contains_key(&original.id));
             assert_eq!(original.launch.recipe.working_directory, issued);
         }
         // A reused original spelling cannot replace the approved inode.
-        let spec = ProcessSpec::from(&LaunchRecipe { program: "/bin/false".into(), arguments: Vec::new(),
-            working_directory: issued, environment: Default::default(), unset_environment: Default::default() });
+        let spec = ProcessSpec::from(&LaunchRecipe {
+            program: "/bin/false".into(),
+            arguments: Vec::new(),
+            working_directory: issued,
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        });
         assert!(ensure_native_account_admission(&host, &spec, Some(&context)).is_err());
     }
 
@@ -5115,9 +5288,13 @@ done
             if completed {
                 assert!(failure.message.contains("directory"), "{}", failure.message);
             } else {
-                assert_eq!(failure.code,ProtocolErrorCode::AccountSwitchUnavailable);
+                assert_eq!(failure.code, ProtocolErrorCode::AccountSwitchUnavailable);
             }
-            assert_eq!(handle.is_completed(),completed,"refusal must not close the source");
+            assert_eq!(
+                handle.is_completed(),
+                completed,
+                "refusal must not close the source"
+            );
             assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
             let response = super::super::client::process_request(
                 &host,
@@ -5143,11 +5320,23 @@ done
         }
         if !handle.is_completed() {
             generation = handle.account_switch_generation().unwrap().unwrap();
-            let refusal = recover_account(&host,1,source.clone(),replacement.clone(),Some(generation),explicit,Default::default()).unwrap_err();
-            assert_eq!(refusal.code,ProtocolErrorCode::AccountSwitchUnavailable);
-            assert!(!handle.is_completed(),"choosing another account never grants whole-session stop consent");
+            let refusal = recover_account(
+                &host,
+                1,
+                source.clone(),
+                replacement.clone(),
+                Some(generation),
+                explicit,
+                Default::default(),
+            )
+            .unwrap_err();
+            assert_eq!(refusal.code, ProtocolErrorCode::AccountSwitchUnavailable);
+            assert!(
+                !handle.is_completed(),
+                "choosing another account never grants whole-session stop consent"
+            );
             assert!(host.lock().unwrap().chat_spawning.is_empty());
-            assert_eq!(std::fs::read(&transcript).unwrap(),b"{}\n");
+            assert_eq!(std::fs::read(&transcript).unwrap(), b"{}\n");
             assert!(std::fs::read_dir(&alternate_home).unwrap().next().is_none());
             // The fixture user separately ends the complete original session.
             handle.close().unwrap();

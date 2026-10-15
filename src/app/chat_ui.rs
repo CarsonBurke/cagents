@@ -6844,24 +6844,34 @@ impl Cagents {
                         if failure.recovery == chat::Recovery::AccountSwitchUnavailable
                             && account_source.is_some() =>
                     {
-                        let fallback = self.chat_account(attempt.session.launch.provider,
-                            &attempt.session.launch.recipe).map(|id| {
-                                let label=self.account_ui.account_label(&id).unwrap_or_else(||id.to_string());
-                                (id,label)
+                        let fallback = self
+                            .chat_account(
+                                attempt.session.launch.provider,
+                                &attempt.session.launch.recipe,
+                            )
+                            .map(|id| {
+                                let label = self
+                                    .account_ui
+                                    .account_label(&id)
+                                    .unwrap_or_else(|| id.to_string());
+                                (id, label)
                             });
                         let runtime = match self.cards.get_mut(&target.card) {
                             Some(CardRuntime::Chat(runtime)) => Some(runtime),
                             _ => self.chat_ui.parked.get_mut(&target.card),
                         };
-                        let Some(runtime) = runtime else { return Task::none(); };
+                        let Some(runtime) = runtime else {
+                            return Task::none();
+                        };
                         runtime.pending_account_switch = None;
                         runtime.account_switch_checking = false;
-                        runtime.account_switch_fallback = runtime.account_switch_fallback.take().or(fallback);
+                        runtime.account_switch_fallback =
+                            runtime.account_switch_fallback.take().or(fallback);
                         runtime.error = Some(failure.message);
                         // This typed response is proved before source/history
                         // effects. Keep the exact attachment, draft and activity;
                         // never run generic replacement cleanup or replay input.
-                        let original=runtime.target;
+                        let original = runtime.target;
                         self.reread_chat_activity(original);
                         return Task::none();
                     }
@@ -12339,22 +12349,41 @@ mod tests {
         }
     }
 
-    fn account_continuation_from_widget(app: &Cagents, target: Target, alternate: &AccountId) -> Action {
-        use iced::advanced::{Layout,Shell,clipboard,layout,widget::Tree};
-        let renderer=crate::app::tests::headless_renderer();
-        let mut element=chat_runtime(app,target.card).account_switch_controls(false).unwrap();
-        let mut tree=Tree::new(element.as_widget());
-        let viewport=iced::Rectangle::with_size(iced::Size::new(1000.0,200.0));
-        let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(iced::Size::ZERO,viewport.size()));
-        let point=Layout::new(&node).bounds().center();
-        let mut messages=Vec::new();
+    fn account_continuation_from_widget(
+        app: &Cagents,
+        target: Target,
+        alternate: &AccountId,
+    ) -> Action {
+        use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
+        let renderer = crate::app::tests::headless_renderer();
+        let mut element = chat_runtime(app, target.card)
+            .account_switch_controls(false)
+            .unwrap();
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = iced::Rectangle::with_size(iced::Size::new(1000.0, 200.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+        );
+        let point = Layout::new(&node).bounds().center();
+        let mut messages = Vec::new();
         for event in [
             iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
-            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)),
+            iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                iced::mouse::Button::Left,
+            )),
         ] {
-            element.as_widget_mut().update(&mut tree,&event,Layout::new(&node),
-                iced::mouse::Cursor::Available(point),&renderer,&mut clipboard::Null,
-                &mut Shell::new(&mut messages),&viewport);
+            element.as_widget_mut().update(
+                &mut tree,
+                &event,
+                Layout::new(&node),
+                iced::mouse::Cursor::Available(point),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
         }
         messages.into_iter().find_map(|message|match message {
             Message::ChatUi(Action::ContinueOnAccount(actual,id)) if actual==target && &id==alternate =>Some(Action::ContinueOnAccount(actual,id)),
@@ -12363,98 +12392,141 @@ mod tests {
     }
 
     #[test]
-    fn failed_queued_account_readiness_exposes_an_actionable_fallback_without_retiring_or_retrying_source() {
-        let mut app=crate::app::tests::context_inspector_test_app(false);
-        let alternate=app.account_ui.add_managed_fixture(Provider::Codex,448);
-        let card=live_chat(&mut app,Some(KNOWN_THREAD));
-        let target=chat_runtime(&app,card).target;
-        let source=chat_runtime(&app,card).session.clone();
-        let handle=chat_runtime(&app,card).handle().unwrap().clone();
-        let mut current=handle.snapshot().as_ref().clone();
-        current.busy=true;
+    fn failed_queued_account_readiness_exposes_an_actionable_fallback_without_retiring_or_retrying_source()
+     {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 448);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let source = chat_runtime(&app, card).session.clone();
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut current = handle.snapshot().as_ref().clone();
+        current.busy = true;
         handle.publish_snapshot_for_test(current);
-        let runtime=app.chat_runtime_mut(target).unwrap();
-        Arc::make_mut(&mut runtime.snapshot).busy=true;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
         runtime.replace_draft(text_editor::Content::with_text("Keep the source request"));
-        drop(app.choose_chat_account(target,alternate.clone()));
-        assert!(chat_runtime(&app,card).pending_account_switch.is_some());
+        drop(app.choose_chat_account(target, alternate.clone()));
+        assert!(chat_runtime(&app, card).pending_account_switch.is_some());
         drop(app.probe_queued_account_switch(target));
-        assert!(chat_runtime(&app,card).account_switch_checking);
-        drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target,alternate.clone(),Err("Readiness transport failed".into()))));
-        let runtime=chat_runtime(&app,card);
+        assert!(chat_runtime(&app, card).account_switch_checking);
+        drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+            target,
+            alternate.clone(),
+            Err("Readiness transport failed".into()),
+        )));
+        let runtime = chat_runtime(&app, card);
         assert!(runtime.pending_account_switch.is_none());
         assert!(!runtime.account_switch_checking);
-        assert_eq!(runtime.error.as_deref(),Some("Readiness transport failed"));
+        assert_eq!(runtime.error.as_deref(), Some("Readiness transport failed"));
         assert!(runtime.connected());
-        assert_eq!(runtime.session,source);
-        assert_eq!(runtime.composer.text(),"Keep the source request");
+        assert_eq!(runtime.session, source);
+        assert_eq!(runtime.composer.text(), "Keep the source request");
         assert!(!app.chat_start_pending(card));
         assert!(app.chat_ui.retiring.is_empty());
-        let continuation=account_continuation_from_widget(&app,target,&alternate);
+        let continuation = account_continuation_from_widget(&app, target, &alternate);
         drop(app.handle_chat_ui(continuation));
-        let new_card=app.workspace.focused().unwrap();
-        assert_ne!(new_card,card);
-        assert_ne!(chat_runtime(&app,new_card).session.id,source.id);
-        assert_eq!(chat_runtime(&app,card).session,source);
-        assert!(Arc::ptr_eq(chat_runtime(&app,card).handle().unwrap(),&handle));
+        let new_card = app.workspace.focused().unwrap();
+        assert_ne!(new_card, card);
+        assert_ne!(chat_runtime(&app, new_card).session.id, source.id);
+        assert_eq!(chat_runtime(&app, card).session, source);
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
     }
 
     #[test]
-    fn unsupported_live_account_handoff_preserves_original_attachment_and_offers_separate_continuation() {
-        for busy in [false,true] {
-            let mut app=crate::app::tests::context_inspector_test_app(false);
-            let alternate=app.account_ui.add_managed_fixture(Provider::Codex,447);
-            let card=live_chat(&mut app,Some(KNOWN_THREAD));
-            let target=chat_runtime(&app,card).target;
-            let source=chat_runtime(&app,card).session.clone();
-            let handle=chat_runtime(&app,card).handle().unwrap().clone();
-            let runtime=app.chat_runtime_mut(target).unwrap();
-            runtime.replace_draft(text_editor::Content::with_text("Preserve this unsent request"));
-            Arc::make_mut(&mut runtime.snapshot).busy=busy;
-            drop(app.choose_chat_account(target,alternate.clone()));
+    fn unsupported_live_account_handoff_preserves_original_attachment_and_offers_separate_continuation()
+     {
+        for busy in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 447);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let source = chat_runtime(&app, card).session.clone();
+            let handle = chat_runtime(&app, card).handle().unwrap().clone();
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.replace_draft(text_editor::Content::with_text(
+                "Preserve this unsent request",
+            ));
+            Arc::make_mut(&mut runtime.snapshot).busy = busy;
+            drop(app.choose_chat_account(target, alternate.clone()));
             if busy {
-                Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy=false;
-                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(target,alternate.clone(),Ok(Some(77)))));
+                Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = false;
+                drop(app.handle_chat_ui(Action::QueuedAccountGeneration(
+                    target,
+                    alternate.clone(),
+                    Ok(Some(77)),
+                )));
             }
-            let attempt=chat_runtime_attempt(&app,card);
-            answer_start(&mut app,attempt,Err(chat::StartFailure{
-                message:"Exact live handoff is unavailable; continue separately with cache loss".into(),
-                recovery:chat::Recovery::AccountSwitchUnavailable,
-            }));
-            let runtime=chat_runtime(&app,card);
-            assert_eq!(runtime.session,source);
-            assert!(Arc::ptr_eq(runtime.handle().unwrap(),&handle));
+            let attempt = chat_runtime_attempt(&app, card);
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message:
+                        "Exact live handoff is unavailable; continue separately with cache loss"
+                            .into(),
+                    recovery: chat::Recovery::AccountSwitchUnavailable,
+                }),
+            );
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.session, source);
+            assert!(Arc::ptr_eq(runtime.handle().unwrap(), &handle));
             assert!(runtime.connected());
             assert!(!runtime.disconnected);
             assert!(runtime.pending_account_switch.is_none());
             assert!(!runtime.account_switch_checking);
-            assert_eq!(runtime.composer.text(),"Preserve this unsent request");
-            assert_eq!(runtime.account_switch_fallback.as_ref().map(|(id,_)|id),Some(&alternate));
+            assert_eq!(runtime.composer.text(), "Preserve this unsent request");
+            assert_eq!(
+                runtime.account_switch_fallback.as_ref().map(|(id, _)| id),
+                Some(&alternate)
+            );
             assert!(!app.chat_ui.removed_accounts.contains(&card));
             assert!(!app.chat_start_pending(card));
-            assert!(app.chat_ui.retiring.is_empty(),"a pre-effect refusal never schedules provider retirement");
+            assert!(
+                app.chat_ui.retiring.is_empty(),
+                "a pre-effect refusal never schedules provider retirement"
+            );
             if busy {
-                let mut current=handle.snapshot().as_ref().clone();
-                current.busy=true;
+                let mut current = handle.snapshot().as_ref().clone();
+                current.busy = true;
                 handle.publish_snapshot_for_test(current);
-                let runtime=app.chat_runtime_mut(target).unwrap();
-                Arc::make_mut(&mut runtime.snapshot).busy=true;
-                runtime.pending=Some(PendingCommand {
-                    followup:false,take_back:None,id:1,draft_revision:None,request:None,
-                    first_prompt:None,model:None,sent:None,page:None,queued:None,
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                Arc::make_mut(&mut runtime.snapshot).busy = true;
+                runtime.pending = Some(PendingCommand {
+                    followup: false,
+                    take_back: None,
+                    id: 1,
+                    draft_revision: None,
+                    request: None,
+                    first_prompt: None,
+                    model: None,
+                    sent: None,
+                    page: None,
+                    queued: None,
                 });
             }
-            let continuation=account_continuation_from_widget(&app,target,&alternate);
+            let continuation = account_continuation_from_widget(&app, target, &alternate);
             drop(app.handle_chat_ui(continuation));
-            let new_card=app.workspace.focused().unwrap();
-            assert_ne!(new_card,card);
-            assert_ne!(chat_runtime(&app,new_card).session.id,source.id);
-            assert!(chat_runtime(&app,new_card).is_draft());
-            assert!(chat_runtime(&app,new_card).composer.text().contains("provider cache is unavailable"));
-            assert_eq!(chat_runtime(&app,card).session,source);
-            assert!(Arc::ptr_eq(chat_runtime(&app,card).handle().unwrap(),&handle));
-            assert_eq!(chat_runtime(&app,card).pending.is_some(),busy);
-            assert_eq!(chat_runtime(&app,card).snapshot.busy,busy);
+            let new_card = app.workspace.focused().unwrap();
+            assert_ne!(new_card, card);
+            assert_ne!(chat_runtime(&app, new_card).session.id, source.id);
+            assert!(chat_runtime(&app, new_card).is_draft());
+            assert!(
+                chat_runtime(&app, new_card)
+                    .composer
+                    .text()
+                    .contains("provider cache is unavailable")
+            );
+            assert_eq!(chat_runtime(&app, card).session, source);
+            assert!(Arc::ptr_eq(
+                chat_runtime(&app, card).handle().unwrap(),
+                &handle
+            ));
+            assert_eq!(chat_runtime(&app, card).pending.is_some(), busy);
+            assert_eq!(chat_runtime(&app, card).snapshot.busy, busy);
         }
     }
 

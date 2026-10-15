@@ -3549,15 +3549,30 @@ mod tests {
 
     #[test]
     fn exact_account_refusals_keep_typed_pre_admission_dispositions_across_ipc() {
-        for (code,recovery) in [
-            (ipc::ProtocolErrorCode::AccountSwitchBusy,crate::chat::Recovery::AccountSwitchBusy),
-            (ipc::ProtocolErrorCode::AccountSwitchUnavailable,crate::chat::Recovery::AccountSwitchUnavailable),
+        for (code, recovery) in [
+            (
+                ipc::ProtocolErrorCode::AccountSwitchBusy,
+                crate::chat::Recovery::AccountSwitchBusy,
+            ),
+            (
+                ipc::ProtocolErrorCode::AccountSwitchUnavailable,
+                crate::chat::Recovery::AccountSwitchUnavailable,
+            ),
         ] {
-            let failure=restore_against(omp_card(Some(CONVERSATION),Some(host_proof("before-update"))),move |_| {
-                ServerMessage::Error(ipc::ProtocolError::new(code,"typed account refusal",false))
-            }).err().expect("daemon refused before provider effects");
-            assert_eq!(failure.recovery,recovery);
-            assert_eq!(failure.message,"typed account refusal");
+            let failure = restore_against(
+                omp_card(Some(CONVERSATION), Some(host_proof("before-update"))),
+                move |_| {
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        code,
+                        "typed account refusal",
+                        false,
+                    ))
+                },
+            )
+            .err()
+            .expect("daemon refused before provider effects");
+            assert_eq!(failure.recovery, recovery);
+            assert_eq!(failure.message, "typed account refusal");
         }
     }
 
