@@ -7692,7 +7692,7 @@ impl Cagents {
                                 runtime.expanded.contains(&id),
                                 false,
                                 chat::coordination::recognize(
-                                    item,
+                                    &item,
                                     runtime.session.launch.provider,
                                 ),
                             ),
