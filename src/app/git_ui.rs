@@ -2346,6 +2346,59 @@ mod tests {
     }
 
     #[test]
+    fn full_reload_and_unchanged_bound_proofs_keep_newer_operation_errors_and_recovery() {
+        const TEST: &str = "app::git_ui::tests::full_reload_and_unchanged_bound_proofs_keep_newer_operation_errors_and_recovery";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        use crate::repository::GitOperationKind;
+        for newer_error in [false, true] {
+            for bound_sample_first in [false, true] {
+                for bound_delivered_first in [false, true] {
+                    let directory = tempfile::tempdir().unwrap();
+                    let root = directory.path().join("repository");
+                    let baseline = fixture(&root);
+                    let key = ActiveWorktreeKey { project_id: ProjectId::new(),
+                        worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+                    let admin = root.join(".git");
+                    fs::write(admin.join("MERGE_HEAD"), fs::read(admin.join("refs/heads/main")).unwrap()).unwrap();
+                    if newer_error { fs::write(admin.join("MERGE_MSG"), "Merge fixture\n").unwrap(); }
+                    else { fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap(); }
+                    let mut app = app_with_status_snapshot(baseline, &key);
+                    app.active_workspace = Some(root.clone());
+                    app.sidebar_state.sync_active_worktree(&app.sidebar_model,
+                        &SidebarFocus::Repository { worktree: root.clone() });
+                    let prime = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+                    drop(app.update(prime));
+                    app.repository_generations.insert(key.project_id, 10);
+                    let mut load = Some(app.repository_read_task(root.clone(), key.project_id, 10, false, Some(ProjectKind::Git)));
+                    let first = if bound_sample_first {
+                        super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
+                    } else { super::super::tests::task_app_message(load.take().unwrap()) };
+                    if newer_error { fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap(); }
+                    else { fs::write(admin.join("MERGE_MSG"), "Repaired fixture\n").unwrap(); }
+                    let second = if bound_sample_first { super::super::tests::task_app_message(load.take().unwrap()) }
+                        else { super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone())) };
+                    let (bound, loaded) = if bound_sample_first { (first, second) } else { (second, first) };
+                    let bound_error = if bound_sample_first { !newer_error } else { newer_error };
+                    assert!(matches!(&bound, Message::SourceControlLoaded { result: Ok(read), .. }
+                        if read.prepared.is_none() && read.operation.is_err() == bound_error),
+                        "the actual unchanged model shortcut must still carry its operation proof");
+                    for message in if bound_delivered_first { [bound, loaded] } else { [loaded, bound] } {
+                        drop(app.update(message));
+                    }
+                    let row = &app.sidebar_model.projects[0].worktrees[0];
+                    assert!(row.status_error.is_none());
+                    assert_eq!(row.operation_error.is_some(), newer_error);
+                    if !newer_error { assert_eq!(row.operation, Some(GitOperationKind::Merge)); }
+                    let entry = &app.refresh_ui.git.entries[&key.project_id];
+                    assert_eq!(entry.snapshot.operations[&key.worktree_id].is_err(), newer_error);
+                    if !newer_error { assert_eq!(entry.snapshot.operations[&key.worktree_id], Ok(Some(GitOperationKind::Merge))); }
+                    assert_eq!(entry.failed_status_attempts.contains_key(&key.worktree_id), newer_error);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn operation_display_proof_recovers_without_events_and_rejects_delayed_watch_replay() {
         const TEST: &str = "app::git_ui::tests::operation_display_proof_recovers_without_events_and_rejects_delayed_watch_replay";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
