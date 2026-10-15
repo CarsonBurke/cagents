@@ -311,6 +311,22 @@ fn assert_no_pty_input(requests: &[ClientRequest]) {
         "assistive reading emitted input: {requests:?}"
     );
 }
+fn settle_initial_typing_focus(
+    widget: &mut TerminalWidget<Message>,
+    tree: &mut Tree,
+    renderer: &Renderer,
+    peer: &Peer,
+) {
+    dispatch(widget, tree, renderer,
+        Event::Window(window::Event::RedrawRequested(Instant::now())));
+    let initial = peer.fence();
+    assert_eq!(initial.iter().filter(|request| matches!(request,
+        ClientRequest::Focus { focused: true, .. })).count(), 1);
+    assert!(initial.iter().all(|request| matches!(request,
+        ClientRequest::SetVisibility { .. } | ClientRequest::Resize { .. }
+            | ClientRequest::Focus { focused: true, .. })),
+        "initial typing focus emitted unexpected input: {initial:?}");
+}
 #[test]
 fn real_widget_assistive_focus_selection_and_navigation_emit_no_pty_commands_on_either_peer() {
     let old = Peer::new();
@@ -668,7 +684,9 @@ fn same_card_cancellation_clears_pending_review_without_a_true_view_acknowledgme
         vec![Message::Review(true)]
     );
     // The parent processes entry and explicit same-card FocusCard before rebuilding.
-    // The final view is still focused, false, and globally unsuppressed.
+    // Reconstruct its authoritative false view, not the local widget's true intent.
+    widget.review_active = false;
+    widget.suppress_focus_reports = false;
     widget.review_revision = 2;
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
     assert!(!reviewing(&tree));
@@ -893,6 +911,8 @@ fn native_actions_from_replaced_same_id_tree_cannot_enter_successor_review() {
         .unwrap();
     let mut current = widget(&new, "same-card", barrier, true, false);
     tree.diff(&mut current as &mut dyn Widget<Message, Theme, Renderer>);
+    // Ordinary typing focus is established before any stale native action.
+    settle_initial_typing_focus(&mut current, &mut tree, &renderer, &new);
     let current_nodes = current.a11y_nodes(
         Layout::new(&layout::Node::new(Size::new(640.0, 320.0))),
         &tree,
@@ -1083,6 +1103,7 @@ fn configured_review_shortcut_toggles_both_ways_without_reaching_the_pty() {
     )
     .review_shortcuts(&["Ctrl+Alt+Shift+R".into()]);
     let mut tree = widget_tree(&widget);
+    settle_initial_typing_focus(&mut widget, &mut tree, &renderer, &peer);
     let press = || {
         Event::Keyboard(keyboard::Event::KeyPressed {
             key: keyboard::Key::Character("r".into()),
@@ -1110,6 +1131,7 @@ fn configured_review_shortcut_toggles_both_ways_without_reaching_the_pty() {
     assert!(dispatch(&mut widget, &mut tree, &renderer, press()).contains(&Message::Review(true)));
     assert!(reviewing(&tree));
     dispatch(&mut widget, &mut tree, &renderer, release());
+    assert_no_pty_input(&peer.fence());
     assert!(dispatch(&mut widget, &mut tree, &renderer, press()).contains(&Message::Review(false)));
     assert!(!reviewing(&tree));
     dispatch(&mut widget, &mut tree, &renderer, release());
