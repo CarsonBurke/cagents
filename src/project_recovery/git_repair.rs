@@ -15,23 +15,35 @@ fn read_marker(path:&Path)->Option<String> {
     (text.len()<=4096).then_some(text)
 }
 
-pub(crate) fn belongs_to_relocated_worktree(path: &Path, relocation: &Relocation) -> bool {
-    let Some(marker)=read_marker(&path.join(".git")) else {return false;};
-    let Some(admin) = marker.trim().strip_prefix("gitdir: ") else {
-        return false;
-    };
-    let admin = Path::new(admin);
-    let admin = if admin.is_absolute() {
-        admin.to_path_buf()
-    } else {
-        path.join(admin)
-    };
-    if !admin.starts_with(&relocation.repository) {
-        return false;
+fn normalized(path:&Path)->PathBuf {
+    let mut result=PathBuf::new();for component in path.components(){match component{std::path::Component::CurDir=>{},std::path::Component::ParentDir=>{result.pop();},component=>result.push(component.as_os_str())}}result
+}
+fn previous_path(path:&Path,relocation:&Relocation)->PathBuf {
+    path.strip_prefix(&relocation.new_root).map(|relative|relocation.old_root.join(relative)).unwrap_or_else(|_|path.to_owned())
+}
+fn linked_admin(path:&Path,marker:&str,relocation:&Relocation)->Option<PathBuf> {
+    let raw=Path::new(marker.trim().strip_prefix("gitdir: ")?);
+    let candidates=if raw.is_absolute(){vec![raw.to_owned()]}else{vec![path.join(raw),previous_path(path,relocation).join(raw)]};
+    let parent=relocation.destination.join("worktrees");
+    for candidate in candidates {
+        let candidate=normalized(&candidate);
+        // Retry may observe our first linking edit already committed. Prefer
+        // the exact current admin before considering the old→new mapping.
+        let current=if candidate.parent()==Some(parent.as_path()){candidate}else if candidate.starts_with(&relocation.repository){relocation.mapped(&candidate)}else{continue};
+        if current.parent()==Some(parent.as_path()){return Some(current);}
     }
-    let admin = relocation.mapped(&admin);
-    let Some(backlink)=read_marker(&admin.join("gitdir")) else {return false;};
-    relocation.mapped(Path::new(backlink.trim())) == path.join(".git")
+    None
+}
+fn backlink_matches(backlink:&str,admin:&Path,path:&Path,relocation:&Relocation)->bool {
+    let raw=Path::new(backlink.trim());
+    let old_admin=admin.strip_prefix(&relocation.destination).map(|relative|relocation.repository.join(relative)).unwrap_or_else(|_|admin.to_owned());
+    let candidates=if raw.is_absolute(){vec![raw.to_owned()]}else{vec![admin.join(raw),old_admin.join(raw)]};
+    candidates.into_iter().map(|path|normalized(&path)).any(|candidate|candidate==path.join(".git")||relocation.mapped(&candidate)==path.join(".git"))
+}
+pub(crate) fn belongs_to_relocated_worktree(path:&Path,relocation:&Relocation)->bool {
+    let Some(marker)=read_marker(&path.join(".git")) else{return false;};
+    let Some(admin)=linked_admin(path,&marker,relocation) else{return false;};
+    read_marker(&admin.join("gitdir")).is_some_and(|backlink|backlink_matches(&backlink,&admin,path,relocation))
 }
 
 // `git worktree repair` does not update an external Git directory's
@@ -90,6 +102,7 @@ pub(crate) fn repair(relocation: &Relocation, worktrees: &[PathBuf]) -> Result<(
     let common=Directory::open(&relocation.destination)?;
     repair_config_pinned(relocation,&root,&common,||{})?;
     let mut known=worktrees.to_vec();
+    known.push(relocation.new_root.clone());
     if let Ok(entries)=std::fs::read_dir(common.anchor().join("worktrees")) {
         for entry in entries.take(4096).flatten() {
             if let Some(marker)=read_marker(&entry.path().join("gitdir")) {
@@ -99,22 +112,16 @@ pub(crate) fn repair(relocation: &Relocation, worktrees: &[PathBuf]) -> Result<(
     }
     known.sort();known.dedup();
     for path in known {
-        let path=relocation.mapped(&path);
-        if path==relocation.new_root || !belongs_to_relocated_worktree(&path,relocation){continue;}
+        let path=if path==relocation.new_root{path}else{relocation.mapped(&path)};
+        if !belongs_to_relocated_worktree(&path,relocation){continue;}
         let checkout=Directory::open(&path)?;
         let before=checkout.read(".git",4096)?;
         let marker=std::str::from_utf8(&before).map_err(|error|error.to_string())?;
-        let admin=Path::new(marker.trim().strip_prefix("gitdir: ").ok_or("Invalid linked checkout marker")?);
-        let admin=if admin.is_absolute(){admin.to_owned()}else{path.join(admin)};
-        if !admin.starts_with(&relocation.repository){return Err("Linked checkout changed Git ownership during Locate".into());}
-        let admin_path=relocation.mapped(&admin);
-        // Only an exact child admin directory is repaired; no inferred name
-        // or arbitrary replacement-clone .git marker grants write authority.
-        if admin_path.parent()!=Some(relocation.destination.join("worktrees").as_path()){return Err("Linked checkout admin directory changed during Locate".into());}
+        let admin_path=linked_admin(&path,marker,relocation).ok_or("Linked checkout changed Git ownership during Locate")?;
         let admin=Directory::open(&admin_path)?;
         let backlink=admin.read("gitdir",4096)?;
         let old=std::str::from_utf8(&backlink).map_err(|error|error.to_string())?;
-        if relocation.mapped(Path::new(old.trim()))!=path.join(".git"){return Err("Linked checkout backlink changed during Locate".into());}
+        if !backlink_matches(old,&admin_path,&path,relocation){return Err("Linked checkout backlink changed during Locate".into());}
         root.require_current()?;common.require_current()?;checkout.require_current()?;admin.require_current()?;
         // Git worktree repair canonicalizes paths internally before writes;
         // retained argument FDs alone cannot fence those later opens. Repair
@@ -152,4 +159,46 @@ mod tests {
             assert!(!common.join("config.lock").exists());
         }
     }
+    #[test]
+    fn selected_moved_linked_checkout_repairs_its_backlink_and_is_not_prunable() {
+        let fixture=tempfile::tempdir().unwrap();
+        let primary=fixture.path().join("primary");let old=fixture.path().join("linked");let moved=fixture.path().join("moved");
+        let git=|directory:&Path,args:&[&str]| {
+            let output=std::process::Command::new("git").current_dir(directory)
+                .env_remove("GIT_DIR").env_remove("GIT_COMMON_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
+                .env("GIT_CONFIG_GLOBAL","/dev/null").env("GIT_CONFIG_NOSYSTEM","1")
+                .args(["-c","core.fsmonitor=false","-c","commit.gpgsign=false","-c","core.hooksPath=/dev/null","-c","user.name=Fixture","-c","user.email=fixture@example.invalid"]).args(args).output().unwrap();
+            assert!(output.status.success(),"{}",String::from_utf8_lossy(&output.stderr));output
+        };
+        git(fixture.path(),&["init","-b","main",primary.to_str().unwrap()]);
+        git(&primary,&["commit","--allow-empty","-m","fixture"]);
+        git(&primary,&["worktree","add","-b","linked",old.to_str().unwrap()]);
+        let common=primary.join(".git");
+        let admin=crate::project_location::checkout_identity(&old).unwrap().0;
+        std::fs::rename(&old,&moved).unwrap();
+        let relocation=Relocation{repository:common.clone(),destination:common,old_root:old.clone(),new_root:moved.clone()};
+        repair(&relocation,&[]).unwrap();
+        assert_eq!(std::fs::read_to_string(admin.join("gitdir")).unwrap().trim(),moved.join(".git").to_str().unwrap());
+        let listed=git(&primary,&["worktree","list","--porcelain"]);
+        let listed=String::from_utf8(listed.stdout).unwrap();
+        assert!(listed.contains(moved.to_str().unwrap()));assert!(!listed.contains(&format!("worktree {}\n",old.display())));
+        let prune=git(&primary,&["worktree","prune","--dry-run","--verbose"]);
+        assert!(!String::from_utf8_lossy(&prune.stdout).contains("linked"));assert!(!String::from_utf8_lossy(&prune.stderr).contains("linked"));
+    }
+    #[test]
+    fn retry_completes_a_link_whose_checkout_marker_already_names_the_new_admin() {
+        let fixture=tempfile::tempdir().unwrap();
+        let old=fixture.path().join("old");let moved=fixture.path().join("moved");
+        let common=moved.join(".git");let admin=common.join("worktrees/linked");let linked=moved.join("linked");
+        std::fs::create_dir_all(&admin).unwrap();std::fs::create_dir(&linked).unwrap();
+        std::fs::write(common.join("config"),b"[core]\nbare = false\n").unwrap();
+        std::fs::write(linked.join(".git"),format!("gitdir: {}\n",admin.display())).unwrap();
+        std::fs::write(admin.join("gitdir"),format!("{}\n",old.join("linked/.git").display())).unwrap();
+        let relocation=Relocation{repository:old.join(".git"),destination:common,old_root:old,new_root:moved.clone()};
+        assert!(belongs_to_relocated_worktree(&linked,&relocation));
+        repair(&relocation,&[]).unwrap();
+        assert_eq!(std::fs::read_to_string(admin.join("gitdir")).unwrap().trim(),linked.join(".git").to_str().unwrap());
+        repair(&relocation,&[]).unwrap();
+    }
+
 }
