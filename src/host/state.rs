@@ -1453,6 +1453,9 @@ impl HostState {
         client: ClientId,
         windows: &[crate::instance::VerifiedWindow],
     ) -> Result<(), String> {
+        if !self.native_actor_startups.is_empty() {
+            return Err("Unconfirmed native helper startup ownership has not settled".into());
+        }
         let verified = |id: &ClientId| {
             self.client_pids
                 .get(id)
@@ -1470,6 +1473,7 @@ impl HostState {
             || !self.chat_handoffs.is_empty()
             || !self.native_closing.is_empty()
             || !self.native_adoption_failures.is_empty()
+            || crate::daemon::child_reaper::has_outstanding_ownership()
         {
             return Err("Hosted process ownership has not settled".into());
         }
@@ -1546,7 +1550,8 @@ impl HostState {
         if self.shutting_down {
             return Err(ShutdownOutcome::AlreadyShuttingDown);
         }
-        if crate::daemon::child_reaper::has_retained_ownership() {
+        if !self.native_actor_startups.is_empty()
+            || crate::daemon::child_reaper::has_retained_ownership() {
             return Err(ShutdownOutcome::OwnershipUncertain);
         }
         if self.shutdown_capabilities.len() == MAX_SHUTDOWN_CAPABILITIES {
@@ -1604,13 +1609,14 @@ impl HostState {
         capability: &ShutdownCapability,
         now: Instant,
     ) -> Result<(), String> {
-        let count = self.inventory_count();
         if self.shutting_down {
             return Err("Daemon is already shutting down".into());
         }
-        if crate::daemon::child_reaper::has_retained_ownership() {
+        if !self.native_actor_startups.is_empty()
+            || crate::daemon::child_reaper::has_retained_ownership() {
             return Err("Original helper cleanup is still owned outside the session inventory; wait for exact cleanup or resolve retained ownership before upgrading".into());
         }
+        let count = self.inventory_count();
         if capability.proof != *self.proof {
             return Err("Daemon changed; obtain a new upgrade preflight".into());
         }
@@ -1651,7 +1657,8 @@ impl HostState {
         // inventory and its indivisible shutdown admission fence. Only service
         // entries and quarantined cleanup credits are extra owners: a failed
         // startup publishes that fence before releasing its host reservation.
-        if !self.shutting_down && crate::daemon::child_reaper::has_retained_ownership() {
+        if !self.shutting_down && (!self.native_actor_startups.is_empty()
+            || crate::daemon::child_reaper::has_retained_ownership()) {
             return ShutdownOutcome::OwnershipUncertain;
         }
         let count = self.inventory_count();

@@ -428,7 +428,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
 }
 
 fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
-    let (chats, upgrading) = {
+    let (chats, upgrading, pending_native_startups) = {
         let state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         (
             state
@@ -437,9 +437,16 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                 .map(|record| (record.session.clone(), record.handle.clone()))
                 .collect::<Vec<_>>(),
             state.has_committed_upgrade(),
+            state.native_actor_startups.len(),
         )
     };
     let mut result = state::finish_upgrade(host);
+    if pending_native_startups != 0 && result.is_ok() {
+        // These contexts may own a real helper before a Record or discovery
+        // JSON exists. Snapshot only; explicit exact startup reconciliation
+        // owns cleanup and never runs under HostLock or a renewed loop budget.
+        result = Err(format!("{pending_native_startups} native helper startup ownership record(s) remain unconfirmed; exact startup cleanup must settle"));
+    }
     for (session, chat) in chats {
         // A committed upgrade transfers ownership, including when the final
         // checkpoint write fails. Explicit Stop/Close still tears down the
