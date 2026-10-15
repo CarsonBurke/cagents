@@ -13994,6 +13994,18 @@ impl Application for Cagents {
                 })
             }
             Message::Repository(action) => {
+                // Measure the actual owning update thread, including runtime
+                // edits, intent draining and synchronous navigation bookkeeping.
+                // This deliberately excludes later layout/redraw and worker CPU.
+                let editor_performance = if cfg!(debug_assertions) && tracing::enabled!(target: "cagents::editor_performance", tracing::Level::DEBUG) {
+                    let kind = match &action {
+                        RepositoryAction::EditorAction { action: repository_widget::EditorAction::Edit(_), .. } => Some("edit"),
+                        RepositoryAction::WorkingDiffDue { .. } => Some("pause"),
+                        RepositoryAction::WorkingDiffLoaded { .. } => Some("result"),
+                        _ => None,
+                    };
+                    kind.map(|kind| (kind, Instant::now()))
+                } else { None };
                 if let RepositoryAction::DiffAnnotations {
                     identity,
                     review_revision,
@@ -14123,6 +14135,11 @@ impl Application for Cagents {
                 }
                 if !self.project_ui.closing.is_empty() {
                     tasks.push(self.complete_closed_projects());
+                }
+                if let Some((kind, started)) = editor_performance {
+                    tracing::debug!(target: "cagents::editor_performance", %card, kind,
+                        update_us = started.elapsed().as_secs_f64() * 1_000_000.0,
+                        "repository owning-thread update");
                 }
                 Task::batch(tasks)
             }
