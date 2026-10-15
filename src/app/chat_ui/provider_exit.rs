@@ -3,6 +3,8 @@
 use super::*;
 
 const PAGE_BYTES: usize = 16 * 1024;
+const SESSION_BYTES: usize = 1024;
+const RECENT_BYTES: usize = 64 * 1024;
 
 use chat::client::{DiagnosticAuthority, DiagnosticCompletion, DiagnosticCopyCompletion,
     DiagnosticCopyInterest, DiagnosticCopySummary, DiagnosticOutput, DiagnosticReadRequest};
@@ -13,20 +15,22 @@ pub(super) struct Key {
     log: chat::ProviderExitLog,
     turn: u64,
     incarnation: Option<uuid::Uuid>,
-    session: Option<String>,
+    session: Option<Arc<str>>,
 }
 impl Key {
     fn matches(&self, snapshot: &Snapshot) -> bool {
         self.turn == snapshot.turn_generation
             && self.incarnation == snapshot.source_incarnation
-            && self.session == snapshot.session_id
+            && self.session.as_deref() == snapshot.session_id.as_deref()
             && snapshot.provider_exit.as_ref().and_then(|diagnostic| diagnostic.log.as_ref()) == Some(&self.log)
     }
     fn from_snapshot(snapshot: &Snapshot) -> Option<Self> {
         let log=snapshot.provider_exit.as_ref()?.log.as_ref()?;
         if log.id.is_empty() || log.id.len()>256 {return None;}
+        let session=snapshot.session_id.as_deref();
+        if session.is_some_and(|value|value.len()>SESSION_BYTES) {return None;}
         Some(Self { log:chat::ProviderExitLog {id:log.id.as_str().to_owned(),bytes:log.bytes,omitted:log.omitted}, turn: snapshot.turn_generation,
-            incarnation: snapshot.source_incarnation, session: snapshot.session_id.clone() })
+            incarnation: snapshot.source_incarnation, session: session.map(Arc::from) })
     }
 }
 #[derive(Clone)]
@@ -309,8 +313,9 @@ impl Cagents {
         let text=self.chat_runtime_mut(target).and_then(|runtime| {
             let handle=runtime.handle()?;
             let diagnostic=runtime.snapshot.provider_exit.as_ref()?;
+            if diagnostic.summary.len()>1024 || diagnostic.output.len()>RECENT_BYTES {return None;}
             handle.source_snapshot_matches(runtime.snapshot.source_incarnation,runtime.snapshot.session_id.as_deref(),|snapshot|
-                snapshot.turn_generation==runtime.snapshot.turn_generation && snapshot.provider_exit.as_ref().map(|value|&value.log)==Some(&diagnostic.log))
+                snapshot.turn_generation==runtime.snapshot.turn_generation && snapshot.provider_exit.as_ref()==Some(diagnostic))
                 .then(||copy_text(diagnostic))
         });
         if let Some(text)=text {
@@ -419,13 +424,13 @@ impl Cagents {
         let Some(runtime)=self.chat_runtime_mut(target) else {request.job.cancel();return Task::none();};
         let Some(loading)=runtime.provider_exit_output.take(&request) else {return Task::none();};
         if !request.scope.matches(runtime) {runtime.provider_exit_output.clear();return Task::none();}
-        if request.job.cancelled() || !loading.copy.as_ref().is_some_and(CopyInterest::current) {return Task::none();}
-        let Some(summary)=loading.formatted_summary.as_ref() else {return Task::none();};
+        if request.job.cancelled() || !loading.copy.as_ref().is_some_and(CopyInterest::current) {return self.reload_provider_exit(target);}
+        let Some(summary)=loading.formatted_summary.as_ref() else {return self.reload_provider_exit(target);};
         let current_summary=request.scope.handle.upgrade().is_some_and(|handle|handle.source_snapshot_matches(
             request.scope.key.incarnation,request.scope.key.session.as_deref(),|snapshot|
                 request.scope.key.matches(snapshot) && snapshot.provider_exit.as_ref().is_some_and(|diagnostic|diagnostic.summary==summary.as_str())));
-        if !current_summary {return Task::none();}
-        let Some(result)=result.take_effect() else {return Task::none();};
+        if !current_summary {return self.reload_provider_exit(target);}
+        let Some(result)=result.take_effect() else {return self.reload_provider_exit(target);};
         match result {
             Ok((text,receipt))=>{
                 runtime.provider_exit_output.error=None;
@@ -433,8 +438,12 @@ impl Cagents {
                 // The charged allocation stays owned until iced has emitted
                 // its immediate clipboard effect. Dropping an undelivered Task
                 // also drops this receipt; the platform clipboard is separate.
-                iced::clipboard::write(text).map(cosmic::Action::App).chain(cosmic::task::message(
-                    action(Action::ProviderExitClipboardIssued(receipt))))
+                let clipboard=iced::clipboard::write(text).map(cosmic::Action::App).chain(cosmic::task::message(
+                    action(Action::ProviderExitClipboardIssued(receipt))));
+                // Show may have joined a hidden formatting job after its read
+                // output moved into the worker. Restore disclosure explicitly;
+                // an idle provider need not publish another Wake.
+                Task::batch([clipboard,self.reload_provider_exit(target)])
             }
             Err(error)=>{
                 runtime.provider_exit_output.error=Some(error.clone());
@@ -529,6 +538,66 @@ mod tests {
             iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(action @ Action::ProviderExitCopyReady(..))))=>return action,
             _=>{}
         }}
+    }
+    #[test]
+    fn diagnostic_scope_bounds_and_shares_compact_native_session_metadata() {
+        let mut session=String::with_capacity(1024*1024);session.push_str("short-session");
+        let mut snapshot=Snapshot {session_id:Some(session),provider_exit:Some(chat::ProviderExitDiagnostic {
+            summary:"failure".into(),output:String::new(),log:Some(chat::ProviderExitLog {id:"log".into(),bytes:1,omitted:0})}),..Snapshot::default()};
+        let key=Key::from_snapshot(&snapshot).unwrap();let cloned=key.clone();
+        assert_eq!(key.session.as_deref(),Some("short-session"));
+        assert!(Arc::ptr_eq(key.session.as_ref().unwrap(),cloned.session.as_ref().unwrap()));
+        snapshot.session_id=Some("x".repeat(SESSION_BYTES));assert!(Key::from_snapshot(&snapshot).is_some());
+        snapshot.session_id=Some("x".repeat(SESSION_BYTES+1));assert!(Key::from_snapshot(&snapshot).is_none());
+    }
+    #[test]
+    fn recent_copy_requires_unchanged_current_summary_and_tail_without_wake() {
+        if isolated("recent_copy_requires_unchanged_current_summary_and_tail_without_wake") {return;}
+        for saved in [false,true] {for mutation in 0..3 {
+            let(mut app,target,handle)=fixture(b"saved diagnostic");
+            if !saved {
+                let mut snapshot=(*handle.snapshot()).clone();snapshot.provider_exit.as_mut().unwrap().log=None;
+                handle.publish_snapshot_for_test(snapshot);app.chat_runtime_mut(target).unwrap().snapshot=handle.snapshot();
+            }
+            let old=app.chat_runtime_mut(target).unwrap().snapshot.clone();
+            if mutation!=0 {
+                let mut current=(*handle.snapshot()).clone();current.generation+=1;
+                let diagnostic=current.provider_exit.as_mut().unwrap();
+                if mutation==1 {diagnostic.summary="new same-turn cause".into();} else {diagnostic.output="new same-turn recent tail".into();}
+                handle.publish_snapshot_for_test(current);
+            }
+            assert!(Arc::ptr_eq(&old,&app.chat_runtime_mut(target).unwrap().snapshot));
+            app.status=None;let task=app.handle_chat_ui(Action::CopyProviderExitRecent(target));
+            assert_eq!(iced::runtime::task::into_stream(task).is_some(),mutation==0);
+            assert_eq!(app.status.is_some(),mutation==0);
+        }}
+    }
+    #[test]
+    fn hidden_copy_then_show_schedules_current_full_disclosure_without_wake() {
+        if isolated("hidden_copy_then_show_schedules_current_full_disclosure_without_wake") {return;}
+        let _guard=chat::client::diagnostic_test_guard();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for supersede in [false,true] {
+                let body=b"complete hidden saved output";let(mut app,target,handle)=fixture(body);
+                app.chat_runtime_mut(target).unwrap().provider_exit_expanded=false;
+                let(request,completion)=held_read(&mut app,target,&handle,body,true);let old_id=request.id;
+                let task=app.handle_chat_ui(Action::ProviderExitLoaded(target,request,completion));
+                let completed=prepared_copy(task).await;
+                let Action::ProviderExitCopyReady(_,_,reply)=&completed else {unreachable!()};
+                assert!(reply.contains_text_for_test("complete hidden saved output"));
+                assert!(app.chat_runtime_mut(target).unwrap().provider_exit_output.ready.is_none());
+                let task=app.handle_chat_ui(Action::ToggleProviderExit(target));assert!(iced::runtime::task::into_stream(task).is_none());
+                if supersede {app.chat_ui.copy_intents.next();}
+                app.status=None;let task=app.handle_chat_ui(completed);
+                assert!(iced::runtime::task::into_stream(task).is_some(),"completion must explicitly schedule full saved disclosure without Wake");
+                let runtime=app.chat_runtime_mut(target).unwrap();
+                let reload=runtime.provider_exit_output.request.as_ref().expect("actual new qualified read scheduled");
+                assert_ne!(reload.request.id,old_id);assert!(!reload.request.job.cancelled());
+                assert!(runtime.provider_exit_expanded && runtime.provider_exit_output.ready.is_none());
+                if supersede {assert!(app.status.is_none());}
+                drop(app);drop(handle);wait_capacity(0);
+            }
+        });
     }
     #[test]
     fn actual_saved_copy_native_clipboard_intent_rejects_successful_late_ready() {
