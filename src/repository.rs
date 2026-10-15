@@ -8505,6 +8505,37 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_operation_proof_reports_marker_errors_without_a_model_rebuild_or_status_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let admin = root.join(".git");
+        fs::create_dir(&admin).unwrap();
+        fs::write(admin.join("HEAD"), "ref: refs/heads/main\n").unwrap();
+        fs::write(admin.join("MERGE_HEAD"), "abc\n").unwrap();
+        let mut outputs = cached_snapshot_outputs(b"", b"");
+        outputs.push(success(&snapshot_status(b"")));
+        let mut metadata_outputs = cached_snapshot_outputs(b"", b"");
+        metadata_outputs.drain(2..4);
+        outputs.extend(metadata_outputs);
+        let executor = Arc::new(FakeExecutor::with_outputs(outputs));
+        let git = RepositoryService::new("git", executor.clone());
+        let cancel = CancellationToken::default();
+        let mut cache = SnapshotCache::default();
+        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+        assert_eq!(cache.row_operation(), Some(&Ok(Some(GitOperationKind::Merge))));
+        let before = executor.commands.lock().unwrap().len();
+        fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap();
+        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
+        assert_eq!(executor.commands.lock().unwrap().len(), before + 1, "unchanged refresh still runs only status");
+        assert!(cache.row_operation().unwrap().as_ref().unwrap_err().contains("Git operation metadata"));
+        assert!(!cache.status_attempt_failed(), "marker/draft parsing failure is not a failed status command");
+        fs::remove_file(admin.join("MERGE_MSG")).unwrap();
+        fs::remove_file(admin.join("MERGE_HEAD")).unwrap();
+        assert!(git.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
+        assert_eq!(cache.row_operation(), Some(&Ok(None)));
+    }
+
+    #[test]
     fn snapshot_publication_remote_matches_direct_selection_without_an_extra_process() {
         let branch = ValidatedBranchName::parse("main").unwrap();
         for (config, expected) in [
