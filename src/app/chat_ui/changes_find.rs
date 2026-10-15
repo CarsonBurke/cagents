@@ -86,12 +86,12 @@ impl State {
         // Metadata then rename then patch for each original file index. Pending
         // boundaries must interleave with real leaves, never append wholesale.
         let order=|path:&[u32]|(path[1],if path[0]==6 {2}else {path[2]});
-        let mut positions:std::collections::BTreeMap<_,_>=suspended.iter().map(|path|(order(path),path.as_slice())).collect();
-        for leaf in leaves {positions.insert(order(&leaf.path),leaf.path.as_slice());}
-        for path in positions.values() {
-            if let Some(leaf)=leaves.iter().find(|leaf|leaf.path.as_slice()==*path) {
-                builder.indexed(item,path,leaf.text.clone(),leaf.prefixes.clone());
-            } else {builder.pending(item,path);}
+        let mut positions=std::collections::BTreeMap::new();
+        for path in suspended {positions.insert(order(path),(path.as_slice(),None));}
+        for leaf in leaves {positions.insert(order(&leaf.path),(leaf.path.as_slice(),Some(leaf)));}
+        for (path,leaf) in positions.values() {
+            if let Some(leaf)=leaf {builder.indexed(item,path,leaf.text.clone(),leaf.prefixes.clone());}
+            else {builder.pending(item,path);}
         }
     }
     fn map(&self)->HashMap<String,Arc<find::External>> {
