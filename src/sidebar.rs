@@ -1923,6 +1923,8 @@ pub struct SourceControlModel {
     pub pending_marker_approval: BTreeMap<RepoPath, crate::repository::ConflictMarkerVersion>,
     pub staged_count: usize,
     pub files: Vec<FileRow>,
+    /// The descriptor-verified target of an explicit Reveal request.
+    pub revealed_path: Option<RepoPath>,
     pub ignored_directory_errors: BTreeMap<RepoPath, String>,
     groups: Vec<ChangeGroup>,
     /// How many distinct paths the change groups hold, as the Changes tab
@@ -2096,6 +2098,7 @@ impl SourceControlModel {
             pending_marker_approval: BTreeMap::new(),
             staged_count: 0,
             files: Vec::new(),
+            revealed_path: None,
             ignored_directory_errors: BTreeMap::new(),
             groups: Vec::new(),
             change_count_label: None,
@@ -2241,6 +2244,7 @@ impl SourceControlModel {
             pending_marker_approval: BTreeMap::new(),
             staged_count,
             files,
+            revealed_path: None,
             ignored_directory_errors: snapshot.files.ignored_directory_errors.clone(),
             groups,
             change_count_label,
@@ -2986,11 +2990,14 @@ impl SidebarState {
     }
 
     pub fn finish_reveal_in_files(&mut self, source: &SourceControlModel) -> Option<Id> {
-        let requested = self.reveal_file.take()?;
-        // A deleted leaf reveals its real parent. The worker supplemented that
-        // directory explicitly, so an empty parent remains a real target.
-        let path = requested.as_path().ancestors().filter_map(|path| RepoPath::parse(path).ok())
-            .find(|path| source.files.iter().any(|row| row.path == *path))?;
+        self.reveal_file.take()?;
+        // A status decoration can retain a deleted leaf in the tree. Only the
+        // worker's descriptor-verified target may become the Reveal selection.
+        // None denotes the repository root (or an error already shown above).
+        let Some(path) = source.revealed_path.clone() else {
+            self.panel_selection = None;
+            return None;
+        };
         let mut position = 0;
         for row in &source.files {
             if row.path.as_path().ancestors().skip(1).filter(|path| !path.as_os_str().is_empty()).all(|path| RepoPath::parse(path).is_ok_and(|parent| self.expanded_directories.contains(&parent))) {
@@ -16526,6 +16533,25 @@ pub(crate) mod tests {
         status.untracked_omitted = false;
         worktree.apply_status(&status);
         assert_eq!(worktree.chrome.dirty_badge.as_deref(), Some("1 changes"));
+    }
+
+    #[test]
+    fn reveal_selects_the_verified_parent_even_when_a_deleted_leaf_is_decorated() {
+        let mut source = source_control();
+        let requested = repo_path("src/deleted.txt");
+        let parent = repo_path("src");
+        source.files = file_rows(&[requested.clone()]);
+        source.revealed_path = Some(parent.clone());
+        let mut state = panel_state(&panel_model());
+        state.reveal_in_files(requested);
+        assert_eq!(state.finish_reveal_in_files(&source), Some(file_row_focus_id(&source.key, &parent)));
+        assert_eq!(state.panel_selection, Some(PanelSelection::File(parent.clone())));
+        assert_eq!(state.files_reveal_demand(), Some(&parent));
+        state.reveal_in_files(repo_path("root-deleted.txt"));
+        source.revealed_path = None;
+        assert_eq!(state.finish_reveal_in_files(&source), None);
+        assert_eq!(state.panel_selection, None);
+        assert_eq!(state.files_reveal_demand(), None);
     }
 
     #[test]

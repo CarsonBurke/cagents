@@ -11240,6 +11240,7 @@ impl Cagents {
                     return Err("source-control read cancelled".to_owned());
                 }
                 let mut reveal_error = None;
+                let mut revealed_path = None;
                 if browse_files {
                     let ignored = service
                         .ignored_files_with_limit(&worktree, &snapshot.files.paths, options.status_limit, &cancellation)
@@ -11259,11 +11260,15 @@ impl Cagents {
                     )
                     .inspect_err(|_| cache.invalidate(false))?;
                     if let Some(path) = reveal_demand.as_ref() {
-                        reveal_error = crate::repository::include_revealed_path(&worktree, &mut snapshot.files, path).err();
+                        match crate::repository::include_revealed_path(&worktree, &mut snapshot.files, path) {
+                            Ok(target) => revealed_path = target,
+                            Err(error) => reveal_error = Some(error),
+                        }
                     }
                     cache.observe_browse(&worktree, &snapshot.files);
                 }
                 let mut model = SourceControlModel::ready_for_tab(model_key, &snapshot, browse_files);
+                model.revealed_path = revealed_path;
                 if let Some(error) = reveal_error { model.set_error(Some(format!("Could not reveal the requested path: {error}"))); }
                 if cancellation.is_cancelled() {
                     cache.invalidate(false);
