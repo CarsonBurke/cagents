@@ -29,14 +29,28 @@ pub(super) fn edit(host: &SharedHost, origin: ClientId, edit: ModelEdit) -> Resu
     // Keep this guard through publication so two concurrent clients cannot
     // publish sequence N+1 before N. No HostState operation acquires this mutex.
     let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
-    if let ModelEdit::ChangeView { scope, expected_revision, operation, .. } = &edit {
-        if !registry.view_operation_seen(*operation).map_err(unavailable)?
-            && registry.view_revision(scope).map_err(unavailable)? != *expected_revision {
-            return Err(ProtocolError::new(ProtocolErrorCode::ViewConflict,
-                "The workspace view changed; rebase this pane mutation on the current revision", true));
+    if let ModelEdit::ChangeView { scope, expected_revision, operation, change } = &edit {
+        if !registry.view_operation_seen(*operation).map_err(unavailable)? {
+            if let Some(reason) = registry.view_change_refusal(scope, change).map_err(unavailable)? {
+                return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false));
+            }
+            if registry.view_revision(scope).map_err(unavailable)? != *expected_revision {
+                return Err(ProtocolError::new(ProtocolErrorCode::ViewConflict,
+                    "The workspace view changed; rebase this pane mutation on the current revision", true));
+            }
         }
     }
     let applied = registry.apply(&edit).map_err(|error| {
+        // The independent execution connection can close a destination after
+        // preflight. The failed transaction rolled back; reclassify its exact
+        // current refusal under this same workspace writer guard.
+        if let ModelEdit::ChangeView { scope, change, .. } = &edit {
+            match registry.view_change_refusal(scope, change) {
+                Ok(Some(reason)) => return ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false),
+                Err(storage) => return unavailable(storage),
+                Ok(None) => {}
+            }
+        }
         if error == "workspace view revision conflict" {
             ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true)
         } else { unavailable(error) }
