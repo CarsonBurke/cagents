@@ -30,6 +30,7 @@ pub(crate) fn remove_actor_final_snapshot(record:&crate::daemon::holder_registry
 mod handle;
 pub use handle::Handle;
 pub(crate) use remote_actor::{ActorIdentity,ActorInspection,InputIdentity,InputReceipt,InputState,OutboxEntry};
+pub(crate) use remote_actor::{RestartFailure as RetainedRestartFailure,RestartCleanup as RetainedRestartCleanup,RestartReceipt as RetainedRestartReceipt};
 use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
@@ -316,7 +317,8 @@ impl LocalHandle {
         // process-only correction cannot prove their embedded provider cwd.
         // Typed production preparation supplies a canonical private Launch
         // before constructing either. Legacy aliases stay fail-closed.
-        let scope_observed=physical_directory.as_ref()==Some(&spec.working_directory);
+        let scope_observed=physical_directory.as_ref()==Some(&spec.working_directory)
+            && spec.execution.as_ref().map(|context|context.provider_directory_observed(&spec.working_directory)).transpose()?.unwrap_or(false);
         let directory_identity = if let Some(physical_directory)=physical_directory {
             spec.working_directory = physical_directory;
             if spec.execution.is_none() {
@@ -3694,6 +3696,13 @@ fn trim_subagent(agent: &mut Subagent) {
 
 #[cfg(test)]
 mod tests {
+    // Fake adapters carry a test-owned operational contract. Production only
+    // stamps this receipt after typed host preparation and the provider hook.
+    fn observed_fixture_directory(path:&std::path::Path)->Arc<super::super::protocol::ExecutionContext> {
+        let context=Arc::new(super::super::protocol::ExecutionContext::capture(path).unwrap());
+        context.observe_provider_directory(path).unwrap();context
+    }
+
     #[test]
     fn dropping_live_ordinary_actor_reaps_its_child_with_a_synthesized_scope_pin() {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
@@ -4063,6 +4072,19 @@ mod tests {
     }
 
     #[test]
+    fn canonical_process_directory_alone_does_not_prove_provider_thread_scope() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
+        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
+        let observation=handle.close_observation();
+        assert!(observation.directory_identity.is_none());
+        assert!(observation.working_directory.as_os_str().is_empty());
+        assert!(handle.close_if_revision(observation.close_revision).is_err());
+        handle.close().unwrap();
+    }
+
+    #[test]
     fn conditional_close_refuses_new_admitted_or_autonomous_work_but_allows_streaming() {
         struct Consent;
         impl Adapter for Consent {
@@ -4081,7 +4103,7 @@ mod tests {
             fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
         }
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
         let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};
         let store=preflight(&spec,&mut initial).unwrap();
         let handle=LocalHandle::start(spec,Box::new(Consent),initial,store,None,|_|{}).unwrap();
@@ -4171,7 +4193,7 @@ mod tests {
             fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
         }
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
         let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};
         let store=preflight(&spec,&mut initial).unwrap();
         let handle=LocalHandle::start(spec,Box::new(PromptCompact),initial,store,None,|_|{}).unwrap();
@@ -4217,7 +4239,7 @@ mod tests {
             }
         }
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"while [ ! -e \"$1/release\" ]; do sleep 0.01; done; printf '{\"turn\":true}\\n'; : > \"$1/emitted\"; exec cat".into(),"fixture".into(),directory.path().to_string_lossy().into_owned()],working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sh".into(),arguments:vec!["-c".into(),"while [ ! -e \"$1/release\" ]; do sleep 0.01; done; printf '{\"turn\":true}\\n'; : > \"$1/emitted\"; exec cat".into(),"fixture".into(),directory.path().to_string_lossy().into_owned()],working_directory:directory.path().into(),environment:BTreeMap::new()};
         let (entered,observed)=crossbeam_channel::bounded(1);let (resume,resumed)=crossbeam_channel::bounded(1);
         let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
         let handle=LocalHandle::start(spec,Box::new(Incoming{entered,resume:resumed}),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
@@ -4247,7 +4269,7 @@ mod tests {
     #[test]
     fn unobserved_native_ownership_stays_visible_without_waiting_for_holder_io() {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
         let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
         let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);handle.close().unwrap();
         // Model the resident ownership marker published by retained teardown.

@@ -84,6 +84,7 @@ struct Startup {
     directory_fd:Option<RawFd>,
     directory_identity:Option<crate::agent_execution::DirectoryIdentity>,
     mailbox_key:Option<[u8;32]>,
+    provider_directory_observed:bool,
     recovery_environment:BTreeMap<String,String>,
 }
 #[derive(Serialize,Deserialize)]
@@ -202,7 +203,8 @@ impl RemoteActor {
         let proof=source.proof.clone().ok_or("Retained actor launch lacks daemon ownership proof")?;
         let directory=spec.execution.as_ref().and_then(|context|context.directory_descriptor());
         let directory_fd=directory.as_ref().map(|file|file.as_raw_fd());
-        let request=Startup {protocol:PROTOCOL,source:source.clone(),program:spec.program,arguments:spec.arguments,environment:spec.environment,working_directory:spec.working_directory,directory_fd,directory_identity:spec.execution.as_ref().map(|context|context.directory_identity()).transpose()?.flatten(),mailbox_key:spec.messages.as_ref().map(|seal|seal.export_private_key()),recovery_environment};
+        let observed=spec.execution.as_ref().map(|context|context.provider_directory_observed(&spec.working_directory)).transpose()?.unwrap_or(false);
+        let request=Startup {protocol:PROTOCOL,source:source.clone(),program:spec.program,arguments:spec.arguments,environment:spec.environment,working_directory:spec.working_directory,directory_fd,directory_identity:spec.execution.as_ref().map(|context|context.directory_identity()).transpose()?.flatten(),mailbox_key:spec.messages.as_ref().map(|seal|seal.export_private_key()),provider_directory_observed:observed,recovery_environment};
         let (control,remote)=UnixStream::pair().map_err(|error|error.to_string())?;
         let fd=remote.as_raw_fd();
         let mut command=ChildCommand::new("/proc/self/exe");
@@ -548,9 +550,11 @@ impl Server {
         let directory=startup.directory_fd.map(|fd|unsafe {Arc::new(File::from_raw_fd(fd))});
         let mut execution=match startup.directory_identity {Some(identity)=>ExecutionContext::restored(identity),None=>ExecutionContext::new(None)};
         execution.directory=directory.clone();
+        if startup.provider_directory_observed {execution.observe_provider_directory(&startup.working_directory)?;}
         let spec=&mut spec_and_adapter.0;
         spec.program=startup.program;spec.arguments=startup.arguments;spec.environment=startup.environment;spec.working_directory=startup.working_directory;spec.unset_environment.clear();spec.execution=Some(Arc::new(execution));spec.messages=startup.mailbox_key.map(|key|Arc::new(crate::agent_execution::mailbox::Seal::new(key)));
         let environment=crate::terminal_ipc::ChatExecutionEnvironment(spec.environment.clone());
+        spec_and_adapter.1.relocate_directory(&spec.working_directory)?;
         let initial=spec_and_adapter.1.initialize()?;
         let mut initial=initial;
         let store=super::preflight(spec,&mut initial)?;
