@@ -773,10 +773,15 @@ pub fn preserve_group(group: libc::gid_t, destination: &File) -> io::Result<()> 
     // its current owner and the group comes from the retained source descriptor.
     if unsafe { libc::fchown(destination.as_raw_fd(), libc::uid_t::MAX, group) } < 0 {
         let error = io::Error::last_os_error();
-        return Err(io::Error::new(error.kind(), format!("cannot preserve source file group: {error}")));
+        return Err(io::Error::new(
+            error.kind(),
+            format!("cannot preserve source file group: {error}"),
+        ));
     }
     if destination.metadata()?.gid() != group {
-        return Err(io::Error::other("the filesystem did not preserve the source file group"));
+        return Err(io::Error::other(
+            "the filesystem did not preserve the source file group",
+        ));
     }
     Ok(())
 }
@@ -795,31 +800,31 @@ pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
 pub struct AccessAcl(Option<Vec<u8>>);
 
 impl AccessAcl {
-pub fn capture(source: &File) -> io::Result<Self> {
-    let name = c"system.posix_acl_access";
-    let value = match read_attribute(source, name) {
-        Ok(value) => value,
-        Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
-        Err(error) => return Err(error),
-    };
-    Ok(Self(value))
-}
+    pub fn capture(source: &File) -> io::Result<Self> {
+        let name = c"system.posix_acl_access";
+        let value = match read_attribute(source, name) {
+            Ok(value) => value,
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self(value))
+    }
 
-pub fn apply(&self, destination: &File) -> io::Result<()> {
-    let name = c"system.posix_acl_access";
-    if let Some(value) = &self.0 {
-        return write_attribute(destination, name, value);
-    }
-    // SAFETY: the descriptor is live and the attribute name is static.
-    let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
-    if status < 0 {
-        let error = io::Error::last_os_error();
-        if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
-            return Err(error);
+    pub fn apply(&self, destination: &File) -> io::Result<()> {
+        let name = c"system.posix_acl_access";
+        if let Some(value) = &self.0 {
+            return write_attribute(destination, name, value);
         }
+        // SAFETY: the descriptor is live and the attribute name is static.
+        let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
+        if status < 0 {
+            let error = io::Error::last_os_error();
+            if !matches!(error.raw_os_error(), Some(libc::ENODATA | libc::EOPNOTSUPP)) {
+                return Err(error);
+            }
+        }
+        Ok(())
     }
-    Ok(())
-}
 }
 
 /// Whether an attribute describes the file's content rather than the kernel's

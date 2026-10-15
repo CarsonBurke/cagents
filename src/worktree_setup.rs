@@ -16,7 +16,10 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
-    os::unix::{ffi::OsStringExt, fs::{MetadataExt, PermissionsExt}},
+    os::unix::{
+        ffi::OsStringExt,
+        fs::{MetadataExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
 };
 
@@ -86,8 +89,12 @@ impl CopyPermissions {
     }
 
     fn check(&self, source: &fs::File) -> Result<(), SetupError> {
-        if source_fingerprint(&source.metadata().map_err(error)?) != source_fingerprint(&self.metadata) {
-            return Err(error("source changed during setup copy; the worktree was kept"));
+        if source_fingerprint(&source.metadata().map_err(error)?)
+            != source_fingerprint(&self.metadata)
+        {
+            return Err(error(
+                "source changed during setup copy; the worktree was kept",
+            ));
         }
         Ok(())
     }
@@ -98,7 +105,9 @@ impl CopyPermissions {
         self.check(source)?;
         fs_safety::preserve_group(self.metadata.gid(), destination).map_err(error)?;
         self.acl.apply(destination).map_err(error)?;
-        destination.set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777)).map_err(error)
+        destination
+            .set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777))
+            .map_err(error)
     }
 }
 
@@ -427,14 +436,21 @@ fn prepare_inner(
     let source = fs_safety::Root::open(primary).map_err(error)?;
     let target = fs_safety::Root::open(destination).map_err(error)?;
     let verify_generation = || -> Result<(), SetupError> {
-        let Some(creation) = creation else { return Ok(()); };
+        let Some(creation) = creation else {
+            return Ok(());
+        };
         use std::os::unix::fs::MetadataExt;
         let held = target.metadata().map_err(error)?;
         let named = fs::symlink_metadata(destination).map_err(error)?;
         let admin = service.git_dir(destination, cancel).map_err(error)?;
-        if !named.is_dir() || held.dev() != named.dev() || held.ino() != named.ino()
-            || !crate::repository::worktree_setup_marker_matches(&admin, creation).map_err(error)? {
-            return Err(error("The setup checkout creation generation changed; review the current checkout explicitly"));
+        if !named.is_dir()
+            || held.dev() != named.dev()
+            || held.ino() != named.ino()
+            || !crate::repository::worktree_setup_marker_matches(&admin, creation).map_err(error)?
+        {
+            return Err(error(
+                "The setup checkout creation generation changed; review the current checkout explicitly",
+            ));
         }
         Ok(())
     };
@@ -754,7 +770,10 @@ mod tests {
         let result = fixture.prepare(&plan);
         fs::set_permissions(&fixture.primary, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap().copied, [PathBuf::from(".env")]);
-        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"secret");
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"secret"
+        );
     }
 
     #[test]
@@ -784,12 +803,26 @@ mod tests {
         let snapshot = CopyPermissions::capture(&input).unwrap();
         let mut private = vec![b'p'; 65536];
         private.extend_from_slice(b"new private bytes");
-        let mut reader = RewritingReader { input: input.try_clone().unwrap(), path: path.clone(), rewrite: Some(private) };
+        let mut reader = RewritingReader {
+            input: input.try_clone().unwrap(),
+            path: path.clone(),
+            rewrite: Some(private),
+        };
         let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
         let mut output = temporary.reopen().unwrap();
         std::io::copy(&mut reader, &mut output).unwrap();
-        assert!(fs::read(temporary.path()).unwrap().ends_with(b"new private bytes"));
-        assert!(snapshot.apply(&input, &output).unwrap_err().to_string().contains("source changed"));
+        assert!(
+            fs::read(temporary.path())
+                .unwrap()
+                .ends_with(b"new private bytes")
+        );
+        assert!(
+            snapshot
+                .apply(&input, &output)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
         assert_eq!(output.metadata().unwrap().mode() & 0o777, 0o600);
         assert!(!fixture.destination.join(".env").exists());
         assert!(fixture.destination.join("tracked").exists());
@@ -806,7 +839,13 @@ mod tests {
         let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
         snapshot.apply(&input, temporary.as_file()).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(snapshot.check(&input).unwrap_err().to_string().contains("source changed"));
+        assert!(
+            snapshot
+                .check(&input)
+                .unwrap_err()
+                .to_string()
+                .contains("source changed")
+        );
         assert!(!fixture.destination.join(".env").exists());
     }
 
@@ -815,8 +854,18 @@ mod tests {
         use std::os::fd::AsRawFd;
         fn write_acl(file: &fs::File, name: &std::ffi::CStr, value: &[u8]) -> bool {
             // SAFETY: file and both borrowed buffers outlive this call.
-            let result = unsafe { libc::fsetxattr(file.as_raw_fd(), name.as_ptr(), value.as_ptr().cast(), value.len(), 0) };
-            if result == 0 { return true; }
+            let result = unsafe {
+                libc::fsetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            };
+            if result == 0 {
+                return true;
+            }
             let error = std::io::Error::last_os_error();
             if matches!(error.raw_os_error(), Some(libc::EOPNOTSUPP | libc::EINVAL)) {
                 eprintln!("SETUP_ACL_FIXTURE_UNSUPPORTED: {error}");
@@ -827,7 +876,9 @@ mod tests {
         fn read_acl(file: &fs::File) -> Option<Vec<u8>> {
             let name = c"system.posix_acl_access";
             // SAFETY: file/name remain live; null with zero size queries length.
-            let size = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+            let size = unsafe {
+                libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0)
+            };
             if size < 0 {
                 let error = std::io::Error::last_os_error();
                 assert_eq!(error.raw_os_error(), Some(libc::ENODATA), "{error}");
@@ -835,7 +886,14 @@ mod tests {
             }
             let mut value = vec![0u8; size as usize];
             // SAFETY: value is writable for its entire passed length.
-            let read = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), value.as_mut_ptr().cast(), value.len()) };
+            let read = unsafe {
+                libc::fgetxattr(
+                    file.as_raw_fd(),
+                    name.as_ptr(),
+                    value.as_mut_ptr().cast(),
+                    value.len(),
+                )
+            };
             assert_eq!(read, size);
             Some(value)
         }
@@ -847,27 +905,48 @@ mod tests {
         // group itself has no access. A mode-only copy would broaden access.
         let mut acl = 2_u32.to_le_bytes().to_vec();
         for (tag, permissions, id) in [
-            (0x01_u16, 6_u16, u32::MAX), (0x02, 4, 12_345),
-            (0x04, 0, u32::MAX), (0x10, 4, u32::MAX), (0x20, 0, u32::MAX),
+            (0x01_u16, 6_u16, u32::MAX),
+            (0x02, 4, 12_345),
+            (0x04, 0, u32::MAX),
+            (0x10, 4, u32::MAX),
+            (0x20, 0, u32::MAX),
         ] {
             acl.extend_from_slice(&tag.to_le_bytes());
             acl.extend_from_slice(&permissions.to_le_bytes());
             acl.extend_from_slice(&id.to_le_bytes());
         }
-        if !write_acl(&source, c"system.posix_acl_access", &acl) { return; }
-        assert_eq!(source.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+        if !write_acl(&source, c"system.posix_acl_access", &acl) {
+            return;
+        }
+        assert_eq!(
+            source.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
         let parent = fs::File::open(&fixture.destination).unwrap();
         assert!(write_acl(&parent, c"system.posix_acl_default", &acl));
-        fs::set_permissions(fixture.primary.join(".env.plain"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(
+            fixture.primary.join(".env.plain"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
         let plan = fixture.config("copy = ['.env*']");
         assert_eq!(fixture.prepare(&plan).unwrap().copied.len(), 2);
         let restricted = fs::File::open(fixture.destination.join(".env.restricted")).unwrap();
         let plain = fs::File::open(fixture.destination.join(".env.plain")).unwrap();
         assert_eq!(read_acl(&restricted), Some(acl));
         assert_eq!(read_acl(&plain), None);
-        assert_eq!(plain.metadata().unwrap().permissions().mode() & 0o777, 0o640);
-        assert_eq!(fs::read(fixture.destination.join(".env.restricted")).unwrap(), b"restricted");
-        assert_eq!(fs::read(fixture.destination.join(".env.plain")).unwrap(), b"plain");
+        assert_eq!(
+            plain.metadata().unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join(".env.restricted")).unwrap(),
+            b"restricted"
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join(".env.plain")).unwrap(),
+            b"plain"
+        );
         println!("SETUP_ACL_COPY_VERIFIED");
     }
 
@@ -876,7 +955,11 @@ mod tests {
         use std::os::unix::fs::MetadataExt;
         let fixture = Fixture::new();
         fs::write(fixture.primary.join(".env"), "private source group").unwrap();
-        fs::set_permissions(fixture.primary.join(".env"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::set_permissions(
+            fixture.primary.join(".env"),
+            fs::Permissions::from_mode(0o640),
+        )
+        .unwrap();
         let source_group = fs::metadata(fixture.primary.join(".env")).unwrap().gid();
         // SAFETY: null/zero queries the supplementary group count.
         let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
@@ -884,7 +967,8 @@ mod tests {
         let mut groups = vec![0 as libc::gid_t; count as usize];
         // SAFETY: groups is writable for count gid_t values.
         assert!(unsafe { libc::getgroups(count, groups.as_mut_ptr()) } >= 0);
-        let Some(destination_group) = groups.into_iter().find(|group| *group != source_group) else {
+        let Some(destination_group) = groups.into_iter().find(|group| *group != source_group)
+        else {
             eprintln!("SETUP_GROUP_FIXTURE_NO_ALTERNATE_GROUP");
             return;
         };
@@ -895,8 +979,14 @@ mod tests {
         let copied = fs::metadata(fixture.destination.join(".env")).unwrap();
         assert_eq!(copied.gid(), source_group);
         assert_eq!(copied.permissions().mode() & 0o777, 0o640);
-        assert_eq!(fs::metadata(&fixture.destination).unwrap().gid(), destination_group);
-        assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"private source group");
+        assert_eq!(
+            fs::metadata(&fixture.destination).unwrap().gid(),
+            destination_group
+        );
+        assert_eq!(
+            fs::read(fixture.destination.join(".env")).unwrap(),
+            b"private source group"
+        );
         println!("SETUP_GROUP_COPY_VERIFIED");
     }
 
@@ -930,7 +1020,13 @@ mod tests {
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join(".env"), "deep secret").unwrap();
         let plan = fixture.config("copy = ['**/.env']");
-        assert!(fixture.prepare(&plan).unwrap_err().to_string().contains("64 directory levels"));
+        assert!(
+            fixture
+                .prepare(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("64 directory levels")
+        );
         assert_eq!(fs::read(directory.join(".env")).unwrap(), b"deep secret");
         assert!(fixture.destination.join("tracked").exists());
         assert!(!fixture.destination.join("nested").exists());
@@ -1113,7 +1209,11 @@ mod tests {
         let other_plan = other.config(config);
         trust(&other.primary, &other_plan, &CancellationToken::new()).unwrap();
         fs::write(fixture.primary.join(".env"), "secret").unwrap();
-        fs::write(fixture.primary.join("tracked"), "must not restore deleted tracked file").unwrap();
+        fs::write(
+            fixture.primary.join("tracked"),
+            "must not restore deleted tracked file",
+        )
+        .unwrap();
         fs::remove_file(fixture.destination.join("tracked")).unwrap();
         // Isolate environment mutation in a subprocess so other parallel tests
         // never inherit these intentionally hostile redirections.
@@ -1128,7 +1228,10 @@ mod tests {
             .env("GIT_DIR", other.primary.join(".git"))
             .env("GIT_WORK_TREE", &other.primary)
             .env("GIT_COMMON_DIR", other.primary.join(".git"))
-            .env("GIT_INDEX_FILE", fixture._directory.path().join("missing-index"))
+            .env(
+                "GIT_INDEX_FILE",
+                fixture._directory.path().join("missing-index"),
+            )
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");

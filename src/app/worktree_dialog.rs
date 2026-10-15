@@ -187,7 +187,10 @@ struct Resolution {
 #[derive(Debug, Clone)]
 enum LinearLookup {
     None,
-    Pending { id: OperationId, token: CancellationToken },
+    Pending {
+        id: OperationId,
+        token: CancellationToken,
+    },
     Ready(crate::linear::IssuePreview),
     Unavailable(String),
 }
@@ -252,12 +255,18 @@ impl WorktreeDialog {
             return;
         }
         self.focused_field = Some(field);
-        let value = if field == WorktreeField::Branch { super::worktree_choices::sanitize_branch(&value) } else { value };
+        let value = if field == WorktreeField::Branch {
+            super::worktree_choices::sanitize_branch(&value)
+        } else {
+            value
+        };
         self.submit_after_linear = false;
         self.submit_after_choices = false;
         if field == WorktreeField::Branch {
             self.draft.selected_branch_reference = None;
-            if let LinearLookup::Pending { token, .. } = &self.linear { token.cancel(); }
+            if let LinearLookup::Pending { token, .. } = &self.linear {
+                token.cancel();
+            }
             self.linear = LinearLookup::None;
             self.submit_after_linear = false;
         }
@@ -314,15 +323,20 @@ impl WorktreeDialog {
     }
 
     fn effective_branch(&self) -> Result<String, crate::repository::ValidationError> {
-        crate::repository::worktree_branch_input(self.branch_input()).map(|branch| self.choices.effective_branch(&branch))
+        crate::repository::worktree_branch_input(self.branch_input())
+            .map(|branch| self.choices.effective_branch(&branch))
     }
 
     pub fn focus_field(&mut self, field: WorktreeField) {
-        if self.resolving.is_none() { self.focused_field = Some(field); }
+        if self.resolving.is_none() {
+            self.focused_field = Some(field);
+        }
     }
 
     pub fn dismiss_suggestions(&mut self, field: WorktreeField) {
-        if self.focused_field == Some(field) { self.focused_field = None; }
+        if self.focused_field == Some(field) {
+            self.focused_field = None;
+        }
     }
 
     pub fn edit_prefix(&mut self, value: String) {
@@ -352,8 +366,11 @@ impl WorktreeDialog {
     }
 
     fn setup_approved(&self) -> bool {
-        self.draft.skip_setup || (self.choices.setup_error.is_none() &&
-            self.choices.setup_plan.as_ref().is_none_or(|plan| !plan.requires_trust() || self.choices.setup_trusted || self.trust_setup))
+        self.draft.skip_setup
+            || (self.choices.setup_error.is_none()
+                && self.choices.setup_plan.as_ref().is_none_or(|plan| {
+                    !plan.requires_trust() || self.choices.setup_trusted || self.trust_setup
+                }))
     }
 
     fn choices_task(&mut self) -> Task<Message> {
@@ -362,72 +379,127 @@ impl WorktreeDialog {
         self.choices_request = Some((id, token.clone()));
         let repository = self.repository.clone();
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || super::worktree_choices::Choices::load(&repository, &token))
-                .await.map_err(|error| error.to_string()).and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || {
+                super::worktree_choices::Choices::load(&repository, &token)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
             Message::WorktreeChoicesResolved { id, result }
         })
     }
 
     fn suggestions(&self, field: WorktreeField, editable: bool) -> Option<Element<'_, Message>> {
-        if !editable || self.focused_field != Some(field) || self.choices_request.is_some() { return None; }
+        if !editable || self.focused_field != Some(field) || self.choices_request.is_some() {
+            return None;
+        }
         let query = match field {
             WorktreeField::Branch => self.draft.branch.as_str(),
             WorktreeField::Base => self.draft.base.as_str(),
             WorktreeField::Destination => return None,
         };
-        if query.contains("://") { return None; }
-        let choices = self.choices.suggestions(query, field == WorktreeField::Base);
-        if choices.is_empty() { return None; }
-        let rows = choices.into_iter().map(|choice| {
-            let kind = match choice.kind { super::worktree_choices::Kind::Local => "local", super::worktree_choices::Kind::Remote => "remote", super::worktree_choices::Kind::Tag => "tag" };
-            crate::ui_controls::button::quiet(format!("{} · {kind}", choice.name))
-                .width(Length::Fill)
-                .on_press(Message::WorktreeChoiceSelected { field, reference: choice.reference.clone() }).into()
-        }).collect::<Vec<Element<'_, Message>>>();
-        Some(widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::XS)))
-            .width(432.0).max_height(216.0).into())
+        if query.contains("://") {
+            return None;
+        }
+        let choices = self
+            .choices
+            .suggestions(query, field == WorktreeField::Base);
+        if choices.is_empty() {
+            return None;
+        }
+        let rows = choices
+            .into_iter()
+            .map(|choice| {
+                let kind = match choice.kind {
+                    super::worktree_choices::Kind::Local => "local",
+                    super::worktree_choices::Kind::Remote => "remote",
+                    super::worktree_choices::Kind::Tag => "tag",
+                };
+                crate::ui_controls::button::quiet(format!("{} · {kind}", choice.name))
+                    .width(Length::Fill)
+                    .on_press(Message::WorktreeChoiceSelected {
+                        field,
+                        reference: choice.reference.clone(),
+                    })
+                    .into()
+            })
+            .collect::<Vec<Element<'_, Message>>>();
+        Some(
+            widget::container(widget::scrollable(
+                widget::column::with_children(rows).spacing(space::XS),
+            ))
+            .width(432.0)
+            .max_height(216.0)
+            .into(),
+        )
     }
 
     fn linear_note(&self) -> Option<String> {
         match &self.linear {
-            LinearLookup::None => self.branch_preview().map(|branch| format!("Branch: {branch}")),
+            LinearLookup::None => self
+                .branch_preview()
+                .map(|branch| format!("Branch: {branch}")),
             LinearLookup::Pending { .. } => Some("Fetching Linear issue…".into()),
-            LinearLookup::Ready(issue) => Some(format!("{}: {} · {} → branch {}", issue.identifier, issue.title, issue.state, issue.branch_name)),
+            LinearLookup::Ready(issue) => Some(format!(
+                "{}: {} · {} → branch {}",
+                issue.identifier, issue.title, issue.state, issue.branch_name
+            )),
             LinearLookup::Unavailable(reason) => {
                 let branch = crate::repository::worktree_branch_input(&self.draft.branch)
                     .unwrap_or_else(|_| self.draft.branch.clone());
-                Some(format!("Issue not fetched: {reason}. Branch: {branch}; the checkout will not be linked."))
-            },
+                Some(format!(
+                    "Issue not fetched: {reason}. Branch: {branch}; the checkout will not be linked."
+                ))
+            }
         }
     }
 
     fn lookup(&mut self) -> Task<Message> {
-        let Ok(reference) = crate::linear::issue_reference(&self.draft.branch) else { return Task::none() };
+        let Ok(reference) = crate::linear::issue_reference(&self.draft.branch) else {
+            return Task::none();
+        };
         let id = OperationId::new();
         let token = CancellationToken::new();
-        self.linear = LinearLookup::Pending { id, token: token.clone() };
+        self.linear = LinearLookup::Pending {
+            id,
+            token: token.clone(),
+        };
         cosmic::task::future(async move {
             tokio::time::sleep(Duration::from_millis(350)).await;
             let result = if token.is_cancelled() {
                 Err("Lookup cancelled".into())
             } else {
                 tokio::task::spawn_blocking(move || {
-                    if token.is_cancelled() { return Err("Lookup cancelled".into()); }
-                    crate::linear::IssuePreview::fetch(&reference, None).map_err(|error| error.message)
-                }).await.map_err(|_| "Linear worker unavailable".to_owned()).and_then(|result| result)
+                    if token.is_cancelled() {
+                        return Err("Lookup cancelled".into());
+                    }
+                    crate::linear::IssuePreview::fetch(&reference, None)
+                        .map_err(|error| error.message)
+                })
+                .await
+                .map_err(|_| "Linear worker unavailable".to_owned())
+                .and_then(|result| result)
             };
             Message::WorktreeLinearResolved { id, result }
         })
     }
 
     fn can_submit(&self) -> bool {
-        self.resolving.is_none() && self.choices_request.is_none() && self.setup_approved() && !matches!(self.linear, LinearLookup::Pending { .. }) && !self.draft.branch.trim().is_empty()
+        self.resolving.is_none()
+            && self.choices_request.is_none()
+            && self.setup_approved()
+            && !matches!(self.linear, LinearLookup::Pending { .. })
+            && !self.draft.branch.trim().is_empty()
     }
 
     /// Stops a resolution the user no longer wants.
     pub fn cancel(&self) {
-        if let Some((_, token)) = &self.choices_request { token.cancel(); }
-        if let LinearLookup::Pending { token, .. } = &self.linear { token.cancel(); }
+        if let Some((_, token)) = &self.choices_request {
+            token.cancel();
+        }
+        if let LinearLookup::Pending { token, .. } = &self.linear {
+            token.cancel();
+        }
         if let Some(resolution) = &self.resolving {
             resolution.token.cancel();
         }
@@ -458,19 +530,34 @@ impl Cagents {
     }
 
     pub(super) fn edit_worktree_branch(&mut self, value: String) -> Task<Message> {
-        let Some(dialog) = self.worktree_dialog.as_mut() else { return Task::none() };
-        if dialog.resolving.is_some() { return Task::none() }
+        let Some(dialog) = self.worktree_dialog.as_mut() else {
+            return Task::none();
+        };
+        if dialog.resolving.is_some() {
+            return Task::none();
+        }
         dialog.edit(WorktreeField::Branch, value);
         dialog.lookup()
     }
 
-    pub(super) fn finish_worktree_linear(&mut self, id: OperationId, result: Result<crate::linear::IssuePreview, String>) -> Task<Message> {
+    pub(super) fn finish_worktree_linear(
+        &mut self,
+        id: OperationId,
+        result: Result<crate::linear::IssuePreview, String>,
+    ) -> Task<Message> {
         if let Some(dialog) = self.worktree_dialog.as_mut()
             && matches!(&dialog.linear, LinearLookup::Pending { id: pending, .. } if *pending == id)
         {
             dialog.linear = match result {
-                Ok(issue) if crate::repository::ValidatedBranchName::parse(&issue.branch_name).is_ok() => LinearLookup::Ready(issue),
-                Ok(_) => LinearLookup::Unavailable("Linear suggested an invalid branch name".into()),
+                Ok(issue)
+                    if crate::repository::ValidatedBranchName::parse(&issue.branch_name)
+                        .is_ok() =>
+                {
+                    LinearLookup::Ready(issue)
+                }
+                Ok(_) => {
+                    LinearLookup::Unavailable("Linear suggested an invalid branch name".into())
+                }
                 Err(reason) => LinearLookup::Unavailable(reason),
             };
             if std::mem::take(&mut dialog.submit_after_linear)
@@ -482,30 +569,64 @@ impl Cagents {
         Task::none()
     }
 
-    pub(super) fn finish_worktree_choices(&mut self, id: OperationId, result: Result<super::worktree_choices::Choices, String>) -> Task<Message> {
-        let Some(dialog) = self.worktree_dialog.as_mut().filter(|dialog| dialog.choices_request.as_ref().is_some_and(|(pending, _)| *pending == id)) else { return Task::none(); };
+    pub(super) fn finish_worktree_choices(
+        &mut self,
+        id: OperationId,
+        result: Result<super::worktree_choices::Choices, String>,
+    ) -> Task<Message> {
+        let Some(dialog) = self.worktree_dialog.as_mut().filter(|dialog| {
+            dialog
+                .choices_request
+                .as_ref()
+                .is_some_and(|(pending, _)| *pending == id)
+        }) else {
+            return Task::none();
+        };
         dialog.choices_request = None;
         match result {
             Ok(mut choices) => {
-                if dialog.prefix_dirty { choices.prefix.clone_from(&dialog.choices.prefix); }
+                if dialog.prefix_dirty {
+                    choices.prefix.clone_from(&dialog.choices.prefix);
+                }
                 dialog.choices = choices;
             }
             Err(error) => {
                 dialog.choices_error = Some(error.clone());
-                dialog.choices.setup_error = Some(format!("Project setup could not be inspected: {error}. Retry opening the dialog, or explicitly skip setup."));
+                dialog.choices.setup_error = Some(format!(
+                    "Project setup could not be inspected: {error}. Retry opening the dialog, or explicitly skip setup."
+                ));
             }
         }
-        if std::mem::take(&mut dialog.submit_after_choices) { return self.submit_worktree_dialog(); }
+        if std::mem::take(&mut dialog.submit_after_choices) {
+            return self.submit_worktree_dialog();
+        }
         Task::none()
     }
 
-    pub(super) fn select_worktree_choice(&mut self, field: WorktreeField, reference: String) -> Task<Message> {
-        let Some(dialog) = self.worktree_dialog.as_mut() else { return Task::none(); };
-        if dialog.resolving.is_some() { return Task::none(); }
-        let Some(choice) = dialog.choices.find(&reference) else { return Task::none(); };
-        let value = if field == WorktreeField::Base { choice.reference.clone() } else { choice.name.clone() };
+    pub(super) fn select_worktree_choice(
+        &mut self,
+        field: WorktreeField,
+        reference: String,
+    ) -> Task<Message> {
+        let Some(dialog) = self.worktree_dialog.as_mut() else {
+            return Task::none();
+        };
+        if dialog.resolving.is_some() {
+            return Task::none();
+        }
+        let Some(choice) = dialog.choices.find(&reference) else {
+            return Task::none();
+        };
+        let value = if field == WorktreeField::Base {
+            choice.reference.clone()
+        } else {
+            choice.name.clone()
+        };
         dialog.edit(field, value);
-        if field == WorktreeField::Branch { dialog.draft.base.clear(); dialog.draft.selected_branch_reference = Some(reference); }
+        if field == WorktreeField::Branch {
+            dialog.draft.base.clear();
+            dialog.draft.selected_branch_reference = Some(reference);
+        }
         dialog.focused_field = None;
         Task::none()
     }
@@ -552,22 +673,42 @@ impl Cagents {
         let project_id = dialog.project_id;
         let draft = dialog.draft.clone();
         let linear_issue = match &dialog.linear {
-            LinearLookup::Ready(issue) => Some(crate::linear::context::LinkedIssue { issue_id: issue.id.clone(), workspace: None }),
+            LinearLookup::Ready(issue) => Some(crate::linear::context::LinkedIssue {
+                issue_id: issue.id.clone(),
+                workspace: None,
+            }),
             _ => None,
         };
-        let setup_intent = (dialog.choices.setup_plan.is_some() || dialog.draft.skip_setup)
-            .then(|| super::worktree_setup_ui::SetupIntent {
-                primary: dialog.choices.primary.clone(), plan: dialog.choices.setup_plan.clone(),
-                skip: dialog.draft.skip_setup, run_id: Some(operation_id), copy_done: false,
+        let setup_intent =
+            (dialog.choices.setup_plan.is_some() || dialog.draft.skip_setup).then(|| {
+                super::worktree_setup_ui::SetupIntent {
+                    primary: dialog.choices.primary.clone(),
+                    plan: dialog.choices.setup_plan.clone(),
+                    skip: dialog.draft.skip_setup,
+                    run_id: Some(operation_id),
+                    copy_done: false,
+                }
             });
         let selected_ref = dialog.draft.selected_branch_reference.clone();
         let prefix = dialog.prefix_dirty.then(|| dialog.choices.prefix.clone());
-        let trust = (dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted)
-            .then(|| dialog.choices.primary.clone().zip(dialog.choices.setup_plan.clone())).flatten();
-        let branch = dialog.effective_branch().expect("branch was validated before resolving");
+        let trust =
+            (dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted)
+                .then(|| {
+                    dialog
+                        .choices
+                        .primary
+                        .clone()
+                        .zip(dialog.choices.setup_plan.clone())
+                })
+                .flatten();
+        let branch = dialog
+            .effective_branch()
+            .expect("branch was validated before resolving");
         let input = WorktreeInput {
             repository: dialog.repository.clone(),
-            base: dialog.choices.creation_base(&branch, &draft.base, selected_ref.as_deref()),
+            base: dialog
+                .choices
+                .creation_base(&branch, &draft.base, selected_ref.as_deref()),
             input: branch,
             managed_directory,
             destination: draft.destination.clone(),
@@ -576,7 +717,8 @@ impl Cagents {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 if let Some((primary, plan)) = trust {
-                    crate::worktree_setup::trust(&primary, &plan, &token).map_err(|error| WorktreeInputError::general(error.to_string()))?;
+                    crate::worktree_setup::trust(&primary, &plan, &token)
+                        .map_err(|error| WorktreeInputError::general(error.to_string()))?;
                 }
                 if let Some(prefix) = prefix {
                     super::worktree_choices::save_prefix(&input.repository, &prefix, &token)
@@ -584,7 +726,11 @@ impl Cagents {
                 }
                 RepositoryService::system("git")
                     .resolve_worktree_request_selected(&input, selected_ref.as_deref(), &token)
-                    .map(|mut request| { request.linear_issue = linear_issue; request.setup_intent = setup_intent; request })
+                    .map(|mut request| {
+                        request.linear_issue = linear_issue;
+                        request.setup_intent = setup_intent;
+                        request
+                    })
                     .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
             })
             .await
@@ -705,8 +851,12 @@ impl Cagents {
             if let Some(error) = field_error(field) {
                 input = input.error(error);
             }
-            crate::ui_controls::popover(input, dialog.suggestions(field, editable), widget::popover::Position::Bottom,
-                Message::WorktreeSuggestionsDismissed(field))
+            crate::ui_controls::popover(
+                input,
+                dialog.suggestions(field, editable),
+                widget::popover::Position::Bottom,
+                Message::WorktreeSuggestionsDismissed(field),
+            )
         };
         let project = self
             .sidebar_model
@@ -757,15 +907,26 @@ impl Cagents {
         let outcome = if dialog.draft.branch.trim().is_empty() {
             iced::widget::Space::new().into()
         } else {
-            let branch = crate::repository::worktree_branch_input(dialog.branch_input()).unwrap_or_else(|_| dialog.draft.branch.clone());
-            design::caption(dialog.choices.outcome_selected(&branch, &dialog.draft.base, dialog.draft.selected_branch_reference.as_deref())).into()
+            let branch = crate::repository::worktree_branch_input(dialog.branch_input())
+                .unwrap_or_else(|_| dialog.draft.branch.clone());
+            design::caption(dialog.choices.outcome_selected(
+                &branch,
+                &dialog.draft.base,
+                dialog.draft.selected_branch_reference.as_deref(),
+            ))
+            .into()
         };
         rows.insert(2, outcome);
         rows.push(match &dialog.choices_error {
-            Some(error) => design::caption(format!("Branch suggestions unavailable: {error}")).into(),
+            Some(error) => {
+                design::caption(format!("Branch suggestions unavailable: {error}")).into()
+            }
             None => iced::widget::Space::new().into(),
         });
-        rows.push(design::caption("Uses locally available refs; remote defaults are not refreshed.").into());
+        rows.push(
+            design::caption("Uses locally available refs; remote defaults are not refreshed.")
+                .into(),
+        );
         if dialog.advanced {
             rows.push(field(
                 "Base branch (optional)",
@@ -808,22 +969,58 @@ impl Cagents {
             ));
         }
         if let Some(plan) = &dialog.choices.setup_plan {
-            if !plan.copy.is_empty() { rows.push(design::caption(format!("Copies from the primary checkout: {}", plan.copy.join(", "))).into()); }
+            if !plan.copy.is_empty() {
+                rows.push(
+                    design::caption(format!(
+                        "Copies from the primary checkout: {}",
+                        plan.copy.join(", ")
+                    ))
+                    .into(),
+                );
+            }
             if !plan.commands.is_empty() {
-                rows.push(design::caption("Setup commands (run in an interactive terminal in the new worktree)").into());
-                rows.push(widget::scrollable(widget::selectable_text(plan.commands.join("\n")).size(design::TEXT_BODY))
-                    .height(96.0).into());
+                rows.push(
+                    design::caption(
+                        "Setup commands (run in an interactive terminal in the new worktree)",
+                    )
+                    .into(),
+                );
+                rows.push(
+                    widget::scrollable(
+                        widget::selectable_text(plan.commands.join("\n")).size(design::TEXT_BODY),
+                    )
+                    .height(96.0)
+                    .into(),
+                );
                 if !dialog.choices.setup_trusted {
-                    rows.push(crate::ui_controls::field::checkbox(dialog.trust_setup)
-                        .label("Trust these setup commands for this project")
-                        .on_toggle_maybe(editable.then_some(Message::WorktreeSetupTrustChanged as fn(bool) -> Message)).into());
-                } else { rows.push(design::caption("Setup commands are trusted for this project.").into()); }
+                    rows.push(
+                        crate::ui_controls::field::checkbox(dialog.trust_setup)
+                            .label("Trust these setup commands for this project")
+                            .on_toggle_maybe(editable.then_some(
+                                Message::WorktreeSetupTrustChanged as fn(bool) -> Message,
+                            ))
+                            .into(),
+                    );
+                } else {
+                    rows.push(
+                        design::caption("Setup commands are trusted for this project.").into(),
+                    );
+                }
             }
         }
-        if let Some(error) = &dialog.choices.setup_error { rows.push(error_note(error)); }
+        if let Some(error) = &dialog.choices.setup_error {
+            rows.push(error_note(error));
+        }
         if dialog.choices.setup_plan.is_some() || dialog.choices.setup_error.is_some() {
-            rows.push(crate::ui_controls::field::checkbox(dialog.draft.skip_setup).label("Skip setup for this worktree")
-                .on_toggle_maybe(editable.then_some(Message::WorktreeSetupSkipChanged as fn(bool) -> Message)).into());
+            rows.push(
+                crate::ui_controls::field::checkbox(dialog.draft.skip_setup)
+                    .label("Skip setup for this worktree")
+                    .on_toggle_maybe(
+                        editable
+                            .then_some(Message::WorktreeSetupSkipChanged as fn(bool) -> Message),
+                    )
+                    .into(),
+            );
         }
         if let Some(error) = dialog.error.as_ref().filter(|error| error.field.is_none()) {
             rows.push(
@@ -853,13 +1050,28 @@ impl Cagents {
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.worktree.cancel"))
                 .on_press(Message::CancelDialog),
-            crate::ui_controls::button::primary(if dialog.resolving.is_some() { "Creating…" } else { "Create worktree" })
-                .id(widget::Id::new("dialog.worktree.create"))
-                .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree)),
+            crate::ui_controls::button::primary(if dialog.resolving.is_some() {
+                "Creating…"
+            } else {
+                "Create worktree"
+            })
+            .id(widget::Id::new("dialog.worktree.create"))
+            .on_press_maybe(dialog.can_submit().then_some(Message::SubmitWorktree)),
         );
-        let form = widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::M)).height(Length::Shrink))
-            .max_height((self.window_height - 220.0).max(120.0));
-        let content = widget::column::with_children(vec![form.into(), widget::container(status).height(24.0).width(Length::Fill).into(), actions]).spacing(space::M);
+        let form = widget::container(
+            widget::scrollable(widget::column::with_children(rows).spacing(space::M))
+                .height(Length::Shrink),
+        )
+        .max_height((self.window_height - 220.0).max(120.0));
+        let content = widget::column::with_children(vec![
+            form.into(),
+            widget::container(status)
+                .height(24.0)
+                .width(Length::Fill)
+                .into(),
+            actions,
+        ])
+        .spacing(space::M);
         Some((
             dialog_ui::surface(content, 520.0),
             editable.then_some(Message::CancelDialog),
@@ -941,7 +1153,11 @@ mod tests {
     }
 
     fn refs_loaded(app: &mut Cagents) {
-        if let Some(id) = app.worktree_dialog.as_ref().and_then(|dialog| dialog.choices_request.as_ref().map(|(id, _)| *id)) {
+        if let Some(id) = app
+            .worktree_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.choices_request.as_ref().map(|(id, _)| *id))
+        {
             drop(app.finish_worktree_choices(id, Ok(Default::default())));
         }
     }
@@ -960,9 +1176,15 @@ mod tests {
 
     #[test]
     fn setup_requires_explicit_trust_or_per_creation_skip() {
-        let mut dialog = WorktreeDialog::new(ProjectId::new(), "/repo".into(), WorktreeDraft::branch("feature/setup"));
+        let mut dialog = WorktreeDialog::new(
+            ProjectId::new(),
+            "/repo".into(),
+            WorktreeDraft::branch("feature/setup"),
+        );
         dialog.choices.setup_plan = Some(crate::worktree_setup::SetupPlan {
-            copy: vec![".env".into()], commands: vec!["pnpm install".into()], fingerprint: "a".repeat(64),
+            copy: vec![".env".into()],
+            commands: vec!["pnpm install".into()],
+            fingerprint: "a".repeat(64),
         });
         assert!(!dialog.setup_approved());
         assert!(!dialog.can_submit());
@@ -980,11 +1202,15 @@ mod tests {
 
     #[test]
     fn branch_input_sanitizes_pasted_titles_applies_prefix_and_rejects_dot_components() {
-        let mut dialog = WorktreeDialog::new(ProjectId::new(), "/repo".into(), WorktreeDraft::default());
+        let mut dialog =
+            WorktreeDialog::new(ProjectId::new(), "/repo".into(), WorktreeDraft::default());
         dialog.edit_prefix("agent/".into());
         dialog.edit(WorktreeField::Branch, "Fix Login Redirect".into());
         assert_eq!(dialog.draft.branch, "fix-login-redirect");
-        assert_eq!(dialog.effective_branch().unwrap(), "agent/fix-login-redirect");
+        assert_eq!(
+            dialog.effective_branch().unwrap(),
+            "agent/fix-login-redirect"
+        );
         assert!(dialog.validate().is_ok());
         dialog.edit(WorktreeField::Branch, "feat/.x".into());
         assert!(dialog.validate().is_err());
@@ -994,12 +1220,18 @@ mod tests {
     fn choices_answers_are_scoped_to_the_current_dialog_and_selection_uses_full_base_ref() {
         let Fixture { mut app, .. } = fixture();
         let id = OperationId::new();
-        app.worktree_dialog.as_mut().unwrap().choices_request = Some((id, CancellationToken::new()));
+        app.worktree_dialog.as_mut().unwrap().choices_request =
+            Some((id, CancellationToken::new()));
         let mut choices = super::super::worktree_choices::Choices::default();
         choices.prefix = "agent/".into();
         choices.refs.push(super::super::worktree_choices::Choice {
-            name: "origin/release".into(), reference: "refs/remotes/origin/release".into(), oid: "a".repeat(40),
-            kind: super::super::worktree_choices::Kind::Remote, ahead: 0, behind: 0, remote_branch: Some("release".into()),
+            name: "origin/release".into(),
+            reference: "refs/remotes/origin/release".into(),
+            oid: "a".repeat(40),
+            kind: super::super::worktree_choices::Kind::Remote,
+            ahead: 0,
+            behind: 0,
+            remote_branch: Some("release".into()),
         });
         drop(app.finish_worktree_choices(OperationId::new(), Ok(choices.clone())));
         assert!(dialog(&app).choices_request.is_some());
@@ -1007,14 +1239,28 @@ mod tests {
         assert_eq!(dialog(&app).choices.prefix, "agent/");
         drop(app.select_worktree_choice(WorktreeField::Base, "refs/remotes/origin/release".into()));
         assert_eq!(dialog(&app).draft.base, "refs/remotes/origin/release");
-        drop(app.select_worktree_choice(WorktreeField::Branch, "refs/remotes/origin/release".into()));
+        drop(
+            app.select_worktree_choice(WorktreeField::Branch, "refs/remotes/origin/release".into()),
+        );
         assert_eq!(dialog(&app).draft.branch, "origin/release");
         assert!(dialog(&app).draft.base.is_empty());
         assert_eq!(dialog(&app).effective_branch().unwrap(), "origin/release");
-        assert_eq!(dialog(&app).draft.selected_branch_reference.as_deref(), Some("refs/remotes/origin/release"));
+        assert_eq!(
+            dialog(&app).draft.selected_branch_reference.as_deref(),
+            Some("refs/remotes/origin/release")
+        );
         let saved = dialog(&app).draft.clone();
-        assert_eq!(WorktreeDialog::new(ProjectId::new(), "/repo".into(), saved).draft.selected_branch_reference.as_deref(), Some("refs/remotes/origin/release"));
-        app.worktree_dialog.as_mut().unwrap().edit(WorktreeField::Branch, "new-local".into());
+        assert_eq!(
+            WorktreeDialog::new(ProjectId::new(), "/repo".into(), saved)
+                .draft
+                .selected_branch_reference
+                .as_deref(),
+            Some("refs/remotes/origin/release")
+        );
+        app.worktree_dialog
+            .as_mut()
+            .unwrap()
+            .edit(WorktreeField::Branch, "new-local".into());
         assert!(dialog(&app).draft.selected_branch_reference.is_none());
     }
 
@@ -1022,19 +1268,35 @@ mod tests {
     fn fetched_linear_issue_selects_its_branch_and_stale_results_are_ignored() {
         let Fixture { mut app, .. } = fixture();
         let id = OperationId::new();
-        app.worktree_dialog.as_mut().unwrap().linear = LinearLookup::Pending { id, token: CancellationToken::new() };
+        app.worktree_dialog.as_mut().unwrap().linear = LinearLookup::Pending {
+            id,
+            token: CancellationToken::new(),
+        };
         let issue = crate::linear::IssuePreview {
             id: "2b498c52-7dc7-4c76-ad59-dfc488c40111".into(),
-            identifier: "ENG-123".into(), title: "Fix login redirect".into(),
+            identifier: "ENG-123".into(),
+            title: "Fix login redirect".into(),
             branch_name: "user/eng-123-fix-login-redirect".into(),
-            url: "https://linear.app/team/issue/ENG-123".into(), state: "Todo".into(),
+            url: "https://linear.app/team/issue/ENG-123".into(),
+            state: "Todo".into(),
         };
         let _ = app.finish_worktree_linear(OperationId::new(), Ok(issue.clone()));
         assert!(matches!(dialog(&app).linear, LinearLookup::Pending { .. }));
         let _ = app.finish_worktree_linear(id, Ok(issue));
-        assert_eq!(dialog(&app).branch_input(), "user/eng-123-fix-login-redirect");
-        assert!(dialog(&app).linear_note().unwrap().contains("Fix login redirect"));
-        app.worktree_dialog.as_mut().unwrap().edit(WorktreeField::Branch, "feature/plain".into());
+        assert_eq!(
+            dialog(&app).branch_input(),
+            "user/eng-123-fix-login-redirect"
+        );
+        assert!(
+            dialog(&app)
+                .linear_note()
+                .unwrap()
+                .contains("Fix login redirect")
+        );
+        app.worktree_dialog
+            .as_mut()
+            .unwrap()
+            .edit(WorktreeField::Branch, "feature/plain".into());
         assert_eq!(dialog(&app).branch_input(), "feature/plain");
         let _ = app.finish_worktree_linear(id, Err("old failure".into()));
         assert!(matches!(dialog(&app).linear, LinearLookup::None));
@@ -1042,7 +1304,11 @@ mod tests {
 
     #[test]
     fn failed_linear_lookup_keeps_creation_available_with_an_explicit_note() {
-        let mut dialog = WorktreeDialog::new(ProjectId::new(), "/repo".into(), WorktreeDraft::branch("ENG-123"));
+        let mut dialog = WorktreeDialog::new(
+            ProjectId::new(),
+            "/repo".into(),
+            WorktreeDraft::branch("ENG-123"),
+        );
         dialog.linear = LinearLookup::Unavailable("No saved credential".into());
         assert!(dialog.can_submit());
         assert!(dialog.validate().is_ok());
@@ -1325,12 +1591,18 @@ mod tests {
         not_created(&mut app, id, "network");
 
         let _ = app.update(Message::Sidebar(SidebarAction::RetryWorktreeOperation(id)));
-        assert!(dialog(&app).submit_after_choices, "retry waits for the fresh ref read");
+        assert!(
+            dialog(&app).submit_after_choices,
+            "retry waits for the fresh ref read"
+        );
         refs_loaded(&mut app);
         let shown = dialog(&app);
         assert_eq!(shown.draft, WorktreeDraft::branch("feature/one"));
         assert!(shown.error.is_none());
-        assert!(shown.resolving.is_some(), "retry submits after the fresh ref read");
+        assert!(
+            shown.resolving.is_some(),
+            "retry submits after the fresh ref read"
+        );
         assert!(app.worktree_operations.contains_key(&id));
     }
 

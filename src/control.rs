@@ -948,23 +948,45 @@ impl ControlClient {
     }
 
     pub fn complete_pending_terminal(
-        &mut self, pane: crate::model::CardId, terminal_id:TerminalId, options:TerminalSpawnOptions,
-    ) -> Result<TerminalDescriptor,ControlError> {
-        self.complete_pending_terminal_request(ClientRequest::CompletePendingTerminal {pane,terminal_id,options},terminal_id)
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        options: TerminalSpawnOptions,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        self.complete_pending_terminal_request(
+            ClientRequest::CompletePendingTerminal {
+                pane,
+                terminal_id,
+                options,
+            },
+            terminal_id,
+        )
     }
 
     pub fn start_worktree_setup(
-        &mut self, pane:crate::model::CardId, terminal_id:TerminalId,
-        run_id:crate::model::OperationId, options:TerminalSpawnOptions,
-    ) -> Result<TerminalDescriptor,ControlError> {
-        self.complete_pending_terminal_request(ClientRequest::StartWorktreeSetup {pane,terminal_id,run_id,options},terminal_id)
+        &mut self,
+        pane: crate::model::CardId,
+        terminal_id: TerminalId,
+        run_id: crate::model::OperationId,
+        options: TerminalSpawnOptions,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        self.complete_pending_terminal_request(
+            ClientRequest::StartWorktreeSetup {
+                pane,
+                terminal_id,
+                run_id,
+                options,
+            },
+            terminal_id,
+        )
     }
 
-    fn complete_pending_terminal_request(&mut self,request:ClientRequest,terminal_id:TerminalId)->Result<TerminalDescriptor,ControlError> {
-        let response = self.request_attached(
-            request,
-            terminal_id,
-        )?;
+    fn complete_pending_terminal_request(
+        &mut self,
+        request: ClientRequest,
+        terminal_id: TerminalId,
+    ) -> Result<TerminalDescriptor, ControlError> {
+        let response = self.request_attached(request, terminal_id)?;
         let terminal = match response {
             ServerResponse::Spawned { terminal } if terminal.session.id == terminal_id => terminal,
             ServerResponse::Spawned { terminal } => {

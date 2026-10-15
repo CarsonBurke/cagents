@@ -44,8 +44,8 @@ mod terminal_failure;
 mod terminal_ui;
 mod update_ui;
 mod workspace_model_sync;
-mod worktree_dialog;
 mod worktree_choices;
+mod worktree_dialog;
 mod worktree_operations;
 mod worktree_setup_ui;
 mod worktree_ui;
@@ -4251,14 +4251,34 @@ pub enum Message {
     },
     WorktreeSetupSkipChanged(bool),
     WorktreeSetupTrustChanged(bool),
-    WorktreeSetupPrepared { operation: crate::model::OperationId, worktree: PathBuf, result: Result<crate::worktree_setup::SetupPreparation, String> },
-    WorktreeSetupReceipts { project: ProjectId, repository: PathBuf, request: crate::model::OperationId,
-        result: Result<(Vec<crate::worktree_control::SetupReceipt>, Vec<String>), String> },
-    WorktreeSetupSelectionCommitted { operation: crate::model::OperationId, worktree: PathBuf },
-    WorktreeSetupSelectionRejected { operation: crate::model::OperationId, worktree: PathBuf },
-    WorktreeChoicesResolved { id: crate::model::OperationId, result: Result<worktree_choices::Choices, String> },
+    WorktreeSetupPrepared {
+        operation: crate::model::OperationId,
+        worktree: PathBuf,
+        result: Result<crate::worktree_setup::SetupPreparation, String>,
+    },
+    WorktreeSetupReceipts {
+        project: ProjectId,
+        repository: PathBuf,
+        request: crate::model::OperationId,
+        result: Result<(Vec<crate::worktree_control::SetupReceipt>, Vec<String>), String>,
+    },
+    WorktreeSetupSelectionCommitted {
+        operation: crate::model::OperationId,
+        worktree: PathBuf,
+    },
+    WorktreeSetupSelectionRejected {
+        operation: crate::model::OperationId,
+        worktree: PathBuf,
+    },
+    WorktreeChoicesResolved {
+        id: crate::model::OperationId,
+        result: Result<worktree_choices::Choices, String>,
+    },
     WorktreeFieldFocused(WorktreeField),
-    WorktreeChoiceSelected { field: WorktreeField, reference: String },
+    WorktreeChoiceSelected {
+        field: WorktreeField,
+        reference: String,
+    },
     WorktreePrefixChanged(String),
     WorktreeSuggestionsDismissed(WorktreeField),
     WorktreeLinearResolved {
@@ -5839,7 +5859,12 @@ impl Cagents {
         }
         let working_directory = session.launch.working_directory.clone();
         let card_id = CardId::new();
-        let setup = session.launch.environment.get("CAGENTS_WORKTREE_SETUP").map(String::as_str) == Some("1");
+        let setup = session
+            .launch
+            .environment
+            .get("CAGENTS_WORKTREE_SETUP")
+            .map(String::as_str)
+            == Some("1");
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "terminal");
         let card = CardState {
             id: card_id,
@@ -5847,10 +5872,14 @@ impl Cagents {
             // A directory name is chosen outside the application, so it needs
             // the same normalisation a reported title gets: it reaches the card
             // header, the accessibility strings and the window title.
-            title: if setup { "Worktree setup".into() } else { working_directory
-                .file_name()
-                .and_then(|name| normalize_card_name(&name.to_string_lossy()))
-                .unwrap_or_else(|| "Terminal".into()) },
+            title: if setup {
+                "Worktree setup".into()
+            } else {
+                working_directory
+                    .file_name()
+                    .and_then(|name| normalize_card_name(&name.to_string_lossy()))
+                    .unwrap_or_else(|| "Terminal".into())
+            },
             width_fraction: self.settings.default_column_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
@@ -5890,7 +5919,11 @@ impl Cagents {
         } else if session.continuity.live_proof().is_none() {
             self.reserve_terminal_creation(card_id);
         }
-        if setup { self.chrome_ui.user_titles.insert(card_id, "Worktree setup".into()); }
+        if setup {
+            self.chrome_ui
+                .user_titles
+                .insert(card_id, "Worktree setup".into());
+        }
         self.persist();
         Task::batch([
             self.start_terminal(card_id, session, true, false),
@@ -11308,8 +11341,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13613,7 +13649,10 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return Task::batch([task, self.request_worktree_setup_receipts(existing_id, false)]);
+                            return Task::batch([
+                                task,
+                                self.request_worktree_setup_receipts(existing_id, false),
+                            ]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -15471,31 +15510,62 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WorktreeBranchChanged(value) => self.edit_worktree_branch(value),
-            Message::WorktreeLinearResolved { id, result } => self.finish_worktree_linear(id, result),
-            Message::WorktreeChoicesResolved { id, result } => self.finish_worktree_choices(id, result),
-            Message::WorktreeSetupPrepared { operation, worktree, result } => self.finish_worktree_setup(operation, worktree, result),
-            Message::WorktreeSetupReceipts { project, repository, request, result } => self.finish_worktree_setup_receipts(project, repository, request, result),
-            Message::WorktreeSetupSelectionCommitted { operation, worktree } => self.worktree_setup_selection_finished(operation, worktree, true),
-            Message::WorktreeSetupSelectionRejected { operation, worktree } => self.worktree_setup_selection_finished(operation, worktree, false),
+            Message::WorktreeLinearResolved { id, result } => {
+                self.finish_worktree_linear(id, result)
+            }
+            Message::WorktreeChoicesResolved { id, result } => {
+                self.finish_worktree_choices(id, result)
+            }
+            Message::WorktreeSetupPrepared {
+                operation,
+                worktree,
+                result,
+            } => self.finish_worktree_setup(operation, worktree, result),
+            Message::WorktreeSetupReceipts {
+                project,
+                repository,
+                request,
+                result,
+            } => self.finish_worktree_setup_receipts(project, repository, request, result),
+            Message::WorktreeSetupSelectionCommitted {
+                operation,
+                worktree,
+            } => self.worktree_setup_selection_finished(operation, worktree, true),
+            Message::WorktreeSetupSelectionRejected {
+                operation,
+                worktree,
+            } => self.worktree_setup_selection_finished(operation, worktree, false),
             Message::WorktreeSetupSkipChanged(skip) => {
-                if let Some(dialog) = &mut self.worktree_dialog { dialog.edit_setup_skip(skip); }
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit_setup_skip(skip);
+                }
                 Task::none()
             }
             Message::WorktreeSetupTrustChanged(trust) => {
-                if let Some(dialog) = &mut self.worktree_dialog { dialog.edit_setup_trust(trust); }
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit_setup_trust(trust);
+                }
                 Task::none()
             }
             Message::WorktreeFieldFocused(field) => {
-                if let Some(dialog) = &mut self.worktree_dialog { dialog.focus_field(field); }
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.focus_field(field);
+                }
                 Task::none()
             }
-            Message::WorktreeChoiceSelected { field, reference } => self.select_worktree_choice(field, reference),
+            Message::WorktreeChoiceSelected { field, reference } => {
+                self.select_worktree_choice(field, reference)
+            }
             Message::WorktreeSuggestionsDismissed(field) => {
-                if let Some(dialog) = &mut self.worktree_dialog { dialog.dismiss_suggestions(field); }
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.dismiss_suggestions(field);
+                }
                 Task::none()
             }
             Message::WorktreePrefixChanged(value) => {
-                if let Some(dialog) = &mut self.worktree_dialog { dialog.edit_prefix(value); }
+                if let Some(dialog) = &mut self.worktree_dialog {
+                    dialog.edit_prefix(value);
+                }
                 Task::none()
             }
             Message::WorktreeBaseChanged(value) => {

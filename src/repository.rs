@@ -6,7 +6,10 @@
 //! straightforward to test with a fake executor.
 
 mod worktree_setup_intent;
-pub use worktree_setup_intent::{WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan, worktree_setup_marker_matches};
+pub use worktree_setup_intent::{
+    WorktreeSetupCreationIdentity, WorktreeSetupIntent, WorktreeSetupPlan,
+    worktree_setup_marker_matches,
+};
 
 use std::{
     borrow::Cow,
@@ -3689,7 +3692,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 for worktree in &mut worktrees {
                     if !worktree.bare {
                         worktree.creation_basis = crate::worktree_basis::read(&worktree.path)
-                            .map_err(|error| ValidationError::Io(format!("could not read worktree creation basis: {error}")))?;
+                            .map_err(|error| {
+                                ValidationError::Io(format!(
+                                    "could not read worktree creation basis: {error}"
+                                ))
+                            })?;
                     }
                     worktree.created_at_unix_ms = std::fs::metadata(&worktree.path)
                         .and_then(|metadata| metadata.created())
@@ -4006,15 +4013,29 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         base_oid: &Oid,
         cancellation: &CancellationToken,
     ) -> Result<BranchComparison, RepositoryError> {
-        let head = self.resolve_head(worktree, cancellation)?.ok_or(RepositoryError::InvalidOutput {
-            field: "head", reason: "an unborn branch has nothing to compare".into(),
-        })?;
-        let command = self.git_read(worktree, ["merge-base", base_oid.as_str(), head.as_str()]).env("GIT_NO_LAZY_FETCH", "1");
+        let head =
+            self.resolve_head(worktree, cancellation)?
+                .ok_or(RepositoryError::InvalidOutput {
+                    field: "head",
+                    reason: "an unborn branch has nothing to compare".into(),
+                })?;
+        let command = self
+            .git_read(worktree, ["merge-base", base_oid.as_str(), head.as_str()])
+            .env("GIT_NO_LAZY_FETCH", "1");
         let output = self.run_checked(&command, cancellation)?;
         let merge_base = Oid::parse_object(parse_utf8_line(&output.stdout, "merge_base")?)
-            .map_err(|error| RepositoryError::InvalidOutput { field: "merge_base", reason: error.to_string() })?;
+            .map_err(|error| RepositoryError::InvalidOutput {
+                field: "merge_base",
+                reason: error.to_string(),
+            })?;
         let entries = self.range_entries(worktree, Some(&merge_base), &head, cancellation)?;
-        Ok(BranchComparison { base_ref: base_ref.clone(), base_oid: base_oid.clone(), head, merge_base, entries })
+        Ok(BranchComparison {
+            base_ref: base_ref.clone(),
+            base_oid: base_oid.clone(),
+            head,
+            merge_base,
+            entries,
+        })
     }
 
     /// Fetches one pull request's head and base branch into the private
@@ -5541,17 +5562,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
     ) -> Result<Option<Oid>, RepositoryError> {
         let _remote = self.checked_remote(worktree, remote, cancellation)?;
-        let command = self.git_read(
-            worktree,
-            [
-                OsString::from("ls-remote"),
-                OsString::from("--refs"),
-                OsString::from("--exit-code"),
-                OsString::from("--"),
-                OsString::from(remote),
-                OsString::from(remote_ref.as_str()),
-            ],
-        ).timeout(Duration::from_secs(3));
+        let command = self
+            .git_read(
+                worktree,
+                [
+                    OsString::from("ls-remote"),
+                    OsString::from("--refs"),
+                    OsString::from("--exit-code"),
+                    OsString::from("--"),
+                    OsString::from(remote),
+                    OsString::from(remote_ref.as_str()),
+                ],
+            )
+            .timeout(Duration::from_secs(3));
         let output = self.run(&command, cancellation)?;
         if !output.success {
             // 2 is `--exit-code`'s "no matching ref"; anything else is a
@@ -5622,12 +5645,31 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let selected_local = selected_ref.filter(|reference| reference.starts_with("refs/heads/"));
         if let Some(reference) = selected_ref {
             let valid = if let Some(local_name) = reference.strip_prefix("refs/heads/") {
-                local_name == name && refs.local.iter().any(|local| local.name.as_str() == reference)
+                local_name == name
+                    && refs
+                        .local
+                        .iter()
+                        .any(|local| local.name.as_str() == reference)
             } else if let Some(remote_name) = reference.strip_prefix("refs/remotes/") {
-                remote_name == name && refs.remote.iter().any(|remote| remote.name.as_str() == reference)
-                    && remotes.iter().any(|remote| remote_name.strip_prefix(&format!("{}/", remote.name)).is_some_and(|branch| !branch.is_empty()))
-            } else { false };
-            if !valid { return Err(ValidationError::InvalidBranch("The selected branch changed or disappeared; choose it again".into()).into()); }
+                remote_name == name
+                    && refs
+                        .remote
+                        .iter()
+                        .any(|remote| remote.name.as_str() == reference)
+                    && remotes.iter().any(|remote| {
+                        remote_name
+                            .strip_prefix(&format!("{}/", remote.name))
+                            .is_some_and(|branch| !branch.is_empty())
+                    })
+            } else {
+                false
+            };
+            if !valid {
+                return Err(ValidationError::InvalidBranch(
+                    "The selected branch changed or disappeared; choose it again".into(),
+                )
+                .into());
+            }
         }
         let explicit = remotes
             .iter()
@@ -5653,19 +5695,35 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // A plain branch name is local intent. Cached remote-tracking refs
             // can identify an existing remote branch; unknown names create a
             // local branch without a speculative network lookup.
-            let mut candidates: Vec<_> = refs.remote.iter().filter_map(|reference| {
-                remotes.iter().filter_map(|remote| {
-                    reference.name.as_str().strip_prefix(&format!("refs/remotes/{}/", remote.name))
-                        .map(|name| (remote, name))
-                }).max_by_key(|(remote, _)| remote.name.len())
-                    .filter(|(_, name)| *name == branch.as_str())
-                    .map(|(remote, name)| (remote.name.clone(), name.to_owned()))
-            }).collect();
+            let mut candidates: Vec<_> = refs
+                .remote
+                .iter()
+                .filter_map(|reference| {
+                    remotes
+                        .iter()
+                        .filter_map(|remote| {
+                            reference
+                                .name
+                                .as_str()
+                                .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                                .map(|name| (remote, name))
+                        })
+                        .max_by_key(|(remote, _)| remote.name.len())
+                        .filter(|(_, name)| *name == branch.as_str())
+                        .map(|(remote, name)| (remote.name.clone(), name.to_owned()))
+                })
+                .collect();
             if candidates.len() > 1 {
                 return Err(ValidationError::InvalidBranch(format!(
                     "{} exists on multiple remotes; enter one of: {}",
-                    branch.as_str(), candidates.iter().map(|(remote, branch)| format!("{remote}/{branch}")).collect::<Vec<_>>().join(", ")
-                )).into());
+                    branch.as_str(),
+                    candidates
+                        .iter()
+                        .map(|(remote, branch)| format!("{remote}/{branch}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+                .into());
             }
             candidates.pop()
         };
@@ -5777,16 +5835,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // branch whose literal short name happens to begin with refs/.
         if let Some(branch) = name.strip_prefix("refs/heads/") {
             if refs.local.iter().any(|local| local.name.as_str() == name) {
-                return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(branch)?));
+                return Ok(BaseRevision::LocalBranch(ValidatedBranchName::parse(
+                    branch,
+                )?));
             }
-            return Err(ValidationError::InvalidBase(format!("Local base {name} disappeared")).into());
+            return Err(
+                ValidationError::InvalidBase(format!("Local base {name} disappeared")).into(),
+            );
         }
         if name.starts_with("refs/remotes/") {
             return Ok(BaseRevision::remote_ref(name)?);
         }
         if name.starts_with("refs/tags/") {
-            let oid = self.resolve_optional_revision(repository, &format!("{name}^{{commit}}"), cancellation)?
-                .ok_or_else(|| ValidationError::InvalidBase(format!("Tag base {name} disappeared")))?;
+            let oid = self
+                .resolve_optional_revision(repository, &format!("{name}^{{commit}}"), cancellation)?
+                .ok_or_else(|| {
+                    ValidationError::InvalidBase(format!("Tag base {name} disappeared"))
+                })?;
             return Ok(BaseRevision::object_id(oid.to_string())?);
         }
         let local_name = name.strip_prefix("refs/heads/").unwrap_or(name);
@@ -5799,9 +5864,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 local_name,
             )?));
         }
-        let tag = format!("refs/tags/{}", name.strip_prefix("refs/tags/").unwrap_or(name));
+        let tag = format!(
+            "refs/tags/{}",
+            name.strip_prefix("refs/tags/").unwrap_or(name)
+        );
         if ValidatedRefName::parse(tag.clone()).is_ok() {
-            if let Some(oid) = self.resolve_optional_revision(repository, &format!("{tag}^{{commit}}"), cancellation)? {
+            if let Some(oid) = self.resolve_optional_revision(
+                repository,
+                &format!("{tag}^{{commit}}"),
+                cancellation,
+            )? {
                 return Ok(BaseRevision::object_id(oid.to_string())?);
             }
         }
@@ -5821,9 +5893,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             ))?);
         }
         let branch = ValidatedBranchName::parse(name)?;
-        let mut candidates: Vec<_> = refs.remote.iter()
-            .filter(|reference| remotes.iter().any(|remote| reference.name.as_str() == format!("refs/remotes/{}/{}", remote.name, branch.as_str())))
-            .map(|reference| reference.name.as_str().to_owned()).collect();
+        let mut candidates: Vec<_> = refs
+            .remote
+            .iter()
+            .filter(|reference| {
+                remotes.iter().any(|remote| {
+                    reference.name.as_str()
+                        == format!("refs/remotes/{}/{}", remote.name, branch.as_str())
+                })
+            })
+            .map(|reference| reference.name.as_str().to_owned())
+            .collect();
         if candidates.len() == 1 {
             return Ok(BaseRevision::remote_ref(candidates.remove(0))?);
         }
@@ -5845,13 +5925,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .find(|remote| remote.name == "origin")
             .or_else(|| (remotes.len() == 1).then(|| &remotes[0]));
         if let Some(remote) = remote {
-            if let Some(head) = refs.remote_heads.iter().find(|head| head.remote == remote.name) {
-                if refs.remote.iter().any(|reference| reference.name == head.target) {
+            if let Some(head) = refs
+                .remote_heads
+                .iter()
+                .find(|head| head.remote == remote.name)
+            {
+                if refs
+                    .remote
+                    .iter()
+                    .any(|reference| reference.name == head.target)
+                {
                     return Ok(BaseRevision::remote_ref(head.target.as_str())?);
                 }
             }
             for branch in ["main", "master"] {
-                if let Some(reference) = refs.remote.iter().find(|reference| reference.name.as_str() == format!("refs/remotes/{}/{branch}", remote.name)) {
+                if let Some(reference) = refs.remote.iter().find(|reference| {
+                    reference.name.as_str() == format!("refs/remotes/{}/{branch}", remote.name)
+                }) {
                     return Ok(BaseRevision::remote_ref(reference.name.as_str())?);
                 }
             }
@@ -7415,7 +7505,16 @@ mod tests {
             ValidatedBranchName::parse("feature/safe").unwrap().as_str(),
             "feature/safe"
         );
-        for invalid in ["-force", "bad name", "a..b", "a.lock", "a@{b", "a//b", ".hidden", "feature/.hidden"] {
+        for invalid in [
+            "-force",
+            "bad name",
+            "a..b",
+            "a.lock",
+            "a@{b",
+            "a//b",
+            ".hidden",
+            "feature/.hidden",
+        ] {
             assert!(ValidatedBranchName::parse(invalid).is_err(), "{invalid}");
         }
     }
@@ -11027,41 +11126,50 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     ValidationError::Io(format!("journal write failed: {error}"))
                 })?;
             if let BaseRevision::RemoteRef(reference) = &journal.request.base {
-                let cached = self.resolve_optional_revision(&journal.request.repository, reference, cancellation)?;
-                if journal.request.track || cached.is_none() {
-                let remotes = self.remotes(&journal.request.repository, cancellation)?;
-                let (remote, branch) = remotes
-                    .iter()
-                    .filter_map(|remote| {
-                        reference
-                            .strip_prefix(&format!("refs/remotes/{}/", remote.name))
-                            .map(|branch| (&remote.name, branch))
-                    })
-                    .max_by_key(|(remote, _)| remote.len())
-                    .ok_or_else(|| {
-                        ValidationError::InvalidBase(format!(
-                            "No configured remote owns {reference}"
-                        ))
-                    })?;
-                let _remote =
-                    self.checked_remote(&journal.request.repository, remote, cancellation)?;
-                ValidatedBranchName::parse(branch)?;
-                let mut fetch = self.git_mutation(
+                let cached = self.resolve_optional_revision(
                     &journal.request.repository,
-                    [
-                        "fetch",
-                        "--no-tags",
-                        "--no-recurse-submodules",
-                        remote.as_str(),
-                        &format!("+refs/heads/{branch}:{reference}"),
-                    ],
-                );
-                fetch.inherited_lease = Some(lease.as_raw_fd());
-                if let Err(failure) = self.run_checked(&fetch, cancellation) {
-                    if cached.is_none() || cancellation.is_cancelled() { return Err(failure.into()); }
-                    remote_refresh_warning = Some(format!("Remote refresh failed; using cached {reference}: {}", failure.reported_detail()));
-                    journal.warnings.push(failure);
-                }
+                    reference,
+                    cancellation,
+                )?;
+                if journal.request.track || cached.is_none() {
+                    let remotes = self.remotes(&journal.request.repository, cancellation)?;
+                    let (remote, branch) = remotes
+                        .iter()
+                        .filter_map(|remote| {
+                            reference
+                                .strip_prefix(&format!("refs/remotes/{}/", remote.name))
+                                .map(|branch| (&remote.name, branch))
+                        })
+                        .max_by_key(|(remote, _)| remote.len())
+                        .ok_or_else(|| {
+                            ValidationError::InvalidBase(format!(
+                                "No configured remote owns {reference}"
+                            ))
+                        })?;
+                    let _remote =
+                        self.checked_remote(&journal.request.repository, remote, cancellation)?;
+                    ValidatedBranchName::parse(branch)?;
+                    let mut fetch = self.git_mutation(
+                        &journal.request.repository,
+                        [
+                            "fetch",
+                            "--no-tags",
+                            "--no-recurse-submodules",
+                            remote.as_str(),
+                            &format!("+refs/heads/{branch}:{reference}"),
+                        ],
+                    );
+                    fetch.inherited_lease = Some(lease.as_raw_fd());
+                    if let Err(failure) = self.run_checked(&fetch, cancellation) {
+                        if cached.is_none() || cancellation.is_cancelled() {
+                            return Err(failure.into());
+                        }
+                        remote_refresh_warning = Some(format!(
+                            "Remote refresh failed; using cached {reference}: {}",
+                            failure.reported_detail()
+                        ));
+                        journal.warnings.push(failure);
+                    }
                 }
             }
             let resolve = self.git_read(
@@ -11208,7 +11316,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             Ok(())
         })();
         journal.detail = match attempt {
-            Ok(()) => remote_refresh_warning.unwrap_or_else(|| "Git exited; reconciling durable outcome".into()),
+            Ok(()) => remote_refresh_warning
+                .unwrap_or_else(|| "Git exited; reconciling durable outcome".into()),
             Err(error) => {
                 let detail = error.to_string();
                 journal.warnings.push(repository_warning(&self.git, error));
@@ -11400,12 +11509,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if residual.branch_exists && owned && admin_dir.is_some() {
             let (admin, admin_root, checkout_root) = admin_dir.expect("admin identity checked");
             journal.admin_dir = Some(admin);
-            if let Err(error) = worktree_setup_intent::record_creation_identity(&admin_root, journal.request.operation_id) {
+            if let Err(error) = worktree_setup_intent::record_creation_identity(
+                &admin_root,
+                journal.request.operation_id,
+            ) {
                 journal.state = WorktreeOperationState::ReconcileRequired;
-                journal.detail = format!("Worktree created; creation identity publication requires reconciliation: {error}");
+                journal.detail = format!(
+                    "Worktree created; creation identity publication requires reconciliation: {error}"
+                );
                 return;
             }
-            if !worktree_setup_intent::named_directory_matches(&admin_root) || !worktree_setup_intent::named_directory_matches(&checkout_root) {
+            if !worktree_setup_intent::named_directory_matches(&admin_root)
+                || !worktree_setup_intent::named_directory_matches(&checkout_root)
+            {
                 journal.state = WorktreeOperationState::ReconcileRequired;
                 journal.detail = "Creation directory identity changed while publishing its generation; inspect before reconciliation".into();
                 return;
@@ -11432,7 +11548,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 )
             {
                 journal.state = WorktreeOperationState::ReconcileRequired;
-                journal.detail = format!("Worktree created; Linear linking requires reconciliation: {error}");
+                journal.detail =
+                    format!("Worktree created; Linear linking requires reconciliation: {error}");
             }
         } else if (!residual.branch_exists
             || journal.existing_branch_oid.as_ref().is_some_and(|before| {
@@ -11459,7 +11576,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 
     /// The created worktree's administrative directory, when the destination
     /// is evidently the worktree this journal created.
-    fn created_admin_dir(&self, journal: &WorktreeJournal) -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)> {
+    fn created_admin_dir(
+        &self,
+        journal: &WorktreeJournal,
+    ) -> Option<(PathBuf, fs_safety::Root, fs_safety::Root)> {
         let token = CancellationToken::new();
         let destination = &journal.request.destination;
         crate::secure_file::reject_symlink_components(destination).ok()?;
@@ -11488,7 +11608,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return None;
         }
         if journal.checkout_completed {
-            return (worktree_setup_intent::named_directory_matches(&checkout_root) && worktree_setup_intent::named_directory_matches(&admin_root)).then_some((git_dir, admin_root, checkout_root));
+            return (worktree_setup_intent::named_directory_matches(&checkout_root)
+                && worktree_setup_intent::named_directory_matches(&admin_root))
+            .then_some((git_dir, admin_root, checkout_root));
         }
         // HEAD and backlinks precede checkout in Git. Without a recorded
         // successful exit, require a real index and a clean index/worktree
@@ -11504,7 +11626,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &token,
                 )
                 .is_ok_and(|output| output.stdout.is_empty());
-        (clean && worktree_setup_intent::named_directory_matches(&checkout_root) && worktree_setup_intent::named_directory_matches(&admin_root)).then_some((git_dir, admin_root, checkout_root))
+        (clean
+            && worktree_setup_intent::named_directory_matches(&checkout_root)
+            && worktree_setup_intent::named_directory_matches(&admin_root))
+        .then_some((git_dir, admin_root, checkout_root))
     }
 
     /// Publish creation metadata after Git success is durable. Recovery never
@@ -11512,40 +11637,77 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// original lock, branch/head/admin identity and exclusive process lease
     /// still prove ownership of this exact completed creation.
     fn record_created_worktree_basis(&self, journal: &mut WorktreeJournal) {
-        if journal.state != WorktreeOperationState::Created || !journal.basis_recording_expected { return; }
-        let (Some(admin), Some(oid)) = (&journal.admin_dir, &journal.base_oid) else { return; };
-        let basis = crate::worktree_basis::CreationBasis::new(journal.request.base.revision_argument(), oid.clone());
-        if let Ok(basis) = &basis && matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.creation_basis.as_ref() == Some(basis)) { return; }
+        if journal.state != WorktreeOperationState::Created || !journal.basis_recording_expected {
+            return;
+        }
+        let (Some(admin), Some(oid)) = (&journal.admin_dir, &journal.base_oid) else {
+            return;
+        };
+        let basis = crate::worktree_basis::CreationBasis::new(
+            journal.request.base.revision_argument(),
+            oid.clone(),
+        );
+        if let Ok(basis) = &basis
+            && matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.creation_basis.as_ref() == Some(basis))
+        {
+            return;
+        }
         let receipt = (|| -> Result<crate::worktree_basis::CreationBasis, String> {
             let basis = basis.map_err(|error| error.to_string())?;
             match crate::worktree_basis::read_admin(admin).map_err(|error| error.to_string())? {
                 Some(existing) if existing == basis => return Ok(basis),
-                Some(_) => return Err("The existing creation basis has a different identity".into()),
+                Some(_) => {
+                    return Err("The existing creation basis has a different identity".into());
+                }
                 None => {}
             }
-            let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE).map_err(|error| error.to_string())?;
-            if lease_file_identity(&lease).ok() != journal.lease_identity { return Err("Creation process lease identity changed".into()); }
+            let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE)
+                .map_err(|error| error.to_string())?;
+            if lease_file_identity(&lease).ok() != journal.lease_identity {
+                return Err("Creation process lease identity changed".into());
+            }
             let token = CancellationToken::new();
-            let records = self.list_worktrees(&journal.request.repository, &token).map_err(|error| error.to_string())?;
+            let records = self
+                .list_worktrees(&journal.request.repository, &token)
+                .map_err(|error| error.to_string())?;
             let label = format!("cagents:{}", journal.request.operation_id);
-            let owned = records.iter().any(|record| record.branch.as_deref() == Some(journal.request.branch.full_ref().as_str())
-                && record.head_oid.as_ref() == Some(oid) && record.lock.reason.as_deref() == Some(label.as_str())
-                && self.git_dir(&record.path, &token).ok().as_ref() == Some(admin));
-            if !owned { return Err("The original creation no longer proves ownership of the missing basis receipt".into()); }
+            let owned = records.iter().any(|record| {
+                record.branch.as_deref() == Some(journal.request.branch.full_ref().as_str())
+                    && record.head_oid.as_ref() == Some(oid)
+                    && record.lock.reason.as_deref() == Some(label.as_str())
+                    && self.git_dir(&record.path, &token).ok().as_ref() == Some(admin)
+            });
+            if !owned {
+                return Err(
+                    "The original creation no longer proves ownership of the missing basis receipt"
+                        .into(),
+                );
+            }
             crate::worktree_basis::record(admin, &basis).map_err(|error| error.to_string())?;
             Ok(basis)
         })();
         match receipt {
-            Ok(basis) => if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome { worktree.creation_basis = Some(basis); },
+            Ok(basis) => {
+                if let Some(WorktreeCreationOutcome::Created { worktree, .. }) =
+                    &mut journal.outcome
+                {
+                    worktree.creation_basis = Some(basis);
+                }
+            }
             Err(error) => {
                 let detail = format!("creation basis could not be recorded: {error}");
                 if !journal.detail.contains(&detail) {
                     journal.detail = format!("{}; {detail}", journal.detail);
-                    journal.warnings.push(repository_warning(&self.git, RepositoryError::Validation(ValidationError::Io(error))));
+                    journal.warnings.push(repository_warning(
+                        &self.git,
+                        RepositoryError::Validation(ValidationError::Io(error)),
+                    ));
                 }
             }
         }
-        if let Some(WorktreeCreationOutcome::Created { warnings, .. }) = &mut journal.outcome { warnings.clone_from(&journal.warnings); }
+        if let Some(WorktreeCreationOutcome::Created { warnings, .. }) = &mut journal.outcome {
+            warnings.clone_from(&journal.warnings);
+        }
     }
 
     /// Only the original live request may clean up its own Git lock. Startup
@@ -11706,10 +11868,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     operation.created_at_unix_ms,
                     &|_| {},
                 ));
-            } else if journal.state == WorktreeOperationState::Created && journal.basis_recording_expected
-                && matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.creation_basis.is_none()) {
+            } else if journal.state == WorktreeOperationState::Created
+                && journal.basis_recording_expected
+                && matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.creation_basis.is_none())
+            {
                 self.record_created_worktree_basis(&mut journal);
-                reports.push(finish_worktree_journal(store, &journal, &operation.payload, operation.created_at_unix_ms, &|_| {}));
+                reports.push(finish_worktree_journal(
+                    store,
+                    &journal,
+                    &operation.payload,
+                    operation.created_at_unix_ms,
+                    &|_| {},
+                ));
             } else {
                 reports.push(journal.report(operation.created_at_unix_ms));
             }
@@ -11950,9 +12120,17 @@ mod worktree_journal_tests {
         journal.base_oid = Some(oid.clone());
         let payload = journal.persist(&fixture.store, &payload).unwrap();
         fs::create_dir(&fixture.request.managed_root).unwrap();
-        let mut command = fixture.service.create_worktree_command(&fixture.request, &oid).unwrap();
+        let mut command = fixture
+            .service
+            .create_worktree_command(&fixture.request, &oid)
+            .unwrap();
         command.inherited_lease = Some(lease.as_raw_fd());
-        assert!(SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap().success);
+        assert!(
+            SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap()
+                .success
+        );
         journal.checkout_completed = true;
         journal.persist(&fixture.store, &payload).unwrap();
         drop(lease);
@@ -11963,16 +12141,30 @@ mod worktree_journal_tests {
         for already_linked in [false, true] {
             let mut fixture = Fixture::new();
             fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
-                issue_id: "ENG-123".into(), workspace: None,
+                issue_id: "ENG-123".into(),
+                workspace: None,
             });
             interrupted_linear_checkout(&fixture);
             if already_linked {
-                crate::linear::context::link_at(&fixture.request.destination, "ENG-123", None).unwrap();
+                crate::linear::context::link_at(&fixture.request.destination, "ENG-123", None)
+                    .unwrap();
             }
-            let report = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
+            let report = fixture
+                .service
+                .rehydrate_worktree_operations(&fixture.store)
+                .unwrap()
+                .remove(0);
             assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-            assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
-            assert_eq!(fixture.journal(fixture.request.operation_id).state, WorktreeOperationState::Created);
+            assert_eq!(
+                crate::linear::context::resolve_at(&fixture.request.destination)
+                    .unwrap()
+                    .issue_id,
+                "ENG-123"
+            );
+            assert_eq!(
+                fixture.journal(fixture.request.operation_id).state,
+                WorktreeOperationState::Created
+            );
         }
     }
 
@@ -11980,22 +12172,63 @@ mod worktree_journal_tests {
     fn failed_linear_link_retains_ownership_for_recovery_retry() {
         let mut fixture = Fixture::new();
         fixture.request.linear_issue = Some(crate::linear::context::LinkedIssue {
-            issue_id: "ENG-123".into(), workspace: None,
+            issue_id: "ENG-123".into(),
+            workspace: None,
         });
         interrupted_linear_checkout(&fixture);
-        let admin = fixture.service.git_dir(&fixture.request.destination, &CancellationToken::new()).unwrap();
+        let admin = fixture
+            .service
+            .git_dir(&fixture.request.destination, &CancellationToken::new())
+            .unwrap();
         let obstruction = admin.join("cagents-linear.json");
         fs::create_dir(&obstruction).unwrap();
-        let report = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
-        assert_eq!(report.state, WorktreeOperationState::ReconcileRequired, "{report:?}");
-        assert!(report.detail.contains("Linear linking requires reconciliation"));
-        assert_eq!(fixture.journal(fixture.request.operation_id).state, WorktreeOperationState::ReconcileRequired);
-        let worktree = fixture.service.list_worktrees(&fixture.request.repository, &CancellationToken::new()).unwrap().into_iter().find(|worktree| worktree.path == fixture.request.destination).unwrap();
-        assert_eq!(worktree.lock.reason, Some(format!("cagents:{}", fixture.request.operation_id)));
+        let report = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            report.state,
+            WorktreeOperationState::ReconcileRequired,
+            "{report:?}"
+        );
+        assert!(
+            report
+                .detail
+                .contains("Linear linking requires reconciliation")
+        );
+        assert_eq!(
+            fixture.journal(fixture.request.operation_id).state,
+            WorktreeOperationState::ReconcileRequired
+        );
+        let worktree = fixture
+            .service
+            .list_worktrees(&fixture.request.repository, &CancellationToken::new())
+            .unwrap()
+            .into_iter()
+            .find(|worktree| worktree.path == fixture.request.destination)
+            .unwrap();
+        assert_eq!(
+            worktree.lock.reason,
+            Some(format!("cagents:{}", fixture.request.operation_id))
+        );
         fs::remove_dir(obstruction).unwrap();
-        let recovered = fixture.service.rehydrate_worktree_operations(&fixture.store).unwrap().remove(0);
-        assert_eq!(recovered.state, WorktreeOperationState::Created, "{recovered:?}");
-        assert_eq!(crate::linear::context::resolve_at(&fixture.request.destination).unwrap().issue_id, "ENG-123");
+        let recovered = fixture
+            .service
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            recovered.state,
+            WorktreeOperationState::Created,
+            "{recovered:?}"
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.destination)
+                .unwrap()
+                .issue_id,
+            "ENG-123"
+        );
     }
 
     #[test]
@@ -12004,42 +12237,167 @@ mod worktree_journal_tests {
         let token = CancellationToken::new();
         let report = fixture.run(&token);
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        let identity = fixture.service.worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id).unwrap().unwrap();
-        assert_eq!(identity.admin_dir.as_ref(), Some(&fixture.service.git_dir(&fixture.request.destination, &token).unwrap()));
-        assert!(identity.matches_checkout(&identity.common_dir, identity.admin_dir.as_deref().unwrap()).unwrap());
-        fixture.git(&["worktree", "remove", fixture.request.destination.to_str().unwrap()]);
+        let identity = fixture
+            .service
+            .worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            identity.admin_dir.as_ref(),
+            Some(
+                &fixture
+                    .service
+                    .git_dir(&fixture.request.destination, &token)
+                    .unwrap()
+            )
+        );
+        assert!(
+            identity
+                .matches_checkout(&identity.common_dir, identity.admin_dir.as_deref().unwrap())
+                .unwrap()
+        );
+        fixture.git(&[
+            "worktree",
+            "remove",
+            fixture.request.destination.to_str().unwrap(),
+        ]);
         let replacement = fixture.request.managed_root.join("replacement");
-        fixture.git(&["worktree", "add", replacement.to_str().unwrap(), fixture.request.branch.as_str()]);
-        fixture.git(&["worktree", "move", replacement.to_str().unwrap(), fixture.request.destination.to_str().unwrap()]);
-        let record = fixture.service.list_worktrees(&fixture.request.repository, &token).unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap();
-        assert_eq!(record.branch.as_deref(), Some(fixture.request.branch.full_ref().as_str()));
-        assert_eq!(identity.common_dir, fixture.service.common_dir(&fixture.request.repository, &token).unwrap());
-        assert_ne!(identity.admin_dir.as_ref(), Some(&fixture.service.git_dir(&fixture.request.destination, &token).unwrap()), "same branch and path do not prove creation identity");
-        assert!(!identity.matches_checkout(&identity.common_dir, &fixture.service.git_dir(&fixture.request.destination, &token).unwrap()).unwrap());
-        fixture.git(&["worktree", "remove", fixture.request.destination.to_str().unwrap()]);
-        fixture.git(&["worktree", "add", fixture.request.destination.to_str().unwrap(), fixture.request.branch.as_str()]);
-        let reused_admin = fixture.service.git_dir(&fixture.request.destination, &token).unwrap();
-        assert_eq!(identity.admin_dir.as_ref(), Some(&reused_admin), "Git reuses the original administrative pathname");
-        assert!(!identity.matches_checkout(&identity.common_dir, &reused_admin).unwrap(), "direct same-path replacement must not inherit setup authority");
+        fixture.git(&[
+            "worktree",
+            "add",
+            replacement.to_str().unwrap(),
+            fixture.request.branch.as_str(),
+        ]);
+        fixture.git(&[
+            "worktree",
+            "move",
+            replacement.to_str().unwrap(),
+            fixture.request.destination.to_str().unwrap(),
+        ]);
+        let record = fixture
+            .service
+            .list_worktrees(&fixture.request.repository, &token)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.path == fixture.request.destination)
+            .unwrap();
+        assert_eq!(
+            record.branch.as_deref(),
+            Some(fixture.request.branch.full_ref().as_str())
+        );
+        assert_eq!(
+            identity.common_dir,
+            fixture
+                .service
+                .common_dir(&fixture.request.repository, &token)
+                .unwrap()
+        );
+        assert_ne!(
+            identity.admin_dir.as_ref(),
+            Some(
+                &fixture
+                    .service
+                    .git_dir(&fixture.request.destination, &token)
+                    .unwrap()
+            ),
+            "same branch and path do not prove creation identity"
+        );
+        assert!(
+            !identity
+                .matches_checkout(
+                    &identity.common_dir,
+                    &fixture
+                        .service
+                        .git_dir(&fixture.request.destination, &token)
+                        .unwrap()
+                )
+                .unwrap()
+        );
+        fixture.git(&[
+            "worktree",
+            "remove",
+            fixture.request.destination.to_str().unwrap(),
+        ]);
+        fixture.git(&[
+            "worktree",
+            "add",
+            fixture.request.destination.to_str().unwrap(),
+            fixture.request.branch.as_str(),
+        ]);
+        let reused_admin = fixture
+            .service
+            .git_dir(&fixture.request.destination, &token)
+            .unwrap();
+        assert_eq!(
+            identity.admin_dir.as_ref(),
+            Some(&reused_admin),
+            "Git reuses the original administrative pathname"
+        );
+        assert!(
+            !identity
+                .matches_checkout(&identity.common_dir, &reused_admin)
+                .unwrap(),
+            "direct same-path replacement must not inherit setup authority"
+        );
         #[cfg(any(feature = "host", feature = "ui"))]
         {
-            let config = fixture.request.repository.join(".cagents"); fs::create_dir(&config).unwrap();
+            let config = fixture.request.repository.join(".cagents");
+            fs::create_dir(&config).unwrap();
             fs::write(config.join("worktree.toml"), "copy = [\".env\"]\n").unwrap();
-            fs::write(fixture.request.repository.join(".env"), "fixture-only-secret").unwrap();
-            let plan = crate::worktree_setup::load(&fixture.request.repository).unwrap().unwrap();
-            assert!(crate::worktree_setup::prepare_for_creation(&fixture.request.repository, &fixture.request.destination, &plan, false, fixture.request.operation_id, &token).is_err(), "a delayed original setup must not copy into the replacement");
+            fs::write(
+                fixture.request.repository.join(".env"),
+                "fixture-only-secret",
+            )
+            .unwrap();
+            let plan = crate::worktree_setup::load(&fixture.request.repository)
+                .unwrap()
+                .unwrap();
+            assert!(
+                crate::worktree_setup::prepare_for_creation(
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &plan,
+                    false,
+                    fixture.request.operation_id,
+                    &token
+                )
+                .is_err(),
+                "a delayed original setup must not copy into the replacement"
+            );
             assert!(!fixture.request.destination.join(".env").exists());
-            assert!(crate::worktree_setup::prepare_for_creation(&fixture.request.repository, &fixture.request.destination, &plan, true, fixture.request.operation_id, &token).unwrap().skipped);
+            assert!(
+                crate::worktree_setup::prepare_for_creation(
+                    &fixture.request.repository,
+                    &fixture.request.destination,
+                    &plan,
+                    true,
+                    fixture.request.operation_id,
+                    &token
+                )
+                .unwrap()
+                .skipped
+            );
             assert!(!fixture.request.destination.join(".env").exists());
         }
-        assert_eq!(fixture.service.worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id).unwrap(), Some(identity), "a read must retain the original receipt rather than reconcile it to the replacement");
+        assert_eq!(
+            fixture
+                .service
+                .worktree_setup_creation_identity(&fixture.store, fixture.request.operation_id)
+                .unwrap(),
+            Some(identity),
+            "a read must retain the original receipt rather than reconcile it to the replacement"
+        );
     }
 
     #[test]
     fn creation_basis_records_nondefault_base_and_pins_branch_changes() {
         let mut fixture = Fixture::new();
         fixture.git(&["switch", "-c", "release/1.2"]);
-        fs::write(fixture.request.repository.join("release.txt"), b"release-only\n").unwrap();
+        fs::write(
+            fixture.request.repository.join("release.txt"),
+            b"release-only\n",
+        )
+        .unwrap();
         fixture.git(&["add", "release.txt"]);
         fixture.git(&["commit", "-m", "release baseline"]);
         let release = fixture.git(&["rev-parse", "HEAD"]);
@@ -12053,15 +12411,39 @@ mod worktree_journal_tests {
         let basis = crate::worktree_basis::read(destination).unwrap().unwrap();
         assert_eq!(basis.reference, "refs/heads/release/1.2");
         assert_eq!(basis.oid, release);
-        let listed = fixture.service.list_worktrees(&fixture.request.repository, &CancellationToken::new()).unwrap();
-        assert_eq!(listed.iter().find(|record| record.path == *destination).unwrap().creation_basis.as_ref(), Some(&basis));
+        let listed = fixture
+            .service
+            .list_worktrees(&fixture.request.repository, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .find(|record| record.path == *destination)
+                .unwrap()
+                .creation_basis
+                .as_ref(),
+            Some(&basis)
+        );
         fs::write(destination.join("feature.txt"), b"feature-only\n").unwrap();
         fixture.git(&["-C", destination.to_str().unwrap(), "add", "feature.txt"]);
-        fixture.git(&["-C", destination.to_str().unwrap(), "commit", "-m", "feature change"]);
+        fixture.git(&[
+            "-C",
+            destination.to_str().unwrap(),
+            "commit",
+            "-m",
+            "feature change",
+        ]);
         // Moving the release ref after creation must not change the recorded basis.
         fixture.git(&["update-ref", "refs/heads/release/1.2", "main"]);
-        let comparison = fixture.service.branch_comparison_at(destination, &basis.display_reference().unwrap(),
-            &Oid::parse_object(basis.oid.clone()).unwrap(), &CancellationToken::new()).unwrap();
+        let comparison = fixture
+            .service
+            .branch_comparison_at(
+                destination,
+                &basis.display_reference().unwrap(),
+                &Oid::parse_object(basis.oid.clone()).unwrap(),
+                &CancellationToken::new(),
+            )
+            .unwrap();
         assert_eq!(comparison.entries.len(), 1);
         assert_eq!(comparison.entries[0].path.display(), "feature.txt");
         assert_eq!(comparison.base_oid.as_str(), release);
@@ -12081,9 +12463,17 @@ mod worktree_journal_tests {
             crate::linear::context::resolve_at(&fixture.request.destination).unwrap(),
             issue,
         );
-        assert_eq!(fixture.journal(fixture.request.operation_id).request.linear_issue, Some(issue));
         assert_eq!(
-            crate::linear::context::resolve_at(&fixture.request.repository).unwrap_err().kind,
+            fixture
+                .journal(fixture.request.operation_id)
+                .request
+                .linear_issue,
+            Some(issue)
+        );
+        assert_eq!(
+            crate::linear::context::resolve_at(&fixture.request.repository)
+                .unwrap_err()
+                .kind,
             "linear_issue_required",
         );
     }
@@ -12092,47 +12482,127 @@ mod worktree_journal_tests {
     fn explicit_local_selection_distinguishes_a_remote_named_local_branch() {
         let fixture = Fixture::new();
         fixture.git(&["branch", "origin/topic"]);
-        fixture.git(&["remote", "add", "origin", fixture.request.repository.to_str().unwrap()]);
+        fixture.git(&[
+            "remote",
+            "add",
+            "origin",
+            fixture.request.repository.to_str().unwrap(),
+        ]);
         fixture.git(&["update-ref", "refs/remotes/origin/topic", "HEAD"]);
-        let input = fixture.input("origin/topic"); let token = CancellationToken::new();
-        let local = fixture.service.resolve_worktree_request_selected(&input, Some("refs/heads/origin/topic"), &token).unwrap();
+        let input = fixture.input("origin/topic");
+        let token = CancellationToken::new();
+        let local = fixture
+            .service
+            .resolve_worktree_request_selected(&input, Some("refs/heads/origin/topic"), &token)
+            .unwrap();
         assert_eq!(local.branch.as_str(), "origin/topic");
         assert!(!local.track);
-        assert!(matches!(local.base, BaseRevision::LocalBranch(ref branch) if branch.as_str() == "origin/topic"));
-        let remote = fixture.service.resolve_worktree_request_selected(&input, Some("refs/remotes/origin/topic"), &token).unwrap();
-        assert_eq!(remote.branch.as_str(), "topic"); assert!(remote.track);
-        assert!(fixture.service.resolve_worktree_request_selected(&input, Some("refs/heads/disappeared"), &token).is_err());
+        assert!(
+            matches!(local.base, BaseRevision::LocalBranch(ref branch) if branch.as_str() == "origin/topic")
+        );
+        let remote = fixture
+            .service
+            .resolve_worktree_request_selected(&input, Some("refs/remotes/origin/topic"), &token)
+            .unwrap();
+        assert_eq!(remote.branch.as_str(), "topic");
+        assert!(remote.track);
+        assert!(
+            fixture
+                .service
+                .resolve_worktree_request_selected(&input, Some("refs/heads/disappeared"), &token)
+                .is_err()
+        );
         fixture.git(&["branch", "refs/remotes/origin/topic"]);
         fixture.git(&["branch", "refs/tags/v1"]);
         fixture.git(&["tag", "v1"]);
         let mut input = fixture.input("new-from-base");
         input.base = "refs/remotes/origin/topic".into();
-        let request = fixture.service.resolve_worktree_request(&input, &token).unwrap();
-        assert!(matches!(request.base, BaseRevision::RemoteRef(ref reference) if reference.as_str() == "refs/remotes/origin/topic"));
+        let request = fixture
+            .service
+            .resolve_worktree_request(&input, &token)
+            .unwrap();
+        assert!(
+            matches!(request.base, BaseRevision::RemoteRef(ref reference) if reference.as_str() == "refs/remotes/origin/topic")
+        );
         input.base = "refs/tags/v1".into();
-        assert!(matches!(fixture.service.resolve_worktree_request(&input, &token).unwrap().base, BaseRevision::ObjectId(_)));
+        assert!(matches!(
+            fixture
+                .service
+                .resolve_worktree_request(&input, &token)
+                .unwrap()
+                .base,
+            BaseRevision::ObjectId(_)
+        ));
     }
 
     #[test]
     fn restart_repairs_a_durable_created_checkout_before_basis_publication() {
-        let mut fixture = Fixture::new(); let token = CancellationToken::new();
+        let mut fixture = Fixture::new();
+        let token = CancellationToken::new();
         fixture.git(&["branch", "release/1.2"]);
-        fixture.request.base = BaseRevision::LocalBranch(ValidatedBranchName::parse("release/1.2").unwrap());
+        fixture.request.base =
+            BaseRevision::LocalBranch(ValidatedBranchName::parse("release/1.2").unwrap());
         assert_eq!(fixture.run(&token).state, WorktreeOperationState::Created);
-        let operation = fixture.store.journaled_worktree_operations().unwrap().into_iter().find(|operation| operation.id == fixture.request.operation_id).unwrap();
-        let mut journal: WorktreeJournal = serde_json::from_value(operation.payload.clone()).unwrap();
-        fs::remove_file(journal.admin_dir.as_ref().unwrap().join("cagents-created-from.json")).unwrap();
-        if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome { worktree.creation_basis = None; }
-        fixture.git(&["worktree", "lock", "--reason", &format!("cagents:{}", operation.id), fixture.request.destination.to_str().unwrap()]);
-        fixture.store.update_operation(operation.id, &operation.payload, &serde_json::to_value(&journal).unwrap(), PendingOperationStatus::Applied).unwrap();
-        let reports = RepositoryService::system("git").rehydrate_worktree_operations(&fixture.store).unwrap();
-        let report = reports.into_iter().find(|report| report.operation_id == operation.id).unwrap();
+        let operation = fixture
+            .store
+            .journaled_worktree_operations()
+            .unwrap()
+            .into_iter()
+            .find(|operation| operation.id == fixture.request.operation_id)
+            .unwrap();
+        let mut journal: WorktreeJournal =
+            serde_json::from_value(operation.payload.clone()).unwrap();
+        fs::remove_file(
+            journal
+                .admin_dir
+                .as_ref()
+                .unwrap()
+                .join("cagents-created-from.json"),
+        )
+        .unwrap();
+        if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome {
+            worktree.creation_basis = None;
+        }
+        fixture.git(&[
+            "worktree",
+            "lock",
+            "--reason",
+            &format!("cagents:{}", operation.id),
+            fixture.request.destination.to_str().unwrap(),
+        ]);
+        fixture
+            .store
+            .update_operation(
+                operation.id,
+                &operation.payload,
+                &serde_json::to_value(&journal).unwrap(),
+                PendingOperationStatus::Applied,
+            )
+            .unwrap();
+        let reports = RepositoryService::system("git")
+            .rehydrate_worktree_operations(&fixture.store)
+            .unwrap();
+        let report = reports
+            .into_iter()
+            .find(|report| report.operation_id == operation.id)
+            .unwrap();
         assert_eq!(report.state, WorktreeOperationState::Created);
-        let basis = crate::worktree_basis::read(&fixture.request.destination).unwrap().unwrap();
+        let basis = crate::worktree_basis::read(&fixture.request.destination)
+            .unwrap()
+            .unwrap();
         assert_eq!(basis.reference, "refs/heads/release/1.2");
         assert_eq!(Some(basis.oid), journal.base_oid);
-        let record = fixture.service.list_worktrees(&fixture.request.repository, &token).unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap();
-        assert!(record.lock.locked, "recovery only repairs metadata; it must not unlock or replay Git");
+        let record = fixture
+            .service
+            .list_worktrees(&fixture.request.repository, &token)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.path == fixture.request.destination)
+            .unwrap();
+        assert!(
+            record.lock.locked,
+            "recovery only repairs metadata; it must not unlock or replay Git"
+        );
         assert!(record.creation_basis.is_some());
     }
 
@@ -12319,19 +12789,38 @@ mod worktree_journal_tests {
         let remote = Fixture::new();
         remote.git(&["commit", "--allow-empty", "-m", "remote advanced"]);
         let bare = fixture.directory.path().join("bare.git");
-        fixture.git(&["clone", "--bare", remote.request.repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
         fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
         fixture.git(&["fetch", "origin"]);
-        fixture.git(&["symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main"]);
+        fixture.git(&[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/main",
+        ]);
         let cached = fixture.git(&["rev-parse", "origin/main"]);
         // An unreachable remote represents both offline and expired-credential
         // operation: creating local history must never try authentication.
-        fixture.git(&["remote", "set-url", "origin", "/nonexistent/cagents-offline-remote.git"]);
+        fixture.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/cagents-offline-remote.git",
+        ]);
         let mut input = fixture.input("offline/new");
         input.managed_directory.clear();
         fixture.resolve(input);
-        assert!(matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/origin/main"));
-        assert_eq!(fixture.request.managed_root, fixture.request.repository.join(".worktrees"));
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/origin/main")
+        );
+        assert_eq!(
+            fixture.request.managed_root,
+            fixture.request.repository.join(".worktrees")
+        );
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert_eq!(fixture.git(&["rev-parse", "offline/new"]), cached);
@@ -12346,7 +12835,12 @@ mod worktree_journal_tests {
         remote.git(&["switch", "-c", "topic"]);
         remote.git(&["commit", "--allow-empty", "-m", "old remote tip"]);
         let bare = fixture.directory.path().join("bare.git");
-        fixture.git(&["clone", "--bare", remote.request.repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
         fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
         fixture.git(&["fetch", "origin"]);
         let old = fixture.git(&["rev-parse", "origin/topic"]);
@@ -12357,56 +12851,103 @@ mod worktree_journal_tests {
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert_ne!(fixture.git(&["rev-parse", "topic"]), old);
-        assert_eq!(fixture.git(&["rev-parse", "topic"]), remote.git(&["rev-parse", "topic"]));
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
         assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "origin");
     }
 
     #[test]
     fn uncached_remote_branch_fetch_allows_successful_transfers_longer_than_discovery_timeout() {
         use std::os::unix::fs::PermissionsExt;
-        let mut fixture = Fixture::new(); let remote = Fixture::new();
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
         remote.git(&["branch", "topic"]);
         let bare = fixture.directory.path().join("bare.git");
-        fixture.git(&["clone", "--bare", remote.request.repository.to_str().unwrap(), bare.to_str().unwrap()]);
+        fixture.git(&[
+            "clone",
+            "--bare",
+            remote.request.repository.to_str().unwrap(),
+            bare.to_str().unwrap(),
+        ]);
         fixture.git(&["remote", "add", "origin", bare.to_str().unwrap()]);
         let upload_pack = fixture.directory.path().join("slow-upload-pack");
-        fs::write(&upload_pack, "#!/bin/sh\ntouch \"$0.ran\"\nsleep 4\nexec git-upload-pack \"$@\"\n").unwrap();
+        fs::write(
+            &upload_pack,
+            "#!/bin/sh\ntouch \"$0.ran\"\nsleep 4\nexec git-upload-pack \"$@\"\n",
+        )
+        .unwrap();
         fs::set_permissions(&upload_pack, fs::Permissions::from_mode(0o755)).unwrap();
-        fixture.git(&["config", "remote.origin.uploadpack", upload_pack.to_str().unwrap()]);
+        fixture.git(&[
+            "config",
+            "remote.origin.uploadpack",
+            upload_pack.to_str().unwrap(),
+        ]);
         fixture.resolve(fixture.input("origin/topic"));
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
         assert!(upload_pack.with_file_name("slow-upload-pack.ran").exists());
-        assert_eq!(fixture.git(&["rev-parse", "topic"]), remote.git(&["rev-parse", "topic"]));
+        assert_eq!(
+            fixture.git(&["rev-parse", "topic"]),
+            remote.git(&["rev-parse", "topic"])
+        );
     }
 
     #[test]
     fn unavailable_remote_branch_refresh_falls_back_to_cached_ref_with_warning() {
         let mut fixture = Fixture::new();
-        let remote = Fixture::new(); remote.git(&["branch", "topic"]);
-        fixture.add_remote("origin", &remote); fixture.git(&["fetch", "origin"]);
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("origin", &remote);
+        fixture.git(&["fetch", "origin"]);
         let cached = fixture.git(&["rev-parse", "origin/topic"]);
-        fixture.git(&["remote", "set-url", "origin", "/nonexistent/cagents-offline-remote.git"]);
+        fixture.git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "/nonexistent/cagents-offline-remote.git",
+        ]);
         fixture.resolve(fixture.input("origin/topic"));
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        assert!(report.detail.contains("using cached refs/remotes/origin/topic"), "{report:?}");
+        assert!(
+            report
+                .detail
+                .contains("using cached refs/remotes/origin/topic"),
+            "{report:?}"
+        );
         assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
-        assert!(matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty()));
+        assert!(
+            matches!(&report.outcome, Some(WorktreeCreationOutcome::Created {warnings, ..}) if !warnings.is_empty())
+        );
     }
 
     #[test]
     fn cached_remote_resolution_preserves_configured_remote_names_containing_slashes() {
-        let mut fixture = Fixture::new(); let remote = Fixture::new();
-        remote.git(&["branch", "topic"]); fixture.add_remote("team/nested", &remote);
+        let mut fixture = Fixture::new();
+        let remote = Fixture::new();
+        remote.git(&["branch", "topic"]);
+        fixture.add_remote("team/nested", &remote);
         fixture.git(&["fetch", "team/nested"]);
         fixture.resolve(fixture.input("topic"));
-        assert!(matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic"));
-        assert_eq!(fixture.run(&CancellationToken::new()).state, WorktreeOperationState::Created);
-        assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "team/nested");
-        let mut input = fixture.input("from-cached-topic"); input.base = "topic".into();
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic")
+        );
+        assert_eq!(
+            fixture.run(&CancellationToken::new()).state,
+            WorktreeOperationState::Created
+        );
+        assert_eq!(
+            fixture.git(&["config", "branch.topic.remote"]),
+            "team/nested"
+        );
+        let mut input = fixture.input("from-cached-topic");
+        input.base = "topic".into();
         fixture.resolve(input);
-        assert!(matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic"));
+        assert!(
+            matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic")
+        );
     }
 
     #[test]
@@ -12415,10 +12956,14 @@ mod worktree_journal_tests {
         let original = fixture.git(&["rev-parse", "HEAD"]);
         fixture.git(&["tag", "-a", "v1", "-m", "release"]);
         fixture.git(&["commit", "--allow-empty", "-m", "later work"]);
-        let mut input = fixture.input("from-tag"); input.base = "v1".into();
+        let mut input = fixture.input("from-tag");
+        input.base = "v1".into();
         fixture.resolve(input);
         assert!(matches!(&fixture.request.base, BaseRevision::ObjectId(oid) if oid == &original));
-        assert_eq!(fixture.run(&CancellationToken::new()).state, WorktreeOperationState::Created);
+        assert_eq!(
+            fixture.run(&CancellationToken::new()).state,
+            WorktreeOperationState::Created
+        );
         assert_eq!(fixture.git(&["rev-parse", "from-tag"]), original);
     }
 
@@ -12476,14 +13021,8 @@ mod worktree_journal_tests {
         fixture.resolve(fixture.input("topic"));
         let report = fixture.run(&CancellationToken::new());
         assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
-        assert_eq!(
-            fixture.git(&["rev-parse", "topic"]),
-            cached
-        );
-        assert_eq!(
-            fixture.git(&["rev-parse", "topic@{upstream}"]),
-            cached
-        );
+        assert_eq!(fixture.git(&["rev-parse", "topic"]), cached);
+        assert_eq!(fixture.git(&["rev-parse", "topic@{upstream}"]), cached);
     }
 
     #[test]
