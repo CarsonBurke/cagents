@@ -1,6 +1,42 @@
 // HOST owning fixtures only. The first real private Claude backend exits cleanly
 // after its completed turn; the same retained helper restarts a second backend.
 // No injected Actor.child/completed flags or guessed ownership metadata.
+// Arm cleanup before dispatch can publish an owning actor. Lease and Broker
+// remain inside this guard through constructor panic and final fixture cleanup.
+// An Err is test failure, never proof of pending-startup or family settlement:
+// the outer originalChild/common-retention owner still handles uncertainty.
+struct RetainedCloseRaceCleanup {
+    host: SharedHost,
+    release: std::path::PathBuf,
+    attempted: bool,
+    notifications: Option<crate::host::notifications::Broker>,
+    lease: Option<crate::daemon::HostLease>,
+}
+impl RetainedCloseRaceCleanup {
+    fn finish(&mut self) -> Result<(), String> {
+        if self.attempted { return Ok(()); }
+        self.attempted = true;
+        let mut failures = Vec::new();
+        if let Err(error) = std::fs::write(&self.release, b"fixture cleanup") {
+            failures.push(format!("release private initialization gate: {error}"));
+        }
+        if let Err(error) = super::super::finish_chat_shutdown(&self.host) {
+            failures.push(format!("exact private host cleanup is unconfirmed: {error}"));
+        }
+        if failures.is_empty() { Ok(()) } else { Err(failures.join("; ")) }
+    }
+    fn finish_or_report(&mut self) {
+        if let Err(error) = self.finish() {
+            eprintln!("Retained fixture cleanup failed; original child ownership remains required: {error}");
+            if !std::thread::panicking() {
+                panic!("Retained fixture cleanup was not confirmed: {error}");
+            }
+        }
+    }
+}
+impl Drop for RetainedCloseRaceCleanup {
+    fn drop(&mut self) { self.finish_or_report(); }
+}
 struct RetainedCloseRaceFixture {
     host: SharedHost,
     path: std::path::PathBuf,
@@ -10,14 +46,20 @@ struct RetainedCloseRaceFixture {
     handle: chat::runtime::Handle,
     identity: chat::runtime::ActorIdentity,
     original: crate::daemon::holder_registry::Process,
-    _lease: crate::daemon::HostLease,
-    _notifications: crate::host::notifications::Broker,
+    cleanup: RetainedCloseRaceCleanup,
 }
 impl RetainedCloseRaceFixture {
     fn start() -> Self { Self::start_with_schedule(false) }
     fn scheduled() -> Self { Self::start_with_schedule(true) }
     fn start_with_schedule(scheduled: bool) -> Self {
         let (host, request, path) = fixture();
+        let mut cleanup = RetainedCloseRaceCleanup {
+            host: host.clone(),
+            release: path.with_file_name("retained-restart-release"),
+            attempted: false,
+            notifications: None,
+            lease: None,
+        };
         let root = path.parent().unwrap();
         let program = root.join("bin/claude");
         let mut script = std::fs::read_to_string(&program).unwrap();
@@ -34,10 +76,10 @@ while IFS= read -r frame; do"#, 1);
         std::fs::write(&program, script).unwrap();
         let proof = host.lock().unwrap().proof().clone();
         let paths = crate::daemon::RuntimePaths::discover().unwrap();
-        let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
-        let notifications = crate::host::notifications::Broker::start(&host,
-            crate::notifications::Application::Cagents).unwrap();
-        host.lock().unwrap().notifications = Some(notifications.handle());
+        cleanup.lease = Some(crate::daemon::HostLease::acquire(&paths, &proof).unwrap());
+        cleanup.notifications = Some(crate::host::notifications::Broker::start(&host,
+            crate::notifications::Application::Cagents).unwrap());
+        host.lock().unwrap().notifications = Some(cleanup.notifications.as_ref().unwrap().handle());
         host.lock().unwrap().enable_holder_recovery();
         let accepted = if scheduled {
             let automation = automation_fixture(&host, &request);
@@ -76,7 +118,7 @@ while IFS= read -r frame; do"#, 1);
         assert!(!original.is_current());
         assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap().lines().count(), 1);
         let agent = registry(&host).unwrap().lock().unwrap().agent(agent.id).unwrap();
-        Self {host, path, agent, run, source, handle, identity, original, _lease:lease, _notifications:notifications}
+        Self {host, path, agent, run, source, handle, identity, original, cleanup}
     }
     fn release_restart(&self) {
         std::fs::write(self.path.parent().unwrap().join("retained-restart-release"), b"release owned fixture backend").unwrap();
@@ -87,11 +129,9 @@ while IFS= read -r frame; do"#, 1);
 }
 impl Drop for RetainedCloseRaceFixture {
     fn drop(&mut self) {
-        // The original retained facade/helper remains the sole cleanup target;
-        // a failed test never discovers a process by name or numeric PID scan.
-        let _ = std::fs::write(self.path.parent().unwrap().join("retained-restart-release"), b"fixture cleanup");
-        let _ = self.handle.close_for_resume();
-        let _ = self.handle.finish_retained_close();
+        // Run while all fixture fields and the guard's lease/Broker are live.
+        // The exact private host owns its handles; no PID/name discovery occurs.
+        self.cleanup.finish_or_report();
     }
 }
 
