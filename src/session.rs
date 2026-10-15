@@ -2884,6 +2884,7 @@ mod tests {
             channels: Vec::new(),
             active_channel: None,
             card_scopes: HashMap::new(),
+            automation_archives: HashMap::new(),
             chat_drafts: HashMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),

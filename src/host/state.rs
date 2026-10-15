@@ -525,8 +525,12 @@ impl HostState {
             .iter()
             .filter(|(_, presence)| {
                 source_session.is_some_and(|session| presence.sessions.contains(&session))
-                    || (matches!(target, crate::notifications::Target::AgentRun(_))
-                        && presence.application == Application::Cagents)
+                    || (matches!(
+                        target,
+                        crate::notifications::Target::AgentRun(_)
+                            | crate::notifications::Target::Automation { .. }
+                            | crate::notifications::Target::AutomationProposal { .. }
+                    ) && presence.application == Application::Cagents)
                     || preferred.is_some_and(|destination| *destination == presence.destination())
             })
             .max_by_key(|(_, presence)| {

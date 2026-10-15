@@ -64,6 +64,8 @@ struct Inner {
     // The journal is bounded. Polling must not resurrect a blocked run after
     // newer unrelated events evict its durable replay identity.
     attention: Mutex<BTreeMap<crate::model::RunId, crate::notifications::Evidence>>,
+    history_pruned_ms: std::sync::atomic::AtomicU64,
+    retirement_after: Mutex<Option<Uuid>>,
 }
 
 #[derive(Clone)]
@@ -87,6 +89,8 @@ impl Broker {
             workers: Mutex::new(BTreeMap::new()),
             cleanup: Mutex::new(Some(cleanup)),
             attention: Mutex::new(attention),
+            history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
+            retirement_after: Mutex::new(None),
         }));
         let owner = handle.clone();
         let thread = std::thread::Builder::new()
@@ -334,6 +338,21 @@ impl Handle {
             return Ok(Duration::from_millis(250));
         }
         let now = service::now()?;
+        let last_pruned = self
+            .0
+            .history_pruned_ms
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if last_pruned == 0 || now.saturating_sub(last_pruned) >= 60 * 60 * 1000 {
+            self.0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .prune_automation_history(now)?;
+            self.0
+                .history_pruned_ms
+                .store(now, std::sync::atomic::Ordering::Relaxed);
+        }
+        super::flush_notifications(host)?;
         let active = self
             .0
             .registry
@@ -349,7 +368,28 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .retain(|run, _| runs.contains(run));
         let mut checking = false;
-        let candidates = self
+        let after = *self
+            .0
+            .retirement_after
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let retirement_page = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pending_automation_precheck_retirements(after)?;
+        *self
+            .0
+            .retirement_after
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = if retirement_page.len() == 32 {
+            retirement_page.last().map(|(id, _)| *id)
+        } else {
+            None
+        };
+        checking |= retirement_page.len() == 32;
+        let mut candidates = self
             .0
             .workers
             .lock()
@@ -358,28 +398,45 @@ impl Handle {
             .filter(|id| !owners.contains(id))
             .copied()
             .collect::<Vec<_>>();
+        candidates.extend(retirement_page.into_iter().map(|(id, _)| id));
+        candidates.sort_unstable();
+        candidates.dedup();
         for id in candidates {
             // A manual request can add a worker after the active census. The
             // absent snapshot entry alone never authorizes deleting its proof.
-            if self
+            let Some(revision) = self
                 .0
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .retired_automation_precheck(id)?
-                .is_none()
-            {
-                continue;
-            }
-            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(worker) = workers.get_mut(&id) else {
+            else {
                 continue;
             };
+            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+            let worker = workers
+                .entry(id)
+                .or_insert_with(|| Worker::recover(&self.0.root, id, revision));
             match worker.retire() {
                 Ok(true) => {
-                    workers.remove(&id);
+                    // Files are gone, but keep this worker entry retryable if
+                    // the durable coalescing transaction fails. Do not nest
+                    // the registry lock beneath the worker census mutex.
+                    drop(workers);
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .coalesce_retired_automation_precheck(id, revision)?;
+                    self.0
+                        .workers
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .remove(&id);
                 }
-                Ok(false) => {} // Reap/reclaim again on the next bounded tick.
+                Ok(false) => {
+                    checking = true;
+                } // Reap/reclaim again on the next bounded tick.
                 Err(error) => {
                     tracing::warn!(%id, %error, "retired precheck files could not be reclaimed");
                     // A reaped owner may leave inaccessible files for the next
@@ -437,7 +494,11 @@ impl Handle {
             let Some(previous) = &automation.next else {
                 continue;
             };
-            let plan = Compiled::new(&automation.definition.schedule)?.due(previous, now)?;
+            let plan = Compiled::new(&automation.definition.schedule)?.due_with_policy(
+                previous,
+                now,
+                &automation.definition.catch_up,
+            )?;
             if let Some(occurrence) = plan.fire {
                 let expected = if plan.missed && occurrence.due_ms > previous.due_ms {
                     self.0
@@ -489,6 +550,7 @@ impl Handle {
                     )?;
             }
         }
+        super::flush_notifications(host)?;
         let next = self
             .0
             .registry
@@ -520,6 +582,42 @@ impl Handle {
         let agent = detail
             .agent
             .ok_or("The automation lost its agent identity")?;
+        let archive_handle = if detail.definition.session_mode == SessionMode::Fresh
+            && !agent.closed
+        {
+            match &agent.session {
+                Some(crate::agent_execution::HostedSession::Chat(session)) => host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .chats
+                    .get(&session.id)
+                    .filter(|record| {
+                        crate::agent_execution::HostedSession::Chat(session.clone()).same_process(
+                            &crate::agent_execution::HostedSession::Chat(record.session.clone()),
+                        )
+                    })
+                    .map(|record| record.handle.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(handle) = &archive_handle
+            && let Some(snapshot) = handle.snapshot(None)
+            && !snapshot.busy
+            && !snapshot.waiting
+            && snapshot.requests.is_empty()
+        {
+            if !self
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .preserve_automation_conversation(firing.id, &agent, snapshot, now)?
+            {
+                return Ok(false);
+            }
+        }
         // Explicit user close is valid cleanup evidence even when the earlier
         // provider outcome was interrupted. It must never authorize a resend.
         let disposition = if agent.closed {
@@ -655,7 +753,13 @@ impl Handle {
             };
             let mut worker = Worker::recover(&self.0.root, id, revision);
             match worker.retire() {
-                Ok(true) => {}
+                Ok(true) => {
+                    self.0
+                        .registry
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .coalesce_retired_automation_precheck(id, revision)?;
+                }
                 Ok(false) => {
                     self.0
                         .workers
@@ -750,6 +854,8 @@ mod tests {
             workers: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
+            retirement_after: Mutex::new(None),
         }));
         let (reported, received) = std::sync::mpsc::channel();
         let thread = std::thread::spawn(move || {
@@ -833,6 +939,8 @@ mod tests {
             workers: Mutex::default(),
             cleanup: Mutex::new(None),
             attention: Mutex::default(),
+            history_pruned_ms: std::sync::atomic::AtomicU64::new(0),
+            retirement_after: Mutex::new(None),
         }));
         let gate = host.lock().unwrap().control_gate.clone();
         let exclusive = gate.write().unwrap();

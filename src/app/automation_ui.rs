@@ -142,7 +142,13 @@ impl Cagents {
                 let Some(agent) = detail.agent else {
                     return Task::none();
                 };
-                if agent.closed
+                let archived = agent.closed
+                    && detail.definition.session_mode == crate::automations::SessionMode::Fresh
+                    && matches!(
+                        &agent.session,
+                        Some(crate::agent_execution::HostedSession::Chat(_))
+                    );
+                if (agent.closed && !archived)
                     || !matches!(agent.origin, crate::agent_execution::Origin::Automation { id } if id == detail.firing.automation)
                 {
                     self.status = Some(TransientNotice::error(
@@ -159,7 +165,24 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                let selected = match &agent.placement {
+                if archived
+                    && !self.can_present_automation_archive(
+                        CardId::from_uuid(agent.id.as_uuid()),
+                        &agent,
+                    )
+                {
+                    self.status = Some(TransientNotice::warning(
+                        "This pane changed after the run completed. Its saved result remains available in run history.",
+                    ));
+                    return Task::none();
+                }
+                let Some(placement) = self.workspace_model.agent_view_scope(&agent).cloned() else {
+                    self.status = Some(TransientNotice::warning(
+                        "This agent's exact pane is no longer available in a single view. Its result remains available in run history.",
+                    ));
+                    return Task::none();
+                };
+                let selected = match &placement {
                     crate::agent_execution::Placement::Channel(id) => {
                         let Some(channel) = self
                             .durable
@@ -179,7 +202,7 @@ impl Cagents {
                     }
                     crate::agent_execution::Placement::Worktree { path, .. } => {
                         if self.project_ui.deleting_directory(path)
-                            || self.worktree_view_scope(path).as_ref() != Some(&agent.placement)
+                            || self.worktree_view_scope(path).as_ref() != Some(&placement)
                         {
                             self.status = Some(TransientNotice::error(
                                 "The agent's worktree view is not loaded in this window. Open its project, then try again.",
@@ -189,9 +212,17 @@ impl Cagents {
                         self.select_worktree(path.clone(), false)
                     }
                 };
+                if archived {
+                    let card = CardId::from_uuid(agent.id.as_uuid());
+                    Arc::make_mut(&mut self.durable)
+                        .automation_archives
+                        .insert(card, agent.id);
+                    self.prepare_automation_archive(card, &agent);
+                }
                 let adopted = self
                     .adopt_execution_agent(&agent)
                     .unwrap_or_else(Task::none);
+                self.persist();
                 Task::batch([
                     adopted,
                     selected,

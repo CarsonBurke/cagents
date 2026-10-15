@@ -1,6 +1,7 @@
 mod account_ui;
 mod agent_ui;
 mod automation_approval;
+mod automation_archives;
 mod automation_ui;
 mod branch_ui;
 #[cfg(feature = "integrated-browser")]
@@ -5429,6 +5430,16 @@ impl Cagents {
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
         let shared = self.shared_views.attached.contains(&card);
+        // A saved execution console is a view of its exact accepted actor.
+        // Before an archive/model push arrives it may still look live locally;
+        // discovering a dead daemon never authorizes rerunning its launcher.
+        // This is only a no-execution fence, never archive/readiness authority.
+        let managed_console = session.launch.arguments
+            == [
+                "agent".to_owned(),
+                "console".to_owned(),
+                crate::model::AgentId::from_uuid(card.as_uuid()).to_string(),
+            ];
         let reserved = self
             .workspace_model
             .views
@@ -5438,13 +5449,13 @@ impl Cagents {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let mut created = false;
-                let (recovered, mode) = if shared && !explicit_retry {
+                let (recovered, mode) = if managed_console || shared && !explicit_retry {
                     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
                     let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
                     // A reserved start has nothing to find yet, and completing
                     // it attaches to the terminal another client got to first.
                     let mut hosted = if reserved { None } else {
-                        client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id)
+                        client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id && (!managed_console || hosted.session.launch==session.launch))
                     };
                     if reserved {
                         for _ in 0..100 {
@@ -7011,6 +7022,24 @@ impl Cagents {
 
     fn persist(&mut self) {
         self.shared_views.prune_restoration_requests(&self.durable);
+        if !self.durable.automation_archives.is_empty() {
+            let closed = self
+                .durable
+                .cards
+                .iter()
+                .filter(|card| {
+                    !card.existence.is_open()
+                        && self.durable.automation_archives.contains_key(&card.id)
+                })
+                .map(|card| card.id)
+                .collect::<Vec<_>>();
+            if !closed.is_empty() {
+                let archives = &mut Arc::make_mut(&mut self.durable).automation_archives;
+                for card in closed {
+                    archives.remove(&card);
+                }
+            }
+        }
         if !self.durable.pending_terminal_creations.is_empty() {
             let open = self
                 .durable
@@ -8316,7 +8345,7 @@ impl Cagents {
         // Actions are only emitted for real transitions, so an empty sweep left
         // the durable state untouched and needs no snapshot.
         let durable_changed = !actions.is_empty();
-        let mut tasks = Vec::new();
+        let mut tasks = vec![self.hydrate_visible_automation_archives(visible)];
         let mut schedule_sweep = false;
         for action in actions {
             match action {
@@ -11272,8 +11301,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -19318,6 +19350,9 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                headless_automation_agents: Vec::new(),
+                archived_automation_agents: Vec::new(),
+                pending_automation_proposals: Vec::new(),
             };
             match frame {
                 // One adopted row.

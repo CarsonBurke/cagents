@@ -23,6 +23,18 @@ pub enum Target {
     AgentRun(RunId),
     /// Pending terminal mailbox attention survives recipient process replacement.
     SessionInbox(crate::agent_execution::Lineage),
+    Automation {
+        id: uuid::Uuid,
+        name: String,
+        reason: String,
+    },
+    AutomationProposal {
+        id: uuid::Uuid,
+        name: String,
+        project: String,
+        #[serde(default)]
+        requester: String,
+    },
 }
 
 impl Target {
@@ -31,6 +43,8 @@ impl Target {
             Self::Session(id) => id.to_string(),
             Self::PullRequest(request) => request.storage_key(),
             Self::AgentRun(id) => format!("run:{id}"),
+            Self::Automation { id, .. } => format!("automation:{id}"),
+            Self::AutomationProposal { id, .. } => format!("automation-proposal:{id}"),
             Self::SessionInbox(lineage) => format!("inbox:{lineage}"),
         }
     }
@@ -67,6 +81,10 @@ pub enum Kind {
     ReviewRequested,
     Interrupted,
     MessageReceived,
+    AutomationPaused,
+    AutomationBlocked,
+    AutomationSkipped,
+    AutomationProposed,
 }
 
 impl Kind {
@@ -79,6 +97,10 @@ impl Kind {
             Self::ReviewRequested => "Your review was requested",
             Self::Interrupted => "Agent outcome unknown",
             Self::MessageReceived => "Session messages waiting",
+            Self::AutomationPaused => "Automation paused",
+            Self::AutomationBlocked => "Automation blocked",
+            Self::AutomationSkipped => "Automation occurrence skipped",
+            Self::AutomationProposed => "Scheduled work needs approval",
         }
     }
 }
@@ -127,6 +149,47 @@ impl Event {
                 .is_some_and(|directory| directory.as_os_str().len() > 4096)
         {
             return Err("Notification metadata exceeds its size limit".into());
+        }
+        match &self.target {
+            Target::Automation { name, reason, .. } => {
+                if name.len() > 160
+                    || reason.len() > 512
+                    || name.chars().chain(reason.chars()).any(char::is_control)
+                    || !matches!(
+                        self.evidence.kind,
+                        Kind::AutomationPaused | Kind::AutomationBlocked | Kind::AutomationSkipped
+                    )
+                {
+                    return Err("Invalid automation notification metadata".into());
+                }
+            }
+            Target::AutomationProposal {
+                name,
+                project,
+                requester,
+                ..
+            } => {
+                if requester.len() > 256
+                    || requester.chars().any(char::is_control)
+                    || name.len() > 160
+                    || project.len() > 256
+                    || name.chars().chain(project.chars()).any(char::is_control)
+                    || self.evidence.kind != Kind::AutomationProposed
+                {
+                    return Err("Invalid automation proposal notification metadata".into());
+                }
+            }
+            _ if matches!(
+                self.evidence.kind,
+                Kind::AutomationPaused
+                    | Kind::AutomationBlocked
+                    | Kind::AutomationSkipped
+                    | Kind::AutomationProposed
+            ) =>
+            {
+                return Err("Automation notifications require an automation target".into());
+            }
+            _ => {}
         }
         if let Some(destination) = &self.destination {
             destination.validate()?;
@@ -345,6 +408,10 @@ impl Preferences {
                 Kind::Succeeded => self.success,
                 Kind::Failed | Kind::Cancelled => self.failure,
                 Kind::Waiting | Kind::Interrupted | Kind::MessageReceived => self.waiting,
+                Kind::AutomationPaused
+                | Kind::AutomationBlocked
+                | Kind::AutomationSkipped
+                | Kind::AutomationProposed => self.waiting,
                 Kind::ReviewRequested => self.review_requests,
             }
     }
@@ -352,6 +419,25 @@ impl Preferences {
 
 /// Only bounded, non-content context may cross into desktop notifications.
 pub fn context(event: &Event) -> String {
+    match &event.target {
+        Target::Automation { name, reason, .. } => return format!("{name} · {reason}"),
+        Target::AutomationProposal {
+            name,
+            project,
+            requester,
+            ..
+        } => {
+            return format!(
+                "{} · {name} · {project}",
+                if requester.is_empty() {
+                    "Hosted conversation"
+                } else {
+                    requester
+                }
+            );
+        }
+        _ => {}
+    }
     if matches!(event.target, Target::SessionInbox(_)) {
         return "Open the terminal and run cagents inbox to read messages.".into();
     }

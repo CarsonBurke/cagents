@@ -174,7 +174,7 @@ fn enabled_automation_dispatches_without_a_window_and_restart_does_not_repeat_it
             "target": {"repository": project, "directory": project, "channel": null},
             "surface": "Chat", "model": null, "permission_mode": null},
         "schedule": {"pattern": {"daily": {"hour": now.hour(), "minute": now.minute()}}, "timezone": "UTC"},
-        "session_mode": "fresh", "precheck": null
+        "session_mode": "fresh", "visibility": "headless", "precheck": null
     });
     let path = fixture.root.path().join("scheduled.json");
     fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
@@ -458,4 +458,321 @@ fn automation_cli_runs_headless_precheck_once_and_keeps_history_after_restart_an
         !fixture.output(&changed).status.success(),
         "retry identity cannot authorize another revision"
     );
+}
+
+#[test]
+fn more_than_sixty_four_headfull_fresh_runs_retire_providers_and_keep_lazy_archives() {
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let provider = fixture.root.path().join("bin/claude");
+    let source = format!(
+        "{}\n{}",
+        "#!/bin/sh\nprintf 'spawn\\n' >> \"$HOME/../spawns\"\nif [ -r /proc/$$/stat ]; then printf '%s ' \"$$\" >> \"$HOME/../provider-pids\"\nawk '{print $22}' /proc/$$/stat >> \"$HOME/../provider-pids\"; fi",
+        include_str!("fixtures/automation-claude.sh").trim_start_matches("#!/bin/sh\n")
+    );
+    fs::write(&provider, source).unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
+    let definition = json!({
+        "name":"Fresh visible archive fixture", "prompt":"Return a fixture result",
+        "agent":{"provider":"Claude","account":null,
+            "target":{"repository":project,"directory":project,"channel":null},
+            "surface":"Chat","model":null,"permission_mode":null},
+        "schedule":{"pattern":{"daily":{"hour":3,"minute":0}},"timezone":"UTC"},
+        "session_mode":"fresh", "precheck":null
+    });
+    let path = fixture.root.path().join("definition.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        created["automation"]["definition"]["visibility"],
+        "headfull"
+    );
+    let id = created["automation"]["id"].as_str().unwrap();
+    let revision = created["automation"]["execution_revision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let socket = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY)
+        .join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
+    let mut last_agent = None;
+    for index in 0..70 {
+        let request = uuid::Uuid::new_v4().to_string();
+        let accepted = fixture.cli(&[
+            "automation",
+            "run-now",
+            id,
+            "--execution-revision",
+            &revision,
+            "--request-id",
+            &request,
+            "--confirm",
+        ]);
+        let firing = accepted["firing"]["id"].as_str().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let detail = loop {
+            let detail = fixture.cli(&["automation", "run", firing]);
+            let shown = fixture.cli(&["automation", "show", id]);
+            if detail["run"]["firing"]["state"] == "succeeded"
+                && shown["automation"]["active_firing"].is_null()
+            {
+                break detail;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "fresh visible run {index} did not settle: {detail}"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            detail["run"]["agent"]["closed"], true,
+            "completed providers must release child capacity"
+        );
+        assert!(
+            client.list_chats().unwrap().is_empty(),
+            "no hosted provider may accumulate after fresh completion"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let identities = fs::read_to_string(fixture.root.path().join("provider-pids")).unwrap();
+            let latest = identities
+                .lines()
+                .last()
+                .unwrap()
+                .split_whitespace()
+                .collect::<Vec<_>>();
+            assert_eq!(latest.len(), 2);
+            if let Ok(stat) = fs::read_to_string(format!("/proc/{}/stat", latest[0])) {
+                let observed = stat
+                    .rsplit_once(')')
+                    .unwrap()
+                    .1
+                    .split_whitespace()
+                    .nth(19)
+                    .unwrap();
+                assert_ne!(
+                    observed, latest[1],
+                    "the exact completed provider process must have exited, even if its PID was subsequently reused"
+                );
+            }
+        }
+        last_agent = Some(
+            detail["run"]["agent"]["id"]
+                .as_str()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+    }
+    let agent = last_agent.unwrap();
+    let before = fs::read_to_string(fixture.root.path().join("prompts")).unwrap();
+    let archive = client
+        .automation(
+            cagents::agent_execution::Authority::default(),
+            cagents::automations::Request::ArchivedConversation { agent },
+        )
+        .unwrap();
+    let cagents::automations::Response::ArchivedConversation(archive) = archive else {
+        panic!("expected exact archive")
+    };
+    assert!(archive.agent.closed);
+    assert!(!archive.snapshot.ready && archive.snapshot.exited);
+    assert!(archive.snapshot.read_only_reason.is_some());
+    assert!(
+        archive
+            .snapshot
+            .items
+            .iter()
+            .any(|item| matches!(&item.content,
+        cagents::chat::ItemContent::Text {text,..} if text.contains("SCHEDULED_RESULT")))
+    );
+    assert!(
+        client.list_chats().unwrap().is_empty(),
+        "reading an archive must not create a replacement provider"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("prompts")).unwrap(),
+        before
+    );
+    assert_eq!(before.lines().count(), 70);
+    assert_eq!(
+        fs::read_to_string(fixture.root.path().join("spawns"))
+            .unwrap()
+            .lines()
+            .count(),
+        70
+    );
+}
+
+#[test]
+fn actual_execution_console_roundtrips_to_the_same_saved_pane_without_provider_replay() {
+    use cagents::{
+        agent_execution::{Agent, HostedSession},
+        model::{
+            BootId, CardId, CardKind, CardState, Existence, Exposure, Residency, WorkspaceState,
+        },
+        persistence::{SnapshotBase, StateStore},
+    };
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    fixture.cli(&["project", "open", project.to_str().unwrap()]);
+    let provider = fixture.root.path().join("bin/claude");
+    fs::write(&provider, include_str!("fixtures/automation-claude.sh")).unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
+    let definition = json!({"name":"Actual console archive","prompt":"Return a fixture result","agent":{"provider":"Claude","account":null,"target":{"repository":project,"directory":project,"placement":null},"surface":"Terminal","model":null,"permission_mode":null},"schedule":{"pattern":{"daily":{"hour":3,"minute":0}},"timezone":"UTC"},"session_mode":"fresh","visibility":"headfull","precheck":null});
+    let path = fixture.root.path().join("terminal.json");
+    fs::write(&path, serde_json::to_vec(&definition).unwrap()).unwrap();
+    let created = fixture.cli(&[
+        "automation",
+        "create",
+        "--definition",
+        path.to_str().unwrap(),
+    ]);
+    let id = created["automation"]["id"].as_str().unwrap();
+    let revision = created["automation"]["execution_revision"]
+        .as_u64()
+        .unwrap()
+        .to_string();
+    let request = uuid::Uuid::new_v4().to_string();
+    let accepted = fixture.cli(&[
+        "automation",
+        "run-now",
+        id,
+        "--execution-revision",
+        &revision,
+        "--request-id",
+        &request,
+        "--confirm",
+    ]);
+    let firing = accepted["firing"]["id"].as_str().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let _detail = loop {
+        let detail = fixture.cli(&["automation", "run", firing]);
+        let shown = fixture.cli(&["automation", "show", id]);
+        if detail["run"]["firing"]["state"] == "succeeded"
+            && shown["automation"]["active_firing"].is_null()
+        {
+            break detail;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "actual console did not settle: {detail}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    };
+    let socket = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY)
+        .join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
+    let cagents::automations::Response::Detail(saved) = client
+        .automation(
+            cagents::agent_execution::Authority::default(),
+            cagents::automations::Request::ShowFiring {
+                id: firing.parse().unwrap(),
+            },
+        )
+        .unwrap()
+    else {
+        panic!("typed run receipt")
+    };
+    let agent: Agent = saved.agent.unwrap();
+    assert!(agent.closed);
+    let console = agent
+        .console
+        .clone()
+        .expect("actual create_console descriptor");
+    let Some(HostedSession::Chat(mut session)) = agent.session.clone() else {
+        panic!("original native provider descriptor")
+    };
+    assert_eq!(console.id, session.id);
+    assert_eq!(
+        console.launch.arguments,
+        vec![
+            "agent".to_owned(),
+            "console".to_owned(),
+            agent.id.to_string()
+        ]
+    );
+    let card = CardId::from_uuid(agent.id.as_uuid());
+    let store = StateStore::open(
+        fixture.root.path().join("pane.sqlite3"),
+        BootId::new("console-fixture"),
+    )
+    .unwrap();
+    let mut workspace = WorkspaceState::default();
+    workspace.cards.push(CardState {
+        id: card,
+        generation: 0,
+        title: "Scheduled console".into(),
+        width_fraction: 0.6,
+        existence: Existence::Open,
+        exposure: Exposure::Visible,
+        residency: Residency::Cold,
+        kind: CardKind::Terminal(console.clone()),
+    });
+    workspace.focused = Some(card);
+    let first = store
+        .save_workspace(
+            &workspace,
+            SnapshotBase {
+                workspace: 0,
+                cards: &Default::default(),
+            },
+        )
+        .unwrap();
+    session.terminal = Some(console);
+    workspace.cards[0].kind = CardKind::Chat(session.clone());
+    workspace.automation_archives.insert(card, agent.id);
+    store
+        .save_workspace(
+            &workspace,
+            SnapshotBase {
+                workspace: first.generation,
+                cards: &first.card_generations,
+            },
+        )
+        .unwrap();
+    let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+    assert_eq!(restored.cards[0].id, card);
+    assert_eq!(restored.cards[0].kind, CardKind::Chat(session.clone()));
+    let before = fs::read_to_string(fixture.root.path().join("prompts")).unwrap();
+    for _ in 0..2 {
+        let cagents::automations::Response::ArchivedConversation(archive) = client
+            .automation(
+                cagents::agent_execution::Authority::default(),
+                cagents::automations::Request::ArchivedConversation { agent: agent.id },
+            )
+            .unwrap()
+        else {
+            panic!("saved view")
+        };
+        assert!(
+            cagents::automations::archive::ArchivedPaneReadiness::qualify(
+                agent.id, &session, &archive
+            )
+            .unwrap()
+            .matches(agent.id, &session)
+        );
+    }
+    assert!(client.list_chats().unwrap().is_empty());
+    assert_eq!(
+        before,
+        fs::read_to_string(fixture.root.path().join("prompts")).unwrap()
+    );
+    assert_eq!(before.lines().count(), 1);
 }

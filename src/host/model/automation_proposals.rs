@@ -57,6 +57,21 @@ fn read(db: &Connection, id: Uuid, owner: Option<&Origin>) -> Result<Option<Prop
 }
 
 impl Registry {
+    pub(crate) fn all_pending_automation_proposals(&self) -> Result<Vec<ProposalSummary>, String> {
+        let mut query = self
+            .db
+            .prepare("SELECT summary FROM automation_proposals WHERE pending=1 ORDER BY id")
+            .map_err(|error| error.to_string())?;
+        query
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| error.to_string())?
+            .map(|row| {
+                serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+
     pub(crate) fn automation_proposal(
         &self,
         id: Uuid,
@@ -155,6 +170,60 @@ impl Registry {
             ],
         )
         .map_err(|_| "Could not save this request ID; use a new request ID".to_owned())?;
+        let project: String = proposal
+            .definition
+            .agent
+            .target
+            .repository
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(128)
+            .collect();
+        // Attribute the request to its actual issuing conversation, rather
+        // than the provider it proposes to schedule (which may differ).
+        let issuer = if let Origin::Child { parent } = &proposal.owner {
+            tx.query_row("SELECT record FROM agents WHERE session_id IN (SELECT session_id FROM session_lineages WHERE lineage=?1) ORDER BY rowid DESC LIMIT 1",
+                [parent.to_string()], |row|row.get::<_,String>(0)).optional().map_err(|error|error.to_string())?
+                .map(|record|serde_json::from_str::<crate::agent_execution::Agent>(&record).map_err(|error|error.to_string())).transpose()?
+        } else {
+            None
+        };
+        let mut requester = issuer
+            .as_ref()
+            .map(|agent| {
+                agent.name.clone().unwrap_or_else(|| {
+                    format!("{} agent {}", agent.spec.provider.label(), agent.id)
+                })
+            })
+            .unwrap_or_else(|| match &proposal.owner {
+                Origin::Child { parent } => format!("Hosted conversation {parent}"),
+                _ => "Hosted conversation".into(),
+            });
+        crate::agent_execution::truncate(&mut requester, 256);
+        super::automations::queue_automation_event(
+            &tx,
+            crate::notifications::Event {
+                target: crate::notifications::Target::AutomationProposal {
+                    id: proposal.id,
+                    name: proposal.definition.name.clone(),
+                    project,
+                    requester,
+                },
+                source_session: None,
+                provider: issuer.as_ref().map(|agent| agent.spec.provider),
+                directory: Some(proposal.definition.agent.target.repository.clone()),
+                destination: None,
+                evidence: crate::notifications::Evidence {
+                    key: format!("proposal:{}", proposal.id),
+                    kind: crate::notifications::Kind::AutomationProposed,
+                },
+            },
+        )?;
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(proposal)
     }
@@ -204,6 +273,8 @@ impl Registry {
             params![current.id.to_string(), encode(&current)?],
         )
         .map_err(|error| error.to_string())?;
+        tx.execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
         Ok(current)
     }
@@ -263,6 +334,8 @@ mod tests {
                 },
             },
             session_mode: SessionMode::Fresh,
+            visibility: crate::automations::Visibility::default(),
+            catch_up: crate::automations::CatchUp::default(),
             precheck: None,
         };
         let proposal = registry
@@ -289,6 +362,34 @@ mod tests {
             due_ms: 1000,
             local: "2026-10-12T09:30".into(),
         }
+    }
+
+    #[test]
+    fn proposal_creation_and_resolution_advance_watch_sequence_and_global_snapshot() {
+        let (_root, mut registry, proposal) = fixture();
+        let sequence = registry.execution_sequence().unwrap();
+        assert!(sequence > 1);
+        assert_eq!(
+            registry.model().unwrap().pending_automation_proposals,
+            vec![ProposalSummary::from(&proposal)]
+        );
+        let notices = registry.automation_notifications().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(
+            notices[0].evidence.kind,
+            crate::notifications::Kind::AutomationProposed
+        );
+        registry
+            .resolve_automation_proposal(&proposal, None, 300)
+            .unwrap();
+        assert_eq!(registry.execution_sequence().unwrap(), sequence + 1);
+        assert!(
+            registry
+                .model()
+                .unwrap()
+                .pending_automation_proposals
+                .is_empty()
+        );
     }
 
     #[test]

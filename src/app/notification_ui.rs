@@ -467,6 +467,26 @@ impl Cagents {
                 );
                 Task::batch([scope, focus, self.activate_main_window(None)])
             }
+            Action::Activated(Target::Automation { id, .. }) => {
+                if self.modal_is_open() || !self.automation_ui.can_open_run() {
+                    self.status = Some(TransientNotice::warning(
+                        "Finish the open request, then reopen this automation notification.",
+                    ));
+                    return self.activate_main_window(None);
+                }
+                let open = self.open_utility_card(CardKind::Automations);
+                let read = self.update_automation_ui(crate::automation_ui::Action::Select(id));
+                Task::batch([open, read, self.activate_main_window(None)])
+            }
+            Action::Activated(Target::AutomationProposal { id, .. }) => {
+                // Model snapshots retain all projects' pending requests.
+                let review =
+                    self.update_automation_approval(super::automation_approval::Action::Open {
+                        id,
+                        revision: 1,
+                    });
+                Task::batch([review, self.activate_main_window(None)])
+            }
             Action::Activated(Target::AgentRun(run)) => {
                 if self.modal_is_open() || !self.automation_ui.can_open_run() {
                     self.status = Some(TransientNotice::warning(

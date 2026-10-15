@@ -1,13 +1,14 @@
 //! A hosted proposal never authorizes itself. The window presents the saved
 //! configuration and answers with its exact immutable request revision.
 use super::*;
-use crate::automations::{Proposal, ProposalState, Request, Response};
+use crate::automations::{Proposal, ProposalState, ProposalSummary, Request, Response};
 
 #[derive(Default)]
 pub(super) struct State {
     proposal: Option<Proposal>,
     available: Option<Proposal>,
-    reading: bool,
+    pending: Vec<ProposalSummary>,
+    reading: Option<(uuid::Uuid, u64)>,
     deciding: bool,
     generation: u64,
     focus: usize,
@@ -17,18 +18,26 @@ pub(super) struct State {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Tick,
+    /// Close the overlay without answering the pending request.
+    Dismiss {
+        id: uuid::Uuid,
+        revision: u64,
+        generation: u64,
+    },
+    Updated(Vec<ProposalSummary>),
+    Loaded {
+        id: uuid::Uuid,
+        revision: u64,
+        result: Arc<Result<Proposal, String>>,
+    },
     Open {
         id: uuid::Uuid,
         revision: u64,
     },
-    Read {
-        generation: u64,
-        result: Arc<Result<Vec<Proposal>, String>>,
-    },
     Decide {
         id: uuid::Uuid,
         revision: u64,
+        generation: u64,
         approved: bool,
     },
     Finished {
@@ -54,61 +63,51 @@ fn placement_description(proposal: &Proposal) -> String {
 }
 
 impl Cagents {
-    fn approval_repository(&self) -> Option<&Path> {
-        match self.active_workspace_destination()? {
-            WorkspaceDestination::Folder(id) => self
-                .sidebar_model
-                .project(id)
-                .map(|project| project.repository.as_path()),
-            WorkspaceDestination::Worktree(id) => self
-                .sidebar_model
-                .projects
-                .iter()
-                .find(|project| project.worktrees.iter().any(|worktree| worktree.id == id))
-                .map(|project| project.repository.as_path()),
-            WorkspaceDestination::Channel(id) => self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.id == id)
-                .and_then(|channel| self.sidebar_model.project(channel.project_id))
-                .map(|project| project.repository.as_path()),
-        }
-    }
-
     pub(super) fn automation_approval_banner(&self) -> Element<'_, Message> {
-        let Some(proposal) = self
-            .automation_approval
-            .available
-            .as_ref()
-            .filter(|proposal| {
-                self.approval_repository()
-                    == Some(proposal.definition.agent.target.repository.as_path())
-            })
-        else {
+        let pending = &self.automation_approval.pending;
+        if pending.is_empty() {
             return iced::widget::Space::new().height(Length::Shrink).into();
-        };
-        widget::container(
-            widget::row::with_children(vec![
-                design::body(format!(
-                    "Scheduled work requested: {}",
-                    proposal.definition.name
-                ))
-                .width(Length::Fill)
-                .into(),
-                crate::ui_controls::button::secondary("Review request")
-                    .on_press_maybe(
-                        (!self.modal_is_open()).then_some(Message::AutomationApproval(
-                            Action::Open {
+        }
+        let rows = pending
+            .iter()
+            .map(|proposal| {
+                widget::row::with_children(vec![
+                    design::body(format!(
+                        "Scheduled work requested: {} · {}",
+                        proposal.name,
+                        proposal.repository.display()
+                    ))
+                    .width(Length::Fill)
+                    .into(),
+                    crate::ui_controls::button::secondary("Review request")
+                        .on_press_maybe((!self.modal_is_open()).then_some(
+                            Message::AutomationApproval(Action::Open {
                                 id: proposal.id,
                                 revision: proposal.revision,
-                            },
-                        )),
-                    )
-                    .into(),
+                            }),
+                        ))
+                        .into(),
+                ])
+                .spacing(space::M)
+                .align_y(Alignment::Center)
+                .into()
+            })
+            .collect();
+        widget::container(
+            widget::column::with_children(vec![
+                design::heading(format!(
+                    "{} pending scheduled-work request(s)",
+                    pending.len()
+                ))
+                .into(),
+                widget::container(
+                    widget::scrollable(widget::column::with_children(rows).spacing(space::S))
+                        .height(Length::Shrink),
+                )
+                .max_height(160)
+                .into(),
             ])
-            .spacing(space::M)
-            .align_y(Alignment::Center),
+            .spacing(space::S),
         )
         .padding(space::M)
         .width(Length::Fill)
@@ -116,12 +115,9 @@ impl Cagents {
     }
 
     pub(super) fn automation_approval_subscription(&self) -> Subscription<Message> {
-        if self.refresh_ui.focused && !self.sidebar_model.projects.is_empty() {
-            cosmic::iced::time::every(Duration::from_secs(2))
-                .map(|_| Message::AutomationApproval(Action::Tick))
-        } else {
-            Subscription::none()
-        }
+        // The existing model watch delivers creation, resolution and reconnect
+        // snapshots. An idle window needs no timer or repeated IPC handshakes.
+        Subscription::none()
     }
 
     pub(super) fn adopt_automation_approval_keyboard_nav(&mut self, restore: bool) -> bool {
@@ -133,123 +129,190 @@ impl Cagents {
     }
 
     pub(super) fn cancel_automation_approval(&mut self) -> Task<Message> {
-        let Some(proposal) = self.automation_approval.proposal.as_ref() else {
+        let Some(action) = self.automation_approval_dismiss_action() else {
             return Task::none();
         };
-        let action = Action::Decide {
+        self.update_automation_approval(action)
+    }
+
+    pub(super) fn automation_approval_dismiss_action(&self) -> Option<Action> {
+        let proposal = self.automation_approval.proposal.as_ref()?;
+        Some(Action::Dismiss {
             id: proposal.id,
             revision: proposal.revision,
-            approved: false,
-        };
-        self.update_automation_approval(action)
+            generation: self.automation_approval.generation,
+        })
+    }
+
+    pub(super) fn approval_user_action_matches(
+        &self,
+        id: uuid::Uuid,
+        revision: u64,
+        generation: u64,
+    ) -> bool {
+        self.automation_approval.generation == generation
+            && self
+                .automation_approval
+                .proposal
+                .as_ref()
+                .is_some_and(|proposal| proposal.id == id && proposal.revision == revision)
+    }
+
+    /// Model retirement is independent of user input and may remove hidden
+    /// backing state. User dismissal must first validate its captured review.
+    fn retire_automation_approval(&mut self) -> Task<Message> {
+        let state = &mut self.automation_approval;
+        if state.deciding || state.proposal.take().is_none() {
+            return Task::none();
+        }
+        state.error = None;
+        if let Some(restore) = state.restore_keyboard_nav.take() {
+            self.core.set_keyboard_nav(restore);
+        }
+        iced::widget::operation::focus(
+            self.workspace
+                .focused()
+                .map(|card| self.card_keyboard_focus(card))
+                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
+        )
+        .map(cosmic::Action::App)
     }
 
     pub(super) fn automation_approval_open(&self) -> bool {
         self.automation_approval.proposal.is_some()
     }
 
+    pub(super) fn approval_dialog_generation(&self) -> Option<u64> {
+        self.automation_approval
+            .proposal
+            .as_ref()
+            .map(|_| self.automation_approval.generation)
+    }
+
     pub(super) fn update_automation_approval(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Tick => {
-                if self.modal_is_open()
-                    || self.automation_approval.reading
-                    || self.chrome_ui.workspace_preview_since.is_some()
+            Action::Updated(pending) => {
+                self.automation_approval.pending = pending;
+                if self
+                    .automation_approval
+                    .available
+                    .as_ref()
+                    .is_some_and(|proposal| {
+                        !self.automation_approval.pending.iter().any(|summary| {
+                            summary.id == proposal.id && summary.revision == proposal.revision
+                        })
+                    })
                 {
-                    return Task::none();
+                    self.automation_approval.available = None;
                 }
-                let Some(repository) = self.approval_repository().map(Path::to_path_buf) else {
-                    return Task::none();
-                };
-                self.automation_approval.reading = true;
-                self.automation_approval.generation =
-                    self.automation_approval.generation.wrapping_add(1);
-                let generation = self.automation_approval.generation;
-                cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
-                        let mut client = crate::control::ControlClient::connect(&socket)
-                            .map_err(|error| error.to_string())?;
-                        let Response::Proposals(proposals) = client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::PendingProposals {
-                                    repository,
-                                    after: None,
-                                    limit: 1,
-                                },
-                            )
-                            .map_err(|error| error.to_string())?
-                        else {
-                            return Err("Unexpected automation approval listing".into());
-                        };
-                        let Some(visible) = proposals.first() else {
-                            return Ok(Vec::new());
-                        };
-                        let Response::Proposal(proposal) = client
-                            .automation(
-                                crate::agent_execution::Authority::default(),
-                                Request::Proposal { id: visible.id },
-                            )
-                            .map_err(|error| error.to_string())?
-                        else {
-                            return Err("Unexpected automation proposal".into());
-                        };
-                        Ok(vec![*proposal])
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string()));
-                    Message::AutomationApproval(Action::Read {
-                        generation,
-                        result: Arc::new(result),
-                    })
-                })
-            }
-            Action::Read { generation, result } => {
-                if generation != self.automation_approval.generation {
-                    return Task::none();
-                }
-                self.automation_approval.reading = false;
-                if self.modal_is_open()
-                    || !self.refresh_ui.focused
-                    || self.chrome_ui.workspace_preview_since.is_some()
+                if !self.automation_approval.deciding
+                    && self
+                        .automation_approval
+                        .proposal
+                        .as_ref()
+                        .is_some_and(|proposal| {
+                            !self.automation_approval.pending.iter().any(|summary| {
+                                summary.id == proposal.id && summary.revision == proposal.revision
+                            })
+                        })
                 {
-                    return Task::none();
+                    return self.retire_automation_approval();
                 }
-                let Ok(proposals) = result.as_ref() else {
-                    return Task::none();
-                };
-                self.automation_approval.available = proposals
-                    .iter()
-                    .find(|proposal| {
-                        proposal.state == ProposalState::Pending
-                            && self.approval_repository()
-                                == Some(proposal.definition.agent.target.repository.as_path())
-                    })
-                    .cloned();
                 Task::none()
+            }
+            Action::Loaded {
+                id,
+                revision,
+                result,
+            } => {
+                if self.automation_approval.reading != Some((id, revision)) {
+                    return Task::none();
+                }
+                self.automation_approval.reading = None;
+                let proposal = match result.as_ref() {
+                    Ok(proposal)
+                        if proposal.id == id
+                            && proposal.revision == revision
+                            && proposal.state == ProposalState::Pending =>
+                    {
+                        proposal.clone()
+                    }
+                    Ok(_) => return Task::none(),
+                    Err(error) => {
+                        self.status = Some(TransientNotice::error(error));
+                        return Task::none();
+                    }
+                };
+                // An explicit notification activation can precede its model
+                // push. The exact user-authorized Pending reply is sufficient
+                // to review it; this never approves or enables any schedule.
+                if !self
+                    .automation_approval
+                    .pending
+                    .iter()
+                    .any(|summary| summary.id == id)
+                {
+                    self.automation_approval
+                        .pending
+                        .push(ProposalSummary::from(&proposal));
+                }
+                self.automation_approval.available = Some(proposal);
+                self.update_automation_approval(Action::Open { id, revision })
+            }
+            Action::Dismiss {
+                id,
+                revision,
+                generation,
+            } => {
+                if !self.approval_user_action_matches(id, revision, generation) {
+                    return Task::none();
+                }
+                self.retire_automation_approval()
             }
             Action::Open { id, revision } => {
                 if self.modal_is_open() || self.chrome_ui.workspace_preview_since.is_some() {
                     return Task::none();
                 }
-                let Some(proposal) = self
+                let proposal = self
                     .automation_approval
                     .available
                     .as_ref()
-                    .filter(|proposal| {
-                        proposal.id == id
-                            && proposal.revision == revision
-                            && self.approval_repository()
-                                == Some(proposal.definition.agent.target.repository.as_path())
-                    })
-                    .cloned()
-                else {
-                    return Task::none();
+                    .filter(|proposal| proposal.id == id && proposal.revision == revision)
+                    .cloned();
+                let Some(proposal) = proposal else {
+                    if self.automation_approval.reading.is_some() {
+                        return Task::none();
+                    }
+                    self.automation_approval.reading = Some((id, revision));
+                    return cosmic::task::future(async move {
+                        let result = tokio::task::spawn_blocking(move || {
+                            let socket = crate::terminal::ensure_daemon_ready()
+                                .map_err(|error| error.to_string())?;
+                            let mut client = crate::control::ControlClient::connect(&socket)
+                                .map_err(|error| error.to_string())?;
+                            match client
+                                .automation(
+                                    crate::agent_execution::Authority::default(),
+                                    Request::Proposal { id },
+                                )
+                                .map_err(|error| error.to_string())?
+                            {
+                                Response::Proposal(proposal) => Ok(*proposal),
+                                _ => Err("Unexpected automation proposal response".to_owned()),
+                            }
+                        })
+                        .await
+                        .unwrap_or_else(|error| Err(error.to_string()));
+                        Message::AutomationApproval(Action::Loaded {
+                            id,
+                            revision,
+                            result: Arc::new(result),
+                        })
+                    });
                 };
                 self.automation_approval.generation =
                     self.automation_approval.generation.wrapping_add(1);
-                self.automation_approval.reading = false;
+                self.automation_approval.reading = None;
                 self.automation_approval.proposal = Some(proposal);
                 self.automation_approval.focus = 0;
                 self.automation_approval.error = None;
@@ -260,15 +323,14 @@ impl Cagents {
             Action::Decide {
                 id,
                 revision,
+                generation,
                 approved,
             } => {
+                if !self.approval_user_action_matches(id, revision, generation) {
+                    return Task::none();
+                }
                 let state = &mut self.automation_approval;
-                if state.deciding
-                    || state
-                        .proposal
-                        .as_ref()
-                        .is_none_or(|proposal| proposal.id != id || proposal.revision != revision)
-                {
+                if state.deciding {
                     return Task::none();
                 }
                 state.deciding = true;
@@ -341,6 +403,7 @@ impl Cagents {
                         });
                         state.proposal = None;
                         state.available = None;
+                        state.pending.retain(|pending| pending.id != receipt.id);
                         if let Some(restore) = state.restore_keyboard_nav.take() {
                             self.core.set_keyboard_nav(restore);
                         }
@@ -380,7 +443,9 @@ impl Cagents {
         };
         use keyboard::key::Named;
         if matches!(key, Named::Tab | Named::ArrowLeft | Named::ArrowRight) {
-            self.automation_approval.focus = 1 - self.automation_approval.focus;
+            let backwards = modifiers.shift() || *key == Named::ArrowLeft;
+            self.automation_approval.focus =
+                (self.automation_approval.focus + if backwards { 2 } else { 1 }) % 3;
             return Some(approval_focus(self.automation_approval.focus));
         }
         if *key == Named::Escape
@@ -390,10 +455,19 @@ impl Cagents {
                 && !modifiers.alt()
                 && !modifiers.logo())
         {
-            let action = Action::Decide {
-                id: proposal.id,
-                revision: proposal.revision,
-                approved: *key != Named::Escape && self.automation_approval.focus == 1,
+            let action = if *key == Named::Escape || self.automation_approval.focus == 0 {
+                Action::Dismiss {
+                    id: proposal.id,
+                    revision: proposal.revision,
+                    generation: self.automation_approval.generation,
+                }
+            } else {
+                Action::Decide {
+                    id: proposal.id,
+                    revision: proposal.revision,
+                    generation: self.automation_approval.generation,
+                    approved: self.automation_approval.focus == 2,
+                }
             };
             return Some(self.update_automation_approval(action));
         }
@@ -457,41 +531,59 @@ impl Cagents {
         if let Some(error) = &state.error {
             content = content.push(notice_detail(error));
         }
+        let dismiss = Action::Dismiss {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: state.generation,
+        };
         let decision = |approved| {
             Message::AutomationApproval(Action::Decide {
                 id: proposal.id,
                 revision: proposal.revision,
+                generation: state.generation,
                 approved,
             })
         };
-        let controls = dialog_ui::confirmation_actions(
+        let controls = dialog_ui::confirmation_controls(vec![
+            crate::ui_controls::button::secondary("Not now")
+                .id(widget::Id::new("automation-approval.dismiss"))
+                .on_press_maybe(
+                    (!state.deciding).then_some(Message::AutomationApproval(dismiss.clone())),
+                )
+                .into(),
             crate::ui_controls::button::secondary("Decline")
                 .id(widget::Id::new("automation-approval.decline"))
-                .on_press_maybe((!state.deciding).then(|| decision(false))),
+                .on_press_maybe((!state.deciding).then(|| decision(false)))
+                .into(),
             crate::ui_controls::button::primary("Approve and enable")
                 .id(widget::Id::new("automation-approval.approve"))
-                .on_press_maybe((!state.deciding).then(|| decision(true))),
-        );
+                .on_press_maybe((!state.deciding).then(|| decision(true)))
+                .into(),
+        ]);
         let surface = widget::column::with_children(vec![
             widget::scrollable(content)
                 .height(Length::Fixed(440.0))
                 .into(),
-            controls,
+            controls.into(),
         ])
         .spacing(space::M);
         Some(dialog_ui::overlay(
             dialog_ui::surface(surface, 680.0),
-            (!state.deciding).then(|| decision(false)),
+            (!state.deciding).then_some(Message::AutomationApproval(dismiss)),
             1.0,
         ))
     }
 }
 
+pub(super) fn default_focus_id() -> widget::Id {
+    widget::Id::new("automation-approval.dismiss")
+}
+
 fn approval_focus(index: usize) -> Task<Message> {
-    iced::widget::operation::focus(widget::Id::new(if index == 0 {
-        "automation-approval.decline"
-    } else {
-        "automation-approval.approve"
+    iced::widget::operation::focus(widget::Id::new(match index {
+        0 => "automation-approval.dismiss",
+        1 => "automation-approval.decline",
+        _ => "automation-approval.approve",
     }))
     .map(cosmic::Action::App)
 }
@@ -530,6 +622,8 @@ mod tests {
                 },
             },
             session_mode: SessionMode::Fresh,
+            visibility: crate::automations::Visibility::default(),
+            catch_up: crate::automations::CatchUp::default(),
             precheck: None,
         };
         Proposal {
@@ -606,36 +700,58 @@ mod tests {
         let proposal = proposal();
         let mut unrelated = proposal.clone();
         unrelated.definition.agent.target.repository = "/other-project".into();
-        drop(app.update_automation_approval(Action::Read {
-            generation: 0,
-            result: Arc::new(Ok(vec![unrelated])),
-        }));
+        drop(
+            app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(
+                &unrelated,
+            )])),
+        );
         assert!(app.automation_approval.available.is_none());
-        let task = app.update_automation_approval(Action::Read {
-            generation: 0,
-            result: Arc::new(Ok(vec![proposal.clone()])),
-        });
+        assert_eq!(
+            app.automation_approval.pending.len(),
+            1,
+            "another project's request updates global attention"
+        );
+        let task =
+            app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(&proposal)]));
         assert!(
             iced::runtime::task::into_stream(task).is_none(),
             "background attention must not move keyboard focus"
         );
         assert!(!app.modal_is_open());
         assert!(app.core.keyboard_nav());
-        assert_eq!(app.automation_approval.available, Some(proposal.clone()));
+        assert!(
+            app.automation_approval.available.is_none(),
+            "model pushes carry bounded summaries; full consent is fetched only for explicit review"
+        );
+        let absent = uuid::Uuid::new_v4();
         drop(app.update_automation_approval(Action::Open {
-            id: uuid::Uuid::new_v4(),
+            id: absent,
             revision: 1,
         }));
         assert!(!app.automation_approval_open());
-        let task = app.update_automation_approval(Action::Open {
+        drop(app.update_automation_approval(Action::Loaded {
+            id: absent,
+            revision: 1,
+            result: Arc::new(Err("The request no longer exists".into())),
+        }));
+        drop(app.update_automation_approval(Action::Open {
             id: proposal.id,
             revision: proposal.revision,
+        }));
+        assert!(
+            !app.modal_is_open(),
+            "the exact private proposal must arrive before displaying consent"
+        );
+        let task = app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal.clone())),
         });
         assert!(app.modal_is_open());
         assert!(!app.core.keyboard_nav());
         assert_eq!(
             super::super::tests::focused_element(app.automation_approval_dialog().unwrap(), task),
-            Some(widget::Id::new("automation-approval.decline"))
+            Some(widget::Id::new("automation-approval.dismiss"))
         );
         app.automation_approval.deciding = true;
         let mut declined = proposal.clone();
@@ -646,61 +762,93 @@ mod tests {
         }));
         assert!(!app.automation_approval_open());
         assert!(app.core.keyboard_nav());
-        drop(app.update_automation_approval(Action::Read {
-            generation: 0,
-            result: Arc::new(Ok(vec![proposal])),
+        drop(app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal)),
         }));
         assert!(!app.automation_approval_open());
         assert!(app.automation_approval.available.is_none());
     }
 
     #[test]
-    fn approval_uses_the_saved_revision_and_defaults_keyboard_focus_to_decline() {
+    fn explicit_notification_review_can_arrive_before_the_proposal_model_push() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let proposal = proposal();
-        app.automation_approval.proposal = Some(proposal.clone());
-        app.automation_approval.generation = 7;
-        assert!(app.modal_is_open());
-        assert_eq!(
-            super::super::tests::focused_element(
-                app.automation_approval_dialog().unwrap(),
-                approval_focus(0)
-            ),
-            Some(widget::Id::new("automation-approval.decline"))
-        );
-        let task = app
-            .automation_approval_key(&key(keyboard::key::Named::Tab), false)
-            .unwrap();
-        assert_eq!(
-            super::super::tests::focused_element(app.automation_approval_dialog().unwrap(), task),
-            Some(widget::Id::new("automation-approval.approve"))
-        );
-        let mut stale = proposal.clone();
-        stale.revision = 2;
-        drop(app.update_automation_approval(Action::Decide {
-            id: stale.id,
-            revision: stale.revision,
-            approved: true,
+        assert!(app.automation_approval.pending.is_empty());
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
         }));
-        assert!(!app.automation_approval.deciding);
-        drop(app.automation_approval_key(&key(keyboard::key::Named::Escape), false));
-        assert!(app.automation_approval.deciding);
-        drop(app.update_automation_approval(Action::Finished {
-            generation: 6,
-            result: Arc::new(Ok(stale)),
+        assert!(!app.automation_approval_open());
+        drop(app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal.clone())),
         }));
         assert!(app.automation_approval_open());
-        let mut declined = proposal;
-        declined.state = ProposalState::Declined;
-        drop(app.update_automation_approval(Action::Finished {
-            generation: 7,
-            result: Arc::new(Ok(declined)),
+        assert_eq!(
+            app.automation_approval.pending,
+            vec![ProposalSummary::from(&proposal)]
+        );
+        assert!(!app.automation_approval.deciding);
+        drop(app.cancel_automation_approval());
+        assert!(!app.automation_approval_open());
+        assert_eq!(app.automation_approval.pending.len(), 1);
+        // An old/unsolicited load cannot reopen a dismissed dialog.
+        drop(app.update_automation_approval(Action::Loaded {
+            id: proposal.id,
+            revision: proposal.revision,
+            result: Arc::new(Ok(proposal)),
         }));
         assert!(!app.automation_approval_open());
     }
 
     #[test]
-    fn approval_failure_returns_focus_to_decline_and_leaves_the_request_unresolved() {
+    fn escape_backdrop_and_default_enter_leave_the_proposal_pending() {
+        for event in [
+            Some(keyboard::key::Named::Escape),
+            Some(keyboard::key::Named::Enter),
+            None,
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let proposal = proposal();
+            app.automation_approval.available = Some(proposal.clone());
+            app.automation_approval.pending = vec![ProposalSummary::from(&proposal)];
+            app.automation_approval.proposal = Some(proposal.clone());
+            assert_eq!(
+                super::super::tests::focused_element(
+                    app.automation_approval_dialog().unwrap(),
+                    approval_focus(0)
+                ),
+                Some(widget::Id::new("automation-approval.dismiss"))
+            );
+            if let Some(event) = event {
+                drop(app.automation_approval_key(&key(event), false));
+            } else {
+                // The backdrop dispatches this same neutral action.
+                drop(app.cancel_automation_approval());
+            }
+            assert!(!app.automation_approval_open());
+            assert!(!app.automation_approval.deciding);
+            assert_eq!(app.automation_approval.available, Some(proposal));
+        }
+    }
+
+    #[test]
+    fn explicit_decline_and_approve_use_the_saved_revision() {
+        for focus in [1, 2] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.automation_approval.proposal = Some(proposal());
+            app.automation_approval.focus = focus;
+            drop(app.automation_approval_key(&key(keyboard::key::Named::Enter), false));
+            assert!(app.automation_approval.deciding);
+            assert!(app.automation_approval_open());
+        }
+    }
+
+    #[test]
+    fn approval_failure_returns_focus_to_not_now_and_leaves_the_request_unresolved() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.automation_approval.proposal = Some(proposal());
         app.automation_approval.deciding = true;
@@ -713,7 +861,7 @@ mod tests {
         assert!(!app.automation_approval.deciding);
         assert_eq!(
             super::super::tests::focused_element(app.automation_approval_dialog().unwrap(), task),
-            Some(widget::Id::new("automation-approval.decline"))
+            Some(widget::Id::new("automation-approval.dismiss"))
         );
         let unresolved = app.automation_approval.proposal.clone().unwrap();
         app.automation_approval.deciding = true;
@@ -737,5 +885,57 @@ mod tests {
             app.automation_approval_open(),
             "another proposal's receipt cannot dismiss this review"
         );
+    }
+
+    #[test]
+    fn queued_user_actions_cannot_control_a_reopened_review_of_the_same_proposal() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        app.automation_approval.available = Some(proposal.clone());
+        app.automation_approval.pending = vec![ProposalSummary::from(&proposal)];
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        }));
+        let old_dismiss = app.automation_approval_dismiss_action().unwrap();
+        let old_generation = app.approval_dialog_generation().unwrap();
+        drop(app.cancel_automation_approval());
+        drop(app.update_automation_approval(Action::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        }));
+        let current_generation = app.approval_dialog_generation().unwrap();
+        assert_ne!(old_generation, current_generation);
+        drop(app.update_automation_approval(old_dismiss));
+        assert!(app.automation_approval_open());
+        drop(app.update_automation_approval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: old_generation,
+            approved: true,
+        }));
+        assert!(!app.automation_approval.deciding);
+        assert_eq!(app.automation_approval.pending.len(), 1);
+        drop(app.update_automation_approval(Action::Decide {
+            id: proposal.id,
+            revision: proposal.revision,
+            generation: current_generation,
+            approved: true,
+        }));
+        assert!(app.automation_approval.deciding);
+    }
+
+    #[test]
+    fn model_resolution_retires_backing_state_independently_of_user_actions() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let proposal = proposal();
+        app.automation_approval.proposal = Some(proposal.clone());
+        app.automation_approval.available = Some(proposal.clone());
+        app.automation_approval.pending = vec![ProposalSummary::from(&proposal)];
+        app.automation_approval.generation = 17;
+        drop(app.update_automation_approval(Action::Updated(Vec::new())));
+        assert!(!app.automation_approval_open());
+        assert!(app.automation_approval.available.is_none());
+        assert!(!app.automation_approval.deciding);
     }
 }

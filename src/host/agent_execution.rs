@@ -642,7 +642,7 @@ fn now() -> u64 {
     chat::now_ms().unwrap_or(0)
 }
 
-fn announce(host: &SharedHost, registry: &SharedRegistry) {
+pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
     let sequence = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -685,6 +685,16 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
 
 fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent, String> {
     let origin = origin(host, authority)?;
+    close_owned_agent_under_control(host, origin, id)
+}
+
+/// The user-only automation management RPC supplies the saved automation
+/// owner, so explicit close uses the same exact-process proof as normal close.
+pub(super) fn close_owned_agent_under_control(
+    host: &SharedHost,
+    origin: Origin,
+    id: AgentId,
+) -> Result<Agent, String> {
     let gate = agent_gate(host, id);
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;
