@@ -83,7 +83,7 @@ impl<Message: Clone + 'static> ContextMenu<'_, Message> {
             bounds.x = my_state.context_cursor.x;
             bounds.y = my_state.context_cursor.y;
 
-            let (id, root_list) = my_state.menu_bar_state.inner.with_data_mut(|state| {
+            let (id, _root_list) = my_state.menu_bar_state.inner.with_data_mut(|state| {
                 if let Some(id) = state.popup_id.get(&self.window_id).copied() {
                     // close existing popups
                     state.menu_states.clear();
@@ -141,7 +141,7 @@ impl<Message: Clone + 'static> ContextMenu<'_, Message> {
                 layout.bounds(),
                 -bounds.height,
             );
-            let (anchor_rect, gravity) = my_state.menu_bar_state.inner.with_data_mut(|state| {
+            let (anchor_rect, _gravity) = my_state.menu_bar_state.inner.with_data_mut(|state| {
                 use iced::Rectangle;
 
                 state.popup_id.insert(self.window_id, id);

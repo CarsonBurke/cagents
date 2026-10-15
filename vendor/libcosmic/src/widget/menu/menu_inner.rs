@@ -557,7 +557,6 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         shell: &mut Shell<'_, Message>,
     ) -> Option<(usize, MenuState)> {
         use event::Event::{Mouse, Touch};
-        use event::Status::{Captured, Ignored};
         use mouse::Button::Left;
         use mouse::Event::{ButtonPressed, ButtonReleased, CursorMoved, WheelScrolled};
         use touch::Event::{FingerLifted, FingerMoved, FingerPressed};
@@ -575,7 +574,7 @@ impl<'b, Message: Clone + 'static> Menu<'b, Message> {
         let viewport_size = viewport.size();
         let overlay_offset = Point::ORIGIN - viewport.position();
         let overlay_cursor = view_cursor.position().unwrap_or_default() - overlay_offset;
-        let menu_roots = match &mut self.menu_roots {
+        let _menu_roots = match &mut self.menu_roots {
             Cow::Borrowed(_) => panic!(),
             Cow::Owned(o) => o.as_mut_slice(),
         };
@@ -972,7 +971,7 @@ impl<Message: std::clone::Clone + 'static> Widget<Message, crate::Theme, crate::
     #[allow(clippy::too_many_lines)]
     fn update(
         &mut self,
-        tree: &mut Tree,
+        _tree: &mut Tree,
         event: &iced::Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
@@ -985,7 +984,7 @@ impl<Message: std::clone::Clone + 'static> Widget<Message, crate::Theme, crate::
 
         #[cfg(wayland_platform)]
         if matches!(WINDOWING_SYSTEM.get(), Some(WindowingSystem::Wayland))
-            && let Some((new_root, new_ms)) = new_root
+            && let Some((new_root, _new_ms)) = new_root
         {
             use iced_runtime::platform_specific::wayland::CornerRadius;
             use iced_runtime::platform_specific::wayland::popup::{
@@ -996,14 +995,14 @@ impl<Message: std::clone::Clone + 'static> Widget<Message, crate::Theme, crate::
             use crate::theme::THEME;
             let overlay_offset = Point::ORIGIN - viewport.position();
 
-            let overlay_cursor = cursor.position().unwrap_or_default() - overlay_offset;
+            let _overlay_cursor = cursor.position().unwrap_or_default() - overlay_offset;
 
             let Some((mut menu, popup_id)) = self.tree.inner.with_data_mut(|state| {
                 let popup_id = *state
                     .popup_id
                     .entry(self.window_id)
                     .or_insert_with(window::Id::unique);
-                let active_roots = state
+                let _active_roots = state
                     .active_root
                     .get(self.depth)
                     .cloned()
@@ -1017,7 +1016,7 @@ impl<Message: std::clone::Clone + 'static> Widget<Message, crate::Theme, crate::
                     .map(|lo| lo.bounds())
                     .collect();
 
-                let mut popup_menu = Menu {
+                let popup_menu = Menu {
                     tree: self.tree.clone(),
                     menu_roots: Cow::Owned(Cow::into_owned(self.menu_roots.clone())),
                     bounds_expand: self.bounds_expand,
@@ -1640,7 +1639,6 @@ fn process_scroll_events<Message>(
 ) where
     Message: Clone,
 {
-    use event::Status::{Captured, Ignored};
     use mouse::ScrollDelta;
 
     menu.tree.inner.with_data_mut(|state| {
