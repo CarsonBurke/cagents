@@ -609,21 +609,43 @@ mod tests {
         let mut source = View::empty(original.clone());
         source.retired.push(id);
         model.views.push(source);
-        assert_eq!(model.agent_view_scope(&agent), None, "closed panes stay closed");
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "closed panes stay closed"
+        );
         let mut destination = View::empty(moved.clone());
         destination.panes.push(pane.clone());
         model.views.push(destination);
         assert_eq!(model.agent_view_scope(&agent), Some(&moved));
-        let restored: WorkspaceModel = serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
-        assert_eq!(restored.agent_view_scope(&agent), Some(&moved), "reconnect follows durable pane membership");
-        let CardKind::Chat(promoted) = &mut model.views[1].panes[0].kind else { unreachable!() };
+        let restored: WorkspaceModel =
+            serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
+        assert_eq!(
+            restored.agent_view_scope(&agent),
+            Some(&moved),
+            "reconnect follows durable pane membership"
+        );
+        let CardKind::Chat(promoted) = &mut model.views[1].panes[0].kind else {
+            unreachable!()
+        };
         promoted.launch.session_id = Some("confirmed-provider-thread".into());
-        assert_eq!(model.agent_view_scope(&agent), Some(&moved), "thread promotion does not replace the actor");
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            Some(&moved),
+            "thread promotion does not replace the actor"
+        );
         assert_eq!(agent.placement, original);
-        assert_eq!(agent.spec.target.repository, std::path::Path::new("/execution-repo"));
+        assert_eq!(
+            agent.spec.target.repository,
+            std::path::Path::new("/execution-repo")
+        );
         // A legacy inventory alias can own the exact same actor.
         model.views[1].panes[0].id = CardId::new();
-        assert_eq!(model.agent_view_scope(&agent), None, "an inventory alias must not create a second canonical pane");
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "an inventory alias must not create a second canonical pane"
+        );
         model.views[1].panes[0].id = id;
         let mut conflicting = View::empty(Scope::Worktree {
             repository: "/execution-repo".into(),
@@ -631,12 +653,25 @@ mod tests {
         });
         conflicting.panes.push(pane);
         model.views.push(conflicting);
-        assert_eq!(model.agent_view_scope(&agent), None, "ambiguous legacy membership chooses no view");
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "ambiguous legacy membership chooses no view"
+        );
         model.views.pop();
-        let CardKind::Chat(session) = &mut model.views[1].panes[0].kind else { unreachable!() };
-        session.proof.as_mut().unwrap().host_incarnation = crate::model::HostIncarnation::new("replacement");
-        assert_eq!(model.agent_view_scope(&agent), None, "same session id cannot substitute a different host");
-        let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else { unreachable!() };
+        let CardKind::Chat(session) = &mut model.views[1].panes[0].kind else {
+            unreachable!()
+        };
+        session.proof.as_mut().unwrap().host_incarnation =
+            crate::model::HostIncarnation::new("replacement");
+        assert_eq!(
+            model.agent_view_scope(&agent),
+            None,
+            "same session id cannot substitute a different host"
+        );
+        let HostedSession::Chat(source) = agent.session.as_ref().unwrap() else {
+            unreachable!()
+        };
         let proof = source.proof.clone().unwrap();
         let terminal = crate::model::TerminalSession {
             id: TerminalId::new(),
@@ -661,8 +696,11 @@ mod tests {
             path: "/execution-repo/tree".into(),
         };
         model.views[1].scope = worktree.clone();
-        assert_eq!(model.agent_view_scope(&terminal_agent), Some(&worktree), "terminal presentation follows its console pane, not its native chat source");
-
+        assert_eq!(
+            model.agent_view_scope(&terminal_agent),
+            Some(&worktree),
+            "terminal presentation follows its console pane, not its native chat source"
+        );
     }
 
     #[test]
