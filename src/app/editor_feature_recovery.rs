@@ -144,6 +144,71 @@ mod tests {
     use super::*;
     use cosmic::iced::futures::StreamExt;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[test]
+    fn root_file_error_receipts_keep_window_custody_before_all_routing_guards() {
+        std::thread::Builder::new().name("root-file-window-custody".into())
+            .stack_size(16 * 1024 * 1024).spawn(|| {
+                tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+                    .block_on(root_file_error_window_contract());
+            }).unwrap().join().unwrap();
+    }
+
+    async fn root_file_error_window_contract() {
+        for prepared in [true, false] {
+            // Missing pane, stale UUID, modal, and update freeze are distinct
+            // dispatch paths. The opaque fixture carries no root admission.
+            for disposition in 0..4 {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                let directory = tempfile::tempdir().unwrap();
+                let unrelated = tempfile::tempdir().unwrap();
+                let calls = Arc::new(AtomicUsize::new(0));
+                let worker = calls.clone();
+                let authority = crate::editor::RecoverySlot::reserve().unwrap().retain(
+                    "original late file cleanup".into(), move || {
+                        if worker.fetch_add(1, Ordering::AcqRel) == 0 { Err("original cleanup still pending".into()) }
+                        else { Ok(()) }
+                    });
+                let card = CardId::new();
+                let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(card, "source.txt");
+                runtime.descriptor.worktree = directory.path().into();
+                identity.worktree = directory.path().into();
+                if disposition != 0 { app.cards.insert(card, CardRuntime::Repository(Box::new(runtime))); }
+                if disposition == 2 { app.resume_ui.open = true; assert!(app.modal_is_open()); }
+                if disposition == 3 { app.update_prepared = true; }
+                let action = repository_widget::fixture_root_file_error_action(identity,
+                    crate::editor::FileIoError::Recovery { message: "late typed completion".into(), authority: authority.clone() }, prepared);
+                drop(app.update(Message::Repository(action)));
+                assert_eq!(app.publication_recovery_authority(directory.path()), Some(authority.clone()),
+                    "original authority must survive missing/stale/modal/frozen dispatch");
+                assert!(!app.publication_recovery_blocks(unrelated.path()));
+                if disposition == 2 {
+                    assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.has_editor_recovery()),
+                        "modal must deliver the lifecycle error to its mounted runtime too");
+                }
+                app.resume_ui.open = false;
+                app.update_prepared = false;
+                app.cards.remove(&card);
+                drop(app.exit_after_language_servers());
+                assert!(app.exit.is_none(), "orphaned unresolved file recovery must block normal exit");
+                for resolved in [false, true] {
+                    let task = app.update(Message::EditorFeatures(Action::RetryPublicationRecovery(authority.clone())));
+                    let mut stream = iced::runtime::task::into_stream(task).expect("original recovery worker");
+                    let mut completed = false;
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                            completed |= matches!(&message, Message::EditorFeatures(Action::PublicationRecoveryResolved { .. }));
+                            drop(app.update(message));
+                        }
+                    }
+                    assert!(completed);
+                    assert_eq!(app.publication_recovery_pending(), !resolved);
+                }
+                assert!(authority.is_resolved());
+                assert_eq!(calls.load(Ordering::Acquire), 2, "retry must use the same original cleanup");
+            }
+        }
+    }
+
     #[tokio::test]
     async fn refused_actual_autosave_timer_is_retired_and_resumed_after_recovery() {
         let mut app = super::super::tests::context_inspector_test_app(false);
