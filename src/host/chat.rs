@@ -4,6 +4,7 @@ mod account_isolation_tests;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
+pub(in crate::host) mod retained_actor;
 #[cfg(test)]
 mod startup_tests;
 use crate::{
@@ -388,6 +389,10 @@ fn changed(host: &Weak<HostLock>, id: TerminalId, update: Update) {
     let Some(host) = host.upgrade() else {
         return;
     };
+    if matches!(&update, Update::RetainedOutcomes) {
+        retained_actor::wake(&host, id);
+        return;
+    }
     if matches!(&update, Update::Attention(_)) {
         // Scheduled outcomes belong to the accepted run, not its temporary
         // provider process. The scheduler publishes committed run evidence.
