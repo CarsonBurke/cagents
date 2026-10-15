@@ -20,7 +20,6 @@ mod completion;
 mod coordination;
 mod find;
 mod fold;
-#[cfg(test)]
 mod flow_layout;
 mod hover;
 mod images;
@@ -144,6 +143,8 @@ pub enum ReturnRefused {
 
 #[derive(Clone)]
 pub enum Action {
+    FlowRequest(Target, flow_layout::Request),
+    FlowReady(Target, flow_layout::Request, Option<Arc<flow_layout::Prepared>>),
     /// Points a draft at a model of any provider, or at a provider's default
     /// model where none is named.
     DraftModel(Target, Provider, Option<String>),
@@ -321,6 +322,8 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::FlowRequest(..)
+                | Self::FlowReady(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
@@ -985,6 +988,7 @@ struct CachedItem {
     /// The body as the Markdown parser is given it, resumed on each append.
     source: markdown_source::Source,
     markdown: markdown::Content,
+    flow_cache: flow_layout::Cache,
     reader_memory: scroll::Memory,
     reader_context: Option<String>,
     /// Each fenced block the Markdown parsed, ready to draw, keyed by the
@@ -1014,7 +1018,8 @@ impl CachedItem {
     /// Approximate exposed presentation storage. Opaque Markdown/parser
     /// allocations and widget/shaping trees are intentionally not estimated.
     fn retained_bytes(&self) -> usize {
-        self.source.retained_capacity()
+        self.flow_cache.retained_bytes()
+            + self.source.retained_capacity()
             + self.blocks.values().map(prose::CodeBlock::retained_span_bytes).sum::<usize>()
             + self.preview.retained_bytes()
             + self.tool_input.iter().chain(self.tool_output.iter()).chain(self.patches.iter())
@@ -1052,6 +1057,9 @@ impl CachedItem {
                     .is_some_and(|item| std::ptr::eq(&item.content, content))
             })
             .and_then(|cached| cached.find_paint.clone());
+        // Source replacement retires every old shaped leaf, including leaves
+        // that vanished or became small enough to use ordinary prose.
+        let flow_cache = flow_layout::Cache::default();
         let reader_memory = previous.as_ref().map(|cached| cached.reader_memory.clone()).unwrap_or_default();
         let reader_context = previous.as_ref().and_then(|cached| cached.reader_context.clone());
         let (
@@ -1133,7 +1141,7 @@ impl CachedItem {
             revision: Self::next_revision(),
             source: markdown_source::Source::default(),
             markdown: markdown::Content::new(),
-            reader_memory, reader_context,
+            flow_cache, reader_memory, reader_context,
             blocks: HashMap::new(),
             open: None,
             detail: None,
@@ -6109,6 +6117,32 @@ impl Cagents {
             return Task::none();
         }
         match action {
+            Action::FlowRequest(target, request) => {
+                let entry = self.chat_runtime_mut(target).and_then(|runtime| runtime.cache.values().find_map(|cached| cached.flow_cache.find(request.id)));
+                if let Some(entry) = entry {
+                    let valid = entry.borrow().accepts(&request);
+                    if valid {
+                        match flow_layout::run(target, request.clone()) {
+                            Ok(task) => return task,
+                            Err(epoch) => entry.borrow_mut().defer(&request, epoch),
+                        }
+                    }
+                }
+            }
+            Action::FlowReady(target, request, ready) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    for cached in runtime.cache.values_mut() {
+                        if let Some(entry) = cached.flow_cache.find(request.id) {
+                            if entry.borrow_mut().complete(&request, ready.clone()) {
+                                // Invalidate retained item factories/layouts without
+                                // reparsing or changing their stable logical IDs.
+                                cached.revision = CachedItem::next_revision();
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             Action::DraftModel(target, provider, model) => {
                 return self.choose_draft_model(target, provider, model);
             }
