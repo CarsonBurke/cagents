@@ -6633,11 +6633,15 @@ mod tests {
         assert!(matches!(carried, Some(Command::OrderedInput { .. })));
         let boundary = worker.interrupt_input();
         assert!(!is_cancelable_input_before(carried.as_ref().unwrap(), boundary));
+        assert!(worker.pending_input.is_empty());
+        assert!(worker.commands.is_empty());
+        assert_eq!(worker.retained_commands.len(), 1);
         let command = worker.retained_commands.pop_front().expect("retained carry control");
         assert!(matches!(command, Command::Carry { .. }));
         worker.retain_carried_for_handoff(&command, &mut carried);
         assert!(!worker.handle_command(command));
-        assert!(result.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        let error = result.recv_timeout(Duration::from_secs(1)).unwrap().unwrap_err();
+        assert!(error.contains("Terminal input or control is still pending"), "{error}");
         assert!(carried.is_none());
         assert!(matches!(worker.retained_commands.front(), Some(Command::OrderedInput { .. })));
         assert!(!worker.carried);
