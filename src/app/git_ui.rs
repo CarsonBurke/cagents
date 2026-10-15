@@ -69,8 +69,11 @@ impl Snapshot {
             } else {
                 self.operations.remove(&id);
             }
-            if let Some(head) = current.heads.get(&id) { self.heads.insert(id, head.clone()); }
-            else { self.heads.remove(&id); }
+            if let Some(head) = current.heads.get(&id) {
+                self.heads.insert(id, head.clone());
+            } else {
+                self.heads.remove(&id);
+            }
             if let Some(latest) = current_rows.get(&id) {
                 *row = (**latest).clone();
                 true
@@ -112,8 +115,11 @@ impl Snapshot {
             } else {
                 self.operations.remove(&id);
             }
-            if let Some(head) = current.heads.get(&id) { self.heads.insert(id, head.clone()); }
-            else { self.heads.remove(&id); }
+            if let Some(head) = current.heads.get(&id) {
+                self.heads.insert(id, head.clone());
+            } else {
+                self.heads.remove(&id);
+            }
         }
         preserved
     }
@@ -229,7 +235,10 @@ impl State {
         // The worker selected this fork from the same successful snapshot's
         // configuration. Authoritative None also revokes an old attachment.
         if let Some(repository) = head_repository {
-            entry.snapshot.heads.insert(key.worktree_id, repository.clone());
+            entry
+                .snapshot
+                .heads
+                .insert(key.worktree_id, repository.clone());
         } else {
             entry.snapshot.heads.remove(&key.worktree_id);
         }
@@ -254,7 +263,6 @@ impl State {
         }
         true
     }
-
 
     pub fn forget(&mut self, project: ProjectId) {
         if let Some(entry) = self.entries.remove(&project)
@@ -1372,7 +1380,8 @@ mod tests {
         Message::SourceControlLoaded {
             key: key.clone(),
             request,
-            result: Ok(SourceControlRead { head_repository: None,
+            result: Ok(SourceControlRead {
+                head_repository: None,
                 prepared: Some(Box::new((snapshot, model))),
                 status,
                 operation,
@@ -1386,9 +1395,33 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let baseline = fixture(&root);
-        git(&root, &["remote", "add", "origin", "https://github.com/old-fork/repo.git"]);
-        git(&root, &["remote", "add", "retained-old", "https://github.com/old-fork/repo.git"]);
-        git(&root, &["remote", "add", "fork", "https://github.com/new-fork/repo.git"]);
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/old-fork/repo.git",
+            ],
+        );
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "retained-old",
+                "https://github.com/old-fork/repo.git",
+            ],
+        );
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/new-fork/repo.git",
+            ],
+        );
         git(&root, &["config", "branch.main.pushremote", "origin"]);
         let key = ActiveWorktreeKey {
             project_id: ProjectId::new(),
@@ -1402,117 +1435,245 @@ mod tests {
             super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
         }
         let first = load(&mut app, &key);
-        assert!(matches!(&first, Message::SourceControlLoaded { result: Ok(read), .. }
-            if read.prepared.is_some() && read.head_repository.as_ref() == Some(&old)));
+        assert!(
+            matches!(&first, Message::SourceControlLoaded { result: Ok(read), .. }
+            if read.prepared.is_some() && read.head_repository.as_ref() == Some(&old))
+        );
         drop(app.update(first));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
-        app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref(),
+            Some(&old)
+        );
+        app.sidebar_model.projects[0].worktrees[0].pull_request_state =
+            Some(sidebar::WorktreePullRequestState::Open);
         let delayed_watch = app.refresh_ui.git.entries[&key.project_id].snapshot.clone();
 
         // No Changed message: the bound fallback must notice repository config.
         // The old repository remains another remote, so set membership is insufficient.
         git(&root, &["config", "branch.main.pushremote", "fork"]);
         let changed = load(&mut app, &key);
-        assert!(matches!(&changed, Message::SourceControlLoaded { result: Ok(read), .. }
-            if read.prepared.is_some() && read.head_repository.as_ref() == Some(&new)));
+        assert!(
+            matches!(&changed, Message::SourceControlLoaded { result: Ok(read), .. }
+            if read.prepared.is_some() && read.head_repository.as_ref() == Some(&new))
+        );
         drop(app.update(changed));
         let row = &app.sidebar_model.projects[0].worktrees[0];
         assert_eq!(row.branch.as_deref(), Some("main"));
         assert_eq!(row.head_repository.as_ref(), Some(&new));
-        assert!(row.pull_request_state.is_none(), "old fork PR must be revoked");
-        drop(app.update(Message::GitUi(Action::Read { project: key.project_id, generation: 9,
-            result: Ok((delayed_watch, None)) })));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&new));
-        assert_eq!(app.refresh_ui.git.entries[&key.project_id].snapshot.heads.get(&key.worktree_id), Some(&new));
+        assert!(
+            row.pull_request_state.is_none(),
+            "old fork PR must be revoked"
+        );
+        drop(app.update(Message::GitUi(Action::Read {
+            project: key.project_id,
+            generation: 9,
+            result: Ok((delayed_watch, None)),
+        })));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref(),
+            Some(&new)
+        );
+        assert_eq!(
+            app.refresh_ui.git.entries[&key.project_id]
+                .snapshot
+                .heads
+                .get(&key.worktree_id),
+            Some(&new)
+        );
 
-        app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+        app.sidebar_model.projects[0].worktrees[0].pull_request_state =
+            Some(sidebar::WorktreePullRequestState::Open);
         let unchanged = load(&mut app, &key);
-        assert!(matches!(&unchanged, Message::SourceControlLoaded { result: Ok(read), .. }
-            if read.prepared.is_none() && read.head_repository.as_ref() == Some(&new)));
+        assert!(
+            matches!(&unchanged, Message::SourceControlLoaded { result: Ok(read), .. }
+            if read.prepared.is_none() && read.head_repository.as_ref() == Some(&new))
+        );
         drop(app.update(unchanged));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].pull_request_state,
-            Some(sidebar::WorktreePullRequestState::Open), "unchanged selected fork retains its PR");
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0].pull_request_state,
+            Some(sidebar::WorktreePullRequestState::Open),
+            "unchanged selected fork retains its PR"
+        );
 
         // URL changes with identical branch, upstream and selected remote also matter.
-        git(&root, &["remote", "set-url", "fork", "https://github.com/third-fork/repo.git"]);
+        git(
+            &root,
+            &[
+                "remote",
+                "set-url",
+                "fork",
+                "https://github.com/third-fork/repo.git",
+            ],
+        );
         let changed_url = load(&mut app, &key);
         drop(app.update(changed_url));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, "third-fork");
-        assert!(app.sidebar_model.projects[0].worktrees[0].pull_request_state.is_none());
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref()
+                .unwrap()
+                .owner,
+            "third-fork"
+        );
+        assert!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .pull_request_state
+                .is_none()
+        );
         for selected in [".", "missing"] {
-            app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+            app.sidebar_model.projects[0].worktrees[0].pull_request_state =
+                Some(sidebar::WorktreePullRequestState::Open);
             git(&root, &["config", "branch.main.pushremote", selected]);
             let local = load(&mut app, &key);
-            assert!(matches!(&local, Message::SourceControlLoaded { result: Ok(read), .. } if read.head_repository.is_none()));
+            assert!(
+                matches!(&local, Message::SourceControlLoaded { result: Ok(read), .. } if read.head_repository.is_none())
+            );
             drop(app.update(local));
-            assert!(app.sidebar_model.projects[0].worktrees[0].head_repository.is_none());
-            assert!(app.sidebar_model.projects[0].worktrees[0].pull_request_state.is_none());
+            assert!(
+                app.sidebar_model.projects[0].worktrees[0]
+                    .head_repository
+                    .is_none()
+            );
+            assert!(
+                app.sidebar_model.projects[0].worktrees[0]
+                    .pull_request_state
+                    .is_none()
+            );
         }
         git(&root, &["config", "branch.main.pushremote", "fork"]);
-        git(&root, &["remote", "set-url", "fork", root.to_str().unwrap()]);
+        git(
+            &root,
+            &["remote", "set-url", "fork", root.to_str().unwrap()],
+        );
         let local = load(&mut app, &key);
-        assert!(matches!(&local, Message::SourceControlLoaded { result: Ok(read), .. } if read.head_repository.is_none()));
+        assert!(
+            matches!(&local, Message::SourceControlLoaded { result: Ok(read), .. } if read.head_repository.is_none())
+        );
         drop(app.update(local));
-        assert!(app.sidebar_model.projects[0].worktrees[0].head_repository.is_none());
+        assert!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .is_none()
+        );
 
         git(&root, &["config", "--unset", "branch.main.pushremote"]);
         git(&root, &["config", "--unset-all", "remote.fork.url"]);
         git(&root, &["config", "include.path", "publication.inc"]);
         let missing_include = load(&mut app, &key);
         drop(app.update(missing_include));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref(),
+            Some(&old)
+        );
         let config_before = fs::read(root.join(".git/config")).unwrap();
         let included = root.join(".git/publication.inc");
         for owner in ["included-first", "included-second"] {
             fs::write(&included, format!("[branch \"main\"]\n pushRemote = fork\n[remote \"fork\"]\n url = https://github.com/{owner}/repo.git\n")).unwrap();
             let changed_include = load(&mut app, &key);
-            assert!(matches!(&changed_include, Message::SourceControlLoaded { result: Ok(read), .. }
-                if read.prepared.is_some() && read.head_repository.as_ref().is_some_and(|key| key.owner == owner)));
+            assert!(
+                matches!(&changed_include, Message::SourceControlLoaded { result: Ok(read), .. }
+                if read.prepared.is_some() && read.head_repository.as_ref().is_some_and(|key| key.owner == owner))
+            );
             drop(app.update(changed_include));
-            assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, owner);
-            assert_eq!(fs::read(root.join(".git/config")).unwrap(), config_before,
-                "only the included file changed, not the main config or porcelain state");
+            assert_eq!(
+                app.sidebar_model.projects[0].worktrees[0]
+                    .head_repository
+                    .as_ref()
+                    .unwrap()
+                    .owner,
+                owner
+            );
+            assert_eq!(
+                fs::read(root.join(".git/config")).unwrap(),
+                config_before,
+                "only the included file changed, not the main config or porcelain state"
+            );
         }
         fs::write(&included, "").unwrap();
         let empty_include = load(&mut app, &key);
         drop(app.update(empty_include));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref(),
+            Some(&old)
+        );
         fs::write(&included, "[branch \"main\"]\n pushRemote = retained-old\n").unwrap();
         let filled_include = load(&mut app, &key);
-        assert!(matches!(&filled_include, Message::SourceControlLoaded { result: Ok(read), .. } if read.prepared.is_some()));
+        assert!(
+            matches!(&filled_include, Message::SourceControlLoaded { result: Ok(read), .. } if read.prepared.is_some())
+        );
         drop(app.update(filled_include));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref(),
+            Some(&old)
+        );
         let mut config = fs::read(root.join(".git/config")).unwrap();
-        config.extend_from_slice(b"\n[includeIf \"gitdir:/inactive/non-utf8-\xff/.git/\"]\n path = inactive.inc\n");
+        config.extend_from_slice(
+            b"\n[includeIf \"gitdir:/inactive/non-utf8-\xff/.git/\"]\n path = inactive.inc\n",
+        );
         fs::write(root.join(".git/config"), config).unwrap();
         let non_utf8 = load(&mut app, &key);
-        assert!(matches!(&non_utf8, Message::SourceControlLoaded { result: Ok(_), .. }),
-            "a legal nonUTF8 include condition must not fail the whole snapshot");
+        assert!(
+            matches!(
+                &non_utf8,
+                Message::SourceControlLoaded { result: Ok(_), .. }
+            ),
+            "a legal nonUTF8 include condition must not fail the whole snapshot"
+        );
         drop(app.update(non_utf8));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref(), Some(&old));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref(),
+            Some(&old)
+        );
     }
 
     #[test]
     fn bound_worker_observes_new_and_changed_global_publication_config() {
         use crate::process::ProcessExecutor;
         const CHILD: &str = "CAGENTS_PUBLICATION_GLOBAL_TEST_CHILD";
-        const TEST: &str = "app::git_ui::tests::bound_worker_observes_new_and_changed_global_publication_config";
+        const TEST: &str =
+            "app::git_ui::tests::bound_worker_observes_new_and_changed_global_publication_config";
         if std::env::var_os(CHILD).is_none() {
             let directory = tempfile::tempdir().unwrap();
             let global = directory.path().join("global-config");
             let mut command = crate::process::CommandSpec::new(std::env::current_exe().unwrap())
                 .args(["--exact", TEST, "--nocapture"])
-                .timeout(Duration::from_secs(60)).output_limits(256 * 1024, 256 * 1024);
-            for (name, _) in std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_")) {
+                .timeout(Duration::from_secs(60))
+                .output_limits(256 * 1024, 256 * 1024);
+            for (name, _) in
+                std::env::vars_os().filter(|(name, _)| name.as_encoded_bytes().starts_with(b"GIT_"))
+            {
                 command = command.env_remove(name);
             }
-            command = command.env(CHILD, global.as_os_str()).env("GIT_CONFIG_GLOBAL", global.as_os_str())
-                .env("GIT_CONFIG_SYSTEM", "/dev/null").env("GIT_CONFIG_NOSYSTEM", "1");
-            let output = crate::process::SystemProcessExecutor.execute(&command, &CancellationToken::default())
+            command = command
+                .env(CHILD, global.as_os_str())
+                .env("GIT_CONFIG_GLOBAL", global.as_os_str())
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1");
+            let output = crate::process::SystemProcessExecutor
+                .execute(&command, &CancellationToken::default())
                 .expect("bounded global fixture child");
-            assert!(output.success, "global fixture failed: {}", String::from_utf8_lossy(&output.stderr));
-            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
-                "child must execute its exact contract: {}", String::from_utf8_lossy(&output.stdout));
+            assert!(
+                output.success,
+                "global fixture failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"),
+                "child must execute its exact contract: {}",
+                String::from_utf8_lossy(&output.stdout)
+            );
             return;
         }
         let global = PathBuf::from(std::env::var_os(CHILD).unwrap());
@@ -1520,37 +1681,91 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let baseline = fixture(&root);
-        git(&root, &["remote", "add", "origin", "https://github.com/global-old/repo.git"]);
-        git(&root, &["remote", "add", "fork", "https://github.com/global-new/repo.git"]);
-        let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/global-old/repo.git",
+            ],
+        );
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "fork",
+                "https://github.com/global-new/repo.git",
+            ],
+        );
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: baseline.worktrees[0].0.id,
+            canonical_path: root.clone(),
+        };
         let mut app = app_with_status_snapshot(baseline, &key);
         fn load(app: &mut Cagents, key: &ActiveWorktreeKey) -> Message {
             super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()))
         }
         let first = load(&mut app, &key);
         drop(app.update(first));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, "global-old");
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref()
+                .unwrap()
+                .owner,
+            "global-old"
+        );
         let local_before = fs::read(root.join(".git/config")).unwrap();
         for (selected, owner) in [("fork", "global-new"), ("origin", "global-old")] {
-            fs::write(&global, format!("[branch \"main\"]\n pushRemote = {selected}\n")).unwrap();
+            fs::write(
+                &global,
+                format!("[branch \"main\"]\n pushRemote = {selected}\n"),
+            )
+            .unwrap();
             let changed = load(&mut app, &key);
-            assert!(matches!(&changed, Message::SourceControlLoaded { result: Ok(read), .. }
-                if read.prepared.is_some() && read.head_repository.as_ref().is_some_and(|key| key.owner == owner)));
+            assert!(
+                matches!(&changed, Message::SourceControlLoaded { result: Ok(read), .. }
+                if read.prepared.is_some() && read.head_repository.as_ref().is_some_and(|key| key.owner == owner))
+            );
             drop(app.update(changed));
-            assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, owner);
+            assert_eq!(
+                app.sidebar_model.projects[0].worktrees[0]
+                    .head_repository
+                    .as_ref()
+                    .unwrap()
+                    .owner,
+                owner
+            );
             assert_eq!(fs::read(root.join(".git/config")).unwrap(), local_before);
         }
     }
 
     #[test]
     fn publication_dependency_discovery_cannot_certify_values_from_before_a_replacement() {
-        use crate::process::{CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput, SystemProcessExecutor};
+        use crate::process::{
+            CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput, SystemProcessExecutor,
+        };
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        struct SwapAfterRead { included: PathBuf, swapped: AtomicBool, config_reads: AtomicUsize }
+        struct SwapAfterRead {
+            included: PathBuf,
+            swapped: AtomicBool,
+            config_reads: AtomicUsize,
+        }
         impl ProcessExecutor for SwapAfterRead {
-            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancel: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
                 let output = SystemProcessExecutor.execute(command, cancel)?;
-                if command.arguments.iter().any(|arg| arg == std::ffi::OsStr::new("--show-origin")) {
+                if command
+                    .arguments
+                    .iter()
+                    .any(|arg| arg == std::ffi::OsStr::new("--show-origin"))
+                {
                     self.config_reads.fetch_add(1, Ordering::Relaxed);
                     if !self.swapped.swap(true, Ordering::Relaxed) {
                         let replacement = self.included.with_extension("replacement");
@@ -1564,38 +1779,91 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("repo");
         let baseline = fixture(&root);
-        git(&root, &["remote", "add", "origin", "https://github.com/before/repo.git"]);
-        git(&root, &["remote", "add", "fork", "https://github.com/after/repo.git"]);
+        git(
+            &root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/before/repo.git",
+            ],
+        );
+        git(
+            &root,
+            &["remote", "add", "fork", "https://github.com/after/repo.git"],
+        );
         git(&root, &["config", "include.path", "publication.inc"]);
         let included = root.join(".git/publication.inc");
         fs::write(&included, "[branch \"main\"]\n pushRemote = origin\n").unwrap();
-        let executor = Arc::new(SwapAfterRead { included, swapped: AtomicBool::new(false), config_reads: AtomicUsize::new(0) });
+        let executor = Arc::new(SwapAfterRead {
+            included,
+            swapped: AtomicBool::new(false),
+            config_reads: AtomicUsize::new(0),
+        });
         let service = RepositoryService::new("git", executor.clone());
         let mut cache = crate::repository::SnapshotCache::default();
         let cancel = CancellationToken::default();
         let options = crate::repository::SnapshotOptions::default();
-        let snapshot = service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().unwrap();
+        let snapshot = service
+            .snapshot_cached(&root, options, &cancel, &mut cache)
+            .unwrap()
+            .unwrap();
         assert!(executor.swapped.load(Ordering::Relaxed));
-        assert!(executor.config_reads.load(Ordering::Relaxed) >= 2,
-            "a newly discovered post-read origin version requires a fenced reread");
+        assert!(
+            executor.config_reads.load(Ordering::Relaxed) >= 2,
+            "a newly discovered post-read origin version requires a fenced reread"
+        );
         let remote = cache.publication_remote().unwrap();
-        assert_eq!(remote.name, "fork", "old Git output must not acquire the new file's identity");
-        let head_repository = remote.push_url.as_deref().or(remote.fetch_url.as_deref())
+        assert_eq!(
+            remote.name, "fork",
+            "old Git output must not acquire the new file's identity"
+        );
+        let head_repository = remote
+            .push_url
+            .as_deref()
+            .or(remote.fetch_url.as_deref())
             .and_then(crate::github::remote_repository_key);
-        let key = ActiveWorktreeKey { project_id: ProjectId::new(), worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let key = ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: baseline.worktrees[0].0.id,
+            canonical_path: root.clone(),
+        };
         let mut app = app_with_status_snapshot(baseline, &key);
         let status = snapshot.status.display_summary();
         let operation = snapshot.operation.as_ref().map(|operation| operation.kind);
         let model = SourceControlModel::ready(key.clone(), &snapshot);
-        drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: 7,
-            result: Ok(SourceControlRead { prepared: Some(Box::new((snapshot, model))), status, operation,
-                head_repository, read: next_status_read() }) }));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].head_repository.as_ref().unwrap().owner, "after");
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: 7,
+            result: Ok(SourceControlRead {
+                prepared: Some(Box::new((snapshot, model))),
+                status,
+                operation,
+                head_repository,
+                read: next_status_read(),
+            }),
+        }));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .as_ref()
+                .unwrap()
+                .owner,
+            "after"
+        );
         let reads = executor.config_reads.load(Ordering::Relaxed);
-        assert!(service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().is_none());
+        assert!(
+            service
+                .snapshot_cached(&root, options, &cancel, &mut cache)
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(cache.publication_remote().unwrap().name, "fork");
-        assert_eq!(executor.config_reads.load(Ordering::Relaxed), reads,
-            "a stable ordinary refresh must not rerun config discovery");
+        assert_eq!(
+            executor.config_reads.load(Ordering::Relaxed),
+            reads,
+            "a stable ordinary refresh must not rerun config discovery"
+        );
     }
 
     #[test]
@@ -1850,7 +2118,8 @@ mod tests {
             let bound_message = Message::SourceControlLoaded {
                 key: key.clone(),
                 request: 7,
-                result: Ok(SourceControlRead { head_repository: None,
+                result: Ok(SourceControlRead {
+                    head_repository: None,
                     status: prepared.status.display_summary(),
                     operation: prepared.operation.as_ref().map(|operation| operation.kind),
                     read: status_read,
@@ -2122,19 +2391,36 @@ mod tests {
         app.refresh_ui.git.entries.get_mut(&project).unwrap().plan = Some(old.clone());
         app.refresh_ui.git.monitor = Some(git_watch::Monitor::start().unwrap());
         let prior_repository = GitHubRepoKey::new("github.com", None, "old-fork", "repo").unwrap();
-        app.refresh_ui.git.entries.get_mut(&project).unwrap().snapshot.heads.insert(key.worktree_id, prior_repository.clone());
+        app.refresh_ui
+            .git
+            .entries
+            .get_mut(&project)
+            .unwrap()
+            .snapshot
+            .heads
+            .insert(key.worktree_id, prior_repository.clone());
         app.sidebar_model.projects[0].worktrees[0].head_repository = Some(prior_repository);
-        app.sidebar_model.projects[0].worktrees[0].pull_request_state = Some(sidebar::WorktreePullRequestState::Open);
+        app.sidebar_model.projects[0].worktrees[0].pull_request_state =
+            Some(sidebar::WorktreePullRequestState::Open);
         let delayed_watch = app.refresh_ui.git.entries[&project].snapshot.clone();
         drop(app.update(bound_status_message(&key, 7, full, read)));
         let row = &app.sidebar_model.projects[0].worktrees[0];
         assert_eq!(row.branch.as_deref(), Some("learned"));
-        assert_eq!(row.label(), "learned", "bound-only success repairs the visible branch too");
+        assert_eq!(
+            row.label(),
+            "learned",
+            "bound-only success repairs the visible branch too"
+        );
         assert_eq!(row.id, key.worktree_id);
         assert_eq!(row.path, key.canonical_path);
         assert!(row.head_repository.is_none());
         assert!(row.pull_request_state.is_none());
-        assert!(!app.refresh_ui.git.entries[&project].snapshot.heads.contains_key(&key.worktree_id));
+        assert!(
+            !app.refresh_ui.git.entries[&project]
+                .snapshot
+                .heads
+                .contains_key(&key.worktree_id)
+        );
         let entry = &app.refresh_ui.git.entries[&project];
         let current = entry.plan.as_ref().unwrap().clone();
         assert!(
@@ -2158,11 +2444,15 @@ mod tests {
             .unwrap()
             .display_summary();
         let mut stale_status = status.clone();
-        stale_status.head = HeadState::Branch { name: "stale-branch".into(), oid: "a".repeat(40) };
+        stale_status.head = HeadState::Branch {
+            name: "stale-branch".into(),
+            oid: "a".repeat(40),
+        };
         drop(app.update(Message::SourceControlLoaded {
             key: key.clone(),
             request: 7,
-            result: Ok(SourceControlRead { head_repository: None,
+            result: Ok(SourceControlRead {
+                head_repository: None,
                 prepared: None,
                 status,
                 operation: None,
@@ -2176,15 +2466,43 @@ mod tests {
             ),
             "unchanged proof must not clone/rebuild coverage"
         );
-        drop(app.update(Message::SourceControlLoaded { key: key.clone(), request: 7,
-            result: Ok(SourceControlRead { head_repository: None, prepared: None, status: stale_status, operation: None, read: read.saturating_sub(1) }) }));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].label(), "learned",
-            "an older accepted-generation callback cannot rewind the visible head");
-        drop(app.update(Message::GitUi(Action::Read { project, generation: 9, result: Ok((delayed_watch, None)) })));
-        assert_eq!(app.sidebar_model.projects[0].worktrees[0].label(), "learned");
-        assert!(app.sidebar_model.projects[0].worktrees[0].head_repository.is_none(),
-            "old watcher cannot restore revoked fork/PR identity");
-        assert!(!app.refresh_ui.git.entries[&project].snapshot.heads.contains_key(&key.worktree_id));
+        drop(app.update(Message::SourceControlLoaded {
+            key: key.clone(),
+            request: 7,
+            result: Ok(SourceControlRead {
+                head_repository: None,
+                prepared: None,
+                status: stale_status,
+                operation: None,
+                read: read.saturating_sub(1),
+            }),
+        }));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0].label(),
+            "learned",
+            "an older accepted-generation callback cannot rewind the visible head"
+        );
+        drop(app.update(Message::GitUi(Action::Read {
+            project,
+            generation: 9,
+            result: Ok((delayed_watch, None)),
+        })));
+        assert_eq!(
+            app.sidebar_model.projects[0].worktrees[0].label(),
+            "learned"
+        );
+        assert!(
+            app.sidebar_model.projects[0].worktrees[0]
+                .head_repository
+                .is_none(),
+            "old watcher cannot restore revoked fork/PR identity"
+        );
+        assert!(
+            !app.refresh_ui.git.entries[&project]
+                .snapshot
+                .heads
+                .contains_key(&key.worktree_id)
+        );
         let monitor = app.refresh_ui.git.monitor.as_ref().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -2371,7 +2689,8 @@ mod tests {
         drop(app.update(Message::SourceControlLoaded {
             key: key.clone(),
             request: 7,
-            result: Ok(SourceControlRead { head_repository: None,
+            result: Ok(SourceControlRead {
+                head_repository: None,
                 prepared: None,
                 status: status.clone(),
                 operation,

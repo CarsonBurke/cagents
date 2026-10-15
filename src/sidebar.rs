@@ -12189,12 +12189,24 @@ pub(crate) mod tests {
         let mut row = worktree(72, &pr.head_ref, false);
         let identity = (row.id, row.path.clone());
         row.set_pull_request(pr.clone());
-        row.apply_status_head(&HeadState::Branch { name: pr.head_ref.clone(), oid: "a".repeat(40) });
-        assert!(row.pull_request().is_some(), "same branch retains attached authority");
-        row.apply_status_head(&HeadState::Branch { name: "feature/learned-name".into(), oid: "b".repeat(40) });
+        row.apply_status_head(&HeadState::Branch {
+            name: pr.head_ref.clone(),
+            oid: "a".repeat(40),
+        });
+        assert!(
+            row.pull_request().is_some(),
+            "same branch retains attached authority"
+        );
+        row.apply_status_head(&HeadState::Branch {
+            name: "feature/learned-name".into(),
+            oid: "b".repeat(40),
+        });
         assert_eq!(row.branch.as_deref(), Some("feature/learned-name"));
         assert_eq!(row.label(), "feature/learned-name");
-        assert_eq!(row.chrome.folded_branch.as_deref(), Some("feature/learned-name"));
+        assert_eq!(
+            row.chrome.folded_branch.as_deref(),
+            Some("feature/learned-name")
+        );
         assert!(row.matches("learned"));
         assert!(row.chrome.tooltip.contains("Branch: feature/learned-name"));
         assert!(row.chrome.accessible_name.contains("feature/learned-name"));
@@ -12202,12 +12214,20 @@ pub(crate) mod tests {
         assert!(row.pull_request_state.is_none());
         assert_eq!((row.id, row.path.clone()), identity);
         row.apply_status_head(&HeadState::Unknown);
-        assert_eq!(row.label(), "feature/learned-name", "unknown cannot erase a known head");
-        row.apply_status_head(&HeadState::Detached { oid: "c".repeat(40) });
+        assert_eq!(
+            row.label(),
+            "feature/learned-name",
+            "unknown cannot erase a known head"
+        );
+        row.apply_status_head(&HeadState::Detached {
+            oid: "c".repeat(40),
+        });
         assert!(row.detached);
         assert!(row.branch.is_none());
         assert_eq!(row.label(), worktree_display_name(&row.path, None, true));
-        row.apply_status_head(&HeadState::Unborn { branch: Some("new/unborn-name".into()) });
+        row.apply_status_head(&HeadState::Unborn {
+            branch: Some("new/unborn-name".into()),
+        });
         assert!(!row.detached);
         assert_eq!(row.label(), "new/unborn-name");
         assert_eq!((row.id, row.path.clone()), identity);

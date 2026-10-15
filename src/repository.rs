@@ -692,7 +692,10 @@ struct PublicationDependencies {
 impl PublicationDependencies {
     fn files_changed(&self) -> bool {
         self.files.iter().any(|(path, previous)| {
-            fs::metadata(path).ok().map(|metadata| file_identity(&metadata)) != *previous
+            fs::metadata(path)
+                .ok()
+                .map(|metadata| file_identity(&metadata))
+                != *previous
         })
     }
 
@@ -2920,12 +2923,17 @@ pub fn parse_remote_config(output: &[u8]) -> Result<Vec<RemoteRecord>, GitParseE
     Ok(remotes.into_values().collect())
 }
 
-fn parse_publication_config(output: &[u8]) -> Result<(Vec<RemoteRecord>, BTreeMap<String, String>), GitParseError> {
+fn parse_publication_config(
+    output: &[u8],
+) -> Result<(Vec<RemoteRecord>, BTreeMap<String, String>), GitParseError> {
     let values = String::from_utf8_lossy(output)
         .split('\0')
         .filter_map(|entry| entry.split_once('\n'))
-        .filter(|(key, _)| *key == "remote.pushdefault"
-            || (key.starts_with("branch.") && (key.ends_with(".pushremote") || key.ends_with(".remote"))))
+        .filter(|(key, _)| {
+            *key == "remote.pushdefault"
+                || (key.starts_with("branch.")
+                    && (key.ends_with(".pushremote") || key.ends_with(".remote")))
+        })
         .map(|(key, value)| (key.to_owned(), value.to_owned()))
         .collect();
     let mut remote_records = Vec::new();
@@ -2942,21 +2950,38 @@ fn parse_observed_publication_config(
     worktree: &Path,
     output: &[u8],
     system_root: Option<&Path>,
-) -> Result<(Vec<RemoteRecord>, BTreeMap<String, String>, PublicationDependencies), GitParseError> {
+) -> Result<
+    (
+        Vec<RemoteRecord>,
+        BTreeMap<String, String>,
+        PublicationDependencies,
+    ),
+    GitParseError,
+> {
     let mut files = BTreeMap::new();
     let mut observe = |path: PathBuf| {
         if !path.as_os_str().is_empty() {
-            let path = if path.is_absolute() { path } else { worktree.join(path) };
-            let identity = fs::metadata(&path).ok().map(|metadata| file_identity(&metadata));
+            let path = if path.is_absolute() {
+                path
+            } else {
+                worktree.join(path)
+            };
+            let identity = fs::metadata(&path)
+                .ok()
+                .map(|metadata| file_identity(&metadata));
             files.insert(path, identity);
         }
     };
     // A previously absent root config has no --show-origin record. Observe
     // those defaults too, so adding the first relevant setting invalidates.
     for name in ["GIT_CONFIG", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL"] {
-        if let Some(path) = std::env::var_os(name) { observe(PathBuf::from(path)); }
+        if let Some(path) = std::env::var_os(name) {
+            observe(PathBuf::from(path));
+        }
     }
-    if let Some(path) = system_root { observe(path.to_owned()); }
+    if let Some(path) = system_root {
+        observe(path.to_owned());
+    }
     if let Some(home) = std::env::var_os("HOME") {
         observe(PathBuf::from(&home).join(".gitconfig"));
         observe(PathBuf::from(home).join(".config/git/config"));
@@ -2966,7 +2991,11 @@ fn parse_observed_publication_config(
     }
     let fields = nul_fields(output, "git config origins")?;
     if fields.len() % 2 != 0 {
-        return Err(malformed("git config origins", fields.len(), "origin is missing its value"));
+        return Err(malformed(
+            "git config origins",
+            fields.len(),
+            "origin is missing its value",
+        ));
     }
     let mut plain = Vec::new();
     let mut opaque = system_root.is_none();
@@ -2975,25 +3004,43 @@ fn parse_observed_publication_config(
         let record = pair[1];
         let origin_file = origin.strip_prefix(b"file:").map(|path| {
             let path = bytes_to_path(path);
-            if path.is_absolute() { path } else { worktree.join(path) }
+            if path.is_absolute() {
+                path
+            } else {
+                worktree.join(path)
+            }
         });
-        if let Some(path) = &origin_file { observe(path.clone()); }
+        if let Some(path) = &origin_file {
+            observe(path.clone());
+        }
         let split = record.iter().position(|byte| *byte == b'\n');
-        let (key, value) = split.map(|split| (&record[..split], &record[split + 1..]))
+        let (key, value) = split
+            .map(|split| (&record[..split], &record[split + 1..]))
             .unwrap_or((record, &[]));
         if key == b"include.path" || (key.starts_with(b"includeif.") && key.ends_with(b".path")) {
             // Include values are relative to their declaring file, not cwd.
             // Observe missing/empty targets as well as consumed origin files.
             let path = if let Some(relative) = value.strip_prefix(b"~/") {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(bytes_to_path(relative)))
+                std::env::var_os("HOME")
+                    .map(|home| PathBuf::from(home).join(bytes_to_path(relative)))
             } else if value.starts_with(b"~") || value.starts_with(b"%(prefix)") {
                 None
             } else {
                 let path = bytes_to_path(value);
-                if path.is_absolute() { Some(path) }
-                else { origin_file.as_ref().and_then(|origin| origin.parent()).map(|parent| parent.join(path)) }
+                if path.is_absolute() {
+                    Some(path)
+                } else {
+                    origin_file
+                        .as_ref()
+                        .and_then(|origin| origin.parent())
+                        .map(|parent| parent.join(path))
+                }
             };
-            if let Some(path) = path { observe(path); } else { opaque = true; }
+            if let Some(path) = path {
+                observe(path);
+            } else {
+                opaque = true;
+            }
         }
         if key.starts_with(b"remote.") || key.starts_with(b"branch.") {
             plain.extend_from_slice(record);
@@ -3001,7 +3048,15 @@ fn parse_observed_publication_config(
         }
     }
     let (remotes, values) = parse_publication_config(&plain)?;
-    Ok((remotes, values, PublicationDependencies { files, opaque, checked: Instant::now() }))
+    Ok((
+        remotes,
+        values,
+        PublicationDependencies {
+            files,
+            opaque,
+            checked: Instant::now(),
+        },
+    ))
 }
 
 /// Keep cached snapshot and direct branch lookups on the same selection policy.
@@ -3016,7 +3071,9 @@ fn select_branch_remote<'a>(
         .or_else(|| values.get(&format!("branch.{branch}.remote")));
     match selected {
         Some(name) => remotes.iter().find(|remote| remote.name == *name),
-        None => remotes.iter().find(|remote| remote.name == "origin")
+        None => remotes
+            .iter()
+            .find(|remote| remote.name == "origin")
             .or_else(|| (remotes.len() == 1).then(|| &remotes[0])),
     }
 }
@@ -4402,15 +4459,27 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         cache: &mut SnapshotCache,
     ) -> Result<Option<RepositorySnapshot>, RepositoryError> {
-        if cache.publication_dependencies.as_ref().is_some_and(PublicationDependencies::files_changed) {
+        if cache
+            .publication_dependencies
+            .as_ref()
+            .is_some_and(PublicationDependencies::files_changed)
+        {
             cache.invalidate(true);
         } else if cache.metadata.is_some()
-            && cache.publication_dependencies.as_ref().is_some_and(PublicationDependencies::reconciliation_due)
+            && cache
+                .publication_dependencies
+                .as_ref()
+                .is_some_and(PublicationDependencies::reconciliation_due)
         {
             // Opaque ~user/installation-prefix include targets cannot be
             // fingerprinted before Git resolves them. Reconcile only this
             // bound panel once a minute; identical config keeps the model.
-            let (remotes, selection, dependencies) = self.observed_publication_configuration(worktree, cancellation, &cache.admin, &mut cache.publication_system_root)?;
+            let (remotes, selection, dependencies) = self.observed_publication_configuration(
+                worktree,
+                cancellation,
+                &cache.admin,
+                &mut cache.publication_system_root,
+            )?;
             let (_, previous, ..) = cache.metadata.as_mut().unwrap();
             if *previous != remotes || cache.publication_config != selection {
                 *previous = remotes;
@@ -4506,7 +4575,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             };
             let output = self.run_checked(&files_command, cancellation)?;
             let files = invalid_output(parse_working_files(&output.stdout), output)?;
-            let (remotes, publication_config, dependencies) = self.observed_publication_configuration(worktree, cancellation, &admin, &mut cache.publication_system_root)?;
+            let (remotes, publication_config, dependencies) = self
+                .observed_publication_configuration(
+                    worktree,
+                    cancellation,
+                    &admin,
+                    &mut cache.publication_system_root,
+                )?;
             cache.publication_config = publication_config;
             cache.publication_dependencies = Some(dependencies);
             let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
@@ -6412,42 +6487,86 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cancellation: &CancellationToken,
         admin: &BTreeMap<PathBuf, Option<FileIdentity>>,
         system_root: &mut Option<Option<PathBuf>>,
-    ) -> Result<(Vec<RemoteRecord>, BTreeMap<String, String>, PublicationDependencies), RepositoryError> {
+    ) -> Result<
+        (
+            Vec<RemoteRecord>,
+            BTreeMap<String, String>,
+            PublicationDependencies,
+        ),
+        RepositoryError,
+    > {
         if system_root.is_none() {
             let command = self.git_read(worktree, ["var", "GIT_CONFIG_SYSTEM"]);
             let output = self.run(&command, cancellation)?;
             *system_root = Some(if output.success {
                 let path = trim_one_line_ending(&output.stdout);
                 (!path.is_empty()).then(|| bytes_to_path(path))
-            } else { None });
+            } else {
+                None
+            });
         }
         let system = system_root.as_ref().and_then(|root| root.as_deref());
         let (_, _, mut seed) = parse_observed_publication_config(worktree, b"", system)?;
-        for path in admin.keys().filter(|path| matches!(path.file_name().and_then(OsStr::to_str), Some("config" | "config.worktree"))) {
-            seed.files.insert(path.clone(), fs::metadata(path).ok().map(|metadata| file_identity(&metadata)));
+        for path in admin.keys().filter(|path| {
+            matches!(
+                path.file_name().and_then(OsStr::to_str),
+                Some("config" | "config.worktree")
+            )
+        }) {
+            seed.files.insert(
+                path.clone(),
+                fs::metadata(path)
+                    .ok()
+                    .map(|metadata| file_identity(&metadata)),
+            );
         }
         let base: Vec<_> = seed.files.keys().cloned().collect();
         let mut known = seed.files;
         for _ in 0..3 {
             if cancellation.is_cancelled() {
-                return Err(process_failure(&CommandSpec::new(&self.git), ProcessFailureKind::Cancelled,
-                    "publication config read cancelled", false).into());
+                return Err(process_failure(
+                    &CommandSpec::new(&self.git),
+                    ProcessFailureKind::Cancelled,
+                    "publication config read cancelled",
+                    false,
+                )
+                .into());
             }
-            let before: BTreeMap<_, _> = known.keys().map(|path| {
-                (path.clone(), fs::metadata(path).ok().map(|metadata| file_identity(&metadata)))
-            }).collect();
-            let command = self.git_read(worktree, [
-                "config", "-z", "--show-origin", "--get-regexp",
-                r"^(remote|branch|include|includeif)\.",
-            ]);
+            let before: BTreeMap<_, _> = known
+                .keys()
+                .map(|path| {
+                    (
+                        path.clone(),
+                        fs::metadata(path)
+                            .ok()
+                            .map(|metadata| file_identity(&metadata)),
+                    )
+                })
+                .collect();
+            let command = self.git_read(
+                worktree,
+                [
+                    "config",
+                    "-z",
+                    "--show-origin",
+                    "--get-regexp",
+                    r"^(remote|branch|include|includeif)\.",
+                ],
+            );
             let output = self.run(&command, cancellation)?;
             if !output.success && output.exit_code != Some(1) {
                 return Err(git_failure(&command, output).into());
             }
             let (remotes, selection, mut after) = invalid_output(
-                parse_observed_publication_config(worktree, &output.stdout, system), output)?;
+                parse_observed_publication_config(worktree, &output.stdout, system),
+                output,
+            )?;
             for path in &base {
-                after.files.entry(path.clone()).or_insert_with(|| fs::metadata(path).ok().map(|metadata| file_identity(&metadata)));
+                after.files.entry(path.clone()).or_insert_with(|| {
+                    fs::metadata(path)
+                        .ok()
+                        .map(|metadata| file_identity(&metadata))
+                });
             }
             if before == after.files {
                 return Ok((remotes, selection, after));
@@ -6456,8 +6575,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // stat alone must never certify old values with a new file version.
             known = after.files;
         }
-        Err(RepositoryError::InvalidOutput { field: "publication configuration",
-            reason: "configuration changed while reading; retry the refresh".into() })
+        Err(RepositoryError::InvalidOutput {
+            field: "publication configuration",
+            reason: "configuration changed while reading; retry the refresh".into(),
+        })
     }
 
     fn branch_config(
@@ -8073,7 +8194,10 @@ mod tests {
             _cancellation: &CancellationToken,
         ) -> Result<ProcessOutput, ProcessFailure> {
             self.commands.lock().unwrap().push(command.clone());
-            if command.arguments.ends_with(&[OsString::from("var"), OsString::from("GIT_CONFIG_SYSTEM")]) {
+            if command
+                .arguments
+                .ends_with(&[OsString::from("var"), OsString::from("GIT_CONFIG_SYSTEM")])
+            {
                 return success(b"/etc/gitconfig\n");
             }
             self.outputs.lock().unwrap().pop().unwrap()
@@ -8180,14 +8304,38 @@ mod tests {
     fn snapshot_publication_remote_matches_direct_selection_without_an_extra_process() {
         let branch = ValidatedBranchName::parse("main").unwrap();
         for (config, expected) in [
-            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\nfork\0", Some("fork")),
-            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\norigin\0branch.main.pushremote\nfork\0", Some("fork")),
-            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0remote.pushdefault\nfork\0branch.main.remote\norigin\0", Some("fork")),
-            ("remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\n.\0", None),
-            ("remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\nmissing\0", None),
-            ("remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0", Some("origin")),
-            ("remote.fork.url\nhttps://github.com/new/repo.git\0", Some("fork")),
-            ("remote.first.url\nhttps://github.com/first/repo.git\0remote.second.url\nhttps://github.com/second/repo.git\0", None),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\nfork\0",
+                Some("fork"),
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0branch.main.pushremote\norigin\0branch.main.pushremote\nfork\0",
+                Some("fork"),
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0remote.pushdefault\nfork\0branch.main.remote\norigin\0",
+                Some("fork"),
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\n.\0",
+                None,
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0branch.main.pushremote\nmissing\0",
+                None,
+            ),
+            (
+                "remote.origin.url\nhttps://github.com/old/repo.git\0remote.fork.url\nhttps://github.com/new/repo.git\0",
+                Some("origin"),
+            ),
+            (
+                "remote.fork.url\nhttps://github.com/new/repo.git\0",
+                Some("fork"),
+            ),
+            (
+                "remote.first.url\nhttps://github.com/first/repo.git\0remote.second.url\nhttps://github.com/second/repo.git\0",
+                None,
+            ),
             ("", None),
         ] {
             let direct = fake_service(vec![success(config.as_bytes())])
@@ -8197,7 +8345,11 @@ mod tests {
             let mut outputs = (0..8).map(|_| success(b"")).collect::<Vec<_>>();
             outputs[1] = success(status);
             let mut observed = Vec::new();
-            for record in config.as_bytes().split(|byte| *byte == 0).filter(|record| !record.is_empty()) {
+            for record in config
+                .as_bytes()
+                .split(|byte| *byte == 0)
+                .filter(|record| !record.is_empty())
+            {
                 observed.extend_from_slice(b"file:/etc/gitconfig\0");
                 observed.extend_from_slice(record);
                 observed.push(0);
@@ -8209,20 +8361,46 @@ mod tests {
             let mut cache = SnapshotCache::default();
             let cancel = CancellationToken::new();
             let root = Path::new("/snapshot-publication-test");
-            assert!(service.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_some());
-            assert_eq!(cache.publication_remote().map(|remote| remote.name.as_str()), expected);
+            assert!(
+                service
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                cache
+                    .publication_remote()
+                    .map(|remote| remote.name.as_str()),
+                expected
+            );
             assert_eq!(cache.publication_remote(), direct.as_ref());
             assert_eq!(executor.commands.lock().unwrap().len(), 9);
-            assert!(service.snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache).unwrap().is_none());
+            assert!(
+                service
+                    .snapshot_cached(root, SnapshotOptions::default(), &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
             assert_eq!(cache.publication_remote(), direct.as_ref());
-            assert_eq!(executor.commands.lock().unwrap().len(), 10,
-                "unchanged publication proof must use only the existing status process");
+            assert_eq!(
+                executor.commands.lock().unwrap().len(),
+                10,
+                "unchanged publication proof must use only the existing status process"
+            );
         }
         let config = "remote.origin.url\nhttps://github.com/first/repo.git\0remote.origin.url\nhttps://github.com/second/repo.git\0remote.origin.pushurl\nhttps://github.com/push-first/repo.git\0remote.origin.pushurl\nhttps://github.com/push-second/repo.git\0";
         let direct = fake_service(vec![success(config.as_bytes())])
-            .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new()).unwrap().unwrap();
-        assert_eq!(direct.fetch_url.as_deref(), Some("https://github.com/first/repo.git"));
-        assert_eq!(direct.push_url.as_deref(), Some("https://github.com/push-first/repo.git"));
+            .branch_remote(Path::new("/repo"), &branch, &CancellationToken::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            direct.fetch_url.as_deref(),
+            Some("https://github.com/first/repo.git")
+        );
+        assert_eq!(
+            direct.push_url.as_deref(),
+            Some("https://github.com/push-first/repo.git")
+        );
     }
 
     #[test]
@@ -8233,23 +8411,50 @@ mod tests {
         let config = root.join(".git/config");
         fs::write(&config, "[include]\n path = publication.inc\n").unwrap();
         let observed = format!("file:{}\0include.path\npublication.inc\0", config.display());
-        let (_, _, absent) = parse_observed_publication_config(root, observed.as_bytes(), Some(Path::new("/etc/gitconfig"))).unwrap();
+        let (_, _, absent) = parse_observed_publication_config(
+            root,
+            observed.as_bytes(),
+            Some(Path::new("/etc/gitconfig")),
+        )
+        .unwrap();
         let included = root.join(".git/publication.inc");
         assert_eq!(absent.files.get(&included), Some(&None));
         assert!(!absent.opaque);
         assert!(!absent.files_changed());
         fs::write(&included, "").unwrap();
-        assert!(absent.files_changed(), "creation of a missing include must invalidate");
-        let (_, _, empty) = parse_observed_publication_config(root, observed.as_bytes(), Some(Path::new("/etc/gitconfig"))).unwrap();
+        assert!(
+            absent.files_changed(),
+            "creation of a missing include must invalidate"
+        );
+        let (_, _, empty) = parse_observed_publication_config(
+            root,
+            observed.as_bytes(),
+            Some(Path::new("/etc/gitconfig")),
+        )
+        .unwrap();
         assert!(!empty.files_changed());
         fs::write(&included, "[branch \"main\"]\n pushRemote = fork\n").unwrap();
-        assert!(empty.files_changed(), "an empty include still carries file provenance");
-        let opaque = format!("file:{}\0include.path\n~other-user/config\0", config.display());
-        let (_, _, mut dependencies) = parse_observed_publication_config(root, opaque.as_bytes(), Some(Path::new("/etc/gitconfig"))).unwrap();
+        assert!(
+            empty.files_changed(),
+            "an empty include still carries file provenance"
+        );
+        let opaque = format!(
+            "file:{}\0include.path\n~other-user/config\0",
+            config.display()
+        );
+        let (_, _, mut dependencies) = parse_observed_publication_config(
+            root,
+            opaque.as_bytes(),
+            Some(Path::new("/etc/gitconfig")),
+        )
+        .unwrap();
         assert!(dependencies.opaque);
         assert!(!dependencies.reconciliation_due());
         dependencies.checked = Instant::now() - Duration::from_secs(61);
-        assert!(dependencies.reconciliation_due(), "opaque targets receive bounded reconciliation");
+        assert!(
+            dependencies.reconciliation_due(),
+            "opaque targets receive bounded reconciliation"
+        );
     }
 
     #[test]

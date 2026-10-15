@@ -11292,7 +11292,10 @@ impl Cagents {
                     "successful source-control read did not expose display status".to_owned()
                 })?;
                 let head_repository = cache.publication_remote().and_then(|remote| {
-                    remote.push_url.as_deref().or(remote.fetch_url.as_deref())
+                    remote
+                        .push_url
+                        .as_deref()
+                        .or(remote.fetch_url.as_deref())
                         .and_then(crate::github::remote_repository_key)
                 });
                 let mut read = SourceControlRead {
@@ -16791,16 +16794,32 @@ impl Application for Cagents {
                 // generation. Watcher scalar updates do not restart it under
                 // continuous writes; only row/cache facts use the shared order.
                 if let Ok(read) = &result
-                    && self.refresh_ui.git.accept_bound_status(&key, &read.status, read.operation, read.head_repository.as_ref(), read.read)
+                    && self.refresh_ui.git.accept_bound_status(
+                        &key,
+                        &read.status,
+                        read.operation,
+                        read.head_repository.as_ref(),
+                        read.read,
+                    )
                 {
                     let head_repository = read.head_repository.clone();
-                    if let Some(worktree) = self.sidebar_model.projects.iter_mut()
+                    if let Some(worktree) = self
+                        .sidebar_model
+                        .projects
+                        .iter_mut()
                         .find(|project| project.id == key.project_id)
-                        .and_then(|project| project.worktrees.iter_mut().find(|worktree| worktree.id == key.worktree_id))
+                        .and_then(|project| {
+                            project
+                                .worktrees
+                                .iter_mut()
+                                .find(|worktree| worktree.id == key.worktree_id)
+                        })
                     {
                         worktree.apply_status(&read.status);
                         worktree.apply_status_head(&read.status.head);
-                        if worktree.head_repository != head_repository { worktree.clear_pull_request(); }
+                        if worktree.head_repository != head_repository {
+                            worktree.clear_pull_request();
+                        }
                         worktree.head_repository = head_repository;
                         worktree.apply_operation(read.operation);
                     }
