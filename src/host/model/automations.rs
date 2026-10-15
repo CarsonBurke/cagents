@@ -4719,6 +4719,13 @@ mod tests {
             repository: directory.path().into(),
             path: directory.path().into(),
         };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: worktree.clone(),
+                panes: vec![],
+                closed: vec![],
+            })
+            .unwrap();
         let proof = crate::model::HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("archive-test"),
             boot_id: crate::model::BootId::new("archive-boot"),
