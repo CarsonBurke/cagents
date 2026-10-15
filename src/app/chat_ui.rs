@@ -452,6 +452,7 @@ pub(super) mod closing;
 
 pub(super) struct State {
     pub(super) close_dialog: Option<closing::Confirmation>,
+    close_generation: u64,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -495,6 +496,7 @@ impl Default for State {
         Self {
             image_viewer: None,
             close_dialog: None,
+            close_generation: 0,
             files: HashMap::new(),
             sender,
             receiver,
@@ -12693,7 +12695,7 @@ mod tests {
     /// Explicitly end a conversation through its confirmation flow.
     fn request_end_chat(app: &mut Cagents, card: CardId) {
         drop(app.update(Message::ChatClose(closing::Action::End(card))));
-        if app.chat_ui.close_dialog.is_some() { drop(app.update(Message::ChatClose(closing::Action::Confirm))); }
+        if let Some(target) = app.chat_ui.close_dialog.as_ref().map(closing::Confirmation::target) { drop(app.update(Message::ChatClose(closing::Action::Confirm(target)))); }
     }
 
     fn close_chat(app: &mut Cagents, card: CardId) {

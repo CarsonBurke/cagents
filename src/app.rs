@@ -2476,6 +2476,7 @@ fn join_failures(failures: &[crate::repository::MutationFailure]) -> String {
 fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
     match message {
         Message::TerminalFailure(action) => action.is_user_action(),
+        Message::ChatClose(chat_ui::closing::Action::End(_)) => true,
         Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
@@ -2535,6 +2536,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
 
 fn user_message_blocked_during_update(message: &Message) -> bool {
     user_workspace_message_blocked_while_modal(message)
+        || matches!(message, Message::ChatClose(action) if !matches!(action, chat_ui::closing::Action::CommitHide(_)))
         || matches!(
             message,
             Message::KeyEvent { .. }
@@ -15680,7 +15682,7 @@ impl Application for Cagents {
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
                 if self.chat_ui.close_dialog.is_some() {
-                    return if is_escape_press(&event) { self.update_chat_close(chat_ui::closing::Action::Cancel) } else { Task::none() };
+                    return if is_escape_press(&event) { self.cancel_chat_close() } else { Task::none() };
                 }
                 if let Some(task) = self.automation_approval_key(&event, captured) {
                     return task;
