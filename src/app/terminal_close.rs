@@ -452,10 +452,17 @@ impl Cagents {
         if !self.pane_close_decision_current(card,batch) {return Task::none();}
         self.close_card_as(card,!self.settings.confirm_terminal_close,false,batch)
     }
-    pub(super) fn resume_card_close_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
-        if !self.pane_close_decision_current(card,batch) {return Task::none();}
+    pub(super) fn capture_card_close_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Option<QueuedCardClose> {
+        if !self.pane_close_decision_current(card,batch) || !self.card_state(card).is_some_and(|state|state.existence.is_open()) {return None;}
         let mut queued=self.queued_card_close(card,false);queued.batch=batch;
+        Some(queued)
+    }
+    pub(super) fn resume_captured_card_close(&mut self,queued:QueuedCardClose)->Task<Message> {
+        if !self.pane_close_decision_current(queued.card,queued.batch) {return Task::none();}
         cosmic::task::message(Message::CloseQueuedCard(queued))
+    }
+    pub(super) fn resume_card_close_for(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
+        self.capture_card_close_for(card,batch).map(|queued|self.resume_captured_card_close(queued)).unwrap_or_else(Task::none)
     }
 
     /// Closes `card` without asking whether to stop what its terminal is
@@ -2070,6 +2077,24 @@ mod tests {
             !app.core.keyboard_nav(),
             "dismissal keeps the reader's newer choice"
         );
+    }
+
+    #[test]
+    fn captured_close_continuation_never_refreshes_consent_to_a_successor() {
+        for initially_bound in [false,true] {
+            let (mut app,card,captured)=bound_fixture();
+            if !initially_bound {app.terminal_close_bindings.bound.remove(&card);}
+            let continuation=app.capture_card_close_for(card,None).unwrap();
+            assert_eq!(continuation.captured.is_some(),initially_bound);
+            let mut successor=captured;successor.execution_instance=uuid::Uuid::new_v4();
+            app.terminal_close_bindings.bound.insert(card,successor.clone());
+            let held=super::super::tests::task_app_message(app.resume_captured_card_close(continuation));
+            drop(app.update(held));
+            assert!(app.terminal_close.is_none());
+            assert!(app.terminal_close_bindings.completed_attempts.is_empty());
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(same_captured(app.terminal_close_bindings.bound.get(&card),Some(&successor)));
+        }
     }
 
     #[test]
