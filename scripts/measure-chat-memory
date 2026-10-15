@@ -8,7 +8,11 @@ cagents executable explicitly. sample refuses a PID outside the private fixture.
 Record these stages on BOTH revisions, with the same viewport and renderer:
 small (one normal chat), restore100, visit20 (scroll each), hidden20 (focus the
 small chat), closed100, then repeat the same seed/visit/hide/close cycle twice.
-After seeding, restart only the private UI to measure fresh restore. Record raw
+Use a 1280x900 logical viewport at scale 1.0. Visit the next 20 panes with
+Ctrl+PageDown; in each send eight wheel notches down and eight up, then focus
+the small chat to hide them. Wait 10 seconds before each 10 second sample. Close
+only minted actor IDs with the close action. After seeding, restart only the
+private UI to measure fresh restore. Record raw
 screenshots, input sequences, source SHA/dirty diff, build profile and compositor
 alongside samples. Actor counts alone do not verify actual UI attachment.
 
