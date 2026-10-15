@@ -11401,6 +11401,7 @@ pub(crate) mod tests {
                 prunable_reason: None,
             },
             Some(&StatusSnapshot {
+                listing_truncated: false,
                 untracked_omitted: false,
                 head: crate::repository::HeadState::Unknown,
                 tracking: TrackingState::NoUpstream,
@@ -15549,6 +15550,7 @@ pub(crate) mod tests {
     fn snapshot() -> RepositorySnapshot {
         RepositorySnapshot {
             status: StatusSnapshot {
+                listing_truncated: false,
                 untracked_omitted: false,
                 head: HeadState::Branch {
                     name: "main".into(),
@@ -15748,6 +15750,7 @@ pub(crate) mod tests {
         let mut worktree =
             SidebarWorktree::from_durable(WorktreeId::new(), "/repo".into(), Some("main".into()));
         let mut status = StatusSnapshot {
+            listing_truncated: false,
             untracked_omitted: true,
             ..StatusSnapshot::default()
         };

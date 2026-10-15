@@ -11037,6 +11037,7 @@ impl Cagents {
         let untracked_changes = self.sidebar_state.section_expanded(PanelSection::Untracked)
             || self.context_tab == ContextTab::Files;
         let options = crate::repository::SnapshotOptions {
+            status_limit: None,
             untracked_changes,
             untracked_files: self.context_tab == ContextTab::Files,
         };
