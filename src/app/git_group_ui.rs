@@ -151,15 +151,32 @@ mod tests {
     async fn whole_group_stage_preserves_marker_confirmation_and_discard_binds_exact_paths() {
         let root = tempfile::tempdir().unwrap();
         git(root.path(), &["init", "-b", "main"]);
+        fs::write(root.path().join("merge.txt"), "baseline\n").unwrap();
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-m", "baseline"]);
+        git(root.path(), &["branch", "other"]);
+        fs::write(root.path().join("merge.txt"), "ours\n").unwrap();
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-m", "ours"]);
+        git(root.path(), &["switch", "other"]);
+        fs::write(root.path().join("merge.txt"), "theirs\n").unwrap();
+        git(root.path(), &["add", "."]);
+        git(root.path(), &["commit", "-m", "theirs"]);
+        git(root.path(), &["switch", "main"]);
+        let conflict = Command::new("git").arg("-C").arg(root.path())
+            .args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "merge", "--no-edit", "other"])
+            .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output().unwrap();
+        assert!(!conflict.status.success());
         fs::write(root.path().join("safe.txt"), "safe\n").unwrap();
-        fs::write(root.path().join("markers.txt"), "<<<<<<< ours\nleft\n=======\nright\n>>>>>>> theirs\n").unwrap();
+        fs::write(root.path().join("markers.txt"), "untracked text\n").unwrap();
         let app = super::super::tests::context_inspector_test_app(false);
         let key = key(root.path());
-        let stage = app.queued_group_task(key.clone(), uuid::Uuid::new_v4(), ChangeArea::Untracked, ChangeGroupCommand::Stage);
+        let stage = app.queued_group_task(key.clone(), uuid::Uuid::new_v4(), ChangeArea::Conflict, ChangeGroupCommand::Stage);
         let Message::SourceControlStageChecked { selection, markers, .. } = run(stage).await else { panic!("marker confirmation required"); };
-        assert_eq!(selection.len(), 2);
+        assert_eq!(selection.len(), 1);
         assert!(!markers.is_empty());
-        assert!(git(root.path(), &["ls-files", "-z"]).is_empty());
+        assert!(!git(root.path(), &["ls-files", "--unmerged", "-z"]).is_empty());
         let discard = app.queued_group_task(key.clone(), uuid::Uuid::new_v4(), ChangeArea::Untracked, ChangeGroupCommand::Discard);
         let Message::SourceControlGroupSelection { result: Ok(selection), .. } = run(discard).await else { panic!("explicit selection required"); };
         fs::write(root.path().join("unconfirmed.txt"), "preserve\n").unwrap();
