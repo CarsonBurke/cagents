@@ -17101,6 +17101,14 @@ impl Application for Cagents {
                 Task::batch(tasks)
             }
             Message::Sidebar(action) => {
+                if let SidebarAction::RunChangeGroup { key, area, command, selection_revision } = action {
+                    if self.focused_repository_is_saving() || self.workspace_inputs_blocked() { return Task::none(); }
+                    let Some(action) = sidebar::resolve_captured_change_group(&self.sidebar_model, &self.sidebar_state, &key, area, command, selection_revision, self.modal_is_open()) else {
+                        self.status = Some(TransientNotice::warning("The original change group changed; choose it again"));
+                        return Task::none();
+                    };
+                    return self.update(Message::Sidebar(action));
+                }
                 if let SidebarAction::RunChangeCommand {
                     command,
                     key,
@@ -17279,7 +17287,7 @@ impl Application for Cagents {
                         } else { Task::none() }
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
-                    SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } => unreachable!("registered commands are validated before dispatch"),
+                    SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } | SidebarAction::RunChangeGroup { .. } => unreachable!("registered commands are validated before dispatch"),
                     SidebarAction::DeleteRows(rows) => {
                         if rows.len() == 1 {
                             self.delete_sidebar_row(rows[0])
