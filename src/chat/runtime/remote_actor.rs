@@ -433,7 +433,7 @@ struct Server {
     installed:bool,
     journal:Arc<Mutex<Journal>>,
     changed:Arc<std::sync::atomic::AtomicU64>,
-    pending:Vec<(InputIdentity,crossbeam_channel::Receiver<Result<(),String>>)>,
+    pending:Vec<(InputIdentity,crossbeam_channel::Receiver<Result<(),String>>,Option<(crate::model::RunId,Arc<std::sync::atomic::AtomicU8>)>)>,
     account_reports:Arc<Mutex<Vec<Update>>>,
     environment:crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment:BTreeMap<String,String>,
@@ -514,10 +514,15 @@ impl Server {
     fn attached(&self)->Result<Attached,String> {Ok(Attached {protocol:PROTOCOL,identity:self.identity.clone(),epoch:self.epoch,resident:self.resident()?,source:self.source.clone(),launch_account_scope:self.actor.launch_account_scope().cloned().map_err(str::to_owned),execution_environment:self.environment.clone(),recovery_environment:self.recovery_environment.clone()})}
     fn finish_inputs(&mut self) {
         let journal=self.journal.clone();
-        self.pending.retain(|(identity,response)| {
+        let completed=self.actor.is_completed();
+        self.pending.retain(|(identity,response,effects)| {
+            if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
             let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
             if let Some(state)=result {
                 let mut journal=journal.lock().unwrap_or_else(|p|p.into_inner());
+                if matches!(&state,InputState::Acknowledged(Err(_))) && let Some((run,effects))=effects && effects.load(Ordering::Acquire)==1 {
+                    if let Err(error)=journal.refuse_unexecuted_run(*run) {let _=journal.record_loss(&error);}
+                }
                 if let Err(error)=journal.finish(identity,state) {let _=journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));}
                 false
             } else {true}
@@ -549,11 +554,16 @@ impl Server {
                 let mut journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
                 if let Some(receipt)=journal.input(&identity)? {return value!(receipt);}
                 if self.pending.len()>=65 {return Err("Retained actor input completion capacity reached".into());}
-                let command=match serde_json::from_value::<InputPayload>(payload).map_err(|error|error.to_string())? {InputPayload::Command {run,command}=>super::ActorCommand::Provider {run,command},InputPayload::Interrupt {run,including_subagents}=>super::ActorCommand::Interrupt {run,including_subagents}};
-                let run=match &command {super::ActorCommand::Provider {run,..}=>*run,_=>None};
+                let (command,run,effects)=match serde_json::from_value::<InputPayload>(payload).map_err(|error|error.to_string())? {
+                    InputPayload::Command {run,command}=> {
+                        let state=Arc::new(std::sync::atomic::AtomicU8::new(0));
+                        (super::ActorCommand::RetainedProvider {run,command,effects:state.clone()},run,run.map(|run|(run,state)))
+                    },
+                    InputPayload::Interrupt {run,including_subagents}=>(super::ActorCommand::Interrupt {run,including_subagents},None,None),
+                };
                 let receipt=journal.admit_with_run(&identity,run)?;
                 self.changed.fetch_add(1,Ordering::Release);
-                match self.actor.enqueue_actor(command) {Ok(reply)=>self.pending.push((identity,reply)),Err(error)=>{journal.finish(&identity,InputState::Acknowledged(Err(error)))?;if let Some(run)=run {journal.refuse_unexecuted_run(run)?;}}}
+                match self.actor.enqueue_actor(command) {Ok(reply)=>self.pending.push((identity,reply,effects)),Err(error)=>{journal.finish(&identity,InputState::Acknowledged(Err(error)))?;if let Some(run)=run {journal.refuse_unexecuted_run(run)?;}}}
                 value!(receipt)
             },
             "snapshot"=>{let (after,)=decode!((Option<u64>,));value!(self.actor.snapshot(after))},
