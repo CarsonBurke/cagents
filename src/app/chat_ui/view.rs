@@ -1115,6 +1115,16 @@ impl Runtime {
         }
     }
 
+    fn turn_elapsed(&self) -> Option<String> {
+        let start = self.snapshot.turn_started_at.or(self.turn_started_at)?;
+        let end = if self.snapshot.is_working() {
+            self.source_now_ms()?
+        } else {
+            self.snapshot.finished_at?
+        };
+        Some(format_duration(end.saturating_sub(start)))
+    }
+
     fn view<'a>(
         &'a self,
         recovery: Option<auth_recovery::Recovery>,
@@ -2182,6 +2192,11 @@ impl Runtime {
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
             );
+        }
+        // The footer is outside retained turn bodies, so even prose-only
+        // work gets a live counter without rebuilding a long answer each tick.
+        if let Some(elapsed) = self.turn_elapsed() {
+            status.push(design::caption(elapsed).into());
         }
         if let Some(channel) = &place.channel {
             status.push(
@@ -4974,6 +4989,137 @@ mod tests {
         );
         runtime.disconnected = true;
         assert_eq!(runtime.conversation_status(false).1, "Disconnected");
+    }
+
+    #[test]
+    fn turn_timer_survives_paging_and_resets_for_a_new_turn() {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let user = chat::Item {
+            id: "user-one".into(),
+            role: chat::Role::User,
+            started_at: Some(1_000),
+            at: Some(1_000),
+            content: ItemContent::Text {
+                text: "first".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let mut snapshot = Snapshot {
+            ready: true,
+            busy: true,
+            generation: 1,
+            turn_generation: 1,
+            sampled_at: Some(2_000),
+            items: vec![Arc::new(user)],
+            ..Snapshot::default()
+        };
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(1_000));
+        snapshot.items.clear();
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_started_at,
+            Some(1_000),
+            "paging cannot discard turn timing metadata"
+        );
+        snapshot.busy = false;
+        snapshot.finished_at = Some(4_000);
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("3.0s"));
+        snapshot.busy = true;
+        snapshot.finished_at = None;
+        snapshot.turn_generation = 2;
+        snapshot.generation += 1;
+        snapshot.sampled_at = Some(5_000);
+        snapshot.turn_started_at = Some(5_000);
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(
+            runtime.turn_started_at,
+            Some(5_000),
+            "a new turn resets the previous start"
+        );
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "user-two".into(),
+            role: chat::Role::User,
+            started_at: Some(5_100),
+            at: Some(5_100),
+            content: ItemContent::Text {
+                text: "second".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        }));
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(5_100));
+    }
+
+    #[test]
+    fn first_attachment_times_a_paged_out_prompt_without_child_wakes_restarting_it() {
+        let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+        let mut snapshot = Snapshot {
+            ready: true,
+            busy: true,
+            generation: 1,
+            turn_generation: 1,
+            turn_started_at: Some(1_000),
+            sampled_at: Some(6_000),
+            has_earlier: true,
+            ..Snapshot::default()
+        };
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(1_000));
+        assert!(runtime.turn_elapsed().is_some());
+        snapshot.busy = false;
+        snapshot.subagents.push(native_child_fixture());
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        assert_eq!(runtime.turn_started_at, Some(1_000));
+        snapshot.subagents[0].status = chat::ToolStatus::Succeeded;
+        snapshot.finished_at = Some(6_000);
+        snapshot.generation += 1;
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("5.0s"));
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("5.0s"));
+    }
+
+    #[test]
+    fn prose_only_turn_elapsed_advances_and_stops_at_settlement() {
+        let user = chat::Item {
+            id: "user".into(),
+            role: chat::Role::User,
+            content: ItemContent::Text {
+                text: "Write an answer".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: Some(1_000),
+            at: Some(1_000),
+        };
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[user]);
+        let state = Arc::make_mut(&mut runtime.snapshot);
+        state.busy = true;
+        state.turn_started_at = Some(1_000);
+        assert!(
+            runtime.turn_elapsed().is_some(),
+            "no tool rows are needed for elapsed time"
+        );
+        let state = Arc::make_mut(&mut runtime.snapshot);
+        state.busy = false;
+        state.finished_at = Some(4_000);
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("3.0s"));
+        assert_eq!(runtime.turn_elapsed().as_deref(), Some("3.0s"));
     }
 
     #[test]
