@@ -169,11 +169,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
             let output =
                 self.run_checked(&self.git_literal_read(worktree, arguments), cancellation)?;
-            notable.extend(
-                parse_path_list(&output.stdout, "ignored worktree files")?
-                    .into_iter()
-                    .filter(|path| !disposable(path, false)),
-            );
+            for (index, raw) in nul_fields(&output.stdout, "ignored worktree files")?
+                .into_iter()
+                .filter(|raw| !raw.is_empty())
+                .enumerate()
+            {
+                let directory = raw.ends_with(b"/");
+                let path = repo_path_field(raw, "ignored worktree files", index)?;
+                if disposable(&path, directory) {
+                    continue;
+                }
+                if directory {
+                    return Err(RepositoryError::InvalidOutput {
+                        field: "worktree_safety",
+                        reason: format!(
+                            "Cannot inspect all files inside ignored directory {path}; worktree was kept"
+                        ),
+                    });
+                }
+                notable.insert(path);
+            }
         }
         Ok(notable.into_iter().collect())
     }
@@ -235,6 +250,17 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             fingerprint.update([0]);
             match fs_safety::metadata_beneath(&root, Path::new(path.as_os_str())) {
                 Ok(metadata) => {
+                    // Git reports an untracked nested repository as one
+                    // directory. Its own timestamps cannot detect edits to
+                    // existing descendants, so it cannot authorize deletion.
+                    if metadata.is_dir() {
+                        return Err(RepositoryError::InvalidOutput {
+                            field: "worktree_safety",
+                            reason: format!(
+                                "Cannot inspect all files inside directory {path}; worktree was kept"
+                            ),
+                        });
+                    }
                     for value in [
                         metadata.dev(),
                         metadata.ino(),
@@ -406,6 +432,46 @@ mod tests {
             service
                 .set_disposable_ignored_directories(root, &["../secret".into()], &cancellation)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn incomplete_nested_repository_inventories_refuse_deletion_before_and_after_child_edits() {
+        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = fixture.path();
+        git(root, &["init", "-b", "main"]);
+        fs::write(root.join(".gitignore"), "ignored/\ntarget/\n").unwrap();
+        git(root, &["add", ".gitignore"]);
+        git(root, &["commit", "-m", "initial"]);
+        let service = RepositoryService::system("git");
+        let cancel = CancellationToken::new();
+        for name in ["ignored", "untracked"] {
+            let nested = root.join(name);
+            fs::create_dir(&nested).unwrap();
+            git(&nested, &["init", "-b", "main"]);
+            fs::write(nested.join("data"), "original").unwrap();
+            for content in ["original", "changed descendant"] {
+                fs::write(nested.join("data"), content).unwrap();
+                let error = service.worktree_safety(root, &cancel).unwrap_err();
+                assert!(
+                    error.to_string().contains("Cannot inspect all files inside"),
+                    "{error}"
+                );
+                assert_eq!(fs::read_to_string(nested.join("data")).unwrap(), content);
+            }
+            fs::remove_dir_all(nested).unwrap();
+        }
+        // Explicitly disposable ignored directories remain policy exclusions.
+        let disposable = root.join("target");
+        fs::create_dir(&disposable).unwrap();
+        git(&disposable, &["init", "-b", "main"]);
+        fs::write(disposable.join("data"), "generated").unwrap();
+        assert!(
+            service
+                .worktree_safety(root, &cancel)
+                .unwrap()
+                .notable_ignored
+                .is_empty()
         );
     }
 
