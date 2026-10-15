@@ -241,7 +241,9 @@ mod tests {
             assert_eq!(preparation_count(), before, "zero catalog preparation includes the no-channel case");
             assert_eq!(app.update_tail.runs, runs);
             let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("same composer"); };
-            assert!(runtime.unsent_text().ends_with(&"typed".repeat(10)));
+            let text = runtime.unsent_text();
+            assert!(text.contains("retain this draft"));
+            assert_eq!(text.matches("typed").count(), 10);
             // Actual incoming registry identity remains a semantic invalidation.
             let mut model = app.workspace_model.clone(); model.identity = uuid::Uuid::new_v4(); model.sequence += 1;
             drop(app.update(Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Read(model))));
