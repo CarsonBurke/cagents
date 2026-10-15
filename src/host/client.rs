@@ -1270,7 +1270,7 @@ pub(super) fn process_admitted(host: &SharedHost, client_id: ClientId, request: 
 }
 
 /// process_request holds shared control admission. Retain both exact owners
-/// under HostState, perform bounded teardown outside it, then retire only the
+/// under HostState, perform teardown outside it, then retire only the
 /// retained worker. A concurrent successor with the same durable ID remains
 /// untouched, while unrelated input may proceed and upgrade writers wait.
 fn close_terminal_source_checked(
