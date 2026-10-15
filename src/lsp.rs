@@ -6255,7 +6255,7 @@ mod tests {
     #[test]
     fn diagnostic_ranges_follow_insert_delete_and_multiline_replacements() {
         fn diagnostic(start: (u32,u32), end: (u32,u32)) -> LspDiagnostic {
-            LspDiagnostic { range: LspRange::new(LspPosition::new(start.0,start.1),LspPosition::new(end.0,end.1)), severity:LspSeverity::Error, message:"error".into(), source:None, code:None }
+            LspDiagnostic { range: LspRange::new(LspPosition::new(start.0,start.1),LspPosition::new(end.0,end.1)), severity:LspSeverity::Error, message:"error".into(), source:None, code:None, protocol:None }
         }
         let mut items = vec![diagnostic((2,3),(2,8)), diagnostic((0,0),(0,2))];
         shift_diagnostics(&mut items, &[LspTextEdit {range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,0)),new_text:"α\r\nβ\n".into()}]);
@@ -6269,7 +6269,7 @@ mod tests {
 
     #[test]
     fn diagnostic_insert_affinity_and_complete_deletion_remain_valid() {
-        let mut item = LspDiagnostic { range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,5)),severity:LspSeverity::Error,message:"error".into(),source:None,code:None };
+        let mut item = LspDiagnostic { range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,5)),severity:LspSeverity::Error,message:"error".into(),source:None,code:None,protocol:None };
         shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,2),LspPosition::new(0,2)),new_text:"α".into()}]);
         assert_eq!(item.range, LspRange::new(LspPosition::new(0,3),LspPosition::new(0,6)));
         shift_diagnostics(std::slice::from_mut(&mut item), &[LspTextEdit {range:LspRange::new(LspPosition::new(0,6),LspPosition::new(0,6)),new_text:"z".into()}]);
