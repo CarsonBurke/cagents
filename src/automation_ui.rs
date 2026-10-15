@@ -979,7 +979,8 @@ impl State {
                 Ok(
                     Response::Proposal(_)
                     | Response::Proposals(_)
-                    | Response::ArchivedConversation(_),
+                    | Response::ArchivedConversation(_)
+                    | Response::ArchivedAgents(_),
                 ) => {
                     self.error = Some("Unexpected automation approval response".into());
                 }
@@ -1480,8 +1481,11 @@ impl State {
                 "The agent may change files and use tools allowed by these permissions. Confirm only this displayed launch configuration."
             }));
             content = content.push(
-                widget::row::with_children(vec![
-                    button("Cancel", Action::CancelConfirmation, !busy),
+                crate::app::dialog_ui::confirmation_controls(vec![
+                    crate::ui_controls::button::secondary("Cancel")
+                        .id(widget::Id::new("automation.confirmation.cancel"))
+                        .on_press_maybe((!busy).then_some(Action::CancelConfirmation))
+                        .into(),
                     if matches!(confirmation.request, Request::Remove { .. }) {
                         crate::ui_controls::button::destructive("Remove automation")
                             .on_press_maybe(
@@ -1491,9 +1495,7 @@ impl State {
                     } else {
                         button("Confirm", Action::Confirm(confirmation.generation), !busy)
                     },
-                ])
-                .spacing(space::S)
-                .wrap(),
+                ]),
             );
         } else if let Some(draft) = &self.draft {
             content = content.push(draft.view(busy, &self.models, self.error.as_deref(), width));

@@ -26,11 +26,10 @@ pub(super) fn confirmation_actions<'a, M: 'a>(
 }
 
 pub(crate) fn confirmation_controls<'a, M: 'a>(
-    mut controls: Vec<Element<'a, M>>,
+    controls: Vec<Element<'a, M>>,
 ) -> Element<'a, M> {
-    controls.insert(0, iced::widget::Space::new().width(Length::Fill).into());
-    widget::row::with_children(controls)
-        .spacing(space::S)
+    widget::container(widget::row::with_children(controls).spacing(space::S).wrap().align_x(iced::alignment::Horizontal::Right))
+        .align_right(Length::Fill)
         .into()
 }
 

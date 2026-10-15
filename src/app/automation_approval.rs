@@ -18,7 +18,6 @@ pub(super) struct State {
 
 #[derive(Debug, Clone)]
 pub enum Action {
-    Tick,
     /// Close the overlay without answering the pending request.
     Dismiss,
     Updated(Vec<ProposalSummary>),
@@ -30,10 +29,6 @@ pub enum Action {
     Open {
         id: uuid::Uuid,
         revision: u64,
-    },
-    Read {
-        generation: u64,
-        result: Arc<Result<Vec<Proposal>, String>>,
     },
     Decide {
         id: uuid::Uuid,
@@ -63,28 +58,6 @@ fn placement_description(proposal: &Proposal) -> String {
 }
 
 impl Cagents {
-    fn approval_repository(&self) -> Option<&Path> {
-        match self.active_workspace_destination()? {
-            WorkspaceDestination::Folder(id) => self
-                .sidebar_model
-                .project(id)
-                .map(|project| project.repository.as_path()),
-            WorkspaceDestination::Worktree(id) => self
-                .sidebar_model
-                .projects
-                .iter()
-                .find(|project| project.worktrees.iter().any(|worktree| worktree.id == id))
-                .map(|project| project.repository.as_path()),
-            WorkspaceDestination::Channel(id) => self
-                .durable
-                .channels
-                .iter()
-                .find(|channel| channel.id == id)
-                .and_then(|channel| self.sidebar_model.project(channel.project_id))
-                .map(|project| project.repository.as_path()),
-        }
-    }
-
     pub(super) fn automation_approval_banner(&self) -> Element<'_, Message> {
         let pending = &self.automation_approval.pending;
         if pending.is_empty() {
@@ -231,60 +204,6 @@ impl Cagents {
                         .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
                 )
                 .map(cosmic::Action::App)
-            }
-            Action::Tick => {
-                if self.modal_is_open()
-                    || self.automation_approval.reading
-                    || self.chrome_ui.workspace_preview_since.is_some()
-                {
-                    return Task::none();
-                }
-                self.automation_approval.reading = true;
-                self.automation_approval.generation =
-                    self.automation_approval.generation.wrapping_add(1);
-                let generation = self.automation_approval.generation;
-                cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || {
-                        let socket = crate::terminal::ensure_daemon_ready()
-                            .map_err(|error| error.to_string())?;
-                        let mut client = crate::control::ControlClient::connect(&socket)
-                            .map_err(|error| error.to_string())?;
-                        Ok(client
-                            .read_workspace_model()
-                            .map_err(|error| error.to_string())?
-                            .pending_automation_proposals)
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(error.to_string()));
-                    let _ = generation;
-                    match result {
-                        Ok(pending) => Message::AutomationApproval(Action::Updated(pending)),
-                        Err(_) => Message::AutomationApproval(Action::Updated(Vec::new())),
-                    }
-                })
-            }
-            Action::Read { generation, result } => {
-                if generation != self.automation_approval.generation {
-                    return Task::none();
-                }
-                self.automation_approval.reading = false;
-                let Ok(proposals) = result.as_ref() else {
-                    return Task::none();
-                };
-                self.automation_approval.pending = proposals
-                    .iter()
-                    .filter(|proposal| proposal.state == ProposalState::Pending)
-                    .map(ProposalSummary::from)
-                    .collect();
-                self.automation_approval.available = proposals
-                    .iter()
-                    .find(|proposal| {
-                        proposal.state == ProposalState::Pending
-                            && self.approval_repository()
-                                == Some(proposal.definition.agent.target.repository.as_path())
-                    })
-                    .cloned();
-                Task::none()
             }
             Action::Open { id, revision } => {
                 if self.modal_is_open() || self.chrome_ui.workspace_preview_since.is_some() {
@@ -713,36 +632,32 @@ mod tests {
         let proposal = proposal();
         let mut unrelated = proposal.clone();
         unrelated.definition.agent.target.repository = "/other-project".into();
-        drop(app.update_automation_approval(Action::Read {
-            generation: 0,
-            result: Arc::new(Ok(vec![unrelated])),
-        }));
+        drop(app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(&unrelated)])));
         assert!(app.automation_approval.available.is_none());
         assert_eq!(
             app.automation_approval.pending.len(),
             1,
             "another project's request updates global attention"
         );
-        let task = app.update_automation_approval(Action::Read {
-            generation: 0,
-            result: Arc::new(Ok(vec![proposal.clone()])),
-        });
+        let task = app.update_automation_approval(Action::Updated(vec![ProposalSummary::from(&proposal)]));
         assert!(
             iced::runtime::task::into_stream(task).is_none(),
             "background attention must not move keyboard focus"
         );
         assert!(!app.modal_is_open());
         assert!(app.core.keyboard_nav());
-        assert_eq!(app.automation_approval.available, Some(proposal.clone()));
+        assert!(app.automation_approval.available.is_none(),"model pushes carry bounded summaries; full consent is fetched only for explicit review");
         drop(app.update_automation_approval(Action::Open {
             id: uuid::Uuid::new_v4(),
             revision: 1,
         }));
         assert!(!app.automation_approval_open());
-        let task = app.update_automation_approval(Action::Open {
+        drop(app.update_automation_approval(Action::Open {
             id: proposal.id,
             revision: proposal.revision,
-        });
+        }));
+        assert!(!app.modal_is_open(),"the exact private proposal must arrive before displaying consent");
+        let task=app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal.clone()))});
         assert!(app.modal_is_open());
         assert!(!app.core.keyboard_nav());
         assert_eq!(
@@ -758,10 +673,7 @@ mod tests {
         }));
         assert!(!app.automation_approval_open());
         assert!(app.core.keyboard_nav());
-        drop(app.update_automation_approval(Action::Read {
-            generation: 0,
-            result: Arc::new(Ok(vec![proposal])),
-        }));
+        drop(app.update_automation_approval(Action::Loaded {id:proposal.id,revision:proposal.revision,result:Arc::new(Ok(proposal))}));
         assert!(!app.automation_approval_open());
         assert!(app.automation_approval.available.is_none());
     }
