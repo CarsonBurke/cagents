@@ -2,6 +2,9 @@
 //! callbacks only wake it; neither callback return nor enqueueing acknowledges
 //! a durable outcome. No RPC, SQLite transaction or journal wait holds HostState.
 use super::*;
+mod restart;
+pub(super) use restart::restart_completed;
+pub(in crate::host) use restart::PreparedRestart;
 use crate::host::model::NativeActorEvent;
 use std::{collections::BTreeSet, sync::{Condvar, Mutex}};
 
