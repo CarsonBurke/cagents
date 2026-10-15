@@ -76,6 +76,27 @@ impl From<ResolveError> for DirectoryCreateError {
     fn from(cause: ResolveError) -> Self { Self { cause, recovery: None } }
 }
 
+/// Permission restoration retains the exact prepublication mode and the
+/// temporary state it introduced. Observably newer ownership/mode changes
+/// refuse restoration. fstat+fchmod is not an atomic metadata compare-and-swap;
+/// concurrent noncooperating chmod on the SAME inode remains an OS API limit.
+#[derive(Debug,Clone,Copy)]
+struct ModeRestoration { original:u32, temporary:u32, uid:u32, gid:u32 }
+impl ModeRestoration {
+    fn restore(self,directory:&Root)->io::Result<()> {
+        let current=directory.metadata()?;
+        if current.uid()!=self.uid || current.gid()!=self.gid {
+            return Err(io::Error::other("directory ownership changed; pending mode restoration retained"));
+        }
+        let mode=current.mode()&0o7777;
+        if mode==self.original {return Ok(());}
+        if mode!=self.temporary {
+            return Err(io::Error::other("directory permissions changed after publication; newer observed mode preserved"));
+        }
+        restore_directory_mode(directory,self.original)
+    }
+}
+
 /// Retained INTERNAL staging after a failed prepublication operation. If mkdir
 /// succeeded but descriptor acquisition failed, namespace/name acquisition is
 /// pending under the protected internal bootstrap contract stated above. This
@@ -88,7 +109,7 @@ pub struct DirectoryPreparation {
     outer: Option<Root>,
     payload: Option<Root>,
     payload_created: bool,
-    pending_mode: Option<u32>,
+    pending_mode: Option<ModeRestoration>,
     created: bool,
     cleanup_error: Option<String>,
 }
@@ -145,7 +166,7 @@ impl DirectoryPreparation {
                     let payload = self.payload.as_ref().unwrap();
                     payload.metadata().map_err(|e| ResolveError::io(&payload.path, &e))?;
                     if let Some(mode)=self.pending_mode {
-                        restore_directory_mode(payload,mode).map_err(|e|ResolveError::io(&payload.path,&e))?;
+                        mode.restore(payload).map_err(|e|ResolveError::io(&payload.path,&e))?;
                         self.pending_mode=None;
                     }
                     remove_directory_within(outer, OsStr::new("directory"))?;
@@ -200,7 +221,7 @@ pub struct DirectoryPublication {
     namespace: DirectoryNamespace,
     identity: Metadata,
     publication_error: Option<String>,
-    pending_mode: Option<u32>,
+    pending_mode: Option<ModeRestoration>,
     private_staging: Option<(Root,OsString)>,
     quarantined: Option<OsString>,
     removed: bool,
@@ -227,7 +248,7 @@ impl DirectoryPublication {
 
     fn restore_pending_mode(&mut self)->Result<(),ResolveError> {
         if let Some(mode)=self.pending_mode {
-            restore_directory_mode(&self.directory,mode).map_err(|e|ResolveError::io(&self.directory.path,&e))?;
+            mode.restore(&self.directory).map_err(|e|ResolveError::io(&self.directory.path,&e))?;
             self.pending_mode=None;
             if self.private_staging.is_none() {self.publication_error=None;}
         }
@@ -467,22 +488,23 @@ impl DirectoryStage {
     }
     fn publish_to(self,parent:Root,name:OsString,after_publish:impl FnOnce(&Root,&OsStr))
         ->Result<DirectoryPublication,(DirectoryCreateError,bool)> {
-        self.publish_to_with_restore(parent,name,after_publish,restore_directory_mode)
+        self.publish_to_with_restore(parent,name,after_publish,|root,pending|pending.restore(root))
     }
     fn publish_to_with_restore(self,parent:Root,name:OsString,after_publish:impl FnOnce(&Root,&OsStr),
-        restore_mode:impl FnOnce(&Root,u32)->io::Result<()>)->Result<DirectoryPublication,(DirectoryCreateError,bool)> {
+        restore_mode:impl FnOnce(&Root,ModeRestoration)->io::Result<()>)->Result<DirectoryPublication,(DirectoryCreateError,bool)> {
         let DirectoryStage {mut preparation,identity}=self;
     // Linux requires write permission on a directory when changing its '..'
     // parent during rename. Widen only owner-write on the retained private
     // payload, then restore its exact observed mode through the same descriptor.
     // No group/other grants or POSIX ACL mask bits are widened.
     let payload=preparation.payload.as_ref().unwrap();
-    let mode=match payload.metadata() {
-        Ok(metadata)=>metadata.mode()&0o7777,
+    let metadata=match payload.metadata() {
+        Ok(metadata)=>metadata,
         Err(error)=>return Err((preparation.fail(ResolveError::io(&parent.path.join(&name),&error)),false)),
     };
+    let mode=metadata.mode()&0o7777;
     if mode&0o200==0 {
-        preparation.pending_mode=Some(mode);
+        preparation.pending_mode=Some(ModeRestoration { original:mode, temporary:mode|0o200,uid:metadata.uid(),gid:metadata.gid() });
         if let Err(error)=set_directory_permissions(payload,mode|0o200) {
             return Err((preparation.fail(ResolveError::io(&parent.path.join(&name),&error)),false));
         }
@@ -1047,7 +1069,7 @@ mod tests {
             |_,_|Err(io::Error::from_raw_os_error(libc::EIO))).unwrap();
         assert_eq!(receipt.identity(),original);
         assert!(receipt.publication_error().unwrap().contains("mode restoration"));
-        assert_eq!(receipt.pending_mode,Some(0));
+        assert_eq!(receipt.pending_mode.unwrap().original,0);
         assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0o200);
         receipt.restore_pending_mode().unwrap();
         assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0);
@@ -1055,6 +1077,25 @@ mod tests {
         assert!(receipt.publication_error().is_none());
         receipt.cleanup_empty().unwrap();
         assert!(receipt.is_removed());
+    }
+
+    #[test]
+    fn pending_mode_retry_preserves_observed_newer_public_permissions() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let stage=stage_directory_in_namespace(&namespace,0o700).unwrap();
+        set_directory_permissions(stage.directory(),0).unwrap();
+        let mut receipt=stage.publish_to_with_restore(root.try_clone().unwrap(),OsString::from("target"),|_,_|{},
+            |_,_|Err(io::Error::from_raw_os_error(libc::EIO))).unwrap();
+        set_directory_permissions(receipt.directory(),0o750).unwrap();
+        assert!(receipt.restore_pending_mode().is_err());
+        assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0o750);
+        assert!(receipt.pending_mode.is_some());
+        assert!(receipt.publication_error().is_some());
+        set_directory_permissions(receipt.directory(),0o200).unwrap();
+        receipt.restore_pending_mode().unwrap();
+        assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0);
     }
 
 }
