@@ -79,39 +79,87 @@ impl State {
 }
 
 impl Cagents {
-    pub(super) fn insert_archive_report_card(&mut self,session:chat::Session,report:&crate::automations::ArchiveReport,title:String)->Option<(CardId,Task<Message>)> {
-        let previous=self.shared_views.applying;
-        self.shared_views.applying=true;
-        let created=self.new_archive_report_card(session);
-        self.shared_views.applying=previous;
-        let (card,task)=created?;
-        let durable=Arc::make_mut(&mut self.durable);
+    pub(super) fn insert_archive_report_card(
+        &mut self,
+        session: chat::Session,
+        report: &crate::automations::ArchiveReport,
+        title: String,
+    ) -> Option<(CardId, Task<Message>)> {
+        let previous = self.shared_views.applying;
+        self.shared_views.applying = true;
+        let created = self.new_archive_report_card(session);
+        self.shared_views.applying = previous;
+        let (card, task) = created?;
+        let durable = Arc::make_mut(&mut self.durable);
         match &report.presentation_scope {
-            Some(scope)=>{durable.card_scopes.insert(card,scope.clone());}
-            None=>{durable.card_scopes.remove(&card);}
+            Some(scope) => {
+                durable.card_scopes.insert(card, scope.clone());
+            }
+            None => {
+                durable.card_scopes.remove(&card);
+            }
         }
-        self.apply_reported_title(card,title);
-        if !self.publish_archive_report_presentation(card,report) {
-            self.status=Some(TransientNotice::warning("The saved report is read-only, but its original shared membership could not be published. Reconnect before trying again."));
+        self.apply_reported_title(card, title);
+        if !self.publish_archive_report_presentation(card, report) {
+            self.status = Some(TransientNotice::warning(
+                "The saved report is read-only, but its original shared membership could not be published. Reconnect before trying again.",
+            ));
         }
         self.persist();
-        Some((card,task))
+        Some((card, task))
     }
 
-    pub(super) fn publish_archive_report_presentation(&mut self,card:CardId,report:&crate::automations::ArchiveReport)->bool {
-        if report.reference.registry!=self.workspace_model.identity {return false;}
-        let Some(view)=self.workspace_model.views.iter().find(|view|view.scope==report.scope) else{return false;};
-        let revision=view.revision;
-        let Some(pane)=self.card_state(card).and_then(|state|Pane::from_card(state,self.durable.card_scopes.get(&card).cloned())) else{return false;};
-        let repository=match &report.scope {
-            Scope::Worktree{repository,..}=>repository.clone(),
-            Scope::Channel(channel)=>match self.workspace_model.channel(*channel) {Some(channel)=>channel.repository.clone(),None=>return false},
+    pub(super) fn publish_archive_report_presentation(
+        &mut self,
+        card: CardId,
+        report: &crate::automations::ArchiveReport,
+    ) -> bool {
+        if report.reference.registry != self.workspace_model.identity {
+            return false;
+        }
+        let Some(view) = self
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == report.scope)
+        else {
+            return false;
         };
-        let change=Change::InsertArchiveReport {registry:report.reference.registry,repository,reference:report.reference.clone(),pane:pane.clone()};
-        let operation=uuid::Uuid::new_v4();
-        self.shared_views.pending.push((operation,report.scope.clone(),change.clone()));
-        self.shared_views.baseline.entry(report.scope.clone()).or_default().push(pane);
-        self.publish_model_edit(ModelEdit::ChangeView {scope:report.scope.clone(),expected_revision:revision,operation,change});
+        let revision = view.revision;
+        let Some(pane) = self
+            .card_state(card)
+            .and_then(|state| Pane::from_card(state, self.durable.card_scopes.get(&card).cloned()))
+        else {
+            return false;
+        };
+        let repository = match &report.scope {
+            Scope::Worktree { repository, .. } => repository.clone(),
+            Scope::Channel(channel) => match self.workspace_model.channel(*channel) {
+                Some(channel) => channel.repository.clone(),
+                None => return false,
+            },
+        };
+        let change = Change::InsertArchiveReport {
+            registry: report.reference.registry,
+            repository,
+            reference: report.reference.clone(),
+            pane: pane.clone(),
+        };
+        let operation = uuid::Uuid::new_v4();
+        self.shared_views
+            .pending
+            .push((operation, report.scope.clone(), change.clone()));
+        self.shared_views
+            .baseline
+            .entry(report.scope.clone())
+            .or_default()
+            .push(pane);
+        self.publish_model_edit(ModelEdit::ChangeView {
+            scope: report.scope.clone(),
+            expected_revision: revision,
+            operation,
+            change,
+        });
         true
     }
 
@@ -535,14 +583,29 @@ impl Cagents {
                 .map(|view| view.revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
-                let change=match change {
-                    Change::Insert{pane,..} if matches!(&pane.kind,CardKind::Chat(session) if session.archive_report.is_some())=> {
-                        let CardKind::Chat(session)=&pane.kind else{unreachable!()};
-                        let reference=session.archive_report.clone().unwrap();
-                        let repository=match &scope {Scope::Worktree{repository,..}=>repository.clone(),Scope::Channel(channel)=>match self.workspace_model.channel(*channel){Some(channel)=>channel.repository.clone(),None=>continue}};
-                        Change::InsertArchiveReport{registry:reference.registry,repository,reference,pane}
+                let change = match change {
+                    Change::Insert { pane, .. } if matches!(&pane.kind,CardKind::Chat(session) if session.archive_report.is_some()) =>
+                    {
+                        let CardKind::Chat(session) = &pane.kind else {
+                            unreachable!()
+                        };
+                        let reference = session.archive_report.clone().unwrap();
+                        let repository = match &scope {
+                            Scope::Worktree { repository, .. } => repository.clone(),
+                            Scope::Channel(channel) => match self.workspace_model.channel(*channel)
+                            {
+                                Some(channel) => channel.repository.clone(),
+                                None => continue,
+                            },
+                        };
+                        Change::InsertArchiveReport {
+                            registry: reference.registry,
+                            repository,
+                            reference,
+                            pane,
+                        }
                     }
-                    change=>change,
+                    change => change,
                 };
                 let operation = match &change {
                     Change::Insert { pane, .. }

@@ -4765,12 +4765,20 @@ mod tests {
         );
     }
 
-    fn archived_membership_fixture() -> (Registry, tempfile::TempDir, crate::workspace_model::views::Pane, crate::workspace_model::views::Scope, crate::agent_execution::Agent) {
+    fn archived_membership_fixture() -> (
+        Registry,
+        tempfile::TempDir,
+        crate::workspace_model::views::Pane,
+        crate::workspace_model::views::Scope,
+        crate::agent_execution::Agent,
+    ) {
         use crate::agent_execution::HostedSession;
         let (mut registry, directory, mut definition) = fixture();
         definition.session_mode = SessionMode::Fresh;
         let (_, firing, agent) = completed_reusable_run(&mut registry, definition);
-        let Some(HostedSession::Chat(native)) = &agent.session else { panic!("native source") };
+        let Some(HostedSession::Chat(native)) = &agent.session else {
+            panic!("native source")
+        };
         let proof = native.proof.as_ref().unwrap();
         let console = crate::model::TerminalSession {
             id: native.id,
@@ -4778,223 +4786,680 @@ mod tests {
                 program: "/bin/true".into(),
                 arguments: vec!["agent".into(), "console".into(), agent.id.to_string()],
                 working_directory: directory.path().into(),
-                environment: Default::default(), unset_environment: Default::default(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
             },
-            transcript_path: None, resume_hint: None, owned_codex_listener: None,
-            recovery_origin: None, predecessor: None,
+            transcript_path: None,
+            resume_hint: None,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
             continuity: crate::model::TerminalContinuity::Live {
-                host_session_id: proof.host_session_id.clone(), boot_id: proof.boot_id.clone(),
+                host_session_id: proof.host_session_id.clone(),
+                boot_id: proof.boot_id.clone(),
                 host_incarnation: proof.host_incarnation.clone(),
             },
         };
-        let agent = registry.bind_agent_console(agent.id, agent.session.as_ref().unwrap(), console.clone()).unwrap();
-        registry.archive_automation_conversation(firing.id, &agent, crate::chat::Snapshot {
-            session_id: Some("retained-membership-thread".into()),
-            ..Default::default()
-        }).unwrap();
+        let agent = registry
+            .bind_agent_console(agent.id, agent.session.as_ref().unwrap(), console.clone())
+            .unwrap();
+        registry
+            .archive_automation_conversation(
+                firing.id,
+                &agent,
+                crate::chat::Snapshot {
+                    session_id: Some("retained-membership-thread".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
         let agent = registry.close_agent(&agent.origin, agent.id).unwrap();
         let pane = crate::workspace_model::views::Pane {
-            id: crate::model::CardId::from_uuid(agent.id.as_uuid()), title: "Saved result".into(),
-            user_title: None, pending_terminal_start: false, width_fraction: 1.0,
-            kind: crate::model::CardKind::Terminal(console), scope: None,
+            id: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+            title: "Saved result".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            kind: crate::model::CardKind::Terminal(console),
+            scope: None,
         };
         let scope = agent.placement.clone();
-        registry.apply(&ModelEdit::SeedView { scope: scope.clone(), panes: vec![pane.clone()], closed: vec![] }).unwrap();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: vec![pane.clone()],
+                closed: vec![],
+            })
+            .unwrap();
         (registry, directory, pane, scope, agent)
     }
 
     #[test]
     fn private_report_response_frames_one_bounded_native_descriptor_without_duplicating_it() {
-        let (registry,_directory,_pane,scope,agent)=archived_membership_fixture();
-        let identity=registry.model().unwrap().identity;
-        let mut archive=registry.archived_automation_conversation(agent.id).unwrap();
-        let Some(crate::agent_execution::HostedSession::Chat(native))=&mut archive.agent.session else {unreachable!()};
-        native.launch.recipe.environment.insert("BOUNDED_PROVIDER_METADATA".into(),"x".repeat(5*1024*1024/2));
-        let mut issued=native.clone();
-        let proof=issued.proof.clone().unwrap();
-        let reference=crate::chat::ArchiveReportReference {format:1,registry:identity,agent:agent.id,source_operation:Uuid::new_v4()};
-        issued.archive_report=Some(reference.clone());
-        archive.snapshot.items.push(std::sync::Arc::new(crate::chat::Item {id:"bounded-report".into(),role:crate::chat::Role::Assistant,
-            content:crate::chat::ItemContent::Text {text:"r".repeat(15*1024*1024/4),thinking:false,phase:Default::default()},at:None,started_at:None}));
-        assert!(serde_json::to_vec(&archive.agent).unwrap().len()<3*1024*1024);
-        assert!(serde_json::to_vec(&archive.snapshot).unwrap().len()<4*1024*1024);
-        let report=crate::automations::ArchiveReport {reference,scope,repository:agent.spec.target.repository.clone(),source_revision:1,presentation_scope:None,
-            session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive};
-        let expected=crate::terminal_ipc::ServerEnvelope {version:crate::terminal_ipc::PROTOCOL_VERSION,request_id:Some(1),proof,
-            message:crate::terminal_ipc::ServerMessage::Response {response:crate::terminal_ipc::ServerResponse::Automation(crate::automations::Response::ArchiveReport(Box::new(report)))}};
-        let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&issued).unwrap();
-        for operation in [crate::automations::Request::ArchiveReportSource {identity,card:crate::model::CardId::from_uuid(agent.id.as_uuid()),descriptor:descriptor.clone()},
-            crate::automations::Request::ReadArchiveReport {reference:issued.archive_report.clone().unwrap(),descriptor:descriptor.clone()}] {
-            let client=crate::terminal_ipc::ClientEnvelope {version:crate::terminal_ipc::PROTOCOL_VERSION,request_id:1,proof:None,
-                request:crate::terminal_ipc::ClientRequest::Automation {authority:Default::default(),operation}};
-            let mut request=Vec::new();crate::terminal_ipc::write_frame(&mut request,&client).unwrap();
-            assert!(request.len()<crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES);
-            let decoded:crate::terminal_ipc::ClientEnvelope=crate::terminal_ipc::read_frame_with_limit(&mut std::io::Cursor::new(request),crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES).unwrap().unwrap();
-            assert_eq!(decoded,client);
+        let (registry, _directory, _pane, scope, agent) = archived_membership_fixture();
+        let identity = registry.model().unwrap().identity;
+        let mut archive = registry.archived_automation_conversation(agent.id).unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(native)) = &mut archive.agent.session
+        else {
+            unreachable!()
+        };
+        native.launch.recipe.environment.insert(
+            "BOUNDED_PROVIDER_METADATA".into(),
+            "x".repeat(5 * 1024 * 1024 / 2),
+        );
+        let mut issued = native.clone();
+        let proof = issued.proof.clone().unwrap();
+        let reference = crate::chat::ArchiveReportReference {
+            format: 1,
+            registry: identity,
+            agent: agent.id,
+            source_operation: Uuid::new_v4(),
+        };
+        issued.archive_report = Some(reference.clone());
+        archive
+            .snapshot
+            .items
+            .push(std::sync::Arc::new(crate::chat::Item {
+                id: "bounded-report".into(),
+                role: crate::chat::Role::Assistant,
+                content: crate::chat::ItemContent::Text {
+                    text: "r".repeat(15 * 1024 * 1024 / 4),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                at: None,
+                started_at: None,
+            }));
+        assert!(serde_json::to_vec(&archive.agent).unwrap().len() < 3 * 1024 * 1024);
+        assert!(serde_json::to_vec(&archive.snapshot).unwrap().len() < 4 * 1024 * 1024);
+        let report = crate::automations::ArchiveReport {
+            reference,
+            scope,
+            repository: agent.spec.target.repository.clone(),
+            source_revision: 1,
+            presentation_scope: None,
+            session_digest: crate::automations::ArchiveReport::session_digest(&issued).unwrap(),
+            archive,
+        };
+        let expected = crate::terminal_ipc::ServerEnvelope {
+            version: crate::terminal_ipc::PROTOCOL_VERSION,
+            request_id: Some(1),
+            proof,
+            message: crate::terminal_ipc::ServerMessage::Response {
+                response: crate::terminal_ipc::ServerResponse::Automation(
+                    crate::automations::Response::ArchiveReport(Box::new(report)),
+                ),
+            },
+        };
+        let descriptor =
+            crate::automations::ArchiveReportDescriptor::from_session(&issued).unwrap();
+        for operation in [
+            crate::automations::Request::ArchiveReportSource {
+                identity,
+                card: crate::model::CardId::from_uuid(agent.id.as_uuid()),
+                descriptor: descriptor.clone(),
+            },
+            crate::automations::Request::ReadArchiveReport {
+                reference: issued.archive_report.clone().unwrap(),
+                descriptor: descriptor.clone(),
+            },
+        ] {
+            let client = crate::terminal_ipc::ClientEnvelope {
+                version: crate::terminal_ipc::PROTOCOL_VERSION,
+                request_id: 1,
+                proof: None,
+                request: crate::terminal_ipc::ClientRequest::Automation {
+                    authority: Default::default(),
+                    operation,
+                },
+            };
+            let mut request = Vec::new();
+            crate::terminal_ipc::write_frame(&mut request, &client).unwrap();
+            assert!(request.len() < crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES);
+            let decoded: crate::terminal_ipc::ClientEnvelope =
+                crate::terminal_ipc::read_frame_with_limit(
+                    &mut std::io::Cursor::new(request),
+                    crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES,
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded, client);
         }
-        assert!(postcard::to_stdvec(&issued).unwrap().len()>crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES,"the descriptor request must not embed the native recipe");
-        let mut frame=Vec::new();
-        crate::terminal_ipc::write_frame(&mut frame,&expected).unwrap();
-        assert!(frame.len()<crate::terminal_ipc::MAX_FRAME_BYTES);
-        assert!(frame.len()+postcard::to_stdvec(&issued).unwrap().len()>crate::terminal_ipc::MAX_FRAME_BYTES,
-            "duplicating the full requested Session would violate the actual frame budget");
-        let decoded:crate::terminal_ipc::ServerEnvelope=crate::terminal_ipc::read_frame(&mut std::io::Cursor::new(frame)).unwrap().unwrap();
-        assert_eq!(decoded,expected);
+        assert!(
+            postcard::to_stdvec(&issued).unwrap().len()
+                > crate::terminal_ipc::MAX_CLIENT_FRAME_BYTES,
+            "the descriptor request must not embed the native recipe"
+        );
+        let mut frame = Vec::new();
+        crate::terminal_ipc::write_frame(&mut frame, &expected).unwrap();
+        assert!(frame.len() < crate::terminal_ipc::MAX_FRAME_BYTES);
+        assert!(
+            frame.len() + postcard::to_stdvec(&issued).unwrap().len()
+                > crate::terminal_ipc::MAX_FRAME_BYTES,
+            "duplicating the full requested Session would violate the actual frame budget"
+        );
+        let decoded: crate::terminal_ipc::ServerEnvelope =
+            crate::terminal_ipc::read_frame(&mut std::io::Cursor::new(frame))
+                .unwrap()
+                .unwrap();
+        assert_eq!(decoded, expected);
     }
 
     #[test]
     fn ended_report_reopens_with_a_new_pane_and_exact_original_owner_without_resurrection() {
         use crate::workspace_model::views::Change;
-        let (mut registry,_directory,original,scope,agent)=archived_membership_fixture();
-        let model=registry.model().unwrap();
-        let source_operation=Uuid::new_v4();
-        let revision=model.views.iter().find(|view|view.scope==scope).unwrap().revision;
-        let old_run=registry.latest_agent_run(agent.id).unwrap();
-        let old_snapshot=serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap()).unwrap();
-        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:source_operation,
-            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:original.clone()}}).unwrap();
-        let Some(crate::agent_execution::HostedSession::Chat(mut native))=agent.session.clone() else{unreachable!()};
-        native.terminal=agent.console.clone();
-        let report=registry.archive_report_source(model.identity,original.id,&native).unwrap().unwrap();
-        let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&native).unwrap();
-        assert_eq!(registry.archive_report_source_descriptor(model.identity,original.id,&descriptor).unwrap(),Some(report.clone()));
-        assert_eq!(report.reference.source_operation,source_operation);
-        assert_eq!(report.reference.agent,agent.id);
-        assert_eq!(report.source_revision,revision);
-        assert_eq!(report.scope,scope);
-        let mut presented=native.clone();presented.archive_report=Some(report.reference.clone());
-        assert!(crate::automations::archive::ArchivedPaneReadiness::qualify_report(&report,&presented).is_ok());
-        let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&presented).unwrap();
-        assert_eq!(registry.read_archive_report_descriptor(&report.reference,&descriptor).unwrap(),report);
-        let mut different=descriptor.clone();different.digest[0]^=1;
-        assert!(registry.read_archive_report_descriptor(&report.reference,&different).is_err());
-        let new_id=crate::model::CardId::new();
-        assert_ne!(new_id,original.id);
-        let pane=crate::workspace_model::views::Pane {id:new_id,kind:crate::model::CardKind::Chat(presented.clone()),scope:report.presentation_scope.clone(),..original.clone()};
-        let current=registry.model().unwrap();
-        let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
-        let insert=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),change:Change::InsertArchiveReport {registry:model.identity,repository:agent.spec.target.repository.clone(),reference:report.reference.clone(),pane:pane.clone()}};
+        let (mut registry, _directory, original, scope, agent) = archived_membership_fixture();
+        let model = registry.model().unwrap();
+        let source_operation = Uuid::new_v4();
+        let revision = model
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
+        let old_run = registry.latest_agent_run(agent.id).unwrap();
+        let old_snapshot =
+            serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap())
+                .unwrap();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: revision,
+                operation: source_operation,
+                change: Change::RemoveArchivedAutomationSource {
+                    registry: model.identity,
+                    repository: agent.spec.target.repository.clone(),
+                    before: original.clone(),
+                },
+            })
+            .unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(mut native)) = agent.session.clone()
+        else {
+            unreachable!()
+        };
+        native.terminal = agent.console.clone();
+        let report = registry
+            .archive_report_source(model.identity, original.id, &native)
+            .unwrap()
+            .unwrap();
+        let descriptor =
+            crate::automations::ArchiveReportDescriptor::from_session(&native).unwrap();
+        assert_eq!(
+            registry
+                .archive_report_source_descriptor(model.identity, original.id, &descriptor)
+                .unwrap(),
+            Some(report.clone())
+        );
+        assert_eq!(report.reference.source_operation, source_operation);
+        assert_eq!(report.reference.agent, agent.id);
+        assert_eq!(report.source_revision, revision);
+        assert_eq!(report.scope, scope);
+        let mut presented = native.clone();
+        presented.archive_report = Some(report.reference.clone());
+        assert!(
+            crate::automations::archive::ArchivedPaneReadiness::qualify_report(&report, &presented)
+                .is_ok()
+        );
+        let descriptor =
+            crate::automations::ArchiveReportDescriptor::from_session(&presented).unwrap();
+        assert_eq!(
+            registry
+                .read_archive_report_descriptor(&report.reference, &descriptor)
+                .unwrap(),
+            report
+        );
+        let mut different = descriptor.clone();
+        different.digest[0] ^= 1;
+        assert!(
+            registry
+                .read_archive_report_descriptor(&report.reference, &different)
+                .is_err()
+        );
+        let new_id = crate::model::CardId::new();
+        assert_ne!(new_id, original.id);
+        let pane = crate::workspace_model::views::Pane {
+            id: new_id,
+            kind: crate::model::CardKind::Chat(presented.clone()),
+            scope: report.presentation_scope.clone(),
+            ..original.clone()
+        };
+        let current = registry.model().unwrap();
+        let revision = current
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
+        let insert = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: revision,
+            operation: Uuid::new_v4(),
+            change: Change::InsertArchiveReport {
+                registry: model.identity,
+                repository: agent.spec.target.repository.clone(),
+                reference: report.reference.clone(),
+                pane: pane.clone(),
+            },
+        };
         assert!(registry.apply(&insert).unwrap().changed);
         assert!(!registry.apply(&insert).unwrap().changed);
-        let current=registry.model().unwrap();
-        let view=current.views.iter().find(|view|view.scope==scope).unwrap();
+        let current = registry.model().unwrap();
+        let view = current
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap();
         assert!(view.retired.contains(&original.id));
-        assert!(!view.panes.iter().any(|pane|pane.id==original.id));
-        assert_eq!(view.panes,vec![pane.clone()]);
-        let mut plain=presented.clone();plain.archive_report=None;
-        let mut fresh=plain.clone();fresh.id=crate::model::TerminalId::new();fresh.proof=None;fresh.terminal=None;fresh.launch.session_id=None;
-        let forged_before=crate::workspace_model::views::Pane {kind:crate::model::CardKind::Chat(plain),..pane.clone()};
-        let desired=crate::workspace_model::views::Pane {kind:crate::model::CardKind::Chat(fresh),..pane.clone()};
-        let forged=Change::Update {before:forged_before,pane:desired};
-        assert!(view.clone().apply(&forged).is_err(),"actual current report identity fences a forged ordinary source basis");
-        assert!(registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:view.revision,operation:Uuid::new_v4(),change:forged}).is_err());
-        assert_eq!(registry.model().unwrap().views.iter().find(|view|view.scope==scope).unwrap().panes,vec![pane.clone()]);
-        let mut titled=pane.clone();titled.title="A safe presentation title".into();
-        assert!(view.clone().apply(&Change::Update {before:pane.clone(),pane:titled}).unwrap(),"presentation metadata remains editable");
-        assert_eq!(registry.agent(agent.id).unwrap(),agent);
-        assert_eq!(registry.latest_agent_run(agent.id).unwrap(),old_run);
-        assert_eq!(serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap()).unwrap(),old_snapshot);
-        assert_eq!(registry.archived_automation_pane_owner(&pane).unwrap().unwrap(),agent);
+        assert!(!view.panes.iter().any(|pane| pane.id == original.id));
+        assert_eq!(view.panes, vec![pane.clone()]);
+        let mut plain = presented.clone();
+        plain.archive_report = None;
+        let mut fresh = plain.clone();
+        fresh.id = crate::model::TerminalId::new();
+        fresh.proof = None;
+        fresh.terminal = None;
+        fresh.launch.session_id = None;
+        let forged_before = crate::workspace_model::views::Pane {
+            kind: crate::model::CardKind::Chat(plain),
+            ..pane.clone()
+        };
+        let desired = crate::workspace_model::views::Pane {
+            kind: crate::model::CardKind::Chat(fresh),
+            ..pane.clone()
+        };
+        let forged = Change::Update {
+            before: forged_before,
+            pane: desired,
+        };
+        assert!(
+            view.clone().apply(&forged).is_err(),
+            "actual current report identity fences a forged ordinary source basis"
+        );
+        assert!(
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: view.revision,
+                    operation: Uuid::new_v4(),
+                    change: forged
+                })
+                .is_err()
+        );
+        assert_eq!(
+            registry
+                .model()
+                .unwrap()
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .panes,
+            vec![pane.clone()]
+        );
+        let mut titled = pane.clone();
+        titled.title = "A safe presentation title".into();
+        assert!(
+            view.clone()
+                .apply(&Change::Update {
+                    before: pane.clone(),
+                    pane: titled
+                })
+                .unwrap(),
+            "presentation metadata remains editable"
+        );
+        assert_eq!(registry.agent(agent.id).unwrap(), agent);
+        assert_eq!(registry.latest_agent_run(agent.id).unwrap(), old_run);
+        assert_eq!(
+            serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap())
+                .unwrap(),
+            old_snapshot
+        );
+        assert_eq!(
+            registry
+                .archived_automation_pane_owner(&pane)
+                .unwrap()
+                .unwrap(),
+            agent
+        );
         // A real StateStore roundtrip preserves the tiny NoStart reference,
         // and the offline updater qualifies the new CardId through its exact
         // original registry receipt without a daemon or provider.
-        let database=_directory.path().join("report-window.sqlite3");
-        let store=crate::persistence::StateStore::open(&database,native.proof.as_ref().unwrap().boot_id.clone()).unwrap();
-        let mut workspace=crate::model::WorkspaceState::default();
-        workspace.cards.push(crate::model::CardState {id:new_id,generation:0,title:pane.title.clone(),width_fraction:1.0,existence:crate::model::Existence::Open,exposure:crate::model::Exposure::Offscreen,residency:crate::model::Residency::Cold,kind:pane.kind.clone()});
-        workspace.focused=Some(new_id);workspace.automation_archives.insert(new_id,agent.id);
-        if let Some(scope)=&report.presentation_scope {workspace.card_scopes.insert(new_id,scope.clone());}
-        let generations=std::collections::BTreeMap::new();
-        store.save_workspace(&workspace,crate::persistence::SnapshotBase {workspace:0,cards:&generations}).unwrap();
-        let restored=store.load_workspace(workspace.id,native.proof.as_ref()).unwrap().unwrap();
-        assert_eq!(restored.cards[0].kind,pane.kind);
-        let readiness=crate::automations::archive::inspect_completed_automation_pane(&database,&_directory.path().join("model.sqlite3"),new_id,&pane.kind).unwrap().unwrap();
-        assert!(readiness.matches(agent.id,&presented));
-        let second_operation=Uuid::new_v4();
-        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:view.revision,operation:second_operation,
-            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:pane}}).unwrap();
-        let second=registry.archive_report_source(model.identity,new_id,&presented).unwrap().unwrap();
-        assert_eq!(second.reference.source_operation,second_operation,"a second End retains its actual new presentation receipt");
-        assert_eq!(second.reference.agent,agent.id);
-        let mut reread=presented;reread.archive_report=Some(second.reference.clone());
-        assert!(crate::automations::archive::ArchivedPaneReadiness::qualify_report(&second,&reread).is_ok());
-        let view=registry.model().unwrap().views.into_iter().find(|view|view.scope==scope).unwrap();
-        assert!(view.retired.contains(&original.id)&&view.retired.contains(&new_id));
+        let database = _directory.path().join("report-window.sqlite3");
+        let store = crate::persistence::StateStore::open(
+            &database,
+            native.proof.as_ref().unwrap().boot_id.clone(),
+        )
+        .unwrap();
+        let mut workspace = crate::model::WorkspaceState::default();
+        workspace.cards.push(crate::model::CardState {
+            id: new_id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: 1.0,
+            existence: crate::model::Existence::Open,
+            exposure: crate::model::Exposure::Offscreen,
+            residency: crate::model::Residency::Cold,
+            kind: pane.kind.clone(),
+        });
+        workspace.focused = Some(new_id);
+        workspace.automation_archives.insert(new_id, agent.id);
+        if let Some(scope) = &report.presentation_scope {
+            workspace.card_scopes.insert(new_id, scope.clone());
+        }
+        let generations = std::collections::BTreeMap::new();
+        store
+            .save_workspace(
+                &workspace,
+                crate::persistence::SnapshotBase {
+                    workspace: 0,
+                    cards: &generations,
+                },
+            )
+            .unwrap();
+        let restored = store
+            .load_workspace(workspace.id, native.proof.as_ref())
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.cards[0].kind, pane.kind);
+        let readiness = crate::automations::archive::inspect_completed_automation_pane(
+            &database,
+            &_directory.path().join("model.sqlite3"),
+            new_id,
+            &pane.kind,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(readiness.matches(agent.id, &presented));
+        let second_operation = Uuid::new_v4();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: view.revision,
+                operation: second_operation,
+                change: Change::RemoveArchivedAutomationSource {
+                    registry: model.identity,
+                    repository: agent.spec.target.repository.clone(),
+                    before: pane,
+                },
+            })
+            .unwrap();
+        let second = registry
+            .archive_report_source(model.identity, new_id, &presented)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            second.reference.source_operation, second_operation,
+            "a second End retains its actual new presentation receipt"
+        );
+        assert_eq!(second.reference.agent, agent.id);
+        let mut reread = presented;
+        reread.archive_report = Some(second.reference.clone());
+        assert!(
+            crate::automations::archive::ArchivedPaneReadiness::qualify_report(&second, &reread)
+                .is_ok()
+        );
+        let view = registry
+            .model()
+            .unwrap()
+            .views
+            .into_iter()
+            .find(|view| view.scope == scope)
+            .unwrap();
+        assert!(view.retired.contains(&original.id) && view.retired.contains(&new_id));
         assert!(view.panes.is_empty());
     }
 
     #[test]
     fn one_hundred_report_presentations_share_native_bodies_and_ttl_retires_only_their_receipts() {
         use crate::workspace_model::views::Change;
-        let (mut registry,_directory,original,scope,agent)=archived_membership_fixture();
-        let model=registry.model().unwrap();
-        let operation=Uuid::new_v4();
-        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:model.views[0].revision,operation,
-            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:original.clone()}}).unwrap();
-        let Some(crate::agent_execution::HostedSession::Chat(mut session))=agent.session.clone() else{unreachable!()};session.terminal=agent.console.clone();
-        let report=registry.archive_report_source(model.identity,original.id,&session).unwrap().unwrap();
-        session.archive_report=Some(report.reference.clone());
-        let original_run=registry.latest_agent_run(agent.id).unwrap();
-        let mut panes=Vec::new();
+        let (mut registry, _directory, original, scope, agent) = archived_membership_fixture();
+        let model = registry.model().unwrap();
+        let operation = Uuid::new_v4();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: model.views[0].revision,
+                operation,
+                change: Change::RemoveArchivedAutomationSource {
+                    registry: model.identity,
+                    repository: agent.spec.target.repository.clone(),
+                    before: original.clone(),
+                },
+            })
+            .unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(mut session)) = agent.session.clone()
+        else {
+            unreachable!()
+        };
+        session.terminal = agent.console.clone();
+        let report = registry
+            .archive_report_source(model.identity, original.id, &session)
+            .unwrap()
+            .unwrap();
+        session.archive_report = Some(report.reference.clone());
+        let original_run = registry.latest_agent_run(agent.id).unwrap();
+        let mut panes = Vec::new();
         for ordinal in 0..100 {
-            let current=registry.model().unwrap();let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
-            let pane=crate::workspace_model::views::Pane {id:crate::model::CardId::new(),title:format!("Report {ordinal}"),scope:report.presentation_scope.clone(),kind:crate::model::CardKind::Chat(session.clone()),..original.clone()};
-            registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),
-                change:Change::InsertArchiveReport {registry:model.identity,repository:agent.spec.target.repository.clone(),reference:report.reference.clone(),pane:pane.clone()}}).unwrap();
+            let current = registry.model().unwrap();
+            let revision = current
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .revision;
+            let pane = crate::workspace_model::views::Pane {
+                id: crate::model::CardId::new(),
+                title: format!("Report {ordinal}"),
+                scope: report.presentation_scope.clone(),
+                kind: crate::model::CardKind::Chat(session.clone()),
+                ..original.clone()
+            };
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: revision,
+                    operation: Uuid::new_v4(),
+                    change: Change::InsertArchiveReport {
+                        registry: model.identity,
+                        repository: agent.spec.target.repository.clone(),
+                        reference: report.reference.clone(),
+                        pane: pane.clone(),
+                    },
+                })
+                .unwrap();
             panes.push(pane);
         }
-        assert_eq!(registry.model().unwrap().views.iter().find(|view|view.scope==scope).unwrap().panes.len(),100);
+        assert_eq!(
+            registry
+                .model()
+                .unwrap()
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .panes
+                .len(),
+            100
+        );
         for pane in panes {
-            let current=registry.model().unwrap();let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
-            registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),
-                change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:pane.clone()}}).unwrap();
-            let descriptor=crate::automations::ArchiveReportDescriptor::from_session(&session).unwrap();
-            let reread=registry.archive_report_source_descriptor(model.identity,pane.id,&descriptor).unwrap().unwrap();
-            assert_eq!(reread.reference.agent,agent.id);
+            let current = registry.model().unwrap();
+            let revision = current
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .revision;
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    scope: scope.clone(),
+                    expected_revision: revision,
+                    operation: Uuid::new_v4(),
+                    change: Change::RemoveArchivedAutomationSource {
+                        registry: model.identity,
+                        repository: agent.spec.target.repository.clone(),
+                        before: pane.clone(),
+                    },
+                })
+                .unwrap();
+            let descriptor =
+                crate::automations::ArchiveReportDescriptor::from_session(&session).unwrap();
+            let reread = registry
+                .archive_report_source_descriptor(model.identity, pane.id, &descriptor)
+                .unwrap()
+                .unwrap();
+            assert_eq!(reread.reference.agent, agent.id);
         }
         let (bodies,receipts,bytes):(u64,u64,u64)=registry.db.query_row("SELECT (SELECT count(*) FROM automation_report_descriptors),receipts,receipt_bytes FROM automation_report_usage WHERE key=0",[],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
-        assert_eq!(bodies,2,"one original console and one normalized read-only Chat body, independent of title/new-card/ref changes");
-        assert_eq!(receipts,101);
-        assert!(bytes<256*1024,"one hundred ordinary End receipts are tiny metadata, not copied native recipes");
-        assert_eq!(registry.latest_agent_run(agent.id).unwrap(),original_run);
-        assert_eq!(registry.agent(agent.id).unwrap(),agent);
-        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1",[agent.id.to_string()]).unwrap();
+        assert_eq!(
+            bodies, 2,
+            "one original console and one normalized read-only Chat body, independent of title/new-card/ref changes"
+        );
+        assert_eq!(receipts, 101);
+        assert!(
+            bytes < 256 * 1024,
+            "one hundred ordinary End receipts are tiny metadata, not copied native recipes"
+        );
+        assert_eq!(registry.latest_agent_run(agent.id).unwrap(), original_run);
+        assert_eq!(registry.agent(agent.id).unwrap(), agent);
+        registry
+            .db
+            .execute(
+                "DELETE FROM automation_snapshots WHERE agent=?1",
+                [agent.id.to_string()],
+            )
+            .unwrap();
         assert_eq!(registry.db.query_row("SELECT descriptors,receipts,receipt_bytes FROM automation_report_usage WHERE key=0",[],|row|Ok((row.get::<_,u64>(0)?,row.get::<_,u64>(1)?,row.get::<_,u64>(2)?))).unwrap(),(0,0,0));
-        assert_eq!(registry.latest_agent_run(agent.id).unwrap(),original_run);
-        assert_eq!(registry.agent(agent.id).unwrap(),agent);
+        assert_eq!(registry.latest_agent_run(agent.id).unwrap(), original_run);
+        assert_eq!(registry.agent(agent.id).unwrap(), agent);
     }
 
     #[test]
     fn archive_report_sources_refuse_spoofed_receipts_scope_revisions_and_expired_payloads() {
         use crate::workspace_model::views::Change;
-        let (mut registry,_directory,original,scope,agent)=archived_membership_fixture();
-        let Some(crate::agent_execution::HostedSession::Chat(mut native))=agent.session.clone() else{unreachable!()};native.terminal=agent.console.clone();
-        let model=registry.model().unwrap();
-        assert!(registry.archive_report_source(model.identity,original.id,&native).is_err(),"an archive without committed membership removal cannot provider-resume");
-        let operation=Uuid::new_v4();
-        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:model.views[0].revision,operation,
-            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:original.clone()}}).unwrap();
-        let report=registry.archive_report_source(model.identity,original.id,&native).unwrap().unwrap();
-        let mut issued=native.clone();issued.archive_report=Some(report.reference.clone());
+        let (mut registry, _directory, original, scope, agent) = archived_membership_fixture();
+        let Some(crate::agent_execution::HostedSession::Chat(mut native)) = agent.session.clone()
+        else {
+            unreachable!()
+        };
+        native.terminal = agent.console.clone();
+        let model = registry.model().unwrap();
+        assert!(
+            registry
+                .archive_report_source(model.identity, original.id, &native)
+                .is_err(),
+            "an archive without committed membership removal cannot provider-resume"
+        );
+        let operation = Uuid::new_v4();
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: model.views[0].revision,
+                operation,
+                change: Change::RemoveArchivedAutomationSource {
+                    registry: model.identity,
+                    repository: agent.spec.target.repository.clone(),
+                    before: original.clone(),
+                },
+            })
+            .unwrap();
+        let report = registry
+            .archive_report_source(model.identity, original.id, &native)
+            .unwrap()
+            .unwrap();
+        let mut issued = native.clone();
+        issued.archive_report = Some(report.reference.clone());
         for variation in 0..5 {
-            let mut reference=report.reference.clone();let mut session=issued.clone();
-            match variation {0=>reference.registry=Uuid::new_v4(),1=>reference.agent=crate::model::AgentId::new(),2=>reference.source_operation=Uuid::new_v4(),3=>session.launch.recipe.arguments.push("--different".into()),_=>session.launch.session_id=Some("other-thread".into())};
-            assert!(registry.read_archive_report(&reference,&session).is_err());
+            let mut reference = report.reference.clone();
+            let mut session = issued.clone();
+            match variation {
+                0 => reference.registry = Uuid::new_v4(),
+                1 => reference.agent = crate::model::AgentId::new(),
+                2 => reference.source_operation = Uuid::new_v4(),
+                3 => session.launch.recipe.arguments.push("--different".into()),
+                _ => session.launch.session_id = Some("other-thread".into()),
+            };
+            assert!(registry.read_archive_report(&reference, &session).is_err());
         }
-        let pane=crate::workspace_model::views::Pane {id:crate::model::CardId::new(),kind:crate::model::CardKind::Chat(issued.clone()),scope:report.presentation_scope.clone(),..original.clone()};
-        let current=registry.model().unwrap();let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
-        let mut edit=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision+1,operation:Uuid::new_v4(),change:Change::InsertArchiveReport {registry:model.identity,repository:agent.spec.target.repository.clone(),reference:report.reference.clone(),pane:pane.clone()}};
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::new(),
+            kind: crate::model::CardKind::Chat(issued.clone()),
+            scope: report.presentation_scope.clone(),
+            ..original.clone()
+        };
+        let current = registry.model().unwrap();
+        let revision = current
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
+        let mut edit = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: revision + 1,
+            operation: Uuid::new_v4(),
+            change: Change::InsertArchiveReport {
+                registry: model.identity,
+                repository: agent.spec.target.repository.clone(),
+                reference: report.reference.clone(),
+                pane: pane.clone(),
+            },
+        };
         assert!(registry.apply(&edit).unwrap_err().contains("revision"));
-        if let ModelEdit::ChangeView {expected_revision,..}=&mut edit {*expected_revision=revision;}
-        let mut spoofed=edit.clone();if let ModelEdit::ChangeView {change:Change::InsertArchiveReport {registry,..},..}=&mut spoofed {*registry=Uuid::new_v4();}
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut edit
+        {
+            *expected_revision = revision;
+        }
+        let mut spoofed = edit.clone();
+        if let ModelEdit::ChangeView {
+            change: Change::InsertArchiveReport { registry, .. },
+            ..
+        } = &mut spoofed
+        {
+            *registry = Uuid::new_v4();
+        }
         assert!(registry.apply(&spoofed).is_err());
-        let mut old_card=edit.clone();if let ModelEdit::ChangeView {change:Change::InsertArchiveReport {pane,..},..}=&mut old_card {pane.id=original.id;}
-        assert!(registry.apply(&old_card).is_err(),"permanent old identity cannot be resurrected");
-        let plain=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),change:Change::Insert {pane,before:None}};
-        assert!(registry.apply(&plain).is_err(),"ordinary Insert cannot borrow a report reference");
-        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1",[agent.id.to_string()]).unwrap();
-        assert!(registry.read_archive_report(&report.reference,&issued).is_err());
-        assert!(registry.archive_report_source(model.identity,original.id,&native).is_err(),"expiry never enables provider fallback");
+        let mut old_card = edit.clone();
+        if let ModelEdit::ChangeView {
+            change: Change::InsertArchiveReport { pane, .. },
+            ..
+        } = &mut old_card
+        {
+            pane.id = original.id;
+        }
+        assert!(
+            registry.apply(&old_card).is_err(),
+            "permanent old identity cannot be resurrected"
+        );
+        let plain = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: revision,
+            operation: Uuid::new_v4(),
+            change: Change::Insert { pane, before: None },
+        };
+        assert!(
+            registry.apply(&plain).is_err(),
+            "ordinary Insert cannot borrow a report reference"
+        );
+        registry
+            .db
+            .execute(
+                "DELETE FROM automation_snapshots WHERE agent=?1",
+                [agent.id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            registry
+                .read_archive_report(&report.reference, &issued)
+                .is_err()
+        );
+        assert!(
+            registry
+                .archive_report_source(model.identity, original.id, &native)
+                .is_err(),
+            "expiry never enables provider fallback"
+        );
         assert!(registry.is_archived_automation_session(native.id).unwrap());
     }
 
@@ -5003,71 +5468,203 @@ mod tests {
         use crate::workspace_model::views::Change;
         let (mut registry, _directory, pane, scope, agent) = archived_membership_fixture();
         let before = registry.model().unwrap();
-        let revision = before.views.iter().find(|view| view.scope == scope).unwrap().revision;
-        let snapshot = registry.archived_automation_conversation(agent.id).unwrap().snapshot;
+        let revision = before
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
+        let snapshot = registry
+            .archived_automation_conversation(agent.id)
+            .unwrap()
+            .snapshot;
         let run = registry.latest_agent_run(agent.id).unwrap();
         let operation = Uuid::new_v4();
-        let edit = ModelEdit::ChangeView { scope: scope.clone(), expected_revision: revision, operation,
-            change: Change::RemoveArchivedAutomationSource { registry: before.identity,
-                repository: agent.spec.target.repository.clone(), before: pane.clone() } };
+        let edit = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: revision,
+            operation,
+            change: Change::RemoveArchivedAutomationSource {
+                registry: before.identity,
+                repository: agent.spec.target.repository.clone(),
+                before: pane.clone(),
+            },
+        };
         let mut wrong = edit.clone();
-        if let ModelEdit::ChangeView { expected_revision, .. } = &mut wrong { *expected_revision += 1; }
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut wrong
+        {
+            *expected_revision += 1;
+        }
         assert!(registry.apply(&wrong).unwrap_err().contains("revision"));
         let mut wrong = edit.clone();
-        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { registry, .. }, .. } = &mut wrong { *registry = Uuid::new_v4(); }
+        if let ModelEdit::ChangeView {
+            change: Change::RemoveArchivedAutomationSource { registry, .. },
+            ..
+        } = &mut wrong
+        {
+            *registry = Uuid::new_v4();
+        }
         assert!(registry.apply(&wrong).is_err());
         let mut wrong = edit.clone();
-        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { repository, .. }, .. } = &mut wrong { *repository = "/foreign-workspace".into(); }
+        if let ModelEdit::ChangeView {
+            change: Change::RemoveArchivedAutomationSource { repository, .. },
+            ..
+        } = &mut wrong
+        {
+            *repository = "/foreign-workspace".into();
+        }
         assert!(registry.apply(&wrong).is_err());
         let mut wrong = edit.clone();
-        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { before, .. }, .. } = &mut wrong {
-            let crate::model::CardKind::Terminal(console) = &mut before.kind else { unreachable!() };
+        if let ModelEdit::ChangeView {
+            change: Change::RemoveArchivedAutomationSource { before, .. },
+            ..
+        } = &mut wrong
+        {
+            let crate::model::CardKind::Terminal(console) = &mut before.kind else {
+                unreachable!()
+            };
             console.launch.working_directory = "/replacement-conversation".into();
         }
         assert!(registry.apply(&wrong).is_err());
         let mut wrong = edit.clone();
-        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { before, .. }, .. } = &mut wrong {
-            let Some(crate::agent_execution::HostedSession::Chat(mut native)) = agent.session.clone() else { unreachable!() };
+        if let ModelEdit::ChangeView {
+            change: Change::RemoveArchivedAutomationSource { before, .. },
+            ..
+        } = &mut wrong
+        {
+            let Some(crate::agent_execution::HostedSession::Chat(mut native)) =
+                agent.session.clone()
+            else {
+                unreachable!()
+            };
             native.terminal = agent.console.clone();
             before.kind = crate::model::CardKind::Chat(native);
         }
-        assert!(registry.apply(&wrong).is_err(), "local read-only projection cannot replace the captured canonical wire pane");
+        assert!(
+            registry.apply(&wrong).is_err(),
+            "local read-only projection cannot replace the captured canonical wire pane"
+        );
         assert!(registry.apply(&edit).unwrap().changed);
-        assert!(!registry.apply(&edit).unwrap().changed, "exact operation replay has no new removal authority");
+        assert!(
+            !registry.apply(&edit).unwrap().changed,
+            "exact operation replay has no new removal authority"
+        );
         let after = registry.model().unwrap();
         let view = after.views.iter().find(|view| view.scope == scope).unwrap();
         assert!(view.panes.is_empty() && view.retired.contains(&pane.id));
         assert_eq!(registry.agent(agent.id).unwrap(), agent);
         assert_eq!(registry.latest_agent_run(agent.id).unwrap(), run);
-        assert_eq!(serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap().snapshot).unwrap(), serde_json::to_value(snapshot).unwrap());
+        assert_eq!(
+            serde_json::to_value(
+                registry
+                    .archived_automation_conversation(agent.id)
+                    .unwrap()
+                    .snapshot
+            )
+            .unwrap(),
+            serde_json::to_value(snapshot).unwrap()
+        );
         let mut spoofed_replay = edit;
-        if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { registry, .. }, .. } = &mut spoofed_replay { *registry = Uuid::new_v4(); }
-        assert!(registry.apply(&spoofed_replay).is_err(), "operation UUID does not bypass workspace ownership");
+        if let ModelEdit::ChangeView {
+            change: Change::RemoveArchivedAutomationSource { registry, .. },
+            ..
+        } = &mut spoofed_replay
+        {
+            *registry = Uuid::new_v4();
+        }
+        assert!(
+            registry.apply(&spoofed_replay).is_err(),
+            "operation UUID does not bypass workspace ownership"
+        );
     }
 
     #[test]
     fn archived_membership_owner_requires_closed_private_receipt_and_exact_original_pair() {
         let (mut registry, _directory, pane, _scope, agent) = archived_membership_fixture();
-        assert_eq!(registry.archived_automation_pane_owner(&pane).unwrap().unwrap(), agent);
+        assert_eq!(
+            registry
+                .archived_automation_pane_owner(&pane)
+                .unwrap()
+                .unwrap(),
+            agent
+        );
         let mut local = pane.clone();
-        let Some(crate::agent_execution::HostedSession::Chat(mut native)) = agent.session.clone() else { unreachable!() };
+        let Some(crate::agent_execution::HostedSession::Chat(mut native)) = agent.session.clone()
+        else {
+            unreachable!()
+        };
         native.terminal = agent.console.clone();
         local.kind = crate::model::CardKind::Chat(native.clone());
-        assert!(registry.archived_automation_pane_owner(&local).unwrap().is_some());
+        assert!(
+            registry
+                .archived_automation_pane_owner(&local)
+                .unwrap()
+                .is_some()
+        );
         native.terminal.as_mut().unwrap().launch.working_directory = "/invented-pair".into();
         local.kind = crate::model::CardKind::Chat(native);
         assert!(registry.archived_automation_pane_owner(&local).is_err());
-        let mut pending = pane.clone(); pending.pending_terminal_start = true;
-        assert!(registry.archived_automation_pane_owner(&pending).unwrap().is_none());
-        registry.db.execute("UPDATE agents SET closed=0 WHERE id=?1", [agent.id.to_string()]).unwrap();
-        assert!(registry.archived_automation_pane_owner(&pane).unwrap().is_none());
-        registry.db.execute("UPDATE agents SET closed=1 WHERE id=?1", [agent.id.to_string()]).unwrap();
-        let mut wrong = agent.clone(); wrong.origin = crate::agent_execution::Origin::User;
-        registry.db.execute("UPDATE agents SET record=?2 WHERE id=?1", params![agent.id.to_string(), encode(&wrong).unwrap()]).unwrap();
+        let mut pending = pane.clone();
+        pending.pending_terminal_start = true;
+        assert!(
+            registry
+                .archived_automation_pane_owner(&pending)
+                .unwrap()
+                .is_none()
+        );
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET closed=0 WHERE id=?1",
+                [agent.id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            registry
+                .archived_automation_pane_owner(&pane)
+                .unwrap()
+                .is_none()
+        );
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET closed=1 WHERE id=?1",
+                [agent.id.to_string()],
+            )
+            .unwrap();
+        let mut wrong = agent.clone();
+        wrong.origin = crate::agent_execution::Origin::User;
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![agent.id.to_string(), encode(&wrong).unwrap()],
+            )
+            .unwrap();
         assert!(registry.archived_automation_pane_owner(&pane).is_err());
-        registry.db.execute("UPDATE agents SET record=?2 WHERE id=?1", params![agent.id.to_string(), encode(&agent).unwrap()]).unwrap();
-        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1", [agent.id.to_string()]).unwrap();
-        assert!(registry.archived_automation_pane_owner(&pane).unwrap().is_none(), "missing retained report grants no new typed authority");
+        registry
+            .db
+            .execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![agent.id.to_string(), encode(&agent).unwrap()],
+            )
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "DELETE FROM automation_snapshots WHERE agent=?1",
+                [agent.id.to_string()],
+            )
+            .unwrap();
+        assert!(
+            registry
+                .archived_automation_pane_owner(&pane)
+                .unwrap()
+                .is_none(),
+            "missing retained report grants no new typed authority"
+        );
     }
 
     #[test]
@@ -5076,56 +5673,147 @@ mod tests {
         let (mut registry, _directory, original, scope, agent) = archived_membership_fixture();
         let before = registry.model().unwrap();
         let mut ended = original.clone();
-        let crate::model::CardKind::Terminal(console) = &mut ended.kind else { unreachable!() };
-        console.continuity = crate::model::TerminalContinuity::Exited {
-            last_exit: crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: 1234 },
+        let crate::model::CardKind::Terminal(console) = &mut ended.kind else {
+            unreachable!()
         };
-        registry.apply(&ModelEdit::ChangeView { scope: scope.clone(), expected_revision: before.views.iter().find(|view| view.scope == scope).unwrap().revision,
-            operation: Uuid::new_v4(), change: Change::Update { before: original, pane: ended.clone() } }).unwrap();
+        console.continuity = crate::model::TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1234,
+            },
+        };
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: before
+                    .views
+                    .iter()
+                    .find(|view| view.scope == scope)
+                    .unwrap()
+                    .revision,
+                operation: Uuid::new_v4(),
+                change: Change::Update {
+                    before: original,
+                    pane: ended.clone(),
+                },
+            })
+            .unwrap();
         let current = registry.model().unwrap();
-        let revision = current.views.iter().find(|view| view.scope == scope).unwrap().revision;
-        assert!(registry.archived_automation_pane_owner(&ended).unwrap().is_some());
-        registry.apply(&ModelEdit::ChangeView { scope: scope.clone(), expected_revision: revision,
-            operation: Uuid::new_v4(), change: Change::RemoveArchivedAutomationSource {
-                registry: current.identity, repository: agent.spec.target.repository.clone(), before: ended,
-            } }).unwrap();
+        let revision = current
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
+        assert!(
+            registry
+                .archived_automation_pane_owner(&ended)
+                .unwrap()
+                .is_some()
+        );
+        registry
+            .apply(&ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: revision,
+                operation: Uuid::new_v4(),
+                change: Change::RemoveArchivedAutomationSource {
+                    registry: current.identity,
+                    repository: agent.spec.target.repository.clone(),
+                    before: ended,
+                },
+            })
+            .unwrap();
         assert!(registry.archived_automation_conversation(agent.id).is_ok());
         assert!(registry.agent(agent.id).unwrap().closed);
-        assert!(registry.model().unwrap().views.iter().find(|view| view.scope == scope).unwrap().panes.is_empty());
+        assert!(
+            registry
+                .model()
+                .unwrap()
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .panes
+                .is_empty()
+        );
     }
 
     #[test]
     fn archived_membership_host_admits_no_worker_uuid_and_refuses_pending_native_identity() {
         let (registry, _directory, pane, scope, agent) = archived_membership_fixture();
         let model = registry.model().unwrap();
-        let revision = model.views.iter().find(|view| view.scope == scope).unwrap().revision;
+        let revision = model
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision;
         let native = agent.session.as_ref().unwrap().id();
-        let proof = match agent.session.as_ref().unwrap() { crate::agent_execution::HostedSession::Chat(source) => source.proof.clone().unwrap(), _ => unreachable!() };
+        let proof = match agent.session.as_ref().unwrap() {
+            crate::agent_execution::HostedSession::Chat(source) => source.proof.clone().unwrap(),
+            _ => unreachable!(),
+        };
         let mut host = crate::host::state::HostState::new(proof);
         host.install_model(registry);
-        let edit = ModelEdit::ChangeView { scope: scope.clone(), expected_revision: revision, operation: Uuid::new_v4(),
+        let edit = ModelEdit::ChangeView {
+            scope: scope.clone(),
+            expected_revision: revision,
+            operation: Uuid::new_v4(),
             change: crate::workspace_model::views::Change::RemoveArchivedAutomationSource {
-                registry: model.identity, repository: agent.spec.target.repository.clone(), before: pane.clone(),
-            } };
+                registry: model.identity,
+                repository: agent.spec.target.repository.clone(),
+                before: pane.clone(),
+            },
+        };
         host.reserve_spawn(native).unwrap();
-        assert!(host.edit_model(1, edit.clone()).is_err(), "an exact pending identity is not a retired worker");
+        assert!(
+            host.edit_model(1, edit.clone()).is_err(),
+            "an exact pending identity is not a retired worker"
+        );
         host.cancel_spawn(native);
-        let Some(crate::agent_execution::HostedSession::Chat(source)) = &agent.session else { unreachable!() };
-        host.native_adoption_failures.remember_upgrade(&crate::upgrade::handoff::Chat {
-            source: source.clone(), previous_sources: vec![], launch: source.launch.clone(),
-        }, "fixture retained source refused restoration");
-        assert!(host.edit_model(1, edit.clone()).is_err(),
-            "a known unadopted retained source is not an absent actor");
+        let Some(crate::agent_execution::HostedSession::Chat(source)) = &agent.session else {
+            unreachable!()
+        };
+        host.native_adoption_failures.remember_upgrade(
+            &crate::upgrade::handoff::Chat {
+                source: source.clone(),
+                previous_sources: vec![],
+                launch: source.launch.clone(),
+            },
+            "fixture retained source refused restoration",
+        );
+        assert!(
+            host.edit_model(1, edit.clone()).is_err(),
+            "a known unadopted retained source is not an absent actor"
+        );
         host.native_adoption_failures = Default::default();
-        let mut unrelated = source.clone(); unrelated.id = crate::model::TerminalId::new();
-        host.native_adoption_failures.remember_upgrade(&crate::upgrade::handoff::Chat {
-            launch: unrelated.launch.clone(), source: unrelated, previous_sources: vec![],
-        }, "unrelated retained source");
+        let mut unrelated = source.clone();
+        unrelated.id = crate::model::TerminalId::new();
+        host.native_adoption_failures.remember_upgrade(
+            &crate::upgrade::handoff::Chat {
+                launch: unrelated.launch.clone(),
+                source: unrelated,
+                previous_sources: vec![],
+            },
+            "unrelated retained source",
+        );
         assert_eq!(host.inventory_count(), 0);
         let after = host.edit_model(1, edit).unwrap();
-        assert!(!host.native_adoption_failures.is_empty(), "unrelated restoration evidence survives membership removal");
-        assert!(after.views.iter().find(|view| view.scope == scope).unwrap().panes.is_empty(),
-            "membership-only authority needs no missing/nil/borrowed execution UUID");
+        assert!(
+            !host.native_adoption_failures.is_empty(),
+            "unrelated restoration evidence survives membership removal"
+        );
+        assert!(
+            after
+                .views
+                .iter()
+                .find(|view| view.scope == scope)
+                .unwrap()
+                .panes
+                .is_empty(),
+            "membership-only authority needs no missing/nil/borrowed execution UUID"
+        );
         assert_eq!(host.inventory_count(), 0);
     }
 

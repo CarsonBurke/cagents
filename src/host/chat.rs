@@ -2185,15 +2185,20 @@ pub(super) fn process(
         ClientRequest::ChatStart { session, .. }
         | ClientRequest::ChatStartSelected { session, .. }
         | ClientRequest::ChatAttach { session }
-        | ClientRequest::ChatPreview {session,..}
-        | ClientRequest::ChatCandidates {session,..} => session.archive_report.is_some(),
+        | ClientRequest::ChatPreview { session, .. }
+        | ClientRequest::ChatCandidates { session, .. } => session.archive_report.is_some(),
         ClientRequest::ChatPrepareResume { source } => source.archive_report.is_some(),
-        ClientRequest::ChatRecoverAccount { source, replacement, .. } =>
-            source.archive_report.is_some() || replacement.archive_report.is_some(),
+        ClientRequest::ChatRecoverAccount {
+            source,
+            replacement,
+            ..
+        } => source.archive_report.is_some() || replacement.archive_report.is_some(),
         _ => false,
     };
     if report_source {
-        return Err(error("Saved automation reports are read-only and cannot start, attach, or resume a provider"));
+        return Err(error(
+            "Saved automation reports are read-only and cannot start, attach, or resume a provider",
+        ));
     }
     // Window watches are asynchronous. The persisted archive reservation is
     // authoritative even if a stale client still presents live controls.
@@ -2871,7 +2876,11 @@ pub(super) fn resolve_upgrade(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Session, ProtocolError> {
-    if source.archive_report.is_some() {return Err(error("A saved automation report has no executable upgrade owner"));}
+    if source.archive_report.is_some() {
+        return Err(error(
+            "A saved automation report has no executable upgrade owner",
+        ));
+    }
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let sources = state.upgrade_chats.get(&source.id).ok_or_else(|| {
         unavailable(
@@ -3283,28 +3292,96 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
-    fn saved_report_markers_refuse_every_session_based_provider_admission_before_process_creation() {
-        let proof=HostSessionProof {host_session_id:HostSessionId::new("report-no-start"),boot_id:BootId::new("boot"),host_incarnation:HostIncarnation::new("instance")};
-        let host=Arc::new(HostLock::new(HostState::new(proof.clone())));
-        let session=Session {id:TerminalId::new(),launch:chat::Launch {provider:Provider::Claude,recipe:LaunchRecipe {program:"/must-never-be-spawned-report".into(),arguments:vec![],working_directory:"/".into(),environment:Default::default(),unset_environment:Default::default()},session_id:Some("report-thread".into())},proof:Some(proof.clone()),terminal:None,owned_codex_listener:None,native_continuity:Default::default(),archive_report:Some(chat::ArchiveReportReference {format:999,registry:uuid::Uuid::new_v4(),agent:crate::model::AgentId::new(),source_operation:uuid::Uuid::new_v4()})};
-        let mut replacement=session.clone();replacement.archive_report=None;replacement.id=TerminalId::new();
+    fn saved_report_markers_refuse_every_session_based_provider_admission_before_process_creation()
+    {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("report-no-start"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("instance"),
+        };
+        let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
+        let session = Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "/must-never-be-spawned-report".into(),
+                    arguments: vec![],
+                    working_directory: "/".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("report-thread".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            archive_report: Some(chat::ArchiveReportReference {
+                format: 999,
+                registry: uuid::Uuid::new_v4(),
+                agent: crate::model::AgentId::new(),
+                source_operation: uuid::Uuid::new_v4(),
+            }),
+        };
+        let mut replacement = session.clone();
+        replacement.archive_report = None;
+        replacement.id = TerminalId::new();
         for request in [
-            ClientRequest::ChatStart {session:session.clone(),source:None,terminate_source:false,execution_environment:Default::default()},
-            ClientRequest::ChatStartSelected {session:session.clone(),source:proof.clone(),token:"never-issued".into()},
-            ClientRequest::ChatAttach {session:session.clone()},
-            ClientRequest::ChatPrepareResume {source:session.clone()},
-            ClientRequest::ChatPreview {session:session.clone(),source:proof.clone()},
-            ClientRequest::ChatCandidates {session:session.clone(),source:proof.clone()},
-            ClientRequest::ChatRecoverAccount {source:session.clone(),replacement,idle_generation:None,execution_environment:Default::default()},
+            ClientRequest::ChatStart {
+                session: session.clone(),
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+            ClientRequest::ChatStartSelected {
+                session: session.clone(),
+                source: proof.clone(),
+                token: "never-issued".into(),
+            },
+            ClientRequest::ChatAttach {
+                session: session.clone(),
+            },
+            ClientRequest::ChatPrepareResume {
+                source: session.clone(),
+            },
+            ClientRequest::ChatPreview {
+                session: session.clone(),
+                source: proof.clone(),
+            },
+            ClientRequest::ChatCandidates {
+                session: session.clone(),
+                source: proof.clone(),
+            },
+            ClientRequest::ChatRecoverAccount {
+                source: session.clone(),
+                replacement,
+                idle_generation: None,
+                execution_environment: Default::default(),
+            },
         ] {
-            let refused=process(&host,1,request).unwrap_err();
+            let refused = process(&host, 1, request).unwrap_err();
             assert!(!refused.retryable);
-            assert!(refused.message.contains("read-only"),"{refused:?}");
+            assert!(refused.message.contains("read-only"), "{refused:?}");
         }
-        assert!(resolve_upgrade(&host,&session).unwrap_err().message.contains("report"));
-        assert!(close_retained_native(&host,&session).unwrap_err().contains("report"));
-        let state=host.lock().unwrap_or_else(|p|p.into_inner());
-        assert!(state.chats.is_empty()&&state.chat_spawning.is_empty()&&state.spawning.is_empty()&&state.terminals.is_empty());
+        assert!(
+            resolve_upgrade(&host, &session)
+                .unwrap_err()
+                .message
+                .contains("report")
+        );
+        assert!(
+            close_retained_native(&host, &session)
+                .unwrap_err()
+                .contains("report")
+        );
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            state.chats.is_empty()
+                && state.chat_spawning.is_empty()
+                && state.spawning.is_empty()
+                && state.terminals.is_empty()
+        );
     }
 
     #[test]

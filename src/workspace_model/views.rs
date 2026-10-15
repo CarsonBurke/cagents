@@ -347,14 +347,19 @@ impl View {
                     self.panes.push(pane.clone());
                 }
             }
-            Change::InsertArchiveReport { pane, reference, .. } => {
+            Change::InsertArchiveReport {
+                pane, reference, ..
+            } => {
                 if pane.pending_terminal_start
-                    || pane.id.as_uuid()==reference.agent.as_uuid()
-                    || !matches!(&pane.kind,CardKind::Chat(session) if session.archive_report.as_ref()==Some(reference)) {
+                    || pane.id.as_uuid() == reference.agent.as_uuid()
+                    || !matches!(&pane.kind,CardKind::Chat(session) if session.archive_report.as_ref()==Some(reference))
+                {
                     return Err("The saved report presentation descriptor is invalid".into());
                 }
                 pane.validate()?;
-                if !self.retired.contains(&pane.id) && !self.panes.iter().any(|current|current.id==pane.id) {
+                if !self.retired.contains(&pane.id)
+                    && !self.panes.iter().any(|current| current.id == pane.id)
+                {
                     self.panes.push(pane.clone());
                 }
             }
@@ -368,11 +373,19 @@ impl View {
                 }
             }
             Change::Update { before, pane } => {
-                let report=|kind:&CardKind|matches!(kind,CardKind::Chat(session) if session.archive_report.is_some());
-                let current=self.panes.iter().find(|current|current.id==before.id);
-                if report(&before.kind) || report(&pane.kind) || current.is_some_and(|current|report(&current.kind)) {
-                    if !current.is_some_and(|current|current.kind==before.kind && current.kind==pane.kind) {
-                        return Err("The saved report presentation cannot become an executable descriptor".into());
+                let report = |kind: &CardKind| matches!(kind,CardKind::Chat(session) if session.archive_report.is_some());
+                let current = self.panes.iter().find(|current| current.id == before.id);
+                if report(&before.kind)
+                    || report(&pane.kind)
+                    || current.is_some_and(|current| report(&current.kind))
+                {
+                    if !current.is_some_and(|current| {
+                        current.kind == before.kind && current.kind == pane.kind
+                    }) {
+                        return Err(
+                            "The saved report presentation cannot become an executable descriptor"
+                                .into(),
+                        );
                     }
                 }
                 if before.id != pane.id {
@@ -404,14 +417,22 @@ impl View {
                 return Err("a transfer must be applied to both views atomically".into());
             }
             Change::RemoveArchivedAutomationSource { before, .. } => {
-                let current = self.panes.iter().find(|pane| pane.id == before.id)
+                let current = self
+                    .panes
+                    .iter()
+                    .find(|pane| pane.id == before.id)
                     .ok_or("workspace archived pane source conflict")?;
-                if current.kind != before.kind || current.scope != before.scope
-                    || current.pending_terminal_start || before.pending_terminal_start {
+                if current.kind != before.kind
+                    || current.scope != before.scope
+                    || current.pending_terminal_start
+                    || before.pending_terminal_start
+                {
                     return Err("workspace archived pane source conflict".into());
                 }
                 self.panes.retain(|pane| pane.id != before.id);
-                if !self.retired.contains(&before.id) { self.retired.push(before.id); }
+                if !self.retired.contains(&before.id) {
+                    self.retired.push(before.id);
+                }
             }
             Change::Remove { id } => {
                 self.panes.retain(|pane| pane.id != *id);

@@ -619,22 +619,59 @@ impl HostState {
                 ));
             }
         }
-        if let ModelEdit::ChangeView { operation, change: crate::workspace_model::views::Change::RemoveArchivedAutomationSource { before, .. } | crate::workspace_model::views::Change::InsertArchiveReport { pane:before, .. }, .. } = &edit {
-            if !self.registry()?.view_operation_seen(*operation).map_err(model_unavailable)? {
-                let owner = self.registry()?.archived_automation_pane_owner(before).map_err(model_unavailable)?
-                    .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::InvalidRequest, "The original closed automation archive is unavailable", false))?;
-                let mut ids = owner.session.iter().map(crate::agent_execution::HostedSession::id).collect::<Vec<_>>();
+        if let ModelEdit::ChangeView {
+            operation,
+            change:
+                crate::workspace_model::views::Change::RemoveArchivedAutomationSource { before, .. }
+                | crate::workspace_model::views::Change::InsertArchiveReport { pane: before, .. },
+            ..
+        } = &edit
+        {
+            if !self
+                .registry()?
+                .view_operation_seen(*operation)
+                .map_err(model_unavailable)?
+            {
+                let owner = self
+                    .registry()?
+                    .archived_automation_pane_owner(before)
+                    .map_err(model_unavailable)?
+                    .ok_or_else(|| {
+                        ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "The original closed automation archive is unavailable",
+                            false,
+                        )
+                    })?;
+                let mut ids = owner
+                    .session
+                    .iter()
+                    .map(crate::agent_execution::HostedSession::id)
+                    .collect::<Vec<_>>();
                 ids.extend(owner.console.iter().map(|console| console.id));
-                if self.execution_startups.contains_key(&owner.id) || ids.iter().any(|id| {
-                    self.terminals.contains_key(id) || self.chats.contains_key(id)
-                        || self.native_adoption_failures.contains_id(*id)
-                        || self.spawning.contains(id) || self.browser_logins_spawning.contains(id)
-                        || self.chat_spawning.contains_key(id) || self.chat_bindings.contains_key(id)
-                        || self.native_closing.contains_key(id) || self.upgrade_chats.contains_key(id)
-                        || self.chat_handoffs.contains_key(id)
-                        || self.chat_handoffs.values().any(|handoff| handoff.replacement().id == *id)
-                }) {
-                    return Err(ProtocolError::new(ProtocolErrorCode::InvalidRequest, "An actor or handoff still owns this archive identity; its shared pane was preserved", false));
+                if self.execution_startups.contains_key(&owner.id)
+                    || ids.iter().any(|id| {
+                        self.terminals.contains_key(id)
+                            || self.chats.contains_key(id)
+                            || self.native_adoption_failures.contains_id(*id)
+                            || self.spawning.contains(id)
+                            || self.browser_logins_spawning.contains(id)
+                            || self.chat_spawning.contains_key(id)
+                            || self.chat_bindings.contains_key(id)
+                            || self.native_closing.contains_key(id)
+                            || self.upgrade_chats.contains_key(id)
+                            || self.chat_handoffs.contains_key(id)
+                            || self
+                                .chat_handoffs
+                                .values()
+                                .any(|handoff| handoff.replacement().id == *id)
+                    })
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "An actor or handoff still owns this archive identity; its shared pane was preserved",
+                        false,
+                    ));
                 }
                 // This mutex spans the no-actor fence and final SQLite source
                 // transaction. This operation never closes or starts anything.

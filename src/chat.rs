@@ -506,7 +506,9 @@ impl Serialize for Session {
         state.serialize_field("terminal", &self.terminal)?;
         state.serialize_field("owned_codex_listener", &self.owned_codex_listener)?;
         state.serialize_field("native_continuity", &self.native_continuity)?;
-        if include_report { state.serialize_field("archive_report", &self.archive_report)?; }
+        if include_report {
+            state.serialize_field("archive_report", &self.archive_report)?;
+        }
         state.end()
     }
 }
@@ -534,7 +536,8 @@ pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1", "0.160.1", "0.1
 /// provider, conversation, executable, working directory, or launch options.
 /// Runtime identities and daemon-allocated listener paths may be refreshed.
 pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
-    if source.archive_report.is_some() || replacement.archive_report.is_some()
+    if source.archive_report.is_some()
+        || replacement.archive_report.is_some()
         || source.id == replacement.id
         || source.launch.session_id.is_none()
         || source.launch.session_id != replacement.launch.session_id
@@ -581,7 +584,9 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
 /// This predicate is not provenance: callers must also have resolved the exact
 /// source through ResolveUpgradeChat and attached its confirmed replacement.
 pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
-    if source.archive_report.is_some() || replacement.archive_report.is_some() {return false;}
+    if source.archive_report.is_some() || replacement.archive_report.is_some() {
+        return false;
+    }
     let Some((old, new)) = source.proof.as_ref().zip(replacement.proof.as_ref()) else {
         return false;
     };
@@ -699,7 +704,8 @@ impl Session {
     /// is before anything can be sent to it, so nothing a reader wrote can be
     /// in one that is still unstarted.
     pub fn is_unstarted(&self) -> bool {
-        self.archive_report.is_none() && self.launch.session_id.is_none()
+        self.archive_report.is_none()
+            && self.launch.session_id.is_none()
             && self.proof.is_none()
             && self.terminal.is_none()
             && self.owned_codex_listener.is_none()
@@ -741,7 +747,9 @@ impl Session {
     /// Authenticated native adoption rotates only daemon ownership. Its paired
     /// terminal has its own holder lineage and keeps the same logical recipe.
     pub fn retains_native_pair_from(&self, previous: &Self) -> bool {
-        if self.archive_report.is_some() || previous.archive_report.is_some() {return false;}
+        if self.archive_report.is_some() || previous.archive_report.is_some() {
+            return false;
+        }
         let (Some(old), Some(new)) = (&previous.terminal, &self.terminal) else {
             return false;
         };
@@ -765,7 +773,9 @@ impl Session {
     /// draft. Its next start receives a fresh identity and asks the daemon for
     /// a new listener rather than reusing the abandoned conversation's socket.
     pub fn reset_owned_codex_listener(&mut self) {
-        if self.archive_report.is_some() {return;}
+        if self.archive_report.is_some() {
+            return;
+        }
         if self.owns_codex_listener() {
             let index = self
                 .launch
@@ -787,7 +797,9 @@ impl Session {
     /// before it launches anything; that resolution is the one change the
     /// launch undergoes, and the rest of the recipe is exactly as asked.
     pub fn resolved_to_owned_codex_listener(&self, started: &Self) -> bool {
-        if self.archive_report.is_some() || started.archive_report.is_some() {return false;}
+        if self.archive_report.is_some() || started.archive_report.is_some() {
+            return false;
+        }
         if self.launch.session_id.is_some()
             || self.terminal.is_some()
             || started.id != self.id
@@ -2113,33 +2125,94 @@ mod tests {
     #[test]
     fn saved_report_reference_preserves_legacy_json_and_explicit_binary_option_slots() {
         use super::*;
-        let mut session=Session {
-            id:crate::model::TerminalId::new(),
-            launch:Launch {provider:Provider::Claude,recipe:LaunchRecipe {program:"claude".into(),arguments:vec![],working_directory:"/report".into(),environment:Default::default(),unset_environment:Default::default()},session_id:Some("thread".into())},
-            proof:None,terminal:None,owned_codex_listener:None,native_continuity:Default::default(),archive_report:None,
+        let mut session = Session {
+            id: crate::model::TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Claude,
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec![],
+                    working_directory: "/report".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("thread".into()),
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+            archive_report: None,
         };
         #[derive(Serialize)]
         struct Legacy<'a> {
-            id:&'a crate::model::TerminalId,launch:&'a Launch,proof:&'a Option<crate::model::HostSessionProof>,terminal:&'a Option<crate::model::TerminalSession>,owned_codex_listener:&'a Option<OwnedCodexListener>,native_continuity:&'a NativeContinuity,
+            id: &'a crate::model::TerminalId,
+            launch: &'a Launch,
+            proof: &'a Option<crate::model::HostSessionProof>,
+            terminal: &'a Option<crate::model::TerminalSession>,
+            owned_codex_listener: &'a Option<OwnedCodexListener>,
+            native_continuity: &'a NativeContinuity,
         }
-        let legacy=serde_json::to_vec(&Legacy {id:&session.id,launch:&session.launch,proof:&session.proof,terminal:&session.terminal,owned_codex_listener:&session.owned_codex_listener,native_continuity:&session.native_continuity}).unwrap();
-        assert_eq!(serde_json::to_vec(&session).unwrap(),legacy,"ordinary source digests retain their original bytes and field order");
-        assert_eq!(serde_json::from_slice::<Session>(&legacy).unwrap(),session);
-        for reference in [None,Some(ArchiveReportReference {format:1,registry:uuid::Uuid::new_v4(),agent:crate::model::AgentId::new(),source_operation:uuid::Uuid::new_v4()})] {
-            session.archive_report=reference;
-            let bytes=postcard::to_stdvec(&session).unwrap();
-            assert_eq!(postcard::from_bytes::<Session>(&bytes).unwrap(),session);
-            assert_eq!(serde_json::from_slice::<Session>(&serde_json::to_vec(&session).unwrap()).unwrap(),session);
+        let legacy = serde_json::to_vec(&Legacy {
+            id: &session.id,
+            launch: &session.launch,
+            proof: &session.proof,
+            terminal: &session.terminal,
+            owned_codex_listener: &session.owned_codex_listener,
+            native_continuity: &session.native_continuity,
+        })
+        .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&session).unwrap(),
+            legacy,
+            "ordinary source digests retain their original bytes and field order"
+        );
+        assert_eq!(serde_json::from_slice::<Session>(&legacy).unwrap(), session);
+        for reference in [
+            None,
+            Some(ArchiveReportReference {
+                format: 1,
+                registry: uuid::Uuid::new_v4(),
+                agent: crate::model::AgentId::new(),
+                source_operation: uuid::Uuid::new_v4(),
+            }),
+        ] {
+            session.archive_report = reference;
+            let bytes = postcard::to_stdvec(&session).unwrap();
+            assert_eq!(postcard::from_bytes::<Session>(&bytes).unwrap(), session);
+            assert_eq!(
+                serde_json::from_slice::<Session>(&serde_json::to_vec(&session).unwrap()).unwrap(),
+                session
+            );
         }
-        session.proof=None;session.terminal=None;session.launch.session_id=None;
-        assert!(!session.is_unstarted(),"a report pointer never becomes an executable draft");
-        session.launch.session_id=Some("thread".into());
-        session.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(),"/account-a".into());
-        let mut replacement=session.clone();replacement.archive_report=None;replacement.id=crate::model::TerminalId::new();
-        replacement.launch.recipe.environment.insert("CLAUDE_CONFIG_DIR".into(),"/account-b".into());
-        assert!(!is_account_recovery(&session,&replacement));
-        let mut ordinary=session.clone();ordinary.archive_report=None;
-        assert!(is_account_recovery(&ordinary,&replacement),"the report guard, not an unrelated recipe failure, denies recovery");
+        session.proof = None;
+        session.terminal = None;
+        session.launch.session_id = None;
+        assert!(
+            !session.is_unstarted(),
+            "a report pointer never becomes an executable draft"
+        );
+        session.launch.session_id = Some("thread".into());
+        session
+            .launch
+            .recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/account-a".into());
+        let mut replacement = session.clone();
+        replacement.archive_report = None;
+        replacement.id = crate::model::TerminalId::new();
+        replacement
+            .launch
+            .recipe
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/account-b".into());
+        assert!(!is_account_recovery(&session, &replacement));
+        let mut ordinary = session.clone();
+        ordinary.archive_report = None;
+        assert!(
+            is_account_recovery(&ordinary, &replacement),
+            "the report guard, not an unrelated recipe failure, denies recovery"
+        );
     }
 
     #[test]

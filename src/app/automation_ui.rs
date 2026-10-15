@@ -156,14 +156,33 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                let canonical=CardId::from_uuid(agent.id.as_uuid());
-                if archived && (self.card_state(canonical).is_some_and(|card|!card.existence.is_open())
-                    || self.workspace_model.views.iter().any(|view|view.retired.contains(&canonical))) {
-                    let Some(crate::agent_execution::HostedSession::Chat(mut session))=agent.session.clone() else{return Task::none();};
-                    session.terminal=agent.console.clone().or(session.terminal);
+                let canonical = CardId::from_uuid(agent.id.as_uuid());
+                if archived
+                    && (self
+                        .card_state(canonical)
+                        .is_some_and(|card| !card.existence.is_open())
+                        || self
+                            .workspace_model
+                            .views
+                            .iter()
+                            .any(|view| view.retired.contains(&canonical)))
+                {
+                    let Some(crate::agent_execution::HostedSession::Chat(mut session)) =
+                        agent.session.clone()
+                    else {
+                        return Task::none();
+                    };
+                    session.terminal = agent.console.clone().or(session.terminal);
                     return self.resume_saved_conversation(crate::persistence::SavedConversation {
-                        card:canonical,title:format!("{} · Saved result",detail.definition.name),session,
-                        open:false,updated_at_unix_ms:detail.firing.finished_ms.unwrap_or(detail.firing.created_ms) as i64,
+                        card: canonical,
+                        title: format!("{} · Saved result", detail.definition.name),
+                        session,
+                        open: false,
+                        updated_at_unix_ms: detail
+                            .firing
+                            .finished_ms
+                            .unwrap_or(detail.firing.created_ms)
+                            as i64,
                     });
                 }
                 if self

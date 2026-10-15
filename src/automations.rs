@@ -164,12 +164,16 @@ pub enum Response {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveReportDescriptor {
     pub id: crate::model::TerminalId,
-    pub digest: [u8;32],
+    pub digest: [u8; 32],
     pub reference: Option<crate::chat::ArchiveReportReference>,
 }
 impl ArchiveReportDescriptor {
-    pub fn from_session(session:&crate::chat::Session)->Result<Self,String> {
-        Ok(Self {id:session.id,digest:ArchiveReport::session_digest(session)?,reference:session.archive_report.clone()})
+    pub fn from_session(session: &crate::chat::Session) -> Result<Self, String> {
+        Ok(Self {
+            id: session.id,
+            digest: ArchiveReport::session_digest(session)?,
+            reference: session.archive_report.clone(),
+        })
     }
 }
 
@@ -184,13 +188,13 @@ pub struct ArchiveReport {
     pub presentation_scope: Option<std::path::PathBuf>,
     /// Binds the exact requested presentation without duplicating a potentially
     /// large native recipe beside the original Agent in every response.
-    pub session_digest: [u8;32],
+    pub session_digest: [u8; 32],
     pub archive: ArchivedConversation,
 }
 impl ArchiveReport {
-    pub fn session_digest(session:&crate::chat::Session)->Result<[u8;32],String>{
-        use sha2::{Digest,Sha256};
-        let encoded=serde_json::to_vec(session).map_err(|error|error.to_string())?;
+    pub fn session_digest(session: &crate::chat::Session) -> Result<[u8; 32], String> {
+        use sha2::{Digest, Sha256};
+        let encoded = serde_json::to_vec(session).map_err(|error| error.to_string())?;
         Ok(Sha256::digest(encoded).into())
     }
 }

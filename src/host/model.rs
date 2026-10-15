@@ -26,8 +26,8 @@ use crate::{
 
 mod automation_archive_clock;
 mod automation_membership;
-mod automation_reports;
 mod automation_proposals;
+mod automation_reports;
 mod automations;
 pub(super) use automations::Claimed;
 mod execution;
@@ -40,12 +40,18 @@ mod views;
 pub(super) const SCHEMA_VERSION: u32 = 15;
 
 /// Read-only source inspection entry point. Does not open/migrate a Registry.
-pub(crate) fn inspect_archive_report_in(db:&Connection,reference:&crate::chat::ArchiveReportReference,session:&crate::chat::Session)->Result<crate::automations::ArchiveReport,String>{
-    let version:u32=db.pragma_query_value(None,"user_version",|row|row.get(0)).map_err(|_|"The report registry version is unreadable")?;
+pub(crate) fn inspect_archive_report_in(
+    db: &Connection,
+    reference: &crate::chat::ArchiveReportReference,
+    session: &crate::chat::Session,
+) -> Result<crate::automations::ArchiveReport, String> {
+    let version: u32 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(|_| "The report registry version is unreadable")?;
     if !(15..=SCHEMA_VERSION).contains(&version) {
         return Err("The report registry has no supported presentation authority".into());
     }
-    automation_reports::report_in(db,reference,session)
+    automation_reports::report_in(db, reference, session)
 }
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes

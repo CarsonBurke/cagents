@@ -160,7 +160,10 @@ pub enum Action {
         Target,
         Arc<Result<crate::automations::ArchivedConversation, String>>,
     ),
-    ArchiveReport(Target, Arc<Result<crate::automations::ArchiveReport,String>>),
+    ArchiveReport(
+        Target,
+        Arc<Result<crate::automations::ArchiveReport, String>>,
+    ),
     ArchiveAgents(
         u64,
         Arc<Result<crate::automations::ArchiveAgentPage, String>>,
@@ -3030,7 +3033,9 @@ fn live_codex_source(chat: TerminalId) -> Result<Option<TerminalSession>, String
 /// daemon's own return would start it. Before a conversation has an identity,
 /// open the selected provider's interactive CLI with its account and policy.
 fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> {
-    if session.archive_report.is_some() {return Err("Saved automation reports cannot resume a provider in a terminal".into());}
+    if session.archive_report.is_some() {
+        return Err("Saved automation reports cannot resume a provider in a terminal".into());
+    }
     if session.launch.session_id.is_none() {
         let mut fresh = session.clone();
         fresh.reset_owned_codex_listener();
@@ -4487,20 +4492,29 @@ impl Cagents {
         ephemeral: bool,
         draft_from: Option<CardId>,
     ) -> Task<Message> {
-        self.insert_chat_card_at(CardId::new(),session,beside,ephemeral,draft_from)
+        self.insert_chat_card_at(CardId::new(), session, beside, ephemeral, draft_from)
     }
 
-    pub(super) fn new_archive_report_card(&mut self,session:chat::Session)->Option<(CardId,Task<Message>)> {
-        if session.archive_report.is_none() {return None;}
-        let card=CardId::new();
-        let task=self.insert_chat_card_at(card,session,None,false,None);
-        Some((card,task))
+    pub(super) fn new_archive_report_card(
+        &mut self,
+        session: chat::Session,
+    ) -> Option<(CardId, Task<Message>)> {
+        if session.archive_report.is_none() {
+            return None;
+        }
+        let card = CardId::new();
+        let task = self.insert_chat_card_at(card, session, None, false, None);
+        Some((card, task))
     }
 
     fn insert_chat_card_at(
-        &mut self, card_id:CardId, session:chat::Session, beside:Option<CardId>,
-        ephemeral:bool, draft_from:Option<CardId>,
-    )->Task<Message> {
+        &mut self,
+        card_id: CardId,
+        session: chat::Session,
+        beside: Option<CardId>,
+        ephemeral: bool,
+        draft_from: Option<CardId>,
+    ) -> Task<Message> {
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
             let durable = self
@@ -4608,16 +4622,27 @@ impl Cagents {
         card: CardId,
     ) -> Option<crate::workspace_model::views::Pane> {
         let agent = self.durable.automation_archives.get(&card)?;
-        if let Some(CardKind::Chat(session))=self.card_state(card).map(|state|&state.kind)
-            && let Some(reference)=session.archive_report.as_ref() {
-            if reference.registry!=self.workspace_model.identity || reference.agent!=*agent
-                || !reference.is_supported() || !self.card_state(card)?.existence.is_open() {
+        if let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind)
+            && let Some(reference) = session.archive_report.as_ref()
+        {
+            if reference.registry != self.workspace_model.identity
+                || reference.agent != *agent
+                || !reference.is_supported()
+                || !self.card_state(card)?.existence.is_open()
+            {
                 return None;
             }
-            let mut owners=self.workspace_model.views.iter().flat_map(|view|&view.panes).filter(|pane|pane.id==card);
-            let pane=owners.next()?;
-            return (owners.next().is_none() && !pane.pending_terminal_start
-                && pane.kind==CardKind::Chat(session.clone())).then(||pane.clone());
+            let mut owners = self
+                .workspace_model
+                .views
+                .iter()
+                .flat_map(|view| &view.panes)
+                .filter(|pane| pane.id == card);
+            let pane = owners.next()?;
+            return (owners.next().is_none()
+                && !pane.pending_terminal_start
+                && pane.kind == CardKind::Chat(session.clone()))
+            .then(|| pane.clone());
         }
         if agent.as_uuid() != card.as_uuid() {
             return None;
@@ -4879,12 +4904,26 @@ impl Cagents {
     pub(super) fn qualify_startup_automation_archives(&mut self) -> Task<Message> {
         // The descriptor itself is a permanent no-start fence, including cold
         // hidden panes whose old canonical map was retired before shutdown.
-        let reports=self.durable.cards.iter().filter_map(|card| {
-            if !card.existence.is_open() {return None;}
-            let CardKind::Chat(session)=&card.kind else{return None;};
-            session.archive_report.as_ref().map(|reference|(card.id,reference.agent))
-        }).collect::<Vec<_>>();
-        Arc::make_mut(&mut self.durable).automation_archives.extend(reports);
+        let reports = self
+            .durable
+            .cards
+            .iter()
+            .filter_map(|card| {
+                if !card.existence.is_open() {
+                    return None;
+                }
+                let CardKind::Chat(session) = &card.kind else {
+                    return None;
+                };
+                session
+                    .archive_report
+                    .as_ref()
+                    .map(|reference| (card.id, reference.agent))
+            })
+            .collect::<Vec<_>>();
+        Arc::make_mut(&mut self.durable)
+            .automation_archives
+            .extend(reports);
 
         // Do not fan a large saved workspace out into one blocking IPC thread
         // and retained archive payload per pane. The startup tick fills four
@@ -4969,26 +5008,32 @@ impl Cagents {
     }
 
     fn complete_automation_archive_read(
-        &mut self, target: Target,
-        result: &Result<crate::automations::ArchivedConversation,String>,
+        &mut self,
+        target: Target,
+        result: &Result<crate::automations::ArchivedConversation, String>,
         report: Option<&crate::automations::ArchiveReport>,
     ) -> Task<Message> {
-        let qualify = |agent: crate::model::AgentId, session: &chat::Session, archive: &crate::automations::ArchivedConversation| {
+        let qualify = |agent: crate::model::AgentId,
+                       session: &chat::Session,
+                       archive: &crate::automations::ArchivedConversation| {
             match report {
-                Some(report) if &report.archive==archive && report.reference.agent==agent =>
-                    crate::automations::archive::ArchivedPaneReadiness::qualify_report(report,session),
+                Some(report) if &report.archive == archive && report.reference.agent == agent => {
+                    crate::automations::archive::ArchivedPaneReadiness::qualify_report(
+                        report, session,
+                    )
+                }
                 Some(_) => Err("The report body changed during presentation qualification".into()),
-                None => crate::automations::archive::ArchivedPaneReadiness::qualify(agent,session,archive),
+                None => crate::automations::archive::ArchivedPaneReadiness::qualify(
+                    agent, session, archive,
+                ),
             }
         };
         if self.chat_ui.abandoned.remove(&target).is_some() {
             return Task::none();
         }
-        let Some(Phase::ReadingArchive { session, .. }) =
-            self.chat_ui.finish(target, |phase| {
-                matches!(phase, Phase::ReadingArchive { .. })
-            })
-        else {
+        let Some(Phase::ReadingArchive { session, .. }) = self.chat_ui.finish(target, |phase| {
+            matches!(phase, Phase::ReadingArchive { .. })
+        }) else {
             return Task::none();
         };
         if self
@@ -4997,8 +5042,7 @@ impl Cagents {
         {
             return Task::none();
         }
-        let Some(CardKind::Chat(current)) =
-            self.card_state(target.card).map(|state| &state.kind)
+        let Some(CardKind::Chat(current)) = self.card_state(target.card).map(|state| &state.kind)
         else {
             return Task::none();
         };
@@ -5025,18 +5069,8 @@ impl Cagents {
             let Ok(archive) = result.as_ref() else {
                 return Task::none();
             };
-            if qualify(
-                archive.agent.id,
-                &session,
-                archive,
-            )
-            .is_err()
-                || qualify(
-                    archive.agent.id,
-                    current,
-                    archive,
-                )
-                .is_err()
+            if qualify(archive.agent.id, &session, archive).is_err()
+                || qualify(archive.agent.id, current, archive).is_err()
             {
                 return Task::none();
             }
@@ -5056,20 +5090,15 @@ impl Cagents {
                         ))
                     }) =>
             {
-                let receipt =
-                    match qualify(
-                        archive.agent.id,
-                        &session,
-                        archive,
-                    ) {
-                        Ok(receipt) => receipt,
-                        Err(error) => {
-                            self.fail_runtime(target.card, error);
-                            return Task::none();
-                        }
-                    };
-                let visible = self.workspace.visibility(target.card)
-                    == Some(VisibilityClass::Visible);
+                let receipt = match qualify(archive.agent.id, &session, archive) {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        self.fail_runtime(target.card, error);
+                        return Task::none();
+                    }
+                };
+                let visible =
+                    self.workspace.visibility(target.card) == Some(VisibilityClass::Visible);
                 if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                     runtime.target = target;
                     runtime.session = session.clone();
@@ -5132,18 +5161,36 @@ impl Cagents {
                 session: session.clone(),
             },
         );
-        if let Some(reference)=session.archive_report.clone() {
+        if let Some(reference) = session.archive_report.clone() {
             return cosmic::task::future(async move {
-                let result=tokio::task::spawn_blocking(move|| {
-                    let socket=crate::terminal::ipc::daemon_socket_path().map_err(|error|error.to_string())?;
-                    let mut client=crate::control::ControlClient::connect(&socket).map_err(|error|error.to_string())?;
-                    match client.automation(crate::agent_execution::Authority::default(),
-                        crate::automations::Request::ReadArchiveReport {reference,descriptor:crate::automations::ArchiveReportDescriptor::from_session(&session)?}).map_err(|error|error.to_string())? {
-                        crate::automations::Response::ArchiveReport(report)=>Ok(*report),
-                        _=>Err("The saved report returned no private presentation receipt".into()),
+                let result = tokio::task::spawn_blocking(move || {
+                    let socket = crate::terminal::ipc::daemon_socket_path()
+                        .map_err(|error| error.to_string())?;
+                    let mut client = crate::control::ControlClient::connect(&socket)
+                        .map_err(|error| error.to_string())?;
+                    match client
+                        .automation(
+                            crate::agent_execution::Authority::default(),
+                            crate::automations::Request::ReadArchiveReport {
+                                reference,
+                                descriptor:
+                                    crate::automations::ArchiveReportDescriptor::from_session(
+                                        &session,
+                                    )?,
+                            },
+                        )
+                        .map_err(|error| error.to_string())?
+                    {
+                        crate::automations::Response::ArchiveReport(report) => Ok(*report),
+                        _ => {
+                            Err("The saved report returned no private presentation receipt".into())
+                        }
                     }
-                }).await.map_err(|error|error.to_string()).and_then(|result|result);
-                Message::ChatUi(Action::ArchiveReport(target,Arc::new(result)))
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+                Message::ChatUi(Action::ArchiveReport(target, Arc::new(result)))
             });
         }
         cosmic::task::future(async move {
@@ -5188,8 +5235,10 @@ impl Cagents {
         session: chat::Session,
         intent: chat::Intent,
     ) -> Task<Message> {
-        if let Some(reference)=session.archive_report.as_ref() {
-            Arc::make_mut(&mut self.durable).automation_archives.insert(card,reference.agent);
+        if let Some(reference) = session.archive_report.as_ref() {
+            Arc::make_mut(&mut self.durable)
+                .automation_archives
+                .insert(card, reference.agent);
         }
         if let Some(agent) = self.durable.automation_archives.get(&card).copied() {
             self.lifecycle.remove(card);
@@ -5365,8 +5414,11 @@ impl Cagents {
         self.chat_ui.removed_accounts.remove(&card);
     }
     #[cfg(test)]
-    pub(in crate::app) fn pending_archive_read_for_test(&self,card:CardId)->Option<Target> {
-        match self.chat_ui.phases.get(&card) {Some(Phase::ReadingArchive {target,..})=>Some(*target),_=>None}
+    pub(in crate::app) fn pending_archive_read_for_test(&self, card: CardId) -> Option<Target> {
+        match self.chat_ui.phases.get(&card) {
+            Some(Phase::ReadingArchive { target, .. }) => Some(*target),
+            _ => None,
+        }
     }
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
         self.chat_ui.phases.contains_key(&card)
@@ -5382,7 +5434,8 @@ impl Cagents {
     /// its runtime instead.
     pub(super) fn chat_offers_fresh_conversation(&self, card: CardId) -> bool {
         if self.durable.automation_archives.contains_key(&card)
-            || matches!(self.card_state(card).map(|state|&state.kind),Some(CardKind::Chat(session)) if session.archive_report.is_some()) {
+            || matches!(self.card_state(card).map(|state|&state.kind),Some(CardKind::Chat(session)) if session.archive_report.is_some())
+        {
             return false;
         }
         if self.chat_start_pending(card) {
@@ -5460,7 +5513,8 @@ impl Cagents {
     /// The control and its handler share the reason a handoff cannot start.
     pub(super) fn chat_switch_blocker(&self, card: CardId) -> Option<Cow<'static, str>> {
         if self.durable.automation_archives.contains_key(&card)
-            || matches!(self.card_state(card).map(|state|&state.kind),Some(CardKind::Chat(session)) if session.archive_report.is_some()) {
+            || matches!(self.card_state(card).map(|state|&state.kind),Some(CardKind::Chat(session)) if session.archive_report.is_some())
+        {
             return Some(Cow::Borrowed(
                 "This completed scheduled conversation is a saved read-only view.",
             ));
@@ -5877,7 +5931,8 @@ impl Cagents {
     ) -> Task<Message> {
         // Every start route, including reconnect and late callbacks, must
         // respect the durable archive identity before touching a provider.
-        if session.archive_report.is_some() || self.durable.automation_archives.contains_key(&card) {
+        if session.archive_report.is_some() || self.durable.automation_archives.contains_key(&card)
+        {
             return self.open_chat(card, session, intent);
         }
         let selection = None;
@@ -6786,11 +6841,19 @@ impl Cagents {
                 return self.startup_archive_probe_received(card, generation, result);
             }
             Action::Archived(target, result) => {
-                return self.complete_automation_archive_read(target,result.as_ref(),None);
+                return self.complete_automation_archive_read(target, result.as_ref(), None);
             }
-            Action::ArchiveReport(target,result) => {
-                let archive=result.as_ref().as_ref().map(|report|report.archive.clone()).map_err(Clone::clone);
-                return self.complete_automation_archive_read(target,&archive,result.as_ref().as_ref().ok());
+            Action::ArchiveReport(target, result) => {
+                let archive = result
+                    .as_ref()
+                    .as_ref()
+                    .map(|report| report.archive.clone())
+                    .map_err(Clone::clone);
+                return self.complete_automation_archive_read(
+                    target,
+                    &archive,
+                    result.as_ref().as_ref().ok(),
+                );
             }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
@@ -9236,7 +9299,10 @@ pub(super) fn show_chat_snapshot_for_test(
 
 #[cfg(test)]
 pub(in crate::app) fn qualified_closed_console_archive_for_test() -> (
-    Cagents, CardId, crate::model::AgentId, Arc<crate::automations::ArchivedConversation>,
+    Cagents,
+    CardId,
+    crate::model::AgentId,
+    Arc<crate::automations::ArchivedConversation>,
 ) {
     tests::qualified_closed_console_archive()
 }
@@ -17751,7 +17817,10 @@ mod tests {
         app.workspace.resize_viewport(1600.0);
         let (card, target) = starting_chat(&mut app);
         app.workspace.resize_viewport(1600.0);
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
         Arc::make_mut(&mut app.durable)
             .automation_archives
@@ -17809,7 +17878,10 @@ mod tests {
         app.workspace.resize_viewport(1600.0);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         app.workspace.resize_viewport(1600.0);
-        assert_eq!(app.workspace.visibility(card), Some(VisibilityClass::Visible));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
         Arc::make_mut(&mut app.durable)
             .automation_archives
             .insert(card, crate::model::AgentId::new());
@@ -17869,7 +17941,10 @@ mod tests {
     /// Source-only shared fixture: all asynchronous tasks are dropped. The private
     /// completion passes through the actual archive qualifier; no daemon/provider runs.
     pub(super) fn qualified_closed_console_archive() -> (
-        Cagents, CardId, crate::model::AgentId, Arc<crate::automations::ArchivedConversation>,
+        Cagents,
+        CardId,
+        crate::model::AgentId,
+        Arc<crate::automations::ArchivedConversation>,
     ) {
         use crate::agent_execution::{
             Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
@@ -17938,31 +18013,49 @@ mod tests {
         if let CardKind::Terminal(current) = &mut app.card_state_mut(card).unwrap().kind {
             current.continuity = crate::model::TerminalContinuity::Exited {
                 last_exit: crate::model::TerminalExit {
-                    code: Some(0), signal: None, occurred_at_unix_ms: 2,
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 2,
                 },
             };
         }
         let directory = console.launch.working_directory.clone();
         app.active_workspace = Some(directory.clone());
         app.known_worktree_roots.insert(directory.clone());
-        Arc::make_mut(&mut app.durable).card_scopes.insert(card, directory.clone());
-        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(
-            crate::model::ProjectId::new(), crate::repository::RepositoryId::new(),
-            "Archive project".into(), directory.clone(), vec![], vec![],
-        ));
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(card, directory.clone());
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                crate::model::ProjectId::new(),
+                crate::repository::RepositoryId::new(),
+                "Archive project".into(),
+                directory.clone(),
+                vec![],
+                vec![],
+            ));
         let scope = crate::workspace_model::views::Scope::Worktree {
-            repository: directory.clone(), path: directory.clone(),
+            repository: directory.clone(),
+            path: directory.clone(),
         };
         let canonical = crate::workspace_model::views::Pane::from_card(
-            app.card_state(card).unwrap(), Some(directory.clone()),
-        ).unwrap();
+            app.card_state(card).unwrap(),
+            Some(directory.clone()),
+        )
+        .unwrap();
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
-            repository: directory.clone(), name: "Archive project".into(),
-            kind: Default::default(), ordinal: 1,
+            repository: directory.clone(),
+            name: "Archive project".into(),
+            kind: Default::default(),
+            ordinal: 1,
         }];
         app.workspace_model.views = vec![crate::workspace_model::views::View {
-            scope, revision: 1, panes: vec![canonical.clone()], retired: vec![],
+            scope,
+            revision: 1,
+            panes: vec![canonical.clone()],
+            retired: vec![],
         }];
         app.workspace_model.archived_automation_agents = vec![agent.clone()];
         assert!(app.prepare_automation_archive(card, &agent));
@@ -17971,19 +18064,26 @@ mod tests {
             panic!("archive presentation is a native conversation");
         };
         let target = app.chat_ui.next_target(card);
-        app.chat_ui.phases.insert(card, Phase::ReadingArchive {
-            target, session: requested,
-        });
+        app.chat_ui.phases.insert(
+            card,
+            Phase::ReadingArchive {
+                target,
+                session: requested,
+            },
+        );
         let archive = Arc::new(crate::automations::ArchivedConversation {
             agent,
             snapshot: Snapshot {
-                generation: 7, session_id: Some("confirmed-console-archive".into()),
+                generation: 7,
+                session_id: Some("confirmed-console-archive".into()),
                 exited: true,
                 read_only_reason: Some("Completed scheduled conversation".into()),
                 items: vec![Arc::new(chat::Item {
-                    id: "closed-automation-report".into(), role: chat::Role::Assistant,
+                    id: "closed-automation-report".into(),
+                    role: chat::Role::Assistant,
                     content: text("The saved automation result remains unchanged."),
-                    at: None, started_at: None,
+                    at: None,
+                    started_at: None,
                 })],
                 ..Default::default()
             },
