@@ -89,6 +89,7 @@ const BELL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 enum Command {
+    Interrupt(Option<KeyInput>),
     OrderedInput { generation: u64, input: Box<Command> },
     Input(Vec<u8>),
     Paste(String, PasteOrigin),
@@ -380,6 +381,7 @@ struct PublishedState {
     shutdown_requested: AtomicBool,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
+    priority_close: Mutex<Option<Command>>,
     shutdown_pidfd: OnceLock<File>,
     /// Final result ownership survives emulator teardown and daemon crashes.
     retained_holder: Mutex<Option<holder::Holder>>,
@@ -427,6 +429,7 @@ impl PublishedState {
             shutdown_requested: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
+            priority_close: Mutex::new(None),
             shutdown_pidfd: OnceLock::new(),
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
@@ -1004,8 +1007,7 @@ impl TerminalHandle {
     pub fn input(&self, bytes: impl Into<Vec<u8>>) -> Result<(), TerminalSendError> {
         let bytes = bytes.into();
         if bytes == [3] {
-            self.inner.published.request_interrupt(None);
-            return Ok(());
+            return self.try_command(Command::Interrupt(None));
         }
         self.try_command(Command::Input(bytes))
     }
@@ -1021,8 +1023,7 @@ impl TerminalHandle {
     pub fn key(&self, key: KeyInput) -> Result<(), TerminalSendError> {
         if key.action != KeyAction::Release && is_interrupt_key(&key)
         {
-            self.inner.published.request_interrupt(Some(key));
-            return Ok(());
+            return self.try_command(Command::Interrupt(Some(key)));
         }
         self.try_command(Command::Key(key))
     }
@@ -1405,6 +1406,21 @@ impl TerminalHandle {
         }
         if matches!(*phase, ArchivePhase::Released) {
             return Err(TerminalSendError::Closed);
+        }
+        if matches!(command, Command::Interrupt(_) | Command::CloseChecked { .. }) {
+            let finished = self.inner.worker.try_lock().ok().is_some_and(|worker| worker.as_ref().is_some_and(JoinHandle::is_finished));
+            if finished || published.completed.load(Ordering::Acquire) { return Err(TerminalSendError::Closed); }
+        }
+        if let Command::Interrupt(key) = command {
+            published.request_interrupt(key);
+            return Ok(());
+        }
+        if matches!(command, Command::CloseChecked { .. }) {
+            let mut priority = published.priority_close.lock().unwrap_or_else(|p| p.into_inner());
+            if priority.is_some() { return Err(TerminalSendError::Full); }
+            *priority = Some(command);
+            let _ = published.capture_tx.try_send(());
+            return Ok(());
         }
         // Serialize input admission with the priority cancellation boundary.
         // Commands submitted after Ctrl+C must survive its queue drain.
@@ -1924,6 +1940,11 @@ impl Worker {
                 let boundary = self.interrupt_input();
                 if carried_command.as_ref().is_some_and(|command| is_cancelable_input_before(command, boundary)) { carried_command = None; }
             }
+            let close = self.published.priority_close.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if let Some(close) = close && self.handle_command(close) {
+                shutting_down = true;
+                break;
+            }
             self.flush_pty_input();
             self.publish_bell();
             // Output or a busy input queue must not keep resetting discovery's
@@ -2238,6 +2259,7 @@ impl Worker {
     fn handle_command(&mut self, command: Command) -> bool {
         match command {
             Command::OrderedInput { input, .. } => return self.handle_command(*input),
+            Command::Interrupt(key) => { self.published.request_interrupt(key); },
             Command::ReadViewport {
                 offset,
                 rows,
@@ -5930,15 +5952,63 @@ mod tests {
     }
 
     #[test]
+    fn checked_close_bypasses_a_saturated_input_inbox() {
+        let (commands, receiver) = command_channel(1);
+        commands.send(Command::Input(vec![b'x'; 1024 * 1024])).unwrap();
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let (run, start) = crossbeam_channel::bounded::<()>(1);
+        let thread = thread::spawn(move || {
+            let (mut worker, _) = capture_worker_for(shell_session("exec sleep 600").launch);
+            worker.commands = receiver;
+            ready.send(Arc::clone(&worker.published)).unwrap();
+            start.recv_timeout(Duration::from_secs(3)).unwrap();
+            worker.run();
+        });
+        let published = initialized.recv_timeout(Duration::from_secs(3)).unwrap();
+        let handle = TerminalHandle { inner: Arc::new(HandleInner {
+            commands, events: crossbeam_channel::unbounded().1, published, worker: Mutex::new(Some(thread)),
+        }) };
+        let closing = handle.clone();
+        let closer = thread::spawn(move || closing.close_checked(true));
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        while handle.inner.published.priority_close.lock().unwrap().is_none() {
+            assert!(std::time::Instant::now() < deadline, "close inspection was rejected by ordinary inbox");
+            thread::yield_now();
+        }
+        assert_eq!(handle.inner.commands.len(), 1, "priority close cannot consume queued paste before inspection");
+        run.send(()).unwrap();
+        assert_eq!(closer.join().unwrap(), super::super::ipc::TerminalCloseResult::Closed);
+        assert!(handle.is_completed());
+    }
+
+    #[test]
+    fn priority_interrupt_obeys_completed_and_released_admission() {
+        let handle = TerminalHandle::spawn(shell_session("exit 0"), TerminalConfig::default(), |_| {}).unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        while !handle.is_completed() { assert!(std::time::Instant::now() < deadline); thread::sleep(Duration::from_millis(5)); }
+        for released in [false, true] {
+            if released { handle.release_completed_holder(); }
+            assert_eq!(handle.input(b"ordinary".to_vec()), Err(TerminalSendError::Closed));
+            assert_eq!(handle.input(vec![3]), Err(TerminalSendError::Closed));
+            let mut key = key_input(KeyAction::Press, TerminalKey::Character('c'), Some("c"), Some('c'));
+            key.modifiers.control = true;
+            assert_eq!(handle.key(key), Err(TerminalSendError::Closed));
+            assert!(!handle.inner.published.interrupt_requested.load(Ordering::Acquire));
+        }
+        handle.shutdown().unwrap();
+    }
+
+    #[test]
     fn concurrent_checked_close_cannot_hold_shutdown_behind_its_join() {
         let published = Arc::new(PublishedState::new(true, Arc::new(|_| {})));
         let completion = Arc::clone(&published);
-        let (commands, receiver) = command_channel(1);
+        let (commands, _receiver) = command_channel(1);
         let (_events, event_receiver) = crossbeam_channel::unbounded();
         let (release, blocked) = crossbeam_channel::bounded::<()>(1);
         let (ready, observed) = crossbeam_channel::bounded(1);
         let worker = thread::spawn(move || {
-            let Command::CloseChecked { reply, .. } = receiver.recv().unwrap() else { panic!("expected close"); };
+            completion.capture_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            let Some(Command::CloseChecked { reply, .. }) = completion.priority_close.lock().unwrap().take() else { panic!("expected priority close"); };
             reply.send(super::super::ipc::TerminalCloseResult::Closed).unwrap();
             ready.send(()).unwrap();
             let _ = blocked.recv();
