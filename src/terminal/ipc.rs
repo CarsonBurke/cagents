@@ -918,6 +918,9 @@ pub struct TerminalHandoffReceipt {
     pub source: crate::chat::Session,
     pub source_execution_instance: uuid::Uuid,
     pub source_binding: ChatSourceBinding,
+    /// Positive publication after this operation's own pairing or first
+    /// confirmed thread learning. The original captured intent stays above.
+    pub retained_binding: Option<ChatSourceBinding>,
     pub terminal: TerminalDescriptor,
 }
 

@@ -632,7 +632,7 @@ pub(crate) mod handoff_tests {
         let before=Pane {id:CardId::new(),title:"Chat".into(),user_title:None,width_fraction:1.0,pending_terminal_start:false,kind:CardKind::Chat(chat.clone()),scope:None};
         let mut confirmed=chat;confirmed.launch.session_id=Some("confirmed".into());
         let execution_instance=uuid::Uuid::new_v4();
-        let receipt=TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(),source:confirmed.clone(),source_execution_instance:execution_instance,source_binding:ChatSourceBinding {source:confirmed,execution_instance,backend:uuid::Uuid::new_v4()},terminal};
+        let receipt=TerminalHandoffReceipt {operation:uuid::Uuid::new_v4(),source:confirmed.clone(),source_execution_instance:execution_instance,source_binding:ChatSourceBinding {source:confirmed,execution_instance,backend:uuid::Uuid::new_v4()},retained_binding:None,terminal};
         (before,receipt)
     }
     #[test]
