@@ -488,6 +488,7 @@ pub struct TerminalSpawnOptions {
     pub cell_width_px: u32,
     pub cell_height_px: u32,
     /// Ghostty scrollback page budget in bytes (allocated lazily).
+    #[serde(alias = "max_scrollback")]
     pub max_scrollback_bytes: usize,
     pub initially_visible: bool,
     pub theme: TerminalTheme,
@@ -1846,6 +1847,16 @@ pub fn validate_proof(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn holder_options_decode_the_legacy_scrollback_field() {
+        let mut legacy = serde_json::to_value(super::TerminalSpawnOptions::default()).unwrap();
+        let object = legacy.as_object_mut().unwrap();
+        object.remove("max_scrollback_bytes");
+        object.insert("max_scrollback".into(), serde_json::json!(10_000));
+        let options: super::TerminalSpawnOptions = serde_json::from_value(legacy).unwrap();
+        assert_eq!(options.max_scrollback_bytes, 10_000);
+    }
+
     use std::io::{Cursor, Read};
 
     use crate::model::{BootId, HostIncarnation, HostSessionId};
