@@ -107,11 +107,7 @@ pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Re
                 let record = registry::evidence(&socket, Kind::Native)?
                     .ok_or("No exact native holder or confirmed close receipt is available")?;
                 let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
-                if &recovery.source != source && !recovery.previous_sources.contains(source) {
-                    return Err(
-                        "Native holder does not recognize this exact issued descriptor".into(),
-                    );
-                }
+                chat::native_holder::recognized_source(&record, &recovery, source)?;
                 let paired = retained_pair(
                     host,
                     recovery.source.terminal.as_ref(),

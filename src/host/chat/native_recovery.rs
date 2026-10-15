@@ -134,17 +134,16 @@ fn restore_reserved(
     if exited {
         return Err("The retained native server exited; explicitly resume the conversation to start another server".into());
     }
-    if &recovery.source != source && !recovery.previous_sources.contains(source) {
-        return Err("Native holder does not recognize this exact issued descriptor".into());
-    }
+    chat::native_holder::recognized_source(&record, &recovery, source)?;
     // Only the authenticated holder's complete issued descriptors can retrieve
     // this failure. An unrecognized caller cannot replace another card's reason.
-    let sources = recovery
+    let mut sources: Vec<_> = recovery
         .previous_sources
         .iter()
         .chain(std::iter::once(&recovery.source))
         .filter_map(AdoptionFailures::source_key)
         .collect();
+    if let Some(key) = AdoptionFailures::source_key(source) { if !sources.contains(&key) { sources.push(key); } }
     let result = restore_authenticated(host, client, source, proof, record, recovery);
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     match &result {
@@ -168,6 +167,7 @@ fn restore_authenticated(
     record: registry::Record,
     recovery: chat::native_holder::Recovery,
 ) -> Result<ServerResponse, String> {
+    let presentations = chat::native_holder::presentation_sources(&record, &recovery)?;
     let mut retained: Vec<_> = recovery
         .previous_sources
         .iter()
@@ -175,6 +175,8 @@ fn restore_authenticated(
         .chain(std::iter::once(recovery.source.clone()))
         .map(crate::agent_execution::HostedSession::Chat)
         .collect();
+    retained.extend(presentations.iter().cloned().map(crate::agent_execution::HostedSession::Chat));
+    retained.push(crate::agent_execution::HostedSession::Chat(source.clone()));
     let execution_registry = super::super::agent_execution::registry(host)?;
     let directory = execution_registry
         .lock()
@@ -193,12 +195,14 @@ fn restore_authenticated(
     let mut initial = adapter.initialize()?;
     let store = chat::runtime::preflight_retained(&spec, &mut initial)?;
     let (holder, recovery) = chat::native_holder::adopt(&record, source, proof)?;
-    let mut session = recovery.source.clone();
+    let mut session = holder.published_source().clone();
     let execution_console = recovery.execution_console.clone();
     let paired_holder = recovery.paired_holder.clone();
     let expected_thread = recovery.confirmed_thread.clone();
     let mut sources = recovery.previous_sources.clone();
+    sources.extend(presentations);
     sources.push(recovery.source.clone());
+    if !sources.contains(source) { sources.push(source.clone()); }
     let weak = Arc::downgrade(host);
     let id = session.id;
     let execution_instance = uuid::Uuid::new_v4();

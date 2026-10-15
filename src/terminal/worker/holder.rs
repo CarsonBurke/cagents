@@ -965,6 +965,9 @@ impl Residence {
             .map_err(|error| error.to_string())?;
         let record = Record {
             version: PROTOCOL,
+            build: Some(crate::daemon::holder_registry::BuildIdentity::current(
+                crate::daemon::holder_registry::Kind::Terminal,
+            )),
             kind: crate::daemon::holder_registry::Kind::Terminal,
             application: crate::instance::APPLICATION_ID.into(),
             boot,

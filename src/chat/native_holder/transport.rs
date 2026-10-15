@@ -28,7 +28,7 @@ use std::{
 };
 
 const ARGUMENT: &str = "--cagents-native-holder";
-const PROTOCOL: u32 = 2;
+const PROTOCOL: u32 = 3;
 const TIMEOUT: Duration = Duration::from_secs(5);
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
@@ -101,6 +101,19 @@ impl Spawn {
             .stderr(Stdio::null())
             .process_group(0);
         crate::host::descriptor_limit::inherit(&mut command);
+        // The helper's signalfd owns SIGCHLD; its provider must receive the
+        // usual unblocked child-exit signals after exec.
+        unsafe {
+            command.pre_exec(|| {
+                let mut signals = std::mem::zeroed();
+                libc::sigemptyset(&mut signals);
+                libc::sigaddset(&mut signals, libc::SIGCHLD);
+                if libc::sigprocmask(libc::SIG_UNBLOCK, &signals, std::ptr::null_mut()) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         if let Some(fd) = self.directory_fd {
             // The dedicated holder keeps this validated directory alive. Only
             // async-signal-safe syscalls run between fork and provider exec.
@@ -169,6 +182,8 @@ pub(crate) struct Holder {
     release_on_drop: bool,
     durable: bool,
     identity: super::Detached,
+    wire_source: Session,
+    alias_publisher: Option<super::aliases::Publisher>,
 }
 
 impl Holder {
@@ -182,10 +197,12 @@ impl Holder {
         process: Process,
     ) -> Result<(), String> {
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
+        let version = super::verified_codex_version(&identity.user_agent)
+            .ok_or("Unverified native provider version")?.to_owned();
         send(
             control,
             &Request::Confirm {
-                thread,
+                thread: thread.clone(),
                 identity,
                 process,
             },
@@ -194,12 +211,18 @@ impl Holder {
         match receive(control, TIMEOUT)? {
             Some(Report::Confirmed) => {
                 self.durable = true;
+                self.identity.source.launch.session_id = Some(thread.clone());
+                self.identity.source.native_continuity = crate::chat::NativeContinuity::Durable { provider_version: version.clone() };
+                self.wire_source.launch.session_id = Some(thread);
+                self.wire_source.native_continuity = crate::chat::NativeContinuity::Durable { provider_version: version };
                 Ok(())
             }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge provider identity".into()),
         }
     }
+
+    pub fn published_source(&self) -> &Session { &self.identity.source }
 
     pub fn preserve(mut self) -> super::Detached {
         self.release_on_drop = false;
@@ -213,18 +236,22 @@ impl Holder {
         execution_console: Option<crate::model::LaunchRecipe>,
         paired_holder: Option<crate::terminal::holder::Record>,
     ) -> Result<(), String> {
+        let mut expected = self.identity.source.clone();
+        expected.terminal = source.terminal.clone();
+        if source != expected { return Err("Published native descriptor changed immutable ownership".into()); }
+        let mut wire = self.wire_source.clone();
+        wire.terminal = source.terminal.clone();
         let control = self.control.as_ref().ok_or("Native holder is detached")?;
-        send(
-            control,
-            &Request::UpdateSource {
-                source,
-                execution_console,
-                paired_holder,
-            },
-            TIMEOUT,
-        )?;
+        send(control, &Request::UpdateSource { source: wire.clone(), execution_console: execution_console.clone(), paired_holder: paired_holder.clone() }, TIMEOUT)?;
         match receive(control, TIMEOUT)? {
-            Some(Report::SourceUpdated) => Ok(()),
+            Some(Report::SourceUpdated) => {
+                if let Some(publisher) = &self.alias_publisher {
+                    publisher.retain(&self.identity.record, &source, &wire)?;
+                }
+                self.wire_source = wire;
+                self.identity.source = source;
+                Ok(())
+            }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge paired view ownership".into()),
         }
@@ -441,6 +468,8 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
             control: Some(control),
             release_on_drop: true,
             durable: false,
+            wire_source: retained_source.clone(),
+            alias_publisher: None,
             identity: super::Detached {
                 record,
                 proof: source_proof.clone(),
@@ -495,7 +524,7 @@ pub(crate) fn inspect(
             record: actual,
             recovery,
             exited,
-        }) if protocol == PROTOCOL && actual == *record => {
+        }) if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
             recovery.validate(&record.boot)?;
             Ok((recovery, exited))
         }
@@ -509,11 +538,20 @@ pub(crate) fn adopt(
     source: &Session,
     proof: &HostSessionProof,
 ) -> Result<(Holder, Recovery), String> {
+    let (before, _) = inspect(record, proof)?;
+    let wire = super::aliases::recognized_source(record, &before, source)?;
     let control = connect(record)?;
+    if record.is_outdated() {
+        tracing::warn!(terminal = %record.terminal, holder_pid = record.holder.pid,
+            helper_version = ?record.build.as_ref().map(|build| &build.version),
+            daemon_version = crate::VERSION,
+            zombies = ?record.zombie_children().ok(),
+            "adopting a native conversation running on an outdated helper");
+    }
     send(
         &control,
         &Request::Adopt {
-            source: source.clone(),
+            source: wire.clone(),
             proof: proof.clone(),
         },
         TIMEOUT,
@@ -523,18 +561,38 @@ pub(crate) fn adopt(
             recovery.validate(&record.boot)?;
             if recovery.source.id != source.id
                 || recovery.source.proof.as_ref() != Some(proof)
-                || (&recovery.source != source && !recovery.previous_sources.contains(source))
+                || (&recovery.source != &wire && !recovery.previous_sources.contains(&wire))
+                || recovery.confirmed_thread != before.confirmed_thread
+                || recovery.server_identity != before.server_identity
+                || recovery.server_version != before.server_version
+                || recovery.server_process != before.server_process
             {
                 return Err("Native holder did not preserve exact adoption lineage".into());
             }
+            // Bind the formerly published alias while its canonical source is
+            // still retained. The new presentation is persisted after pairing.
+            super::aliases::retain(record, &recovery, source, &wire)?;
+            let mut published = source.clone();
+            published.proof = Some(proof.clone());
+            published.launch.session_id = recovery.confirmed_thread.clone();
+            published.native_continuity = recovery.source.native_continuity.clone();
+            // A historical pane may predate the paired console. Retain the
+            // holder's current exact pair, then the host authenticates its worker.
+            published.terminal = recovery.source.terminal.clone();
+            // A protocol attach can fail before the paired-view update. Its
+            // retained Detached owner must still resolve this rotated source
+            // for explicit receipt-proven cleanup, without loading history.
+            super::aliases::retain(record, &recovery, &published, &recovery.source)?;
             Ok((
                 Holder {
                     control: Some(control),
                     release_on_drop: false,
                     durable: true,
+                    wire_source: recovery.source.clone(),
+                    alias_publisher: Some(super::aliases::Publisher::new(&recovery)?),
                     identity: super::Detached {
                         record: record.clone(),
-                        source: recovery.source.clone(),
+                        source: published,
                         proof: proof.clone(),
                     },
                 },
@@ -552,12 +610,16 @@ struct Residence {
     record: Record,
     recovery: Recovery,
     child: Server,
+    child_events: ChildEvents,
     released: bool,
     _working_directory: Option<std::fs::File>,
 }
 
 impl Residence {
     fn start(spawn: Spawn) -> Result<Self, String> {
+        // Block before creating children so even a very short-lived tool cannot
+        // disappear between the initial reap and the blocking poll.
+        let child_events = ChildEvents::new().map_err(|error| error.to_string())?;
         let working_directory = spawn
             .directory_fd
             .map(|fd| {
@@ -590,7 +652,8 @@ impl Residence {
             }
         };
         let record = Record {
-            version: 3,
+            version: 4,
+            build: Some(registry::BuildIdentity::current(Kind::Native)),
             kind: Kind::Native,
             application: crate::instance::APPLICATION_ID.into(),
             boot,
@@ -604,6 +667,7 @@ impl Residence {
             record,
             recovery: spawn.recovery,
             child,
+            child_events,
             released: false,
             _working_directory: working_directory,
         };
@@ -660,7 +724,7 @@ impl Residence {
 
     fn attend(&mut self, control: UnixStream) -> bool {
         loop {
-            if wait_for_control(control.as_raw_fd(), &self.child).is_err() {
+            if wait_for_control(control.as_raw_fd(), &self.child, &self.child_events).is_err() {
                 return self.recovery.is_durable();
             }
             let request = match receive(&control, TIMEOUT) {
@@ -749,7 +813,13 @@ impl Residence {
 
     fn orphan(&mut self) -> bool {
         loop {
-            if wait_for_control(self.listener.socket.as_raw_fd(), &self.child).is_err() {
+            if wait_for_control(
+                self.listener.socket.as_raw_fd(),
+                &self.child,
+                &self.child_events,
+            )
+            .is_err()
+            {
                 return false;
             }
             let (control, _) = match self.listener.socket.accept() {
@@ -798,25 +868,99 @@ impl Residence {
     }
 }
 
-/// Keep the dedicated subreaper doing its job even when no daemon is sending
-/// requests. One periodic wake serves both attached streams and orphan listeners.
+/// SIGCHLD is blocked only in the dedicated holder. The provider's pre-exec
+/// hook restores the ordinary mask so its own child management is unaffected.
+struct ChildEvents {
+    fd: std::fs::File,
+    previous: libc::sigset_t,
+}
+
+impl ChildEvents {
+    fn new() -> io::Result<Self> {
+        // SAFETY: both signal sets are live writable objects; this helper is
+        // single-threaded and is the sole owner of child wait statuses.
+        unsafe {
+            let mut mask = std::mem::zeroed();
+            let mut previous = std::mem::zeroed();
+            libc::sigemptyset(&mut mask);
+            libc::sigaddset(&mut mask, libc::SIGCHLD);
+            let result = libc::pthread_sigmask(libc::SIG_BLOCK, &mask, &mut previous);
+            if result != 0 {
+                return Err(io::Error::from_raw_os_error(result));
+            }
+            let fd = libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK);
+            if fd < 0 {
+                let error = io::Error::last_os_error();
+                libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
+                return Err(error);
+            }
+            Ok(Self {
+                fd: std::fs::File::from_raw_fd(fd),
+                previous,
+            })
+        }
+    }
+
+    fn drain(&self) -> io::Result<()> {
+        let mut event = [0_u8; std::mem::size_of::<libc::signalfd_siginfo>()];
+        loop {
+            match (&self.fd).read(&mut event) {
+                Ok(0) => return Ok(()),
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for ChildEvents {
+    fn drop(&mut self) {
+        // SAFETY: restore the mask on the same single holder thread.
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut());
+        }
+    }
+}
+
+/// A child exit or control message is the only source of idle wakeups. Reap
+/// once before blocking as well, including orphans already pending at startup.
 fn wait_for_control(
     fd: RawFd,
     children: &crate::daemon::owned_children::OwnedChildren,
+    child_events: &ChildEvents,
 ) -> io::Result<()> {
     loop {
         if let Err(error) = children.reap_exited_descendants() {
             // A transient inspection failure must not tear down a durable server.
             eprintln!("Native holder could not reap exited tools: {error}");
         }
-        let mut poll = libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        match unsafe { libc::poll(&mut poll, 1, 1_000) } {
-            result if result > 0 => return Ok(()),
-            0 => continue,
+        let mut poll = [
+            libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: child_events.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        // SAFETY: the array and both owned descriptors remain live throughout
+        // poll. No timer is armed: an idle holder sleeps indefinitely.
+        match unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as libc::nfds_t, -1) } {
+            result if result > 0 => {
+                if poll[1].revents != 0 {
+                    child_events.drain()?;
+                    // A simultaneous control event must not postpone reaping.
+                    children.reap_exited_descendants()?;
+                }
+                if poll[0].revents != 0 {
+                    return Ok(());
+                }
+            }
             _ => {
                 let error = io::Error::last_os_error();
                 if error.kind() != io::ErrorKind::Interrupted {
@@ -1080,21 +1224,33 @@ mod tests {
     fn idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_IDLE_REAPER_TEST";
         if std::env::var_os(STAGE).is_none() {
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "chat::native_holder::transport::tests::idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider",
-                    "--nocapture",
-                ])
-                .env(STAGE, "1")
-                .output()
-                .unwrap();
+            let mut fixture = Command::new(std::env::current_exe().unwrap());
+            fixture.args([
+                "--exact",
+                "chat::native_holder::transport::tests::idle_control_and_orphan_listener_reap_tools_without_reaping_or_killing_provider",
+                "--nocapture",
+            ]).env(STAGE, "1");
+            // All libtest threads must inherit the blocked signal. Blocking
+            // only this test thread would let the harness consume SIGCHLD.
+            unsafe {
+                fixture.pre_exec(|| {
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    libc::sigaddset(&mut mask, libc::SIGCHLD);
+                    if libc::sigprocmask(libc::SIG_BLOCK, &mask, std::ptr::null_mut()) != 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = fixture.output().unwrap();
             assert!(output.status.success(), "{output:?}");
             return;
         }
         // Isolate subreaper state and wait ownership from the test harness's
         // other tests. The fixture launcher exits without waiting for its tools.
         assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let child_events = ChildEvents::new().unwrap();
         for orphan in [false, true] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let child = Command::new("/bin/sh")
@@ -1124,23 +1280,31 @@ mod tests {
             let tool = read_pid("tool");
             let tool_identity = Process::read(tool).unwrap();
 
+            let observed_tool = tool_identity.clone();
             if orphan {
                 let path = directory.path().join("control.sock");
                 let listener = UnixListener::bind(&path).unwrap();
                 let connector = std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(1_500));
-                    UnixStream::connect(path).unwrap()
+                    std::thread::sleep(Duration::from_millis(500));
+                    let reaped = !observed_tool.is_current();
+                    let stream = UnixStream::connect(path).unwrap();
+                    assert!(reaped, "orphan was not reaped on SIGCHLD");
+                    stream
                 });
-                wait_for_control(listener.as_raw_fd(), &server).unwrap();
+                wait_for_control(listener.as_raw_fd(), &server, &child_events).unwrap();
                 let _peer = connector.join().unwrap();
                 let _accepted = listener.accept().unwrap();
             } else {
                 let (reader, mut writer) = UnixStream::pair().unwrap();
                 let sender = std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(1_500));
+                    std::thread::sleep(Duration::from_millis(500));
+                    assert!(
+                        !observed_tool.is_current(),
+                        "tool was not reaped on SIGCHLD"
+                    );
                     writer.write_all(b"x").unwrap();
                 });
-                wait_for_control(reader.as_raw_fd(), &server).unwrap();
+                wait_for_control(reader.as_raw_fd(), &server, &child_events).unwrap();
                 sender.join().unwrap();
             }
 
