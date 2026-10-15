@@ -4385,6 +4385,7 @@ impl SidebarState {
             | SidebarAction::DeleteSelectedRows
             | SidebarAction::RunCommand { .. }
             | SidebarAction::RunChangeCommand { .. }
+            | SidebarAction::RunChangeGroup { .. }
             | SidebarAction::DeleteRows(_)
             | SidebarAction::ClearRowSelection => {}
         }
@@ -4416,6 +4417,12 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    RunChangeGroup {
+        key: ActiveWorktreeKey,
+        area: ChangeArea,
+        command: ChangeGroupCommand,
+        selection_revision: u64,
+    },
     RunChangeCommand {
         command: crate::workspace_widget::GlobalShortcut,
         key: ActiveWorktreeKey,
@@ -10358,6 +10365,49 @@ pub fn change_selection_order(
         }
     }
     order
+}
+
+/// Whole-area availability never materializes selected or group paths. Stage
+/// and unstage remain queueable; discard waits for the active mutation.
+pub fn whole_change_group_available(
+    model: &SidebarModel,
+    state: &SidebarState,
+    area: ChangeArea,
+    command: ChangeGroupCommand,
+    modal_open: bool,
+) -> bool {
+    let Some(source) = model.source_control.as_ref() else { return false; };
+    if modal_open || state.active_worktree() != Some(&source.key)
+        || !model.contains_worktree(&source.key)
+        || !matches!(source.data_state, SidebarDataState::Ready)
+        || state.change_rows.first_in_area(area).is_some()
+        || source.group(area).is_none_or(ChangeGroup::is_empty)
+        || (source.busy() && command == ChangeGroupCommand::Discard)
+    { return false; }
+    match command {
+        ChangeGroupCommand::Stage => area != ChangeArea::Staged,
+        ChangeGroupCommand::Unstage => area == ChangeArea::Staged,
+        ChangeGroupCommand::Discard => matches!(area, ChangeArea::Unstaged | ChangeArea::Untracked),
+    }
+}
+
+/// Revalidate the original whole-area intent before entering the existing
+/// fresh, uncapped mutation pipeline. A later row selection cannot retarget it.
+pub fn resolve_captured_change_group(
+    model: &SidebarModel,
+    state: &SidebarState,
+    key: &ActiveWorktreeKey,
+    area: ChangeArea,
+    command: ChangeGroupCommand,
+    selection_revision: u64,
+    modal_open: bool,
+) -> Option<SidebarAction> {
+    if state.active_worktree() != Some(key)
+        || model.source_control.as_ref().is_none_or(|source| source.key != *key)
+        || state.change_selection_revision() != selection_revision
+        || !whole_change_group_available(model, state, area, command, modal_open)
+    { return None; }
+    Some(SidebarAction::ChangeGroup { key: key.clone(), area, command })
 }
 
 pub fn selected_change_group_anchor(
