@@ -21,6 +21,7 @@ mod browser_backend;
 mod browser_host;
 mod file_ui;
 mod git_ui;
+mod git_group_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
 mod latency_ui;
@@ -3973,7 +3974,7 @@ pub enum Message {
     },
     SourceControlGroupSelection {
         key: ActiveWorktreeKey,
-        generation: u64,
+        operation: uuid::Uuid,
         area: crate::repository::ChangeArea,
         command: sidebar::ChangeGroupCommand,
         result: Result<Vec<crate::repository::PathSelection>, String>,
@@ -4772,6 +4773,12 @@ impl WorkspaceDestination {
 #[derive(Debug, Clone)]
 enum QueuedGitMutation {
     Stage(Vec<crate::repository::PathSelection>),
+    /// Resolve an uncapped group only after all earlier worktree commands.
+    Area {
+        area: crate::repository::ChangeArea,
+        command: sidebar::ChangeGroupCommand,
+        preview: Vec<crate::repository::PathSelection>,
+    },
     StageApproved {
         selection: Vec<crate::repository::PathSelection>,
         approved: std::collections::BTreeMap<
@@ -4791,6 +4798,19 @@ impl QueuedGitMutation {
             Self::Unstage(_) => MutationKind::Unstage,
             Self::Discard(_) => MutationKind::Discard,
             Self::Operation(_) => MutationKind::Other,
+            Self::Area { command, .. } => match command {
+                sidebar::ChangeGroupCommand::Stage => MutationKind::Stage,
+                sidebar::ChangeGroupCommand::Unstage => MutationKind::Unstage,
+                sidebar::ChangeGroupCommand::Discard => MutationKind::Other,
+            },
+        }
+    }
+
+    fn optimistic_selection(&self) -> Option<&[crate::repository::PathSelection]> {
+        match self {
+            Self::Stage(selection) | Self::StageApproved { selection, .. } | Self::Unstage(selection) => Some(selection),
+            Self::Area { command: sidebar::ChangeGroupCommand::Stage | sidebar::ChangeGroupCommand::Unstage, preview, .. } => Some(preview),
+            _ => None,
         }
     }
 
@@ -11295,9 +11315,7 @@ impl Cagents {
         if let Some(active) = self.source_control_mutations.get_mut(&key.canonical_path) {
             QueuedGitMutation::append(&mut active.pending, request.clone());
             if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                if let QueuedGitMutation::Stage(selection)
-                | QueuedGitMutation::StageApproved { selection, .. }
-                | QueuedGitMutation::Unstage(selection) = &request
+                if let Some(selection) = request.optimistic_selection()
                 {
                     source.optimistic_mutation(kind, selection);
                 }
@@ -11311,9 +11329,7 @@ impl Cagents {
             active.request = Some(request.clone());
         }
         if let Some(source) = self.sidebar_model.source_control.as_mut() {
-            if let QueuedGitMutation::Stage(selection)
-            | QueuedGitMutation::StageApproved { selection, .. }
-            | QueuedGitMutation::Unstage(selection) = &request
+            if let Some(selection) = request.optimistic_selection()
             {
                 source.optimistic_mutation(kind, selection);
             }
@@ -11328,6 +11344,7 @@ impl Cagents {
         request: QueuedGitMutation,
     ) -> Task<Message> {
         let request = match request {
+            QueuedGitMutation::Area { area, command, .. } => return self.queued_group_task(key, operation, area, command),
             QueuedGitMutation::Stage(selection)
             | QueuedGitMutation::StageApproved { selection, .. } => {
                 let approved = self
@@ -11416,6 +11433,7 @@ impl Cagents {
                 QueuedGitMutation::Discard(request) => {
                     ("Discard", service.discard(&request, cancellation))
                 }
+                QueuedGitMutation::Area { .. } => unreachable!("group tasks are dispatched before ordinary mutations"),
                 QueuedGitMutation::Operation(operation) => (
                     operation.label(),
                     service.git_operation(&worktree, &operation, cancellation),
@@ -14480,23 +14498,6 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
-                if let SidebarAction::ChangeGroup { key, area, command } = &action {
-                    if !self.source_control_is_bound(key) { return Task::none(); }
-                    let key = key.clone();
-                    let area = *area;
-                    let command = *command;
-                    let generation = self.sidebar_state.begin_group_selection();
-                    return cosmic::task::future(async move {
-                        let worktree = key.canonical_path.clone();
-                        let result = tokio::task::spawn_blocking(move || {
-                            RepositoryService::system("git").status(&worktree, &CancellationToken::default())
-                                .map(|status| status.area(area).map(crate::repository::PathSelection::from_changed_path).collect())
-                                .map_err(|error| error.to_string())
-                        }).await.map_err(|error| format!("group selection reader failed: {error}"))
-                            .and_then(|result| result);
-                        Message::SourceControlGroupSelection { key, generation, area, command, result }
-                    });
-                }
                 // Entering a worktree that is being deleted is refused, and
                 // for the same reason before the selection would claim it.
                 if self
@@ -14797,7 +14798,6 @@ impl Application for Cagents {
                     | SidebarAction::ToggleSourceControlPanel { .. }
                     | SidebarAction::SetChangeListMode { .. }
                     | SidebarAction::ChangeViewport { .. }
-                    | SidebarAction::ChangeGroup { .. }
                     | SidebarAction::SetWorktreePanel { .. }
                     | SidebarAction::ToggleDirectory { .. }
                     | SidebarAction::ToggleChangeDirectory { .. }
@@ -14873,6 +14873,7 @@ impl Application for Cagents {
                         }
                         Task::none()
                     }
+                    SidebarAction::ChangeGroup { key, area, command } => self.enqueue_change_group(key, area, command),
                     SidebarAction::Stage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Stage(selection)),
                     SidebarAction::Unstage { key, selection } => self.enqueue_git_mutation(key, QueuedGitMutation::Unstage(selection)),
                     SidebarAction::ConfirmDiscard { key, request } => self.enqueue_git_mutation(key, QueuedGitMutation::Discard(request)),
@@ -16668,21 +16669,7 @@ impl Application for Cagents {
                 });
                 Task::none()
             }
-            Message::SourceControlGroupSelection { key, generation, area, command, result } => {
-                if !self.source_control_is_bound(&key) || !self.sidebar_state.finish_group_selection(generation) {
-                    return Task::none();
-                }
-                match result {
-                    Ok(selection) => sidebar::resolve_group_selection(&key, area, command, selection)
-                        .map_or_else(Task::none, |action| cosmic::task::message(Message::Sidebar(action))),
-                    Err(error) => {
-                        if let Some(source) = self.sidebar_model.source_control.as_mut() {
-                            source.set_error(Some(format!("Could not read all paths for this action: {error}")));
-                        }
-                        Task::none()
-                    }
-                }
-            }
+            Message::SourceControlGroupSelection { key, operation, area, command, result } => self.finish_group_selection(key, operation, area, command, result),
             Message::SourceControlReleased => Task::none(),
             Message::SourceControlLoaded {
                 key,
@@ -16865,11 +16852,7 @@ impl Application for Cagents {
                 let failed = report.is_some();
                 if !failed
                     && let Some(rollback) = mutation.rollback.as_mut()
-                    && let Some(
-                        QueuedGitMutation::Stage(selection)
-                        | QueuedGitMutation::StageApproved { selection, .. }
-                        | QueuedGitMutation::Unstage(selection),
-                    ) = mutation.request.as_ref()
+                    && let Some(selection) = mutation.request.as_ref().and_then(QueuedGitMutation::optimistic_selection)
                 {
                     rollback.optimistic_mutation(mutation.kind, selection);
                 }
@@ -16883,9 +16866,7 @@ impl Application for Cagents {
                 {
                     *source = rollback.clone();
                     for pending in &mutation.pending {
-                        if let QueuedGitMutation::Stage(selection)
-                        | QueuedGitMutation::StageApproved { selection, .. }
-                        | QueuedGitMutation::Unstage(selection) = pending
+                        if let Some(selection) = pending.optimistic_selection()
                         {
                             source.optimistic_mutation(pending.kind(), selection);
                         }

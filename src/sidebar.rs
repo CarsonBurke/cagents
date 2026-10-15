@@ -2918,8 +2918,6 @@ pub struct SidebarState {
     collapsed_change_directories: BTreeMap<ChangeTreeScope, BTreeSet<RepoPath>>,
     change_first_rows: BTreeMap<ChangeTreeScope, usize>,
     change_scroll_epoch: u64,
-    group_selection_generation: u64,
-    group_selection_loading: bool,
     files_page: usize,
     publish: Option<PublishDraft>,
     discard: Option<DiscardConfirmation>,
@@ -3193,18 +3191,6 @@ impl SidebarState {
         self.filter
     }
 
-    pub fn begin_group_selection(&mut self) -> u64 {
-        self.group_selection_generation = self.group_selection_generation.wrapping_add(1);
-        self.group_selection_loading = true;
-        self.group_selection_generation
-    }
-
-    pub fn finish_group_selection(&mut self, generation: u64) -> bool {
-        if generation != self.group_selection_generation { return false; }
-        self.group_selection_loading = false;
-        true
-    }
-
     pub fn controls_expanded(&self) -> bool {
         self.controls_expanded
     }
@@ -3342,8 +3328,6 @@ impl SidebarState {
         self.collapsed_change_directories.clear();
         self.change_first_rows.clear();
         self.change_scroll_epoch = self.change_scroll_epoch.wrapping_add(1);
-        self.group_selection_generation = self.group_selection_generation.wrapping_add(1);
-        self.group_selection_loading = false;
         self.files_page = 0;
         // Every section is one worktree's change area now, not a view of the
         // panel, so none of their disclosures carry to the next worktree.
@@ -8179,9 +8163,6 @@ fn changes_section<'a>(
     let mut column = widget::column::with_capacity(source.groups().len() + 1).spacing(space::XS);
     if let Some(notice) = &source.change_limit_notice {
         column = column.push(design::caption(notice.as_ref()));
-    }
-    if state.group_selection_loading {
-        column = column.push(design::caption("Reading all paths in this change group…"));
     }
     if source.groups().iter().all(ChangeGroup::is_empty) {
         column = column.push(design::caption(
