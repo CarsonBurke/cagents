@@ -865,6 +865,7 @@ const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
 
 fn notice_details_id(id: u64) -> String { format!("chrome.notices.details.{id}") }
 fn notice_target_id(id: u64, card: CardId) -> String { format!("chrome.notices.target.{id}.{card}") }
+fn notice_file_id(id: u64) -> String { format!("chrome.notices.file.{id}") }
 
 fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
@@ -957,6 +958,7 @@ impl Cagents {
                                 .map(|card| Cow::Owned(notice_target_id(entry.id, *card))));
                         }
                     }
+                    if entry.notice.key.as_deref() == Some("settings-reload") { ring.push(Cow::Owned(notice_file_id(entry.id))); }
                     ring.push(Cow::Owned(notice_dismiss_id(entry.id)));
                 }
                 // In the order the notices draw them: the lane's own notice,
@@ -1426,6 +1428,13 @@ impl Cagents {
                             }
                         }
                         widget::column::with_children(children).spacing(space::XS).into()
+                    } else { body };
+                    let body = if entry.notice.key.as_deref() == Some("settings-reload") {
+                        widget::column::with_children(vec![body,
+                            crate::ui_controls::button::secondary("Open file")
+                                .on_press(Message::OpenSettingsFile { reveal: false })
+                                .id(widget::Id::new(notice_file_id(entry.id))).into(),
+                        ]).spacing(space::XS).into()
                     } else { body };
                     notices.push(super::notice_surface(
                         entry.notice.severity,

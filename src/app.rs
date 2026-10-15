@@ -35,6 +35,7 @@ mod review_request_ui;
 mod safety_tests;
 mod session_recovery;
 mod settings_ui;
+mod settings_watch;
 mod shared_views;
 mod sidebar_selection_ui;
 mod terminal_adoption;
@@ -2144,7 +2145,8 @@ struct SettingsSave {
     view: WindowView,
     store: Option<Arc<crate::persistence::StateStore>>,
     lane: Arc<std::sync::Mutex<Option<SettingsSaved>>>,
-    reset: bool,
+    reset: Option<u64>,
+    reset_keys: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -2152,6 +2154,8 @@ pub struct SettingsSaved {
     generation: u64,
     path: PathBuf,
     settings: AppSettings,
+    backup: Option<PathBuf>,
+    reset: Option<u64>,
 }
 
 impl SettingsSave {
@@ -2171,17 +2175,28 @@ impl SettingsSave {
                 .save_window_view(&value)
                 .map_err(|error| error.to_string())?;
         }
-        if self.reset {
-            settings::save(&self.path, &self.desired)
+        let backup = if let Some(reset) = self.reset {
+            if let Some(backup) = lane.as_ref().filter(|saved| saved.reset == Some(reset)).and_then(|saved| saved.backup.clone()) {
+                settings::save(&self.path, &self.desired).map_err(|error| error.to_string())?;
+                Some(backup)
+            } else {
+                Some(if self.reset_keys.is_empty() {
+                    settings::reset_with_backup(&self.path, &self.desired)
+                } else {
+                    settings::reset_keys_with_backup(&self.path, &self.desired, &self.reset_keys)
+                }.map_err(|error| error.to_string())?)
+            }
         } else {
             let base = lane.as_ref().map_or(&self.base, |saved| &saved.settings);
-            settings::save_merged(&self.path, base, &self.desired)
-        }
-        .map_err(|error| error.to_string())?;
+            settings::save_merged(&self.path, base, &self.desired).map_err(|error| error.to_string())?;
+            None
+        };
         let saved = SettingsSaved {
             generation: self.generation,
             path: self.path,
             settings: self.desired,
+            backup,
+            reset: self.reset,
         };
         *lane = Some(saved.clone());
         Ok(saved)
@@ -2558,6 +2573,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::SettingsChanged { .. }
         | Message::SettingsDraftChanged { .. }
         | Message::ResetSettings
+        | Message::ResetSettingsCategory(_)
+        | Message::OpenSettingsFile { .. }
+        | Message::UndoSettingsReset
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
@@ -2851,6 +2869,76 @@ pub enum SettingsField {
 }
 
 impl SettingsField {
+    const PREFERENCES: &[Self] = &[
+        Self::AppTheme,
+        Self::UiScale,
+        Self::TerminalLineHeight,
+        Self::TerminalPadding,
+        Self::TerminalScrollSize,
+        Self::TerminalScrollSpeed,
+        Self::TerminalCursorStyle,
+        Self::TerminalTheme,
+        Self::MaxHotCards,
+        Self::HibernationDelayMs,
+        Self::TerminalFontSize,
+        Self::TerminalFontFamily,
+        Self::ConfirmMultilinePaste,
+        Self::BrowserSearchUrl,
+        Self::EditorFontFamily,
+        Self::EditorFontSize,
+        Self::TerminalScrollbackLines,
+        Self::ManagedWorktreeDirectory,
+        Self::AutoDeleteMergedWorktrees,
+        Self::WorktreeSort,
+        Self::DefaultWorktreePane,
+        Self::DefaultChannelPane,
+        Self::DefaultColumnFraction,
+        Self::LinkOpenDestination,
+        Self::EditorAutoSave,
+        Self::EditorWrapLines,
+        Self::DiffHideUnchanged,
+        Self::ChatEnterSends,
+        Self::ChatExpandToolGroups,
+        Self::ChatContentFraction,
+        Self::DefaultNativePaneFraction,
+        Self::ShowStatusBar,
+        Self::ShowWorktreeChangesIcons,
+        Self::RelaunchAgentsOnUpgrade,
+        Self::CheckForUpdates,
+        Self::EditorSyntaxTheme,
+        Self::ConfirmTerminalClose,
+        Self::FocusFollowsMouse,
+        Self::LinkOpenGesture,
+        Self::PullRequestOpenTarget,
+    ];
+
+    fn config_key(self) -> String {
+        if let Self::Notifications(field) = self {
+            use crate::notifications::Field;
+            let key = match field {
+                Field::Enabled => "enabled", Field::Success => "success", Field::Failure => "failure",
+                Field::Waiting => "waiting", Field::WhileFocused => "while_focused", Field::ReviewRequests => "review_requests",
+            };
+            return format!("notifications.{key}");
+        }
+        let name = format!("{self:?}");
+        if let Some(action) = name.strip_prefix("Shortcut") {
+            let action = match action { "NewThread" => "NewNativeThread", other => other };
+            let mut key = String::from("keyboard_shortcuts.");
+            for (index, ch) in action.chars().enumerate() {
+                if index > 0 && (ch.is_uppercase() || ch.is_ascii_digit()) { key.push('_'); }
+                key.extend(ch.to_lowercase());
+            }
+            return key;
+        }
+        let mut key = String::new();
+        for (index, ch) in name.chars().enumerate() {
+            if index > 0 && ch.is_uppercase() { key.push('_'); }
+            key.extend(ch.to_lowercase());
+        }
+        key
+    }
+
     /// The shortcut table in `KeyboardShortcuts::actions` order.
     const SHORTCUTS: [Self; 38] = [
         Self::ShortcutNewTerminal,
@@ -2993,7 +3081,6 @@ impl SettingsField {
             | Self::UiScale
             | Self::ShowStatusBar
             | Self::ShowWorktreeChangesIcons
-            | Self::AutoDeleteMergedWorktrees
             | Self::DefaultColumnFraction => SettingsCategory::Appearance,
             Self::TerminalLineHeight
             | Self::TerminalPadding
@@ -3010,6 +3097,7 @@ impl SettingsField {
             Self::MaxHotCards
             | Self::HibernationDelayMs
             | Self::ManagedWorktreeDirectory
+            | Self::AutoDeleteMergedWorktrees
             | Self::WorktreeSort
             | Self::DefaultWorktreePane
             | Self::DefaultChannelPane
@@ -3437,6 +3525,91 @@ impl SettingsDraft {
             }
         }
     }
+    /// Refresh unrelated controls while keeping only text the user is still editing.
+    fn preserve_field(&mut self, previous: &Self, field: SettingsField) {
+        match field {
+            SettingsField::Notifications(field) => self.notifications.set(field, previous.notifications.get(field)),
+            SettingsField::AppTheme => self.app_theme = previous.app_theme.clone(),
+            SettingsField::UiScale => self.ui_scale = previous.ui_scale.clone(),
+            SettingsField::TerminalLineHeight => self.terminal_line_height = previous.terminal_line_height.clone(),
+            SettingsField::TerminalPadding => self.terminal_padding = previous.terminal_padding.clone(),
+            SettingsField::TerminalScrollSize => self.terminal_scroll_size = previous.terminal_scroll_size.clone(),
+            SettingsField::TerminalScrollSpeed => self.terminal_scroll_speed = previous.terminal_scroll_speed.clone(),
+            SettingsField::TerminalTheme => self.terminal_theme = previous.terminal_theme.clone(),
+            SettingsField::TerminalCursorStyle => self.terminal_cursor_style = previous.terminal_cursor_style.clone(),
+            SettingsField::MaxHotCards => self.max_hot_cards = previous.max_hot_cards.clone(),
+            SettingsField::HibernationDelayMs => self.hibernation_delay_ms = previous.hibernation_delay_ms.clone(),
+            SettingsField::TerminalFontSize => self.terminal_font_size = previous.terminal_font_size.clone(),
+            SettingsField::TerminalFontFamily => self.terminal_font_family = previous.terminal_font_family.clone(),
+            SettingsField::ConfirmMultilinePaste => self.confirm_multiline_paste = previous.confirm_multiline_paste,
+            SettingsField::BrowserSearchUrl => self.browser_search_url = previous.browser_search_url.clone(),
+            SettingsField::EditorFontFamily => self.editor_font_family = previous.editor_font_family.clone(),
+            SettingsField::EditorFontSize => self.editor_font_size = previous.editor_font_size.clone(),
+            SettingsField::TerminalScrollbackLines => self.terminal_scrollback_lines = previous.terminal_scrollback_lines.clone(),
+            SettingsField::ManagedWorktreeDirectory => self.managed_worktree_directory = previous.managed_worktree_directory.clone(),
+            SettingsField::AutoDeleteMergedWorktrees => self.auto_delete_merged_worktrees = previous.auto_delete_merged_worktrees,
+            SettingsField::WorktreeSort => self.worktree_sort = previous.worktree_sort.clone(),
+            SettingsField::DefaultWorktreePane => self.default_worktree_pane = previous.default_worktree_pane,
+            SettingsField::DefaultChannelPane => self.default_channel_pane = previous.default_channel_pane,
+            SettingsField::DefaultColumnFraction => self.default_column_fraction = previous.default_column_fraction.clone(),
+            SettingsField::EditorAutoSave => self.editor_auto_save = previous.editor_auto_save,
+            SettingsField::EditorWrapLines => self.editor_wrap_lines = previous.editor_wrap_lines,
+            SettingsField::DiffHideUnchanged => self.diff_hide_unchanged = previous.diff_hide_unchanged,
+            SettingsField::ConfirmTerminalClose => self.confirm_terminal_close = previous.confirm_terminal_close,
+            SettingsField::ChatEnterSends => self.chat_enter_sends = previous.chat_enter_sends,
+            SettingsField::ChatExpandToolGroups => self.chat_expand_tool_groups = previous.chat_expand_tool_groups,
+            SettingsField::ChatContentFraction => self.chat_content_fraction = previous.chat_content_fraction.clone(),
+            SettingsField::DefaultNativePaneFraction => self.default_native_pane_fraction = previous.default_native_pane_fraction.clone(),
+            SettingsField::ShowStatusBar => self.show_status_bar = previous.show_status_bar,
+            SettingsField::ShowWorktreeChangesIcons => self.show_worktree_changes_icons = previous.show_worktree_changes_icons,
+            SettingsField::RelaunchAgentsOnUpgrade => self.relaunch_agents_on_upgrade = previous.relaunch_agents_on_upgrade,
+            SettingsField::CheckForUpdates => self.check_for_updates = previous.check_for_updates,
+            SettingsField::EditorSyntaxTheme => self.editor_syntax_theme = previous.editor_syntax_theme,
+            SettingsField::FocusFollowsMouse => self.focus_follows_mouse = previous.focus_follows_mouse,
+            SettingsField::LinkOpenDestination => self.link_open_destination = previous.link_open_destination,
+            SettingsField::LinkOpenGesture => self.link_open_gesture = previous.link_open_gesture,
+            SettingsField::ShortcutNewTerminal => self.keyboard_shortcuts.new_terminal = previous.keyboard_shortcuts.new_terminal.clone(),
+            SettingsField::ShortcutToggleProjects => self.keyboard_shortcuts.toggle_projects = previous.keyboard_shortcuts.toggle_projects.clone(),
+            SettingsField::ShortcutRenamePane => self.keyboard_shortcuts.rename_pane = previous.keyboard_shortcuts.rename_pane.clone(),
+            SettingsField::ShortcutCommandPalette => self.keyboard_shortcuts.command_palette = previous.keyboard_shortcuts.command_palette.clone(),
+            SettingsField::ShortcutNewThread => self.keyboard_shortcuts.new_native_thread = previous.keyboard_shortcuts.new_native_thread.clone(),
+            SettingsField::ShortcutChatPermissions => self.keyboard_shortcuts.chat_permissions = previous.keyboard_shortcuts.chat_permissions.clone(),
+            SettingsField::ShortcutChatModel => self.keyboard_shortcuts.chat_model = previous.keyboard_shortcuts.chat_model.clone(),
+            SettingsField::ShortcutChatAccount => self.keyboard_shortcuts.chat_account = previous.keyboard_shortcuts.chat_account.clone(),
+            SettingsField::ShortcutToggleInspector => self.keyboard_shortcuts.toggle_inspector = previous.keyboard_shortcuts.toggle_inspector.clone(),
+            SettingsField::ShortcutOpenSettings => self.keyboard_shortcuts.open_settings = previous.keyboard_shortcuts.open_settings.clone(),
+            SettingsField::ShortcutMovePaneLeft => self.keyboard_shortcuts.move_pane_left = previous.keyboard_shortcuts.move_pane_left.clone(),
+            SettingsField::ShortcutMovePaneRight => self.keyboard_shortcuts.move_pane_right = previous.keyboard_shortcuts.move_pane_right.clone(),
+            SettingsField::ShortcutReopenPane => self.keyboard_shortcuts.reopen_pane = previous.keyboard_shortcuts.reopen_pane.clone(),
+            SettingsField::ShortcutFocusPane1 => self.keyboard_shortcuts.focus_pane_1 = previous.keyboard_shortcuts.focus_pane_1.clone(),
+            SettingsField::ShortcutFocusPane2 => self.keyboard_shortcuts.focus_pane_2 = previous.keyboard_shortcuts.focus_pane_2.clone(),
+            SettingsField::ShortcutFocusPane3 => self.keyboard_shortcuts.focus_pane_3 = previous.keyboard_shortcuts.focus_pane_3.clone(),
+            SettingsField::ShortcutFocusPane4 => self.keyboard_shortcuts.focus_pane_4 = previous.keyboard_shortcuts.focus_pane_4.clone(),
+            SettingsField::ShortcutFocusPane5 => self.keyboard_shortcuts.focus_pane_5 = previous.keyboard_shortcuts.focus_pane_5.clone(),
+            SettingsField::ShortcutFocusPane6 => self.keyboard_shortcuts.focus_pane_6 = previous.keyboard_shortcuts.focus_pane_6.clone(),
+            SettingsField::ShortcutFocusPane7 => self.keyboard_shortcuts.focus_pane_7 = previous.keyboard_shortcuts.focus_pane_7.clone(),
+            SettingsField::ShortcutFocusPane8 => self.keyboard_shortcuts.focus_pane_8 = previous.keyboard_shortcuts.focus_pane_8.clone(),
+            SettingsField::ShortcutFocusPane9 => self.keyboard_shortcuts.focus_pane_9 = previous.keyboard_shortcuts.focus_pane_9.clone(),
+            SettingsField::ShortcutNewChannel => self.keyboard_shortcuts.new_channel = previous.keyboard_shortcuts.new_channel.clone(),
+            SettingsField::ShortcutClonePane => self.keyboard_shortcuts.clone_pane = previous.keyboard_shortcuts.clone_pane.clone(),
+            SettingsField::ShortcutCloseFocusedColumn => self.keyboard_shortcuts.close_focused_column = previous.keyboard_shortcuts.close_focused_column.clone(),
+            SettingsField::ShortcutFindInPane => self.keyboard_shortcuts.find_in_pane = previous.keyboard_shortcuts.find_in_pane.clone(),
+            SettingsField::ShortcutSearchProjects => self.keyboard_shortcuts.search_projects = previous.keyboard_shortcuts.search_projects.clone(),
+            SettingsField::ShortcutPreviousColumn => self.keyboard_shortcuts.previous_column = previous.keyboard_shortcuts.previous_column.clone(),
+            SettingsField::ShortcutNextColumn => self.keyboard_shortcuts.next_column = previous.keyboard_shortcuts.next_column.clone(),
+            SettingsField::ShortcutCyclePaneWidth => self.keyboard_shortcuts.cycle_pane_width = previous.keyboard_shortcuts.cycle_pane_width.clone(),
+            SettingsField::ShortcutPreviousWorkspace => self.keyboard_shortcuts.previous_workspace = previous.keyboard_shortcuts.previous_workspace.clone(),
+            SettingsField::ShortcutNextWorkspace => self.keyboard_shortcuts.next_workspace = previous.keyboard_shortcuts.next_workspace.clone(),
+            SettingsField::PullRequestOpenTarget => self.pull_request_open_target = previous.pull_request_open_target,
+            SettingsField::ShortcutReviewToggleViewed => self.keyboard_shortcuts.review_toggle_viewed = previous.keyboard_shortcuts.review_toggle_viewed.clone(),
+            SettingsField::ShortcutReviewNextFile => self.keyboard_shortcuts.review_next_file = previous.keyboard_shortcuts.review_next_file.clone(),
+            SettingsField::ShortcutReviewPreviousFile => self.keyboard_shortcuts.review_previous_file = previous.keyboard_shortcuts.review_previous_file.clone(),
+            SettingsField::ShortcutReviewNextUnviewed => self.keyboard_shortcuts.review_next_unviewed = previous.keyboard_shortcuts.review_next_unviewed.clone(),
+            SettingsField::ShortcutReviewNextChange => self.keyboard_shortcuts.review_next_change = previous.keyboard_shortcuts.review_next_change.clone(),
+            SettingsField::ShortcutReviewPreviousChange => self.keyboard_shortcuts.review_previous_change = previous.keyboard_shortcuts.review_previous_change.clone(),
+        }
+    }
+
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -4387,6 +4560,11 @@ pub enum Message {
     DocumentToneStale,
     /// Opens the confirmation; `ConfirmResetSettings` performs the reset.
     ResetSettings,
+    ResetSettingsCategory(SettingsCategory),
+    OpenSettingsFile { reveal: bool },
+    SettingsFileOpened(Result<(), String>),
+    SettingsReloaded(Result<AppSettings, String>),
+    UndoSettingsReset,
     ConfirmResetSettings,
     CancelResetSettings,
     SessionSaveHealthChanged(SessionSaveHealthEvent),
@@ -4889,6 +5067,7 @@ pub struct Cagents {
     settings_save_generation: u64,
     settings_ack_generation: u64,
     settings_reset_generation: Option<u64>,
+    settings_reset_keys: Vec<String>,
     settings_save_lane: Arc<std::sync::Mutex<Option<SettingsSaved>>>,
     update_prepared: bool,
     update_flush_pending: bool,
@@ -4924,6 +5103,8 @@ pub struct Cagents {
     window_height: f32,
     core: Core,
     settings_path: Option<PathBuf>,
+    settings_reload_error: Option<String>,
+    settings_backup: Option<PathBuf>,
     settings_write_blocked: bool,
     /// Bounded notice history, fed from `status` at the end of every `update`.
     notices: NoticeLog,
@@ -9313,6 +9494,8 @@ impl Cagents {
                 &self.settings_search,
                 settings_ui::SettingsContext {
                     feedback: self.settings_feedback.as_ref(),
+                    reload_error: self.settings_reload_error.as_deref(),
+                    can_undo: self.settings_backup.is_some(),
                     invalid: &self.settings_invalid,
                     accounts: self.default_account_choices(),
                     updates: self.update_summary(),
@@ -12255,12 +12438,14 @@ impl Cagents {
             view,
             store: self.session.as_ref().map(SessionRuntime::operation_store),
             lane: Arc::clone(&self.settings_save_lane),
-            reset: self.settings_reset_generation.is_some(),
+            reset: self.settings_reset_generation,
+            reset_keys: self.settings_reset_keys.clone(),
         })
     }
 
     fn acknowledge_settings_save(&mut self, saved: SettingsSaved) {
         if saved.generation >= self.settings_ack_generation {
+            if let Some(backup) = saved.backup.clone() { self.settings_backup = Some(backup); }
             self.settings_ack_generation = saved.generation;
             self.settings_base = saved.settings;
             self.settings_path = Some(saved.path);
@@ -12591,7 +12776,8 @@ impl Cagents {
         {
             // Also re-applies the terminal theme.
             tasks.push(self.synchronize_appearance(previous.ui_scale));
-        } else if previous.terminal_theme != self.settings.terminal_theme {
+        } else if previous.terminal_theme != self.settings.terminal_theme
+            || previous.custom_terminal_theme != self.settings.custom_terminal_theme {
             self.synchronize_terminal_theme();
         }
         let (wrap_lines, syntax_theme) = (
@@ -12732,7 +12918,66 @@ impl Cagents {
         iced::widget::operation::focus(target).map(cosmic::Action::App)
     }
 
+    fn reload_settings(&mut self, result: Result<AppSettings, String>) -> Task<Message> {
+        match result {
+            Err(error) => {
+                self.status = Some(TransientNotice::error("Could not reload settings.toml; your working settings are still active.").key("settings-reload").details(error.clone()));
+                self.settings_reload_error = Some(error);
+                Task::none()
+            }
+            Ok(mut loaded) => {
+                // Geometry belongs to this window's saved view, not another
+                // window or the bootstrap snapshot watched on subscription.
+                loaded.sidebar_width = self.settings.sidebar_width;
+                loaded.inspector_width = self.settings.inspector_width;
+                self.notices.resolve("settings-reload");
+                if self.status.as_ref().is_some_and(|notice| notice.key.as_deref() == Some("settings-reload")) { self.status = None; }
+                self.settings_reload_error = None;
+                self.settings_write_blocked = false;
+                // Keep local changes that are still waiting for their save lane;
+                // this avoids an external write racing a debounced UI edit.
+                let next = match settings::merge_live(&self.settings_base, &self.settings, &loaded) {
+                    Ok(next) => next,
+                    Err(error) => return self.reload_settings(Err(error.to_string())),
+                };
+                self.settings_base = loaded;
+                let previous = std::mem::replace(&mut self.settings, next);
+                let mut draft = SettingsDraft::from_settings(&self.settings);
+                for field in self.settings_pending.keys().chain(self.settings_invalid.keys()).copied() {
+                    draft.preserve_field(&self.settings_draft, field);
+                }
+                self.settings_draft = draft;
+                self.synchronize_settings(&previous)
+            }
+        }
+    }
+
+    fn reset_settings_category(&mut self, category: SettingsCategory) -> Task<Message> {
+        let Ok(mut next) = toml::Value::try_from(&self.settings) else { return Task::none(); };
+        let Ok(defaults) = toml::Value::try_from(AppSettings::default()) else { return Task::none(); };
+        let table = next.as_table_mut().expect("settings table");
+        let mut keys: Vec<_> = SettingsField::PREFERENCES.iter().filter(|field| field.category() == category)
+            .map(|field| field.config_key()).collect();
+        if category == SettingsCategory::Keyboard { keys.push("keyboard_shortcuts".into()); }
+        if category == SettingsCategory::Notifications { keys.push("notifications".into()); }
+        if category == SettingsCategory::Terminal { keys.push("custom_terminal_theme".into()); }
+        if category == SettingsCategory::Editor { keys.push("language_servers".into()); }
+        self.settings_reset_keys = keys.clone();
+        for key in keys {
+            if let Some(default) = defaults.get(&key) { table.insert(key, default.clone()); }
+            else { table.remove(&key); }
+        }
+        let Ok(next) = next.try_into::<AppSettings>() else { return Task::none(); };
+        let Ok(next) = next.validate() else { return Task::none(); };
+        let previous = std::mem::replace(&mut self.settings, next);
+        self.settings_draft = SettingsDraft::from_settings(&self.settings);
+        self.settings_pending.retain(|field, _| field.category() != category);
+        self.settings_invalid.retain(|field, _| field.category() != category);
+        Task::batch([self.save_settings_task(true), self.synchronize_settings(&previous)])
+    }
+
     fn reset_settings(&mut self) -> Task<Message> {
+        self.settings_reset_keys.clear();
         let previous = std::mem::take(&mut self.settings);
         self.settings_draft = SettingsDraft::from_settings(&self.settings);
         self.settings_pending.clear();
@@ -12931,6 +13176,7 @@ impl Application for Cagents {
             settings_save_generation: 0,
             settings_ack_generation: 0,
             settings_reset_generation: None,
+            settings_reset_keys: Vec::new(),
             settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
             update_prepared: false,
             update_flush_pending: false,
@@ -12954,6 +13200,8 @@ impl Application for Cagents {
             window_width: 1_600.0,
             window_height: 900.0,
             settings_path,
+            settings_reload_error: status.clone(),
+            settings_backup: None,
             settings_write_blocked,
             notices: NoticeLog::default(),
             sidebar_model: SidebarModel::ready(SidebarMode::Expanded, sidebar_projects),
@@ -13058,7 +13306,7 @@ impl Application for Cagents {
             settings_generation: 0,
             settings_invalid: HashMap::new(),
             settings_save_error: None,
-            status: status.map(TransientNotice::error),
+            status: status.map(|error| TransientNotice::error("Could not load settings.toml; defaults are active.").key("settings-reload").details(error)),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
@@ -13069,8 +13317,12 @@ impl Application for Cagents {
         // by message, so distinct failures stay distinct and a repeated one
         // collapses into a count. The alternative this replaces was losing
         // cards with no diagnostic anywhere in the UI.
-        for warning in restore_warnings.into_iter().chain(settings_warnings) {
+        for warning in restore_warnings {
             app.notices.record(TransientNotice::warning(warning));
+        }
+        if !settings_warnings.is_empty() {
+            app.notices.record(TransientNotice::warning("Some settings could not be read.")
+                .key("settings-reload").details(settings_warnings.join("\n")));
         }
         if let Some(view) = window_view {
             app.sidebar_state.restore_view(view.sidebar);
@@ -14810,13 +15062,12 @@ impl Application for Cagents {
                     Ok(saved) => {
                         if saved.generation >= self.settings_ack_generation {
                             self.settings_save_error = None;
+                            self.notices.resolve("settings-save");
                         }
                         self.acknowledge_settings_save(saved);
                     }
                     Err(error) if generation >= self.settings_ack_generation => {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Could not save settings: {error}"
-                        )));
+                        self.status = Some(TransientNotice::warning("Could not save settings.").key("settings-save").details(error.clone()));
                         self.settings_save_error = Some(error);
                     }
                     Err(_) => {}
@@ -16215,6 +16466,54 @@ impl Application for Cagents {
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
             Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::SettingsReloaded(result) => self.reload_settings(result),
+            Message::ResetSettingsCategory(category) => self.reset_settings_category(category),
+            Message::UndoSettingsReset => {
+                let (Some(path), Some(backup)) = (self.settings_path.clone(), self.settings_backup.take()) else { return Task::none(); };
+                let lane = self.settings_save_lane.clone();
+                self.settings_save_generation += 1;
+                let generation = self.settings_save_generation;
+                self.settings_ack_generation = generation;
+                self.settings_reset_generation = None;
+                self.settings_base = self.settings.clone();
+                self.settings_pending.clear();
+                self.settings_invalid.clear();
+                let fallback = self.settings.clone();
+                cosmic::task::future(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let mut saved = lane.lock().map_err(|_| "Settings save lane unavailable".to_owned())?;
+                        settings::restore_backup(&path, backup).map_err(|error| error.to_string())?;
+                        let result = settings::load_live(&path);
+                        // Captured saves from before Undo cannot rewrite the
+                        // restored bytes after this lock is released.
+                        *saved = Some(SettingsSaved { generation, path,
+                            settings: result.as_ref().unwrap_or(&fallback).clone(),
+                            backup: None, reset: None });
+                        result
+                    }).await.map_err(|error| error.to_string()).and_then(|result| result);
+                    Message::SettingsReloaded(result)
+                })
+            }
+            Message::OpenSettingsFile { reveal } => {
+                let path = self.settings_path.clone().or_else(|| settings::default_path().ok());
+                let current = self.settings.clone();
+                cosmic::task::future(async move {
+                    let result = async {
+                        let path = path.ok_or_else(|| "Settings directory is unavailable".to_owned())?;
+                        let destination = path.clone();
+                        tokio::task::spawn_blocking(move || settings::ensure_file(destination, &current))
+                            .await.map_err(|error| error.to_string())?.map_err(|error| error.to_string())?;
+                        if reveal { file_manager::reveal(&path).await.map(|_| ()) }
+                        else { open_system_url(url::Url::from_file_path(&path).map_err(|_| "Settings path is invalid".to_owned())?).await }
+                    }.await;
+                    Message::SettingsFileOpened(result)
+                })
+            }
+            Message::SettingsFileOpened(result) => {
+                if result.is_ok() { self.notices.resolve("settings-file"); }
+                if let Err(error) = result { self.status = Some(TransientNotice::error("Could not open settings.toml").key("settings-file").details(error)); }
+                Task::none()
+            }
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -16565,6 +16864,7 @@ impl Application for Cagents {
             if self.notices.entries.iter().any(|entry| entry.expires_at.is_some()) {
                 iced::time::every(Duration::from_secs(1)).map(Message::ExpireNotices)
             } else { Subscription::none() },
+            self.settings_path.clone().map_or_else(Subscription::none, |path| Subscription::run_with(path, settings_watch::stream).map(Message::SettingsReloaded)),
             self.chat_subscription(),
             self.notification_subscription(),
             Subscription::run(crate::daemon_health::stream).map(Message::DaemonHealth),
@@ -17386,6 +17686,7 @@ impl Application for Cagents {
         let surface: Element<'_, Message> = widget::column::with_children(vec![
             surface,
             self.daemon_health_banner(),
+            self.settings_reload_banner(),
             self.automation_approval_banner(),
             bar,
         ])
@@ -19435,7 +19736,7 @@ mod tests {
                 if let Some(mut stream) = iced::runtime::task::into_stream(task) {
                     while let Some(action) = stream.next().await {
                         if let iced::runtime::Action::Output(cosmic::Action::App(
-                            message @ Message::SettingsSaved { .. },
+                            message @ (Message::SettingsSaved { .. } | Message::SettingsReloaded(_)),
                         )) = action
                         {
                             let _ = app.update(message);
@@ -19443,6 +19744,50 @@ mod tests {
                     }
                 }
             });
+    }
+
+    #[test]
+    fn external_settings_edits_apply_in_every_window_and_reject_invalid_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut first = context_inspector_test_app(false);
+        let mut second = context_inspector_test_app(false);
+        for app in [&mut first, &mut second] {
+            app.settings_path = Some(path.clone());
+            app.settings_write_blocked = false;
+        }
+        first.settings.terminal_font_size = 21.0;
+        first.save_settings_now().unwrap();
+        drop(second.update(Message::SettingsReloaded(settings::load_live(&path))));
+        assert_eq!(second.settings.terminal_font_size, 21.0);
+        std::fs::write(&path, "schema_version = 3\nterminal_font_size = -5\n").unwrap();
+        drop(second.update(Message::SettingsReloaded(settings::load_live(&path))));
+        assert_eq!(second.settings.terminal_font_size, 21.0);
+        assert!(second.settings_reload_error.is_some());
+        assert!(second.notices.recent().any(|entry| entry.notice.key.as_deref() == Some("settings-reload")));
+        settings::save(&path, &first.settings).unwrap();
+        drop(second.update(Message::SettingsReloaded(settings::load_live(&path))));
+        assert!(second.settings_reload_error.is_none());
+        assert!(!second.notices.recent().any(|entry| entry.notice.key.as_deref() == Some("settings-reload")));
+    }
+
+    #[test]
+    fn settings_reset_save_records_recoverable_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = format!("# retained comment\n{}", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &original).unwrap();
+        app.settings_reset_generation = Some(app.settings_save_generation + 1);
+        let saved = app.capture_settings_save().unwrap().run().unwrap();
+        app.acknowledge_settings_save(saved);
+        let backup = app.settings_backup.as_ref().unwrap();
+        assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
+        settings::restore_backup(&path, backup).unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
     }
 
     #[test]
@@ -19484,6 +19829,57 @@ mod tests {
         app.acknowledge_settings_save(second_ack);
         app.acknowledge_settings_save(first_ack);
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, original);
+    }
+
+    #[test]
+    fn settings_undo_action_restores_bytes_and_fences_earlier_saves() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = format!("# my configuration\n{}", std::fs::read_to_string(&path).unwrap());
+        std::fs::write(&path, &original).unwrap();
+        let reset = app.reset_settings();
+        settle_settings_task(&mut app, reset);
+        assert!(app.settings_backup.is_some());
+        app.settings.terminal_font_size = 24.0;
+        let older_save = app.capture_settings_save().unwrap();
+        let undo = app.update(Message::UndoSettingsReset);
+        settle_settings_task(&mut app, undo);
+        older_save.run().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn settings_external_reload_refreshes_controls_but_preserves_invalid_drafts() {
+        let mut app = context_inspector_test_app(false);
+        let field = SettingsField::TerminalFontSize;
+        app.settings_draft.set(field, "unfinished".into());
+        app.settings_invalid.insert(field, "Enter a valid number".into());
+        let mut external = app.settings.clone();
+        external.custom_terminal_theme = Some(crate::terminal::TerminalTheme::Dark.palette());
+        drop(app.reload_settings(Ok(external)));
+        assert!(app.settings_draft.has_custom_terminal_theme);
+        assert_eq!(app.settings_draft.terminal_font_size, "unfinished");
+    }
+
+    #[test]
+    fn repeated_settings_reset_saves_keep_the_first_recovery_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let original = std::fs::read(&path).unwrap();
+        app.settings_reset_generation = Some(app.settings_save_generation + 1);
+        let first = app.capture_settings_save().unwrap().run().unwrap();
+        app.settings.terminal_font_size = 22.0;
+        let second = app.capture_settings_save().unwrap().run().unwrap();
+        assert_eq!(first.backup, second.backup);
+        assert_eq!(std::fs::read(second.backup.unwrap()).unwrap(), original);
     }
 
     #[test]
@@ -25269,6 +25665,7 @@ mod tests {
             settings_save_generation: 0,
             settings_ack_generation: 0,
             settings_reset_generation: None,
+            settings_reset_keys: Vec::new(),
             settings_save_lane: Arc::new(std::sync::Mutex::new(None)),
             update_prepared: false,
             update_flush_pending: false,
@@ -25297,6 +25694,8 @@ mod tests {
             window_height: 900.0,
             core,
             settings_path: None,
+            settings_reload_error: None,
+            settings_backup: None,
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
             retained_outputs: HashMap::new(),
