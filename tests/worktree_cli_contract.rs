@@ -1507,3 +1507,94 @@ time.sleep(600)
     let device_service::Reply::Worktree(Reply::SetupIntent {intent,..})=client.device_operation(device_service::Operation::Worktree{operation:Operation::SetupIntent{repository:project,path:path.clone()}}).unwrap() else {panic!("wrong retained intent");};
     assert_eq!(serde_json::from_str::<Value>(&intent).unwrap(),before);
 }
+
+
+#[test]
+fn edited_pending_setup_cannot_use_a_current_runs_trust_for_a_different_recipe() {
+    use cagents::{
+        device_service,
+        model::{CardId, CardKind, LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
+        repository::WorktreeSetupIntent,
+        workspace_model::{ModelEdit, views::{Change, Pane, Scope}},
+        worktree_control::{Operation, Reply},
+    };
+    let fixture = Fixture::new();
+    let project = fixture.root.path().join("project");
+    let path = fixture.create("edited-pending");
+    fs::create_dir(project.join(".cagents")).unwrap();
+    fs::write(project.join(".cagents/worktree.toml"), "setup = \"printf approved > approved-setup\"\n").unwrap();
+    let plan = cagents::worktree_setup::load(&project).unwrap().unwrap();
+    cagents::worktree_setup::trust(&project, &plan, &cagents::repository::CancellationToken::new()).unwrap();
+    let command = plan.terminal_command().unwrap();
+    let mut intent: WorktreeSetupIntent = serde_json::from_value(fixture.setup_intent(&path)).unwrap();
+    intent.skip = false; intent.copy_done = true; intent.plan = Some(plan);
+    let run = intent.run_id.unwrap();
+    // Model a crash after an approved preparation but before the first child.
+    // All creation/registration/generation authority is the real settled receipt.
+    let journal = fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("worktree-operations.sqlite3");
+    let connection = rusqlite::Connection::open(&journal).unwrap();
+    assert_eq!(connection.execute("UPDATE pending_operations SET payload_json=json_set(payload_json,'$.request.setup_intent',json(?1)) WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?2",rusqlite::params![serde_json::to_string(&intent).unwrap(),path.to_str().unwrap()]).unwrap(),1);
+    drop(connection);
+    let socket = fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let mut client = cagents::control::ControlClient::connect(&socket).unwrap();
+    let repository = project.join(".git");
+    let device_service::Reply::Worktree(Reply::SetupIntent { creation_id, .. }) = client.device_operation(device_service::Operation::Worktree {
+        operation: Operation::SetupIntent { repository: repository.clone(), path: path.clone() },
+    }).unwrap() else { panic!("wrong setup metadata"); };
+    let canonical = LaunchRecipe {
+        program: "/bin/sh".into(), arguments: vec!["-c".into(), command], working_directory: path.clone(),
+        environment: [
+            ("CAGENTS_WORKTREE_SETUP".into(), "1".into()),
+            ("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string()),
+            ("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(), creation_id.to_string()),
+        ].into(), unset_environment: Default::default(),
+    };
+    let terminal = TerminalId::new();
+    let pane_id = CardId::new();
+    let scope = Scope::Worktree { repository, path: path.clone() };
+    let session = |recipe: LaunchRecipe| TerminalSession {
+        id: terminal, launch: recipe.clone(), transcript_path: None, resume_hint: None,
+        owned_codex_listener: None, recovery_origin: None, predecessor: None,
+        continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None },
+    };
+    client.edit_workspace_model(ModelEdit::SeedView {
+        scope: scope.clone(), panes: vec![Pane {
+            id: pane_id, title: "Worktree setup".into(), user_title: None, pending_terminal_start: true,
+            width_fraction: 1.0, kind: CardKind::Terminal(session(canonical.clone())), scope: Some(path.clone()),
+        }], closed: vec![],
+    }).unwrap();
+    let mut altered = Vec::new();
+    let mut recipe = canonical.clone(); recipe.arguments[1] = "printf unreviewed > unauthorized-setup".into(); altered.push(recipe);
+    let mut recipe = canonical.clone(); recipe.program = "/bin/bash".into(); altered.push(recipe);
+    let mut recipe = canonical.clone(); recipe.environment.insert("ENV".into(), path.join("unreviewed-env").to_string_lossy().into_owned()); altered.push(recipe);
+    let mut recipe = canonical.clone(); recipe.unset_environment.insert("PATH".into()); altered.push(recipe);
+    for (approved, recipe) in altered.into_iter().map(|recipe| (false, recipe)).chain(std::iter::once((true, canonical))) {
+        let model = client.read_workspace_model().unwrap();
+        let view = model.views.iter().find(|view| view.scope == scope).unwrap();
+        let before = view.panes.iter().find(|pane| pane.id == pane_id).unwrap().clone();
+        let mut pane = before.clone(); pane.kind = CardKind::Terminal(session(recipe.clone()));
+        client.edit_workspace_model(ModelEdit::ChangeView {
+            scope: scope.clone(), expected_revision: view.revision, operation: uuid::Uuid::new_v4(),
+            change: Change::Update { before, pane },
+        }).unwrap();
+        let result = client.start_worktree_setup(pane_id, terminal, run, Default::default());
+        if approved {
+            result.unwrap();
+        } else {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("differs from its reviewed configuration"), "{error:?}");
+            assert!(!path.join("approved-setup").exists());
+            assert!(!path.join("unauthorized-setup").exists());
+            assert!(client.list().unwrap().is_empty());
+            let current: WorktreeSetupIntent = serde_json::from_value(fixture.setup_intent(&path)).unwrap();
+            assert_eq!(current, intent);
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.join("approved-setup").exists() {
+        assert!(Instant::now() < deadline, "canonical approved command must still execute");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!path.join("unauthorized-setup").exists());
+    assert_eq!(client.close_terminal_checked(terminal, false).unwrap(), cagents::terminal_ipc::TerminalCloseResult::Closed);
+}

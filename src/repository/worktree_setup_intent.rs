@@ -25,6 +25,42 @@ impl WorktreeSetupPlan {
     pub fn requires_trust(&self) -> bool {
         !self.commands.is_empty()
     }
+
+    /// The shell program prepared from this exact reviewed configuration.
+    pub fn terminal_command(&self) -> Option<String> {
+        (!self.commands.is_empty()).then(|| {
+            self.commands.iter()
+                .map(|command| format!("/bin/sh -c '{}'", command.replace('\'', "'\\''")))
+                .collect::<Vec<_>>().join(" && ")
+        })
+    }
+
+    /// Pane edits do not confer new setup authority. Only the canonical shell
+    /// recipe and inert setup identity/timestamp metadata may use this plan.
+    pub(crate) fn matches_terminal_recipe(
+        &self,
+        recipe: &crate::model::LaunchRecipe,
+        destination: &Path,
+        creation: OperationId,
+        run: OperationId,
+    ) -> bool {
+        let Some(command) = self.terminal_command() else { return false; };
+        let mut expected = std::collections::BTreeMap::from([
+            ("CAGENTS_WORKTREE_SETUP".to_owned(), "1".to_owned()),
+            ("CAGENTS_WORKTREE_SETUP_ID".to_owned(), run.to_string()),
+            ("CAGENTS_WORKTREE_SETUP_CREATION_ID".to_owned(), creation.to_string()),
+        ]);
+        if let Some(started) = recipe.environment.get("CAGENTS_WORKTREE_SETUP_STARTED_AT") {
+            let Ok(value) = started.parse::<u64>() else { return false; };
+            if value.to_string() != *started { return false; }
+            expected.insert("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), started.clone());
+        }
+        recipe.program == "/bin/sh"
+            && recipe.arguments == ["-c".to_owned(), command]
+            && recipe.working_directory == destination
+            && recipe.environment == expected
+            && recipe.unset_environment.is_empty()
+    }
 }
 
 /// Retained intent is evidence for explicit recovery, never permission to
@@ -655,6 +691,39 @@ mod tests {
             "replacement lease inode must not inherit execution authority"
         );
         drop(old);
+    }
+
+    #[test]
+    fn setup_plan_accepts_only_its_canonical_terminal_recipe() {
+        let creation = OperationId::new();
+        let run = OperationId::new();
+        let destination = Path::new("/reviewed-checkout");
+        let plan = WorktreeSetupPlan {
+            copy: Vec::new(), commands: vec!["printf '%s' quoted".into(), "false".into()],
+            fingerprint: "exact-reviewed-config".into(),
+        };
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/sh".into(), arguments: vec!["-c".into(), plan.terminal_command().unwrap()],
+            working_directory: destination.to_owned(),
+            environment: [
+                ("CAGENTS_WORKTREE_SETUP".into(), "1".into()),
+                ("CAGENTS_WORKTREE_SETUP_ID".into(), run.to_string()),
+                ("CAGENTS_WORKTREE_SETUP_CREATION_ID".into(), creation.to_string()),
+            ].into(), unset_environment: Default::default(),
+        };
+        assert!(plan.matches_terminal_recipe(&recipe, destination, creation, run));
+        let mut timestamped = recipe.clone();
+        timestamped.environment.insert("CAGENTS_WORKTREE_SETUP_STARTED_AT".into(), "123".into());
+        assert!(plan.matches_terminal_recipe(&timestamped, destination, creation, run));
+        let mut changed = recipe.clone(); changed.program = "/bin/bash".into();
+        assert!(!plan.matches_terminal_recipe(&changed, destination, creation, run));
+        changed = recipe.clone(); changed.arguments[1] = "touch unreviewed".into();
+        assert!(!plan.matches_terminal_recipe(&changed, destination, creation, run));
+        changed = recipe.clone(); changed.environment.insert("ENV".into(), "/unreviewed-script".into());
+        assert!(!plan.matches_terminal_recipe(&changed, destination, creation, run));
+        changed = recipe.clone(); changed.unset_environment.insert("PATH".into());
+        assert!(!plan.matches_terminal_recipe(&changed, destination, creation, run));
+        assert!(!plan.matches_terminal_recipe(&recipe, destination, creation, OperationId::new()));
     }
 
     #[test]

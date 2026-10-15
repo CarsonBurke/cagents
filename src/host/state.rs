@@ -3559,6 +3559,11 @@ fn worktree_setup_run_guard(
     {
         return Err(invalid("This setup run was superseded, skipped or is not prepared; review its current intent before starting".into()));
     }
+    if !intent.plan.as_ref().is_some_and(|plan| {
+        plan.matches_terminal_recipe(recipe, &request.destination, creation, run)
+    }) {
+        return Err(invalid("This setup terminal recipe differs from its reviewed configuration; review setup again before starting".into()));
+    }
     let saved_common =
         serde_json::from_value::<std::path::PathBuf>(guard.operation.payload["common_dir"].clone())
             .map_err(|error| invalid(error.to_string()))?;

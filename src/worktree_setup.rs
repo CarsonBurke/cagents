@@ -606,13 +606,7 @@ fn prepare_inner(
         return Err(SetupError::TrustRequired);
     }
     verify_generation()?;
-    result.command = (!plan.commands.is_empty()).then(|| {
-        plan.commands
-            .iter()
-            .map(|command| format!("/bin/sh -c '{}'", command.replace('\'', "'\\''")))
-            .collect::<Vec<_>>()
-            .join(" && ")
-    });
+    result.command = plan.terminal_command();
     Ok(result)
 }
 
