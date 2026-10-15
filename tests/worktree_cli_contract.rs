@@ -132,6 +132,7 @@ fn untrusted_setup_refuses_before_creation_no_setup_skips_and_trusted_copy_uses_
     while !path.join("setup-result").exists() {assert!(Instant::now()<deadline,"setup terminal did not run: {created}");thread::sleep(Duration::from_millis(20));}
     assert_eq!(fs::read_to_string(path.join("setup-result")).unwrap(),"ready");
     assert_eq!(created["setup"]["terminal"]["launch"]["environment"]["CAGENTS_WORKTREE_SETUP"],"1");
+    assert!(created["setup"]["terminal"]["launch"]["environment"]["CAGENTS_WORKTREE_SETUP_STARTED_AT"].as_str().unwrap().parse::<u64>().unwrap()>0);
 }
 
 #[test]
