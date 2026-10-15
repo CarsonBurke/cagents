@@ -5,6 +5,7 @@ pub(super) fn stream(agent: &str, follow: bool, format: &str, json_output: bool)
     let agent = session.agent(agent)?;
     let mut cursor = None;
     let mut first = true;
+    let mut markdown_output=Markdown::default();
     let mut out = io::BufWriter::new(io::stdout().lock());
     loop {
         let Reply::Transcript(page) = session.call(Operation::Transcript { agent, cursor: cursor.clone() })? else {
@@ -24,12 +25,16 @@ pub(super) fn stream(agent: &str, follow: bool, format: &str, json_output: bool)
                     .map_err(|e| AppError::new("output", e))?;
             }
             for part in &page.parts {
-                write!(out, "{}", markdown(part)).map_err(|e| AppError::new("output", e))?;
+                write!(out, "{}", markdown_output.part(part)).map_err(|e| AppError::new("output", e))?;
             }
+        }
+        let finished=page.at_end && (!follow || page.closed);
+        if finished && !(json_output || format=="json") {
+            write!(out,"{}",markdown_output.finish()).map_err(|e|AppError::new("output",e))?;
         }
         out.flush().map_err(|e| AppError::new("output", e))?;
         first = false;
-        if page.at_end && (!follow || page.closed) { break; }
+        if finished { break; }
         if !page.at_end && page.next == cursor {
             return Err(AppError::new("agent.transcript", "Transcript cursor did not advance"));
         }
@@ -45,15 +50,28 @@ fn fenced(body: &str) -> String {
     format!("{fence}text\n{body}\n{fence}\n\n")
 }
 
-fn markdown(part: &crate::agent_execution::TranscriptPart) -> String {
+#[derive(Default)]
+struct Markdown { open_prose:Option<String> }
+impl Markdown {
+    fn part(&mut self,part:&crate::agent_execution::TranscriptPart)->String {
+        let prose=matches!(&part.item.content,crate::chat::ItemContent::Text{..}|crate::chat::ItemContent::Delivery{..});
+        let continuation=prose && self.open_prose.as_deref()==Some(part.item.id.as_str());
+        let mut output=if self.open_prose.is_some() && !continuation {self.finish()} else {String::new()};
+        output.push_str(&markdown(part,!continuation));
+        if prose {self.open_prose=Some(part.item.id.clone());}
+        output
+    }
+    fn finish(&mut self)->&'static str {if self.open_prose.take().is_some(){"\n\n"}else{""}}
+}
+fn markdown(part: &crate::agent_execution::TranscriptPart,heading:bool) -> String {
     use crate::chat::{ItemContent, Role};
-    let mut output = if part.offset == 0 {
+    let mut output = if heading && part.offset == 0 {
         format!("## {}\n\n", match part.item.role { Role::User => "User", Role::Assistant => "Assistant", Role::System => "System" })
     } else { String::new() };
     match &part.item.content {
         ItemContent::Text { text, thinking, .. } => {
-            if *thinking && part.offset == 0 { output.push_str("*Thinking*\n\n"); }
-            output.push_str(text); if part.complete { output.push_str("\n\n"); }
+            if *thinking && heading && part.offset == 0 { output.push_str("*Thinking*\n\n"); }
+            output.push_str(text);
         }
         ItemContent::Command { command, output: body, .. } => {
             if part.offset == 0 { output.push_str(&format!("Command: `{command}`\n\n")); }
@@ -73,7 +91,7 @@ fn markdown(part: &crate::agent_execution::TranscriptPart) -> String {
             output.push('\n');
         }
         ItemContent::Image { path, description } => output.push_str(&format!("![{description}]({path})\n\n")),
-        ItemContent::Delivery { summary, body, .. } => { if part.offset == 0 { output.push_str(&format!("{summary}\n\n")); } output.push_str(body); if part.complete { output.push_str("\n\n"); } }
+        ItemContent::Delivery { summary, body, .. } => { if heading && part.offset == 0 { output.push_str(&format!("{summary}\n\n")); } output.push_str(body); }
     }
     if part.attachment_omitted { output.push_str("> An oversized attachment path was omitted.\n\n"); }
     output
@@ -83,6 +101,26 @@ fn markdown(part: &crate::agent_execution::TranscriptPart) -> String {
 mod tests {
     use super::*;
     #[test]
+    fn markdown_follow_preserves_a_word_across_caught_up_polls() {
+        let part=|id:&str,text:&str,offset|crate::agent_execution::TranscriptPart{item:crate::chat::Item{id:id.into(),role:crate::chat::Role::Assistant,content:crate::chat::ItemContent::Text{text:text.into(),thinking:false,phase:crate::chat::Phase::Final},at:None,started_at:None},offset,complete:true,attachment_omitted:false};
+        let mut renderer=Markdown::default();
+        let mut output=renderer.part(&part("stream","Hel",0));
+        output.push_str(&renderer.part(&part("stream","lo",3)));
+        assert_eq!(output,"## Assistant\n\nHello");
+        output.push_str(&renderer.part(&part("next","Next item",0)));
+        output.push_str(renderer.finish());
+        assert_eq!(output,"## Assistant\n\nHello\n\n## Assistant\n\nNext item\n\n");
+    }
+    #[test]
+    fn markdown_follow_empty_placeholder_does_not_repeat_heading() {
+        let mut part=crate::agent_execution::TranscriptPart{item:crate::chat::Item{id:"stream".into(),role:crate::chat::Role::Assistant,content:crate::chat::ItemContent::Text{text:String::new(),thinking:false,phase:crate::chat::Phase::Final},at:None,started_at:None},offset:0,complete:true,attachment_omitted:false};
+        let mut renderer=Markdown::default();let mut output=renderer.part(&part);
+        if let crate::chat::ItemContent::Text{text,..}=&mut part.item.content {*text="Hello".into();}
+        output.push_str(&renderer.part(&part));output.push_str(renderer.finish());
+        assert_eq!(output,"## Assistant\n\nHello\n\n");
+    }
+
+    #[test]
     fn transcript_arguments_and_markdown_preserve_user_and_assistant_text() {
         for args in [vec!["cagents", "agent", "transcript", "reviewer"], vec!["cagents", "agent", "transcript", "reviewer", "--follow", "--format", "json"]] {
             assert!(Cli::try_parse_from(args).is_ok());
@@ -91,6 +129,7 @@ mod tests {
             id: "message".into(), role: crate::chat::Role::Assistant, content: crate::chat::ItemContent::Text {
                 text: "Readable transcript".into(), thinking: false, phase: crate::chat::Phase::Final }, at: None, started_at: None,
         }, offset: 0, complete: true, attachment_omitted: false };
-        assert_eq!(markdown(&part), "## Assistant\n\nReadable transcript\n\n");
+        let mut renderer=Markdown::default();
+        assert_eq!(format!("{}{}",renderer.part(&part),renderer.finish()), "## Assistant\n\nReadable transcript\n\n");
     }
 }
