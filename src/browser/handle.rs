@@ -52,8 +52,9 @@ impl KeyboardInput {
             "AltLeft" | "AltRight" => {
                 self.modifiers.alt = remaining("AltLeft", "AltRight");
             }
-            "SuperLeft" | "SuperRight" => {
-                self.modifiers.meta = remaining("SuperLeft", "SuperRight");
+            "SuperLeft" | "SuperRight" | "MetaLeft" | "MetaRight" => {
+                self.modifiers.meta = remaining("MetaLeft", "MetaRight")
+                    || remaining("SuperLeft", "SuperRight");
             }
             _ => {}
         }
@@ -1071,8 +1072,13 @@ mod tests {
                     control: kind == 0, shift: kind == 1,
                     alt: kind == 2, meta: kind == 3, ..Default::default()
                 };
+                let code_name = |code| match code {
+                    Code::SuperLeft => "MetaLeft".into(),
+                    Code::SuperRight => "MetaRight".into(),
+                    _ => format!("{code:?}"),
+                };
                 let input = |state, code, location| BrowserInput::Key {
-                    state, key: name.into(), code: format!("{code:?}"), location,
+                    state, key: name.into(), code: code_name(code), location,
                     modifiers: expected_modifiers,
                     repeat: false, composing: false,
                 };
@@ -1091,9 +1097,9 @@ mod tests {
                     }) = command { Some((code, location, modifiers)) } else { None }
                 }).collect();
                 assert_eq!(releases.len(), 2);
-                assert_eq!(releases[0].0, format!("{:?}", keys[1].0));
+                assert_eq!(releases[0].0, code_name(keys[1].0));
                 assert_eq!(releases[0].1, keys[1].1);
-                assert_eq!(releases[1].0, format!("{:?}", keys[0].0));
+                assert_eq!(releases[1].0, code_name(keys[0].0));
                 assert_eq!(releases[1].1, keys[0].1);
                 assert_eq!(releases[0].2, expected_modifiers);
                 assert_eq!(releases[1].2, BrowserModifiers::default());
