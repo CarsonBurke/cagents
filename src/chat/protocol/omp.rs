@@ -241,6 +241,9 @@ impl Omp {
         let id = format!("cagents-{}", self.sequence);
         if kind == "get_state" {
             self.state_request = Some(id.clone());
+            // Every replacement is issued after the compact ACK too. Keep
+            // the completion phase while the latest-state fence advances.
+            if let Some(probe)=self.compaction_probe.as_mut() {*probe=id.clone();}
             if let Some((probe, _)) = self
                 .execution
                 .as_mut()
@@ -2588,6 +2591,22 @@ mod tests {
         let ended=adapter.receive(json!({"type":"auto_compaction_end"})).unwrap();
         assert!(ended.events.contains(&Event::Compaction {active:false}));
         assert!(!ended.events.iter().any(|event|matches!(event,Event::TurnFinished{..})));
+    }
+
+    #[test]
+    fn post_ack_compaction_probe_survives_a_superseding_refresh() {
+        let mut adapter=Omp {ready:true,session_id:Some("same".into()),..Default::default()};
+        let requested=adapter.command(Command::Compact).unwrap();
+        let acknowledged=adapter.receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}})).unwrap();
+        let old=acknowledged.writes.iter().find(|frame|frame["type"]=="get_state").unwrap();
+        let refreshed=adapter.command(Command::Refresh).unwrap();
+        let current=refreshed.writes.iter().find(|frame|frame["type"]=="get_state").unwrap();
+        assert_ne!(old["id"],current["id"]);
+        let old=adapter.receive(json!({"type":"response","id":old["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(old.events.is_empty(),"superseded state replies remain fenced");
+        let current=adapter.receive(json!({"type":"response","id":current["id"],"command":"get_state","success":true,"data":{"sessionId":"same","isStreaming":false,"isCompacting":false}})).unwrap();
+        assert!(current.events.contains(&Event::Compaction {active:false}));
+        assert!(!adapter.compaction_active);
     }
 
     #[test]
