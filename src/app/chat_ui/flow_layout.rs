@@ -16,7 +16,12 @@ type ParagraphBuffer = <cosmic::Renderer as iced::advanced::text::Renderer>::Par
 use std::{cell::RefCell, rc::Rc};
 
 #[derive(Clone, Default)]
-pub(super) struct Cache(Rc<RefCell<HashMap<u64, std::rc::Weak<RefCell<Entry>>>>>);
+pub(super) struct Cache(Rc<RefCell<Entries>>);
+#[derive(Default)]
+struct Entries {
+    logical: HashMap<u64, std::rc::Weak<RefCell<Entry>>>,
+    requests: HashMap<u64, std::rc::Weak<RefCell<Entry>>>,
+}
 pub(super) type Handle = Rc<RefCell<Entry>>;
 
 pub(super) struct Entry {
@@ -79,7 +84,7 @@ impl Cache {
     }
     fn source_entry(&self, identity: u64, source: Source) -> Handle {
         let mut entries = self.0.borrow_mut();
-        if let Some(entry) = entries.get(&identity).and_then(std::rc::Weak::upgrade) {
+        if let Some(entry) = entries.logical.get(&identity).and_then(std::rc::Weak::upgrade) {
             let reusable = source.extends(&entry.borrow().source);
             if reusable {
                 let mut current = entry.borrow_mut();
@@ -100,14 +105,21 @@ impl Cache {
             source_len, source_revision: 0, ready_revision: None,
             key: None, attempt: 0, requested: false, deferred: None, failed: false, ready: None,
             cancelled: Arc::new(AtomicBool::new(false)) }));
-        entries.insert(identity, Rc::downgrade(&entry));
+        // Prune in batches rather than walking visited history on each
+        // request or keeping an unbounded set of dead presentation headers.
+        if entries.logical.len() >= 256 || entries.requests.len() >= 256 {
+            entries.logical.retain(|_, entry| entry.strong_count() != 0);
+            entries.requests.retain(|_, entry| entry.strong_count() != 0);
+        }
+        entries.logical.insert(identity, Rc::downgrade(&entry));
+        entries.requests.insert(entry.borrow().id, Rc::downgrade(&entry));
         entry
     }
     pub(super) fn find(&self, id: u64) -> Option<Handle> {
-        self.0.borrow().values().filter_map(std::rc::Weak::upgrade).find(|entry| entry.borrow().id == id)
+        self.0.borrow().requests.get(&id).and_then(std::rc::Weak::upgrade)
     }
     pub(super) fn retained_bytes(&self) -> usize {
-        self.0.borrow().values().filter_map(std::rc::Weak::upgrade).filter_map(|entry| entry.borrow().ready.clone())
+        self.0.borrow().logical.values().filter_map(std::rc::Weak::upgrade).filter_map(|entry| entry.borrow().ready.clone())
             .map(|prepared| prepared.snapshot.retained_bytes()).sum()
     }
 }
@@ -597,4 +609,18 @@ fn continuous_append_publishes_versioned_progress_and_eventually_exact_final_geo
     let replacement = cache.markdown_entry(7, text(&rewrite), style);
     assert!(!Rc::ptr_eq(&entry, &replacement));
     assert!(!replacement.borrow().accepts(&pending), "old rendered source cannot cross a rewrite");
+}
+
+#[test]
+fn request_lookup_does_not_retain_visited_flow_owners() {
+    let cache = Cache::default();
+    let active = cache.entry(0, vec![Span::new("active")].into());
+    let id = active.borrow().id;
+    for identity in 1..10_000 { drop(cache.entry(identity, vec![Span::new("visited")].into())); }
+    assert!(Rc::ptr_eq(&cache.find(id).expect("active request"), &active));
+    assert!(cache.0.borrow().logical.len() <= 256);
+    assert!(cache.0.borrow().requests.len() <= 256);
+    let weak = Rc::downgrade(&active); drop(active);
+    assert!(weak.upgrade().is_none());
+    assert!(cache.find(id).is_none());
 }
