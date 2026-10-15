@@ -1607,8 +1607,9 @@ impl Runtime {
             .padding(iced::Padding::new(step::GAP_M))
             .width(Length::Fill);
         let transcript_index = content.len();
-        let (catalog, bookmark) = self.selection_document();
-        let selected_transcript = selection::transcript_virtualized(
+        let selected_transcript = if self.visible.load(Ordering::Relaxed) {
+            let (catalog, bookmark) = self.selection_document();
+            crate::ui_memory::gate(selection::transcript_virtualized(
             scroll::transcript_observed(
                 transcript,
                 target,
@@ -1639,7 +1640,10 @@ impl Runtime {
             self.selected_subagent.as_deref(),
             catalog,
             bookmark,
-        );
+            ))
+        } else {
+            crate::ui_memory::gate(widget::Space::new().width(Length::Fill).height(Length::Fill))
+        };
         content.push(widget::column::with_children(vec![find_bar, selected_transcript])
             .spacing(if self.find.is_some() { step::GAP_S } else { 0.0 })
             .height(Length::Fill)
