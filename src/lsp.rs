@@ -3653,6 +3653,9 @@ struct RetiringSession {
 #[derive(Default)]
 struct SessionActivity {
     documents: HashSet<LspDocumentId>,
+    // Resource refreshes also need a routing identity after the final tab closes.
+    // The application refreshes global metrics before resolving that tab.
+    last_document: Option<LspDocumentId>,
     // Monotonic ticks relative to the manager's epoch, convenient for fake-clock tests.
     last_used: Duration,
 }
@@ -4152,6 +4155,7 @@ impl LspManager {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             activity.documents.insert(doc);
+            activity.last_document = Some(doc);
             activity.last_used = self.epoch.elapsed();
         }
         handle.status()
@@ -4836,7 +4840,11 @@ impl LspManager {
                     expired
                 };
                 if expired {
+                    let doc = watched.activity.lock().unwrap_or_else(|error| error.into_inner()).last_document;
                     retire_from_watchdog(watched).await;
+                    if let Some(doc) = doc {
+                        events.emit_now(LspEvent::Resources { doc });
+                    }
                     break;
                 }
                 if watched.retired.load(Ordering::Acquire) || watched.commands.is_closed() {
@@ -4847,7 +4855,7 @@ impl LspManager {
                     .await
                     .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
                 {
-                    let doc=watched.activity.lock().unwrap_or_else(|error|error.into_inner()).documents.iter().copied().next();
+                    let doc = watched.activity.lock().unwrap_or_else(|error| error.into_inner()).last_document;
                     retire_from_watchdog(watched).await;
                     // Refresh cached inspector metrics even when this was the
                     // final server, so no other watchdog remains to refresh it.
@@ -4883,10 +4891,7 @@ impl LspManager {
                     .activity
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
-                    .documents
-                    .iter()
-                    .next()
-                    .copied();
+                    .last_document;
                 // One wake per server refresh, independent of its tab count.
                 if let Some(doc) = doc {
                     events.emit_now(LspEvent::Resources { doc });
@@ -5443,6 +5448,7 @@ mod tests {
     fn idle_state_uses_monotonic_fake_clock_and_never_evicts_open_documents() {
         let mut activity = SessionActivity {
             documents: HashSet::new(),
+            last_document: None,
             last_used: Duration::from_secs(20),
         };
         let timeout = Duration::from_secs(600);
@@ -5688,6 +5694,11 @@ mod tests {
             manager.close(LspDocumentId(2));
             handle.wait_for("shutdown").await;
             handle.wait_for("exit").await;
+            next_matching(&events, |event| match event {
+                LspEvent::Resources { doc } if *doc == LspDocumentId(2) => Some(()),
+                _ => None,
+            }).await;
+            assert!(manager.live_servers().is_empty(), "idle retirement must refresh cached metrics even after every document closed");
             assert!(
                 manager
                     .sessions
