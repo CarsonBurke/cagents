@@ -13966,6 +13966,38 @@ mod tests {
     }
 
     #[test]
+    fn declined_native_character_rebuilds_projections_when_it_synchronizes_another_card() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = draft_chat(&mut app);
+        write(&mut app, first, "keep first draft");
+        let second = draft_chat(&mut app);
+        write(&mut app, second, "keep second draft");
+        let update = app.workspace.focus(first).unwrap();
+        drop(app.apply_viewport(update, false, false));
+        drop(app.update(Message::Sidebar(crate::sidebar::SidebarAction::SearchChanged(String::new()))));
+        let before = app.update_tail.runs;
+        assert_eq!(app.workspace.focused(), Some(first));
+        let native = || Message::RoutedKeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: keyboard::Key::Character("t".into()), modified_key: keyboard::Key::Character("t".into()),
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
+                location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::empty(), text: Some("t".into()), repeat: false,
+            }, captured: true,
+            region: crate::input_trace::KeyboardRegion { pane: workspace_widget::FocusedPane::Chat, card: Some(second) },
+            widget: Some(card_control_id(second, "chat-composer")),
+        };
+        drop(app.update(native()));
+        assert_eq!(app.workspace.focused(), Some(second));
+        assert!(app.update_tail.runs.iter().zip(before).all(|(after, before)| *after > before),
+            "native-to-model focus synchronization is a semantic projection change");
+        let settled = app.update_tail.runs;
+        drop(app.update(native()));
+        assert_eq!(app.update_tail.runs, settled, "same-card declined input remains projection-neutral");
+        assert_eq!(chat_runtime(&app, first).composer.text(), "keep first draft");
+        assert_eq!(chat_runtime(&app, second).composer.text(), "keep second draft");
+    }
+
+    #[test]
     fn prepared_pr_context_preserves_the_existing_unsent_draft_and_does_not_send() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);

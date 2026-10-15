@@ -21689,6 +21689,7 @@ impl Application for Cagents {
                 {
                     return Task::none();
                 }
+                let mut synchronized_focus = false;
                 let focus_task = if !self.workspace_inputs_blocked()
                     && let Some(card) = self.input_trace.keyboard_card()
                     && self.workspace.focused() != Some(card)
@@ -21696,6 +21697,7 @@ impl Application for Cagents {
                 {
                     // Synchronize the action target without moving native
                     // focus or delivering the widget's input a second time.
+                    synchronized_focus = true;
                     self.apply_viewport(update, false, false)
                 } else {
                     Task::none()
@@ -22096,7 +22098,7 @@ impl Application for Cagents {
                             // can an ordinary character be projection-neutral.
                             // Modified chords and non-character keys stay
                             // conservative; a bound bare character took Some above.
-                            if matches!(&event,
+                            if !synchronized_focus && matches!(&event,
                                 keyboard::Event::KeyPressed { key: keyboard::Key::Character(_), modifiers, .. }
                                 | keyboard::Event::KeyReleased { key: keyboard::Key::Character(_), modifiers, .. }
                                 if !modifiers.control() && !modifiers.alt() && !modifiers.logo()) {
