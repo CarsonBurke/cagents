@@ -56,14 +56,32 @@ impl Reservation {
         }
         let slot = self.slot.expect("a live reservation owns one credit");
         debug_assert!(state.entries[slot].is_none());
-        state.entries[slot] = Some(Entry { child, pidfd, ticket: self.ticket, suspended: false });
+        state.entries[slot] = Some(Entry { child, pidfd: Some(pidfd), ticket: self.ticket, suspended: false });
         if let Err(error) = service.wake() {
             let entry = state.entries[slot].take().expect("transfer remains private under its lock");
             drop(state);
-            return Err((error, entry.child, entry.pidfd, self));
+            return Err((error, entry.child, entry.pidfd.expect("normal transfer retains a pidfd"), self));
         }
         self.slot = None;
         Ok(())
+    }
+
+    /// Final-drop fallback when normal transfer or spawn-time pidfd capture
+    /// fails. The existing credit guarantees storage without allocation or a
+    /// successful wake. No descriptor in this suspended entry authorizes a
+    /// wait or signal. Admission stops until this ownership fault is repaired;
+    /// the original Child and credit remain owned even if the worker stopped.
+    pub(crate) fn preserve_suspended(mut self, child: Child, pidfd: Option<File>, reason: &str) {
+        let service = self.service.clone();
+        let mut state = service.state.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = self.slot.take().expect("a live reservation owns one credit");
+        debug_assert!(state.entries[slot].is_none());
+        let pid = child.id();
+        state.entries[slot] = Some(Entry { child, pidfd, ticket: self.ticket, suspended: true });
+        if state.failure.is_none() {
+            state.failure = Some(format!("Exact child {pid} remains suspended: {reason}"));
+        }
+        tracing::error!(pid, %reason, "Preserved original child and admission credit without reaping authority; new helper admission is unavailable");
     }
 }
 impl Drop for Reservation {
@@ -74,7 +92,7 @@ impl Drop for Reservation {
     }
 }
 
-struct Entry { child: Child, pidfd: File, ticket: u64, suspended: bool }
+struct Entry { child: Child, pidfd: Option<File>, ticket: u64, suspended: bool }
 struct State {
     entries: Vec<Option<Entry>>,
     free: Vec<usize>,
@@ -167,7 +185,7 @@ impl Service {
                 if state.stopping { return; }
                 state.entries.iter().enumerate().filter_map(|(slot, entry)| {
                     let entry = entry.as_ref().filter(|entry| !entry.suspended)?;
-                    Some((slot, entry.ticket, entry.pidfd.as_raw_fd()))
+                    Some((slot, entry.ticket, entry.pidfd.as_ref()?.as_raw_fd()))
                 }).collect::<Vec<_>>()
             };
             let mut poll = Vec::with_capacity(snapshot.len() + 1);
@@ -248,8 +266,15 @@ mod tests {
             for mut entry in entries {
                 // Test teardown alone may stop its own fixture child after a
                 // failing assertion; production service never sends signals.
-                unsafe { libc::syscall(libc::SYS_pidfd_send_signal, entry.pidfd.as_raw_fd(), libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(), 0); }
+                // Suspended entries may contain an absent or untrusted fd.
+                // Test teardown owns the original Child and may kill it here.
+                if !entry.suspended {
+                    let pidfd = entry.pidfd.as_ref().unwrap();
+                    unsafe { libc::syscall(libc::SYS_pidfd_send_signal, pidfd.as_raw_fd(), libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(), 0); }
+                } else {
+                    let _ = entry.child.kill();
+                }
                 let _ = entry.child.wait();
             }
         }
@@ -372,6 +397,42 @@ mod tests {
         assert!(reaper.service.state.lock().unwrap().entries.iter().all(Option::is_none));
         drop(returned); drop(reservation);
         assert_eq!(reaper.free(), 1);
+    }
+
+    #[test]
+    fn final_drop_after_wake_failure_preserves_originals_without_returning_credit() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.service.reserve().unwrap();
+        let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let child = owned.child.take().unwrap(); let pid = child.id();
+        reaper.service.fail_wake.store(true, Ordering::Release);
+        let (error, child, pidfd, reservation) = reservation.retain(child, owned.pidfd.try_clone().unwrap()).unwrap_err();
+        reservation.preserve_suspended(child, Some(pidfd), &error.to_string());
+        let state = reaper.service.state.lock().unwrap();
+        let entry = state.entries[0].as_ref().unwrap();
+        assert_eq!(entry.child.id(), pid);
+        assert!(entry.suspended && entry.pidfd.is_some());
+        assert!(state.free.is_empty());
+        assert!(state.failure.as_ref().unwrap().contains("injected"));
+        drop(state);
+        assert!(reaper.service.reserve().is_err(), "suspended ownership must stop new admission");
+    }
+
+    #[test]
+    fn failed_pidfd_capture_preserves_original_child_without_inventing_reaping_authority() {
+        let reaper = TestService::new(1);
+        let reservation = reaper.service.reserve().unwrap();
+        let mut owned = Probe::spawn(&["-c", "exec /bin/sleep 600"]);
+        let child = owned.child.take().unwrap(); let pid = child.id();
+        reservation.preserve_suspended(child, None, "spawn-time pidfd capture failed");
+        let state = reaper.service.state.lock().unwrap();
+        let entry = state.entries[0].as_ref().unwrap();
+        assert_eq!(entry.child.id(), pid);
+        assert!(entry.suspended && entry.pidfd.is_none());
+        assert!(state.free.is_empty());
+        drop(state);
+        assert!(reaper.service.reserve().is_err());
+        assert!(owned.pidfd.metadata().is_ok(), "the fixture retains its own independent cleanup authority");
     }
 
     #[test]
