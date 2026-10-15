@@ -55,8 +55,7 @@ impl Cagents {
 impl Runtime {
     pub(super) fn has_unsent_text(&self) -> bool {
         let content = self.history_stash.as_ref().filter(|_| self.history_cursor.is_some()).unwrap_or(&self.composer);
-        let mut lines = content.lines();
-        lines.next().is_some_and(|line| !line.text.is_empty()) || lines.next().is_some()
+        !content.is_empty()
     }
 
     pub(super) fn expected_remote_close_error(&self, error: &str) -> bool {
