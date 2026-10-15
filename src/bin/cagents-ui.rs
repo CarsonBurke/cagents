@@ -100,6 +100,7 @@ pub(crate) fn main_with_before_start(
     }));
 
     let result = run(options);
+    tracing::debug!(target: "cagents::lifecycle", stage = "run_returned");
     match &result {
         Err(error) => report_startup_failure(&error.to_string()),
         // The window reports readiness from its first frame, so reaching here
@@ -284,23 +285,45 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let fixture =
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
-        let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
+        let started = std::time::Instant::now();
+        let lease = cagents::instance::WindowLease::acquire(new_window, slot).map_err(|error| {
+            let category = if matches!(error.get_ref().and_then(|inner|
+                inner.downcast_ref::<cagents::instance::ApplicationLeaseError>()),
+                Some(cagents::instance::ApplicationLeaseError::AlreadyRunning)) {
+                "lease_held"
+            } else { "lease_io" };
+            tracing::debug!(target: "cagents::startup", stage = "lease_failed", category,
+                elapsed_ms = started.elapsed().as_millis() as u64);
+            error
+        })?;
+        tracing::debug!(target: "cagents::startup", stage = "lease_acquired",
+            elapsed_ms = started.elapsed().as_millis() as u64);
         let device_source = if device_window_scoped && source.is_some() {
             source.map(str::to_owned)
         } else {
             cagents::device::window_slot(source)?
         };
+        let stage = std::time::Instant::now();
         cagents::session::SessionRuntime::initialize_window(
             device_source
                 .as_deref()
                 .unwrap_or(cagents::instance::PRIMARY_WINDOW),
         )?;
+        tracing::debug!(target: "cagents::startup", stage = "persistence_initialized",
+            elapsed_ms = stage.elapsed().as_millis() as u64);
         let (activation_tx, activation_rx) = async_channel::unbounded();
         let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
+        let stage = std::time::Instant::now();
         if !fixture {
             cagents::terminal::ensure_daemon_ready()?;
         }
+        tracing::debug!(target: "cagents::startup", stage = "daemon_ready",
+            elapsed_ms = stage.elapsed().as_millis() as u64);
+        let stage = std::time::Instant::now();
         let restored = cagents::app::Cagents::load_startup()?;
+        tracing::debug!(target: "cagents::startup", stage = "state_restored",
+            elapsed_ms = stage.elapsed().as_millis() as u64,
+            total_ms = started.elapsed().as_millis() as u64);
         Ok((lease, (listener, activation_rx), restored))
     })();
     let (_application_lease, activation, restored) = startup?;

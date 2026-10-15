@@ -11762,6 +11762,7 @@ impl Cagents {
     /// application that spawned it. The wait is bounded by the module's own
     /// reap timeout, so a server that refuses to die cannot hold the exit.
     fn exit_after_language_servers(&mut self) -> Task<Message> {
+        let close_started = Instant::now();
         if self.exit.is_some() {
             return Task::none();
         }
@@ -11770,13 +11771,18 @@ impl Cagents {
         // window is being raised, and it would open none. Refused, the
         // launcher waits for this process to release the window lease and
         // starts a fresh window.
+        tracing::debug!(target: "cagents::lifecycle", stage = "close_accepted");
         self.activation_rx.close();
         // `Drop` writes the final state; this snapshot is queued now because
         // someone who has watched the window close may power off before then.
         self.persist();
+        tracing::debug!(target: "cagents::lifecycle", stage = "close_snapshot_queued",
+            elapsed_ms = close_started.elapsed().as_millis() as u64);
         let reaped = self.lsp.begin_shutdown();
         let reap = cosmic::task::future(async move {
             reaped.await;
+            tracing::debug!(target: "cagents::lifecycle", stage = "language_servers_reaped",
+                elapsed_ms = close_started.elapsed().as_millis() as u64);
             Message::LanguageServersReaped
         });
         let close = self.close_main_window();
@@ -11842,6 +11848,7 @@ impl Cagents {
     /// `Drop` runs it again for an exit this application did not drive.
     #[cfg(feature = "integrated-browser")]
     fn release_browser_parent(&mut self) {
+        let release_started = Instant::now();
         let cards = self
             .cards
             .iter()
@@ -11863,6 +11870,8 @@ impl Cagents {
         for teardown in self.browser_teardowns.drain(..) {
             let _ = teardown.join();
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "browser_threads_joined",
+            elapsed_ms = release_started.elapsed().as_millis() as u64);
         self.browser_backend.retire();
         if let Some(factory) = self.browser_factory.take() {
             factory.release_parent();
@@ -11870,6 +11879,8 @@ impl Cagents {
         if let Some(parent_lifetime) = self.browser_parent_lifetime.take() {
             parent_lifetime.deactivate();
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "browser_parent_released",
+            elapsed_ms = release_started.elapsed().as_millis() as u64);
     }
 
     fn activate_main_window(&self, token: Option<String>) -> Task<Message> {
@@ -14788,6 +14799,7 @@ impl Application for Cagents {
             }
             Message::UpdateUi(action) => self.update_update_ui(action),
             Message::StartupWindowOpened(window) => {
+                tracing::debug!(target: "cagents::startup", stage = "window_opened");
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
@@ -15009,6 +15021,7 @@ impl Application for Cagents {
                 Task::none()
             }
             Message::WindowCloseRequested(window) => {
+                tracing::debug!(target: "cagents::lifecycle", stage = "close_requested");
                 // libcosmic reports the closed window through this same
                 // request, and a second close must not reopen the exit.
                 if self.exit.is_some() || self.dirty_repository_close.is_some() {
@@ -17480,6 +17493,8 @@ impl Application for Cagents {
 
 impl Drop for Cagents {
     fn drop(&mut self) {
+        let drop_started = Instant::now();
+        tracing::debug!(target: "cagents::lifecycle", stage = "application_drop_started");
         self.latency.abandon_pending();
         self.persist();
         self.fold_settings_drafts();
@@ -17492,6 +17507,8 @@ impl Drop for Cagents {
         if let Some(session) = &mut self.session {
             session.shutdown();
         }
+        tracing::debug!(target: "cagents::lifecycle", stage = "final_persistence_shutdown_finished",
+            elapsed_ms = drop_started.elapsed().as_millis() as u64);
         // Reached without the exit path having run - a panic, or a close this
         // application did not drive - so nothing has awaited the reap and the
         // runtime is going away regardless. `shutdown` alone would leave every

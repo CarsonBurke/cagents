@@ -1317,6 +1317,10 @@ async fn run_instance<P>(
                     || window.raw.pre_present_notify(),
                 ) {
                     Ok(()) => {
+                        if !window.first_frame_submitted {
+                            window.first_frame_submitted = true;
+                            log::debug!(target: "cagents::startup", "stage=first_frame_submitted window={id:?}");
+                        }
                         present_span.finish();
                     }
                     Err(error) => match error {
