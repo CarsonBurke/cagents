@@ -7628,7 +7628,7 @@ impl Cagents {
                 .find(|channel| channel.cards.contains(&card.id) && !channel.title.is_empty())
             && (card.title == chat_ui::chat_card_title(session.launch.provider)
                 || (channel.title_source == crate::model::ChannelTitleSource::Manual
-                    && channel.cards.first() == Some(&card.id)))
+                    && self.channel_primary_chat(channel) == Some(card.id)))
         {
             return &channel.title;
         }

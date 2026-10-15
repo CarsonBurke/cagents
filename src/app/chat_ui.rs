@@ -12615,6 +12615,7 @@ mod tests {
     fn manual_channel_name_titles_its_main_chat_without_hiding_sibling_titles() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        app.card_state_mut(card).unwrap().title = "Provider conversation summary".into();
         let mut sibling = app.card_state(card).unwrap().clone();
         sibling.id = CardId::new();
         sibling.title = "Sibling conversation".into();
@@ -12641,6 +12642,73 @@ mod tests {
         );
         drop(app.sync_chrome());
         assert_eq!(app.core.window.header_title, "My renamed conversation");
+    }
+
+    #[test]
+    fn manual_channel_title_survives_provider_updates_after_utility_and_closing_panes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let terminal = crate::app::tests::terminal_card_state();
+        let terminal_id = terminal.id;
+        let mut closing = app.card_state(card).unwrap().clone();
+        closing.id = CardId::new();
+        closing.existence = Existence::Closing {
+            operation_id: crate::model::OperationId::new(),
+        };
+        let closing_id = closing.id;
+        let mut sibling = app.card_state(card).unwrap().clone();
+        sibling.id = CardId::new();
+        sibling.title = "Sibling conversation".into();
+        let sibling_id = sibling.id;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend([terminal, closing, sibling]);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: crate::model::ChannelId::new(),
+            project_id: crate::model::ProjectId::new(),
+            title: "My renamed conversation".into(),
+            title_source: crate::model::ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![CardId::new(), terminal_id, closing_id, card, sibling_id],
+            focused: Some(card),
+        });
+        assert_eq!(
+            app.channel_primary_chat(app.durable.channels.last().unwrap()),
+            Some(card)
+        );
+        let snapshot = Snapshot {
+            ready: true,
+            title: Some("New provider conversation summary".into()),
+            generation: 1,
+            ..Snapshot::default()
+        };
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        drop(app.sync_chrome());
+        assert_eq!(
+            app.card_state(card).unwrap().title,
+            "New provider conversation summary"
+        );
+        assert_eq!(app.card_chrome[&card].title, "My renamed conversation");
+        assert_eq!(app.core.window.header_title, "My renamed conversation");
+        assert_eq!(
+            app.title(window::Id::RESERVED),
+            format!("My renamed conversation{WINDOW_TITLE_SEPARATOR}{APPLICATION_NAME}")
+        );
+        assert_eq!(
+            app.card_display_title(app.card_state(sibling_id).unwrap()),
+            "Sibling conversation"
+        );
+        app.chrome_ui
+            .user_titles
+            .insert(card, "Explicit pane name".into());
+        assert_eq!(
+            app.card_display_title(app.card_state(card).unwrap()),
+            "Explicit pane name"
+        );
     }
 
     #[test]
