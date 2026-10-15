@@ -30,7 +30,8 @@ fn same_directory(held: &fs::File, path: &Path) -> io::Result<()> {
     let held = held.metadata()?;
     let named = fs::symlink_metadata(path)?;
     if !held.is_dir() || !named.is_dir() || held.uid() != unsafe { libc::geteuid() }
-        || named.uid() != held.uid() || (held.dev(),held.ino()) != (named.dev(),named.ino()) {
+        || named.uid() != held.uid() || held.mode() & 0o077 != 0 || named.mode() & 0o077 != 0
+        || (held.dev(),held.ino()) != (named.dev(),named.ino()) {
         return Err(io::Error::other("The newly created account directory changed; files were retained"));
     }
     Ok(())
@@ -158,4 +159,20 @@ mod tests {
         assert!(create(root.path(),Provider::Claude,key).is_err());
         assert_eq!(fs::read_to_string(created.home().join("existing")).unwrap(), "keep");
     }
+    #[test]
+    fn widened_private_directory_permissions_refuse_publication_and_retain_files() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let mut path = None;
+        let result = homes.create_with_config_initialized(Provider::Claude,None,CodexConfig::Shared,|created| {
+            path = Some(created.home().to_owned());
+            fs::write(created.home().join("retained"),"keep")?;
+            created.directory().set_permissions(fs::Permissions::from_mode(0o755))?;
+            assert!(created.revalidate().is_err());
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read_to_string(path.unwrap().join("retained")).unwrap(),"keep");
+    }
+
 }
