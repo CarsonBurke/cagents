@@ -2605,7 +2605,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::NewTerminal
         | Message::OpenRepository
         | Message::FocusCard(_)
-        | Message::Palette(palette_ui::Action::FocusPane(_))
+        | Message::Palette(palette_ui::Action::FocusPane(_) | palette_ui::Action::RunProjectCreation(_))
         | Message::FocusAttention(_)
         | Message::MovePaneToChannel { .. }
         | Message::PaneDropToChannel { .. }
@@ -2772,7 +2772,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::MovePaneToChannel { .. }
             | Message::PaneDropToChannel { .. }
             | Message::FocusCard(_)
-            | Message::Palette(palette_ui::Action::FocusPane(_))
+            | Message::Palette(palette_ui::Action::FocusPane(_) | palette_ui::Action::RunProjectCreation(_))
             | Message::FocusAttention(_)
             | Message::TerminalReviewMode { active: true, .. }
             | Message::FocusAdjacent(_)

@@ -14,7 +14,7 @@ impl Cagents {
     /// Consume the original displayed project token; never upgrade an old row
     /// action to the source that happens to occupy the same project today.
     pub(super) fn run_project_creation_target(&mut self, target: sidebar::commands::ProjectCreationTarget) -> Task<Message> {
-        if crate::device::is_remote() || self.modal_is_open() || self.focused_repository_is_saving()
+        if crate::device::is_remote() || self.update_prepared || self.modal_is_open() || self.focused_repository_is_saving()
             || self.workspace_inputs_blocked() || !target.current_in(&self.sidebar_model) {
             return Task::none();
         }
