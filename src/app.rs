@@ -16242,7 +16242,9 @@ impl Application for Cagents {
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DaemonHealth(health) => {
                 self.daemon_health_ui.health = health;
-                if !self.daemon_health_ui.health.unavailable() && self.daemon_health_ui.confirmation
+                if !self.daemon_health_ui.health.unavailable()
+                    && self.daemon_health_ui.confirmation
+                    && !self.daemon_health_ui.requested_restart
                 {
                     self.update_daemon_health_ui(daemon_health_ui::Action::Cancel)
                 } else {

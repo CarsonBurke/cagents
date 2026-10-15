@@ -5,6 +5,7 @@ use crate::daemon_health;
 pub(super) struct State {
     pub health: daemon_health::State,
     pub confirmation: bool,
+    pub requested_restart: bool,
     preparing: bool,
     restarting: bool,
     generation: u64,
@@ -17,6 +18,7 @@ pub(super) struct State {
 #[derive(Clone, Debug)]
 pub enum Action {
     Open,
+    OpenRequested,
     Cancel,
     Confirm,
     Prepared {
@@ -29,8 +31,9 @@ pub enum Action {
 impl Cagents {
     pub(super) fn update_daemon_health_ui(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Open
-                if self.daemon_health_ui.health.unavailable()
+            Action::Open | Action::OpenRequested
+                if (self.daemon_health_ui.health.unavailable()
+                    || matches!(action, Action::OpenRequested))
                     && !self.modal_is_open()
                     && !self.daemon_health_ui.restarting
                     && !crate::device::is_remote() =>
@@ -38,6 +41,7 @@ impl Cagents {
                 let state = &mut self.daemon_health_ui;
                 state.generation = state.generation.wrapping_add(1);
                 state.confirmation = true;
+                state.requested_restart = matches!(action, Action::OpenRequested);
                 state.preparing = true;
                 state.target = None;
                 state.error = None;
@@ -80,7 +84,8 @@ impl Cagents {
             Action::Confirm
                 if self.daemon_health_ui.confirmation
                     && !self.daemon_health_ui.restarting
-                    && self.daemon_health_ui.health.unavailable() =>
+                    && (self.daemon_health_ui.health.unavailable()
+                        || self.daemon_health_ui.requested_restart) =>
             {
                 let Some(target) = self.daemon_health_ui.target.take() else {
                     return Task::none();
@@ -161,7 +166,8 @@ impl Cagents {
         if matches!(key, Named::Tab | Named::ArrowLeft | Named::ArrowRight) {
             let count = 1 + usize::from(
                 self.daemon_health_ui.target.is_some()
-                    && self.daemon_health_ui.health.unavailable(),
+                    && (self.daemon_health_ui.health.unavailable()
+                        || self.daemon_health_ui.requested_restart),
             );
             let backwards = modifiers.shift() || *key == Named::ArrowLeft;
             self.daemon_health_ui.focus = if backwards {
@@ -239,8 +245,10 @@ impl Cagents {
             design::title(
                 if matches!(state.health, daemon_health::State::Incompatible { .. }) {
                     "Restart the incompatible daemon?"
-                } else {
+                } else if state.health.unavailable() {
                     "Restart the unresponsive daemon?"
+                } else {
+                    "Restart the daemon?"
                 },
             )
             .into(),
@@ -269,7 +277,9 @@ impl Cagents {
             crate::ui_controls::button::destructive("Restart daemon")
                 .id(widget::Id::new("daemon-health.confirm"))
                 .on_press_maybe(
-                    (state.target.is_some() && !state.restarting && state.health.unavailable())
+                    (state.target.is_some()
+                        && !state.restarting
+                        && (state.health.unavailable() || state.requested_restart))
                         .then_some(Message::DaemonHealthUi(Action::Confirm)),
                 ),
         ));
@@ -312,6 +322,23 @@ mod tests {
             repeat: false,
         }
     }
+    #[test]
+    fn an_explicit_restart_request_keeps_confirmation_while_daemon_is_responsive() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.daemon_health_ui.health = daemon_health::State::Responsive;
+        drop(app.update_daemon_health_ui(Action::OpenRequested));
+        assert!(app.daemon_health_ui.confirmation);
+        drop(app.update(Message::DaemonHealth(daemon_health::State::Responsive)));
+        assert!(app.daemon_health_ui.confirmation);
+        drop(app.update_daemon_health_ui(Action::Confirm));
+        assert!(
+            !app.daemon_health_ui.restarting,
+            "unverified process ownership never restarts a daemon"
+        );
+        drop(app.update_daemon_health_ui(Action::Cancel));
+        assert!(!app.daemon_health_ui.confirmation);
+    }
+
     #[test]
     fn protocol_mismatch_offers_reviewed_restart_without_stopping_anything() {
         let mut app = super::super::tests::context_inspector_test_app(false);
