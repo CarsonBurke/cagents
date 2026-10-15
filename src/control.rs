@@ -23,6 +23,7 @@ mod agents;
 mod channels;
 pub use agents::AgentCommand;
 mod automations;
+mod completions;
 pub use automations::AutomationCommand;
 mod sessions;
 pub use sessions::SessionsArgs;
@@ -81,7 +82,7 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[command(
     name = "cagents",
     version = crate::VERSION,
-    about = "Control cagents terminals and processes"
+    about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear and accounts"
 )]
 pub struct Cli {
     /// Backend device from devices.json; local is the default.
@@ -97,6 +98,12 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum TopCommand {
+    /// Generate a shell completion script without contacting services.
+    Completions {
+        /// Shell whose completion script should be generated.
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
     /// Read bounded private diagnostics without starting services.
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
@@ -164,34 +171,44 @@ pub enum TopCommand {
     },
     /// Run the detached updater started by an explicit application Update action.
     #[command(hide = true)]
-    UpdateWorker { job_id: String },
+    UpdateWorker {
+        #[arg(help = "Detached update job ID.")]
+        job_id: String,
+    },
     /// Cooperatively fence application windows around an external installer.
     #[command(hide = true)]
     CoordinateInstall {
         #[arg(long)]
+        #[arg(help = "Installation destination prefix.")]
         prefix: PathBuf,
         #[arg(long)]
+        #[arg(help = "Installer executable to run.")]
         installer: PathBuf,
         /// Publish files while preserving running windows and the daemon.
         #[arg(long)]
         stage_only: bool,
         #[arg(last = true)]
+        #[arg(help = "Arguments passed to the installer after --.")]
         arguments: Vec<OsString>,
     },
     /// Validate a launch fence inherited from the update coordinator.
     #[command(hide = true)]
     VerifyInstallGuard {
         #[arg(long)]
+        #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
     },
     /// Record that staged files must retain windows on the running daemon's UI.
     #[command(hide = true)]
     RecordDeferredInstall {
         #[arg(long, requires_all = ["prefix", "version_root"])]
+        #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
         #[arg(long, requires = "stage_only")]
+        #[arg(help = "Installation destination prefix.")]
         prefix: Option<PathBuf>,
         #[arg(long, requires = "stage_only")]
+        #[arg(help = "Directory containing the staged executable version.")]
         version_root: Option<PathBuf>,
     },
     /// Save, close and reopen every window with this installation's executables.
@@ -229,8 +246,10 @@ pub enum DaemonCommand {
     /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
         #[arg(long, conflicts_with = "confirm")]
+        #[arg(help = "Refuse shutdown while hosted sessions remain.")]
         require_empty: bool,
         #[arg(long, conflicts_with = "confirm")]
+        #[arg(help = "Refuse shutdown if the observed session inventory generation changed.")]
         expected_generation: Option<u64>,
         /// Confirm termination of the counted hosted sessions. Bare, this
         /// prompts on the terminal. A service unit or script has no terminal,
@@ -286,17 +305,27 @@ pub enum TerminalCommand {
     },
     /// Write UTF-8 text to a terminal.
     Write {
+        #[arg(help = "The daemon terminal ID.")]
         terminal_id: TerminalId,
+        #[arg(help = "UTF-8 text to write.")]
         text: String,
     },
     /// Explicitly terminate a terminal.
-    Close { terminal_id: TerminalId },
+    Close {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Read a current immutable terminal snapshot.
-    Snapshot { terminal_id: TerminalId },
+    Snapshot {
+        /// The daemon terminal ID.
+        terminal_id: TerminalId,
+    },
     /// Wait until a current terminal snapshot contains text.
     Wait {
+        #[arg(help = "The daemon terminal ID.")]
         terminal_id: TerminalId,
         #[arg(long)]
+        #[arg(help = "Text that must appear in the terminal snapshot.")]
         text: String,
         /// Maximum time to wait, in seconds.
         #[arg(long, default_value_t = 30.0, value_parser = parse_positive_seconds)]
@@ -354,7 +383,10 @@ pub enum ChannelCommand {
         repository: Option<PathBuf>,
     },
     /// Delete a channel everywhere.
-    Close { channel_id: ChannelId },
+    Close {
+        /// The shared channel ID.
+        channel_id: ChannelId,
+    },
 }
 
 /// A `--project` value: a path, made absolute, or the name of an open
@@ -2006,6 +2038,13 @@ where
         }
     };
 
+    // Grammar-only output must work without device selection, installer routing,
+    // daemon startup, or a reachable backend.
+    if let TopCommand::Completions { shell } = cli.command {
+        emit_success(cli.json, completions::execute(shell));
+        return ExitCode::SUCCESS;
+    }
+
     // Local evidence must remain readable when a staged owner, backend, or
     // daemon cannot start. Do not select/prepare a device or follow a route.
     if matches!(cli.command, TopCommand::Diagnostics) {
@@ -2129,7 +2168,8 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
     !matches!(
         command,
-        TopCommand::Diagnostics
+        TopCommand::Completions { .. }
+            | TopCommand::Diagnostics
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
@@ -2150,6 +2190,7 @@ pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
     match command {
+        TopCommand::Completions { shell } => Ok(completions::execute(shell)),
         TopCommand::Diagnostics => {
             let report = crate::diagnostics::inspect().map_err(|_| {
                 AppError::new(
