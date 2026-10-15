@@ -344,11 +344,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let root = self.captured_worktree_root(&request.worktree)?;
         let source = self.recovery_source_authority(&request.worktree, &root)?;
-        let context = crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire(
-            &root,
-            known_checkouts,
-        )
-        .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let context =
+            crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire_with_owner(
+                &root,
+                known_checkouts,
+                source.clone(),
+                source.recovery_descriptor_count(),
+            )
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
         let custody = Arc::new(DiscardCustody {
             git: self.git.clone(),
             executor: self.creation_executor.clone(),
