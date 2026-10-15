@@ -13946,7 +13946,7 @@ mod tests {
         let task = runtime.open_file(card, "a.rs".into());
         use cosmic::iced::futures::StreamExt;
         let mut stream = iced::runtime::task::into_stream(task).unwrap();
-        let completion = loop { if let Some(iced::runtime::Action::Output(action)) = stream.next().await { break action; } };
+        let completion = loop { if let iced::runtime::Action::Output(action) = stream.next().await.expect("absent loader must produce completion") { break action; } };
         assert!(matches!(&completion, RepositoryAction::ConfiguredFileLoaded { result: Ok(LoadedFile { content: FileContent::SavedAbsence, .. }), .. }));
         std::fs::rename(&root, directory.path().join("second-retired")).unwrap();
         std::fs::create_dir(&root).unwrap();
@@ -13957,6 +13957,26 @@ mod tests {
         assert!(runtime.save_error().is_some());
         assert!(!root.join("a.rs").exists(), "old Undo cannot recreate a file in the replacement checkout");
         assert!(!directory.path().join("second-retired/a.rs").exists());
+    }
+
+    #[tokio::test]
+    async fn per_file_undo_drops_changed_disk_bytes_in_the_same_worktree() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::write(directory.path().join("a.rs"), "original").unwrap();
+        std::fs::write(directory.path().join("b.rs"), "other").unwrap();
+        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "original");
+        runtime.descriptor.worktree = directory.path().to_path_buf(); runtime.standalone = true; runtime.set_auto_save(false);
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.can_step_editor_history(false));
+        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        std::fs::write(directory.path().join("a.rs"), "outside edit").unwrap();
+        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("outside edit"));
+        assert!(!runtime.can_step_editor_history(false));
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(runtime.editor_text().as_deref(), Some("outside edit"));
     }
 
     #[tokio::test]
