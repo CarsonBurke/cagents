@@ -250,20 +250,26 @@ impl Cagents {
     /// Prefer those known roots while they are in the current row inventory;
     /// a bare common directory is metadata, never a navigable checkout.
     pub(super) fn project_activation_worktree(&self, project: &SidebarProject) -> Option<PathBuf> {
-        let checkout = |path: &Path| {
-            project.kind != ProjectKind::Git || path != project.repository.as_path()
-        };
+        let checkout =
+            |path: &Path| project.kind != ProjectKind::Git || path != project.repository.as_path();
         let listed = |path: &Path| {
-            project.worktrees.iter().any(|row| row.path.as_path() == path)
+            project
+                .worktrees
+                .iter()
+                .any(|row| row.path.as_path() == path)
         };
         self.project_ui
             .primary_checkout_roots
             .get(&project.repository)
             .filter(|path| listed(path))
             .or_else(|| {
-                project.worktrees.iter()
-                    .find(|row| checkout(&row.path)
-                        && sidebar::is_primary_worktree(&project.repository, &row.path))
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| {
+                        checkout(&row.path)
+                            && sidebar::is_primary_worktree(&project.repository, &row.path)
+                    })
                     .map(|row| &row.path)
             })
             .or_else(|| {
@@ -272,7 +278,13 @@ impl Cagents {
                     .get(&project.repository)
                     .filter(|path| listed(path))
             })
-            .or_else(|| project.worktrees.iter().find(|row| checkout(&row.path)).map(|row| &row.path))
+            .or_else(|| {
+                project
+                    .worktrees
+                    .iter()
+                    .find(|row| checkout(&row.path))
+                    .map(|row| &row.path)
+            })
             .cloned()
     }
 

@@ -1967,33 +1967,62 @@ mod tests {
         let repository = PathBuf::from("/fixture/metadata.git");
         let linked = PathBuf::from("/fixture/linked");
         let primary = PathBuf::from("/fixture/primary");
-        let row = |path: &Path| SidebarWorktree::from_durable(
-            crate::model::WorktreeId::new(), path.to_path_buf(), Some("topic".into()),
-        );
+        let row = |path: &Path| {
+            SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                path.to_path_buf(),
+                Some("topic".into()),
+            )
+        };
         let mut project = SidebarProject::new(
-            project_id, RepositoryId::new(), "fixture".into(), repository.clone(),
-            vec![row(&repository), row(&linked)], Vec::new(),
+            project_id,
+            RepositoryId::new(),
+            "fixture".into(),
+            repository.clone(),
+            vec![row(&repository), row(&linked)],
+            Vec::new(),
         );
-        app.project_ui.checkout_roots.insert(repository.clone(), linked.clone());
-        assert_eq!(app.project_activation_worktree(&project), Some(linked.clone()),
-            "Git's first bare metadata record must not displace the actual checkout");
-        app.project_ui.primary_checkout_roots.insert(repository.clone(), primary.clone());
-        assert_eq!(app.project_activation_worktree(&project), Some(linked.clone()),
-            "a retained primary absent from current rows must not fence a usable linked checkout");
+        app.project_ui
+            .checkout_roots
+            .insert(repository.clone(), linked.clone());
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(linked.clone()),
+            "Git's first bare metadata record must not displace the actual checkout"
+        );
+        app.project_ui
+            .primary_checkout_roots
+            .insert(repository.clone(), primary.clone());
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(linked.clone()),
+            "a retained primary absent from current rows must not fence a usable linked checkout"
+        );
         project.worktrees.push(row(&primary));
-        assert_eq!(app.project_activation_worktree(&project), Some(primary.clone()),
-            "a verified separate-directory primary wins over a linked checkout regardless of row order");
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(primary.clone()),
+            "a verified separate-directory primary wins over a linked checkout regardless of row order"
+        );
         app.project_ui.primary_checkout_roots.clear();
         app.project_ui.checkout_roots.clear();
-        assert_eq!(app.project_activation_worktree(&project), Some(linked.clone()),
-            "legacy fallback also skips the non-checkout metadata row");
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(linked.clone()),
+            "legacy fallback also skips the non-checkout metadata row"
+        );
         project.worktrees.truncate(1);
         assert_eq!(app.project_activation_worktree(&project), None);
         project.repository = primary.join(".git");
         project.worktrees = vec![row(&linked), row(&primary)];
-        app.project_ui.checkout_roots.insert(project.repository.clone(), linked);
-        assert_eq!(app.project_activation_worktree(&project), Some(primary),
-            "an ordinary primary remains selected when only a linked checkout was opened explicitly");
+        app.project_ui
+            .checkout_roots
+            .insert(project.repository.clone(), linked);
+        assert_eq!(
+            app.project_activation_worktree(&project),
+            Some(primary),
+            "an ordinary primary remains selected when only a linked checkout was opened explicitly"
+        );
     }
 
     /// A channel another window created arrives as a scope, not as a
