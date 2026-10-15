@@ -18839,6 +18839,7 @@ mod tests {
         assert!(
             activations
                 .send_blocking(instance::UiActivation {
+                    project: None,
                     token: None,
                     session: None,
                     update: None,
