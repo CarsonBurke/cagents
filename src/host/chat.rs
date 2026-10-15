@@ -1952,6 +1952,23 @@ fn confirm_account_conversation(
     }
 }
 
+pub(super) fn enqueue_deferred(
+    host:&SharedHost,client:ClientId,request:ClientRequest,
+) -> Result<crossbeam_channel::Receiver<Result<(),String>>,ProtocolError> {
+    let mut pending=None;
+    super::agent_execution::interactive(host,client,request,|request| {
+        let ClientRequest::ChatCommand {chat_id,command}=request else {return Err(error("Expected a provider control command"));};
+        let handle={
+            let state=host.lock().unwrap_or_else(|p|p.into_inner());
+            if state.shutting_down {return Err(unavailable("Daemon is shutting down"));}
+            attached(&state,client,chat_id)?.handle.clone()
+        };
+        pending=Some(handle.enqueue_command(command).map_err(unavailable)?);
+        Ok(ServerResponse::Accepted)
+    })?;
+    pending.ok_or_else(||error("Provider control was not admitted"))
+}
+
 pub(super) fn process(
     host: &SharedHost,
     client: ClientId,

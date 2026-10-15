@@ -83,6 +83,7 @@ impl Registration {
 
 impl Drop for Registration {
     fn drop(&mut self) {
+        super::deferred::disconnected(&self.host,self.client_id);
         disconnect_client(&self.host, self.client_id);
         self.delivery.close_after_drain();
     }
@@ -252,7 +253,13 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         // A request that panics has released every guard it held by the time
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
-        let request = envelope.request;
+        let prepared=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||super::deferred::try_defer(&host,client_id,request_id,delivery.clone(),envelope.request)))
+            .unwrap_or_else(|_|Err(ProtocolError::new(ProtocolErrorCode::Internal,"the daemon failed while admitting this provider control",false)));
+        let request=match prepared {
+            Ok(Some(request))=>request,
+            Ok(None)=>continue,
+            Err(error)=> {if push_error(&delivery,&host,request_id,error).is_err() {break;}continue;}
+        };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             handle(&host, client_id, request)
         }))
@@ -303,7 +310,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
     let _ = writer.join();
 }
 
-fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
+pub(super) fn control_gate(host: &SharedHost) -> Arc<RwLock<()>> {
     // Never wait for admission while holding HostState: admitted operations
     // need to reacquire it after synchronous provider/PTY work.
     Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate)
