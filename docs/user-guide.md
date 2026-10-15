@@ -919,13 +919,15 @@ the source for resumed history.
   browserless builds. Each window restores its selected file, caret, selection,
   and editor scroll position after reopening or an application update. This also
   applies to files selected inside a folder or repository pane.
-- Closing an idle shell needs no confirmation. A running agent, foreground
-  child, background job, or uncertain process state asks first, with Close
-  focused; Cancel or Escape keeps the pane. The close button and
-  `Ctrl+Shift+W` follow the same rule. An unfinished command also asks when
-  the shell supplies OSC 133 prompt markers; interactive fish receives this
-  integration automatically. Clearing that command restores an unconfirmed
-  idle close. Shells without prompt integration ask conservatively because an idle process alone cannot prove that the prompt is empty. **Don't ask me again** turns confirmation off; Settings → **Confirm
+- A fresh integrated shell at an untouched empty prompt needs no close
+  confirmation. A running agent, foreground child, background job, or uncertain
+  input or process state asks first, with Close focused; Cancel or Escape keeps
+  the pane. The close button and `Ctrl+Shift+W` follow the same rule. Interactive
+  fish receives OSC 133 prompt integration automatically. After any input has
+  been sent, closing asks conservatively, including after clearing the command:
+  an empty rendered prompt cannot prove that the shell consumed every admitted
+  input byte. Recovered terminals and shells without prompt integration also
+  ask. **Don't ask me again** turns confirmation off; Settings → **Confirm
   closing active processes** turns it back on.
 - Every close, confirmed or not, first rechecks the terminal's identity with
   the daemon. If the daemon is unreachable, the pane is kept.
