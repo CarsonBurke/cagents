@@ -3059,10 +3059,14 @@ impl ProjectCommand {
 /// A label for a newly discovered project; the registry preserves existing
 /// names under the same transaction as the visit.
 fn project_name_hint(repository: &Path, checkout: Option<&Path>, primary: Option<&Path>) -> String {
-    let root = primary.or_else(|| {
-        (repository.file_name().is_some_and(|name| name == ".git"))
-            .then(|| repository.parent()).flatten()
-    }).or(checkout).unwrap_or(repository);
+    let root = primary
+        .or_else(|| {
+            (repository.file_name().is_some_and(|name| name == ".git"))
+                .then(|| repository.parent())
+                .flatten()
+        })
+        .or(checkout)
+        .unwrap_or(repository);
     repository_display_name(root)
 }
 
@@ -3085,7 +3089,11 @@ fn project_output(
                     reopen: true,
                     kind,
                     repository: repository.clone(),
-                    name: project_name_hint(&repository, checkout.as_deref(), primary_checkout.as_deref()),
+                    name: project_name_hint(
+                        &repository,
+                        checkout.as_deref(),
+                        primary_checkout.as_deref(),
+                    ),
                     checkout,
                     primary_checkout,
                 })
@@ -3321,7 +3329,11 @@ fn channel_output(
                     reopen: false,
                     kind,
                     repository: repository.clone(),
-                    name: project_name_hint(&repository, checkout.as_deref(), primary_checkout.as_deref()),
+                    name: project_name_hint(
+                        &repository,
+                        checkout.as_deref(),
+                        primary_checkout.as_deref(),
+                    ),
                     checkout,
                     primary_checkout,
                 })
@@ -4370,9 +4382,30 @@ mod tests {
 
     #[test]
     fn project_visit_name_hint_uses_primary_identity_before_linked_checkout() {
-        assert_eq!(project_name_hint(Path::new("/work/primary/.git"), Some(Path::new("/work/linked")), None), "primary");
-        assert_eq!(project_name_hint(Path::new("/metadata"), Some(Path::new("/work/linked")), Some(Path::new("/work/primary"))), "primary");
-        assert_eq!(project_name_hint(Path::new("/metadata"), Some(Path::new("/work/linked")), None), "linked");
+        assert_eq!(
+            project_name_hint(
+                Path::new("/work/primary/.git"),
+                Some(Path::new("/work/linked")),
+                None
+            ),
+            "primary"
+        );
+        assert_eq!(
+            project_name_hint(
+                Path::new("/metadata"),
+                Some(Path::new("/work/linked")),
+                Some(Path::new("/work/primary"))
+            ),
+            "primary"
+        );
+        assert_eq!(
+            project_name_hint(
+                Path::new("/metadata"),
+                Some(Path::new("/work/linked")),
+                None
+            ),
+            "linked"
+        );
     }
 
     #[test]
@@ -4452,7 +4485,10 @@ mod tests {
         assert_eq!(output.data["sequence"], json!(4));
         assert_eq!(
             output.human,
-            format!("{}\tCustom project label", checkout.path().canonicalize().unwrap().display()),
+            format!(
+                "{}\tCustom project label",
+                checkout.path().canonicalize().unwrap().display()
+            ),
             "one tab-separated line: checkout path, name"
         );
     }
