@@ -21492,7 +21492,17 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| {
-            let result = std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            for (name, _) in std::env::vars_os() {
+                if name.to_string_lossy().starts_with("GIT_") {
+                    command.env_remove(name);
+                }
+            }
+            let result = command
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "-c", "init.templateDir="])
                 .arg("-C").arg(directory.path()).args(args).output().unwrap();
             assert!(result.status.success(), "{}", String::from_utf8_lossy(&result.stderr));
         };
