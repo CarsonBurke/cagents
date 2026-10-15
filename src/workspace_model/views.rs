@@ -346,18 +346,14 @@ impl<'a> AttentionDirectoryIndex<'a> {
     }
 
     pub fn directory(&self, card: &CardState) -> AttentionDirectory<'a> {
-        let Some(location) = self.locations.get(&card.id) else {
-            return AttentionDirectory::Launch;
+        if !card.existence.is_open() { return AttentionDirectory::Unavailable; }
+        let location = self.locations.get(&card.id);
+        let Some(actor) = self.agents.get(&card.id) else {
+            return if location.is_none() { AttentionDirectory::Launch }
+                else { AttentionDirectory::Unavailable };
         };
-        let Some(location) = *location else {
-            return AttentionDirectory::Unavailable;
-        };
-        let Some(Some(agent)) = self.agents.get(&card.id) else {
-            return AttentionDirectory::Unavailable;
-        };
-        if !card.existence.is_open() || agent.closed
-            || location.blocked_directory.is_some() || !location.directory.is_absolute()
-            || self.displays.scope(agent).is_none()
+        let Some(agent) = *actor else { return AttentionDirectory::Unavailable; };
+        if agent.closed || self.displays.scope(agent).is_none()
         {
             return AttentionDirectory::Unavailable;
         }
@@ -375,10 +371,12 @@ impl<'a> AttentionDirectoryIndex<'a> {
                 && crate::agent_execution::same_terminal_process(current, saved),
             _ => false,
         };
-        if matches {
-            AttentionDirectory::Verified(&location.directory)
-        } else {
-            AttentionDirectory::Unavailable
+        if !matches { return AttentionDirectory::Unavailable; }
+        match location {
+            None => AttentionDirectory::Launch,
+            Some(Some(location)) if location.blocked_directory.is_none()
+                && location.directory.is_absolute() => AttentionDirectory::Verified(&location.directory),
+            Some(_) => AttentionDirectory::Unavailable,
         }
     }
 }
@@ -1012,6 +1010,21 @@ mod managed_display_tests {
         let mut old = base;
         old.agent_locations.clear();
         assert_eq!(AttentionDirectoryIndex::new(&old).directory(&card), AttentionDirectory::Launch);
+        for case in 0..4 {
+            let mut stale = old.clone();
+            match case {
+                0 => stale.agents[0].closed = true,
+                1 => stale.agents.push(agent.clone()),
+                2 => {
+                    stale.views[0].panes.clear();
+                    stale.views[0].retired.push(card.id);
+                },
+                3 => stale.views.push(stale.views[0].clone()),
+                _ => unreachable!(),
+            }
+            assert_eq!(AttentionDirectoryIndex::new(&stale).directory(&card),
+                AttentionDirectory::Unavailable, "missing DTO cannot bypass known managed refusal {case}");
+        }
         assert_eq!(AttentionDirectoryIndex::new(&Default::default()).directory(&card), AttentionDirectory::Launch);
     }
 
