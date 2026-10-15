@@ -360,9 +360,9 @@ impl Cagents {
             }
             LspEvent::CodeActions { request, doc, items, .. } => {
                 let Some(operation) = self.take_editor_feature_request(request, doc) else { return Some(Task::none()); };
-                if !self.editor_operation_current(&operation) { return Some(Task::none()); }
+                if !self.editor_operation_current(&operation) || self.editor_features.renames.contains_key(&operation.card) { return Some(Task::none()); }
                 self.editor_features.code_actions.insert(operation.card, (operation.version, items.clone()));
-                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) { runtime.set_editor_code_actions(items.clone()); }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&operation.card) { runtime.set_editor_code_actions(items); }
                 if items.is_empty() { self.status = Some(TransientNotice::success("No code actions are available here")); }
                 Some(Task::none())
             }
@@ -536,7 +536,7 @@ impl Cagents {
                 let Some(item) = items.get(index).cloned() else { return Task::none(); };
                 let Some(mut operation) = self.editor_operation(card, LspEditKind::CodeAction) else { return Task::none(); };
                 if operation.version != version || item.disabled.is_some() { self.feature_failure(card, "This code action is no longer available"); return Task::none(); }
-                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_code_actions(Vec::new()); }
+                if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.set_editor_code_actions(&[]); }
                 if item.needs_resolve {
                     let request = self.lsp.request_resolve_code_action(operation.doc, item);
                     self.editor_features.requests.insert(request, operation);

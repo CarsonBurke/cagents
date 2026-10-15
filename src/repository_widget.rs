@@ -325,6 +325,7 @@ pub enum EditorLspAction {
     Format { selection: bool },
     CodeActions,
     CodeActionsAt(Option<LspPosition>),
+    CodeActionNext(bool),
     ChooseCodeAction(usize),
     Signature,
     Complete,
@@ -345,10 +346,13 @@ pub enum EditorLspAction {
     Dismiss,
 }
 
+struct EditorCodeAction { title: String, disabled: Option<String> }
+
 #[derive(Default)]
 struct EditorLanguageState {
     rename: Option<String>,
-    code_actions: Vec<crate::lsp::LspCodeAction>,
+    code_actions: Vec<EditorCodeAction>,
+    code_action_selected: usize,
     code_action_lines: Vec<usize>,
     code_action_support: bool,
     available_actions_at: Option<(u64, text_editor::Position)>,
@@ -3076,12 +3080,19 @@ impl RepositoryRuntime {
         self.language.diagnostics = diagnostics;
     }
 
-    pub fn set_editor_rename(&mut self, draft: Option<String>) { self.language.rename = draft; }
-    pub fn set_editor_code_actions(&mut self, items: Vec<crate::lsp::LspCodeAction>) {
+    pub fn set_editor_rename(&mut self, draft: Option<String>) {
+        if draft.is_some() { self.dismiss_editor_results(); }
+        self.language.rename = draft;
+    }
+    pub fn editor_feature_ui_open(&self) -> bool { self.language.rename.is_some() || !self.language.code_actions.is_empty() }
+    pub fn set_editor_code_actions(&mut self, items: &[crate::lsp::LspCodeAction]) {
         self.language.available_actions_at = if items.is_empty() { None } else {
             match &self.document { DocumentState::Editable(document) => Some((document.revision, document.content.cursor().position)), _ => None }
         };
-        self.language.code_actions = items;
+        self.language.code_action_selected = items.iter().position(|item| item.is_preferred && item.disabled.is_none()).or_else(|| items.iter().position(|item| item.disabled.is_none())).unwrap_or(0);
+        self.language.code_actions = items.iter().map(|item| EditorCodeAction { title: item.title.clone(), disabled: item.disabled.clone() }).collect();
+        self.language.completions.clear();
+        self.language.hover.clear();
     }
     pub fn set_editor_code_action_support(&mut self, supported: bool) { self.language.code_action_support = supported; }
     pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) { self.language.signature = signature; }
@@ -5420,6 +5431,13 @@ impl RepositoryRuntime {
             }
             RepositoryAction::Language { action, .. } => {
                 match action {
+                    EditorLspAction::CodeActionNext(forward) if !self.language.code_actions.is_empty() => {
+                        let count = self.language.code_actions.len();
+                        for _ in 0..count {
+                            self.language.code_action_selected = if forward { (self.language.code_action_selected + 1) % count } else { (self.language.code_action_selected + count - 1) % count };
+                            if self.language.code_actions[self.language.code_action_selected].disabled.is_none() { break; }
+                        }
+                    }
                     EditorLspAction::Next(forward) if !self.language.completions.is_empty() => {
                         let count = self.language.completions.len();
                         self.language.selected = if forward {
@@ -8845,6 +8863,9 @@ fn editable_document_view<'a>(
                     {
                         Some(EditorLspAction::Dismiss)
                     }
+                    Key::Named(Named::ArrowDown) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::CodeActionNext(true)),
+                    Key::Named(Named::ArrowUp) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::CodeActionNext(false)),
+                    Key::Named(Named::Enter) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::ChooseCodeAction(runtime.language.code_action_selected)),
                     Key::Named(Named::ArrowDown) if !runtime.language.completions.is_empty() => {
                         Some(EditorLspAction::Next(true))
                     }
@@ -8890,11 +8911,20 @@ fn editable_document_view<'a>(
         ]).spacing(space::S).align_y(Alignment::Center).into());
     }
     if !runtime.language.code_actions.is_empty() {
-        error_rows.push(widget::scrollable(widget::column::with_children(runtime.language.code_actions.iter().enumerate().map(|(index, action)| {
-            crate::ui_controls::button::secondary(action.disabled.as_ref().map_or_else(|| action.title.clone(), |reason| format!("{} — {reason}", action.title)))
-                .on_press_maybe(action.disabled.is_none().then_some(RepositoryAction::Language { card, action: EditorLspAction::ChooseCodeAction(index) }))
-                .into()
-        }).collect::<Vec<_>>()).spacing(space::XS)).height(Length::Shrink).into());
+        let first = runtime.language.code_action_selected / 8 * 8;
+        let end = (first + 8).min(runtime.language.code_actions.len());
+        let rows = runtime.language.code_actions.iter().enumerate().skip(first).take(8).map(|(index, action)| {
+            let label = crate::design::body(action.disabled.as_ref().map_or_else(|| action.title.clone(), |reason| format!("{} — {reason}", action.title)))
+                .wrapping(iced::widget::text::Wrapping::None).ellipsize(iced::widget::text::Ellipsize::End(iced::advanced::text::EllipsizeHeightLimit::Lines(1)));
+            widget::button::custom(label).class(crate::ui_controls::control_style(index == runtime.language.code_action_selected, None))
+                .width(Length::Fill).on_press_maybe(action.disabled.is_none().then_some(RepositoryAction::Language { card, action: EditorLspAction::ChooseCodeAction(index) })).into()
+        }).collect::<Vec<_>>();
+        error_rows.push(widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::XS)).height(Length::Shrink)).max_height(240).into());
+        error_rows.push(widget::row::with_children(vec![
+            crate::design::caption(format!("Actions {}–{} of {} · ↑ ↓ choose · Enter apply · Escape close", first + 1, end, runtime.language.code_actions.len())).width(Length::Fill).into(),
+            crate::ui_controls::button::secondary("Previous").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActionNext(false) }).into(),
+            crate::ui_controls::button::secondary("Next").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActionNext(true) }).into(),
+        ]).spacing(space::S).into());
     }
     if let Some(help) = &runtime.language.signature {
         if let Some(signature) = help.signatures.get(help.active_signature) {

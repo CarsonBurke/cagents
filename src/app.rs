@@ -10556,8 +10556,10 @@ impl Cagents {
                     && runtime.cursor_position() == Some(at)
                 {
                     state.completion_request = None;
-                    runtime.set_editor_completions(items.clone());
-                    state.context.completions = items;
+                    if !runtime.editor_feature_ui_open() {
+                        runtime.set_editor_completions(items.clone());
+                        state.context.completions = items;
+                    }
                 }
             }
             LspEvent::Hover {
@@ -10847,7 +10849,7 @@ impl Cagents {
             Action::CompleteAt { doc, version, at }
                 if self.lsp_document(card) == Some(doc)
                     && self.lsp.document_version(doc) == Some(version)
-                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at)) =>
+                    && matches!(self.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(at) && !runtime.editor_feature_ui_open()) =>
             {
                 self.request_lsp(card, LspRequestKind::Completion)
             }
@@ -10902,7 +10904,7 @@ impl Cagents {
                 }
                 task
             }
-            Action::Next(_) | Action::Dismiss => {
+            Action::Next(_) | Action::CodeActionNext(_) | Action::Dismiss => {
                 if matches!(action, Action::Dismiss) {
                     if let Some(state) = self.lsp_contexts.get_mut(&card) {
                         state.invalidate_answers();
