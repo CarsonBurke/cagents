@@ -30,6 +30,7 @@ const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
 mod provider_exit;
 pub(crate) use provider_exit::Output as ProviderExitOutput;
 mod diagnostic_read;
+mod diagnostic_decode;
 pub(crate) use diagnostic_read::{
     DiagnosticAuthority, DiagnosticCompletion, DiagnosticCopyCompletion, DiagnosticCopyInterest,
     DiagnosticCopyReceipt, DiagnosticCopySummary, DiagnosticOutput, DiagnosticReadRequest,
@@ -1026,8 +1027,10 @@ impl ClientHandle {
             let mut read_again = false;
             let mut resync = false;
             let failure = loop {
-                let envelope: ServerEnvelope = match codec.read(&mut reader_stream) {
-                    Ok(Some(value)) => value,
+                let envelope: ServerEnvelope = match codec.read_with(&mut reader_stream, |payload|
+                    diagnostic_decode::decode(payload, &proof, id, &diagnostic_pending)) {
+                    Ok(Some(Some(value))) => value,
+                    Ok(Some(None)) => continue,
                     Ok(None) => break "Chat daemon disconnected; exact session retained for reattachment".into(),
                     Err(error) => break format!("Chat daemon frame failed: {error}"),
                 };
@@ -1067,27 +1070,8 @@ impl ClientHandle {
                     wake(Wake::Changed);
                     return;
                 }
-                if let Some(mut pending) = envelope.request_id.and_then(|request| diagnostic_pending.lock().unwrap_or_else(|p| p.into_inner()).remove(&request)) {
-                    let ownership = pending.ownership.take();
-                    let result = match envelope.message {
-                        ServerMessage::Response { response: ServerResponse::ChatProviderExitOutput { chat_id, log_id, offset, bytes, next_offset, omitted } } if chat_id == id =>
-                            Ok(provider_exit::Page { log_id, offset, bytes, next_offset, omitted, _ownership: ownership }),
-                        ServerMessage::Error(error) => {
-                            let compact = provider_exit::compact_error(error.message);
-                            drop(ownership); // Original error allocation is gone; only <=512-byte metadata remains.
-                            Err(compact)
-                        }
-                        unexpected => { drop(unexpected); drop(ownership); Err("Unexpected provider output reply".into()) },
-                    };
-                    if let Some(reply) = pending.reply { let _ = reply.try_send(result); }
-                    // With no waiter, result drops here on the reader. Its
-                    // decoded Page Vec is destroyed before the attached lease.
-                    continue;
-                }
-                // Timed-out/cancelled local queries retain their namespace even
-                // after the waiter is gone. Their late errors must not replace
-                // the provider crash reason in the watch snapshot.
-                if envelope.request_id.is_some_and(provider_exit::owns_request) { continue; }
+                // Diagnostic replies were authenticated and routed by their
+                // borrowed bounded decoder before allocating an owned envelope.
                 if let Some(reply)=envelope.request_id.and_then(|request|file_pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&request)) {
                     let result=match envelope.message {
                         ServerMessage::Response{response:ServerResponse::ChatFileChanges{chat_id,summary}} if chat_id==id=>Ok(super::FileChangeReply::Files(summary)),

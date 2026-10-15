@@ -2,7 +2,7 @@
 use super::*;
 
 pub(crate) const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PAGE_BYTES: usize = 256 * 1024;
+pub(super) const MAX_PAGE_BYTES: usize = 256 * 1024;
 pub(super) const REQUEST_NAMESPACE: u64 = 1 << 63;
 pub(super) fn owns_request(request: u64) -> bool {
     request & REQUEST_NAMESPACE != 0
