@@ -99,7 +99,7 @@ impl SaveBaseline {
     }
 }
 fn changed() -> FileIoError {
-    FileIoError::Io("The save target identity, contents or access metadata changed; no replacement was published.".into())
+    FileIoError::Io("The save target identity, contents or access metadata changed.".into())
 }
 
 struct Holding {
@@ -120,7 +120,9 @@ impl Holding {
         // inherited default ACL. Refuse restrictive/nonprivate surprises; do
         // not chmod another directory after a mutable-name reopening.
         let m = root.metadata().map_err(io_error)?;
-        if m.mode() & 0o777 != 0o700 || m.uid() != unsafe { libc::geteuid() } {
+        // SAFETY: geteuid has no arguments or pointer/lifetime requirements.
+        let effective_uid = unsafe { libc::geteuid() };
+        if m.mode() & 0o777 != 0o700 || m.uid() != effective_uid {
             return Err(FileIoError::Io(format!(
                 "The save holding directory is not private; preserved at {}.",
                 root.path().display()
@@ -196,6 +198,7 @@ fn publish_with_hooks(
         }
     };
     let mut temporary_baseline = None;
+    let mut readable_temporary = None;
     let prepare = (|| {
         fs_safety::copy_ownership(destination, &temporary).map_err(io_error)?;
         fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
@@ -204,9 +207,17 @@ fn publish_with_hooks(
         fs_safety::copy_access_acl(destination, &temporary).map_err(io_error)?;
         let lost = fs_safety::copy_extended_attributes(destination, &temporary);
         temporary.sync_all().map_err(io_error)?;
-        let mut prepared = SaveBaseline::capture(&temporary, Some(blake3::hash(bytes)))?;
+        // create_temporary_in deliberately returns O_WRONLY. Authenticate a
+        // separate no-follow read descriptor against that exact written inode
+        // before hashing; cloning the write-only FD would fail with EBADF.
+        let readable = fs_safety::open_beneath(&holding.root, Path::new(&temporary_name)).map_err(resolve_error)?;
+        let written = temporary.metadata().map_err(io_error)?;
+        let opened = readable.metadata().map_err(io_error)?;
+        if !same_file(&written, &opened) || full_version(&written) != full_version(&opened) { return Err(changed()); }
+        let mut prepared = SaveBaseline::capture(&readable, Some(blake3::hash(bytes)))?;
         prepared.hash_limit = bytes.len() as u64;
         temporary_baseline = Some(prepared);
+        readable_temporary = Some(readable);
         before_publish().map_err(io_error)?;
         // This coherency check is supplementary: the atomic acquisition below,
         // followed by verification of what it ACTUALLY moved, owns the name.
@@ -220,7 +231,7 @@ fn publish_with_hooks(
                 parent,
                 &holding,
                 &temporary_name,
-                &temporary,
+                readable_temporary.as_ref().unwrap_or(&temporary),
                 temporary_baseline.as_ref(),
                 error,
             ));
@@ -234,7 +245,7 @@ fn publish_with_hooks(
             parent,
             &holding,
             &temporary_name,
-            &temporary,
+            readable_temporary.as_ref().unwrap_or(&temporary),
             temporary_baseline.as_ref(),
             resolve_error(error),
         ));
@@ -254,7 +265,7 @@ fn publish_with_hooks(
         verify_temporary(
             &holding,
             &temporary_name,
-            &temporary,
+            readable_temporary.as_ref().unwrap_or(&temporary),
             temporary_baseline.as_ref(),
         )?;
         fs_safety::rename_new_between(&holding.root, &temporary_name, parent, name.as_os_str())
@@ -284,7 +295,7 @@ fn publish_with_hooks(
             let cleanup_temp = remove_temporary(
                 &holding,
                 &temporary_name,
-                &temporary,
+                readable_temporary.as_ref().unwrap_or(&temporary),
                 temporary_baseline.as_ref(),
             );
             let mut message = format!("{error}; ");
@@ -294,7 +305,7 @@ fn publish_with_hooks(
                     if let Err(error) = fs_safety::sync_directory(parent) { message.push_str(&format!("; restoration durability unconfirmed: {error}")); }
                     if let Err(error) = holding.remove_empty(parent) { message.push_str(&format!("; {error}")); }
                 }
-                Err(error) => message.push_str(&format!("the acquired entry remains as previous in {}; destination left intact: {error}", holding.location())),
+                Err(error) => message.push_str(&format!("the recovery entry remains as previous in {}; destination left intact: {error}", holding.location())),
             }
             if let Err(error) = cleanup_temp {
                 message.push_str(&format!("; partial replacement cleanup failed: {error}"));
