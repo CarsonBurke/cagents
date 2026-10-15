@@ -6945,6 +6945,11 @@ pub enum Message {
     /// key is no longer the bound one is a read of a tree nobody is looking at
     /// and is dropped rather than rendered.
     SourceControlReleased,
+    RepositoryInitialOpen {
+        card: CardId,
+        request: OperationId,
+        action: Box<RepositoryAction>,
+    },
     RepositoryReaderReady {
         card: CardId,
         request: OperationId,
@@ -19148,7 +19153,6 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 let card = action.card();
-                if self.defer_initial_repository_open(&action) { return Task::none(); }
                 if matches!(&action, RepositoryAction::Save { overwrite: false, .. }) {
                     if let Some(task) = self.maybe_format_before_save(card) { return task; }
                 }
@@ -22057,6 +22061,10 @@ impl Application for Cagents {
                 result,
             } => self.finish_group_selection(key, operation, area, command, result),
             Message::SourceControlReleased => Task::none(),
+            Message::RepositoryInitialOpen { card, request, action } => {
+                self.defer_initial_repository_open(card, request, *action);
+                Task::none()
+            }
             Message::RepositoryReaderReady { card, request, result } => {
                 self.finish_repository_reader(card, request, result)
             }

@@ -26,14 +26,23 @@ impl Cagents {
 
     /// Only original read/navigation intent can wait for initialization.
     /// Git commands, captured controls and arbitrary editor edits never do.
-    pub(super) fn defer_initial_repository_open(&mut self, action: &RepositoryAction) -> bool {
-        if !matches!(action, RepositoryAction::OpenWorkingDiff { .. }
+    pub(super) fn repository_open_message(&self, action: RepositoryAction) -> Message {
+        self.refresh_ui.pane_readers.get(&action.card()).map_or_else(
+            || Message::Repository(action.clone()),
+            |pending| Message::RepositoryInitialOpen { card: action.card(), request: pending.request,
+                action: Box::new(action.clone()) },
+        )
+    }
+
+    pub(super) fn defer_initial_repository_open(&mut self, card: CardId, request: OperationId,
+        action: RepositoryAction) {
+        if action.card() != card || !matches!(action, RepositoryAction::OpenWorkingDiff { .. }
             | RepositoryAction::OpenCommittedFile { .. }
             | RepositoryAction::OpenFileFromBrowser { .. }
-            | RepositoryAction::OpenLocation { .. }) { return false; }
-        let Some(pending) = self.refresh_ui.pane_readers.get_mut(&action.card()) else { return false; };
-        pending.open = Some(InitialOpen::Action(Box::new(action.clone())));
-        true
+            | RepositoryAction::OpenLocation { .. }) { return; }
+        let Some(pending) = self.refresh_ui.pane_readers.get_mut(&card)
+            .filter(|pending| pending.request == request) else { return; };
+        pending.open = Some(InitialOpen::Action(Box::new(action)));
     }
 
     pub(super) fn defer_initial_source_location(&mut self, card: CardId, path: PathBuf, line: usize) {
@@ -375,14 +384,23 @@ mod tests {
             worktree: directory.path().to_owned(), selected_file: None };
         app.card_state_mut(card).unwrap().kind = CardKind::Repository(view.clone());
         app.refresh_ui.source_binding = Some(git_binding::Binding::new(key));
-        let opening = app.attach_repository_pane(card, view);
+        let opening = app.attach_repository_pane(card, view.clone());
         let held = worker(opening).await;
-        drop(app.update(Message::Repository(RepositoryAction::OpenWorkingDiff {
+        let action = RepositoryAction::OpenWorkingDiff {
             card, file: repository_widget::RepositoryFile { path: "file.txt".into(), staged: true, ..Default::default() },
             basis: DiffBasis::HeadToIndex,
-        })));
+        };
+        let old_open = app.repository_open_message(action.clone());
+        let replacement = app.attach_repository_pane(card, view);
+        drop(app.update(old_open));
+        assert!(app.refresh_ui.pane_readers.get(&card).unwrap().open.is_none(),
+            "a prior pending open cannot target a new same-card request");
+        drop(app.update(held));
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
+        let current_open = app.repository_open_message(action);
+        drop(app.update(current_open));
         assert!(app.refresh_ui.pane_readers.get(&card).unwrap().open.is_some());
+        let held = worker(replacement).await;
         // Arbitrary user commands are not replayed through this read-only slot.
         drop(app.update(Message::Repository(RepositoryAction::StageSelected { card, stage: true })));
         assert!(app.source_control_mutations.is_empty());
