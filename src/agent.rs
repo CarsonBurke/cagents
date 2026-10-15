@@ -49,7 +49,7 @@ pub enum ActivityOutcome {
 impl ActivityOutcome {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Succeeded => "Succeeded",
+            Self::Succeeded => "Finished",
             Self::Cancelled => "Cancelled",
             Self::Failed { .. } => "Failed",
             Self::Interrupted { .. } => "Interrupted",
