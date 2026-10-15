@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, VecDeque},
     ops::Range,
     path::Path,
-    sync::{Arc, LazyLock, Mutex},
+    sync::{Arc, Condvar, LazyLock, Mutex},
 };
 
 use imara_diff::{Algorithm, Diff, InternedInput};
@@ -519,56 +519,42 @@ fn highlight_lines(
     Ok(lines)
 }
 
-/// Baselines are keyed by exact bytes, grammar and palette pair. Checkpoints
-/// carry lexical state only: replaying up to 127 lines does not recolor them.
+/// Only source and immutable colored spans are retained. Native parser state
+/// owns private, potentially deep grammar stacks and is never cached per line.
 struct BaselineSyntax {
     text: Arc<str>,
     hash: blake3::Hash,
     token: String,
     theme: crate::settings::EditorSyntaxTheme,
     syntax: Arc<SyntaxLines>,
-    line_ranges: Vec<Range<usize>>,
-    checkpoints: Vec<(usize, parsing::ParseState, parsing::ScopeStack)>,
     retained_bytes: usize,
 }
 
-impl BaselineSyntax {
-    fn parser_at(
-        &self,
-        line: usize,
-        cancellation: &CancellationToken,
-    ) -> Result<HighlightParser, Cancelled> {
-        let mut parser = HighlightParser::new(&self.token, self.theme);
-        let (start, state, stack) = self
-            .checkpoints
-            .iter()
-            .rev()
-            .find(|(at, ..)| *at <= line)
-            .expect("baseline has an initial checkpoint");
-        parser.parser = state.clone();
-        parser.stack = stack.clone();
-        for range in &self.line_ranges[*start..line] {
-            check_cancelled(cancellation)?;
-            let text = &self.text[range.clone()];
-            let text = text
-                .strip_suffix("\r\n")
-                .or_else(|| text.strip_suffix('\n'))
-                .unwrap_or(text);
-            for (_, op) in parser
-                .parser
-                .parse_line(text, parser.syntaxes)
-                .unwrap_or_default()
-            {
-                let _ = parser.stack.apply(&op);
-            }
-        }
-        Ok(parser)
+struct BaselineFlight {
+    text: Arc<str>,
+    hash: blake3::Hash,
+    token: String,
+    theme: crate::settings::EditorSyntaxTheme,
+    finished: Mutex<bool>,
+    ready: Condvar,
+}
+
+/// Cancellation or a failed builder wakes waiters, which may retry. The
+/// global cache lock never spans parsing, waiting, or renderer/font work.
+struct BaselineBuilder(Arc<BaselineFlight>);
+impl Drop for BaselineBuilder {
+    fn drop(&mut self) {
+        BASELINES.lock().unwrap_or_else(|error| error.into_inner()).pending
+            .retain(|entry| !Arc::ptr_eq(entry, &self.0));
+        *self.0.finished.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        self.0.ready.notify_all();
     }
 }
 
 #[derive(Default)]
 struct BaselineCache {
     entries: VecDeque<Arc<BaselineSyntax>>,
+    pending: Vec<Arc<BaselineFlight>>,
     bytes: usize,
 }
 
@@ -577,87 +563,78 @@ const BASELINE_CACHE_ENTRIES: usize = 8;
 static BASELINES: LazyLock<Mutex<BaselineCache>> =
     LazyLock::new(|| Mutex::new(BaselineCache::default()));
 
-fn baseline_syntax(
-    before: &Arc<str>,
-    token: &str,
-    theme: crate::settings::EditorSyntaxTheme,
-    cancellation: &CancellationToken,
+fn baseline_syntax(before: &Arc<str>, token: &str,
+    theme: crate::settings::EditorSyntaxTheme, cancellation: &CancellationToken,
 ) -> Result<Arc<BaselineSyntax>, Cancelled> {
     let hash = blake3::hash(before.as_bytes());
-    // This lock never crosses rendering/font-system code. Serializing cache
-    // misses ensures simultaneous views do not highlight the same blob twice.
-    let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
-    check_cancelled(cancellation)?;
-    if let Some(index) = cache.entries.iter().position(|entry| {
-        entry.hash == hash
-            && entry.token == token
-            && entry.theme == theme
-            && entry.text.as_ref() == before.as_ref()
-    }) {
-        let entry = cache.entries.remove(index).expect("matched baseline");
-        cache.entries.push_back(Arc::clone(&entry));
-        return Ok(entry);
-    }
+    let builder = loop {
+        check_cancelled(cancellation)?;
+        let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(index) = cache.entries.iter().position(|entry| entry.hash == hash
+            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()) {
+            let entry = cache.entries.remove(index).expect("matched baseline");
+            cache.entries.push_back(Arc::clone(&entry));
+            return Ok(entry);
+        }
+        if let Some(flight) = cache.pending.iter().find(|entry| entry.hash == hash
+            && entry.token == token && entry.theme == theme && entry.text.as_ref() == before.as_ref()).cloned() {
+            drop(cache);
+            let mut finished = flight.finished.lock().unwrap_or_else(|error| error.into_inner());
+            while !*finished {
+                check_cancelled(cancellation)?;
+                finished = flight.ready.wait_timeout(finished, std::time::Duration::from_millis(25))
+                    .unwrap_or_else(|error| error.into_inner()).0;
+            }
+        } else {
+            let flight = Arc::new(BaselineFlight { text: Arc::clone(before), hash, token: token.to_owned(), theme,
+                finished: Mutex::new(false), ready: Condvar::new() });
+            cache.pending.push(Arc::clone(&flight));
+            break BaselineBuilder(flight);
+        }
+    };
     let mut parser = HighlightParser::new(token, theme);
     let mut syntax: SyntaxLines = Default::default();
-    let mut checkpoints = Vec::new();
-    let mut line_count = 0;
-    let mut line_ranges = Vec::new();
-    let mut offset = 0;
-    for (line, text) in before.split_inclusive('\n').enumerate() {
-        check_cancelled(cancellation)?;
-        if line % 128 == 0 {
-            checkpoints.push((line, parser.parser.clone(), parser.stack.clone()));
-        }
-        for (lines, spans) in syntax.iter_mut().zip(parser.line(text, cancellation)?) {
-            lines.push(spans.into());
-        }
-        line_count = line + 1;
-        line_ranges.push(offset..offset + text.len());
-        offset += text.len();
+    for text in before.split_inclusive('\n') {
+        for (lines, spans) in syntax.iter_mut().zip(parser.line(text, cancellation)?) { lines.push(spans.into()); }
     }
-    checkpoints.push((line_count, parser.parser.clone(), parser.stack.clone()));
-    let retained_bytes = before.len()
-        + line_ranges.capacity() * std::mem::size_of::<Range<usize>>()
-        + syntax
-            .iter()
-            .map(|lines| {
-                lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
-                    + lines
-                        .iter()
-                        .map(|spans| {
-                            std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()
-                        })
-                        .sum::<usize>()
-            })
-            .sum::<usize>()
-        + checkpoints
-            .iter()
-            .map(|(_, _, stack)| 512 + stack.scopes.len() * std::mem::size_of::<parsing::Scope>())
-            .sum::<usize>();
-    let baseline = Arc::new(BaselineSyntax {
-        text: Arc::clone(before),
-        hash,
-        token: token.to_owned(),
-        theme,
-        syntax: Arc::new(syntax),
-        line_ranges,
-        checkpoints,
-        retained_bytes,
-    });
-    if retained_bytes <= BASELINE_CACHE_BYTES {
-        while cache.entries.len() >= BASELINE_CACHE_ENTRIES
-            || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES
-        {
-            let Some(oldest) = cache.entries.pop_front() else {
-                break;
-            };
-            cache.bytes -= oldest.retained_bytes;
+    // This is a payload bound, including Arc headers/vector capacities. The
+    // allocator's metadata/fragmentation and in-flight requests are measured
+    // separately; no opaque parser heap is retained inside this cache.
+    let retained_bytes = std::mem::size_of::<BaselineSyntax>() + before.len()
+        + 6 * std::mem::size_of::<usize>() + token.len()
+        + syntax.iter().map(|lines| lines.capacity() * std::mem::size_of::<Arc<[SyntaxSpan]>>()
+            + lines.iter().map(|spans| std::mem::size_of_val(spans.as_ref()) + 2 * std::mem::size_of::<usize>()).sum::<usize>()).sum::<usize>();
+    let baseline = Arc::new(BaselineSyntax { text: Arc::clone(before), hash,
+        token: token.to_owned(), theme, syntax: Arc::new(syntax), retained_bytes });
+    {
+        let mut cache = BASELINES.lock().unwrap_or_else(|error| error.into_inner());
+        if retained_bytes <= BASELINE_CACHE_BYTES {
+            while cache.entries.len() >= BASELINE_CACHE_ENTRIES || cache.bytes + retained_bytes > BASELINE_CACHE_BYTES {
+                let Some(oldest) = cache.entries.pop_front() else { break; };
+                cache.bytes -= oldest.retained_bytes;
+            }
+            cache.bytes += retained_bytes;
+            cache.entries.push_back(Arc::clone(&baseline));
         }
-        cache.bytes += retained_bytes;
-        cache.entries.push_back(Arc::clone(&baseline));
     }
+    drop(builder);
     Ok(baseline)
+}
+
+/// State-only forward parsing is linear in the baseline, with at most one
+/// live old-side stack. Sharing a colored run never stores deep checkpoints.
+fn advance_lexical(parser: &mut HighlightParser, lines: &[&str], cursor: &mut usize,
+    end: usize, cancellation: &CancellationToken) -> Result<(), Cancelled> {
+    debug_assert!(*cursor <= end);
+    for text in &lines[*cursor..end] {
+        check_cancelled(cancellation)?;
+        let text = text.strip_suffix("\r\n").or_else(|| text.strip_suffix('\n')).unwrap_or(text);
+        for (_, op) in parser.parser.parse_line(text, parser.syntaxes).unwrap_or_default() {
+            let _ = parser.stack.apply(&op);
+        }
+    }
+    *cursor = end;
+    Ok(())
 }
 
 /// Reuse each unchanged run independently. Several distant edits must not
@@ -706,6 +683,8 @@ fn highlight_comparison_model(
         }
     }
     let mut parser = HighlightParser::new(&token, theme);
+    let mut old_parser = HighlightParser::new(&token, theme);
+    let mut old_cursor = 0;
     let mut new: SyntaxLines = std::array::from_fn(|_| Vec::with_capacity(new_lines.len()));
     let mut index = 0;
     let mut probe = 0;
@@ -715,8 +694,8 @@ fn highlight_comparison_model(
             let starts_run =
                 index == 0 || corresponding[index - 1].is_none_or(|previous| previous + 1 != old);
             if starts_run || index >= probe {
-                let old_state = baseline.parser_at(old, cancellation)?;
-                if parser.parser == old_state.parser && parser.stack == old_state.stack {
+                advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old, cancellation)?;
+                if parser.parser == old_parser.parser && parser.stack == old_parser.stack {
                     let mut end = index + 1;
                     while end < corresponding.len() && corresponding[end] == Some(old + end - index)
                     {
@@ -728,13 +707,15 @@ fn highlight_comparison_model(
                             lines.push(Arc::clone(spans));
                         }
                     }
-                    parser = baseline.parser_at(old + end - index, cancellation)?;
+                    advance_lexical(&mut old_parser, &old_lines, &mut old_cursor, old + end - index, cancellation)?;
+                    parser.parser = old_parser.parser.clone();
+                    parser.stack = old_parser.stack.clone();
                     index = end;
                     probe = index;
                     continue;
                 }
                 // A multiline delimiter may alter an arbitrarily long suffix.
-                // Check convergence at lexical checkpoints without quadratic replay.
+                // Check convergence at bounded intervals while advancing the old state only once.
                 probe = index + 128 - old % 128;
             }
         } else {
@@ -3734,6 +3715,52 @@ mod memory_contracts {
         let cache = BASELINES.lock().unwrap();
         assert!(cache.entries.len() <= BASELINE_CACHE_ENTRIES);
         assert!(cache.bytes <= BASELINE_CACHE_BYTES);
+    }
+
+    #[test]
+    fn nested_grammar_cache_retains_only_exact_source_and_colored_spans() {
+        let text: Arc<str> = ("/*\n".repeat(512) + &"*/\n".repeat(512)).into();
+        let baseline = baseline_syntax(&text, "rs", AUTO, &CancellationToken::new()).unwrap();
+        let spans: usize = baseline.syntax.iter().flat_map(|lines| lines.iter()).map(|line| line.len()).sum();
+        let payload = std::mem::size_of::<BaselineSyntax>() + text.len() + 6 * std::mem::size_of::<usize>() + baseline.token.len()
+            + baseline.syntax.iter().map(|lines| lines.capacity()*std::mem::size_of::<Arc<[SyntaxSpan]>>()
+                + lines.len()*2*std::mem::size_of::<usize>()).sum::<usize>() + spans*std::mem::size_of::<SyntaxSpan>();
+        assert_eq!(baseline.retained_bytes, payload);
+        assert!(baseline.retained_bytes < text.len()*100, "no retained quadratic parser checkpoint heap");
+    }
+
+    #[test]
+    fn same_blob_baseline_builds_once_under_concurrent_requests() {
+        let text: Arc<str> = (0..64).map(|line| format!("fn concurrent_cache_{line}() {{}}\n")).collect::<String>().into();
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let workers: Vec<_> = (0..8).map(|_| {
+            let text = Arc::clone(&text); let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                WORK_COUNTS.with(|counts| counts.set((0,0))); barrier.wait();
+                let baseline = baseline_syntax(&text,"rs",AUTO,&CancellationToken::new()).unwrap();
+                (baseline,WORK_COUNTS.with(std::cell::Cell::get).0)
+            })
+        }).collect();
+        let results: Vec<_> = workers.into_iter().map(|worker| worker.join().unwrap()).collect();
+        assert_eq!(results.iter().map(|(_,count)| count).sum::<usize>(),64);
+        assert!(results.iter().all(|(baseline,_)| Arc::ptr_eq(baseline,&results[0].0)));
+    }
+
+    #[test]
+    fn waiting_baseline_can_cancel_while_unrelated_blob_completes() {
+        let text: Arc<str> = Arc::from("fn held_cache_miss() {}\n");
+        let flight = Arc::new(BaselineFlight { text: Arc::clone(&text), hash: blake3::hash(text.as_bytes()), token:"rs".into(),
+            theme:AUTO,finished:Mutex::new(false),ready:Condvar::new() });
+        BASELINES.lock().unwrap().pending.push(Arc::clone(&flight));
+        let builder = BaselineBuilder(flight);
+        let cancellation = CancellationToken::new();
+        let worker_cancel = cancellation.clone();
+        let worker = std::thread::spawn(move || baseline_syntax(&text,"rs",AUTO,&worker_cancel).is_err());
+        let other: Arc<str> = Arc::from("fn unrelated_cache_miss() {}\n");
+        assert!(baseline_syntax(&other,"rs",AUTO,&CancellationToken::new()).is_ok());
+        cancellation.cancel();
+        assert!(worker.join().unwrap());
+        drop(builder);
     }
 
     #[test]
