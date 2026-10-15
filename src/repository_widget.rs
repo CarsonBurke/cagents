@@ -13384,6 +13384,7 @@ mod tests {
             DiffBasis::HeadToIndex,
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
+                present: [true; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: Vec::new(),
@@ -14258,6 +14259,7 @@ mod tests {
             DiffBasis::IndexToWorktree,
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
+                present: [true; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: vec![inline; 100_000],
@@ -14639,6 +14641,7 @@ mod tests {
             DiffBasis::IndexToWorktree,
             DiffState::ready(staged_text_diff(DiffModel {
                 line_counts: [0; 2],
+                present: [true; 2],
                 before: Arc::from(""),
                 after: Arc::from(""),
                 inline_rows: vec![
@@ -16830,6 +16833,7 @@ mod tests {
     fn model_with(additions: u32) -> DiffModel {
         DiffModel {
             line_counts: [0; 2],
+            present: [true; 2],
             before: Arc::from(""),
             after: Arc::from(""),
             inline_rows: Vec::new(),
