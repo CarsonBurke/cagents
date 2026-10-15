@@ -722,9 +722,19 @@ impl Handle {
             return Err("Provider ownership is being preserved for a successor; refresh before stopping it".into());
         }
         if self.is_completed() || self.0.stop.load(Ordering::Acquire) {
-            return if unobserved {
+            let _admission=match self.0.ownership_admission.try_lock() {
+                Ok(admission)=>admission,
+                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock)=>return Err("Provider ownership admission is busy; retain its owner and retry".into()),
+            };
+            return if self.0.preserve_native.load(Ordering::Acquire) {
+                Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
+            } else if unobserved {
                 Err("Retained provider ownership must be reattached before session stop".into())
-            } else { Ok(()) };
+            } else {
+                self.0.release_native.store(true,Ordering::Release);
+                Ok(())
+            };
         }
         if self.0.draining.load(Ordering::Acquire) {
             return Err("Provider ownership is changing; refresh before stopping it".into());
