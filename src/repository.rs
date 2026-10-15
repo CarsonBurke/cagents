@@ -22,6 +22,7 @@ mod authority;
 pub use authority::{WorktreeAuthority, WorktreeExecutor};
 mod creation_authority;
 mod creation_retention;
+pub(crate) mod creation_journal;
 mod creation_receiver;
 pub(crate) use creation_receiver::{ReceivedCreationScopes, ValidatedCreationOperation};
 pub use creation_retention::{RetainedWorktreeCreation, CreationRetention, SettledCreatedWorktree};
@@ -13393,7 +13394,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// neither the return carrier nor its serialized report mints new authority.
     #[cfg(feature = "ui")]
     pub fn create_worktree_journaled_retained(
-        &self, store: &StateStore, request: &CreateWorktreeRequest, generation: u64,
+        &self, store: Arc<StateStore>, request: &CreateWorktreeRequest, generation: u64,
         cancellation: &CancellationToken, progress: &async_channel::Sender<WorktreeProgressEvent>,
     ) -> RetainedWorktreeCreation {
         let Some(authority) = &self.authority else {
@@ -13405,9 +13406,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 .map(|service| (service, scope, evidence)));
         match captured {
             Ok((service, scope, evidence)) => {
-                let report = service.create_worktree_journaled_inner(store, request, generation,
+                let report = service.create_worktree_journaled_inner(&store, request, generation,
                     cancellation, progress, Some((scope.clone(), evidence)));
-                RetainedWorktreeCreation::from_original(report, scope, authority.clone())
+                RetainedWorktreeCreation::from_original(report, scope, authority.clone(), store)
             }
             Err(error) => RetainedWorktreeCreation::refused(creation_refusal(request, generation, progress,
                 format!("The original creation source is unavailable; no creation was started: {error}"))),
@@ -14398,7 +14399,7 @@ mod worktree_journal_tests {
 
     struct Fixture {
         directory: tempfile::TempDir,
-        store: StateStore,
+        store: Arc<StateStore>,
         request: CreateWorktreeRequest,
         service: RepositoryService,
     }
@@ -14472,11 +14473,11 @@ mod worktree_journal_tests {
                 "-m",
                 "base",
             ]);
-            let store = StateStore::open(
+            let store = Arc::new(StateStore::open(
                 directory.path().join("state.sqlite"),
                 BootId::new("journal-test-boot"),
             )
-            .unwrap();
+            .unwrap());
             let root = directory.path().join("managed");
             let request = CreateWorktreeRequest {
                 repository,
@@ -14637,7 +14638,7 @@ mod worktree_journal_tests {
             let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
             let scoped = fixture.service.with_worktree_authority(authority).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &CancellationToken::new(), &sender);
             let report = &retained.report;
             assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
@@ -14678,7 +14679,7 @@ mod worktree_journal_tests {
             WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
         let (sender, _) = async_channel::bounded(8);
         creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(true));
-        let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+        let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
             7, &CancellationToken::new(), &sender);
             let report = &retained.report;
         creation_authority::FAIL_AFTER_PUBLICATION.with(|failure| failure.set(false));
@@ -14731,7 +14732,7 @@ mod worktree_journal_tests {
             7, &CancellationToken::new(), &sender);
         assert_eq!(report.state, WorktreeOperationState::NotCreated);
         assert!(report.outcome.is_none());
-        let unbound = fixture.service.create_worktree_journaled_retained(&fixture.store,
+        let unbound = fixture.service.create_worktree_journaled_retained(fixture.store.clone(),
             &fixture.request, 7, &CancellationToken::new(), &sender);
         assert_eq!(unbound.report.state, WorktreeOperationState::NotCreated);
         assert!(unbound.created.is_none());
@@ -14751,7 +14752,7 @@ mod worktree_journal_tests {
             let scoped = fixture.service.with_worktree_authority(
                 WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(),
                 &fixture.request, 7, &CancellationToken::new(), &sender);
             assert_eq!(retained.report.state, WorktreeOperationState::Created, "{:?}", retained.report);
             let created = retained.created.as_ref().expect("actual created capability");
@@ -14790,14 +14791,14 @@ mod worktree_journal_tests {
         let authority = WorktreeAuthority::capture(&fixture.request.repository).unwrap();
         let scoped = fixture.service.with_worktree_authority(authority.clone()).unwrap();
         let (sender, _) = async_channel::bounded(8);
-        let retained = scoped.create_worktree_journaled_retained(&fixture.store,
+        let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(),
             &fixture.request, 7, &CancellationToken::new(), &sender);
         assert!(retained.created.is_some(), "{:?}", retained.report);
         let mut journal = fixture.journal(fixture.request.operation_id);
         assert!(journal.live_created.is_none());
         journal.restore_creation_authority().unwrap();
         let restored = RetainedWorktreeCreation::from_original(retained.report.clone(),
-            journal.live_creation.as_ref().unwrap().clone(), authority);
+            journal.live_creation.as_ref().unwrap().clone(), authority, fixture.store.clone());
         assert_eq!(restored.report.state, WorktreeOperationState::Created);
         assert!(restored.created.is_none());
         assert!(restored.authority_error.as_ref().unwrap().contains("no original pre-unlock authority"));
@@ -14814,7 +14815,7 @@ mod worktree_journal_tests {
         let scoped = fixture.service.with_worktree_authority(authority).unwrap();
         let before = fixture.git(&["rev-parse", "feature"]);
         let (sender, _) = async_channel::bounded(8);
-        let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+        let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
             7, &CancellationToken::new(), &sender);
             let report = &retained.report;
         assert_eq!(report.state, WorktreeOperationState::MalformedPayload, "{report:?}");
@@ -14870,7 +14871,7 @@ mod worktree_journal_tests {
             let scoped = service.with_worktree_authority(
                 WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &CancellationToken::new(), &sender);
             let report = &retained.report;
             assert!(executor.seen.load(Ordering::SeqCst), "the test must reach the delayed Git effect");
@@ -14943,7 +14944,7 @@ mod worktree_journal_tests {
             let scoped = RepositoryService::new("git", executor.clone())
                 .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &CancellationToken::new(), &sender);
             let report = &retained.report;
             assert!(executor.seen.load(Ordering::SeqCst));
@@ -14972,7 +14973,7 @@ mod worktree_journal_tests {
             let scoped = RepositoryService::new("git", Arc::new(CancelAtGit { after_exit }))
                 .with_worktree_authority(WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &token, &sender);
             let report = &retained.report;
             assert!(token.is_cancelled());
@@ -15074,7 +15075,7 @@ mod worktree_journal_tests {
             let service = RepositoryService::new("git", executor.clone()).with_worktree_authority(
                 WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = service.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = service.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &CancellationToken::new(), &sender);
             let report = &retained.report;
             assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
@@ -15116,7 +15117,7 @@ mod worktree_journal_tests {
             let scoped = RepositoryService::new("git", executor.clone()).with_worktree_authority(
                 WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &CancellationToken::new(), &sender);
             let report = &retained.report;
             assert!(executor.attempted.load(Ordering::SeqCst));
@@ -15192,7 +15193,7 @@ mod worktree_journal_tests {
             let scoped = RepositoryService::new("git", executor.clone()).with_worktree_authority(
                 WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &CancellationToken::new(), &sender);
             let report = &retained.report;
             assert!(executor.changed.load(Ordering::SeqCst), "{phase}/{alteration}: {report:?}");
@@ -15278,7 +15279,7 @@ printf refused > "$CAGENTS_ALIAS_RESULT"
             let scoped = RepositoryService::new("git", executor.clone()).with_worktree_authority(
                 WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
             let (sender, _) = async_channel::bounded(8);
-            let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+            let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
                 7, &CancellationToken::new(), &sender);
             let report = &retained.report;
             if mode == "alias" {

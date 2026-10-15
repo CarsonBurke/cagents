@@ -18,7 +18,7 @@ fn received_created_scopes_bind_actual_journal_and_original_six_roles() {
     let scoped = fixture.service.clone().with_worktree_authority(
         WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
     let (sender, _) = async_channel::bounded(8);
-    let retained = scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+    let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
         7, &CancellationToken::new(), &sender);
     let created = retained.created.as_ref().expect("actual settled original carrier");
     let accepted = ReceivedCreationScopes::validate_received(&fixture.store, created.operation(),
@@ -59,7 +59,7 @@ fn received_created_scopes_refuse_name_retarget_without_reading_replacement() {
         let scoped=fixture.service.clone().with_worktree_authority(
             WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
         let (sender, _)=async_channel::bounded(8);
-        let retained=scoped.create_worktree_journaled_retained(&fixture.store, &fixture.request,
+        let retained=scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
             7, &CancellationToken::new(), &sender);
         let created=retained.created.as_ref().expect("actual settled original carrier");
         let roots=received_original_roles(created); // retain BEFORE late replacement
@@ -70,6 +70,7 @@ fn received_created_scopes_refuse_name_retarget_without_reading_replacement() {
         fs::create_dir(&name).unwrap();
         let marker=name.join("foreign");fs::write(&marker,b"untouched replacement").unwrap();
         assert!(ReceivedCreationScopes::validate_received(&fixture.store,created.operation(),7,roots).is_err());
+        assert!(created.read_original_journal().is_err(), "producer cannot substitute a late named scope");
         assert_eq!(fs::read(marker).unwrap(),b"untouched replacement");
         assert_eq!(fs::read_dir(&name).unwrap().count(),1,"no constructor/history/process effects at receiver");
     }
@@ -88,4 +89,57 @@ fn received_creation_single_row_read_refuses_oversized_payload() {
     }).unwrap();
     assert!(fixture.store.journaled_worktree_operation(id).is_err());
     assert!(fixture.store.journaled_worktree_operation(OperationId::new()).unwrap().is_none());
+}
+
+#[test]
+fn original_creation_journal_uses_same_connection_and_never_a_decoy_store() {
+    if isolated_creation_fixture(concat!(module_path!(), "::original_creation_journal_uses_same_connection_and_never_a_decoy_store")) { return; }
+    let fixture = Fixture::new();
+    let scoped = fixture.service.clone().with_worktree_authority(
+        WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+    let (sender, _) = async_channel::bounded(8);
+    let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
+        7, &CancellationToken::new(), &sender);
+    let created = retained.created.as_ref().expect("actual settled original carrier");
+    let checked = created.read_original_journal().unwrap();
+    let saved = fixture.store.journaled_worktree_operation(created.operation()).unwrap().unwrap();
+    assert_eq!(checked.operation(), &saved);
+    let bytes = creation_journal::encode_original_creation_operation(&checked).unwrap();
+    assert!(bytes.len() <= creation_journal::CREATION_JOURNAL_BODY_LIMIT);
+    assert_eq!(creation_journal::decode_creation_operation_description(&bytes).unwrap(), saved);
+
+    // A second real store can hold the same plausible creation, but the
+    // carrier's API accepts no selector and must still consult its original.
+    let decoy = StateStore::open(fixture.directory.path().join("decoy.sqlite"),
+        BootId::new("decoy-boot")).unwrap();
+    let mut pending = saved.clone();
+    pending.status = PendingOperationStatus::Pending;
+    decoy.begin_operation(&pending).unwrap();
+    decoy.resolve_operation(pending.id, PendingOperationStatus::Applied).unwrap();
+    ReceivedCreationScopes::validate_received(&decoy, created.operation(), 7,
+        received_original_roles(created)).unwrap();
+    fixture.store.release_worktree_creation(created.operation()).unwrap();
+    assert!(created.read_original_journal().is_err(), "matching decoy must never replace the original journal");
+}
+
+#[test]
+fn original_creation_journal_retains_connection_and_refuses_its_shutdown() {
+    if isolated_creation_fixture(concat!(module_path!(), "::original_creation_journal_retains_connection_and_refuses_its_shutdown")) { return; }
+    let fixture = Fixture::new();
+    let scoped = fixture.service.clone().with_worktree_authority(
+        WorktreeAuthority::capture(&fixture.request.repository).unwrap()).unwrap();
+    let (sender, _) = async_channel::bounded(8);
+    let retained = scoped.create_worktree_journaled_retained(fixture.store.clone(), &fixture.request,
+        7, &CancellationToken::new(), &sender);
+    let created = retained.created.as_ref().expect("actual settled original carrier").clone();
+    let weak = Arc::downgrade(&fixture.store);
+    drop(retained);
+    let Fixture { directory: _directory, store, request: _, service: _ } = fixture;
+    drop(store);
+    assert!(weak.upgrade().is_some(), "same original connection must survive external Arc drops");
+    created.read_original_journal().unwrap();
+    weak.upgrade().unwrap().shutdown().unwrap();
+    assert!(created.read_original_journal().is_err(), "closed original connection must not be reopened");
+    drop(created);
+    assert!(weak.upgrade().is_none(), "no global/path-based store substitute is retained");
 }

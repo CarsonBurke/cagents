@@ -16,12 +16,23 @@ pub struct RetainedWorktreeCreation {
 
 /// Keeps original roots and unresolved private publication receipts alive.
 /// This is not a serialized recovery description and has no filesystem Drop.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct CreationRetention {
     operation: OperationId,
     generation: u64,
     source: WorktreeAuthority,
     _session: Arc<creation_authority::CreationSession>,
+    original_store: Arc<StateStore>,
+}
+
+impl fmt::Debug for CreationRetention {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("CreationRetention")
+            .field("operation", &self.operation)
+            .field("generation", &self.generation)
+            .field("source", &self.source)
+            .finish_non_exhaustive()
+    }
 }
 
 impl CreationRetention {
@@ -69,6 +80,21 @@ impl SettledCreatedWorktree {
     pub fn validate(&self) -> Result<(), RepositoryError> {
         self.source.validate()?;
         self.destination.validate()
+    }
+    /// Blocking-worker evidence read through the SAME connection retained by
+    /// the actual creator. No caller-provided store or path can substitute it.
+    /// The result is producer evidence, not host audience/start authority.
+    pub(crate) fn read_original_journal(&self) -> Result<ValidatedCreationOperation, RepositoryError> {
+        let roots = self.transport_roots()?;
+        let checked = ReceivedCreationScopes::validate_received(
+            &self._retention.original_store, roots.operation, roots.generation,
+            [roots.source.0, roots.source.1, roots.source.2,
+             roots.destination.0, roots.destination.1, roots.destination.2],
+        )?;
+        if checked.record() != &self.record {
+            return Err(ValidationError::Io("The original settled creation record changed".into()).into());
+        }
+        Ok(checked.into_validated_operation())
     }
     pub(crate) fn transport_roots(&self) -> Result<SettledCreationRoots, RepositoryError> {
         self.validate()?;
@@ -123,9 +149,10 @@ impl RetainedWorktreeCreation {
     }
     pub(super) fn from_original(report: WorktreeOperationReport,
         session: Arc<creation_authority::CreationSession>, source: WorktreeAuthority,
+        original_store: Arc<StateStore>,
     ) -> Self {
         let retention = CreationRetention { operation: report.operation_id,
-            generation: report.generation, source, _session: session.clone() };
+            generation: report.generation, source, _session: session.clone(), original_store };
         let candidate = session.pending_settlement.lock().unwrap_or_else(|p|p.into_inner()).take();
         let (created, authority_error) = if report.state == WorktreeOperationState::Created {
             match candidate.ok_or_else(|| RepositoryError::from(ValidationError::Io("The Created report has no original pre-unlock authority; automatic opening was withheld".into())))
