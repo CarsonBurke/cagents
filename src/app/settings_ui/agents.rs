@@ -72,3 +72,25 @@ pub(super) fn controls<'a>(draft: &'a SettingsDraft, context: &SettingsContext<'
     }
     groups
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_provider_binary_does_not_hide_the_edited_environment_refusal() {
+        let mut current = AppSettings::default();
+        current.agents.insert("claude".into(), settings::AgentLaunchSettings { executable: Some("/missing/pinned-provider".into()), ..Default::default() });
+        let field = SettingsField::Agent(Provider::Claude, AgentSetting::Environment);
+        for (raw, expected) in [
+            (r#"[["NAME","first"],["NAME","second"]]"#, "unique"),
+            (r#"[["1INVALID","value"]]"#, "Environment names"),
+            (r#"[["CAGENTS_AUTO_ACCOUNT","value"]]"#, "reserved"),
+        ] {
+            let SettingsDecision::Invalid(message) = settings_update(&current, field, raw) else { panic!("invalid environment must be refused"); };
+            assert!(message.contains(expected), "{message}");
+            assert!(!message.contains("executable"), "an unchanged stale sibling must not replace the edited field's reason");
+        }
+        assert!(matches!(settings_update(&current, field, r#"[["VALID_NAME","value"]]"#), SettingsDecision::Persist(_)));
+    }
+}

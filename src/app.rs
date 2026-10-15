@@ -3883,7 +3883,6 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
     Some(match field {
 
         SettingsField::DefaultShell => "Default shell must be an absolute path to an executable file.".into(),
-        SettingsField::Agent(provider, _) => attempted.agents.get(settings::agents::provider_key(provider))?.validate(provider).err()?,
         SettingsField::TerminalScrollSize => format!(
             "{label} must be 1–{} lines.",
             settings::MAX_TERMINAL_SCROLL_SIZE
