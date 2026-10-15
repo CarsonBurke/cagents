@@ -49,42 +49,65 @@ pub(crate) fn get_or_init_messages() -> Sender<Message> {
             #[cfg(feature = "tokio")]
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
 
-            thread::Builder::new().name("accesskit-unix".into()).spawn(|| {
-                let executor = Executor::new();
-                block_on(executor.run(async {
-                    #[cfg(not(feature = "tokio"))]
-                    let mut messages = rx.fuse();
-                    #[cfg(feature = "tokio")]
-                    let mut messages = UnboundedReceiverStream::new(rx).fuse();
-                    let mut adapters = Vec::new();
-                    let mut retry = Retry::default();
-                    loop {
-                        let result = async {
-                            let session_bus = Builder::session()?
-                                .internal_executor(false).build().await?;
-                            run_event_loop(&executor, session_bus, &mut messages, &mut adapters, &mut retry).await
-                        }.await;
-                        let Err(error) = result else {
-                            break; // All adapter senders were retired.
-                        };
-                        if retry.attempts == 0 {
-                            tracing::warn!(%error, "Accessibility bus unavailable; retrying in background");
-                        }
-                        for entry in adapters.iter_mut() {
-                            deactivate_adapter(entry);
-                        }
-                        // Keep consuming adapter lifecycle messages while disconnected.
-                        // In particular, retain windows mounted before the bus exists.
-                        if !wait_for_retry(&mut messages, &mut adapters, retry.next_delay()).await {
-                            break;
-                        }
-                    }
-                }))
-            }).expect("launch accessibility adapter thread");
+            thread::Builder::new()
+                .name("accesskit-unix".into())
+                .spawn(|| {
+                    let executor = Executor::new();
+                    block_on(executor.run(async {
+                        #[cfg(not(feature = "tokio"))]
+                        let mut messages = rx.fuse();
+                        #[cfg(feature = "tokio")]
+                        let mut messages = UnboundedReceiverStream::new(rx).fuse();
+                        drive_context(
+                            &executor,
+                            &mut messages,
+                            || async { Builder::session()?.internal_executor(false).build().await },
+                            |_| {},
+                        )
+                        .await;
+                    }))
+                })
+                .expect("launch accessibility adapter thread");
 
             tx
         })
         .clone()
+}
+
+/// Keep lifecycle receivers and adapters alive through failed connection attempts.
+/// The connector and retry observation are injected by the refused-bus regression.
+async fn drive_context<F, Connect>(
+    executor: &Executor<'_>,
+    messages: &mut (impl futures_lite::Stream<Item = Message> + Unpin),
+    mut connect: Connect,
+    mut retry_scheduled: impl FnMut(std::time::Duration),
+) where
+    Connect: FnMut() -> F,
+    F: std::future::Future<Output = zbus::Result<Connection>>,
+{
+    let mut adapters = Vec::new();
+    let mut retry = Retry::default();
+    loop {
+        let result = async {
+            let session_bus = connect().await?;
+            run_event_loop(executor, session_bus, messages, &mut adapters, &mut retry).await
+        }
+        .await;
+        let Err(error) = result else {
+            break;
+        };
+        if retry.attempts == 0 {
+            tracing::warn!(%error, "Accessibility bus unavailable; retrying in background");
+        }
+        for entry in &mut adapters {
+            deactivate_adapter(entry);
+        }
+        let delay = retry.next_delay();
+        retry_scheduled(delay);
+        if !wait_for_retry(messages, &mut adapters, delay).await {
+            break;
+        }
+    }
 }
 
 struct AdapterEntry {
@@ -224,6 +247,10 @@ async fn run_event_loop(
 
     let mut atspi_bus: Option<Bus> = None;
     loop {
+        let next_message = messages.next();
+        #[cfg(not(feature = "tokio"))]
+        let next_message = next_message.fuse();
+        pin!(next_message);
         let heartbeat = retry_sleep(std::time::Duration::from_secs(5));
         #[cfg(not(feature = "tokio"))]
         let heartbeat = heartbeat.fuse();
@@ -260,7 +287,7 @@ async fn run_event_loop(
                     }
                 }
             }
-            message = messages.next() => {
+            message = next_message => {
                 if let Some(message) = message {
                     process_adapter_message(&atspi_bus, adapters, message).await?;
                 } else {
@@ -361,16 +388,42 @@ mod connection_tests {
 
     #[test]
     fn refused_bus_connection_returns_an_error_and_schedules_retry() {
-        block_on(async {
-            let connection = Builder::address("unix:path=/nonexistent/cagents-atspi-test-bus")
-                .unwrap()
-                .internal_executor(false)
-                .build()
-                .await;
-            assert!(connection.is_err());
-            let mut retry = Retry::default();
-            assert_eq!(retry.next_delay(), std::time::Duration::from_secs(1));
-            assert_eq!(retry.next_delay(), std::time::Duration::from_secs(2));
-        });
+        let executor = Executor::new();
+        block_on(executor.run(async {
+            #[cfg(not(feature = "tokio"))]
+            let (tx, rx) = async_channel::unbounded::<Message>();
+            #[cfg(feature = "tokio")]
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+            #[cfg(not(feature = "tokio"))]
+            let mut messages = rx.fuse();
+            #[cfg(feature = "tokio")]
+            let mut messages = UnboundedReceiverStream::new(rx).fuse();
+            let mut sender = Some(tx);
+            let attempts = std::cell::Cell::new(0);
+            let mut scheduled = Vec::new();
+            drive_context(
+                &executor,
+                &mut messages,
+                || {
+                    attempts.set(attempts.get() + 1);
+                    async {
+                        Builder::address("unix:path=/nonexistent/cagents-atspi-test-bus")
+                            .unwrap()
+                            .internal_executor(false)
+                            .build()
+                            .await
+                    }
+                },
+                |delay| {
+                    scheduled.push(delay);
+                    // Once the real failed attempt schedules its retry, retire
+                    // the final sender: the driver's disconnected wait must exit.
+                    drop(sender.take());
+                },
+            )
+            .await;
+            assert_eq!(attempts.get(), 1);
+            assert_eq!(scheduled, [std::time::Duration::from_secs(1)]);
+        }));
     }
 }
