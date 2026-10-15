@@ -224,6 +224,7 @@ fn dispatch_accepted_with_directory(
 /// The provider's own launch arguments for a new agent's settings, in the
 /// spelling its native chat adapter translates. Each is applied before the
 /// provider can receive a prompt, so the first turn already runs with it.
+#[cfg(test)]
 fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     use crate::agent::Provider;
     let mut arguments = Vec::new();
@@ -345,21 +346,20 @@ fn dispatch(
         (record.session.clone(), record.handle.clone())
     } else {
         let account = selected_account(&accepted.agent.spec).map_err(before)?;
-        let mut session = chat::fresh_session(
+        let settings = crate::settings::default_path().map_err(|error| before(error.to_string())).and_then(|path| crate::settings::load(path).map_err(|error| before(error.to_string())))?;
+        let configuration = settings.agents.get(crate::settings::agents::provider_key(accepted.agent.spec.provider)).cloned().unwrap_or_default();
+        let mut session = chat::fresh_session_configured(
             accepted.agent.spec.provider,
             TerminalId::new(),
             accepted.agent.spec.target.directory.clone(),
             &account,
-        )
-        .map_err(before)?;
-        // Use each provider's existing launch policy before it can receive a
-        // prompt. Post-start settings controls are unsupported by some adapters
-        // and an asynchronous acknowledgement must not race the first turn.
-        session
-            .launch
-            .recipe
-            .arguments
-            .extend(launch_options(&accepted.agent.spec));
+            &configuration,
+            crate::settings::agents::LaunchDefaults {
+                model: accepted.agent.spec.model.as_deref(),
+                effort: accepted.agent.spec.reasoning_effort.as_deref(),
+                permission_mode: accepted.agent.spec.permission_mode.as_deref(),
+            },
+        ).map_err(before)?;
         let proof = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())

@@ -249,6 +249,8 @@ pub enum LoginShellError {
         "no usable login shell was found in the effective user's passwd entry, SHELL, or /bin/sh"
     )]
     Unavailable,
+    #[error("The configured default shell is unavailable or is not executable")]
+    ConfiguredUnavailable,
 }
 
 impl LaunchRecipe {
@@ -270,9 +272,12 @@ impl LaunchRecipe {
     }
 }
 
-/// The shell a new terminal runs: the passwd entry's, else `SHELL`, else
-/// `/bin/sh`.
+/// The configured shell for new terminals, otherwise the passwd entry's,
+/// `SHELL`, then `/bin/sh`.
 pub(crate) fn login_shell() -> Result<String, LoginShellError> {
+    if let Some(shell) = crate::settings::default_path().ok().and_then(|path| crate::settings::load(path).ok()).and_then(|settings| settings.default_shell) {
+        return if crate::settings::agents::executable_available(&shell) { Ok(shell) } else { Err(LoginShellError::ConfiguredUnavailable) };
+    }
     choose_login_shell(
         passwd_shell(),
         std::env::var_os("SHELL").and_then(|shell| shell.into_string().ok()),

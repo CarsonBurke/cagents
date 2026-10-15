@@ -271,6 +271,7 @@ pub enum Action {
     Field(Target, String, String, String),
     Choice(Target, String, String, String),
     Answer(Target, String, String),
+    DenyInstructions(Target, String, bool),
     /// Puts a completion row's text over the word being completed. When the
     /// row is no longer offered, because the word changed under the key that
     /// chose it, the key does what it does without the list: the action
@@ -388,6 +389,7 @@ impl Action {
             | Self::Field(target, _, _, _)
             | Self::Choice(target, _, _, _)
             | Self::Answer(target, _, _)
+            | Self::DenyInstructions(target, _, _)
             | Self::Complete(target, _, _)
             | Self::Scrolled(target, _, _, _)
             | Self::ModelPicker(target, _)
@@ -595,6 +597,7 @@ impl ChangeToken {
             chat::ToolStatus::Failed => 2,
             chat::ToolStatus::Denied => 3,
             chat::ToolStatus::Stopped => 4,
+            chat::ToolStatus::AwaitingApproval => 5,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -823,6 +826,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::AwaitingApproval => "Awaiting approval",
     }
 }
 
@@ -1493,6 +1497,9 @@ pub(super) struct Runtime {
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
     source_clock: Option<chat::client::SourceClock>,
+    /// Tiny interaction metadata survives transcript window/cache eviction.
+    turn_started_at: Option<u64>,
+    turn_prompt_id: Option<String>,
     finished_stamp: Option<(u64, String, String)>,
     cache: HashMap<String, CachedItem>,
     /// Only the latest explicitly requested preview is retained outside recency.
@@ -2064,6 +2071,8 @@ impl Runtime {
                 ..Snapshot::default()
             }),
             source_clock: None,
+            turn_started_at: None,
+            turn_prompt_id: None,
             finished_stamp: None,
             connection,
             queued: None,
@@ -2491,6 +2500,34 @@ impl Runtime {
                 self.asked_after.insert(last.id.clone());
             }
         }
+        fn latest_user(state: &Snapshot) -> Option<&Arc<chat::Item>> {
+            state.items.iter().rev().find(|item| {
+                item.role == chat::Role::User
+                    && matches!(
+                        item.content,
+                        ItemContent::Text {
+                            thinking: false,
+                            ..
+                        }
+                    )
+            })
+        }
+        let current_user = latest_user(&snapshot);
+        let previous_user = latest_user(&self.snapshot);
+        let new_turn = snapshot.turn_generation != self.snapshot.turn_generation
+            || snapshot.session_id != self.snapshot.session_id
+            || (!self.snapshot.busy && snapshot.busy);
+        if new_turn {
+            self.turn_prompt_id = None;
+            self.turn_started_at = snapshot.turn_started_at;
+        }
+        if self.turn_prompt_id.is_none()
+            && let Some(user) = current_user
+            && previous_user.is_none_or(|previous| previous.id != user.id)
+        {
+            self.turn_started_at = user.started_at.or(user.at).or(self.turn_started_at);
+            self.turn_prompt_id = Some(user.id.clone());
+        }
         self.source_clock = source_clock;
         let cache = &self.cache;
         let turns = turn::group(&snapshot.items, &self.asked_after, |item| {
@@ -2547,6 +2584,24 @@ impl Runtime {
             .iter()
             .filter(|agent| agent.stopped_by_interrupt(&self.snapshot.capabilities))
             .count()
+    }
+
+    fn denial_response(&self, request_id: &str) -> Option<Command> {
+        if self.session.launch.provider != Provider::Claude
+            || !self.snapshot.requests.iter().any(|request| {
+                request.id == request_id
+                    && request.kind == chat::RequestKind::Approval
+                    && request.actions.iter().any(|choice| choice.id == "deny")
+            })
+        {
+            return None;
+        }
+        let text = self.composer.text().trim_end_matches('\n').to_owned();
+        (!text.trim().is_empty()).then(|| Command::Answer {
+            request_id: request_id.to_owned(),
+            action: "deny".into(),
+            answers: vec![chat::Answer::denial_instructions(text)],
+        })
     }
 
     fn refresh_find(&mut self) {
@@ -2984,8 +3039,16 @@ fn fresh_chat_session(
     working_directory: PathBuf,
     account: &Account,
     automatic: bool,
+    configuration: &settings::AgentLaunchSettings,
 ) -> Result<chat::Session, String> {
-    let mut session = chat::fresh_session(provider, id, working_directory, account)?;
+    let mut session = chat::fresh_session_configured(
+        provider,
+        id,
+        working_directory,
+        account,
+        configuration,
+        Default::default(),
+    )?;
     if automatic {
         session
             .launch
@@ -3013,18 +3076,10 @@ fn draft_snapshot(
             attachments: true,
             model_selection: true,
             reasoning_selection: true,
-            permission_modes: match provider {
-                Provider::Claude => vec![
-                    "manual".into(),
-                    "acceptEdits".into(),
-                    "auto".into(),
-                    "plan".into(),
-                    "dontAsk".into(),
-                    "bypassPermissions".into(),
-                ],
-                Provider::Codex => vec!["readOnly".into(), "workspaceWrite".into(), "yolo".into()],
-                Provider::Omp => Vec::new(),
-            },
+            permission_modes: settings::agents::permission_modes(provider)
+                .iter()
+                .map(|mode| (*mode).into())
+                .collect(),
             skill_reach: match provider {
                 Provider::Codex => chat::SkillReach::Anywhere,
                 Provider::Claude => chat::SkillReach::Leading,
@@ -3592,6 +3647,12 @@ impl Cagents {
         };
         let account = self.default_account_for_directory(provider, &directory);
         let automatic = self.automatic_accounts_for_directory(provider, &directory);
+        let configuration = self
+            .settings
+            .agents
+            .get(settings::agents::provider_key(provider))
+            .cloned()
+            .unwrap_or_default();
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -3599,7 +3660,7 @@ impl Cagents {
             return Task::none();
         }
         runtime.model_picker = None;
-        let moved = if runtime.session.launch.provider == provider {
+        let mut moved = if runtime.session.launch.provider == provider {
             None
         } else {
             match fresh_chat_session(
@@ -3608,6 +3669,7 @@ impl Cagents {
                 runtime.session.launch.recipe.working_directory.clone(),
                 &account,
                 automatic,
+                &configuration,
             ) {
                 Ok(session) => Some(session),
                 Err(error) => {
@@ -3633,6 +3695,15 @@ impl Cagents {
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
         }
+        let launch = moved
+            .as_mut()
+            .map_or(&mut runtime.session.launch, |session| &mut session.launch);
+        settings::agents::set_model_options(
+            &mut launch.recipe.arguments,
+            provider,
+            snapshot.selected_model.as_deref(),
+            snapshot.reasoning.as_deref(),
+        );
         runtime.snapshot = Arc::new(snapshot);
         runtime.completion.restart(true);
         if let Some(session) = &moved {
@@ -3687,6 +3758,16 @@ impl Cagents {
             .get(&provider)
             .cloned()
             .map_or((None, None), |(model, reasoning)| (Some(model), reasoning));
+        let configured = self
+            .settings
+            .agents
+            .get(settings::agents::provider_key(provider));
+        let model = configured
+            .and_then(|settings| settings.model.clone())
+            .or(model);
+        let reasoning = configured
+            .and_then(|settings| settings.effort.clone())
+            .or(reasoning);
         draft_snapshot(provider, models, model, reasoning)
     }
 
@@ -3708,6 +3789,12 @@ impl Cagents {
         let Some(account) = self.known_account(&id) else {
             return Task::none();
         };
+        let configuration = self
+            .settings
+            .agents
+            .get(settings::agents::provider_key(account.provider))
+            .cloned()
+            .unwrap_or_default();
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
@@ -3721,6 +3808,7 @@ impl Cagents {
             runtime.session.launch.recipe.working_directory.clone(),
             &account,
             false,
+            &configuration,
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -4351,6 +4439,10 @@ impl Cagents {
             working_directory.clone(),
             &account,
             automatic,
+            self.settings
+                .agents
+                .get(settings::agents::provider_key(provider))
+                .unwrap_or(&settings::AgentLaunchSettings::default()),
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -5293,6 +5385,15 @@ impl Cagents {
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
         let mut session = runtime.session.clone();
         session.id = TerminalId::new();
+        settings::AgentLaunchSettings::default().append_options(
+            session.launch.provider,
+            &mut session.launch.recipe.arguments,
+            settings::agents::LaunchDefaults {
+                model: runtime.snapshot.selected_model.as_deref(),
+                effort: runtime.snapshot.reasoning.as_deref(),
+                permission_mode: None,
+            },
+        );
         let text = runtime.composer.text();
         let resolved_text = completion::invocations(
             completion::from_leading_skill(&text, &runtime.snapshot.skills),
@@ -7319,7 +7420,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7414,7 +7516,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -7475,7 +7578,9 @@ impl Cagents {
                         }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
-                            runtime.take_attachments();
+                            if pending.request.is_none() {
+                                runtime.take_attachments();
+                            }
                         }
                         if let Some(sent) = pending.sent {
                             runtime.remember(sent);
@@ -8065,6 +8170,31 @@ impl Cagents {
                     }
                 }
             }
+            Action::DenyInstructions(target, request_id, send) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if runtime.session.launch.provider != Provider::Claude
+                    || !runtime.snapshot.requests.iter().any(|request| {
+                        request.id == request_id
+                            && request.kind == chat::RequestKind::Approval
+                            && request.actions.iter().any(|choice| choice.id == "deny")
+                    })
+                {
+                    return Task::none();
+                }
+                if !send {
+                    return iced::widget::operation::focus(card_control_id(
+                        target.card,
+                        "chat-composer",
+                    ))
+                    .map(cosmic::Action::App);
+                }
+                let Some(command) = runtime.denial_response(&request_id) else {
+                    return Task::none();
+                };
+                return self.chat_send(target, command, true);
+            }
             Action::Answer(target, request_id, action) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -8633,6 +8763,72 @@ mod tests {
         assert!(runtime.prompt_suggestion().is_some());
         Arc::make_mut(&mut runtime.snapshot).session_id = Some("other-session".into());
         assert!(runtime.prompt_suggestion().is_none());
+    }
+
+    #[test]
+    fn denying_with_composer_instructions_clears_only_the_acknowledged_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("approval"));
+        let target = {
+            let CardRuntime::Chat(runtime) = app.cards.get_mut(&card).unwrap() else {
+                unreachable!()
+            };
+            runtime.session.launch.provider = Provider::Claude;
+            runtime.replace_draft(text_editor::Content::with_text(
+                "use git push --force-with-lease instead",
+            ));
+            runtime.attachments.push(Attachment {
+                path: "retained.png".into(),
+            });
+            Arc::make_mut(&mut runtime.snapshot)
+                .requests
+                .push(chat::Request {
+                    kind: chat::RequestKind::Approval,
+                    id: "approval".into(),
+                    title: "Allow Bash?".into(),
+                    description: String::new(),
+                    fields: vec![],
+                    actions: vec![chat::Choice {
+                        id: "deny".into(),
+                        label: "Deny".into(),
+                        description: String::new(),
+                    }],
+                });
+            runtime.target
+        };
+        assert_eq!(
+            chat_runtime(&app, card).denial_response("approval"),
+            Some(Command::Answer {
+                request_id: "approval".into(),
+                action: "deny".into(),
+                answers: vec![chat::Answer::denial_instructions(
+                    "use git push --force-with-lease instead".into()
+                )],
+            })
+        );
+        drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
+        let runtime = chat_runtime(&app, card);
+        let pending = runtime
+            .pending
+            .as_ref()
+            .expect("the approval is dispatched");
+        assert_eq!(pending.request.as_deref(), Some("approval"));
+        let command_id = pending.id;
+        let next = runtime.next_command;
+        assert_eq!(
+            runtime.composer.text().trim_end(),
+            "use git push --force-with-lease instead"
+        );
+        drop(app.handle_chat_ui(Action::DenyInstructions(target, "approval".into(), true)));
+        assert_eq!(
+            chat_runtime(&app, card).next_command,
+            next,
+            "duplicate clicks cannot dispatch twice"
+        );
+        drop(app.handle_chat_ui(Action::CommandFinished(target, command_id, Ok(()))));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.composer.text().trim().is_empty());
+        assert_eq!(runtime.attachments[0].path, PathBuf::from("retained.png"));
     }
 
     #[test]
@@ -9746,6 +9942,7 @@ mod tests {
                     "/project".into(),
                     &account,
                     false,
+                    &settings::AgentLaunchSettings::default(),
                 )
                 .unwrap();
                 let expected = account
@@ -11147,14 +11344,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11173,7 +11375,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -13505,6 +13710,120 @@ mod tests {
         assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
         std::fs::write(other.path().join("config.toml"), "malformed TOML [").unwrap();
         assert_eq!(draft_permission_mode(&recipe, Provider::Codex), None);
+    }
+
+    #[test]
+    fn agents_controls_repair_invalid_siblings_one_field_at_a_time() {
+        let mut current = AppSettings {
+            default_shell: Some("/missing/shell".into()),
+            agents: std::collections::BTreeMap::from([
+                (
+                    "claude".into(),
+                    settings::AgentLaunchSettings {
+                        executable: Some("/missing/claude".into()),
+                        environment: std::collections::BTreeMap::from([(
+                            "CLAUDE_CONFIG_DIR".into(),
+                            "forbidden".into(),
+                        )]),
+                        permission_mode: Some("plan".into()),
+                        ..Default::default()
+                    },
+                ),
+                (
+                    "codex".into(),
+                    settings::AgentLaunchSettings {
+                        executable: Some("/missing/codex".into()),
+                        ..Default::default()
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+        for (field, value) in [
+            (
+                SettingsField::Agent(Provider::Claude, AgentSetting::Executable),
+                "/bin/sh",
+            ),
+            (
+                SettingsField::Agent(Provider::Codex, AgentSetting::Executable),
+                "/bin/sh",
+            ),
+            (SettingsField::DefaultShell, "/bin/sh"),
+            (
+                SettingsField::Agent(Provider::Claude, AgentSetting::Environment),
+                "[]",
+            ),
+        ] {
+            let SettingsDecision::Persist(next) = settings_update(&current, field, value) else {
+                panic!("repair {field:?} must not reject invalid siblings")
+            };
+            current = next;
+        }
+        assert_eq!(
+            current.agents["claude"].permission_mode.as_deref(),
+            Some("plan")
+        );
+        current.validate().unwrap();
+    }
+
+    #[test]
+    fn new_draft_uses_provider_defaults_and_keeps_composer_choices_local() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.agents.insert(
+            "claude".into(),
+            settings::AgentLaunchSettings {
+                executable: Some("/bin/sh".into()),
+                model: Some("configured-model".into()),
+                effort: Some("low".into()),
+                permission_mode: Some("plan".into()),
+                ..Default::default()
+            },
+        );
+        drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
+        let card = app.workspace.focused().unwrap();
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.session.launch.recipe.program, "/bin/sh");
+        assert_eq!(
+            runtime.snapshot.selected_model.as_deref(),
+            Some("configured-model")
+        );
+        assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
+        assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some("plan"));
+        let target = runtime.target;
+        drop(app.choose_draft_model(target, Provider::Claude, Some("conversation-model".into())));
+        assert_eq!(
+            chat_runtime(&app, card).snapshot.selected_model.as_deref(),
+            Some("conversation-model")
+        );
+        // Dropping the returned task starts no provider, while the prepared
+        // recipe must already contain the per-conversation override.
+        drop(app.start_chat_draft(target));
+        assert!(
+            chat_runtime(&app, card)
+                .session
+                .launch
+                .recipe
+                .arguments
+                .windows(2)
+                .any(|pair| pair == ["--model", "conversation-model"])
+        );
+        assert!(
+            !chat_runtime(&app, card)
+                .session
+                .launch
+                .recipe
+                .arguments
+                .iter()
+                .any(|argument| argument == "configured-model")
+        );
+        drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
+        let next = app.workspace.focused().unwrap();
+        assert_ne!(next, card);
+        assert_eq!(
+            chat_runtime(&app, next).snapshot.selected_model.as_deref(),
+            Some("configured-model")
+        );
     }
 
     #[test]

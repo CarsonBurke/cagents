@@ -108,6 +108,7 @@ fn chat_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatTerminal { .. }
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
+                | ServerResponse::ChatOriginal { .. }
         }
     )
 }
@@ -544,6 +545,30 @@ mod tests {
         };
         assert_eq!(error.code, ProtocolErrorCode::QueueFull);
         assert!(error.retryable);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn immutable_original_pages_share_the_bounded_chat_page_backlog() {
+        let queue = DeliveryQueue::new(7, 64);
+        let chat_id = TerminalId::new();
+        let mut envelope = redraw(chat_id, 0);
+        envelope.message = ServerMessage::Response {
+            response: ServerResponse::ChatOriginal {
+                chat_id,
+                result: Err(crate::chat::annotations::OriginalError::Changed),
+            },
+        };
+        for request in 1..=MAX_QUEUED_CHAT_PAGES {
+            envelope.request_id = Some(request as u64);
+            queue.push(envelope.clone()).unwrap();
+        }
+        envelope.request_id = Some(3);
+        assert_eq!(queue.push(envelope), Err(DeliveryError::Full));
+        assert!(
+            matches!(queue.pop().unwrap().message, ServerMessage::Error(error)
+            if error.code == ProtocolErrorCode::QueueFull)
+        );
         assert!(queue.pop().is_none());
     }
 }
