@@ -1114,6 +1114,15 @@ mod tests {
                         }
                     }
                     assert!(!messages.contains(&FocusConflictMessage::RawInput), "{messages:?}");
+                    if text_field && matches!(&event, Event::InputMethod(_)) {
+                        let edited: Vec<_> = messages.iter().filter_map(|message| {
+                            if let FocusConflictMessage::Edited(value) = message { Some(value) } else { None }
+                        }).collect();
+                        assert_eq!(edited.len(), 1, "native field must positively receive the IME commit: {messages:?}");
+                        assert_eq!(edited[0].matches("ime").count(), 1);
+                        assert_eq!(edited[0].replacen("ime", "", 1), "retained",
+                            "native IME insertion preserves the existing field value");
+                    }
                     assert!(!raw_focused.get(), "conflicting native flag must be cleared before child delivery");
                     assert_eq!(trace.keyboard_widget_id(), Some(control.clone()));
                     assert_eq!(trace.keyboard_focus(), Some(control_region.pane));
