@@ -93,12 +93,19 @@ fn consent(host:&SharedHost,repository:&Path,path:&Path)->SessionStopConsent {
 fn stop_with(repository:&Path,path:&Path,fingerprint:String,token:uuid::Uuid,consent:SessionStopConsent)->Operation {
     Operation::StopSessions {repository:repository.into(),path:path.into(),consent,expected_fingerprint:fingerprint,stop_authority:token}
 }
-fn fingerprint(root:&Path)->String { RepositoryService::system("git").worktree_safety(root,&CancellationToken::new()).unwrap().fingerprint }
+fn safety(root:&Path)->crate::repository::WorktreeSafetySnapshot { RepositoryService::system("git").worktree_safety(root,&CancellationToken::new()).unwrap() }
+fn fingerprint(root:&Path)->String { safety(root).fingerprint }
 fn cloned(parent:&Path,root:&Path)->PathBuf {
     let clone=parent.join("replacement");
     git(parent,&["clone","--quiet","--no-hardlinks",root.to_str().unwrap(),clone.to_str().unwrap()]);
     git(&clone,&["remote","remove","origin"]);
-    assert_eq!(fingerprint(root),fingerprint(&clone),"clean clone has same branch/OID/safety projection");
+    let original=safety(root);let replacement=safety(&clone);
+    assert_eq!((original.modified,original.untracked),(0,0));
+    assert_eq!((replacement.modified,replacement.untracked),(0,0));
+    assert!(original.head_oid.is_some());
+    assert_eq!(original.head_oid,replacement.head_oid,"actual same commit");
+    assert_eq!(original.branch,replacement.branch,"actual same branch");
+    assert_eq!(original.fingerprint,replacement.fingerprint,"clean clone has same safety projection");
     clone
 }
 fn inspect_at(host:&SharedHost,repository:&Path,path:&Path)->(String,uuid::Uuid) {
@@ -185,10 +192,16 @@ fn changed_symlink_target_cannot_spend_original_inspection_with_fresh_other_acto
     let alias=parent.path().join("selected");std::os::unix::fs::symlink(&root,&alias).unwrap();
     let host=host();let a=Actor::start(&host,&root);let b=Actor::start(&host,&other);
     let (fp,token)=inspect_at(&host,&root,&alias);
+    let (same_fp,original_roster_token)=inspect_at(&host,&root,&alias);
+    assert_eq!(same_fp,fp);let original_a=consent(&host,&root,&alias);
     fs::remove_file(&alias).unwrap();std::os::unix::fs::symlink(&other,&alias).unwrap();
     let fresh_b=consent(&host,&root,&alias);assert_eq!(fresh_b.sessions[0].session,b.id);
-    assert!(request(&host,1,stop_with(&root,&alias,fp,token,fresh_b)).is_err());
+    assert!(request(&host,1,stop_with(&root,&alias,fp.clone(),token,fresh_b)).is_err());
+    // Matching A consent passes the captured canonical census; the original
+    // lexical-alias check itself must still refuse the redirected request.
+    assert!(request(&host,1,stop_with(&root,&alias,fp,original_roster_token,original_a)).is_err());
     a.assert_live(&host);b.assert_live(&host);
+    assert!(!a.handle.close_observation().closing && !b.handle.close_observation().closing);
 }
 
 #[test]
