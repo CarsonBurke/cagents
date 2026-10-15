@@ -287,10 +287,12 @@ fn restore_authenticated(
                     && current.handle.holder_identity() == paired_holder.as_ref()
                     && current.session.launch == terminal.launch
                     && current.session.owned_codex_listener == terminal.owned_codex_listener
-                    && current.session.continuity.live_proof().as_ref() == Some(proof)
             })
             .ok_or("The paired terminal could not be recovered; native ownership was preserved")?;
-        *terminal = current.session.clone();
+        *terminal = state.native_terminal_projection(terminal.id)?;
+        if terminal.continuity.live_proof().as_ref() != Some(proof) {
+            return Err("The native console worker belongs to a different daemon owner".into());
+        }
         Ok(Some(current.handle.clone()))
     })();
     let paired = match paired {

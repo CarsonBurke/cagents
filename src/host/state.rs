@@ -1249,6 +1249,21 @@ impl HostState {
     }
 
     /// Read-only history and presentation remain available after PTY teardown.
+    /// Only typed native recovery may inspect this private projection before
+    /// the console's durable actor binding is committed. Public descriptors
+    /// keep masking a provisional record as Failed.
+    pub(super) fn native_terminal_projection(&self, id: TerminalId) -> Result<TerminalSession, String> {
+        let terminal = self.terminals.get(&id).ok_or("The native console worker is unavailable")?;
+        if terminal.handle.is_completed() || !self.proof().is_complete() {
+            return Err("The native console worker completed or its current ownership is unavailable".into());
+        }
+        let proof = self.proof();
+        let mut current = terminal.session.clone();
+        current.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        Ok(current)
+    }
+
     /// A recovered provider console remains provisional until its native actor
     /// and durable Chat association have both been installed by typed recovery.
     pub(super) fn native_terminal_binding_known(&self, id: TerminalId) -> bool {
@@ -1258,13 +1273,7 @@ impl HostState {
         if chat.handle.is_completed() || chat.session.proof.as_ref() != Some(self.proof())
             || !chat.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&terminal.handle))
             || pair.continuity.live_proof().as_ref() != Some(self.proof()) { return false; }
-        // An authenticated current worker can retain its original unhosted
-        // launch continuity. Project its private owner directly: descriptor()
-        // intentionally masks this provisional record as Failed.
-        let proof = self.proof();
-        let mut current = terminal.session.clone();
-        current.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(),
-            boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
+        let Ok(current) = self.native_terminal_projection(id) else { return false; };
         let mut pair = pair.clone();
         pair.continuity = current.continuity.clone();
         pair.resume_hint = current.resume_hint.clone();
