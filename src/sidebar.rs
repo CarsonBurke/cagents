@@ -11839,9 +11839,7 @@ mod row_interaction {
                         ..
                     }) if state.focused => {
                         let action = match named {
-                            keyboard::key::Named::Enter
-                                if modifiers.is_empty() =>
-                            {
+                            keyboard::key::Named::Enter if modifiers.is_empty() => {
                                 Some(SidebarAction::InvokeChangeRows {
                                     key: key.clone(),
                                     row: row.clone(),
