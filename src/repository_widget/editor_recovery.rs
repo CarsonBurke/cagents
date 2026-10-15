@@ -8,7 +8,7 @@ pub(super) struct State {
     pub(super) pending: Option<crate::editor::RecoveryAuthority>,
 }
 impl RepositoryRuntime {
-    pub fn has_editor_recovery(&self) -> bool { self.recovery.is_some() || self.recovery_capture_ticket.is_some() }
+    pub fn has_editor_recovery(&self) -> bool { self.recovery.as_ref().is_some_and(|state| !state.authority.is_resolved()) || self.recovery_capture_ticket.is_some() }
 
     /// A publisher can hand an unopened-file recovery to its owning runtime.
     /// The authority itself retains the exact source descriptors and paths.

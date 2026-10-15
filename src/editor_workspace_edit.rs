@@ -174,35 +174,91 @@ fn prepare_at(root: Arc<fs_safety::Root>, protection: Arc<Option<crate::worktree
 /// publications only while their exact written hash still matches, preserving
 /// concurrent outside edits and reporting any file that could not be restored.
 #[derive(Debug, Clone, Default)]
-pub struct PublicationReport { pub durability_warnings: Vec<String> }
+pub struct PublicationReport {
+    pub durability_warnings: Vec<String>,
+    pub recovery: Option<editor::RecoveryAuthority>,
+    pub worktree: Option<PathBuf>,
+}
+impl PublicationReport {
+    fn retain(&mut self, authority: &editor::RecoveryAuthority) {
+        self.recovery = Some(match self.recovery.take() { Some(previous) => previous.combine(authority.clone()), None => authority.clone() });
+    }
+    fn durability(&mut self, path: &Path, durability: SaveDurability, restoring: bool) {
+        let action = if restoring { "restored" } else { "replaced" };
+        match durability {
+            SaveDurability::Durable => {},
+            SaveDurability::Unconfirmed { error } => self.durability_warnings.push(format!("{} was {action}, but crash durability is unconfirmed: {error}", path.display())),
+            SaveDurability::Recovery { error, authority } => {
+                self.retain(&authority);
+                self.durability_warnings.push(format!("{} was {action}; retained file recovery is still required: {error}", path.display()));
+            }
+        }
+    }
+}
 
-pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, String> {
+#[derive(Debug, Clone)]
+pub struct PublicationFailure {
+    pub message: String,
+    pub recovery: Option<editor::RecoveryAuthority>,
+    pub worktree: Option<PathBuf>,
+}
+impl From<String> for PublicationFailure {
+    fn from(message: String) -> Self { Self { message, recovery: None, worktree: None } }
+}
+impl From<&str> for PublicationFailure { fn from(message: &str) -> Self { message.to_owned().into() } }
+impl std::fmt::Display for PublicationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { formatter.write_str(&self.message) }
+}
+impl std::error::Error for PublicationFailure {}
+impl PublicationFailure { pub fn contains(&self, pattern: &str) -> bool { self.message.contains(pattern) } }
+
+pub fn publish_unopened(plan: &Plan) -> Result<PublicationReport, PublicationFailure> {
     publish_unopened_with_before_file(plan, |_| {})
 }
 
-fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(usize)) -> Result<PublicationReport, String> {
+fn publish_unopened_with_before_file(plan: &Plan, mut before_file: impl FnMut(usize)) -> Result<PublicationReport, PublicationFailure> {
     verify_root(&plan.root)?;
-    let mut report = PublicationReport::default();
+    let mut report = PublicationReport { worktree: Some(plan.worktree.clone()), ..Default::default() };
     let mut published: Vec<&DocumentPlan> = Vec::new();
     for (index, document) in plan.documents.iter().filter(|document| !document.open && document.before != document.after).enumerate() {
         before_file(index);
-        let saved = verify_root(&plan.root).and_then(|()| editor::save_file_at(&plan.root, &document.relative, &document.after, document.before_hash, false).map_err(|error| error.to_string()));
+        let saved = verify_root(&plan.root).map_err(editor::FileIoError::Io)
+            .and_then(|()| editor::save_file_at(&plan.root, &document.relative, &document.after, document.before_hash, false));
         let failure = match saved {
             Ok(SaveOutcome::Saved { durability, .. }) => {
-                if let SaveDurability::Unconfirmed { error } = durability { report.durability_warnings.push(format!("{} was replaced, but durability is unconfirmed: {error}", document.relative.display())); }
+                report.durability(&document.relative, durability, false);
                 published.push(document); continue;
             },
             Ok(SaveOutcome::Conflict { .. }) => format!("{} changed on disk", document.relative.display()),
-            Err(error) => format!("{}: {error}", document.relative.display()),
+            Ok(SaveOutcome::Absent { durability, .. }) => {
+                report.durability(&document.relative, durability, false);
+                format!("{} unexpectedly became absent; publication was refused", document.relative.display())
+            },
+            Err(error) => {
+                if let Some(authority) = error.recovery_authority() { report.retain(authority); }
+                format!("{}: {error}", document.relative.display())
+            }
         };
         let mut unrestored = Vec::new();
         for previous in published.into_iter().rev() {
-            if !matches!(editor::save_file_at(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false), Ok(SaveOutcome::Saved { .. })) {
-                unrestored.push(previous.relative.display().to_string());
+            let restored = editor::save_file_at(&plan.root, &previous.relative, &previous.before, blake3::hash(previous.after.as_bytes()), false);
+            match restored {
+                Ok(SaveOutcome::Saved { durability, .. }) => report.durability(&previous.relative, durability, true),
+                Err(error) => {
+                    if let Some(authority) = error.recovery_authority() { report.retain(authority); }
+                    unrestored.push(format!("{}: {error}", previous.relative.display()));
+                },
+                Ok(SaveOutcome::Absent { durability, .. }) => {
+                    report.durability(&previous.relative, durability, true);
+                    unrestored.push(previous.relative.display().to_string());
+                },
+                Ok(SaveOutcome::Conflict { .. }) => unrestored.push(previous.relative.display().to_string()),
             }
         }
-        return Err(if unrestored.is_empty() { format!("The workspace edit was canceled: {failure}. Earlier writes were restored.") }
-            else { format!("The workspace edit stopped: {failure}. These files could not be restored because they changed or could not be written: {}", unrestored.join(", ")) });
+        let mut message = if unrestored.is_empty() { format!("The workspace edit was canceled: {failure}. Earlier writes were restored.") }
+            else { format!("The workspace edit stopped: {failure}. These files could not be restored because they changed or could not be written: {}", unrestored.join(", ")) };
+        if !report.durability_warnings.is_empty() { message.push_str("\n"); message.push_str(&report.durability_warnings.join("\n")); }
+        return Err(PublicationFailure { message, recovery: report.recovery, worktree: report.worktree });
     }
     Ok(report)
 }

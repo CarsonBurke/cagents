@@ -10202,7 +10202,7 @@ pub fn view_with_review<'a>(
     // Recovery belongs to the runtime, including a late receipt delivered
     // while another file is loading or shown as a noneditable viewer.
     let mut rows = Vec::new();
-    if let Some(recovery) = &runtime.recovery {
+    if let Some(recovery) = runtime.recovery.as_ref().filter(|state| !state.authority.is_resolved()) {
         rows.push(widget::container(widget::row::with_children(vec![
             crate::design::body(&recovery.message).width(Length::Fill).into(),
             crate::ui_controls::button::secondary("Retry file recovery")

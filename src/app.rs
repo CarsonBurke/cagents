@@ -22,6 +22,7 @@ mod browser_backend;
 mod browser_host;
 mod file_ui;
 mod editor_features;
+mod editor_feature_recovery;
 mod git_group_ui;
 mod git_patch_ui;
 mod git_ui;
@@ -15681,7 +15682,7 @@ impl Cagents {
     }
 
     fn exit_after_language_servers(&mut self) -> Task<Message> {
-        if self.cards.values().any(|runtime| match runtime {
+        if self.publication_recovery_pending() || self.cards.values().any(|runtime| match runtime {
             CardRuntime::Repository(runtime) => runtime.has_editor_recovery(),
             CardRuntime::PullRequests(pane) => pane.runtime.has_editor_recovery(),
             _ => false,
@@ -22501,6 +22502,9 @@ impl Application for Cagents {
         };
 
         let main_content = self.workspace_chrome(workspace);
+        let main_content = if let Some(recovery) = self.publication_recovery_view() {
+            widget::column::with_children(vec![recovery, main_content]).width(Length::Fill).height(Length::Fill).into()
+        } else { main_content };
 
         let context_model = (self.context_inspector_visible()
             && self.context_tab == ContextTab::Details)

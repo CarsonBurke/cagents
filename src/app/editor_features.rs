@@ -23,7 +23,9 @@ pub enum Action {
     ApplyPreview,
     CancelPreview,
     HidePublication(u64),
-    Published { ticket: u64, result: Result<workspace::PublicationReport, String> },
+    RetryPublicationRecovery(crate::editor::RecoveryAuthority),
+    PublicationRecoveryResolved { authority: crate::editor::RecoveryAuthority, result: Result<(), String> },
+    Published { ticket: u64, result: Result<workspace::PublicationReport, workspace::PublicationFailure> },
 }
 
 #[cfg(test)]
@@ -801,6 +803,7 @@ pub(super) struct State {
     preview: Option<Preview>,
     publication: Option<Publication>,
     publication_saves: HashMap<CardId, (repository_widget::RepositoryMenuIdentity, PathBuf)>,
+    pub(super) recovery: Option<super::editor_feature_recovery::State>,
     pub(super) location_history: crate::editor_locations::History,
     pub(super) jump_origins: HashMap<CardId, crate::editor_locations::Location>,
     pub(super) history_restores: HashMap<CardId, (crate::editor_locations::Location, crate::editor_locations::Target)>,
@@ -815,6 +818,7 @@ impl State {
     }
     pub fn modal_open(&self) -> bool { self.modal_dialog().is_some() }
     pub fn publishing(&self) -> bool { self.publication.is_some() }
+    pub(super) fn publication_origin(&self, ticket: u64) -> Option<CardId> { self.publication.as_ref().filter(|publication| publication.ticket == ticket).map(|publication| publication.operation.card) }
     fn next(&mut self) -> u64 { self.next_ticket = self.next_ticket.wrapping_add(1).max(1); self.next_ticket }
 }
 
@@ -1105,7 +1109,7 @@ impl Cagents {
         }
         let user_action = matches!(action,
             Action::Rename(_) | Action::RenameDraft(..) | Action::SubmitRename(..) | Action::Format { .. }
-            | Action::CodeActions(_) | Action::ChooseCodeAction(..) | Action::Signature(..));
+            | Action::CodeActions(_) | Action::ChooseCodeAction(..) | Action::Signature(..) | Action::RetryPublicationRecovery(..));
         if !user_action { return false; }
         if crate::device::is_remote() { return true; }
         // Save-and-close is an explicit answer to the dirty-buffer dialog.
@@ -1324,15 +1328,22 @@ impl Cagents {
                 self.notices.record(TransientNotice::warning("Applying workspace edit… Work continues after progress is hidden.").key(format!("editor-publication:{ticket}")));
                 self.modal_restore_focus(self.modal_restore_fallback())
             }
+            Action::RetryPublicationRecovery(authority) => self.start_publication_recovery(authority),
+            Action::PublicationRecoveryResolved { authority, result } => {
+                self.finish_publication_recovery(authority, result); Task::none()
+            }
             Action::Published { ticket, result } => {
+                // Retain before ticket/owner rejection: even a late completion
+                // must keep live authority when its original card has closed.
+                self.retain_publication_result_recovery(ticket, &result);
                 let Some(mut publication) = self.editor_features.publication.take() else { return Task::none(); };
                 if publication.ticket != ticket { self.editor_features.publication = Some(publication); return Task::none(); }
                 self.notices.resolve(&format!("editor-publication:{ticket}"));
                 let report = match result {
                     Err(error) => {
                         for card in publication.cards { if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) { runtime.cancel_workspace_edit(ticket); } }
-                        if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.clone())); }
-                        self.feature_failure(publication.operation.card, error);
+                        if let Some(lease) = publication.server_lease.take() { lease.respond(false, Some(error.to_string())); }
+                        self.feature_failure(publication.operation.card, error.to_string());
                         return Task::batch([self.save_after_feature(&publication.operation), self.finish_editor_publication_saves(), self.modal_restore_focus(self.modal_restore_fallback())]);
                     }
                     Ok(report) => report,
@@ -1402,6 +1413,11 @@ impl Cagents {
         operation.annotations = edit.annotations;
         let Some(CardRuntime::Repository(owner)) = self.cards.get(&operation.card) else { return Task::none(); };
         let worktree = owner.descriptor.worktree.clone();
+        if self.publication_recovery_blocks(&worktree) {
+            self.reject_server_edit(&operation, "Resolve retained file recovery in this worktree before preparing another edit");
+            self.feature_failure(operation.card, "Resolve retained file recovery in this worktree before preparing another edit");
+            return Task::none();
+        }
         operation.open_files = self.editor_open_files();
         let open_paths = operation.open_files.iter().map(|(_, path)| path.clone()).collect();
         let documents = edit.documents.into_iter().map(|document| workspace::DocumentEdits { path: document.path, version: document.version, observed_version: document.observed_version, coordinates: document.coordinates, edits: document.edits }).collect();
@@ -1443,6 +1459,11 @@ impl Cagents {
     }
 
     fn publish_editor_workspace_edit(&mut self, ticket: u64, operation: Operation, plan: Arc<workspace::Plan>) -> Task<Message> {
+        if self.publication_recovery_blocks(&plan.worktree) {
+            self.reject_server_edit(&operation, "Resolve retained file recovery in this worktree before publishing another edit");
+            self.feature_failure(operation.card, "Resolve retained file recovery in this worktree before publishing another edit");
+            return Task::none();
+        }
         if self.editor_features.publication.is_some() { self.reject_server_edit(&operation, "Another edit is being applied"); return Task::none(); }
         if operation.open_files != self.editor_open_files() {
             self.reject_server_edit(&operation, "The open file tabs changed; prepare the edit again");
@@ -1487,7 +1508,7 @@ impl Cagents {
         }
         self.editor_features.publication = Some(Publication { hidden: false, ticket, operation, cards, server_lease });
         let publication = cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || workspace::publish_unopened(&plan)).await.map_err(|error| error.to_string()).and_then(|result| result);
+            let result = tokio::task::spawn_blocking(move || workspace::publish_unopened(&plan)).await.map_err(|error| workspace::PublicationFailure::from(error.to_string())).and_then(|result| result);
             Message::EditorFeatures(Action::Published { ticket, result })
         });
         Task::batch([publication, self.modal_focus(widget::Id::new("editor-publication.hide"))])
