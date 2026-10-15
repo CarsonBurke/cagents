@@ -8474,6 +8474,13 @@ fn default_menu_shortcuts() -> &'static crate::settings::KeyboardShortcuts {
     &DEFAULT
 }
 
+#[cfg(test)]
+fn default_menu_shortcuts_shared() -> &'static Arc<crate::settings::KeyboardShortcuts> {
+    static DEFAULT: LazyLock<Arc<crate::settings::KeyboardShortcuts>> =
+        LazyLock::new(Default::default);
+    &DEFAULT
+}
+
 /// Files, Git changes, or pull requests, with one tab row between them. Used
 /// by the standalone editor, which has no context-inspector tab strip.
 ///
@@ -18254,14 +18261,14 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(actions.contains(&open));
             assert!(
                 !actions
                     .iter()
                     .any(|action| matches!(action, SidebarAction::NewWorktree { .. }))
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(!names.iter().any(|name| name.starts_with("New worktree")));
         }
     }
@@ -18288,7 +18295,7 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(
                 actions.contains(&reload),
                 "compact {compact}: the row cannot be read again: {actions:?}"
@@ -18298,10 +18305,10 @@ pub(crate) mod tests {
                 "compact {compact}: an unreadable project offered more than a reload: {actions:?}"
             );
             assert!(
-                frame_enter_presses(&renderer, body(&model, &state, compact, true, &default_menu_shortcuts())).is_empty(),
+                frame_enter_presses(&renderer, body(&model, &state, compact, true, default_menu_shortcuts_shared())).is_empty(),
                 "compact {compact}: the reload stays withheld while a modal is up"
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(
                 names.iter().any(|name| name
                     == "Couldn’t read project Cagents: fatal: not a git repository. Try again"),
@@ -18320,10 +18327,10 @@ pub(crate) mod tests {
         let state = SidebarState::default();
         for compact in [false, true] {
             assert!(
-                frame_enter_presses(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts())).is_empty(),
+                frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared())).is_empty(),
                 "compact {compact}: a retry was offered while a read was already running"
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(
                 names.iter().any(|name| name
                     == "Couldn’t read project Cagents: fatal: not a git repository. Trying again"),
@@ -18375,7 +18382,7 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(
                 actions.contains(&SidebarAction::CancelWorktreeOperation(operation)),
                 "compact {compact}: a running operation lost its cancel: {actions:?}"
@@ -18415,7 +18422,7 @@ pub(crate) mod tests {
         let mut state = SidebarState::default();
         state.set_worktrees_with_panes(BTreeSet::from([(project_id, kept)]));
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(opens(&actions, kept), "compact {compact}: {actions:?}");
             assert!(
                 !opens(&actions, doomed),
@@ -18427,7 +18434,7 @@ pub(crate) mod tests {
                 }),
                 "compact {compact}: a channel being deleted can still be opened"
             );
-            let names = accessible_names(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let names = accessible_names(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             for expected in [
                 // The row is labelled by its pull request.
                 "Deleting worktree Polish sidebar",
@@ -18443,7 +18450,7 @@ pub(crate) mod tests {
         entry.worktrees[1].deletion = Some(RowDeletion::Failed("The worktree has changes".into()));
         entry.channels[0].deletion = Some(RowDeletion::Failed("Daemon unreachable".into()));
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false, &default_menu_shortcuts()));
+        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false, default_menu_shortcuts_shared()));
         assert!(
             opens(&actions, doomed),
             "a failed deletion leaves the row usable"
@@ -18461,7 +18468,7 @@ pub(crate) mod tests {
             }),
             "{actions:?}"
         );
-        let names = accessible_names(&renderer, body(&model, &state, false, false, &default_menu_shortcuts()));
+        let names = accessible_names(&renderer, body(&model, &state, false, false, default_menu_shortcuts_shared()));
         assert!(
             names
                 .iter()
@@ -18486,7 +18493,7 @@ pub(crate) mod tests {
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
         for compact in [false, true] {
-            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, &default_menu_shortcuts()));
+            let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false, default_menu_shortcuts_shared()));
             assert!(
                 actions.contains(&SidebarAction::DismissWorktreeOperation(operation)),
                 "compact {compact}: a failed operation cannot be dismissed: {actions:?}"
@@ -18515,7 +18522,7 @@ pub(crate) mod tests {
         });
         let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
         let state = SidebarState::default();
-        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false, &default_menu_shortcuts()));
+        let actions = frame_enter_presses(&renderer, body(&model, &state, false, false, default_menu_shortcuts_shared()));
         for action in [
             SidebarAction::EditWorktreeOperation(operation),
             SidebarAction::RetryWorktreeOperation(operation),
@@ -18523,7 +18530,7 @@ pub(crate) mod tests {
         ] {
             assert!(actions.contains(&action), "{action:?} missing: {actions:?}");
         }
-        let behind_a_dialog = frame_enter_presses(&renderer, body(&model, &state, false, true, &default_menu_shortcuts()));
+        let behind_a_dialog = frame_enter_presses(&renderer, body(&model, &state, false, true, default_menu_shortcuts_shared()));
         assert!(
             !behind_a_dialog.iter().any(|action| matches!(
                 action,
@@ -21168,7 +21175,7 @@ pub(crate) mod tests {
             }
             match basis {
                 "missing-head" | "normal-unborn" => source.head_oid = None,
-                "changed-head" => source.head_oid = Some("b".repeat(40)),
+                "changed-head" => source.head_oid = Some("b".repeat(40).into()),
                 "missing-pin" => state.commit_draft.amend_head = None,
                 _ => {}
             }

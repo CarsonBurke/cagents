@@ -1245,7 +1245,10 @@ mod tests {
         let action = sidebar::commands::registered(sidebar::commands::bound(source.command_binding_id(),
             SidebarAction::HistoryCommand { key: key.clone(), oid, mainline: row.mainline,
                 message: row.message.clone(), command: sidebar::HistoryCommand::NewWorktree }));
-        app.sidebar_state.changes_tab = sidebar::ChangesTab::History;
+        app.sidebar_state.apply(&SidebarAction::SetChangesTab {
+            key: key.clone(),
+            tab: sidebar::ChangesTab::History,
+        });
         app.sidebar_model.projects.iter_mut().find(|project| project.id == key.project_id).unwrap()
             .repository = temporary.path().join("different-primary");
         drop(app.update(Message::Sidebar(action)));

@@ -1928,7 +1928,7 @@ mod search_tests {
                 let content = widget::column::with_children(
                     settings_category_controls(SettingsCategory::Accounts, &app.settings_draft, &context)
                         .into_iter().filter_map(|group| group.view("Accounts", "")));
-                let mut ui = UserInterface::build(content.into(), iced::Size::new(1200., 1000.),
+                let mut ui = UserInterface::build(content, iced::Size::new(1200., 1000.),
                     Cache::new(), &mut renderer);
                 ui.operate(&renderer, &mut focusable::focus::<()>(widget::Id::new("settings.open-accounts")));
                 let enter = iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter);
