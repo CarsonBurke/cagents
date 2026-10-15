@@ -2485,11 +2485,12 @@ impl Cagents {
                         self.account_ui.set_registry(registry);
                         self.recover_logins();
                     }
-                    Err(error) => {
+                    Err(error) if current_discovery => {
                         self.status = Some(TransientNotice::error(format!(
                             "Your added accounts could not be read: {error}"
                         )));
                     }
+                    Err(_) => {}
                 }
                 if current_discovery { self.account_ui.restore(loaded.restored); }
                 for (provider, catalog) in loaded.catalogs {
