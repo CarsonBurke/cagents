@@ -18,6 +18,7 @@ pub(super) struct OwnerPaths {
     watch_dirty: bool,
     generation: u64,
     invalidated: HashSet<PathBuf>,
+    superseded: HashSet<PathBuf>,
     watch: Arc<owner_watch::Monitor>,
 }
 
@@ -36,6 +37,7 @@ impl OwnerPaths {
         self.generation = self.generation.wrapping_add(1);
         self.inflight_epoch = Some(self.watch.epoch());
         self.inflight_generation = Some(self.generation);
+        self.superseded.clear();
         self.watch_dirty = false;
         self.inflight = std::mem::take(&mut self.queued);
         Some((self.generation, self.inflight.iter().cloned().collect()))
@@ -49,24 +51,36 @@ impl OwnerPaths {
             self.queued.extend(self.invalidated.drain());
             self.inflight_generation = None;
             self.inflight_epoch = None;
+            self.superseded.clear();
             return false;
         }
         for (path, resolved) in paths {
-            if self.inflight.contains(&path) && self.active.contains(&path) && !self.invalidated.contains(&path) {
+            if self.inflight.contains(&path) && self.active.contains(&path) && !self.invalidated.contains(&path) && !self.superseded.contains(&path) {
                 self.cached.insert(path, resolved);
             }
         }
         self.queued.extend(self.invalidated.drain());
         self.inflight.clear();
+        self.superseded.clear();
         self.inflight_generation = None;
         self.inflight_epoch = None;
         true
+    }
+
+    fn install_prepared(&mut self, paths: Vec<(PathBuf,PathBuf)>) {
+        for (path,resolved) in paths {
+            self.queued.remove(&path);
+            self.invalidated.remove(&path);
+            if self.inflight.contains(&path) { self.superseded.insert(path.clone()); }
+            self.cached.insert(path,resolved);
+        }
     }
 
     fn retain_paths(&mut self, active: HashSet<PathBuf>) {
         self.cached.retain(|path, _| active.contains(path));
         self.queued.retain(|path| active.contains(path));
         self.invalidated.retain(|path| active.contains(path));
+        self.superseded.retain(|path| active.contains(path));
         self.watch_dirty |= self.watch.retain(&active);
         self.active = active;
     }
@@ -2647,6 +2661,18 @@ mod owner_path_cache_tests {
             }
         }
         assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn older_owner_batch_cannot_overwrite_a_prepared_selection() {
+        let mut cache = OwnerPaths::default();
+        let alias = PathBuf::from("/alias");
+        cache.request(&alias,false);
+        let (generation,_) = cache.take_batch().unwrap();
+        cache.install_prepared(vec![(alias.clone(),"/new-target".into())]);
+        assert!(cache.finish(generation,vec![(alias.clone(),"/old-target".into())]));
+        assert_eq!(cache.canonical(&alias),PathBuf::from("/new-target"));
+        assert!(cache.take_batch().is_none());
     }
 
     #[test]

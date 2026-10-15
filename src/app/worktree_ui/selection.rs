@@ -67,6 +67,9 @@ fn prepare_target(
         }
         let physical = resolved.iter().find(|(lexical,_)|lexical==&selected.0)
             .map_or_else(||selected.0.clone(),|(_,physical)|physical.clone());
+        if !resolved.iter().any(|(lexical,_)|lexical==&selected.0) {
+            resolved.push((selected.0.clone(),physical.clone()));
+        }
         Ok::<_,std::io::Error>((selected.0,physical,resolved))
     };
     let first = resolve(&mut canonicalize).map_err(|e|e.to_string())?;
@@ -149,7 +152,7 @@ impl Cagents {
         }
         self.worktree_protections.install_prepared(prepared.guard);
         self.worktree_protection_sync.invalidate();
-        self.worktree_owner_paths.cached.extend(prepared.canonical);
+        self.worktree_owner_paths.install_prepared(prepared.canonical);
         let selected = self.select_worktree_inner(prepared.path, create);
         let initialization = self.initialize_prepared_scope_runtimes();
         let after = self.finish_worktree_selection(intent);
