@@ -141,8 +141,7 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             let db = Connection::open(&path).map_err(|e| e.to_string())?;
             db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;
-                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL,running INTEGER NOT NULL DEFAULT 0);
-                CREATE INDEX running_tools ON items(id) WHERE running=1;
+                CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
             db.execute_batch(file_changes::SCHEMA)
                 .map_err(|e| e.to_string())?;
@@ -359,7 +358,7 @@ impl Store {
         let transaction = self.db.transaction().map_err(|e| e.to_string())?;
         let index_spans = spans.clone();
         let spans = postcard::to_stdvec(&spans).map_err(|e| e.to_string())?;
-        transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans,running) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans,running=excluded.running", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans,item.content.status()==Some(crate::chat::ToolStatus::Running)]).map_err(|e| e.to_string())?;
+        transaction.execute("INSERT INTO items(id,ordinal,metadata,len0,len1,len2,spans) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans]).map_err(|e| e.to_string())?;
         if preserve_input {
             transaction
                 .execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])
@@ -708,16 +707,6 @@ impl Store {
         if let Some(warning) = self.flush_input()? {
             out.push(nonfatal(warning));
         }
-        if let Event::TurnFinished { outcome, .. } = &event {
-            let status = match outcome {
-                crate::notifications::Kind::Cancelled => Some(crate::chat::ToolStatus::Stopped),
-                crate::notifications::Kind::Failed => Some(crate::chat::ToolStatus::Failed),
-                _ => None,
-            };
-            if let Some(status) = status {
-                self.finish_running(status)?;
-            }
-        }
         let input_delta = matches!(&event, Event::InputDelta { .. });
         match event {
             Event::InputDelta { id, offset, delta } | Event::OutputDelta { id, offset, delta } => {
@@ -861,60 +850,6 @@ impl Store {
             }
         }
         Ok(out)
-    }
-    /// Finalize only the indexed live tools, leaving transcript bodies and
-    /// completed history untouched. Batch metadata bounds transient memory.
-    pub(super) fn finish_running(&mut self, status: crate::chat::ToolStatus) -> Result<(), String> {
-        let _ = self.flush_text()?;
-        let _ = self.flush_input()?;
-        loop {
-            let rows = {
-                let mut query = self
-                    .db
-                    .prepare("SELECT id,metadata FROM items WHERE running=1 LIMIT 64")
-                    .map_err(|error| error.to_string())?;
-                let rows = query
-                    .query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-                    })
-                    .map_err(|error| error.to_string())?
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|error| error.to_string())?;
-                rows
-            };
-            if rows.is_empty() {
-                break;
-            }
-            for (id, metadata) in rows {
-                let mut item: Item =
-                    postcard::from_bytes(&metadata).map_err(|error| error.to_string())?;
-                match &mut item.content {
-                    ItemContent::Tool {
-                        status: current, ..
-                    }
-                    | ItemContent::Command {
-                        status: current, ..
-                    }
-                    | ItemContent::Changes {
-                        status: current, ..
-                    } if *current == crate::chat::ToolStatus::Running => *current = status,
-                    _ => {}
-                }
-                if matches!(item.content, ItemContent::Changes { .. }) {
-                    self.finish_file_status("", &id, status)?;
-                }
-                let metadata = postcard::to_stdvec(&item).map_err(|error| error.to_string())?;
-                self.db
-                    .execute(
-                        "UPDATE items SET metadata=?2,running=0 WHERE id=?1",
-                        params![id, metadata],
-                    )
-                    .map_err(|error| error.to_string())?;
-                self.changed(&id);
-                self.dirty = true;
-            }
-        }
-        Ok(())
     }
     fn flush_input(&mut self) -> Result<Option<String>, String> {
         match self.pending_input.take() {
@@ -1850,64 +1785,57 @@ mod tests {
     }
 
     #[test]
-    fn terminal_outcomes_update_only_running_metadata_and_never_rewrite_bodies() {
-        for (outcome, expected) in [
-            (
-                crate::notifications::Kind::Cancelled,
-                crate::chat::ToolStatus::Stopped,
-            ),
-            (
-                crate::notifications::Kind::Failed,
-                crate::chat::ToolStatus::Failed,
-            ),
-            (
-                crate::notifications::Kind::Succeeded,
-                crate::chat::ToolStatus::Running,
-            ),
-        ] {
+    fn parent_completion_preserves_canonical_items_and_file_statuses() {
+        use crate::chat::{ChangeKind, FileChange, Snapshot, ToolStatus};
+        for outcome in [crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed, crate::notifications::Kind::Succeeded] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let mut store = Store::at(directory.path().into()).unwrap();
-            let input = "retained input".repeat(1000);
-            let output = "retained output".repeat(1000);
-            store
-                .apply(Event::Item(Item {
-                    id: "pending".into(),
-                    role: Role::Assistant,
-                    started_at: None,
-                    at: None,
-                    content: ItemContent::Tool {
-                        name: "Write".into(),
-                        input: input.clone(),
-                        output: output.clone(),
-                        status: crate::chat::ToolStatus::Running,
-                    },
-                }))
-                .unwrap();
-            let before: i64 = store
-                .db
-                .query_row("SELECT total_changes()", [], |row| row.get(0))
-                .unwrap();
-            store
-                .apply(Event::TurnFinished { key: None, outcome })
-                .unwrap();
-            let after: i64 = store
-                .db
-                .query_row("SELECT total_changes()", [], |row| row.get(0))
-                .unwrap();
-            assert_eq!(
-                after - before,
-                if outcome == crate::notifications::Kind::Succeeded {
-                    0
-                } else {
-                    1
-                },
-                "only the metadata row changes; chunks are never deleted or rewritten"
-            );
-            store.apply(Event::TurnStarted).unwrap();
+            let item = |id: &str, content| Item { id: id.into(), role: Role::Assistant,
+                started_at: None, at: None, content };
+            let tool = item("remote-tool", ItemContent::Tool { name: "mcp__external__job".into(),
+                input: "retained input".repeat(1000), output: "retained output".repeat(1000),
+                status: ToolStatus::Running });
+            let command = item("remote-command", ItemContent::Command { label: "Remote command".into(),
+                command: "work".into(), working_directory: "/workspace".into(),
+                action: Default::default(), status: ToolStatus::Running, exit_code: None,
+                duration_ms: None, output: "retained command".repeat(1000) });
+            let edit = item("remote-edit", ItemContent::Changes { changes: vec![FileChange {
+                path: "tracked.rs".into(), kind: ChangeKind::Updated,
+                diff: "@@ -1 +1 @@\n-old\n+new\n".into() }], status: ToolStatus::Running });
+            let originals = [tool, command, edit.clone()];
+            for item in &originals { store.apply(Event::Item(item.clone())).unwrap(); }
+            store.apply(Event::SubagentItem { id: "delegate".into(), item: edit.clone() }).unwrap();
+            let before: i64 = store.db.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+            for event in [Event::TurnFinished { key: None, outcome },
+                Event::Error { message: "Provider exited".into(), fatal: true },
+                Event::Exited { code: Some(3) }, Event::TurnStarted] { store.apply(event).unwrap(); }
+            let after: i64 = store.db.query_row("SELECT total_changes()", [], |row| row.get(0)).unwrap();
+            assert_eq!(after, before, "parent failure must not rewrite canonical item/chunk/file rows");
             let page = store.window().unwrap();
-            assert!(
-                matches!(&page.items[0].content,ItemContent::Tool{input:actual_input,output:actual_output,status,..} if actual_input==&input && actual_output==&output && *status==expected)
-            );
+            for original in &originals {
+                assert_eq!(page.items.iter().find(|item| item.id == original.id).unwrap().content,
+                    original.content);
+            }
+            let mut snapshot = Snapshot::default();
+            store.publish_files(&mut snapshot).unwrap();
+            assert_eq!(snapshot.file_changes.files.iter().map(|file| file.pending).sum::<u64>(), 2);
+            for mut item in originals {
+                match &mut item.content {
+                    ItemContent::Tool {status, ..} | ItemContent::Command {status, ..}
+                    | ItemContent::Changes {status, ..} => *status = ToolStatus::Succeeded,
+                    _ => unreachable!(),
+                }
+                store.apply(Event::Item(item)).unwrap();
+            }
+            let mut completed_edit = edit;
+            if let ItemContent::Changes {status, ..} = &mut completed_edit.content { *status = ToolStatus::Succeeded; }
+            store.apply(Event::SubagentItem { id: "delegate".into(), item: completed_edit }).unwrap();
+            assert!(store.window().unwrap().items.iter().all(|item| item.content.status() == Some(ToolStatus::Succeeded)));
+            store.publish_files(&mut snapshot).unwrap();
+            assert_eq!(snapshot.file_changes.files.iter().map(|file| file.pending).sum::<u64>(), 0);
+            assert_eq!(snapshot.file_changes.files.iter().map(|file| file.succeeded).sum::<u64>(), 2,
+                "real native root/delegated edit completion still updates the canonical Files projection");
         }
     }
 

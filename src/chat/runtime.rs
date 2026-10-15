@@ -555,12 +555,9 @@ impl Handle {
                         });
                     }
                     if state.outcome.is_some() && state.finished_at.is_none() { state.finished_at = observed_at(); }
-                    let terminal=match &state.outcome {Some(crate::agent::ActivityOutcome::Failed{..})=>Some(ToolStatus::Failed),Some(crate::agent::ActivityOutcome::Cancelled|crate::agent::ActivityOutcome::Interrupted{..})=>Some(ToolStatus::Stopped),_=>None};
-                    if let Some(status)=terminal {
-                        finish_snapshot_work(&mut state,status,direct_closed&&native_closed);
-                        drop(state);
-                        if let Err(error)=actor.store.lock().unwrap_or_else(|p|p.into_inner()).finish_running(status) {tracing::warn!(%error,"Cannot settle ended provider tool metadata");}
-                    }
+                    // Provider-family cleanup is not a terminal proof for a
+                    // tool or delegated task reported by an external server.
+                    // Preserve its last actual native item status.
                 }
                 actor.apply(Event::Exited { code });
                 let usage = actor
@@ -2921,14 +2918,6 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::TurnFinished { outcome, .. } => {
             use crate::{agent::ActivityOutcome, notifications::Kind};
-            match outcome {
-                Kind::Cancelled => {
-                    let all = state.capabilities.interrupt_stops_background;
-                    finish_snapshot_work(state, ToolStatus::Stopped, all);
-                }
-                Kind::Failed => finish_snapshot_work(state, ToolStatus::Failed, false),
-                _ => {}
-            }
             state.outcome = match outcome {
                 Kind::Succeeded => Some(ActivityOutcome::Succeeded),
                 Kind::Cancelled => Some(ActivityOutcome::Cancelled),
@@ -3377,37 +3366,6 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
     }
     if child_changed {
         trim_subagents(state);
-    }
-}
-
-fn finish_snapshot_work(state: &mut Snapshot, status: ToolStatus, include_background: bool) {
-    fn finish_items(items: &mut [Arc<Item>], status: ToolStatus) {
-        for item in items {
-            if item.content.status() != Some(ToolStatus::Running) {
-                continue;
-            }
-            match &mut Arc::make_mut(item).content {
-                ItemContent::Tool {
-                    status: current, ..
-                }
-                | ItemContent::Command {
-                    status: current, ..
-                }
-                | ItemContent::Changes {
-                    status: current, ..
-                } => *current = status,
-                _ => {}
-            }
-        }
-    }
-    finish_items(&mut state.items, status);
-    for child in &mut state.subagents {
-        if child.status == ToolStatus::Running && (!child.background || include_background) {
-            child.status = status;
-            child.waiting = false;
-            child.detail.clear();
-            finish_items(&mut child.items, status);
-        }
     }
 }
 
@@ -4026,51 +3984,54 @@ mod tests {
     }
 
     #[test]
-    fn cancelled_work_does_not_become_running_again_when_the_next_turn_starts() {
+    fn parent_completion_preserves_native_item_and_delegated_statuses() {
         let tool = Arc::new(Item {
-            id: "old-tool".into(),
-            role: Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Tool {
-                name: "Bash".into(),
-                input: "work".into(),
-                output: String::new(),
-                status: ToolStatus::Running,
-            },
+            id: "remote-tool".into(), role: Role::Assistant,
+            started_at: None, at: None,
+            content: ItemContent::Tool { name: "mcp__external__job".into(),
+                input: "work".into(), output: "pending".into(), status: ToolStatus::Running },
         });
-        let mut state = Snapshot {
-            items: vec![tool],
-            ..Default::default()
-        };
-        subagent(&mut state, "foreground");
-        subagent(&mut state, "background").background = true;
-        let mut indices = BTreeMap::new();
-        apply_event(
-            &mut state,
-            &mut indices,
-            Event::TurnFinished {
-                key: None,
-                outcome: crate::notifications::Kind::Cancelled,
-            },
-        );
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
-        assert_eq!(
-            state.subagents[1].status,
-            ToolStatus::Running,
-            "a background child outside interruption ownership remains live"
-        );
-        apply_event(&mut state, &mut indices, Event::TurnStarted);
-        assert!(state.outcome.is_none());
-        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
-        finish_snapshot_work(&mut state, ToolStatus::Failed, true);
-        assert_eq!(
-            state.subagents[1].status,
-            ToolStatus::Failed,
-            "confirmed provider teardown settles all owned children"
-        );
+        let mut command = (*tool).clone();
+        command.id = "remote-command".into();
+        command.content = ItemContent::Command { label: "Remote command".into(),
+            command: "work".into(), working_directory: "/workspace".into(),
+            action: Default::default(), status: ToolStatus::Running,
+            exit_code: None, duration_ms: None, output: "pending".into() };
+        let mut changes = (*tool).clone();
+        changes.id = "remote-change".into();
+        changes.content = ItemContent::Changes { changes: Vec::new(), status: ToolStatus::Running };
+        let items = vec![tool.clone(), Arc::new(command), Arc::new(changes)];
+        for outcome in [crate::notifications::Kind::Cancelled,
+            crate::notifications::Kind::Failed, crate::notifications::Kind::Succeeded] {
+            let mut state = Snapshot { items: items.clone(), ..Default::default() };
+            state.capabilities.interrupt_stops_background = true;
+            for background in [false, true] {
+                let child = subagent(&mut state, if background {"background"} else {"foreground"});
+                child.background = background;
+                child.waiting = true;
+                child.items = vec![tool.clone()];
+            }
+            let mut indices = BTreeMap::from([(tool.id.clone(), 0)]);
+            apply_event(&mut state, &mut indices, Event::TurnFinished { key: None, outcome });
+            assert!(state.outcome.is_some(), "the parent scalar outcome is retained");
+            apply_event(&mut state, &mut indices, Event::Error { message: "Provider exited".into(), fatal: true });
+            apply_event(&mut state, &mut indices, Event::Exited { code: Some(3) });
+            apply_event(&mut state, &mut indices, Event::TurnStarted);
+            assert!(state.outcome.is_none());
+            assert_eq!(state.items, items, "parent completion/exit/next turn is not per-item evidence");
+            for child in &state.subagents {
+                assert_eq!(child.status, ToolStatus::Running);
+                assert!(child.waiting, "parent exit cannot settle an external child's request");
+                assert_eq!(child.items[0].content, tool.content);
+            }
+            let mut completed = (*tool).clone();
+            if let ItemContent::Tool { status, .. } = &mut completed.content { *status = ToolStatus::Succeeded; }
+            apply_event(&mut state, &mut indices, Event::Item(completed.clone()));
+            apply_event(&mut state, &mut indices, Event::SubagentItem { id: "foreground".into(), item: completed });
+            assert_eq!(state.items[0].content.status(), Some(ToolStatus::Succeeded));
+            assert_eq!(state.subagents[0].items[0].content.status(), Some(ToolStatus::Succeeded),
+                "an actual native child item completion still applies");
+        }
     }
 
     #[test]
