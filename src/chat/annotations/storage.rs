@@ -160,6 +160,8 @@ impl Store {
     }
     #[cfg(test)]
     pub(crate) fn purge_for_test(&mut self)->Result<(),String>{self.purge_current_session()}
+    #[cfg(test)]
+    pub(crate) fn fail_latest_for_test(&self){self.db.execute_batch("CREATE TRIGGER fixture_latest_error BEFORE INSERT ON latest BEGIN SELECT RAISE(FAIL,'fixture latest write failure'); END;").unwrap();}
     fn purge_current_session(&mut self)->Result<(),String>{
         self.scope.revalidate()?;let session=self.confirmed()?.to_owned();
         let transaction=self.db.transaction().map_err(|e|e.to_string())?;
@@ -324,7 +326,7 @@ impl Store {
         let text=String::from_utf8(bytes).map_err(|_|OriginalError::InvalidRange)?;
         let next_offset=offset+text.len();
         let complete=next_offset==original.text_bytes;
-        Ok(OriginalPage{original,offset,next_offset,text,complete})
+        Ok(OriginalPage{session_id:session.to_owned(),original,offset,next_offset,text,complete})
     }
     /// Repeated delivery of an already seen Awaiting request is replay and
     /// cannot reopen a denied action. Only a distinct request starts a decision.

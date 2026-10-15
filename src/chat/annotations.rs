@@ -53,6 +53,7 @@ pub struct OriginalPrompt {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OriginalPage {
+    pub session_id:String,
     pub original: OriginalPrompt,
     pub offset: usize,
     pub next_offset: usize,

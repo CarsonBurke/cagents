@@ -947,8 +947,10 @@ impl Handle {
     }
     /// Cache-only metadata lookup. The host must release its actor-map lock
     /// before calling; this neither sends provider work nor hydrates snapshots.
-    pub(crate) fn original_prompt(&self,user:Option<&str>,offset:usize,limit:usize)->Result<super::annotations::OriginalPage,super::annotations::OriginalError>{
-        self.0.annotations.lock().unwrap_or_else(|p|p.into_inner()).original(user,offset,limit)
+    pub(crate) fn original_prompt(&self,user:Option<&str>,expected_session:Option<&str>,offset:usize,limit:usize)->Result<super::annotations::OriginalPage,super::annotations::OriginalError>{
+        let authority=self.0.annotations.lock().unwrap_or_else(|p|p.into_inner());
+        if expected_session.is_some_and(|expected|authority.session()!=Some(expected)){return Err(super::annotations::OriginalError::Changed);}
+        authority.original(user,offset,limit)
     }
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()

@@ -58,6 +58,7 @@ impl Authority {
         }
         warning
     }
+    pub(super) fn session(&self)->Option<&str>{self.session.as_deref()}
     pub(super) fn original(&self,user:Option<&str>,offset:usize,limit:usize)->Result<OriginalPage,OriginalError>{
         let store=self.store.as_ref().ok_or_else(||OriginalError::Unavailable(self.notice.clone().or_else(||self.scope.as_ref().err().cloned()).unwrap_or_else(||"No qualified provider-confirmed original command is available".into())))?;
         let user=user.or(self.latest_proven.as_deref()).ok_or_else(||OriginalError::Unavailable("The provider's current latest user message has not been confirmed".into()))?;
@@ -294,6 +295,9 @@ mod tests {
         let newer=authority.prepare(&mut command,root.path()).unwrap().unwrap();let rejected=authority.prepare(&mut command,root.path()).unwrap().unwrap();let rejected_path=authority.pending_store().unwrap().prepared(&rejected).unwrap().text.path;
         assert!(authority.originals(vec![OriginalUpdate::Accepted{command_id:newer,session_id:"session".into(),user_id:"newer-user".into(),turn_id:"newer-turn".into(),aliases:vec![]},OriginalUpdate::Latest{session_id:"session".into(),user_id:"newer-user".into()},OriginalUpdate::Rejected{command_id:rejected.clone()}]).is_some());
         assert!(matches!(authority.original(None,0,32),Err(OriginalError::Unavailable(_))));assert_eq!(authority.latest_proven.as_deref(),Some("newer-user"));assert!(!rejected_path.exists());assert!(authority.pending_store().unwrap().prepared(&rejected).is_err());
+        // An infrastructure write failure cannot restore an older eligibility.
+        authority.latest_user("older-user").unwrap();authority.store.as_ref().unwrap().fail_latest_for_test();
+        assert!(authority.originals(vec![OriginalUpdate::Latest{session_id:"session".into(),user_id:"newest-unavailable-user".into()}]).is_some());assert_eq!(authority.latest_proven.as_deref(),Some("newest-unavailable-user"));assert!(matches!(authority.original(None,0,32),Err(OriginalError::Unavailable(_))));assert_eq!(authority.original(Some("older-user"),0,32).unwrap().text,"older");
     }
 
 }
