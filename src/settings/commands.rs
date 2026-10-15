@@ -1,5 +1,5 @@
 //! Validated configuration operations shared by the CLI and selected daemon.
-use super::{AppSettings, load_detailed, save, save_merged};
+use super::{AppSettings, ensure_file, load_detailed, save_merged};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::path::Path;
@@ -13,9 +13,8 @@ pub enum Operation {
 
 pub fn execute(path: &Path, operation: Operation) -> Result<Value, String> {
     if let Operation::Path { create } = operation {
-        if create && !path.exists() {
-            save(path, &load_detailed(path).map_err(|e| e.to_string())?.settings)
-                .map_err(|e| e.to_string())?;
+        if create {
+            ensure_file(path, &AppSettings::default()).map_err(|e| e.to_string())?;
         }
         return Ok(json!({"path": path}));
     }
@@ -102,6 +101,19 @@ fn replace(document: &mut Value, key: &str, value: Value) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn settings_open_preserves_a_file_created_after_its_original_snapshot() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("settings.toml");
+        // Deterministic old race: one caller observed defaults while absent,
+        // another completed its save before the first caller's create step.
+        let stale=load_detailed(&path).unwrap().settings;
+        let writer_path=path.clone();
+        std::thread::spawn(move ||execute(&writer_path,Operation::Set{key:"terminal_font_size".into(),value:"15".into()}).unwrap()).join().unwrap();
+        ensure_file(&path,&stale).unwrap();
+        execute(&path,Operation::Path{create:true}).unwrap();
+        assert_eq!(super::super::load(&path).unwrap().terminal_font_size,15.0);
+    }
+
     #[test]
     fn settings_commands_share_validation_and_preserve_unrelated_values() {
         let root = tempfile::tempdir().unwrap();

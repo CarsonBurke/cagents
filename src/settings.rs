@@ -1877,6 +1877,18 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
     Ok(lock)
 }
 
+/// Create settings for the editor only when still absent under the settings
+/// lock; an in-flight open must never overwrite a concurrent settings change.
+pub fn ensure_file(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    reject_unsafe_destination(path)?;
+    if !path.exists() {
+        save_unlocked(path, settings)?;
+    }
+    Ok(())
+}
+
 /// Applies only fields this window changed since its last successful save.
 /// Nested shortcut tables merge by action; list-valued preferences are atomic.
 pub fn save_merged(
