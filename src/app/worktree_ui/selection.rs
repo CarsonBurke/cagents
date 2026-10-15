@@ -9,6 +9,10 @@ pub(in crate::app) struct State {
     pub(in crate::app) initialize_runtimes: bool,
     /// Superseded workers can still own a not-yet-delivered directory lease.
     pub(super) inflight: HashSet<u64>,
+    #[cfg(test)]
+    local_window_override: Option<bool>,
+    #[cfg(test)]
+    canonicalize_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
 }
 impl State {
     #[cfg(test)]
@@ -179,12 +183,10 @@ impl Cagents {
         create: bool,
         intent: Intent,
     ) -> Task<Message> {
-        self.select_worktree_then_with_window(
-            path,
-            create,
-            intent,
-            crate::instance::window_is_initialized() && !crate::device::is_remote(),
-        )
+        let local_window = crate::instance::window_is_initialized() && !crate::device::is_remote();
+        #[cfg(test)]
+        let local_window = self.worktree_selection.local_window_override.unwrap_or(local_window);
+        self.select_worktree_then_with_window(path, create, intent, local_window)
     }
 
     fn select_worktree_then_with_window(
@@ -246,6 +248,8 @@ impl Cagents {
             .collect::<Vec<_>>();
         let cached = self.worktree_owner_paths.cached.get(&path).cloned();
         let watch = self.worktree_owner_paths.watch.clone();
+        #[cfg(test)]
+        let canonicalize_calls = self.worktree_selection.canonicalize_calls.clone();
         let prepare =
             self.prepare_worktree_selection(generation, path, create, intent, epoch, move |path| {
                 prepare_target(
@@ -253,7 +257,13 @@ impl Cagents {
                     roots,
                     cached,
                     &watch,
-                    |path| path.canonicalize(),
+                    move |path| {
+                        #[cfg(test)]
+                        if let Some(calls) = &canonicalize_calls {
+                            calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        path.canonicalize()
+                    },
                     |path| {
                         crate::worktree_cleanup::protect(path)?
                             .ok_or_else(|| {
@@ -266,6 +276,15 @@ impl Cagents {
                 )
             });
         Task::batch([cancelled, prepare])
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn force_local_selection_with_counter_for_test(
+        &mut self,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        self.worktree_selection.local_window_override = Some(true);
+        self.worktree_selection.canonicalize_calls = Some(calls);
     }
 
     /// Repository discovery updates ownership without superseding a deliberate
