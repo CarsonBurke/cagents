@@ -16,6 +16,8 @@ use cosmic::{Element, Renderer, Theme, widget};
 use serde::Deserialize;
 
 mod context_menu;
+mod focus_snapshot;
+pub(crate) use focus_snapshot::{FocusSnapshot, observe_focus};
 mod list_navigation;
 pub use list_navigation::reveal_list_selection;
 

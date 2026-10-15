@@ -272,10 +272,10 @@ impl Cagents {
                     active: true,
                     dont_ask_again: false,
                     detail: None,
-                    focus: 1,
+                    focus: 0,
                 });
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                close_focus(0)
             }
             Err(error) => {
                 self.status = Some(TransientNotice::error(format!(
@@ -597,9 +597,9 @@ impl Cagents {
                 intent.restore_keyboard_nav = self.core.keyboard_nav();
                 intent.pending = false;
                 intent.active = true;
-                intent.focus = 1;
+                intent.focus = 0;
                 self.core.set_keyboard_nav(false);
-                close_focus(1)
+                close_focus(0)
             }
             outcome => {
                 // `Stale` and a mismatched identity both mean the request was
@@ -705,7 +705,7 @@ impl Cagents {
                     .into(),
             ]
         };
-        rows.push(widget::row::with_children(buttons).spacing(space::S).into());
+        rows.push(super::dialog_ui::confirmation_controls(buttons));
         Some(super::dialog_ui::surface(
             widget::column::with_children(rows).spacing(space::M),
             560.0,

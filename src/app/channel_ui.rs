@@ -259,7 +259,7 @@ impl State {
     }
 
     pub(super) fn focus_target() -> widget::Id {
-        widget::Id::new("dialog.channel.confirm")
+        widget::Id::new("dialog.channel.close")
     }
 }
 
@@ -787,16 +787,12 @@ impl Cagents {
         let dialog = self.channel_ui.dialog.as_ref()?;
         let mut rows: Vec<Element<'_, Message>> = vec![
             design::title("Delete channel?").into(),
-            super::notice_body(dialog.title.clone()),
-            super::notice_body(match dialog.chats {
-                0 => "It holds no conversations.".to_owned(),
-                1 => "Deleting it closes the one conversation inside it.".to_owned(),
-                chats => format!("Deleting it closes the {chats} conversations inside it."),
-            }),
-            super::notice_detail(
-                "The channel and the conversations it holds are removed from this workspace. \
-                 Nothing outside the channel is touched.",
-            ),
+            super::notice_body(format!(
+                "Delete {} and its {} conversation{} from this workspace?",
+                dialog.title,
+                dialog.chats,
+                if dialog.chats == 1 { "" } else { "s" },
+            )),
         ];
         if let Some(failure) = &dialog.failure {
             rows.push(super::notice_body(format!(
@@ -812,7 +808,7 @@ impl Cagents {
             } else {
                 "Delete channel"
             })
-            .id(State::focus_target())
+            .id(widget::Id::new("dialog.channel.confirm"))
             .on_press(Message::ChannelUi(Action::ConfirmDelete)),
         ));
         Some(super::dialog_ui::surface(
@@ -1293,6 +1289,20 @@ mod tests {
             assert!(!app.durable.channels.iter().any(|channel| channel.id == id));
             assert!(!app.channel_ui.modal_open());
         }
+    }
+
+    #[test]
+    fn channel_delete_starts_on_cancel_and_escape_keeps_the_channel() {
+        let (mut app, channel, _, _) = channel_with_a_conversation();
+        let task = app.handle_channel_ui(Action::RequestDelete(channel));
+        assert_eq!(
+            super::super::tests::focused_element(app.channel_dialog_view().unwrap(), task),
+            Some(widget::Id::new("dialog.channel.close"))
+        );
+        drop(app.cancel_top_modal());
+        assert!(app.channel_ui.dialog.is_none());
+        assert!(app.durable.channels.iter().any(|row| row.id == channel));
+        assert!(!app.channel_ui.deletion_running());
     }
 
     #[test]

@@ -909,6 +909,9 @@ impl Cagents {
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
             let mut button = crate::ui_controls::button::secondary(label.to_owned());
+            if matches!(value, Action::Close) {
+                button = button.id(widget::Id::new("device.close"));
+            }
             if !state.busy {
                 button = button.on_press(action(value));
             }

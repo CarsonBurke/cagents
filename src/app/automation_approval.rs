@@ -3,6 +3,10 @@
 use super::*;
 use crate::automations::{Proposal, ProposalState, Request, Response};
 
+pub(super) fn default_focus_id() -> widget::Id {
+    widget::Id::new("automation-approval.decline")
+}
+
 #[derive(Default)]
 pub(super) struct State {
     proposal: Option<Proposal>,

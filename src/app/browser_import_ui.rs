@@ -46,6 +46,28 @@ mod tests {
         assert_eq!(app.durable.cards.len(), 1);
         assert_eq!(app.durable.cards[0].id, card);
     }
+
+    #[test]
+    fn escape_closes_intro_without_scanning_or_importing() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.browser_import.phase = Phase::Intro;
+        drop(app.cancel_top_modal());
+        assert!(!app.browser_import.open());
+        assert!(!app.modal_is_open());
+        assert!(app.durable.cards.is_empty());
+        assert!(!app.browser_import.cancel.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn escape_from_stop_confirmation_keeps_the_import_working() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.browser_import.phase = Phase::Scanning;
+        app.browser_import.confirm_cancel = true;
+        drop(app.cancel_top_modal());
+        assert!(matches!(app.browser_import.phase, Phase::Scanning));
+        assert!(!app.browser_import.confirm_cancel);
+        assert!(!app.browser_import.cancel.load(Ordering::Relaxed));
+    }
 }
 
 pub struct Transfer {
@@ -448,12 +470,20 @@ impl Cagents {
             Action::Cancel => {
                 if self.browser_import.busy() {
                     self.browser_import.confirm_cancel = true;
+                    return iced::widget::operation::focus(widget::Id::new(
+                        "browser-import.cancel",
+                    ))
+                    .map(cosmic::Action::App);
                 } else {
                     self.browser_import.phase = Phase::Closed;
                     self.browser_import.found.clear();
                 }
             }
-            Action::KeepWorking => self.browser_import.confirm_cancel = false,
+            Action::KeepWorking => {
+                self.browser_import.confirm_cancel = false;
+                return iced::widget::operation::focus(widget::Id::new("browser-import.cancel"))
+                    .map(cosmic::Action::App);
+            }
             Action::ConfirmCancel => {
                 self.browser_import.cancel.store(true, Ordering::Relaxed);
                 self.browser_import.confirm_cancel = false;
@@ -461,6 +491,15 @@ impl Cagents {
             _ => {}
         }
         Task::none()
+    }
+
+    pub(super) fn cancel_browser_import(&mut self) -> Task<Message> {
+        let action = if self.browser_import.confirm_cancel {
+            Action::KeepWorking
+        } else {
+            Action::Cancel
+        };
+        self.update_browser_import(action)
     }
 
     pub(super) fn browser_import_dialog(&self) -> Option<Element<'_, Message>> {
@@ -472,32 +511,31 @@ impl Cagents {
             vec![crate::design::title("Import browser logins").into()];
         let button = |label: &'static str, action| {
             crate::ui_controls::button::secondary(label)
+                .id(widget::Id::new(
+                    if matches!(action, Action::Cancel | Action::KeepWorking) {
+                        "browser-import.cancel"
+                    } else {
+                        label
+                    },
+                ))
                 .on_press(message(action))
                 .into()
         };
         if state.confirm_cancel {
             content.push(notice_body("Stop this import? A scan may be waiting for the desktop keyring. Cookies already written into the in-app browser remain there."));
-            content.push(
-                widget::row::with_children(vec![
-                    button("Keep going", Action::KeepWorking),
-                    button("Stop import", Action::ConfirmCancel),
-                ])
-                .spacing(space::S)
-                .into(),
-            );
+            content.push(super::dialog_ui::confirmation_controls(vec![
+                button("Keep going", Action::KeepWorking),
+                button("Stop import", Action::ConfirmCancel),
+            ]));
         } else {
             match &state.phase {
                 Phase::Intro => {
                     content.push(notice_body("Read cookie databases from Chrome, Chromium, Brave, Firefox, and Zen profiles on this machine? You choose the sites before importing. Encrypted Chrome-family cookies may ask to unlock your desktop keyring."));
                     content.push(notice_body("Cookie values stay in this app's browser and are never sent to its terminal service. Source profiles are read-only. Imported logins apply to all in-app tabs for this app session; some sites may still require signing in."));
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Skip", Action::Cancel),
-                            button("Scan local profiles", Action::Consent),
-                        ])
-                        .spacing(space::S)
-                        .into(),
-                    );
+                    content.push(super::dialog_ui::confirmation_controls(vec![
+                        button("Skip", Action::Cancel),
+                        button("Scan local profiles", Action::Consent),
+                    ]));
                 }
                 Phase::Scanning | Phase::Extracting | Phase::Importing => {
                     content.push(notice_body(if state.cancel.load(Ordering::Relaxed) {
@@ -604,29 +642,21 @@ impl Cagents {
                             .height(Length::Fixed(360.0))
                             .into(),
                     );
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Cancel", Action::Cancel),
-                            button("Scan again", Action::Consent),
-                            button("Import selected", Action::Import),
-                        ])
-                        .spacing(space::S)
-                        .into(),
-                    );
+                    content.push(super::dialog_ui::confirmation_controls(vec![
+                        button("Cancel", Action::Cancel),
+                        button("Scan again", Action::Consent),
+                        button("Import selected", Action::Import),
+                    ]));
                 }
                 Phase::Finished(detail) => {
                     content.push(notice_body(detail.clone()));
                     for error in &state.errors {
                         content.push(crate::design::body(error.clone()).into());
                     }
-                    content.push(
-                        widget::row::with_children(vec![
-                            button("Done", Action::Cancel),
-                            button("Retry", Action::Consent),
-                        ])
-                        .spacing(space::S)
-                        .into(),
-                    );
+                    content.push(super::dialog_ui::confirmation_controls(vec![
+                        button("Done", Action::Cancel),
+                        button("Retry", Action::Consent),
+                    ]));
                 }
                 Phase::Closed => {}
             }
@@ -636,7 +666,11 @@ impl Cagents {
                 widget::column::with_children(content).spacing(space::L),
                 620.0,
             ),
-            Some(message(Action::Cancel)),
+            Some(message(if state.confirm_cancel {
+                Action::KeepWorking
+            } else {
+                Action::Cancel
+            })),
             1.0,
         ))
     }

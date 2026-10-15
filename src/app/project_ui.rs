@@ -12,6 +12,14 @@ struct AutomaticAttempt {
     at: Instant,
 }
 
+/// Independently stacked project confirmations. Feature additions extend this
+/// enum and the role-specific state/view/focus/dismiss helpers together.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalRole {
+    WorktreeDelete,
+    ProjectRemove,
+}
+
 #[derive(Debug, Default)]
 pub struct State {
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
@@ -54,7 +62,25 @@ impl State {
     }
 
     pub fn modal_open(&self) -> bool {
-        self.dialog.is_some() || self.remove_dialog.is_some()
+        self.modal_roles().next().is_some()
+    }
+
+    pub(super) fn modal_roles(&self) -> impl Iterator<Item = ModalRole> {
+        [
+            self.dialog.as_ref().map(|_| ModalRole::WorktreeDelete),
+            self.remove_dialog
+                .as_ref()
+                .map(|_| ModalRole::ProjectRemove),
+        ]
+        .into_iter()
+        .flatten()
+    }
+
+    pub(super) fn focus_target_for(&self, role: ModalRole) -> widget::Id {
+        widget::Id::new(match role {
+            ModalRole::WorktreeDelete => "dialog.project.close",
+            ModalRole::ProjectRemove => "dialog.project.remove.cancel",
+        })
     }
 
     fn running(&self) -> impl Iterator<Item = &Target> {
@@ -124,20 +150,11 @@ impl State {
     }
 
     pub(super) fn focus_target(&self) -> widget::Id {
-        if self.remove_dialog.is_some() {
-            return widget::Id::new("dialog.project.remove.confirm");
-        }
-        widget::Id::new(
-            if self
-                .dialog
-                .as_ref()
-                .is_some_and(|dialog| dialog.blocker.is_some())
-            {
-                "dialog.project.close"
-            } else {
-                "dialog.project.confirm"
-            },
-        )
+        self.focus_target_for(if self.remove_dialog.is_some() {
+            ModalRole::ProjectRemove
+        } else {
+            ModalRole::WorktreeDelete
+        })
     }
 }
 
@@ -211,6 +228,7 @@ pub enum Action {
     },
     Finished(Result<(), String>),
     Dismiss,
+    DismissRole(ModalRole),
 }
 
 impl Cagents {
@@ -895,6 +913,17 @@ impl Cagents {
     }
 
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
+        let required_role = match action {
+            Action::ConfirmRemove => Some(ModalRole::ProjectRemove),
+            Action::ConfirmDelete => Some(ModalRole::WorktreeDelete),
+            Action::DismissRole(role) => Some(role),
+            _ => None,
+        };
+        if required_role
+            .is_some_and(|role| self.top_modal() != Some(modal_ui::Modal::Project(role)))
+        {
+            return Task::none();
+        }
         match action {
             Action::AwaitClosedProject(project, generation) => {
                 if self.project_ui.close_generation.get(&project) != Some(&generation) {
@@ -1172,22 +1201,12 @@ impl Cagents {
                     }
                 }
             }
+            Action::DismissRole(role) => return self.dismiss_project_modal(role),
             Action::Dismiss => {
-                self.project_ui.remove_dialog = None;
-                let dismissed = self.project_ui.dialog.take();
-                // Declining to run a failed deletion again is the answer to
-                // it, so its row stops asking.
-                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
-                    && self
-                        .project_ui
-                        .deletions
-                        .get(&id)
-                        .is_some_and(|deletion| deletion.failure.is_some())
-                {
-                    self.project_ui.deletions.remove(&id);
-                    self.sync_worktree_operation_rows();
-                }
-                return self.project_dialog_closed();
+                return match self.top_modal() {
+                    Some(modal_ui::Modal::Project(role)) => self.dismiss_project_modal(role),
+                    _ => Task::none(),
+                };
             }
             Action::ConfirmRemove => {
                 let Some(mut removal) = self.project_ui.remove_dialog.take() else {
@@ -1718,8 +1737,32 @@ impl Cagents {
         ))
     }
 
-    pub(super) fn project_dialog_view(&self) -> Option<Element<'_, Message>> {
-        if let Some(removal) = &self.project_ui.remove_dialog {
+    pub(super) fn dismiss_project_modal(&mut self, role: ModalRole) -> Task<Message> {
+        match role {
+            ModalRole::ProjectRemove => {
+                self.project_ui.remove_dialog = None;
+            }
+            ModalRole::WorktreeDelete => {
+                let dismissed = self.project_ui.dialog.take();
+                // Declining a failed deletion clears only that row's retry.
+                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
+                    && self
+                        .project_ui
+                        .deletions
+                        .get(&id)
+                        .is_some_and(|deletion| deletion.failure.is_some())
+                {
+                    self.project_ui.deletions.remove(&id);
+                    self.sync_worktree_operation_rows();
+                }
+            }
+        }
+        self.project_dialog_closed()
+    }
+
+    pub(super) fn project_dialog_view_for(&self, role: ModalRole) -> Option<Element<'_, Message>> {
+        if role == ModalRole::ProjectRemove {
+            let removal = self.project_ui.remove_dialog.as_ref()?;
             let detail = if removal.channels == 0 {
                 "No channels are attached to this project.".to_owned()
             } else {
@@ -1741,7 +1784,8 @@ impl Cagents {
                     }),
                     super::dialog_ui::confirmation_actions(
                         crate::ui_controls::button::secondary("Cancel")
-                            .on_press(Message::ProjectUi(Action::Dismiss)),
+                            .id(widget::Id::new("dialog.project.remove.cancel"))
+                            .on_press(Message::ProjectUi(Action::DismissRole(ModalRole::ProjectRemove))),
                         crate::ui_controls::button::destructive("Remove project")
                             .id(widget::Id::new("dialog.project.remove.confirm"))
                             .on_press(Message::ProjectUi(Action::ConfirmRemove)),
@@ -1782,7 +1826,9 @@ impl Cagents {
         rows.push(super::dialog_ui::confirmation_actions(
             crate::ui_controls::button::secondary("Cancel")
                 .id(widget::Id::new("dialog.project.close"))
-                .on_press(Message::ProjectUi(Action::Dismiss)),
+                .on_press(Message::ProjectUi(Action::DismissRole(
+                    ModalRole::WorktreeDelete,
+                ))),
             crate::ui_controls::button::destructive(if dialog.failure.is_some() {
                 "Retry delete"
             } else {
@@ -2296,6 +2342,69 @@ fn worktree_removal_command(target: &Target) -> CommandSpec {
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn project_modal_roles_cancel_only_the_top_payload_and_block_hidden_confirmation() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = ProjectId::new();
+        let target = Target {
+            project,
+            worktree: None,
+            repository: "/repo".into(),
+            path: "/repo/linked".into(),
+            label: "linked".into(),
+        };
+        app.project_ui.dialog = Some(Dialog {
+            target,
+            blocker: None,
+            failure: None,
+        });
+        app.project_ui.remove_dialog = Some(ProjectRemoval {
+            project,
+            repository: "/repo".into(),
+            kind: ProjectKind::Git,
+            name: "repo".into(),
+            worktrees: Vec::new(),
+            channels: 0,
+            project_sessions: ProjectSessionOwnership::default(),
+        });
+        let _ = app.finish_modal_update(Task::none());
+        assert_eq!(
+            app.top_modal(),
+            Some(modal_ui::Modal::Project(ModalRole::ProjectRemove))
+        );
+        assert!(
+            app.project_dialog_view_for(ModalRole::ProjectRemove)
+                .is_some()
+        );
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::DismissRole(ModalRole::WorktreeDelete));
+        assert!(
+            app.project_ui.remove_dialog.is_some(),
+            "a stale lower Cancel cannot dismiss the newer dialog"
+        );
+        assert!(
+            app.project_ui.dialog.is_some(),
+            "a hidden delete confirmation cannot run"
+        );
+        let _ = app.handle_project_action(Action::Dismiss);
+        let _ = app.finish_modal_update(Task::none());
+        assert!(app.project_ui.remove_dialog.is_none());
+        assert!(
+            app.project_ui.dialog.is_some(),
+            "cancel keeps the underlying dialog"
+        );
+        assert_eq!(
+            app.top_modal(),
+            Some(modal_ui::Modal::Project(ModalRole::WorktreeDelete))
+        );
+        assert!(
+            app.project_dialog_view_for(ModalRole::WorktreeDelete)
+                .is_some()
+        );
+        let _ = app.handle_project_action(Action::Dismiss);
+        assert!(!app.project_ui.modal_open());
+    }
 
     /// A window with session storage and one project at `repository` whose
     /// linked worktree is `linked`, both of them saved.

@@ -18,17 +18,85 @@ pub(crate) fn surface<'a, M: 'a>(
 
 /// The closing row every confirmation shares: right-aligned, the dismissal
 /// before the committing action, a sibling-control gap apart.
-pub(super) fn confirmation_actions<'a>(
-    dismiss: impl Into<Element<'a, Message>>,
-    confirm: impl Into<Element<'a, Message>>,
-) -> Element<'a, Message> {
-    widget::row::with_children(vec![
-        iced::widget::Space::new().width(Length::Fill).into(),
-        dismiss.into(),
-        confirm.into(),
-    ])
-    .spacing(space::S)
+pub(crate) fn confirmation_actions<'a, M: 'a>(
+    dismiss: impl Into<Element<'a, M>>,
+    confirm: impl Into<Element<'a, M>>,
+) -> Element<'a, M> {
+    confirmation_controls(vec![dismiss.into(), confirm.into()])
+}
+
+/// Multi-action confirmations retain the same safe-first, trailing row.
+pub(crate) fn confirmation_controls<'a, M: 'a>(controls: Vec<Element<'a, M>>) -> Element<'a, M> {
+    widget::container(
+        widget::row::with_children(controls)
+            .spacing(space::S)
+            .wrap()
+            .align_x(iced::alignment::Horizontal::Right),
+    )
+    .align_right(Length::Fill)
     .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cosmic::iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree, operation},
+    };
+
+    #[test]
+    fn long_confirmation_actions_wrap_and_remain_reachable_in_a_narrow_window() {
+        let renderer = super::super::tests::headless_renderer();
+        let controls = (0..4)
+            .map(|index| {
+                crate::ui_controls::button::secondary("Keep editing automation")
+                    .width(170)
+                    .id(widget::Id::from(format!("fixture.action-{index}")))
+                    .on_press(Message::DismissStatus)
+                    .into()
+            })
+            .collect();
+        let mut element = confirmation_controls(controls);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(300.0, 300.0)),
+        );
+        #[derive(Default)]
+        struct Bounds(Vec<iced::Rectangle>);
+        impl Operation for Bounds {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: iced::Rectangle,
+                _: &mut dyn operation::Focusable,
+            ) {
+                if id.is_some() {
+                    self.0.push(bounds);
+                }
+            }
+        }
+        let mut bounds = Bounds::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut bounds);
+        assert_eq!(bounds.0.len(), 4);
+        assert!(
+            bounds
+                .0
+                .iter()
+                .all(|bounds| bounds.x >= 0.0 && bounds.x + bounds.width <= 300.0)
+        );
+        assert!(
+            bounds.0[3].y > bounds.0[0].y,
+            "actions must wrap instead of extending beyond the window"
+        );
+    }
 }
 
 pub(super) fn overlay<'a>(

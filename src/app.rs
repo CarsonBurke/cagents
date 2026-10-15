@@ -13,6 +13,7 @@ mod daemon_recovery;
 mod daemon_stop;
 mod device_ui;
 pub(crate) mod dialog_ui;
+mod modal_ui;
 #[cfg(test)]
 use crate::file_manager::open_system_url_with_opener;
 use crate::file_manager::{self, open_system_url};
@@ -2578,6 +2579,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::ProjectUi(
                     project_ui::Action::Command { .. }
                         | project_ui::Action::ConfirmDelete
+                        | project_ui::Action::ConfirmRemove
+                        | project_ui::Action::DismissRole(_)
                         | project_ui::Action::Dismiss
                 )
                 | Message::ChannelUi(
@@ -4748,6 +4751,7 @@ struct SourceControlMutation {
 }
 
 pub struct Cagents {
+    modal_stack: modal_ui::Stack,
     device_ui: device_ui::State,
     workspace: Workspace,
     durable: Arc<WorkspaceState>,
@@ -11174,90 +11178,25 @@ impl Cagents {
     /// therefore act on a keystroke, because the user is aiming it at the
     /// dialog - and a terminal acts by writing to a shell.
     fn modal_is_open(&self) -> bool {
-        self.update_ui.confirmation.is_some() || self.other_modal_is_open()
-    }
-
-    fn other_modal_is_open(&self) -> bool {
-        self.form_dialog_is_open() || self.modal_over_form_dialogs()
-    }
-
-    /// The worktree and pull request dialogs: forms, whose focused field
-    /// captures the keys the dialog itself answers.
-    fn form_dialog_is_open(&self) -> bool {
-        self.device_ui.open
-            || self.worktree_dialog.is_some()
-            || self.pull_request_dialog.is_some()
-            || self.resume_ui.open
+        self.top_modal().is_some()
     }
 
     /// Closes the topmost form dialog, stopping whatever it was waiting on.
     fn cancel_form_dialog(&mut self) -> Task<Message> {
-        if self.automation_approval_open() {
-            return self.cancel_automation_approval();
-        }
-        if self.session_recovery.open() {
-            return self.update_session_recovery(session_recovery::Action::Cancel);
-        }
-        if self.daemon_health_ui.confirmation {
-            return self.update_daemon_health_ui(daemon_health_ui::Action::Cancel);
-        }
-        if self.transient_work_close.is_some() {
-            return cosmic::task::message(Message::CancelTransientWorkClose);
-        }
-        if let Some(action) = self.automation_ui.keep_draft_action() {
-            return self.update_automation_ui(action);
-        }
-        if self.device_ui.open {
-            return self.update_device(device_ui::Action::Close);
-        }
-        if self.resume_ui.open {
-            return self.update_resume(resume_ui::Action::Close);
-        }
-        if let Some(dialog) = self.worktree_dialog.take() {
-            dialog.cancel();
-        } else if self.pull_request_dialog.take().is_some() {
-            self.pull_request_dialog_generation =
-                self.pull_request_dialog_generation.wrapping_add(1);
-        }
-        if let Some(target) = self.nested_modal_focus_target() {
-            return iced::widget::operation::focus(target).map(cosmic::Action::App);
-        }
-        self.focus_context_overlay_if_exposed()
+        self.cancel_top_modal()
     }
 
     /// Whether a form dialog is the dialog on screen, not one under another.
     fn form_dialog_on_top(&self) -> bool {
-        self.form_dialog_is_open()
-            && self.update_ui.confirmation.is_none()
-            && !self.modal_over_form_dialogs()
-    }
-
-    /// The dialogs `dialog` mounts above the form dialogs, besides the
-    /// update confirmation, which `modal_is_open` adds.
-    fn modal_over_form_dialogs(&self) -> bool {
-        #[cfg(feature = "integrated-browser")]
-        if self.browser_import.open() {
-            return true;
-        }
-        self.session_recovery.open()
-            || self.daemon_health_ui.confirmation
-            || self.automation_approval_open()
-            || self.dirty_repository_close.is_some()
-            || self.transient_work_close.is_some()
-            || self.automation_ui.draft_dialog_open()
-            || self.chat_ui.image_viewer.is_some()
-            || self.terminal_paste.is_some()
-            || self.terminal_close_dialog_visible()
-            || self.settings_reset_confirm
-            || self.project_ui.modal_open()
-            || self.channel_ui.modal_open()
-            || self.sidebar_selection_ui.dialog.is_some()
-            // Mounted by `dialog` from the sidebar's own state, so nothing
-            // beneath it can learn about it any other way. Leaving it out is
-            // how the one dialog that is on screen *because* it is about to
-            // destroy work becomes the one dialog the pane keeps its commands
-            // live behind.
-            || self.sidebar_state.pending_discard().is_some()
+        matches!(
+            self.top_modal(),
+            Some(
+                modal_ui::Modal::Device
+                    | modal_ui::Modal::Resume
+                    | modal_ui::Modal::Worktree
+                    | modal_ui::Modal::PullRequest
+            )
+        )
     }
 
     fn context_inspector_visible(&self) -> bool {
@@ -11272,8 +11211,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -11940,29 +11882,12 @@ impl Cagents {
     }
 
     fn nested_modal_focus_target(&self) -> Option<widget::Id> {
-        if self.automation_ui.draft_dialog_open() {
-            return Some(crate::automation_ui::draft_dialog_focus_id());
-        }
-        if self.resume_ui.open {
-            return Some(resume_ui::focus_id());
-        }
-        if let Some(dialog) = &self.sidebar_selection_ui.dialog {
-            Some(dialog.focus_target())
-        } else if self.sidebar_state.pending_discard().is_some() {
-            Some(sidebar::discard_confirm_id())
-        } else if self.project_ui.modal_open() {
-            Some(self.project_ui.focus_target())
-        } else if self.channel_ui.modal_open() {
-            Some(channel_ui::State::focus_target())
-        } else if self.worktree_dialog.is_some() {
-            Some(worktree_dialog_focus_id())
-        } else if self.pull_request_dialog.is_some() {
-            Some(pull_request_dialog_focus_id())
-        } else if self.context_inspector_is_overlay() {
-            Some(context_inspector_toggle_id())
-        } else {
-            None
-        }
+        self.top_modal()
+            .map(|modal| self.modal_initial_focus(modal))
+            .or_else(|| {
+                self.context_inspector_is_overlay()
+                    .then(context_inspector_toggle_id)
+            })
     }
 
     fn restore_pull_request_dialog(
@@ -12643,24 +12568,6 @@ impl Cagents {
         Task::batch(tasks)
     }
 
-    fn settings_reset_on_top(&self) -> bool {
-        #[cfg(feature = "integrated-browser")]
-        if self.browser_import.open() {
-            return false;
-        }
-        self.settings_reset_confirm
-            && !self.automation_approval_open()
-            && self.transient_work_close.is_none()
-            && !self.automation_ui.draft_dialog_open()
-            && !self.device_ui.open
-            && self.chat_ui.image_viewer.is_none()
-            && self.terminal_paste.is_none()
-            && !self.session_recovery.open()
-            && !self.daemon_health_ui.confirmation
-            && self.update_ui.confirmation.is_none()
-            && !self.terminal_close_dialog_visible()
-    }
-
     fn close_settings_reset(&mut self) -> Task<Message> {
         if !std::mem::take(&mut self.settings_reset_confirm) {
             return Task::none();
@@ -12952,6 +12859,7 @@ impl Application for Cagents {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            modal_stack: Default::default(),
             settings_reset_focus_confirm: false,
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
@@ -13126,6 +13034,11 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        self.reconcile_modal_backing_state();
+        let modal_entry_focus = self.finish_modal_update(Task::none());
+        // Keep the large dispatch body in place for independent feature changes.
+        #[rustfmt::skip]
+        let task = (|| {
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -14428,7 +14341,7 @@ impl Application for Cagents {
                     | SidebarAction::CancelDiscard => Task::none(),
                     SidebarAction::RequestDiscard { .. } => {
                         if self.sidebar_state.pending_discard().is_some() {
-                            iced::widget::operation::focus(sidebar::discard_confirm_id())
+                            iced::widget::operation::focus(sidebar::discard_cancel_id())
                                 .map(cosmic::Action::App)
                         } else {
                             Task::none()
@@ -15676,34 +15589,12 @@ impl Application for Cagents {
             },
             Message::CancelDialog => self.cancel_form_dialog(),
             Message::KeyEvent { event, captured } => {
-                if let Some(task) = self.automation_approval_key(&event, captured) {
+                if let Some(task) = self.modal_key_event(&event, captured) {
                     return task;
                 }
-                if let Some(task) = self.session_recovery_key_event(&event, captured) {
-                    return task;
-                }
-                if let Some(task) = self.daemon_health_key_event(&event, captured) {
-                    return task;
-                }
+
                 if let keyboard::Event::ModifiersChanged(modifiers) = &event {
                     self.keyboard_modifiers = *modifiers;
-                }
-                if self.chat_ui.image_viewer.is_some() {
-                    if let keyboard::Event::KeyPressed { key, .. } = &event {
-                        match key {
-                            keyboard::Key::Named(keyboard::key::Named::Escape) => {
-                                self.chat_ui.image_viewer = None
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowLeft) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(false);
-                            }
-                            keyboard::Key::Named(keyboard::key::Named::ArrowRight) => {
-                                self.chat_ui.image_viewer.as_mut().unwrap().next(true);
-                            }
-                            _ => {}
-                        }
-                    }
-                    return Task::none();
                 }
                 if !captured
                     && !self.workspace_inputs_blocked()
@@ -15788,18 +15679,6 @@ impl Application for Cagents {
                 // keystroke. Global shortcuts below are deliberately exempt:
                 // `WorkspaceSurface` captures those chords itself, before any
                 // child sees them, and relies on this message to act on them.
-                // A form dialog on top answers Escape before anything under
-                // it, such as a find bar or picker, and even when its focused
-                // field captured the key to blur itself: otherwise closing it
-                // would take a second press.
-                if is_escape_press(&event) && self.form_dialog_on_top() {
-                    return self.cancel_form_dialog();
-                }
-                if self.form_dialog_on_top()
-                    && let Some(task) = self.resume_key_event(&event)
-                {
-                    return task;
-                }
                 if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
                     return self.update_device(device_ui::Action::Menu(false));
                 }
@@ -15814,68 +15693,13 @@ impl Application for Cagents {
                             .map(cosmic::Action::App)
                     });
                 }
-                if self.settings_reset_on_top() {
-                    if is_escape_press(&event) {
-                        return self.close_settings_reset();
-                    }
-                    if is_tab_press(&event).is_some() {
-                        self.settings_reset_focus_confirm = !self.settings_reset_focus_confirm;
-                        let target = if self.settings_reset_focus_confirm {
-                            "dialog.reset-settings.confirm"
-                        } else {
-                            "dialog.reset-settings.cancel"
-                        };
-                        return iced::widget::operation::focus(widget::Id::new(target))
-                            .map(cosmic::Action::App);
-                    }
-                }
                 if is_escape_press(&event) && !captured {
-                    if self.transient_work_close.is_some() {
-                        return cosmic::task::message(Message::CancelTransientWorkClose);
-                    }
-                    if let Some(action) = self.automation_ui.keep_draft_action() {
-                        return self.update_automation_ui(action);
-                    }
-                    if let Some((card, _)) = &self.terminal_paste {
-                        return self
-                            .handle_terminal_find(terminal_ui::Action::ConfirmPaste(*card, false));
-                    }
-                    if self.update_ui.confirmation.is_some() {
-                        return self.update_update_ui(update_ui::Action::CancelApply);
-                    }
-                    if self.terminal_close_dialog_visible() {
-                        return self.cancel_terminal_close();
-                    }
-                    if self.sidebar_state.pending_discard().is_some() {
-                        return cosmic::task::message(Message::Sidebar(
-                            SidebarAction::CancelDiscard,
-                        ));
-                    }
-                    if self.project_ui.modal_open() {
-                        return self.handle_project_action(project_ui::Action::Dismiss);
-                    }
-                    if self.sidebar_selection_ui.dialog.is_some() {
-                        return self
-                            .update_sidebar_selection(sidebar_selection_ui::Action::Dismiss);
-                    }
-                    if self.dirty_repository_close.is_some() {
-                        if self.dirty_repository_close.as_ref().is_some_and(|close| {
-                            matches!(self.cards.get(&close.card), Some(CardRuntime::Repository(runtime)) if runtime.is_saving())
-                        }) {
-                            return Task::none();
-                        }
-                        return cosmic::task::message(Message::CancelRepositoryClose);
-                    }
-                    // Ahead of the inspector and the sidebar because the find
-                    // bar is the innermost thing the user is looking at, and
-                    // behind the confirmations above because those are modal.
+                    // Modal keyboard routing already returned above. The find
+                    // bar precedes the remaining workspace overlays.
                     if let Some(card) = self.focused_repository_card_with_find() {
                         return cosmic::task::message(Message::Repository(
                             RepositoryAction::CloseFind { card },
                         ));
-                    }
-                    if self.worktree_dialog.is_some() || self.pull_request_dialog.is_some() {
-                        return cosmic::task::message(Message::CancelDialog);
                     }
                     if self.sidebar_state.controls_expanded() {
                         return self.update(Message::Sidebar(SidebarAction::ToggleControls));
@@ -15885,16 +15709,6 @@ impl Application for Cagents {
                             InspectorAction::Close,
                         ));
                     }
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.terminal_close_dialog_visible()
-                {
-                    return self.cycle_terminal_close_focus(backwards);
-                }
-                if let Some(backwards) = is_tab_press(&event)
-                    && self.dirty_repository_close.is_some()
-                {
-                    return self.cycle_dirty_close_focus(backwards);
                 }
                 // A chord typed at a dialog is not the workspace's to act on:
                 // the close chord must not close the card behind the dialog.
@@ -16494,6 +16308,12 @@ impl Application for Cagents {
             notices,
             terminal_probes,
         ])
+
+        })();
+        self.reconcile_modal_backing_state();
+        // Only the immediate entry focus operation gates feature tasks. A
+        // long-lived feature stream must never delay focus restoration.
+        modal_entry_focus.chain(self.finish_modal_update(task))
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -16612,10 +16432,15 @@ impl Application for Cagents {
     }
 
     fn dialog(&self) -> Option<Element<'_, Message>> {
-        if let Some(dialog) = self.automation_approval_dialog() {
+        let top = self.top_modal()?;
+        #[rustfmt::skip]
+        let dialog = (|| {
+        if top == modal_ui::Modal::Approval
+            && let Some(dialog) = self.automation_approval_dialog() {
             return Some(dialog);
         }
-        if self.transient_work_close.is_some() {
+        if top == modal_ui::Modal::TransientClose
+            && self.transient_work_close.is_some() {
             let mut controls: Vec<Element<'_, Message>> = vec![
                 crate::ui_controls::button::secondary("Cancel close")
                     .id(widget::Id::new("dialog.transient-close.cancel"))
@@ -16652,10 +16477,7 @@ impl Application for Cagents {
                         notice_detail(self.window_close_transient_blocker().unwrap_or(
                             "The pending work is complete. Cancel this dialog and close again.",
                         )),
-                        widget::row::with_children(controls)
-                            .spacing(space::S)
-                            .wrap()
-                            .into(),
+                        dialog_ui::confirmation_controls(controls),
                     ])
                     .spacing(space::M),
                     480.0,
@@ -16664,7 +16486,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(dialog) = self.automation_ui.draft_dialog() {
+        if top == modal_ui::Modal::AutomationDraft
+            && let Some(dialog) = self.automation_ui.draft_dialog() {
             return Some(dialog_ui::overlay(
                 dialog.map(Message::AutomationUi),
                 self.automation_ui
@@ -16673,33 +16496,41 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if self.device_ui.open {
+        if top == modal_ui::Modal::Device
+            && self.device_ui.open {
             return Some(dialog_ui::overlay(
                 self.device_dialog(),
                 (!self.device_ui.busy()).then_some(Message::Device(device_ui::Action::Close)),
                 1.0,
             ));
         }
-        if let Some(gallery) = &self.chat_ui.image_viewer {
+        if top == modal_ui::Modal::Image
+            && let Some(gallery) = &self.chat_ui.image_viewer {
             return Some(gallery.view());
         }
-        if let Some(dialog) = self.terminal_paste_dialog() {
+        if top == modal_ui::Modal::Paste
+            && let Some(dialog) = self.terminal_paste_dialog() {
             return Some(dialog);
         }
         #[cfg(feature = "integrated-browser")]
-        if let Some(dialog) = self.browser_import_dialog() {
+        if top == modal_ui::Modal::BrowserImport
+            && let Some(dialog) = self.browser_import_dialog() {
             return Some(dialog);
         }
-        if let Some(dialog) = self.session_recovery_dialog() {
+        if top == modal_ui::Modal::Recovery
+            && let Some(dialog) = self.session_recovery_dialog() {
             return Some(dialog);
         }
-        if let Some(dialog) = self.daemon_health_dialog() {
+        if top == modal_ui::Modal::Health
+            && let Some(dialog) = self.daemon_health_dialog() {
             return Some(dialog);
         }
-        if let Some(dialog) = self.update_dialog() {
+        if top == modal_ui::Modal::Update
+            && let Some(dialog) = self.update_dialog() {
             return Some(dialog);
         }
-        if let Some(intent) = &self.terminal_close
+        if top == modal_ui::Modal::TerminalClose
+            && let Some(intent) = &self.terminal_close
             && self.terminal_close_dialog_visible()
         {
             return self.terminal_close_dialog().map(|surface| {
@@ -16713,7 +16544,8 @@ impl Application for Cagents {
         // Above the settings surface it is raised from, because it is about to
         // discard every shortcut, font, theme and language-server entry the
         // user configured, with no undo.
-        if self.settings_reset_confirm {
+        if top == modal_ui::Modal::SettingsReset
+            && self.settings_reset_confirm {
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
                     widget::column::with_children(vec![
@@ -16724,8 +16556,7 @@ impl Application for Cagents {
                              pane widths, and the configured language servers.",
                         ),
                         notice_detail("This cannot be undone."),
-                        widget::row::with_children(vec![
-                            iced::widget::Space::new().width(Length::Fill).into(),
+                        dialog_ui::confirmation_controls(vec![
                             crate::ui_controls::button::secondary("Cancel")
                                 .id(widget::Id::new("dialog.reset-settings.cancel"))
                                 .on_press(Message::CancelResetSettings)
@@ -16734,9 +16565,7 @@ impl Application for Cagents {
                                 .id(widget::Id::new("dialog.reset-settings.confirm"))
                                 .on_press(Message::ConfirmResetSettings)
                                 .into(),
-                        ])
-                        .spacing(space::S)
-                        .into(),
+                        ]),
                     ])
                     .spacing(space::M),
                     480.0,
@@ -16747,14 +16576,16 @@ impl Application for Cagents {
         }
         // First, because a discard is the one dialog on screen precisely
         // because it is about to destroy work that exists nowhere else.
-        if let Some(pending) = self.sidebar_state.pending_discard() {
+        if top == modal_ui::Modal::Discard
+            && let Some(pending) = self.sidebar_state.pending_discard() {
             return Some(dialog_ui::overlay(
                 sidebar::discard_confirmation_dialog(pending).map(Message::Sidebar),
                 Some(Message::Sidebar(SidebarAction::CancelDiscard)),
                 1.0,
             ));
         }
-        if let Some(close) = self.dirty_repository_close.as_ref() {
+        if top == modal_ui::Modal::DirtyClose
+            && let Some(close) = self.dirty_repository_close.as_ref() {
             let card = close.card;
             let runtime = match self.cards.get(&card) {
                 Some(CardRuntime::Repository(runtime)) => runtime,
@@ -16821,9 +16652,7 @@ impl Application for Cagents {
                 .into(),
             );
             rows.push(
-                widget::row::with_children(controls)
-                    .spacing(space::S)
-                    .into(),
+                dialog_ui::confirmation_controls(controls),
             );
             return Some(dialog_ui::overlay(
                 dialog_ui::surface(
@@ -16835,7 +16664,8 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(surface) = self.sidebar_selection_dialog() {
+        if top == modal_ui::Modal::Selection
+            && let Some(surface) = self.sidebar_selection_dialog() {
             return Some(dialog_ui::overlay(
                 surface,
                 Some(Message::SidebarSelection(
@@ -16844,28 +16674,33 @@ impl Application for Cagents {
                 1.0,
             ));
         }
-        if let Some(surface) = self.project_dialog_view() {
+        if let modal_ui::Modal::Project(role) = top
+            && let Some(surface) = self.project_dialog_view_for(role) {
             return Some(dialog_ui::overlay(
                 surface,
-                Some(Message::ProjectUi(project_ui::Action::Dismiss)),
+                Some(Message::ProjectUi(project_ui::Action::DismissRole(role))),
                 1.0,
             ));
         }
-        if let Some(surface) = self.channel_dialog_view() {
+        if top == modal_ui::Modal::Channel
+            && let Some(surface) = self.channel_dialog_view() {
             return Some(dialog_ui::overlay(
                 surface,
                 Some(Message::ChannelUi(channel_ui::Action::Dismiss)),
                 1.0,
             ));
         }
-        if let Some((surface, dismiss)) = self.worktree_dialog_view() {
+        if top == modal_ui::Modal::Worktree
+            && let Some((surface, dismiss)) = self.worktree_dialog_view() {
             return Some(dialog_ui::overlay(surface, dismiss, 1.0));
         }
 
-        if let Some(dialog) = self.resume_dialog() {
+        if top == modal_ui::Modal::Resume
+            && let Some(dialog) = self.resume_dialog() {
             return Some(dialog);
         }
 
+        if top != modal_ui::Modal::PullRequest { return None; }
         let dialog = self.pull_request_dialog.as_ref()?;
         let head = dialog.head.trim();
         let base = dialog.base.trim();
@@ -16887,6 +16722,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Title", &dialog.title)
                     .id(pull_request_dialog_focus_id())
                     .on_input(Message::PullRequestTitleChanged)
+                    .on_submit(|_| Message::SubmitPullRequest)
                     .into(),
             ])
             .spacing(space::XS)
@@ -16896,6 +16732,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Head branch", &dialog.head)
                     .id(widget::Id::new("dialog.pull-request.head"))
                     .on_input(Message::PullRequestHeadChanged)
+                    .on_submit(|_| Message::SubmitPullRequest)
                     .into(),
             ])
             .spacing(space::XS)
@@ -16905,6 +16742,7 @@ impl Application for Cagents {
                 crate::ui_controls::field::text("Base branch", &dialog.base)
                     .id(widget::Id::new("dialog.pull-request.base"))
                     .on_input(Message::PullRequestBaseChanged)
+                    .on_submit(|_| Message::SubmitPullRequest)
                     .into(),
             ])
             .spacing(space::XS)
@@ -16940,7 +16778,7 @@ impl Application for Cagents {
             );
         }
         rows.push(
-            widget::row::with_children(vec![
+            dialog_ui::confirmation_controls(vec![
                 crate::ui_controls::button::secondary("Cancel")
                     .on_press(Message::CancelDialog)
                     .into(),
@@ -16958,9 +16796,7 @@ impl Application for Cagents {
                         .then_some(Message::SubmitPullRequest),
                     )
                     .into(),
-            ])
-            .spacing(space::S)
-            .into(),
+            ]),
         );
         Some(dialog_ui::overlay(
             dialog_ui::surface(
@@ -16972,6 +16808,10 @@ impl Application for Cagents {
             Some(Message::CancelDialog),
             1.0,
         ))
+        })();
+        dialog.map(|dialog| {
+            crate::interaction::observe_focus(dialog, self.modal_stack.focus_snapshot(top))
+        })
     }
 
     /// The application opens no window but its main one, which stops being
@@ -17347,6 +17187,8 @@ impl Application for Cagents {
         );
         let surface = crate::input_trace::observe(surface, &self.input_trace);
         let surface = crate::file_drop::surface(surface, self.core.scale_factor());
+        let surface =
+            crate::interaction::observe_focus(surface, self.modal_stack.workspace_focus.clone());
         #[cfg(feature = "latency-harness")]
         return latency_ui::instrument(
             surface,
@@ -20803,6 +20645,61 @@ mod tests {
             draft: true,
             retry_confirmation: None,
         }
+    }
+
+    #[test]
+    fn enter_in_the_pull_request_title_publishes_submit() {
+        use cosmic::iced::{
+            Event, Rectangle,
+            advanced::{
+                Layout, Shell, clipboard, layout,
+                widget::{Tree, operation},
+            },
+            mouse,
+        };
+        let mut app = context_inspector_test_app(false);
+        app.pull_request_dialog = Some(pull_request_test_dialog());
+        let renderer = headless_renderer();
+        let mut element = app.dialog().unwrap();
+        let mut tree = Tree::new(&element);
+        let bounds = Rectangle::with_size(iced::Size::new(1200.0, 900.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, bounds.size()),
+        );
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut operation::focusable::focus::<()>(pull_request_dialog_focus_id()),
+        );
+        let mut messages = Vec::new();
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                modified_key: keyboard::Key::Named(keyboard::key::Named::Enter),
+                physical_key: keyboard::key::Physical::Unidentified(
+                    keyboard::key::NativeCode::Unidentified,
+                ),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            }),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard::Null,
+            &mut Shell::new(&mut messages),
+            &bounds,
+        );
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, Message::SubmitPullRequest))
+        );
     }
 
     fn authorize_pull_request_test(app: &mut Cagents, dialog: &PullRequestDialog) {
@@ -24535,9 +24432,9 @@ mod tests {
         focused_element(cosmic::Application::view(app), task)
     }
 
-    pub(super) fn focused_element(
-        mut element: Element<'_, Message>,
-        task: Task<Message>,
+    pub(super) fn focused_element<M: 'static>(
+        mut element: Element<'_, M>,
+        task: Task<M>,
     ) -> Option<widget::Id> {
         use cosmic::iced::advanced::layout;
         use cosmic::iced::advanced::widget::Tree;
@@ -25227,6 +25124,7 @@ mod tests {
             repository_load_sequence: 0,
             worktree_dialog: None,
             settings_reset_confirm: false,
+            modal_stack: Default::default(),
             settings_reset_focus_confirm: false,
             settings_reset_keyboard_nav: None,
             pull_request_dialog: None,
