@@ -115,7 +115,7 @@ impl<E:ProcessExecutor> GitHubService<E>{
         if source==replacement{return Err(GitHubError::Inspection("This suggestion is already present in the PR head.".into()));}
         let query="mutation($input:CreateCommitOnBranchInput!){createCommitOnBranch(input:$input){commit{oid url}}}";
         let input=serde_json::json!({"query":query,"variables":{"input":{"branch":{"repositoryNameWithOwner":format!("{}/{}",repository.owner,repository.name),"branchName":branch},"expectedHeadOid":request.expected_head,"message":{"headline":format!("Apply review suggestion to {}",thread.path)},"fileChanges":{"additions":[{"path":thread.path,"contents":base64::engine::general_purpose::STANDARD.encode(replacement.as_bytes())}]}}}});
-        let mut command=self.gh_command([OsString::from("api"),"graphql".into(),"--hostname".into(),repository.authority().into(),"--input".into(),"-".into()]);command.stdin=Some(input.to_string().into_bytes());
+        let mut command=self.gh_command([OsString::from("api"),"graphql".into(),"--include".into(),"--hostname".into(),repository.authority().into(),"--input".into(),"-".into()]);command.stdin=Some(input.to_string().into_bytes());
         self.mutate_command(&repository,&command,"/createCommitOnBranch",cancellation).map(|outcome|outcome.map(|_|()))
     }
 }
@@ -150,7 +150,7 @@ mod mutation_tests {
         let key=PullRequestKey::new(GitHubRepoKey::new("suggestions.invalid",None,"owner","repo").unwrap(),1).unwrap();
         let request=SuggestionRequest{comment:"comment".into(),expected_body:"```suggestion\nfixed\n```".into(),index:0,expected_head:"a".repeat(40)};
         assert!(matches!(api.apply_suggestion(&key,&request,&CancellationToken::new()).unwrap(),ReviewMutationOutcome::Applied(())));
-        let calls=executor.calls.lock().unwrap();let command=calls.last().unwrap();assert!(command.arguments.iter().any(|argument|argument=="--input"));
+        let calls=executor.calls.lock().unwrap();let command=calls.last().unwrap();assert!(command.arguments.iter().any(|argument|argument=="--input"));assert!(command.arguments.iter().any(|argument|argument=="--include"));
         let input:serde_json::Value=serde_json::from_slice(command.stdin.as_ref().unwrap()).unwrap();let input=&input["variables"]["input"];
         assert_eq!(input["branch"]["repositoryNameWithOwner"],"author/fork");assert_eq!(input["branch"]["branchName"],"feature");assert_eq!(input["expectedHeadOid"],"a".repeat(40));
         let content=base64::engine::general_purpose::STANDARD.decode(input["fileChanges"]["additions"][0]["contents"].as_str().unwrap()).unwrap();assert_eq!(content,b"before\nfixed\nafter\n");
