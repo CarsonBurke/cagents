@@ -256,11 +256,12 @@ impl Editor {
         }
         let Some(worktree) = self.begin_mutation(origin.card, MutationKind::Commit) else { return Task::none(); };
         self.tab_mut(origin.card).unwrap().git_review.submitted_revision = Some(revision);
+        let cancel = self.mutation_cancellation(origin.card).expect("admitted commit has cancellation");
         cosmic::task::future(async move {
             let request = CommitRequest { worktree, message };
             let authority = origin.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let service = RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?; let cancel = CancellationToken::new();
+                let service = RepositoryService::system("git").with_worktree_authority(authority.authority).map_err(|error| error.to_string())?;
                 match expected { Some(head) if amend => service.commit_amend_at(&request, &head, &cancel), _ => service.commit_with_amend(&request, amend, &cancel) }.map_err(|error| error.to_string())
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::GitReview(Action::Committed { origin, revision, result })
@@ -662,6 +663,52 @@ mod tests {
         run_tasks(&mut app, task);
         assert!(app.notice.as_deref().is_some_and(|notice| !notice.contains("Commit failed") && (notice.contains("available") || notice.contains("No such file"))), "{:?}", app.notice);
         assert_eq!(git(&destination, &["log", "-1", "--format=%s"]), "Captured successful commit");
+    }
+
+    #[test]
+    fn standalone_commit_cancel_uses_admitted_token_and_preserves_known_worker_outcome() {
+        use cosmic::iced::futures::StreamExt;
+        for after_worker in [false, true] {
+            let directory = git_fixture(); let root = directory.path();
+            std::fs::write(root.join("tracked.txt"), "staged cancellation fixture\n").unwrap();
+            git(root, &["add", "tracked.txt"]);
+            let original_head = git(root, &["rev-parse", "HEAD"]);
+            let mut app = editor(); let card = open_real_git(&mut app, root, None); let origin = bound(&app, card);
+            let message = "Commit with cancellation";
+            sidebar_action(&mut app, SidebarAction::CommitMessageChanged { key: origin.key.clone(), message: message.into() });
+            let task = app.update(Message::Sidebar(SidebarAction::Commit { key: origin.key.clone(), message: message.into(), amend: false }));
+            let cancellation = app.mutation_cancellation(card).expect("Commit admitted");
+            let mut messages = Vec::new();
+            let task = if after_worker {
+                messages = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+                    let mut messages = Vec::new();
+                    let mut stream = iced::runtime::task::into_stream(task).expect("Commit worker");
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action { messages.push(message); }
+                    }
+                    messages
+                });
+                assert!(messages.iter().any(|message| matches!(message, Message::GitReview(Action::Committed { result: Ok(CommitOutcome::Created { .. }), .. }))));
+                Task::none()
+            } else { task };
+            sidebar_action(&mut app, SidebarAction::CancelGitMutation { key: origin.key });
+            assert!(cancellation.is_cancelled());
+            assert_eq!(app.tab(card).unwrap().mutation, Some(MutationKind::Commit), "Cancel waits for the owned result");
+            if after_worker {
+                for message in messages { let result = app.update(message); run_tasks(&mut app, result); }
+                assert_ne!(git(root, &["rev-parse", "HEAD"]), original_head);
+                assert_eq!(git(root, &["log", "-1", "--format=%s"]), message);
+                assert!(app.tab(card).unwrap().navigation.commit_message().is_empty(), "known Created remains successful after Cancel");
+            } else {
+                run_tasks(&mut app, task);
+                assert_eq!(git(root, &["rev-parse", "HEAD"]), original_head);
+                assert_eq!(app.tab(card).unwrap().navigation.commit_message(), message);
+                assert!(!git(root, &["diff", "--cached", "--name-only"]).is_empty());
+            }
+            assert!(app.tab(card).unwrap().mutation.is_none());
+            assert!(app.tab(card).unwrap().git_review.submitted_revision.is_none());
+            assert!(app.mutation_cancellation(card).is_none());
+        }
     }
 
     #[test]
