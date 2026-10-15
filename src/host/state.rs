@@ -469,8 +469,11 @@ impl HostState {
 
     /// Resident admission state only; this never opens or probes a store.
     pub(super) fn managed_registry_unavailable(&self) -> bool {
-        !matches!(self.model_admission, ModelAdmission::Unmanaged)
-            && (self.model.is_none() || self.execution_registry.is_none())
+        match self.model_admission {
+            ModelAdmission::Unmanaged => false,
+            ModelAdmission::Opening | ModelAdmission::Unavailable => true,
+            ModelAdmission::Ready => self.model.is_none() || self.execution_registry.is_none(),
+        }
     }
 
     /// In-memory publication of the exact durable observer registration. The
