@@ -29,7 +29,7 @@ impl OriginalUiJournalPeer {
         let pid=peer_pid(&peer)?;
         require_live(&peer)?;
         let process=Path::new("/proc").join(pid.to_string());
-        let image=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_CLOEXEC).open(image)?;
+        let image=OpenOptions::new().read(true).custom_flags(libc::O_NOFOLLOW|libc::O_NONBLOCK|libc::O_CLOEXEC).open(image)?;
         let expected=image.metadata()?;
         require_ui_role(&process)?;
         let actual=fs::metadata(process.join("exe"))?;
@@ -201,7 +201,8 @@ fn require_private_regular(metadata:&fs::Metadata)->io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{io::{BufRead,BufReader},os::unix::net::UnixListener,process::{Command,Stdio}};
+    use std::{io::{BufRead,BufReader},os::unix::net::UnixListener};
+    use crate::process::{CancellationToken,CommandSpec,ProcessExecutor,SystemProcessExecutor};
 
     #[test]
     fn original_peer_pidfd_is_kernel_bound_and_close_on_exec() {
@@ -220,7 +221,8 @@ mod tests {
         let _database=OpenOptions::new().read(true).open(root.join("journal.sqlite3")).unwrap();
         mark_lease_capable_process().unwrap();
         let stream=UnixStream::connect(root.join("peer.socket")).unwrap();
-        let mut line=String::new();BufReader::new(stream).read_line(&mut line).unwrap();
+        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut line=String::new();BufReader::new(stream.take(32)).read_line(&mut line).unwrap();
         assert_eq!(line,"exit\n");
     }
 
@@ -231,27 +233,33 @@ mod tests {
         let database=directory.path().join("journal.sqlite3");
         OpenOptions::new().write(true).create_new(true).mode(0o600).open(&database).unwrap();
         let listener=UnixListener::bind(directory.path().join("peer.socket")).unwrap();
-        let mut child=Command::new(std::env::current_exe().unwrap())
+        listener.set_nonblocking(true).unwrap();
+        let cancellation=CancellationToken::new();
+        struct CancelOnDrop(CancellationToken);
+        impl Drop for CancelOnDrop {fn drop(&mut self){self.0.cancel();}}
+        let _cancel=CancelOnDrop(cancellation.clone());
+        let spec=CommandSpec::new(std::env::current_exe().unwrap())
             .args(["--exact","instance::ui_journal::tests::original_ui_fixture_child","--nocapture"])
             .env("CAGENTS_TEST_ORIGINAL_UI_JOURNAL",directory.path())
-            .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
-        struct Cleanup<'a>(&'a mut std::process::Child);
-        impl Drop for Cleanup<'_> {fn drop(&mut self){let _=self.0.kill();let _=self.0.wait();}}
-        let cleanup=Cleanup(&mut child);
-        listener.set_nonblocking(true).unwrap();
-        let deadline=Instant::now()+Duration::from_secs(5);
-        let mut stream=loop {match listener.accept(){Ok((stream,_))=>break stream,
-            Err(error) if error.kind()==io::ErrorKind::WouldBlock && Instant::now()<deadline=>std::thread::yield_now(),
-            Err(error)=>panic!("fixture accept: {error}")}};
-        let audience=OriginalUiJournalPeer::capture_in(&stream,directory.path(),&std::env::current_exe().unwrap(),
-            |slot|{assert_eq!(slot,"fixture");Ok(database.clone())},deadline).unwrap();
-        assert_eq!(audience.slot(),"fixture");
-        assert_eq!(audience.database_identity().unwrap(),identity(&fs::metadata(&database).unwrap()));
-        audience.validate(deadline).unwrap();
-        stream.write_all(b"exit\n").unwrap();
-        let status=cleanup.0.wait().unwrap(); assert!(status.success());
-        let mut stdout=String::new();cleanup.0.stdout.take().unwrap().read_to_string(&mut stdout).unwrap();
-        assert!(stdout.contains("1 passed; 0 failed"),"{stdout}");
-        assert!(audience.validate(deadline).is_err());
+            .timeout(Duration::from_secs(5)).output_limits(16384,16384);
+        std::thread::scope(|scope| {
+            let child=scope.spawn(||SystemProcessExecutor.execute(&spec,&cancellation));
+            let deadline=Instant::now()+Duration::from_secs(5);
+            let mut stream=loop {match listener.accept(){Ok((stream,_))=>break stream,
+                Err(error) if error.kind()==io::ErrorKind::WouldBlock && Instant::now()<deadline=>std::thread::yield_now(),
+                Err(error)=>panic!("fixture accept: {error}")}};
+            stream.set_write_timeout(Some(Duration::from_secs(1))).unwrap();
+            let audience=OriginalUiJournalPeer::capture_in(&stream,directory.path(),&std::env::current_exe().unwrap(),
+                |slot|{assert_eq!(slot,"fixture");Ok(database.clone())},deadline).unwrap();
+            assert_eq!(audience.slot(),"fixture");
+            assert_eq!(audience.database_identity().unwrap(),identity(&fs::metadata(&database).unwrap()));
+            audience.validate(deadline).unwrap();
+            stream.write_all(b"exit\n").unwrap();
+            let output=child.join().unwrap().unwrap();
+            assert!(output.success,"{output:?}");
+            let stdout=String::from_utf8(output.stdout).unwrap();
+            assert!(stdout.contains("1 passed; 0 failed"),"{stdout}");
+            assert!(audience.validate(deadline).is_err());
+        });
     }
 }
