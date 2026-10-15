@@ -1362,6 +1362,128 @@ mod tests {
     }
 
     #[test]
+    fn owned_native_confirmation_error_revokes_previous_binding_before_frame_application() {
+        use std::os::unix::fs::PermissionsExt;
+        const EXACT: &str = "host::chat::source_binding::tests::owned_native_confirmation_error_revokes_previous_binding_before_frame_application";
+        if chat::runtime::isolated_backend_contract(EXACT) { return; }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let program = directory.path().join("codex");
+        // A real child owns the endpoint and speaks framed WebSocket. It only
+        // echoes fixture JSON; no installed provider/account/service is used.
+        std::fs::write(&program, r##"#!/usr/bin/python3
+import base64, hashlib, json, socket, struct, sys
+path = sys.argv[sys.argv.index('--remote') + 1].removeprefix('unix://')
+listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+listener.settimeout(15)
+listener.bind(path)
+listener.listen(1)
+peer, _ = listener.accept()
+peer.settimeout(15)
+def exact(count):
+    data = b''
+    while len(data) < count:
+        part = peer.recv(count - len(data))
+        if not part: raise EOFError()
+        data += part
+    return data
+header = b''
+while not header.endswith(b'\r\n\r\n'):
+    header += exact(1)
+    if len(header) > 8192: raise ValueError('oversized HTTP header')
+key = next(line.split(b':', 1)[1].strip() for line in header.split(b'\r\n') if line.lower().startswith(b'sec-websocket-key:'))
+accept = base64.b64encode(hashlib.sha1(key + b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').digest())
+peer.sendall(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ' + accept + b'\r\n\r\n')
+def frame(opcode, data):
+    if len(data) >= 126: raise ValueError('fixture response cap')
+    peer.sendall(bytes([128 | opcode, len(data)]) + data)
+try:
+    while True:
+        first, second = exact(2)
+        count = second & 127
+        if count == 126: count = struct.unpack('!H', exact(2))[0]
+        if count == 127: count = struct.unpack('!Q', exact(8))[0]
+        if count > 4096: raise ValueError('fixture request cap')
+        mask = exact(4) if second & 128 else b'\0' * 4
+        data = bytes(value ^ mask[index % 4] for index, value in enumerate(exact(count)))
+        opcode = first & 15
+        if opcode == 8: break
+        if opcode == 9:
+            frame(10, data)
+        elif opcode == 1:
+            request = json.loads(data)
+            frame(1, json.dumps({'thread': request['thread']}).encode())
+except (EOFError, BrokenPipeError, ConnectionResetError):
+    pass
+finally:
+    peer.close()
+    listener.close()
+"##).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut source = chat::native_holder::fixture_source();
+        let proof = source.proof.as_mut().unwrap();
+        proof.boot_id = crate::daemon::read_boot_id().unwrap();
+        source.owned_codex_listener.as_mut().unwrap().allocator = proof.clone();
+        source.launch.recipe.program = program.to_string_lossy().into_owned();
+        source.launch.recipe.working_directory = directory.path().into();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        struct NativeFrames { identity: chat::protocol::ServerIdentity }
+        impl Adapter for NativeFrames {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step { writes: vec![serde_json::json!({"thread":"first"})], ..Step::default() })
+            }
+            fn command(&mut self, command: chat::Command) -> Result<Step, String> {
+                let chat::Command::SetModel { model, .. } = command else { return Err("unexpected fixture command".into()); };
+                Ok(Step { writes: vec![serde_json::json!({"thread":model})], ..Step::default() })
+            }
+            fn receive(&mut self, value: serde_json::Value) -> Result<Step, String> {
+                let id = value["thread"].as_str().ok_or("missing fixture thread")?.to_owned();
+                Ok(Step { events: vec![chat::Event::Session { id, title: None }, chat::Event::Ready(true)], ..Step::default() })
+            }
+            fn server_identity(&self) -> Option<&chat::protocol::ServerIdentity> { Some(&self.identity) }
+        }
+        let mut spec = ProcessSpec::from(&source.launch.recipe);
+        spec.transport = chat::protocol::TransportSpec::OwnedUnixWebSocket {
+            socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(NativeFrames { identity: chat::native_holder::fixture_identity() });
+        let mut initial = adapter.initialize().unwrap();
+        let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let instance = uuid::Uuid::new_v4();
+        let notifications: Arc<Mutex<Option<Weak<HostLock>>>> = Default::default();
+        let notified = notifications.clone();
+        let id = source.id;
+        let handle = Handle::start_owned(spec, adapter, initial, store, source.clone(), Default::default(), move |update| {
+            let host = notified.lock().unwrap().clone();
+            if let Some(host) = host { changed_owned(&host, id, instance, update); }
+        }).unwrap();
+        let owner = Owner(handle.clone());
+        let fixture = BackendFixture::new(source.clone(), handle.clone(), instance);
+        *notifications.lock().unwrap() = Some(Arc::downgrade(&fixture.host));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while handle.confirmed_session_id().as_deref() != Some("first")
+            || !matches!(handle.native_continuity(), chat::NativeContinuity::Durable { .. }) {
+            assert!(Instant::now() < deadline, "owned native server did not confirm first conversation");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(matches!(handle.native_continuity(), chat::NativeContinuity::Durable { .. }));
+        let binding = fixture.capture().unwrap();
+        assert!(fixture.validates(&binding));
+        handle.command(chat::Command::SetModel { model: "second".into(), reasoning: None }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = handle.snapshot(None).unwrap();
+            if snapshot.error.as_deref().is_some_and(|error| error.contains("cannot change conversations")) { break; }
+            assert!(Instant::now() < deadline, "actual durable holder refusal missing: {:?}", snapshot.error);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(handle.confirmed_session_id().as_deref(), Some("first"), "failed confirmation never positively publishes second thread");
+        assert!(!fixture.validates(&binding), "actual early Identity callback must revoke first binding despite failed holder.confirm, without any refresh/read");
+        assert!(fixture.host.lock().unwrap().chats[&id].source_binding.is_none());
+        let _ = owner.0.close();
+    }
+
+    #[test]
     fn binding_refresh_and_require_refuse_busy_presentation_without_holding_host() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let source = source(directory.path());
