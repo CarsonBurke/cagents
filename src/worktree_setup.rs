@@ -16,7 +16,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{Read, Write},
-    os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+    os::unix::{ffi::OsStringExt, fs::{MetadataExt, PermissionsExt}},
     path::{Path, PathBuf},
 };
 
@@ -44,6 +44,62 @@ pub enum SetupError {
 
 fn error(error: impl std::fmt::Display) -> SetupError {
     SetupError::Invalid(error.to_string())
+}
+
+struct CopyPermissions {
+    metadata: fs::Metadata,
+    acl: fs_safety::AccessAcl,
+}
+
+#[derive(PartialEq, Eq)]
+struct SourceFingerprint {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+    group: u32,
+    length: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+fn source_fingerprint(metadata: &fs::Metadata) -> SourceFingerprint {
+    SourceFingerprint {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+        owner: metadata.uid(),
+        group: metadata.gid(),
+        length: metadata.len(),
+        modified: (metadata.mtime(), metadata.mtime_nsec()),
+        changed: (metadata.ctime(), metadata.ctime_nsec()),
+    }
+}
+
+impl CopyPermissions {
+    fn capture(source: &fs::File) -> Result<Self, SetupError> {
+        let metadata = source.metadata().map_err(error)?;
+        let acl = fs_safety::AccessAcl::capture(source).map_err(error)?;
+        let snapshot = Self { metadata, acl };
+        snapshot.check(source)?;
+        Ok(snapshot)
+    }
+
+    fn check(&self, source: &fs::File) -> Result<(), SetupError> {
+        if source_fingerprint(&source.metadata().map_err(error)?) != source_fingerprint(&self.metadata) {
+            return Err(error("source changed during setup copy; the worktree was kept"));
+        }
+        Ok(())
+    }
+
+    fn apply(&self, source: &fs::File, destination: &fs::File) -> Result<(), SetupError> {
+        // The access ACL itself can widen permissions. Refuse a changed source
+        // before applying any captured access rights to the private temporary.
+        self.check(source)?;
+        fs_safety::preserve_group(self.metadata.gid(), destination).map_err(error)?;
+        self.acl.apply(destination).map_err(error)?;
+        destination.set_permissions(fs::Permissions::from_mode(self.metadata.mode() & 0o777)).map_err(error)
+    }
 }
 
 fn check_cancel(cancel: &CancellationToken) -> Result<(), SetupError> {
@@ -421,7 +477,8 @@ pub fn prepare(
             }
             Err(err) => return Err(error(err)),
         };
-        let metadata = input.metadata().map_err(error)?;
+        let permissions = CopyPermissions::capture(&input)?;
+        let metadata = &permissions.metadata;
         if !metadata.is_file() || metadata.len() > FILE_LIMIT {
             return Err(error(format!(
                 "{} is not a regular file up to 64 MiB",
@@ -455,16 +512,11 @@ pub fn prepare(
             // identities and restoring the source group. Raising its mode
             // first could expose bytes to a destination's unrelated group or
             // named ACL user before the source's permissions replace them.
-            fs_safety::copy_group(&input, &output).map_err(error)?;
-            fs_safety::copy_access_acl(&input, &output).map_err(error)?;
-            output
-                .set_permissions(fs::Permissions::from_mode(
-                    metadata.permissions().mode() & 0o777,
-                ))
-                .map_err(error)?;
+            permissions.apply(&input, &output)?;
             output.sync_all().map_err(error)?;
             check_cancel(cancel)?;
             index_lock.check().map_err(error)?;
+            permissions.check(&input)?;
             fs_safety::rename_new_within(
                 &parent,
                 &temporary,
@@ -664,6 +716,59 @@ mod tests {
         fs::set_permissions(&fixture.primary, fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(result.unwrap().copied, [PathBuf::from(".env")]);
         assert_eq!(fs::read(fixture.destination.join(".env")).unwrap(), b"secret");
+    }
+
+    #[test]
+    fn changed_source_cannot_publish_new_private_bytes_with_old_permissions() {
+        struct RewritingReader {
+            input: fs::File,
+            path: PathBuf,
+            rewrite: Option<Vec<u8>>,
+        }
+        impl Read for RewritingReader {
+            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+                let count = self.input.read(buffer)?;
+                if let Some(bytes) = self.rewrite.take() {
+                    // A deterministic interleaving after the first read, with
+                    // no sleep or dependence on the copy thread's scheduling.
+                    fs::set_permissions(&self.path, fs::Permissions::from_mode(0o600))?;
+                    fs::write(&self.path, bytes)?;
+                }
+                Ok(count)
+            }
+        }
+        let fixture = Fixture::new();
+        let path = fixture.primary.join(".env");
+        fs::write(&path, vec![b'p'; 65536]).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let input = fs::File::open(&path).unwrap();
+        let snapshot = CopyPermissions::capture(&input).unwrap();
+        let mut private = vec![b'p'; 65536];
+        private.extend_from_slice(b"new private bytes");
+        let mut reader = RewritingReader { input: input.try_clone().unwrap(), path: path.clone(), rewrite: Some(private) };
+        let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
+        let mut output = temporary.reopen().unwrap();
+        std::io::copy(&mut reader, &mut output).unwrap();
+        assert!(fs::read(temporary.path()).unwrap().ends_with(b"new private bytes"));
+        assert!(snapshot.apply(&input, &output).unwrap_err().to_string().contains("source changed"));
+        assert_eq!(output.metadata().unwrap().mode() & 0o777, 0o600);
+        assert!(!fixture.destination.join(".env").exists());
+        assert!(fixture.destination.join("tracked").exists());
+    }
+
+    #[test]
+    fn source_changes_after_permission_application_refuse_publication() {
+        let fixture = Fixture::new();
+        let path = fixture.primary.join(".env");
+        fs::write(&path, "original bytes").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let input = fs::File::open(&path).unwrap();
+        let snapshot = CopyPermissions::capture(&input).unwrap();
+        let temporary = tempfile::NamedTempFile::new_in(&fixture.destination).unwrap();
+        snapshot.apply(&input, temporary.as_file()).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(snapshot.check(&input).unwrap_err().to_string().contains("source changed"));
+        assert!(!fixture.destination.join(".env").exists());
     }
 
     #[test]

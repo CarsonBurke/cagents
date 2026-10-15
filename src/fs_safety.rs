@@ -760,7 +760,12 @@ pub fn copy_ownership(source: &File, destination: &File) -> io::Result<()> {
 /// different group. Failure prevents publication rather than broadening access.
 pub fn copy_group(source: &File, destination: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
-    let group = source.metadata()?.gid();
+    preserve_group(source.metadata()?.gid(), destination)
+}
+
+/// Apply a group captured with the source's other permission metadata.
+pub fn preserve_group(group: libc::gid_t, destination: &File) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
     if destination.metadata()?.gid() == group {
         return Ok(());
     }
@@ -786,14 +791,29 @@ pub fn copy_group(source: &File, destination: &File) -> io::Result<()> {
 /// access, so every failure prevents publication. An absent source ACL removes
 /// any access ACL inherited by the destination from its parent.
 pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
+    AccessAcl::capture(source)?.apply(destination)
+}
+
+/// A captured access ACL, including the absence of one. Copy callers can keep
+/// mode, group and ACL from one verified source snapshot instead of mixing
+/// metadata observed before and after a concurrent permission change.
+pub struct AccessAcl(Option<Vec<u8>>);
+
+impl AccessAcl {
+pub fn capture(source: &File) -> io::Result<Self> {
     let name = c"system.posix_acl_access";
     let value = match read_attribute(source, name) {
         Ok(value) => value,
         Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => None,
         Err(error) => return Err(error),
     };
-    if let Some(value) = value {
-        return write_attribute(destination, name, &value);
+    Ok(Self(value))
+}
+
+pub fn apply(&self, destination: &File) -> io::Result<()> {
+    let name = c"system.posix_acl_access";
+    if let Some(value) = &self.0 {
+        return write_attribute(destination, name, value);
     }
     // SAFETY: the descriptor is live and the attribute name is static.
     let status = unsafe { libc::fremovexattr(destination.as_raw_fd(), name.as_ptr()) };
@@ -804,6 +824,7 @@ pub fn copy_access_acl(source: &File, destination: &File) -> io::Result<()> {
         }
     }
     Ok(())
+}
 }
 
 /// Whether an attribute describes the file's content rather than the kernel's
