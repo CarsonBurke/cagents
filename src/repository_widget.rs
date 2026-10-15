@@ -889,6 +889,14 @@ impl EditorDocument {
     /// re-parsed at a debounce boundary instead.
     fn apply(&mut self, action: text_editor::Action) -> Applied {
         match action {
+            text_editor::Action::Edit(edit @ (text_editor::Edit::Indent | text_editor::Edit::Unindent)) => {
+                let before = self.content.cursor();
+                let changes = self.content.indent_recorded(matches!(edit, text_editor::Edit::Unindent));
+                if changes.is_empty() { return Applied::Unchanged; }
+                self.history.record_group(changes, before, self.content.cursor(), Instant::now());
+                self.text_changed();
+                Applied::Changed(None)
+            }
             text_editor::Action::Edit(edit) => {
                 let kind = edit_kind(&edit, self.content.cursor());
                 let trailing_cr = trailing_carriage_return(&self.content).is_some();
