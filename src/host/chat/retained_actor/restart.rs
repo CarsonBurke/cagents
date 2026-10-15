@@ -7,6 +7,7 @@ use super::*;
 pub(in crate::host) struct PreparedRestart {
     request: uuid::Uuid,
     settled: bool,
+    failed_proved: bool,
     identity: chat::runtime::ActorIdentity,
     source: Session,
     spec: chat::protocol::ProcessSpec,
@@ -62,7 +63,7 @@ pub(in crate::host) fn restart_completed(
         let account = crate::account::registry::authorize_spawn(&spec.environment, None)
             .map_err(|error| unavailable(error.to_string()))?;
         drop(account);
-        let prepared = PreparedRestart { request, settled: false, identity: identity.clone(), source: source.clone(), spec,
+        let prepared = PreparedRestart { request, settled: false, failed_proved: false, identity: identity.clone(), source: source.clone(), spec,
             recovery_environment: handle.restart_environment().0 };
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down || state.chats.get(&source.id).is_none_or(|record|
@@ -86,7 +87,15 @@ pub(in crate::host) fn restart_completed(
     if receipt.id != request { return Err(unavailable("The retained provider returned another restart identity")); }
     match receipt.state {
         chat::runtime::RetainedRestartState::Accepted => return Err(unavailable("The exact restart is still pending; retry this pane to inspect the same provider receipt")),
-        chat::runtime::RetainedRestartState::Acknowledged(Err(reason)) => return Err(unavailable(reason)),
+        chat::runtime::RetainedRestartState::Acknowledged(Err(failure)) => {
+            if matches!(failure.cleanup, chat::runtime::RetainedRestartCleanup::TeardownProved) {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(pending) = state.native_actor_restarts.get_mut(&source.id).filter(|pending|
+                    pending.request == request && pending.identity == identity)
+                { pending.settled = true; pending.failed_proved = true; }
+            }
+            return Err(unavailable(failure.reason));
+        },
         chat::runtime::RetainedRestartState::Acknowledged(Ok(_)) => {}
     }
     {
@@ -118,4 +127,13 @@ pub(in crate::host) fn restart_completed(
     drop(state);
     handle.wake_retained_outcomes();
     Ok(Some(response))
+}
+
+/// A new user retry may prepare another request only after the helper's
+/// explicit positive teardown receipt for this exact failed request.
+pub(in crate::host) fn restart_failure_proved(host: &SharedHost, id: TerminalId, request: uuid::Uuid) -> bool {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state.native_actor_restarts.get(&id).is_some_and(|pending|
+        pending.request == request && pending.failed_proved && state.chats.get(&id).is_some_and(|record|
+            record.execution_instance == pending.identity.instance && record.handle.actor_identity().as_ref() == Some(&pending.identity)))
 }

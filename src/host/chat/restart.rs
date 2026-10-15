@@ -102,8 +102,16 @@ pub(super) fn run(host:&SharedHost, client:ClientId, source:&Session, execution:
 
 fn finish_backend(host:&SharedHost,client:ClientId,source:&Session,execution:Option<Arc<chat::protocol::ExecutionContext>>,plan:&PairPlan)->Result<ServerResponse,ProtocolError>{
     let _request_id=request_id(host,source.id)?;
-    super::restart_completed_inner(host,client,plan.source(),execution)?
-        .ok_or_else(||unavailable("The exact stopped actor changed before restart"))?;
+    let response = super::restart_completed_inner(host,client,plan.source(),execution);
+    if response.is_err() && super::retained_actor::restart_failure_proved(host,source.id,_request_id) {
+        let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
+        if let Some(restart)=state.chat_restarts.get_mut(&source.id).filter(|restart|restart.busy && restart.request==_request_id) {
+            // Only the NEXT explicit call uses this new ID; this failed call
+            // never launches again and never replays accepted input.
+            restart.request=uuid::Uuid::new_v4();
+        }
+    }
+    response?.ok_or_else(||unavailable("The exact stopped actor changed before restart"))?;
     let actor={
         let mut state=host.lock().unwrap_or_else(|p|p.into_inner());
         let actor=state.chats.get(&source.id).map(|record|record.handle.clone()).ok_or_else(||unavailable("The restarted actor disappeared before pair recovery"))?;

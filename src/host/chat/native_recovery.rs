@@ -337,6 +337,7 @@ fn restore_authenticated(
         let _ = handle.close();
         return Err(error);
     }
+    handle.commit_native_installation()?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let pair_unchanged = match (&session.terminal, &paired) {
         (None, None) => true,
@@ -380,7 +381,6 @@ fn restore_authenticated(
         returning_terminal: false,
     };
     let response = session_snapshot(&record);
-    record.handle.commit_native_installation();
     let retired = state.chats.insert(id, record);
     if let Some(context) = execution_context {
         context.installed();
