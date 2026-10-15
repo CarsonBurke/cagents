@@ -360,6 +360,9 @@ pub struct KeyboardShortcuts {
     pub rename_file: Vec<String>,
     pub duplicate_file: Vec<String>,
     pub copy_relative_path: Vec<String>,
+    pub stage_selected_changes: Vec<String>,
+    pub unstage_selected_changes: Vec<String>,
+    pub discard_selected_changes: Vec<String>,
 
     /// Serialized action names whose configured chords pass through to terminals.
     pub terminal_passthrough_actions: Vec<String>,
@@ -486,6 +489,9 @@ impl Default for KeyboardShortcuts {
             rename_file: vec![],
             duplicate_file: vec![],
             copy_relative_path: vec![],
+            stage_selected_changes: vec![],
+            unstage_selected_changes: vec![],
+            discard_selected_changes: vec![],
 
             terminal_passthrough_actions: [
                 "rename_pane",
@@ -518,7 +524,7 @@ impl KeyboardShortcuts {
     }
 
     /// Every action's chord list, in the order the dialog presents them.
-    pub fn actions(&self) -> [&Vec<String>; 113] {
+    pub fn actions(&self) -> [&Vec<String>; 116] {
         [
             &self.new_terminal,
             &self.new_channel,
@@ -638,13 +644,16 @@ impl KeyboardShortcuts {
             &self.rename_file,
             &self.duplicate_file,
             &self.copy_relative_path,
+            &self.stage_selected_changes,
+            &self.unstage_selected_changes,
+            &self.discard_selected_changes,
 
         ]
     }
 
     /// Replaces one registered action's chords; call the full validator before saving.
     /// The same stable order as `actions`, used by record/reassign and reset.
-    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 113] {
+    pub fn actions_mut(&mut self) -> [&mut Vec<String>; 116] {
         [
             &mut self.new_terminal,
             &mut self.new_channel,
@@ -759,6 +768,9 @@ impl KeyboardShortcuts {
             &mut self.rename_file,
             &mut self.duplicate_file,
             &mut self.copy_relative_path,
+            &mut self.stage_selected_changes,
+            &mut self.unstage_selected_changes,
+            &mut self.discard_selected_changes,
         ]
     }
 
@@ -808,7 +820,7 @@ impl KeyboardShortcuts {
 }
 
 /// The serialized name of each action, in `KeyboardShortcuts::actions` order.
-const SHORTCUT_ACTIONS: [&str; 113] = [
+const SHORTCUT_ACTIONS: [&str; 116] = [
     "new_terminal",
     "new_channel",
     "clone_pane",
@@ -927,6 +939,9 @@ const SHORTCUT_ACTIONS: [&str; 113] = [
     "rename_file",
     "duplicate_file",
     "copy_relative_path",
+    "stage_selected_changes",
+    "unstage_selected_changes",
+    "discard_selected_changes",
 
 ];
 
@@ -2109,7 +2124,7 @@ fn preserve_existing_shortcut(shortcuts: &mut toml::Table, action: &str) {
 
 /// The actions added after the shortcut table was introduced, each of which
 /// an older table may lack.
-const INTRODUCED_SHORTCUT_ACTIONS: [&str; 108] = [
+const INTRODUCED_SHORTCUT_ACTIONS: [&str; 111] = [
     "find_in_pane",
     "toggle_projects",
     "rename_pane",
@@ -2223,6 +2238,9 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 108] = [
     "rename_file",
     "duplicate_file",
     "copy_relative_path",
+    "stage_selected_changes",
+    "unstage_selected_changes",
+    "discard_selected_changes",
 
 ];
 
