@@ -246,29 +246,6 @@ impl ProcessFailure {
         })
     }
 
-    /// What to report about this failure, in whichever words actually describe
-    /// it.
-    ///
-    /// [`ProcessFailureKind::Exit`] is the one kind whose own `message` says
-    /// nothing beyond an exit code, a number standing in for the two
-    /// sentences `gh` wrote about
-    /// how to log in, or for `fatal: not a git repository`. So it is the one
-    /// kind whose stderr is preferred, and only when there is some.
-    ///
-    /// Every other kind is named by this program rather than by the process: a
-    /// timeout, a cancellation, a spawn that never happened, an output limit,
-    /// a wait that failed. Each of those carries captured stderr too, and
-    /// quoting it would replace the only description of the fault with
-    /// whatever the process last said before it - a timed-out `gh pr create`
-    /// reported as an unrelated progress line, a `git fetch` this program
-    /// killed on its deadline reported as `Receiving objects:  73% (…)`, and a
-    /// git that never ran reported as whatever a previous one left behind.
-    ///
-    /// The guard is here rather than at the callers because it is not a
-    /// property of either surface. It was written once, for `gh`, while the
-    /// `git` caller quoted stderr for all six kinds under a comment claiming
-    /// this very rule; one helper holding the whole rule is what stops the two
-    /// from drifting apart again.
     /// Preserve hook diagnostics written to either stream. Status/progress lines
     /// are retained in the full output; the inline excerpt stays compact.
     pub fn output_excerpt(&self) -> Option<String> {
@@ -310,6 +287,29 @@ impl ProcessFailure {
         output
     }
 
+    /// What to report about this failure, in whichever words actually describe
+    /// it.
+    ///
+    /// [`ProcessFailureKind::Exit`] is the one kind whose own `message` says
+    /// nothing beyond an exit code, a number standing in for the two
+    /// sentences `gh` wrote about
+    /// how to log in, or for `fatal: not a git repository`. So it is the one
+    /// kind whose stderr is preferred, and only when there is some.
+    ///
+    /// Every other kind is named by this program rather than by the process: a
+    /// timeout, a cancellation, a spawn that never happened, an output limit,
+    /// a wait that failed. Each of those carries captured stderr too, and
+    /// quoting it would replace the only description of the fault with
+    /// whatever the process last said before it - a timed-out `gh pr create`
+    /// reported as an unrelated progress line, a `git fetch` this program
+    /// killed on its deadline reported as `Receiving objects:  73% (…)`, and a
+    /// git that never ran reported as whatever a previous one left behind.
+    ///
+    /// The guard is here rather than at the callers because it is not a
+    /// property of either surface. It was written once, for `gh`, while the
+    /// `git` caller quoted stderr for all six kinds under a comment claiming
+    /// this very rule; one helper holding the whole rule is what stops the two
+    /// from drifting apart again.
     pub fn reported_detail(&self) -> String {
         if self.kind != ProcessFailureKind::Exit {
             return self.to_string();

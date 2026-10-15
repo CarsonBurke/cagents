@@ -46,6 +46,9 @@ pub use crate::process::{
     ProcessFailureKind, ProcessOutput, SystemProcessExecutor,
 };
 
+#[path = "repository_stash.rs"]
+mod stash_mutations;
+
 const ZERO_SHA1: &str = "0000000000000000000000000000000000000000";
 
 /// Commits returned by one [`RepositoryService::history`] page.
@@ -1209,6 +1212,9 @@ impl GitOperation {
         }
     }
 }
+
+/// Identity of the exact file contents presented in a marker confirmation.
+pub type ConflictMarkerVersion = (u64, u64, u64, i64, i64, i64, i64);
 
 /// Recognize complete or incomplete conflict marker blocks conservatively.
 pub fn has_conflict_markers(bytes: &[u8]) -> bool {
@@ -4544,65 +4550,110 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 if let Some(outcome) = self.operation_failure(&pull, cancellation)? {
                     return Ok(outcome);
                 }
-                // Resolve the exact upstream destination through the same
-                // checked push path; never depend on push.default.
-                let snapshot = self.snapshot(worktree, cancellation)?;
-                let Some(reference) = snapshot.local_refs.iter().find(|reference| reference.head)
-                else {
-                    return Ok(MutationOutcome::NotApplied {
-                        failure: MutationFailure::Rejected {
-                            reason: "Sync requires a checked-out branch".into(),
-                        },
-                    });
-                };
-                let Some(upstream) = reference.upstream.as_ref() else {
-                    return Ok(MutationOutcome::NotApplied {
-                        failure: MutationFailure::Rejected {
-                            reason: "Sync requires an upstream".into(),
-                        },
-                    });
-                };
-                let Some(remote_ref) = snapshot
-                    .remote_refs
-                    .iter()
-                    .find(|candidate| candidate.name == *upstream)
-                else {
-                    return Ok(MutationOutcome::NotApplied {
-                        failure: MutationFailure::Rejected {
-                            reason: "The upstream does not name a remote branch".into(),
-                        },
-                    });
-                };
-                let branch = ValidatedBranchName::parse(
-                    reference
-                        .name
-                        .as_str()
-                        .strip_prefix("refs/heads/")
-                        .unwrap_or(reference.name.as_str()),
-                )?;
-                return Ok(
-                    match self.push(
-                        &PushRequest {
-                            worktree: worktree.to_owned(),
-                            branch,
-                            target: PushTarget::Upstream {
-                                remote: remote_ref.remote.clone(),
-                                remote_ref: remote_ref.name.clone(),
+                let after_pull = (|| -> Result<MutationOutcome, RepositoryError> {
+                    // Resolve the exact upstream destination through the same
+                    // checked push path; never depend on push.default.
+                    let snapshot = self.snapshot(worktree, cancellation)?;
+                    let Some(reference) =
+                        snapshot.local_refs.iter().find(|reference| reference.head)
+                    else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "Sync requires a checked-out branch".into(),
                             },
+                        });
+                    };
+                    let Some(upstream) = reference.upstream.as_ref() else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "Sync requires an upstream".into(),
+                            },
+                        });
+                    };
+                    let Some(remote_ref) = snapshot
+                        .remote_refs
+                        .iter()
+                        .find(|candidate| candidate.name == *upstream)
+                    else {
+                        return Ok(MutationOutcome::NotApplied {
+                            failure: MutationFailure::Rejected {
+                                reason: "The upstream does not name a remote branch".into(),
+                            },
+                        });
+                    };
+                    let branch = ValidatedBranchName::parse(
+                        reference
+                            .name
+                            .as_str()
+                            .strip_prefix("refs/heads/")
+                            .unwrap_or(reference.name.as_str()),
+                    )?;
+                    Ok(
+                        match self.push(
+                            &PushRequest {
+                                worktree: worktree.to_owned(),
+                                branch,
+                                target: PushTarget::Upstream {
+                                    remote: remote_ref.remote.clone(),
+                                    remote_ref: remote_ref.name.clone(),
+                                },
+                            },
+                            cancellation,
+                        )? {
+                            PushOutcome::Pushed { .. } => {
+                                MutationOutcome::Applied { paths: Vec::new() }
+                            }
+                            PushOutcome::NotPushed { failure } => {
+                                MutationOutcome::PartiallyApplied {
+                                    paths: Vec::new(),
+                                    failures: vec![
+                                        MutationFailure::Reconciliation {
+                                            reason: "Pull completed, but the push did not complete"
+                                                .into(),
+                                        },
+                                        failure,
+                                    ],
+                                }
+                            }
+                            PushOutcome::OutcomeUnknown { failure } => {
+                                MutationOutcome::OutcomeUnknown { failure }
+                            }
                         },
-                        cancellation,
-                    )? {
-                        PushOutcome::Pushed { .. } => {
-                            MutationOutcome::Applied { paths: Vec::new() }
+                    )
+                })();
+                let completed = || MutationFailure::Reconciliation {
+                    reason: "Pull completed, but the push did not complete".into(),
+                };
+                return Ok(match after_pull {
+                    Ok(MutationOutcome::NotApplied { failure }) => {
+                        MutationOutcome::PartiallyApplied {
+                            paths: Vec::new(),
+                            failures: vec![completed(), failure],
                         }
-                        PushOutcome::NotPushed { failure } => {
-                            MutationOutcome::NotApplied { failure }
+                    }
+                    Ok(MutationOutcome::OutcomeUnknown { failure }) => {
+                        MutationOutcome::OutcomeUnknown {
+                            failure: MutationFailure::Reconciliation {
+                                reason: format!(
+                                    "Pull completed; the push outcome is unconfirmed: {failure}"
+                                ),
+                            },
                         }
-                        PushOutcome::OutcomeUnknown { failure } => {
-                            MutationOutcome::OutcomeUnknown { failure }
+                    }
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        let failure = match error {
+                            RepositoryError::Process(failure) => MutationFailure::Process(failure),
+                            error => MutationFailure::Reconciliation {
+                                reason: format!("Could not prepare the push: {error}"),
+                            },
+                        };
+                        MutationOutcome::PartiallyApplied {
+                            paths: Vec::new(),
+                            failures: vec![completed(), failure],
                         }
-                    },
-                );
+                    }
+                });
             }
             GitOperation::StashPush {
                 message,
@@ -4620,43 +4671,52 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             GitOperation::StashApply {
                 reference,
                 expected_oid,
-                ..
+                pop,
+            } => {
+                let apply = self
+                    .git_mutation(worktree, ["stash", "apply", expected_oid.as_str()])
+                    .without_timeout();
+                if let Some(outcome) = self.operation_failure(&apply, cancellation)? {
+                    return Ok(outcome);
+                }
+                if *pop
+                    && let Err(failure) =
+                        self.drop_stash_at(worktree, reference, expected_oid, cancellation)
+                {
+                    let reason = match failure {
+                        stash_mutations::StashDropFailure::Refused(reason) => format!(
+                            "The selected stash was applied, but its entry was preserved: {reason}"
+                        ),
+                        stash_mutations::StashDropFailure::Uncertain(reason) => format!(
+                            "The selected stash was applied, but deletion is unconfirmed; check the stash list before retrying: {reason}"
+                        ),
+                    };
+                    return Ok(MutationOutcome::PartiallyApplied {
+                        paths: Vec::new(),
+                        failures: vec![MutationFailure::Reconciliation { reason }],
+                    });
+                }
+                return Ok(MutationOutcome::Applied { paths: Vec::new() });
             }
-            | GitOperation::StashDrop {
+            GitOperation::StashDrop {
                 reference,
                 expected_oid,
             } => {
-                if !self
-                    .stashes(worktree, cancellation)?
-                    .iter()
-                    .any(|entry| entry.reference == *reference && entry.oid == *expected_oid)
-                {
-                    return Ok(MutationOutcome::NotApplied {
-                        failure: MutationFailure::Rejected {
-                            reason:
-                                "The selected stash changed; refresh before applying or dropping it"
-                                    .into(),
-                        },
-                    });
-                }
-                self.git_mutation(
-                    worktree,
-                    [
-                        "stash",
-                        match operation {
-                            GitOperation::StashDrop { .. } => "drop",
-                            _ if matches!(
-                                operation,
-                                GitOperation::StashApply { pop: true, .. }
-                            ) =>
-                            {
-                                "pop"
+                return Ok(
+                    match self.drop_stash_at(worktree, reference, expected_oid, cancellation) {
+                        Ok(()) => MutationOutcome::Applied { paths: Vec::new() },
+                        Err(stash_mutations::StashDropFailure::Refused(reason)) => {
+                            MutationOutcome::NotApplied {
+                                failure: MutationFailure::Rejected { reason },
                             }
-                            _ => "apply",
-                        },
-                        reference,
-                    ],
-                )
+                        }
+                        Err(stash_mutations::StashDropFailure::Uncertain(reason)) => {
+                            MutationOutcome::OutcomeUnknown {
+                                failure: MutationFailure::Reconciliation { reason },
+                            }
+                        }
+                    },
+                );
             }
             GitOperation::ResolveConflict { path, ours } => {
                 let entries = self.index_entries(worktree, path, cancellation)?;
@@ -5478,6 +5538,82 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection);
         }
         Ok(self.git_pathspec_mutation(worktree, ["add", "-A"], paths))
+    }
+
+    /// Check the current unmerged index at queue execution, never at the time
+    /// a row was clicked. An explicit approval applies only to those exact
+    /// scanned file identities, so editing a waiting file requires a new answer.
+    pub fn check_stage_markers(
+        &self,
+        request: &StageRequest,
+        approved: &BTreeMap<RepoPath, ConflictMarkerVersion>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<BTreeMap<RepoPath, ConflictMarkerVersion>>, RepositoryError> {
+        use std::os::unix::fs::MetadataExt;
+        let command = self.git_read(&request.worktree, ["ls-files", "--unmerged", "-z"]);
+        let output = self.run_checked(&command, cancellation)?;
+        let entries = invalid_output(parse_index_entries(&output.stdout), output)?;
+        let mut conflicted = entries
+            .into_iter()
+            .map(|entry| entry.path)
+            .collect::<HashSet<_>>();
+        conflicted.extend(approved.keys().cloned());
+        let paths = selection_pathspecs(&request.selection);
+        if !paths.iter().any(|path| conflicted.contains(path)) {
+            return Ok(None);
+        }
+        let root = fs_safety::Root::open(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let version = |metadata: &fs::Metadata| {
+            (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.len(),
+                metadata.mtime(),
+                metadata.mtime_nsec(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+            )
+        };
+        let mut markers = BTreeMap::new();
+        for path in paths.into_iter().filter(|path| conflicted.contains(path)) {
+            let metadata = match fs_safety::metadata_beneath(&root, path.as_path()) {
+                Ok(metadata) => metadata,
+                Err(error) if error.is_not_found() => continue,
+                Err(error) => return Err(ValidationError::Io(error.to_string()).into()),
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let mut file = fs_safety::open_beneath(&root, path.as_path())
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let opened = file
+                .metadata()
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let remaining = scan_conflict_markers(&mut file, cancellation)
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let after = file
+                .metadata()
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            let named = fs_safety::metadata_beneath(&root, path.as_path())
+                .map_err(|error| ValidationError::Io(error.to_string()))?;
+            if version(&metadata) != version(&opened)
+                || version(&opened) != version(&after)
+                || version(&after) != version(&named)
+            {
+                return Err(ValidationError::Io(format!(
+                    "{path} changed while checking conflict markers; retry staging"
+                ))
+                .into());
+            }
+            if remaining {
+                markers.insert(path, version(&after));
+            }
+        }
+        Ok(markers
+            .iter()
+            .any(|(path, version)| approved.get(path) != Some(version))
+            .then_some(markers))
     }
 
     /// Stages the selected paths, including the deletion half of a rename the
