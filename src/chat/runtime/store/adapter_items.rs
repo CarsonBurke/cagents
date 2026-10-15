@@ -40,8 +40,10 @@ impl Store {
         if key.agent_id.is_some() {
             return self.child_adapter_item(key);
         }
-        let record=self.db.query_row("SELECT metadata,len0,len1,len2,spans FROM items WHERE id=?1 AND length(metadata)<=?2 AND length(spans)<=?2",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Vec<u8>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Vec<u8>>(4)?))).optional().map_err(|error|error.to_string())?;
+        let record=self.db.query_row("SELECT CASE WHEN length(metadata)<=?2 THEN metadata ELSE NULL END,len0,len1,len2,CASE WHEN length(spans)<=?2 THEN spans ELSE NULL END FROM items WHERE id=?1",params![key.item_id,METADATA_LIMIT],|row|Ok((row.get::<_,Option<Vec<u8>>>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?,row.get::<_,i64>(3)?,row.get::<_,Option<Vec<u8>>>(4)?))).optional().map_err(|error|error.to_string())?;
         let Some((metadata,len0,len1,len2,spans))=record else {return Ok(None);};
+        let metadata=metadata.ok_or("Original tool metadata exceeds its canonical limit")?;
+        let spans=spans.ok_or("Original tool patch metadata exceeds its canonical limit")?;
         let lengths=[len0,len1,len2].map(usize::try_from);
         let [Ok(len0),Ok(len1),Ok(len2)]=lengths else {return Err("Original tool source has invalid body lengths".into());};
         if len0.checked_add(len1).and_then(|bytes|bytes.checked_add(len2)).is_none_or(|bytes|bytes>MAX_REHYDRATION) {return Err("Original tool source exceeds the bounded adapter read limit".into());}
@@ -167,6 +169,16 @@ mod tests {
         commit(&store,adapter.as_mut(),step);
         let item=reader(&store).read(&CanonicalItemKey::new(None,"large-same-frame")).unwrap().unwrap();
         assert!(matches!(item.content,ItemContent::Changes {status:ToolStatus::Succeeded,..}));
+    }
+
+    #[test]
+    fn oversized_existing_metadata_is_an_explicit_source_error_not_a_missing_tool() {
+        for field in ["metadata","spans"] {
+            let store=Arc::new(Mutex::new(Store::new().unwrap()));
+            store.lock().unwrap().apply(Event::Item(Item {id:"known".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"Known".into(),input:"original".into(),output:String::new(),status:crate::chat::ToolStatus::Running}})).unwrap();
+            store.lock().unwrap().db.execute(&format!("UPDATE items SET {field}=zeroblob(?1) WHERE id='known'"),[METADATA_LIMIT+1]).unwrap();
+            assert!(reader(&store).read(&CanonicalItemKey::new(None,"known")).is_err(),"existing over-limit {field} cannot be interpreted as absent");
+        }
     }
 
     #[test]

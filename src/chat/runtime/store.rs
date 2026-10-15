@@ -654,6 +654,11 @@ impl Store {
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     pub fn apply(&mut self, mut event: Event) -> Result<Vec<Event>, String> {
+        if matches!(&event,Event::Reset {..}) {
+            // Revoke before the first destructive operation, including a
+            // failing child/index cleanup. Old readers must never revive.
+            self.canonical_generation=uuid::Uuid::new_v4();
+        }
         if let Some(seal) = &self.messages {
             match &mut event {
                 Event::Item(item) => seal.recognize(item),
@@ -824,7 +829,6 @@ impl Store {
                 self.dirty = true;
             }
             Event::Reset { reason } => {
-                self.canonical_generation = uuid::Uuid::new_v4();
                 self.files_reset()?;
                 self.db
                     .execute("DELETE FROM items", [])
