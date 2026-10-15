@@ -1643,7 +1643,9 @@ mod tests {
         ));
         let reference_directory=tempfile::tempdir_in("/var/tmp").unwrap();
         let mut reference=Store::at(reference_directory.path().into()).unwrap();
-        reference.apply(Event::Item(Item {id:"large-input".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"Write".into(),input,output:String::new(),status:crate::chat::ToolStatus::Running}})).unwrap();
+        // Compare the same observed times: a separate live put would stamp a
+        // later wall clock, which is unrelated to append/reload equivalence.
+        reference.put(Item {id:"large-input".into(),role:Role::Assistant,started_at:hydrated.items[0].started_at,at:hydrated.items[0].at,content:ItemContent::Tool {name:"Write".into(),input,output:String::new(),status:crate::chat::ToolStatus::Running}},true).unwrap();
         assert_eq!(hydrated.items,reference.window().unwrap().items,"append hydration must equal a single authoritative full item");
     }
 
