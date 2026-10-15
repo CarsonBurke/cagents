@@ -3072,6 +3072,19 @@ impl<Message> Widget<Message, Theme, Renderer> for WorkspaceSurface<'_, Message>
         if !should_forward_to_raw_children(shell.is_event_captured()) {
             return;
         }
+        // Native controls may ignore an editing chord. Ignored input still
+        // belongs to that control, rather than the selected raw terminal or
+        // browser behind it. In-pane find/address controls retain their card.
+        if matches!(
+            event,
+            Event::Keyboard(keyboard::Event::KeyPressed { .. }) | Event::InputMethod(_)
+        ) && matches!(
+            self.input.keyboard_focus(),
+            Some(FocusedPane::TextInput | FocusedPane::OutsideWorkspace | FocusedPane::SidebarRows | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges)
+        ) && self.input.keyboard_card().is_none()
+        {
+            return;
+        }
 
         let Some(clipped) = clipped_viewport(layout.bounds(), viewport) else {
             return;
@@ -4879,7 +4892,7 @@ mod tests {
         )));
     }
 
-    /// A leaf that reports every key press it is shown, as its card.
+    /// A leaf that reports every input admission it is shown, as its card.
     struct KeyProbe(CardId);
 
     impl Widget<Option<CardId>, Theme, Renderer> for KeyProbe {
@@ -4916,8 +4929,177 @@ mod tests {
             shell: &mut Shell<'_, Option<CardId>>,
             _viewport: &Rectangle,
         ) {
-            if matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. })) {
+            if matches!(
+                event,
+                Event::Keyboard(keyboard::Event::KeyPressed { .. })
+                    | Event::InputMethod(cosmic::iced::input_method::Event::Commit(_))
+            ) {
                 shell.publish(Some(self.0));
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_sidebar_chords_never_reach_the_selected_raw_card() {
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::advanced::widget::operation::focusable;
+        use keyboard::key::Code;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let shortcuts = KeyboardShortcuts::default();
+        let trace = InputTrace::default();
+        let sidebar = widget::Id::new("raw-isolation.sidebar");
+        let card = CardId::new();
+        let raw = WorkspaceSurface::new(
+            Element::new(KeyProbe(card)),
+            &shortcuts,
+            FocusedPane::Terminal,
+            400.0,
+            |_| None,
+        )
+        .with_keyboard_trace(&trace);
+        let row: Element<'_, Option<CardId>> = widget::row::with_children(vec![
+            widget::text_input("Search projects", "query")
+                .id(sidebar.clone())
+                .on_input(|_| None)
+                .width(200)
+                .into(),
+            Element::new(raw),
+        ])
+        .into();
+        let mut element = crate::input_trace::observe_keyboard_focus(row, &trace, Vec::new());
+        let mut tree = Tree::new(element.as_widget());
+        let viewport = Rectangle::with_size(Size::new(600.0, 240.0));
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(viewport.size(), viewport.size()),
+        );
+        let mut focus = focusable::focus::<()>(sidebar);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut focus);
+        let mut messages = Vec::new();
+        let mut clipboard = clipboard::Null;
+        for event in [
+            keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL),
+            key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false),
+            key_press("t", Code::KeyT, keyboard::Modifiers::CTRL, false),
+            keyboard::Event::ModifiersChanged(
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+            ),
+            key_press(
+                "z",
+                Code::KeyZ,
+                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                false,
+            ),
+        ] {
+            let mut shell = Shell::new(&mut messages);
+            element.as_widget_mut().update(
+                &mut tree,
+                &Event::Keyboard(event),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &renderer,
+                &mut clipboard,
+                &mut shell,
+                &viewport,
+            );
+        }
+        assert_eq!(trace.keyboard_focus(), Some(FocusedPane::TextInput));
+        assert!(
+            messages.is_empty(),
+            "ignored sidebar chords must not enter raw card input: {messages:?}"
+        );
+        let mut shell = Shell::new(&mut messages);
+        element.as_widget_mut().update(
+            &mut tree,
+            &Event::InputMethod(cosmic::iced::input_method::Event::Commit(
+                "sidebar-only".into(),
+            )),
+            Layout::new(&node),
+            mouse::Cursor::Unavailable,
+            &renderer,
+            &mut clipboard,
+            &mut shell,
+            &viewport,
+        );
+        assert!(
+            messages.iter().all(Option::is_none),
+            "IME input must not enter the raw card: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn in_pane_inputs_keep_raw_delivery_while_external_inputs_do_not() {
+        use crate::input_trace::KeyboardRegion;
+        use cosmic::iced::advanced::clipboard;
+        use keyboard::key::Code;
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let shortcuts = KeyboardShortcuts::default();
+        let card = CardId::new();
+        for (region, expected) in [
+            (KeyboardRegion::from(FocusedPane::TextInput), false),
+            (KeyboardRegion::from(FocusedPane::OutsideWorkspace), false),
+            (KeyboardRegion::from(FocusedPane::SidebarRows), false),
+            (KeyboardRegion::from(FocusedPane::SidebarFiles), false),
+            (KeyboardRegion::from(FocusedPane::SidebarChanges), false),
+            (
+                KeyboardRegion {
+                    pane: FocusedPane::TextInput,
+                    card: Some(card),
+                },
+                true,
+            ),
+            (
+                KeyboardRegion {
+                    pane: FocusedPane::Terminal,
+                    card: Some(card),
+                },
+                true,
+            ),
+        ] {
+            let trace = InputTrace::with_keyboard_region(region);
+            let mut surface = WorkspaceSurface::new(
+                Element::new(KeyProbe(card)),
+                &shortcuts,
+                FocusedPane::Terminal,
+                400.0,
+                |_| None,
+            )
+            .with_keyboard_trace(&trace);
+            let mut tree = Tree::new(&surface as &dyn Widget<Option<CardId>, Theme, Renderer>);
+            let viewport = Rectangle::with_size(Size::new(400.0, 200.0));
+            let node = surface.layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(viewport.size(), viewport.size()),
+            );
+            for event in [
+                Event::Keyboard(key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false)),
+                Event::InputMethod(cosmic::iced::input_method::Event::Commit("input".into())),
+            ] {
+                let mut messages = Vec::new();
+                let mut shell = Shell::new(&mut messages);
+                surface.update(
+                    &mut tree,
+                    &event,
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut shell,
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if expected {
+                        vec![Some(card)]
+                    } else {
+                        Vec::new()
+                    },
+                    "{region:?}"
+                );
             }
         }
     }
