@@ -74,6 +74,9 @@ impl SavedUndo {
 #[derive(Default)]
 pub(crate) struct UndoLru { entries: VecDeque<(PathBuf, SavedUndo)>, bytes: usize }
 impl UndoLru {
+    pub(crate) fn retained_root_identities(&self) -> impl Iterator<Item = &crate::editor::FileRootIdentity> {
+        self.entries.iter().filter_map(|(_, undo)| undo.root.as_ref())
+    }
     /// At most eight cached histories; clone original descriptor Arcs only.
     pub(crate) fn retained_roots(&self) -> impl Iterator<Item = std::sync::Arc<crate::fs_safety::Root>> + '_ {
         self.entries.iter().filter_map(|(_, undo)| undo.root.as_ref().map(crate::editor::FileRootIdentity::retained_root))

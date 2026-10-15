@@ -422,6 +422,9 @@ impl FileRootIdentity {
     pub fn retained_admission(&self) -> Option<crate::edited_root_admission::AdmittedRoot> {
         self.admission.clone()
     }
+    pub(crate) fn has_active_admission(&self) -> bool {
+        self.admission.as_ref().is_some_and(|admission| admission.ticket().phase() == crate::edited_root_admission::AdmissionPhase::Active)
+    }
     /// Worker-only attachment before Editable publication. A successful ticket
     /// from another Root cannot be rebound merely by storing it in the model.
     pub(crate) fn with_admission(mut self, admission: crate::edited_root_admission::AdmittedRoot, deadline: std::time::Instant) -> Result<Self, FileIoError> {
