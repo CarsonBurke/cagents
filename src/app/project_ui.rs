@@ -506,17 +506,21 @@ impl Cagents {
         else {
             return Task::none();
         };
+        let ordinal=self.durable.shared_project_bindings.get(&project).map(|binding|binding.ordinal)
+            .or_else(||self.workspace_model.project(repository).map(|project|project.ordinal));
+        let joined=self.durable.workspace_model_identity.unwrap_or(self.workspace_model.identity);
+        let Some(basis)=ProjectCloseRegistry::capture(joined,ordinal) else {
+            self.project_ui.closed.remove(repository);
+            self.status=Some(TransientNotice::warning("Project sessions and editors were kept because this window cannot verify the original project identity."));
+            return Task::none();
+        };
+        self.project_ui.close_registry.insert(project,basis);
         self.project_ui
             .closing
             .insert(project, repository.to_path_buf());
         self.project_ui
             .close_started
             .insert(project, Instant::now());
-        let ordinal=self.durable.shared_project_bindings.get(&project).map(|binding|binding.ordinal)
-            .or_else(||self.workspace_model.project(repository).map(|project|project.ordinal));
-        if let Some(basis)=ProjectCloseRegistry::capture(self.workspace_model.identity,ordinal) {
-            self.project_ui.close_registry.insert(project,basis);
-        }
         self.project_ui.next_close_generation =
             self.project_ui.next_close_generation.wrapping_add(1);
         self.project_ui
@@ -3182,6 +3186,24 @@ mod tests {
             assert!(app.sidebar_model.project(project).is_some());assert!(app.card_state(card).unwrap().existence.is_open());
             assert!(app.cards.contains_key(&card));assert!(!authority.is_resolved());
         }
+    }
+
+    #[test]
+    fn unknown_shared_project_instance_refuses_before_channel_close_effects() {
+        let repository=PathBuf::from("/unknown-shared-instance");
+        let linked=SidebarWorktree::from_durable(WorktreeId::new(),repository.join("linked"),Some("feature".into()));
+        let primary=SidebarWorktree::from_durable(WorktreeId::new(),repository.clone(),Some("main".into()));
+        let (mut app,_storage,project)=deletable_app(&repository,&linked,&primary);
+        let registry=uuid::Uuid::new_v4();app.workspace_model.identity=registry;
+        Arc::make_mut(&mut app.durable).workspace_model_identity=Some(registry);
+        drop(app.add_terminal(repository.clone()));let card=app.durable.cards.last().unwrap().id;
+        let channel=crate::model::ChannelId::new();
+        Arc::make_mut(&mut app.durable).channels.push(crate::model::ProjectChannel{title_source:Default::default(),id:channel,project_id:project,title:"Original channel".into(),ordinal:0,shared:true,cards:vec![card],focused:Some(card)});
+        drop(app.close_shared_project(&repository));
+        assert!(!app.project_ui.closing.contains_key(&project));assert!(!app.project_ui.closed.contains(&repository));
+        assert!(!app.channel_ui.is_deleting(channel));assert!(app.durable.channels.iter().any(|row|row.id==channel));
+        assert!(app.card_state(card).unwrap().existence.is_open());assert!(app.sidebar_model.project(project).is_some());
+        assert!(app.status.as_ref().is_some_and(|notice|notice.message.contains("original project identity")));
     }
 
     #[test]
