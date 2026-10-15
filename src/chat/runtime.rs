@@ -61,6 +61,9 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    /// Existing-process control only. Caller admission is separate; the actor
+    /// compares this already-captured witness immediately before dispatch.
+    ConditionalInterrupt { expected: BackendIdentity },
     ClaimBackendSource {
         expected: BackendIdentity,
         result: crossbeam_channel::Sender<Result<uuid::Uuid, String>>,
@@ -1088,6 +1091,7 @@ impl LocalHandle {
         let urgent = matches!(
             &command,
             ActorCommand::Interrupt { .. }
+                | ActorCommand::ConditionalInterrupt { .. }
                 | ActorCommand::Provider {
                     command: Command::Interrupt,
                     ..
@@ -3262,6 +3266,13 @@ impl Actor {
                 self.adapter.after_close_input_drained();
             }
             let (run, command) = match command {
+                ActorCommand::ConditionalInterrupt { expected } => {
+                    if !expected.matches_actor(self) {
+                        let _ = reply.send(Err("The captured backend changed; no interrupt was dispatched".into()));
+                        continue;
+                    }
+                    (None, Command::Interrupt)
+                }
                 ActorCommand::ClaimBackendSource { expected, result } => {
                     let admitted = if !expected.matches_actor(self) {
                         Err(
@@ -9318,6 +9329,75 @@ mod tests {
         );
         handle.close().unwrap();
     }
+    #[test]
+    fn conditional_interrupt_compares_actual_backend_at_actor_dispatch_without_retargeting() {
+        let exact = thread::current().name().expect("named contract").to_owned();
+        if isolated_backend_contract(&exact) { return; }
+        struct Observe(Arc<std::sync::atomic::AtomicUsize>);
+        impl Adapter for Observe {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                Ok(Step { events: frame.get("thread").and_then(Value::as_str)
+                    .map(|id| vec![Event::Session { id: id.into(), title: None }]).unwrap_or_default(),
+                    ..Default::default() })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                match command {
+                    Command::Interrupt => { self.0.fetch_add(1, Ordering::AcqRel); Ok(Step::default()) }
+                    Command::Prompt { text, .. } => Ok(Step { writes: vec![serde_json::json!({"thread":text})], ..Default::default() }),
+                    _ => Ok(Step::default()),
+                }
+            }
+        }
+        struct Close(Handle);
+        impl Drop for Close { fn drop(&mut self) { let _ = self.0.close(); } }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: vec![],
+            working_directory: root.path().into(), environment: BTreeMap::new() };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner = Close(Handle::start(spec, Box::new(Observe(interrupts.clone())), initial, store, None, |_| {}).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.0.provider_process().is_none() { assert!(Instant::now() < deadline); thread::yield_now(); }
+        let process = owner.0.provider_process().unwrap();
+        let proof = crate::model::HostSessionProof { host_session_id: "conditional-interrupt".into(),
+            boot_id: crate::daemon::read_boot_id().unwrap(), host_incarnation: "conditional-interrupt".into() };
+        let original = owner.0.backend_identity(&proof).unwrap();
+        let wait = |reply: crossbeam_channel::Receiver<Result<(), String>>| reply.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(wait(owner.0.enqueue_conditional_interrupt(original.clone()).unwrap()).is_ok());
+        assert_eq!(interrupts.load(Ordering::Acquire), 1);
+        for field in ["actor", "process", "helper"] {
+            let mut changed = serde_json::to_value(&original).unwrap();
+            match field {
+                "process" => changed["process"]["start"] = serde_json::json!(process.start + 1),
+                field => changed[field] = serde_json::json!(uuid::Uuid::new_v4()),
+            }
+            let changed = serde_json::from_value(changed).unwrap();
+            let refused = match owner.0.enqueue_conditional_interrupt(changed) {
+                Ok(reply) => wait(reply).is_err(), Err(_) => true,
+            };
+            assert!(refused, "different {field} must not interrupt this actor");
+        }
+        // The actual JSON-lines decoder confirms a different native thread in
+        // the SAME actor/process, after the original witness was captured.
+        owner.0.command(Command::Prompt { text: "later-thread".into(), attachments: Vec::new(), mode: super::PromptMode::Send }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.0.confirmed_session_id().as_deref() != Some("later-thread") { assert!(Instant::now() < deadline); thread::yield_now(); }
+        assert!(wait(owner.0.enqueue_conditional_interrupt(original).unwrap()).is_err());
+        assert_eq!(interrupts.load(Ordering::Acquire), 1);
+        let current = owner.0.backend_identity(&proof).unwrap();
+        assert!(wait(owner.0.enqueue_conditional_interrupt(current.clone()).unwrap()).is_ok());
+        assert_eq!(interrupts.load(Ordering::Acquire), 2);
+        let claim = owner.0.claim_backend_source(&current).unwrap().into_result().unwrap();
+        assert!(wait(owner.0.enqueue_conditional_interrupt(current.clone()).unwrap()).unwrap_err().contains("pending terminal handoff"));
+        owner.0.release_backend_source(&current, claim).unwrap();
+        assert_eq!(interrupts.load(Ordering::Acquire), 2);
+        assert_eq!(owner.0.provider_process(), Some(process), "no restart or process selection is permitted");
+        owner.0.close().unwrap();
+    }
+
     #[test]
     fn claimed_actor_dispatches_64_normal_plus_urgent_without_an_extra_wake() {
         let exact = thread::current().name().expect("named contract").to_owned();

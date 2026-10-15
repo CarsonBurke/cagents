@@ -559,6 +559,21 @@ impl Handle {
             Owner::Remote(remote) => remote.enqueue(None, command),
         }
     }
+    /// This is only a compare-and-enqueue primitive, never host permission.
+    /// The caller retains its original authenticated witness; no getter,
+    /// restart, source learning or process selection occurs here.
+    pub(crate) fn enqueue_conditional_interrupt(
+        &self,
+        expected: BackendIdentity,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+        match &self.0 {
+            Owner::Local(local) if expected.helper.is_none() && expected.valid() => {
+                local.enqueue_actor(super::ActorCommand::ConditionalInterrupt { expected })
+            }
+            Owner::Remote(remote) => remote.enqueue_conditional_interrupt(expected),
+            _ => Err("The captured backend is not owned by this actor".into()),
+        }
+    }
     pub fn command(&self, command: Command) -> Result<(), String> {
         self.try_command(command).map_err(String::from)
     }

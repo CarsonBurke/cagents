@@ -50,6 +50,7 @@ fn payload_digest(bytes: &[u8]) -> [u8; 32] {
 
 #[derive(Serialize, Deserialize)]
 enum InputPayload {
+    ConditionalInterrupt { expected: super::BackendIdentity },
     Command {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -944,6 +945,15 @@ impl RemoteActor {
         command: Command,
     ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
         self.enqueue_payload(InputPayload::Command { run, command })
+    }
+    pub(super) fn enqueue_conditional_interrupt(
+        &self,
+        expected: super::BackendIdentity,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+        if !expected.valid() || !expected.belongs_to_helper(self.identity().instance) {
+            return Err("The captured backend belongs to another retained helper".into());
+        }
+        self.enqueue_payload(InputPayload::ConditionalInterrupt { expected })
     }
     pub fn pending_inputs(&self) -> Vec<InputIdentity> {
         self.0
@@ -2038,6 +2048,12 @@ impl Server {
                 let (command, run, effects) = match serde_json::from_value::<InputPayload>(payload)
                     .map_err(|error| error.to_string())?
                 {
+                    InputPayload::ConditionalInterrupt { expected } => {
+                        if !expected.valid() || !expected.belongs_to_helper(self.identity.instance) {
+                            return Err("The captured backend belongs to another retained helper".into());
+                        }
+                        (super::ActorCommand::ConditionalInterrupt { expected }, None, None)
+                    }
                     InputPayload::Command { run, command } => {
                         let state = Arc::new(std::sync::atomic::AtomicU8::new(0));
                         (
@@ -3198,6 +3214,69 @@ done"#;
         );
         release.send(()).unwrap();
         finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
+    #[test]
+    fn retained_conditional_interrupt_checks_epoch_helper_and_actual_backend_in_input_journal() {
+        let exact = thread::current().name().expect("named contract").to_owned();
+        if isolated_backend_contract(&exact) { return; }
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        let process = server.actor.provider_process().unwrap();
+        let (conversation, revision) = server.actor.backend_confirmation();
+        // Every witness field comes from the actual retained Local actor. This
+        // test exercises Server input admission, actor dispatch and journal ACK;
+        // it does not substitute a synthetic confirmation or host permission.
+        let witness: super::super::BackendIdentity = serde_json::from_value(json!({
+            "helper":server.identity.instance,"actor":server.actor.backend_instance(),
+            "process":process,"conversation":conversation,"conversation_revision":revision,
+        })).unwrap();
+        let input = |witness| {
+            let payload = serde_json::to_value(InputPayload::ConditionalInterrupt { expected:witness }).unwrap();
+            let identity = InputIdentity { sequence:1,id:uuid::Uuid::new_v4(),hash:payload_digest(&serde_json::to_vec(&payload).unwrap()) };
+            (identity,payload)
+        };
+        let invoke = |server:&mut Server,epoch,args| server.invoke(Invocation {
+            proof:server.proof.clone(),epoch:Some(epoch),method:"input".into(),args,
+        });
+        let mut foreign = serde_json::to_value(&witness).unwrap();
+        foreign["helper"] = json!(uuid::Uuid::new_v4());
+        let (identity,payload) = input(serde_json::from_value(foreign).unwrap());
+        let epoch = server.epoch;
+        assert!(invoke(server,epoch,json!([identity,payload])).unwrap_err().contains("another retained helper"));
+        assert_eq!(server.journal.lock().unwrap().next_input().unwrap(),1);
+        let (identity,payload) = input(witness.clone());
+        assert!(invoke(server,uuid::Uuid::new_v4(),json!([identity,payload])).is_err());
+        assert_eq!(server.journal.lock().unwrap().next_input().unwrap(),1);
+        invoke(server,epoch,json!([identity,payload])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            server.finish_inputs();
+            let receipt = server.journal.lock().unwrap().input(&identity).unwrap().unwrap();
+            if matches!(receipt.state,InputState::Acknowledged(Ok(()))) { break; }
+            assert!(Instant::now()<deadline,"actual retained conditional interrupt never ACKed");
+            thread::sleep(Duration::from_millis(2));
+        }
+        let repeated: InputReceipt = serde_json::from_value(invoke(server,epoch,json!([identity,payload])).unwrap()).unwrap();
+        assert!(matches!(repeated.state,InputState::Acknowledged(Ok(()))));
+        assert_eq!(server.journal.lock().unwrap().next_input().unwrap(),2);
+        let mut wrong = serde_json::to_value(witness).unwrap();
+        wrong["actor"] = json!(uuid::Uuid::new_v4());
+        let (_,payload) = input(serde_json::from_value(wrong).unwrap());
+        let identity = InputIdentity { sequence:2,id:uuid::Uuid::new_v4(),hash:payload_digest(&serde_json::to_vec(&payload).unwrap()) };
+        invoke(server,epoch,json!([identity,payload])).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            server.finish_inputs();
+            let receipt = server.journal.lock().unwrap().input(&identity).unwrap().unwrap();
+            if let InputState::Acknowledged(Err(reason)) = receipt.state {
+                assert!(reason.contains("captured backend changed")); break;
+            }
+            assert!(Instant::now()<deadline,"wrong backend did not settle refusal");
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(server.actor.provider_process(),Some(process));
+        server.actor.close().unwrap();
     }
 
     #[test]
