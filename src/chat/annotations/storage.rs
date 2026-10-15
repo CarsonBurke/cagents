@@ -21,12 +21,13 @@ pub(crate) struct PendingAttachment {
     pub attachment: OriginalAttachment,
     _lease: fs::File,
     accepted: bool,
+    reserved_bytes:u64,
     pending_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 impl Drop for PendingAttachment {
     fn drop(&mut self) {
         if !self.accepted {let _=fs::remove_file(&self.attachment.path);}
-        self.pending_bytes.fetch_sub(32*1024*1024,std::sync::atomic::Ordering::AcqRel);
+        self.pending_bytes.fetch_sub(self.reserved_bytes,std::sync::atomic::Ordering::AcqRel);
     }
 }
 fn valid_id(id: &str) -> bool { !id.is_empty() && id.len() <= ID_BYTES }
@@ -132,7 +133,7 @@ impl Store {
           CREATE TABLE IF NOT EXISTS aliases(alias TEXT PRIMARY KEY,user_id TEXT NOT NULL REFERENCES prompts(user_id));
           CREATE TABLE IF NOT EXISTS approvals(agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,decision INTEGER NOT NULL,PRIMARY KEY(agent,item,request));
           CREATE TABLE IF NOT EXISTS current_approval(agent TEXT NOT NULL,item TEXT NOT NULL,request TEXT NOT NULL,PRIMARY KEY(agent,item));
-          CREATE TABLE IF NOT EXISTS retained_attachments(path TEXT PRIMARY KEY,accepted INTEGER NOT NULL DEFAULT 0);
+          CREATE TABLE IF NOT EXISTS retained_attachments(path TEXT PRIMARY KEY,accepted INTEGER NOT NULL DEFAULT 0,bytes INTEGER NOT NULL);
           CREATE INDEX IF NOT EXISTS pending_attachments ON retained_attachments(accepted) WHERE accepted=0;
           CREATE TABLE IF NOT EXISTS latest(singleton INTEGER PRIMARY KEY CHECK(singleton=1),user_id TEXT NOT NULL); PRAGMA user_version=1;")
             .map_err(|e|e.to_string())?;
@@ -171,8 +172,10 @@ impl Store {
         self.scope.revalidate().map_err(OriginalError::Unavailable)?;
         self.recover_pending().map_err(OriginalError::Unavailable)?;
         let mut input=fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
-        if !input.metadata().map_err(|e|OriginalError::Unavailable(e.to_string()))?.is_file(){return Err(OriginalError::Unavailable("The original attachment is not a regular file".into()));}
-        self.pending_bytes.fetch_update(Ordering::AcqRel,Ordering::Acquire,|bytes|(bytes<64*1024*1024).then_some(bytes+32*1024*1024)).map_err(|_|OriginalError::TooLarge)?;
+        let metadata=input.metadata().map_err(|e|OriginalError::Unavailable(e.to_string()))?;
+        if !metadata.is_file(){return Err(OriginalError::Unavailable("The original attachment is not a regular file".into()));}
+        let reserved_bytes=metadata.len();if reserved_bytes>32*1024*1024{return Err(OriginalError::TooLarge);}
+        self.pending_bytes.fetch_update(Ordering::AcqRel,Ordering::Acquire,|bytes|bytes.checked_add(reserved_bytes).filter(|total|*total<=64*1024*1024)).map_err(|_|OriginalError::TooLarge)?;
         let extension=path.extension().and_then(|value|value.to_str()).filter(|value|!value.is_empty()&&value.len()<=16&&value.bytes().all(|byte|byte.is_ascii_alphanumeric()));
         let name=format!("capture-{}{}",uuid::Uuid::new_v4(),extension.map(|value|format!(".{value}")).unwrap_or_default());
         let retained=self.directory.join(&name);
@@ -180,14 +183,15 @@ impl Store {
             let mut output=fs::OpenOptions::new().write(true).create_new(true).mode(0o600).custom_flags(libc::O_NOFOLLOW).open(&retained).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
             // SAFETY: output owns this newly created regular file.
             if unsafe{libc::flock(output.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)}!=0{return Err(OriginalError::Unavailable(std::io::Error::last_os_error().to_string()));}
-            if self.db.execute("INSERT INTO retained_attachments(path) SELECT ?1 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<2",[&name]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
+            if self.db.execute("INSERT INTO retained_attachments(path,bytes) SELECT ?1,?2 WHERE (SELECT count(*) FROM retained_attachments WHERE accepted=0)<32 AND (SELECT coalesce(sum(bytes),0) FROM retained_attachments WHERE accepted=0)+?2<=67108864",params![name,reserved_bytes]).map_err(storage_error)?!=1{return Err(OriginalError::TooLarge);}
             let mut hash=Sha256::new();let mut bytes=0u64;let mut chunk=[0u8;64*1024];
-            loop {let count=input.read(&mut chunk).map_err(|e|OriginalError::Unavailable(e.to_string()))?;if count==0{break;}bytes=bytes.saturating_add(count as u64);if bytes>32*1024*1024{return Err(OriginalError::TooLarge);}hash.update(&chunk[..count]);output.write_all(&chunk[..count]).map_err(|e|OriginalError::Unavailable(e.to_string()))?;}
+            loop {let count=input.read(&mut chunk).map_err(|e|OriginalError::Unavailable(e.to_string()))?;if count==0{break;}bytes=bytes.saturating_add(count as u64);if bytes>reserved_bytes{return Err(OriginalError::Changed);}hash.update(&chunk[..count]);output.write_all(&chunk[..count]).map_err(|e|OriginalError::Unavailable(e.to_string()))?;}
+            if bytes!=reserved_bytes{return Err(OriginalError::Changed);}
             output.sync_all().map_err(|e|OriginalError::Unavailable(e.to_string()))?;
             fs::File::open(&self.directory).and_then(|file|file.sync_all()).map_err(|e|OriginalError::Unavailable(e.to_string()))?;
-            Ok(PendingAttachment{attachment:OriginalAttachment{original_path:path.to_owned(),path:retained.clone(),bytes,sha256:hash.finalize().into()},_lease:output,accepted:false,pending_bytes:self.pending_bytes.clone()})
+            Ok(PendingAttachment{attachment:OriginalAttachment{original_path:path.to_owned(),path:retained.clone(),bytes,sha256:hash.finalize().into()},_lease:output,accepted:false,reserved_bytes,pending_bytes:self.pending_bytes.clone()})
         })();
-        if result.is_err(){let _=fs::remove_file(retained);self.pending_bytes.fetch_sub(32*1024*1024,Ordering::AcqRel);}
+        if result.is_err(){let _=fs::remove_file(retained);self.pending_bytes.fetch_sub(reserved_bytes,Ordering::AcqRel);}
         result
     }
     /// Persist only after a provider acknowledgment binds this exact original
@@ -377,6 +381,18 @@ mod tests {
         let mut orphan=active;orphan.accepted=true;drop(orphan);drop(store);
         let reopened=Store::at(&annotations,&account,"session").unwrap();assert!(!orphan_path.exists());assert!(accepted_path.exists());
         assert_eq!(reopened.original(Some("accepted"),0,4).unwrap().original,original);
+    }
+
+    #[test]
+    fn tiny_multi_image_prompt_fits_but_actual_aggregate_pending_bytes_are_bounded(){
+        let root=tempfile::tempdir().unwrap();let account=scope(root.path(),crate::agent::Provider::Claude);let annotations=root.path().join("annotations");
+        let mut store=Store::at(&annotations,&account,"session").unwrap();let path=root.path().join("tiny.png");fs::write(&path,b"tiny image").unwrap();
+        let mut captures=(0..4).map(|_|store.retain_attachment(&path).unwrap()).collect::<Vec<_>>();let mut original=prompt("four-images","text");original.attachments=captures.iter().map(|capture|capture.attachment.clone()).collect();
+        store.accept(&original,"text",&[],&mut captures).unwrap();drop(captures);
+        let large=root.path().join("large.png");fs::File::create(&large).unwrap().set_len(32*1024*1024).unwrap();
+        let first=store.retain_attachment(&large).unwrap();let second=store.retain_attachment(&large).unwrap();
+        assert!(matches!(store.retain_attachment(&path),Err(OriginalError::TooLarge)));drop(first);drop(second);
+        assert!(store.retain_attachment(&path).is_ok());
     }
 
 }
