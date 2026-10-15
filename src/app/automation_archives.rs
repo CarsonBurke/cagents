@@ -53,17 +53,22 @@ impl Cagents {
         &mut self,
         readers: impl IntoIterator<Item = (CardId, crate::model::TerminalId)>,
     ) {
-        let open = self.durable.cards.iter().filter_map(|card| {
-            if !card.existence.is_open() {
-                return None;
-            }
-            let session = match &card.kind {
-                CardKind::Chat(session) => session.id,
-                CardKind::Terminal(session) => session.id,
-                _ => return None,
-            };
-            Some((card.id, session))
-        }).collect::<HashMap<_, _>>();
+        let open = self
+            .durable
+            .cards
+            .iter()
+            .filter_map(|card| {
+                if !card.existence.is_open() {
+                    return None;
+                }
+                let session = match &card.kind {
+                    CardKind::Chat(session) => session.id,
+                    CardKind::Terminal(session) => session.id,
+                    _ => return None,
+                };
+                Some((card.id, session))
+            })
+            .collect::<HashMap<_, _>>();
         let revoked = &mut self.chat_ui.archive_discovery.revoked_readers;
         revoked.retain(|card, session| open.get(card) == Some(session));
         for (card, session) in readers {

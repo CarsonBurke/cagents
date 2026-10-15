@@ -2212,14 +2212,20 @@ fn current_skip_notice_group(
     if automation.blocked.is_some()
         || automation.execution_revision != firing.revision
         || (!automation.enabled
-            && matches!(firing.trigger, crate::automations::Trigger::Scheduled { .. }))
+            && matches!(
+                firing.trigger,
+                crate::automations::Trigger::Scheduled { .. }
+            ))
     {
         return Ok(false);
     }
-    let latest: String = tx.query_row(
-        "SELECT record FROM automation_firings WHERE automation=?1 ORDER BY rowid DESC LIMIT 1",
-        [firing.automation.to_string()], |row| row.get(0),
-    ).map_err(|error| error.to_string())?;
+    let latest: String = tx
+        .query_row(
+            "SELECT record FROM automation_firings WHERE automation=?1 ORDER BY rowid DESC LIMIT 1",
+            [firing.automation.to_string()],
+            |row| row.get(0),
+        )
+        .map_err(|error| error.to_string())?;
     let latest: Firing = decode(&latest)?;
     Ok(latest.state == FiringState::Skipped
         && latest.agent.is_none()
@@ -5373,13 +5379,7 @@ mod tests {
                         .unwrap();
                 } else {
                     registry
-                        .set_automation_enabled(
-                            created.id,
-                            enabled.revision,
-                            None,
-                            false,
-                            120_000,
-                        )
+                        .set_automation_enabled(created.id, enabled.revision, None, false, 120_000)
                         .unwrap();
                 }
                 let attention = registry.automation_notifications().unwrap();
