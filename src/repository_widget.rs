@@ -6374,14 +6374,14 @@ impl RepositoryRuntime {
 
     fn update_diff_typography(&mut self) {
         let anchor = self.current_diff_viewport();
-        let height = self.diff_typography().line_height;
+        let typography = self.diff_typography();
         for (_, state) in &mut self.diffs {
             if let DiffState::Ready(_, layout) = state {
-                layout.set_row_height(height);
+                layout.set_row_heights(typography.line_height, typography.fold_height());
             }
         }
         if let Some((_, _, DiffState::Ready(_, layout))) = &mut self.stale_diff {
-            layout.set_row_height(height);
+            layout.set_row_heights(typography.line_height, typography.fold_height());
         }
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         self.apply_diff_viewport(anchor);
@@ -8394,7 +8394,8 @@ impl RepositoryRuntime {
             self.clear_diff_find();
         }
         if let DiffState::Ready(_, layout) = &mut state {
-            layout.set_row_height(self.diff_typography().line_height);
+            let typography = self.diff_typography();
+            layout.set_row_heights(typography.line_height, typography.fold_height());
         }
         self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
         let restores_current = basis == self.diff_basis && matches!(&state, DiffState::Ready(_, _));
@@ -12233,8 +12234,7 @@ fn diff_model_view<'a>(
         crate::ui_controls::responsive(move |size| {
             // One native two-axis scrollable owns both coordinates. The canvas
             // counter-translates the fixed gutters/center; only code moves in X.
-            let gutter =
-                (model.row_count(DiffMode::Inline).max(1).ilog10() + 1).max(4) as f32 * 8.0 + 12.0;
+            let gutter = runtime.diff_typography().gutter_width(model.row_count(DiffMode::Inline));
             let code_width = (model.max_line_width[usize::from(cosmic::theme::is_dark())] as f32
                 * runtime.editor_font_size
                 / DIFF_FONT_SIZE)
@@ -12245,7 +12245,7 @@ fn diff_model_view<'a>(
                 0.0
             };
             let geometry =
-                DiffScrollGeometry::new(size.width - mutation_gutter, gutter, runtime.diff_mode);
+                DiffScrollGeometry::new(size.width - mutation_gutter, gutter, runtime.diff_mode, runtime.diff_typography().marker_width());
             let viewport_width = geometry.viewport_width + mutation_gutter;
             let overflow = geometry.overflow(code_width);
             let horizontal = runtime.diff_horizontal.clamp(0.0, overflow);
@@ -12575,6 +12575,7 @@ fn diff_fold_row<'a>(
     width: f32,
 ) -> Element<'a, RepositoryAction> {
     let mode = runtime.diff_mode;
+    let typography = runtime.diff_typography();
     let run = &model.unchanged_runs(mode)[fold.fold];
     let count = fold.hidden.len();
     let identity = runtime
@@ -12627,10 +12628,13 @@ fn diff_fold_row<'a>(
     }
     // Room for both reveals in either layout; a split half has no marker
     // column, but the fold row spans both halves and needs no alignment.
-    let gutter_width = gutter + DIFF_MARKER_WIDTH;
+    let gutter_width = gutter + typography.marker_width();
     let mut label = vec![
         widget::text::body(format!("{count} unchanged lines"))
-            .size(12)
+            .font(typography.font)
+            .size(typography.size)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(typography.line_height)))
             .class(cosmic::theme::Text::Custom(crate::design::muted_text))
             .into(),
     ];
@@ -12641,7 +12645,10 @@ fn diff_fold_row<'a>(
             } else {
                 format!("· {} comments", fold.discussions)
             })
-            .size(12)
+            .font(typography.font)
+            .size(typography.size)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(typography.line_height)))
             .class(cosmic::theme::Text::Custom(|theme| {
                 iced::widget::text::Style {
                     color: Some(crate::design::accent_color(theme)),
@@ -12697,7 +12704,7 @@ fn diff_fold_row<'a>(
         }
     }))
     .padding([0.0, DIFF_ROW_PADDING])
-    .height(runtime.diff_typography().line_height)
+    .height(typography.fold_height())
     .width(width)
     .align_y(Alignment::Center)
     .clip(true)
@@ -12724,6 +12731,27 @@ struct DiffTypography {
     size: f32,
     line_height: f32,
 }
+impl DiffTypography {
+    fn gutter_size(self) -> f32 {
+        self.size * (12.0 / DIFF_FONT_SIZE)
+    }
+
+    fn gutter_width(self, rows: usize) -> f32 {
+        // Reserve a full em per digit, including zoom, rather than fixed-pixel
+        // columns. The selected editor family also draws the line numbers.
+        let digits = (rows.max(1).ilog10() + 1).max(4);
+        digits as f32 * self.gutter_size() + 2.0 * space::S
+    }
+
+    fn marker_width(self) -> f32 {
+        DIFF_MARKER_WIDTH.max(self.size)
+    }
+
+    fn fold_height(self) -> f32 {
+        (self.line_height + 2.0 * space::XXS).max(crate::design::COMPACT_CONTROL_SIZE)
+    }
+}
+
 impl Default for DiffTypography {
     fn default() -> Self {
         Self {
@@ -12745,12 +12773,12 @@ struct DiffScrollGeometry {
 }
 
 impl DiffScrollGeometry {
-    fn new(width: f32, gutter: f32, mode: DiffMode) -> Self {
+    fn new(width: f32, gutter: f32, mode: DiffMode, marker_width: f32) -> Self {
         // The vertical thumb's rail, taken off the width every coordinate
         // downstream is measured in, so a code column never ends underneath it.
         let viewport_width = (width - crate::design::SCROLLBAR_GUTTER).max(0.0);
         let code_viewport = match mode {
-            DiffMode::Inline => viewport_width - 2.0 * gutter - DIFF_MARKER_WIDTH,
+            DiffMode::Inline => viewport_width - 2.0 * gutter - marker_width,
             DiffMode::Split => (viewport_width - DIFF_SPLIT_DIVIDER) / 2.0 - gutter,
         }
         .max(0.0);
@@ -12829,7 +12857,9 @@ fn inline_diff_row_with_review<'a>(
             widget::text::body(marker)
                 .size(typography.size)
                 .font(typography.font)
-                .width(DIFF_MARKER_WIDTH)
+                .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(typography.line_height)))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .width(typography.marker_width())
                 .into(),
             diff_text(
                 &row.text,
@@ -13018,9 +13048,11 @@ fn diff_gutter(
     typography: DiffTypography,
 ) -> Element<'static, RepositoryAction> {
     widget::container(
-        crate::design::caption(line.map_or_else(String::new, |line| line.to_string()))
+        widget::text(line.map_or_else(String::new, |line| line.to_string()))
             .font(typography.font)
-            .size(12)
+            .size(typography.gutter_size())
+            .wrapping(iced::widget::text::Wrapping::None)
+            .line_height(iced::widget::text::LineHeight::Absolute(iced::Pixels(typography.line_height)))
             .align_x(Alignment::End)
             .width(Length::Fill)
             .class(cosmic::theme::Text::Custom(|theme| {
@@ -16275,6 +16307,87 @@ mod tests {
 
 
     #[test]
+    fn diff_mounted_rows_match_offsets_at_minimum_mixed_and_maximum_typography() {
+        let _typography_guard = crate::design::typography_test_guard();
+        let renderer = headless_renderer();
+        let before = (0..80).map(|line| format!("line {line}\n")).collect::<String>();
+        let after = before.replace("line 40\n", "changed 40\n");
+        let card = CardId::new();
+        let (mut runtime, _) = working_diff_runtime(card, &before, &after);
+        drop(runtime.take_lsp_intents());
+
+        fn fits_vertically(node: &layout::Node) {
+            for child in node.children() {
+                let bounds = child.bounds();
+                assert!(bounds.y >= -0.1 && bounds.y + bounds.height <= node.size().height + 0.1,
+                    "child {bounds:?} escapes row {:?}", node.size());
+                fits_vertically(child);
+            }
+        }
+
+        for (interface_size, editor_size, relative_height) in [
+            (10.0, 8.0, 1.0),
+            (24.0, 14.0, 1.3),
+            (24.0, 40.0, 2.0),
+        ] {
+            crate::design::configure_typography("", interface_size, "", 14.0);
+            runtime.set_editor_font(Font::MONOSPACE, editor_size);
+            runtime.set_line_height(relative_height);
+            let typography = runtime.diff_typography();
+            let model = runtime.diff_model().unwrap();
+            let gutter = typography.gutter_width(model.row_count(DiffMode::Inline));
+            let mut label = diff_gutter(Some(50_000), typography.gutter_width(50_000), typography);
+            let mut tree = Tree::new(label.as_widget());
+            let node = label.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 1000.0)));
+            assert!((node.size().height - typography.line_height).abs() < 0.1);
+            fits_vertically(&node);
+
+            for mode in [DiffMode::Inline, DiffMode::Split] {
+                runtime.diff_mode = mode;
+                let model = runtime.diff_model().unwrap();
+                let layout = runtime.diff_layout().unwrap();
+                let folded = layout.folded(mode);
+                let offsets = layout.rows(mode);
+                for width in [380.0, 1000.0] {
+                    let mut children = Vec::new();
+                    for display in 0..folded.len() {
+                        let element = match folded.row(display) {
+                            DisplayRow::Fold { fold, rows: hidden } => diff_fold_row(card, &runtime, model,
+                                DiffFold { fold, hidden, discussions: 1 }, gutter, width),
+                            DisplayRow::Code(row) => match mode {
+                                DiffMode::Inline => inline_diff_row_with_review(&model.inline_rows[row], &model.syntax,
+                                    gutter, 2000.0, 0.0, None, typography, None),
+                                DiffMode::Split => split_diff_row_with_review(&model.split_rows[row], &model.syntax,
+                                    gutter, 2000.0, 0.0, None, typography, None),
+                            },
+                        };
+                        children.push(element);
+                    }
+                    let mut column: Element<'_, RepositoryAction> = widget::column::with_children(children).width(width).into();
+                    let mut tree = Tree::new(column.as_widget());
+                    let node = column.as_widget_mut().layout(&mut tree, &renderer,
+                        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 10_000.0)));
+                    assert!((node.size().height - offsets.total_height()).abs() < 0.1);
+                    for (display, child) in node.children().iter().enumerate() {
+                        assert!((child.bounds().y - offsets.offset(display)).abs() < 0.1);
+                        assert!((child.size().height - offsets.height(display)).abs() < 0.1);
+                        fits_vertically(child);
+                    }
+                }
+            }
+            let model = runtime.diff_model().unwrap();
+            let first_change = model.change_starts(runtime.diff_mode)[0];
+            let mut controls = diff_mutations::gutter(card, &runtime, model, first_change, typography.line_height);
+            let mut tree = Tree::new(controls.as_widget());
+            let node = controls.as_widget_mut().layout(&mut tree, &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(1000.0, 1000.0)));
+            assert!((node.size().height - typography.line_height).abs() < 0.1);
+            fits_vertically(&node);
+        }
+    }
+
+    #[test]
     fn diff_scroll_range_matches_shaped_content_and_real_split_half_layout() {
         let renderer = headless_renderer();
         for source in [
@@ -16339,7 +16452,7 @@ mod tests {
             // modes: no stale range may survive a resize or mode transition.
             for width in [320.0, 1200.0, 480.0] {
                 for mode in [DiffMode::Split, DiffMode::Inline, DiffMode::Split] {
-                    let geometry = DiffScrollGeometry::new(width, 44.0, mode);
+                    let geometry = DiffScrollGeometry::new(width, 44.0, mode, DIFF_MARKER_WIDTH);
                     if mode == DiffMode::Inline {
                         let two_gutter_code =
                             geometry.viewport_width - 2.0 * 44.0 - DIFF_MARKER_WIDTH;
@@ -18881,9 +18994,10 @@ mod tests {
             folded.row(display - 2),
             DisplayRow::Fold { fold: 1, .. }
         ));
+        let offset = layout.rows(DiffMode::Inline).offset(display) + 10.0;
         drop(runtime.update(RepositoryAction::DiffViewport {
             card,
-            offset: display as f32 * DIFF_ROW_HEIGHT + 10.0,
+            offset,
             height: 100.0,
             horizontal: 0.0,
             user_initiated: true,
@@ -18916,7 +19030,7 @@ mod tests {
         );
         assert_eq!(
             runtime.diff_viewport.offset,
-            display as f32 * DIFF_ROW_HEIGHT + 10.0,
+            runtime.diff_layout().unwrap().rows(DiffMode::Inline).offset(display) + 10.0,
             "the row that was on screen stays on screen"
         );
 
@@ -18925,8 +19039,8 @@ mod tests {
         runtime.diff_viewport.height = 300.0;
         drop(runtime.update(RepositoryAction::NextChange { card }));
         let bottom =
-            folded.len() as f32 * DIFF_ROW_HEIGHT + crate::design::SCROLLBAR_GUTTER - 300.0;
-        assert!(bottom < folded.display(150) as f32 * DIFF_ROW_HEIGHT);
+            runtime.diff_layout().unwrap().rows(DiffMode::Inline).total_height() + crate::design::SCROLLBAR_GUTTER - 300.0;
+        assert!(bottom < runtime.diff_layout().unwrap().rows(DiffMode::Inline).offset(folded.display(150)));
         assert_eq!(runtime.diff_viewport.offset, bottom);
         // Reveals are shared by both layouts.
         drop(runtime.update(RepositoryAction::ApplyDiffMode { card, split: true }));
@@ -18958,9 +19072,10 @@ mod tests {
             .unwrap()
             .folded(DiffMode::Inline)
             .display(60);
+        let offset = runtime.diff_layout().unwrap().rows(DiffMode::Inline).offset(fold);
         drop(runtime.update(RepositoryAction::DiffViewport {
             card,
-            offset: fold as f32 * DIFF_ROW_HEIGHT,
+            offset,
             height: 300.0,
             horizontal: 0.0,
             user_initiated: true,
@@ -18979,7 +19094,7 @@ mod tests {
             .folded(DiffMode::Inline)
             .clone();
         assert_eq!(folded.row(fold), DisplayRow::Code(54));
-        assert_eq!(runtime.diff_viewport.offset, fold as f32 * DIFF_ROW_HEIGHT);
+        assert_eq!(runtime.diff_viewport.offset, offset);
 
         // The same comparison read again keeps its reveal and its place.
         runtime.set_diff_state(
@@ -18990,7 +19105,7 @@ mod tests {
             runtime.diff_layout().unwrap().folded(DiffMode::Inline),
             &folded
         );
-        assert_eq!(runtime.diff_viewport.offset, fold as f32 * DIFF_ROW_HEIGHT);
+        assert_eq!(runtime.diff_viewport.offset, offset);
 
         // An edit above renumbers the new side and shifts every row by one;
         // the runs keep their lengths, so the reveal holds, and the same line

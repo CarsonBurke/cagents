@@ -576,12 +576,14 @@ pub(super) fn gutter<'a>(
     };
     let button = |kind, icon: Icon, label: &'static str| {
         let enabled = runtime.can_mutate_diff(kind);
-        let control = widget::button::custom(icon.handle().icon().size(12))
+        let target = height.min(20.0);
+        let glyph = runtime.diff_typography().gutter_size().min(target).floor().max(1.0) as u16;
+        let control = widget::button::custom(icon.handle().icon().size(glyph))
             .name(label)
             .class(crate::ui_controls::control_style(false, None))
             .padding(0)
             .width(20.0)
-            .height(height.min(20.0))
+            .height(target)
             .on_press_maybe(enabled.then(|| RepositoryAction::ApplyDiffHunk {
                 card,
                 kind,

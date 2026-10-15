@@ -1,5 +1,6 @@
 //! Diff coordinates independent of mounted widgets. Uniform files allocate no
-//! table; annotations materialize cumulative row offsets once per measurement.
+//! table; nonuniform fold extents and annotations materialize cumulative offsets
+//! when their geometry changes, never per mounted row or render.
 //!
 //! Long runs of unchanged rows are folded behind a single row. Folding maps
 //! the model's rows to *display* rows, which are what [`RowOffsets`] measures
@@ -17,6 +18,7 @@ pub(super) struct RowOffsets {
     line_height: f32,
     leading: f32,
     annotations: std::collections::BTreeMap<usize, f32>,
+    row_heights: std::collections::BTreeMap<usize, f32>,
     offsets: Vec<f64>,
 }
 
@@ -44,8 +46,44 @@ impl RowOffsets {
             line_height,
             leading: 0.0,
             annotations: Default::default(),
+            row_heights: Default::default(),
             offsets: Vec::new(),
         }
+    }
+
+    fn folded(folded: &FoldedRows, line_height: f32, fold_height: f32) -> Self {
+        assert!(fold_height.is_finite() && fold_height > 0.0);
+        let mut rows = Self::uniform(folded.len(), line_height);
+        if fold_height != line_height {
+            rows.row_heights = folded.hidden.iter().map(|hidden| (hidden.display, fold_height)).collect();
+            rows.rebuild_offsets();
+        }
+        rows
+    }
+
+    fn rebuild_offsets(&mut self) {
+        if self.annotations.is_empty() && self.row_heights.is_empty() {
+            self.offsets.clear();
+            return;
+        }
+        let mut offsets = Vec::with_capacity(self.rows + 1);
+        let mut sum = f64::from(self.leading);
+        offsets.push(sum);
+        let mut heights = self.row_heights.iter().peekable();
+        let mut extra = self.annotations.iter().peekable();
+        for row in 0..self.rows {
+            let height = if heights.peek().is_some_and(|(index, _)| **index == row) {
+                *heights.next().expect("fold row").1
+            } else {
+                self.line_height
+            };
+            sum += f64::from(height);
+            if extra.peek().is_some_and(|(index, _)| **index == row) {
+                sum += f64::from(*extra.next().expect("measured row").1);
+            }
+            offsets.push(sum);
+        }
+        self.offsets = offsets;
     }
 
     pub fn annotations(&self) -> &std::collections::BTreeMap<usize, f32> {
@@ -155,25 +193,9 @@ impl RowOffsets {
         if self.leading == leading && self.annotations == extra {
             return false;
         }
-        let offsets = if extra.is_empty() {
-            Vec::new()
-        } else {
-            let mut offsets = Vec::with_capacity(self.rows + 1);
-            let mut sum = f64::from(leading);
-            offsets.push(sum);
-            let mut extra = extra.iter().peekable();
-            for row in 0..self.rows {
-                sum += f64::from(self.line_height);
-                if extra.peek().is_some_and(|(index, _)| **index == row) {
-                    sum += f64::from(*extra.next().expect("measured row").1);
-                }
-                offsets.push(sum);
-            }
-            offsets
-        };
         self.leading = leading;
         self.annotations = extra;
-        self.offsets = offsets;
+        self.rebuild_offsets();
         true
     }
 }
@@ -363,6 +385,7 @@ pub(super) struct DiffLayout {
     folded: [FoldedRows; 2],
     offsets: [RowOffsets; 2],
     row_height: f32,
+    fold_height: f32,
 }
 
 fn layout_index(mode: DiffMode) -> usize {
@@ -385,6 +408,7 @@ impl DiffLayout {
             folded,
             offsets,
             row_height,
+            fold_height: row_height,
         }
     }
 
@@ -420,16 +444,17 @@ impl DiffLayout {
         self.reveals = previous.reveals.clone();
         for mode in [DiffMode::Inline, DiffMode::Split] {
             let folded = Self::fold(Some(model), mode, &self.reveals);
-            self.offsets[layout_index(mode)] = RowOffsets::uniform(folded.len(), self.row_height);
+            self.offsets[layout_index(mode)] = RowOffsets::folded(&folded, self.row_height, self.fold_height);
             self.folded[layout_index(mode)] = folded;
         }
     }
 
-    pub fn set_row_height(&mut self, height: f32) {
-        if self.row_height == height {
+    pub fn set_row_heights(&mut self, height: f32, fold_height: f32) {
+        if self.row_height == height && self.fold_height == fold_height {
             return;
         }
         self.row_height = height;
+        self.fold_height = fold_height;
         for (index, rows) in self.offsets.iter_mut().enumerate() {
             let leading = rows.leading_height();
             let annotations = rows
@@ -437,7 +462,7 @@ impl DiffLayout {
                 .iter()
                 .map(|(row, height)| (*row, *height))
                 .collect::<Vec<_>>();
-            *rows = RowOffsets::uniform(self.folded[index].len(), height);
+            *rows = RowOffsets::folded(&self.folded[index], height, fold_height);
             rows.annotate(leading, &annotations);
         }
     }
@@ -493,7 +518,7 @@ impl DiffLayout {
                 .map(|(row, height)| (folded.display(self.folded[index].model(*row)), *height))
                 .collect();
             let leading = previous.leading_height();
-            let mut offsets = RowOffsets::uniform(folded.len(), self.row_height);
+            let mut offsets = RowOffsets::folded(&folded, self.row_height, self.fold_height);
             offsets.annotate(leading, &annotations);
             self.folded[index] = folded;
             self.offsets[index] = offsets;
@@ -505,6 +530,48 @@ impl DiffLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fold_extents_survive_annotations_zoom_and_reveal_without_changing_model_anchors() {
+        let before = "unchanged\n".repeat(100);
+        let after = format!("{}replacement\n{}", "unchanged\n".repeat(50), "unchanged\n".repeat(49));
+        let model = crate::diff_view::build_diff(&before, &after);
+        let mut layout = DiffLayout::new(Some(&model), 8.0);
+        layout.set_row_heights(8.0, 20.0);
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            let folded = layout.folded(mode);
+            let rows = layout.rows(mode);
+            let mut sum = 0.0;
+            for display in 0..folded.len() {
+                assert_eq!(rows.offset(display), sum);
+                let height = match folded.row(display) { DisplayRow::Code(_) => 8.0, DisplayRow::Fold { .. } => 20.0 };
+                assert_eq!(rows.height(display), height);
+                let anchor = rows.anchor(sum + height * 0.5);
+                assert_eq!(rows.restore(anchor), sum + height * 0.5);
+                sum += height;
+            }
+            assert_eq!(rows.total_height(), sum);
+        }
+        let row = layout.folded(DiffMode::Inline).display(50);
+        layout.rows_mut(DiffMode::Inline).annotate(11.0, &[(row, 37.0)]);
+        assert_eq!(layout.rows(DiffMode::Inline).height(row), 45.0);
+        layout.set_row_heights(80.0, 84.0);
+        assert_eq!(layout.rows(DiffMode::Inline).height(row), 117.0);
+        assert_eq!(layout.rows(DiffMode::Inline).leading_height(), 11.0);
+        assert!(layout.expand(&model, 0, FoldExpansion::Down));
+        let row = layout.folded(DiffMode::Inline).display(50);
+        assert_eq!(layout.rows(DiffMode::Inline).annotations().get(&row), Some(&37.0));
+        for mode in [DiffMode::Inline, DiffMode::Split] {
+            for display in 0..layout.folded(mode).len() {
+                if matches!(layout.folded(mode).row(display), DisplayRow::Fold { .. }) {
+                    assert_eq!(layout.rows(mode).height(display), 84.0);
+                }
+            }
+        }
+        assert!(layout.set_folding(&model, false));
+        assert_eq!(layout.rows(DiffMode::Inline).height(50), 117.0);
+        assert_eq!(layout.rows(DiffMode::Inline).total_height(), 11.0 + model.row_count(DiffMode::Inline) as f32 * 80.0 + 37.0);
+    }
 
     #[test]
     fn folding_preference_preserves_reveals_and_logical_annotation_rows() {
