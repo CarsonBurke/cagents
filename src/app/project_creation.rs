@@ -31,10 +31,12 @@ impl Cagents {
 
     /// Already admitted effects survive an unchanged automatic refresh.
     pub(super) fn current_project_creation_source(&self, project: ProjectId, id: OperationId) -> bool {
-        self.retained_project_creation_source(project).is_some_and(|source| source.id() == id)
+        self.sidebar_model.project(project).is_some_and(|row| row.unreachable.is_none())
+            && self.retained_project_creation_source(project).is_some_and(|source| source.id() == id)
     }
 
     pub(super) fn project_creation_generation(&self, project: ProjectId) -> Option<u64> {
+        if self.sidebar_model.project(project)?.unreachable.is_some() { return None; }
         self.retained_project_creation_source(project)?;
         Some(self.project_ui.creation_sources.get(&project)?.logical_generation)
     }

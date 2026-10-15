@@ -18035,6 +18035,14 @@ impl Application for Cagents {
                                 ));
                             }
                             let existing_id = existing.id;
+                            let existing_repository = existing.repository.clone();
+                            // A provisional add did not replace the canonical
+                            // row's complete metadata. Publish no new authority
+                            // into that older row: explicitly read its own actor.
+                            let canonical_refresh = if !superseded {
+                                self.retire_project_creation_source(existing_id);
+                                self.repository_load_task(existing_repository, Some(existing_id), false)
+                            } else { Task::none() };
                             self.repository_generations.remove(&project_id);
                             if let Some(previous) =
                                 self.repository_pr_cancellations.remove(&project_id)
@@ -18066,7 +18074,7 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return task;
+                            return Task::batch([task, canonical_refresh]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
@@ -18162,6 +18170,9 @@ impl Application for Cagents {
                         } else {
                             self.sidebar_model.projects.push(sidebar_project);
                         }
+                        self.publish_project_creation_source(loaded.project.id, generation,
+                            loaded.creation_source.clone(),
+                            loaded.repository.as_ref().is_some_and(|repository| repository.is_bare));
                         self.sidebar_model
                             .apply_project_order(&self.durable.project_order);
                         self.sync_worktree_operation_rows();
