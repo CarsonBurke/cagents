@@ -9,7 +9,31 @@ use cagents::{
 };
 
 #[derive(Clone)]
-pub(crate) struct Journal(Arc<StateStore>);
+pub(crate) struct Journal {
+    store: Arc<StateStore>,
+    #[cfg(target_os = "linux")]
+    original: cagents::original_creation_journal::OriginalCreationJournalStore,
+}
+impl Journal {
+    /// Called by the actual original-open worker, after startup's ready OFD
+    /// exists. Keep the token beside the SAME creator connection; neither a
+    /// later path lookup nor another independently opened connection may stand
+    /// in for this owner.
+    #[cfg(target_os = "linux")]
+    fn from_original_store(store: Arc<StateStore>) -> Result<Self, String> {
+        let original = cagents::original_creation_journal::OriginalCreationJournalStore::from_standalone_editor(Arc::clone(&store))
+            .map_err(|error| format!("Worktree creation is unavailable because its original journal owner could not be verified: {error}"))?;
+        Ok(Self { store, original })
+    }
+    #[cfg(not(target_os = "linux"))]
+    fn from_original_store(_store: Arc<StateStore>) -> Result<Self, String> {
+        Err("Worktree creation requires the supported original editor journal owner on this platform.".into())
+    }
+    #[cfg(target_os = "linux")]
+    pub(super) fn original_creation_journal(&self) -> &cagents::original_creation_journal::OriginalCreationJournalStore {
+        &self.original
+    }
+}
 impl std::fmt::Debug for Journal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CheckoutJournal")
@@ -106,10 +130,11 @@ impl Editor {
             let result = tokio::task::spawn_blocking(move || {
                 let boot = cagents::session::current_boot_id().map_err(|e| e.to_string())?;
                 let store = Arc::new(StateStore::open(path, boot).map_err(|e| e.to_string())?);
+                let journal = Journal::from_original_store(store)?;
                 let reports = RepositoryService::system("git")
-                    .rehydrate_worktree_operations(&store)
+                    .rehydrate_worktree_operations(&journal.store)
                     .map_err(|e| e.to_string())?;
-                Ok((Journal(store), reports))
+                Ok((journal, reports))
             })
             .await
             .map_err(|e| e.to_string())
@@ -317,7 +342,7 @@ impl Editor {
                             RepositoryService::system("git").with_worktree_authority(original).map_err(|error| error.to_string())
                         });
                         Ok::<_, String>(match prepared {
-                            Ok(service) => cagents::pull_request_review::checkout::create_retained_with_service(&service, &journal.0, &request, &cancellation),
+                            Ok(service) => cagents::pull_request_review::checkout::create_retained_with_service(&service, &journal.store, &request, &cancellation),
                             Err(error) => RetainedWorktreeCreation::not_started(&request, 1, error),
                         })
                     })
