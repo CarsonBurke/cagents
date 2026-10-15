@@ -7234,6 +7234,26 @@ mod tests {
     }
 
     #[test]
+    fn registered_chat_latest_can_be_cleared_and_remapped_without_claiming_native_submit() {
+        use keyboard::key::{Code, Physical, Named};
+        let end = keyboard::Event::KeyPressed { key: keyboard::Key::Named(Named::End), modified_key: keyboard::Key::Named(Named::End), physical_key: Physical::Code(Code::End), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::CTRL, text: None, repeat: false };
+        let mut shortcuts = KeyboardShortcuts::default();
+        assert!(shortcuts.fault().is_none());
+        for focused in [FocusedPane::Chat, FocusedPane::ChatPane] { assert_eq!(global_shortcut(&end, &shortcuts, focused), Some(GlobalShortcut::ChatLatest)); }
+        for focused in [FocusedPane::TextInput, FocusedPane::Editor, FocusedPane::Terminal, FocusedPane::SidebarRows] { assert_eq!(global_shortcut(&end, &shortcuts, focused), None); }
+        shortcuts.chat_latest.clear();
+        assert_eq!(global_shortcut(&end, &shortcuts, FocusedPane::Chat), None);
+        shortcuts.chat_latest = vec!["Alt+F9".into()];
+        let remapped = keyboard::Event::KeyPressed { key: keyboard::Key::Named(Named::F9), modified_key: keyboard::Key::Named(Named::F9), physical_key: Physical::Code(Code::F9), location: keyboard::Location::Standard, modifiers: keyboard::Modifiers::ALT, text: None, repeat: false };
+        assert!(shortcuts.fault().is_none());
+        assert_eq!(global_shortcut(&remapped, &shortcuts, FocusedPane::Chat), Some(GlobalShortcut::ChatLatest));
+        assert_eq!(global_shortcut(&end, &shortcuts, FocusedPane::Chat), None);
+        for command in [GlobalShortcut::ChatSend, GlobalShortcut::ChatSteer, GlobalShortcut::ChatQueue, GlobalShortcut::ChatInterrupt] {
+            assert!(shortcut_keys(command, &KeyboardShortcuts::default()).is_empty(), "explicit aliases are distinct from native composer confirmation/cancel policy");
+        }
+    }
+
+    #[test]
     fn registered_browser_navigation_retires_old_aliases_and_preserves_native_fields() {
         use keyboard::key::{Code, Physical};
         let event = |named, code, modifiers| keyboard::Event::KeyPressed { key: keyboard::Key::Named(named), modified_key: keyboard::Key::Named(named), physical_key: Physical::Code(code), location: keyboard::Location::Standard, modifiers, text: None, repeat: false };
