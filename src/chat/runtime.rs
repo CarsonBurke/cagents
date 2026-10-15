@@ -3129,6 +3129,10 @@ impl Actor {
             _ => None,
         });
         let mut execution_events = Vec::new();
+        // A presentation-cache failure cannot erase a provider's already
+        // decoded final outcome later in this same frame. Keep processing
+        // bounded semantic proof, then return the original cache error.
+        let mut frame_error = None;
         for mut event in step.events {
             if let Event::Error { message, .. } | Event::HistoryError(message) = &mut event {
                 *message = super::protocol::preview(message.as_bytes(), 1024);
@@ -3159,21 +3163,21 @@ impl Actor {
                 } => Some(message.clone()),
                 _ => None,
             };
-            let events = self
-                .store
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .apply(event)?;
-            if events.is_empty() {
-                self.touch();
-            } else {
-                for event in events {
-                    self.apply(event);
+            // Clone only small semantic fields, never transcript/tool data.
+            let authority = matches!(&event, Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
+                | Event::Usage(_) | Event::Session { .. }).then(|| event.clone());
+            let events = if frame_error.is_some() { None } else {
+                match self.store.lock().unwrap_or_else(|p| p.into_inner()).apply(event) {
+                    Ok(events) => Some(events),
+                    Err(error) => { frame_error = Some(error); None }
                 }
+            };
+            match events {
+                Some(events) if events.is_empty() => self.touch(),
+                Some(events) => for event in events { self.apply(event); },
+                None => if let Some(event) = authority { self.apply(event); },
             }
-            if let Some(message) = fatal {
-                return Err(message);
-            }
+            if let Some(message) = fatal { frame_error.get_or_insert(message); }
         }
         // An outcome is acted on as soon as it is published, and its reader
         // asks which conversation produced it. Answer before announcing.
@@ -3211,7 +3215,7 @@ impl Actor {
             }
         }
         self.publish_activity();
-        Ok(())
+        match frame_error { Some(error) => Err(error), None => Ok(()) }
     }
     fn apply(&mut self, event: Event) {
         if matches!(&event, Event::PastTurnFinished { .. }) {
@@ -4209,6 +4213,66 @@ mod tests {
         let context = Arc::new(super::super::protocol::ExecutionContext::capture(path).unwrap());
         context.observe_provider_directory(path).unwrap();
         context
+    }
+
+    #[test]
+    fn final_provider_proof_survives_a_pending_transcript_flush_failure() {
+        struct FinalFrame { run: Option<crate::model::RunId> }
+        impl Adapter for FinalFrame {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step { events: vec![Event::Ready(true)], ..Default::default() }) }
+            fn command(&mut self, _: Command) -> Result<Step, String> { Err("use a correlated run".into()) }
+            fn command_for_run(&mut self, run: crate::model::RunId, _: Command) -> Result<Step, String> {
+                self.run = Some(run);
+                Ok(Step { writes: vec![serde_json::json!({"final":true})], events: vec![
+                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Started { key: "confirmed-provider-turn".into() } },
+                    Event::TurnStarted,
+                ] })
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                assert_eq!(frame, serde_json::json!({"final":true}));
+                let run = self.run.take().unwrap();
+                Ok(Step { writes: Vec::new(), events: vec![
+                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Scope },
+                    Event::TextDelta { id: "answer".into(), role: Role::Assistant, thinking: false, delta: "Partial response".into() },
+                    // Store flushes the pending delta here and fails. The
+                    // remaining typed provider proof must still be processed.
+                    Event::TurnSettled,
+                    Event::Item(crate::chat::Item { id: "answer".into(), role: Role::Assistant, started_at: None, at: None,
+                        content: ItemContent::Text { text: "Exact final response".into(), thinking: false, phase: Phase::Final } }),
+                    Event::Usage(Default::default()),
+                    Event::TurnFinished { key: Some("confirmed-provider-turn".into()), outcome: crate::notifications::Kind::Succeeded },
+                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Settled },
+                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } },
+                ] })
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(),
+            working_directory: directory.path().into(), environment: BTreeMap::new() };
+        let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None });
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (updates, receiver) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| { let _ = updates.send(update); }).unwrap();
+        until(&handle, |state| state.ready);
+        handle.0.store.lock().unwrap().refuse_writes_for_test();
+        let run = crate::model::RunId::new();
+        handle.command_for_run(run, Command::Prompt { text: "One accepted prompt".into(), attachments: Vec::new(), mode: crate::chat::PromptMode::Send }).unwrap();
+        until(&handle, |state| state.exited);
+        handle.close().unwrap();
+        let updates = receiver.try_iter().collect::<Vec<_>>();
+        let finished = updates.iter().filter_map(|update| match update {
+            Update::Execution { run: actual, update: crate::agent_execution::Update::Finished { state, result } } if *actual == run => Some((state, result)),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(finished.len(), 1, "the cache failure cannot synthesize a second terminal outcome: {updates:?}");
+        assert_eq!(*finished[0].0, crate::agent_execution::State::Succeeded);
+        assert_eq!(finished[0].1.text, "Exact final response");
+        let evidence = updates.iter().filter_map(|update| match update { Update::Attention(evidence) => Some(evidence), _ => None }).collect::<Vec<_>>();
+        assert_eq!(evidence.len(), 1, "known success must not be replaced by a cache-error failure alert");
+        assert_eq!(evidence[0].kind, crate::notifications::Kind::Succeeded);
+        assert!(handle.failure().is_some(), "the transcript I/O failure remains visible independently of provider success");
     }
 
     #[test]
