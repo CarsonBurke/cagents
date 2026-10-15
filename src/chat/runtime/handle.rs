@@ -29,6 +29,7 @@ impl Handle {
         let previous=previous.map(Handle::local_actor).transpose()?;
         LocalHandle::start_adopted(spec,adapter,initial,store,recovery,holder,previous,notify).map(|local|Self(Owner::Local(local)))
     }
+    pub(crate) fn restart_remote(&self,id:uuid::Uuid,spec:ProcessSpec,source:chat::Session,recovery_environment:BTreeMap<String,String>)->Result<super::remote_actor::RestartReceipt,String> {match &self.0 {Owner::Remote(remote)=>remote.restart(id,spec,source,recovery_environment),Owner::Local(_)=>Err("This actor is local; use its existing local restart owner".into())}}
     pub(crate) fn restart_environment(&self)->crate::terminal_ipc::ChatExecutionEnvironment {match &self.0 {Owner::Local(local)=>local.restart_environment(),Owner::Remote(remote)=>crate::terminal_ipc::ChatExecutionEnvironment(remote.restart_environment())}}
     /// The host selects this after preparing the exact authorized launch. It
     /// must drain/commit/ACK the outbox; ordinary notification is only a wakeup.

@@ -54,6 +54,7 @@ impl Journal {
         let db = Connection::open(path).map_err(|error| error.to_string())?;
         db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
             CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL);
+            CREATE TABLE restarts(id TEXT PRIMARY KEY,hash BLOB NOT NULL,state BLOB NOT NULL);
             CREATE TABLE retained_runs(run TEXT PRIMARY KEY,finished INTEGER);
             CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL);
             CREATE TABLE metadata(key TEXT PRIMARY KEY,value BLOB NOT NULL);
@@ -189,6 +190,19 @@ impl Journal {
     pub fn next_input(&self)->Result<u64,String> {self.number("input_sequence")?.checked_add(1).ok_or("Input sequence exhausted".into())}
     pub fn acknowledged(&self)->Result<u64,String> {self.number("outcome_ack")}
     pub fn latest(&self)->Result<u64,String> {let ack=self.acknowledged()?;self.db.query_row("SELECT COALESCE(MAX(sequence),?1) FROM outcomes",[ack],|row|row.get(0)).map_err(|error|error.to_string())}
+    pub fn restart(&self,id:uuid::Uuid,hash:&[u8;32])->Result<Option<super::restart::RestartState>,String> {
+        let row:Option<(Vec<u8>,Vec<u8>)>=self.db.query_row("SELECT hash,state FROM restarts WHERE id=?1",[id.to_string()],|row|Ok((row.get(0)?,row.get(1)?))).optional().map_err(|error|error.to_string())?;
+        row.map(|(stored,state)| {if stored.as_slice()!=hash {return Err("Restart identity was already used for a different launch".into());}serde_json::from_slice(&state).map_err(|error|error.to_string())}).transpose()
+    }
+    pub fn admit_restart(&mut self,id:uuid::Uuid,hash:&[u8;32])->Result<(),String> {
+        let count:usize=self.db.query_row("SELECT COUNT(*) FROM restarts",[],|row|row.get(0)).map_err(|error|error.to_string())?;
+        if count>=128 {return Err("Retained actor restart receipt capacity reached".into());}
+        self.db.execute("INSERT INTO restarts(id,hash,state) VALUES(?1,?2,?3)",params![id.to_string(),hash.as_slice(),serde_json::to_vec(&super::restart::RestartState::Accepted).map_err(|error|error.to_string())?]).map_err(|error|error.to_string())?;Ok(())
+    }
+    pub fn finish_restart(&mut self,id:uuid::Uuid,result:Result<crate::daemon::holder_registry::Process,String>)->Result<super::restart::RestartState,String> {
+        let state=super::restart::RestartState::Acknowledged(result);
+        self.db.execute("UPDATE restarts SET state=?1 WHERE id=?2",params![serde_json::to_vec(&state).map_err(|error|error.to_string())?,id.to_string()]).map_err(|error|error.to_string())?;Ok(state)
+    }
     fn number(&self,key:&str)->Result<u64,String> {
         let value:String=self.db.query_row("SELECT value FROM metadata WHERE key=?1",[key],|row|row.get(0)).map_err(|error|error.to_string())?;
         value.parse().map_err(|_|"Invalid actor journal sequence".into())
@@ -198,6 +212,16 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn restart_identity_is_deduplicated_before_any_replacement_effects() {
+        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),4096).unwrap();
+        let id=uuid::Uuid::new_v4();let hash=[5;32];journal.admit_restart(id,&hash).unwrap();
+        assert_eq!(journal.restart(id,&hash).unwrap(),Some(super::super::restart::RestartState::Accepted));
+        assert!(journal.restart(id,&[6;32]).is_err());
+        let process=crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap();
+        journal.finish_restart(id,Ok(process.clone())).unwrap();
+        assert_eq!(journal.restart(id,&hash).unwrap(),Some(super::super::restart::RestartState::Acknowledged(Ok(process))));
+    }
     #[test]
     fn accepted_run_survives_input_ack_and_finished_delivery_until_durable_outcome_ack() {
         let dir=tempfile::tempdir_in("/var/tmp").unwrap();
