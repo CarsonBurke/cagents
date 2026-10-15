@@ -6261,7 +6261,7 @@ mod tests {
         let CardKind::Terminal(terminal) = workspace.cards[0].kind.clone() else { panic!("terminal"); };
         let mut source = crate::chat::fresh_session(crate::agent::Provider::Claude, TerminalId::new(),
             terminal.launch.working_directory.clone(), &crate::account::Account::system(crate::agent::Provider::Claude)).unwrap();
-        source.proof = terminal.continuity.live_proof().cloned();
+        source.proof = terminal.continuity.live_proof();
         let binding = ChatSourceBinding { source: source.clone(), execution_instance: uuid::Uuid::new_v4(), backend: uuid::Uuid::new_v4() };
         let mut descriptor = TerminalDescriptor::relaunchable(terminal.id, terminal.launch.clone(), terminal.transcript_path.clone());
         descriptor.session = terminal;
