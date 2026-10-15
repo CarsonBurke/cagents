@@ -516,6 +516,11 @@ mod tests {
         for mode in [0o711, 0o1700, 0o2700] {
             fs::set_permissions(fixture.path(), fs::Permissions::from_mode(mode)).unwrap();
             let observed = held.metadata().unwrap();
+            if mode == 0o2700 && observed.mode() & 0o2000 == 0 {
+                // The kernel can strip SGID for an inherited non-member gid.
+                println!("RECOVERY_SGID_DRIFT_UNAVAILABLE: kernel cleared requested SGID");
+                continue;
+            }
             assert_ne!(observed.mode() & 0o7777, 0o700);
             assert!(verify_recovery_directory_private(&held, &expected).is_err());
             assert!(verify_recovery_directory_private(&held, &observed).is_err());
