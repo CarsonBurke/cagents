@@ -11,6 +11,9 @@ use thiserror::Error;
 use crate::fs_safety::{self, ResolveError, Root};
 
 mod presence;
+mod recovery;
+pub use recovery::RecoveryAuthority;
+pub(crate) use recovery::RecoverySlot;
 pub use presence::FileRestoration;
 pub(crate) use presence::{PresenceSave, save_document_file, save_document_file_at, capture_restoration_at};
 
@@ -280,6 +283,14 @@ pub enum FileIoError {
     OutsideWorktree,
     #[error("file operation failed: {0}")]
     Io(String),
+    #[error("file operation needs recovery: {message}")]
+    Recovery { message: String, authority: RecoveryAuthority },
+}
+
+impl FileIoError {
+    pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> {
+        match self { Self::Recovery { authority, .. } => Some(authority), _ => None }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +316,15 @@ pub enum SaveDurability {
     /// The new bytes are the live disk baseline even though crash durability is
     /// not guaranteed.
     Unconfirmed { error: String },
+    /// Live bytes are committed; producer-owned cleanup/recovery still needs
+    /// resolution. The UI must retain this authority rather than only its text.
+    Recovery { error: String, authority: RecoveryAuthority },
+}
+
+impl SaveDurability {
+    pub fn recovery_authority(&self) -> Option<&RecoveryAuthority> {
+        match self { Self::Recovery { authority, .. } => Some(authority), _ => None }
+    }
 }
 
 pub fn validate_repo_path(path: &Path) -> Result<(), FileIoError> {
