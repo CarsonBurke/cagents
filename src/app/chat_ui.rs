@@ -9001,8 +9001,11 @@ pub(super) fn show_chat_snapshot_for_test(
 ) -> usize {
     let requests = snapshot.requests.len();
     let items = snapshot.items.len();
-    let child_items: Vec<_> = snapshot.subagents.iter()
-        .map(|agent| (agent.id.clone(), agent.items.len())).collect();
+    let child_items: Vec<_> = snapshot
+        .subagents
+        .iter()
+        .map(|agent| (agent.id.clone(), agent.items.len()))
+        .collect();
     let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
         panic!("chat snapshot requires a chat runtime");
     };
@@ -9015,11 +9018,21 @@ pub(super) fn show_chat_snapshot_for_test(
         .replace_snapshot_for_test(snapshot);
     runtime.show(true);
     preparation::drain_fixture(runtime);
-    assert_eq!(runtime.snapshot.items.len(), items,
-        "visible fixtures must retain their published parent body");
-    assert_eq!(runtime.snapshot.subagents.iter()
-        .map(|agent| (agent.id.clone(), agent.items.len())).collect::<Vec<_>>(), child_items,
-        "visible fixtures must retain their published child bodies");
+    assert_eq!(
+        runtime.snapshot.items.len(),
+        items,
+        "visible fixtures must retain their published parent body"
+    );
+    assert_eq!(
+        runtime
+            .snapshot
+            .subagents
+            .iter()
+            .map(|agent| (agent.id.clone(), agent.items.len()))
+            .collect::<Vec<_>>(),
+        child_items,
+        "visible fixtures must retain their published child bodies"
+    );
     assert_eq!(
         runtime.snapshot.requests.len(),
         requests,
@@ -13206,7 +13219,10 @@ mod tests {
         let theme = crate::settings::EditorSyntaxTheme::Auto;
         let source = "x".repeat(6000);
         let renderer = crate::app::tests::headless_renderer();
-        let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(400.0, 200.0));
         for temporary in [false, true] {
             if !temporary {
@@ -13279,22 +13295,22 @@ mod tests {
                 .get("tool")
                 .map(|cached| cached.revision);
             let reply = executor.block_on(async {
-            let task = app.handle_chat_action(action);
-            let mut outputs =
-                iced::runtime::task::into_stream(task).expect("actual dispatch starts shaping");
-            tokio::time::timeout(Duration::from_secs(20), async {
-                while let Some(output) = outputs.next().await {
-                    if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
-                        action @ Action::FlowReady(..),
-                    ))) = output
-                    {
-                        return action;
+                let task = app.handle_chat_action(action);
+                let mut outputs =
+                    iced::runtime::task::into_stream(task).expect("actual dispatch starts shaping");
+                tokio::time::timeout(Duration::from_secs(20), async {
+                    while let Some(output) = outputs.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(
+                            Message::ChatUi(action @ Action::FlowReady(..)),
+                        )) = output
+                        {
+                            return action;
+                        }
                     }
-                }
-                panic!("flow task produced no completion");
-            })
-            .await
-            .expect("bounded fixture completion")
+                    panic!("flow task produced no completion");
+                })
+                .await
+                .expect("bounded fixture completion")
             });
             drop(app.handle_chat_action(reply));
             if !temporary {
