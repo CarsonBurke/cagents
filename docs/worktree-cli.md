@@ -36,16 +36,16 @@ live sessions. Close their sessions before removal. Window cards, editor scopes
 and setup preparation also retain directory protection; close those scopes
 before using the CLI to remove their checkout. `--force` preserves these active
 protection fences. It freshly checks modified,
-untracked, notable ignored, unpushed and detached-only work. `--force` explicitly
-confirms discarding those files and commits; a detached-only head is first
-preserved on a rescue branch. `--delete-branch` runs Git's safe `branch -d` after
+untracked, notable ignored, unpushed and detached-only work. `--force` acknowledges
+that local work and permits discarding files. The attached branch remains; a
+detached-only head is first preserved on a rescue branch. `--delete-branch` runs Git's safe `branch -d` after
 removal. It never force-deletes an unmerged branch; if Git refuses, the result
 explains that the worktree was removed and its branch retained.
 
 ## JSON version 1
 
 Every result uses the ordinary CLI `{ "ok", "command", "data" }` envelope.
-Failure uses the ordinary error envelope and a non-zero exit code. The `data`
+Failure writes the ordinary error envelope to stderr and uses a non-zero exit code. The `data`
 object has `schema_version: 1`:
 
 - `worktree.create`: `worktree`, `warnings` (strings), `setup` (null or
