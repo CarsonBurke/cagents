@@ -40,7 +40,7 @@ use std::{
 #[cfg(test)]
 use crate::process::WaitEvent;
 pub(crate) use crate::process::{CLEANUP_GRACE, DEFAULT_STDERR_LIMIT, process_failure};
-#[cfg(any(feature = "ui", test))]
+#[cfg(feature = "ui")]
 pub(crate) use crate::process::{SIGKILL, SIGTERM, TERMINATION_GRACE, signal_process_group};
 pub use crate::process::{
     CancellationToken, CommandSpec, FAILURE_DETAIL_LIMIT, ProcessExecutor, ProcessFailure,
@@ -6153,7 +6153,7 @@ pub(crate) struct GitFileLock {
 
 impl GitFileLock {
     /// Git removed the containing administrative directory itself.
-    #[cfg(any(feature = "host", test))]
+    #[cfg(feature = "host")]
     pub(crate) fn retired_with_directory(&mut self) {
         self.active = false;
     }

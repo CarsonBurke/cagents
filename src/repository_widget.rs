@@ -10754,7 +10754,7 @@ mod tests {
         #[derive(Clone)]
         enum ShellMessage {
             Preview,
-            Repository(RepositoryAction),
+            Repository { _action: RepositoryAction },
         }
         let card = CardId::new();
         let mut runtime = RepositoryRuntime::dirty_fixture(card);
@@ -10768,7 +10768,7 @@ mod tests {
                     .on_press(ShellMessage::Preview)
                     .into(),
             ),
-            ShellMessage::Repository,
+            |action| ShellMessage::Repository { _action: action },
         )
         .unwrap();
         let mut tree = Tree::new(toolbar.as_widget());

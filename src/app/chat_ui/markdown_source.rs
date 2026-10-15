@@ -998,7 +998,7 @@ mod tests {
             for cut in cuts {
                 let mut source = Source::default();
                 let mut given = String::new();
-                let mut take = |step: Step, given: &mut String| match step {
+                let take = |step: Step, given: &mut String| match step {
                     Step::Append(text) => given.push_str(&text),
                     Step::Restart(text) => *given = text,
                 };

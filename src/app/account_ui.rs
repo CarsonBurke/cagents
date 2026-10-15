@@ -5499,7 +5499,7 @@ mod tests {
         assert_eq!(exhausted.tone, ChipTone::Exhausted);
         assert!(exhausted.essential, "a narrow bar still says 0% left");
         assert_eq!(tone(0.95, UsageStatus::Ok).tone, ChipTone::Exhausted);
-        assert_eq!(ChipTone::Current.color(), None);
+        assert!(ChipTone::Current.color().is_none());
         assert!(ChipTone::Exhausted.color().is_some());
 
         // Old figures stay muted however low they were.

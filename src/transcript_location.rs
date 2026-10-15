@@ -119,7 +119,7 @@ fn open_in(
     })
 }
 
-#[cfg(any(feature = "host", test))]
+#[cfg(feature = "host")]
 pub(crate) fn capture(
     terminal: TerminalId,
     path: &Path,
