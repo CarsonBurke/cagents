@@ -20,6 +20,7 @@ OWNER_COUNTERS = {
     "chat_runtime": ("resident_bytes", "cache_entries", "exposed_presentation_bytes"),
     "chat_client": ("resident_bytes",),
     "chat_offline": ("pending_bytes", "in_flight_bytes", "io_buffer_capacity", "disk_bytes"),
+    "chat_source_pool": ("admitted_bytes", "reserved_bytes"),
     "ipc": ("read_capacity", "write_capacity"),
 }
 
@@ -61,10 +62,12 @@ def trace_owners(log, pid=None):
                     stacks.pop((thread, base), None)
                     stacks[(thread, base)] = (size, guard, role)
             elif owner in owners:
-                identity = fields.get({"ipc": "codec", "chat_offline": "offline_id"}.get(owner, "chat_id"))
+                identity = fields.get({"ipc": "codec", "chat_offline": "offline_id", "chat_source_pool": "pool_id"}.get(owner, "chat_id"))
                 try:
                     if not identity or not line.endswith("\n"):
                         raise ValueError("unfinished owner event")
+                    if owner == "chat_source_pool" and (identity != "1" or fields.get("accounting") != "logical_source_payload"):
+                        raise ValueError("unknown shared source accounting schema")
                     # A partial write or a probe schema mismatch must not turn a
                     # previously measured owner into a fabricated zero-byte owner.
                     counters = [int(fields[key]) for key in OWNER_COUNTERS[owner]]
@@ -178,12 +181,15 @@ def main():
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     owners, stacks, coverage = trace_owners(args.log, args.pid)
-    report = {"schema_version": 3, "owner_totals": owner_totals(owners),
+    report = {"schema_version": 4, "owner_totals": owner_totals(owners),
               "trace_coverage": coverage,
               "incomplete_events_preserve_last_complete_owner_sample": True,
               "body_bytes_are_arc_references_not_unique_heap": True,
               "exposed_presentation_bytes_omit_opaque_parser_and_renderer": True,
               "offline_pending_bytes_are_shared_arc_references": True,
+              "source_pool_is_one_latest_global_sample_per_process": True,
+              "source_pool_payload_and_reservations_are_not_rss": True,
+              "source_pool_prunes_weak_owners_on_observation": True,
               "offline_partial_deserializer_allocations_are_opaque": True,
               "offline_disk_bytes_are_unlinked_files_not_ui_heap": True}
     if args.pid:

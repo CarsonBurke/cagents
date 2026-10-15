@@ -68,6 +68,16 @@ class OwnerCensus(unittest.TestCase):
             + prefix + 'released=true pending_bytes=0 in_flight_bytes=0 io_buffer_capacity=0 disk_bytes=0\n')
         self.assertEqual(CENSUS["owner_totals"](owners)["chat_offline"]["owners"], 0)
 
+    def test_shared_source_pool_uses_latest_global_sample_not_runtime_sum(self):
+        prefix = 'cagents::memory: process_id=42 owner="chat_source_pool" pool_id=1 accounting="logical_source_payload" '
+        owners, _, coverage = self.parse(prefix + 'admitted_bytes=8192 reserved_bytes=4096\n'
+            + prefix + 'admitted_bytes=16384 reserved_bytes=0\n'
+            + prefix + 'admitted_bytes=0\n'
+            + prefix.replace('pool_id=1', 'pool_id=2') + 'admitted_bytes=99 reserved_bytes=0\n')
+        self.assertEqual(CENSUS["owner_totals"](owners)["chat_source_pool"], {
+            "owners": 1, "admitted_bytes": 16384, "reserved_bytes": 0})
+        self.assertEqual(coverage["incomplete_owner_events"], 2)
+
     def test_mapping_intersections_do_not_prorate_partial_vmas(self):
         result = CENSUS["stack_totals"]([(4096, 8192), (8192, 4096)], [
             {"start": 4096, "end": 8192, "Rss": 8, "Pss": 7},
