@@ -1,4 +1,11 @@
-use std::{cell::Cell, collections::HashMap, mem, rc::Rc, sync::{Arc, LazyLock}, time::Duration};
+use std::{
+    cell::Cell,
+    collections::HashMap,
+    mem,
+    rc::Rc,
+    sync::{Arc, LazyLock},
+    time::Duration,
+};
 
 use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
@@ -85,7 +92,6 @@ pub enum GlobalShortcut {
     MarkAllRead,
     SearchInProject,
     CloneRepository,
-
 
     CommandPalette,
     NewThread,
@@ -352,7 +358,10 @@ impl ShortcutDescriptor {
         {
             "Navigation"
         } else if self.scope == ShortcutScope::Chat
-            || matches!(self.action, GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread)
+            || matches!(
+                self.action,
+                GlobalShortcut::ResumeConversation | GlobalShortcut::NewThread
+            )
         {
             "Chat"
         } else if self.scope == ShortcutScope::Review {
@@ -378,10 +387,14 @@ impl ShortcutDescriptor {
         match self.action {
             GlobalShortcut::NewWorktree => context.active_git_project,
             GlobalShortcut::MarkAllRead => context.has_unread,
-            GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => context.has_attention,
+            GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => {
+                context.has_attention
+            }
             GlobalShortcut::CycleWorkspace(_) => context.can_cycle_workspace,
             GlobalShortcut::SearchInProject => context.can_search_project,
-            GlobalShortcut::ReviewToggleViewed | GlobalShortcut::ReviewNextUnviewed => context.is_pull_request,
+            GlobalShortcut::ReviewToggleViewed | GlobalShortcut::ReviewNextUnviewed => {
+                context.is_pull_request
+            }
             GlobalShortcut::ChatAccount => context.chat_account,
             GlobalShortcut::ChatModel => context.chat_model,
             GlobalShortcut::ChatPermissions => context.chat_permissions,
@@ -899,10 +912,10 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
         repeatable: false,
         scope: ShortcutScope::Workspace,
     },
-
 ];
 
-static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> = LazyLock::new(KeyboardShortcuts::default);
+static DEFAULT_KEYBOARD_SHORTCUTS: LazyLock<KeyboardShortcuts> =
+    LazyLock::new(KeyboardShortcuts::default);
 
 pub fn default_shortcut_keys(action: GlobalShortcut) -> &'static [String] {
     shortcut_keys(action, &DEFAULT_KEYBOARD_SHORTCUTS)
@@ -956,7 +969,6 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::MarkAllRead => &shortcuts.mark_all_read,
         GlobalShortcut::SearchInProject => &shortcuts.search_in_project,
         GlobalShortcut::CloneRepository => &shortcuts.clone_repository,
-
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,
         GlobalShortcut::NewThread => &shortcuts.new_native_thread,
@@ -5397,16 +5409,19 @@ mod tests {
     #[test]
     fn every_shortcut_descriptor_has_a_unique_configurable_binding() {
         let shortcuts = KeyboardShortcuts::default();
-        let mut bindings = HashSet::new();
+        assert!(shortcuts.fault().is_none(), "defaults obey binding scope and reservation policy");
+        let mut identities = HashSet::new();
         for descriptor in GLOBAL_SHORTCUT_DESCRIPTORS {
             assert!(!descriptor.label.is_empty());
+            assert!(identities.insert(descriptor.id()), "registered IDs are unique");
+            let index = KeyboardShortcuts::action_names().iter().position(|id| *id == descriptor.id()).expect("every descriptor is configurable");
             let keys = shortcut_keys(descriptor.action, &shortcuts);
-            assert!(!keys.is_empty());
+            assert_eq!(keys, shortcuts.actions()[index]);
+            if keys.is_empty() {
+                assert!(!crate::settings::shortcut_required(index), "only optional actions may start unbound");
+            }
             for chord in keys {
                 assert!(parse_shortcut(chord).is_ok());
-                // Distinct across every action, not merely within one, or a
-                // chord would dispatch to whichever descriptor came first.
-                assert!(bindings.insert(chord.clone()));
             }
             // The one-line form the dialog shows has to read back as the same
             // chords, or editing a two-chord action there would drop one.

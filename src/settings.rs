@@ -515,7 +515,6 @@ impl KeyboardShortcuts {
             &self.mark_all_read,
             &self.search_in_project,
             &self.clone_repository,
-
         ]
     }
 
@@ -604,7 +603,11 @@ impl KeyboardShortcuts {
     }
 
     pub fn set_action(&mut self, index: usize, chords: Vec<String>) {
-        *self.actions_mut().into_iter().nth(index).expect("known shortcut action") = chords;
+        *self
+            .actions_mut()
+            .into_iter()
+            .nth(index)
+            .expect("known shortcut action") = chords;
     }
 
     fn validate(&self) -> Result<(), SettingsError> {
@@ -727,7 +730,6 @@ const SHORTCUT_ACTIONS: [&str; 77] = [
     "mark_all_read",
     "search_in_project",
     "clone_repository",
-
 ];
 
 /// An action a shortcut table cannot bind.
@@ -1910,7 +1912,6 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 72] = [
     "mark_all_read",
     "search_in_project",
     "clone_repository",
-
 ];
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
@@ -3341,7 +3342,10 @@ mod tests {
             let chords = vec!["Ctrl+Alt+Shift+K".to_owned()];
             shortcuts.set_action(index, chords.clone());
             let serialized = toml::Value::try_from(&shortcuts).unwrap();
-            assert_eq!(serialized.get(*name).unwrap().as_array().unwrap(), &[toml::Value::String(chords[0].clone())]);
+            assert_eq!(
+                serialized.get(*name).unwrap().as_array().unwrap(),
+                &[toml::Value::String(chords[0].clone())]
+            );
             assert_eq!(shortcuts.actions()[index], &chords);
         }
     }

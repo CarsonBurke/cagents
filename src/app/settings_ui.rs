@@ -1012,7 +1012,11 @@ fn settings_layout<'a>(
     width: f32,
 ) -> Element<'a, Message> {
     let (feedback, invalid) = (context.feedback, context.invalid);
-    let content_max_width = if category == SettingsCategory::Keyboard { 960.0 } else { CONTENT_MAX_WIDTH };
+    let content_max_width = if category == SettingsCategory::Keyboard {
+        960.0
+    } else {
+        CONTENT_MAX_WIDTH
+    };
     let narrow = width < RAIL_BREAKPOINT;
     let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
@@ -1221,7 +1225,8 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
 }
 
 fn shortcut_group(field: SettingsField) -> &'static str {
-    workspace_widget::shortcut_descriptor(field.shortcut_action().expect("shortcut field")).category()
+    workspace_widget::shortcut_descriptor(field.shortcut_action().expect("shortcut field"))
+        .category()
 }
 
 fn keyboard_groups<'a>(
@@ -1239,7 +1244,11 @@ fn keyboard_groups<'a>(
             .filter(|field| shortcut_group(*field) == group)
             .map(|field| {
                 let action = field.shortcut_action().expect("shortcut field");
-                let value = shortcut_values.iter().find(|(candidate, _)| *candidate == action).expect("registered draft").1;
+                let value = shortcut_values
+                    .iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered draft")
+                    .1;
                 shortcut_input(
                     field.label(),
                     value,
@@ -1364,8 +1373,14 @@ fn shortcut_input<'a>(
         }
     }
     let row = widget::row::with_children(vec![
-        design::body(format!("{label}{required}")).width(Length::FillPortion(3)).into(),
-        widget::row::with_children(controls).spacing(2).align_y(Alignment::Center).width(Length::FillPortion(4)).into(),
+        design::body(format!("{label}{required}"))
+            .width(Length::FillPortion(3))
+            .into(),
+        widget::row::with_children(controls)
+            .spacing(2)
+            .align_y(Alignment::Center)
+            .width(Length::FillPortion(4))
+            .into(),
         design::caption(source).width(64).into(),
         {
             let action_key = KeyboardShortcuts::action_names()[index];
@@ -1424,18 +1439,47 @@ mod keyboard_table_tests {
 
     #[test]
     fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
-        use iced::{Size, advanced::{layout, widget::Tree}};
+        use iced::{
+            Size,
+            advanced::{layout, widget::Tree},
+        };
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let draft = SettingsDraft::from_settings(&AppSettings::default());
         let invalid = HashMap::new();
         for field in SettingsField::SHORTCUTS {
             let action = field.shortcut_action().unwrap();
-            let value = draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).unwrap().1;
-            let row = shortcut_input(field.label(), value, field, &draft.keyboard_shortcuts, &invalid);
-            let mut element = settings_group("Keyboard", "", vec![row]).compact().view("Keyboard", "").unwrap();
+            let value = draft
+                .keyboard_shortcuts
+                .shortcut_values()
+                .into_iter()
+                .find(|(candidate, _)| *candidate == action)
+                .unwrap()
+                .1;
+            let row = shortcut_input(
+                field.label(),
+                value,
+                field,
+                &draft.keyboard_shortcuts,
+                &invalid,
+            );
+            let mut element = settings_group("Keyboard", "", vec![row])
+                .compact()
+                .view("Keyboard", "")
+                .unwrap();
             let mut tree = Tree::new(element.as_widget());
-            let height = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0))).size().height;
-            assert!(height <= 64.0, "{field:?} must keep its key chip, Record and Reset on one line; group height was {height}");
+            let height = element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0)),
+                )
+                .size()
+                .height;
+            assert!(
+                height <= 64.0,
+                "{field:?} must keep its key chip, Record and Reset on one line; group height was {height}"
+            );
         }
     }
 

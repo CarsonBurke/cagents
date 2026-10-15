@@ -17,7 +17,11 @@ pub fn reveal_list_selection<Message: Send + 'static>(
 
 /// Reveal a selected region in a list that also contains section headings.
 /// The actual mounted viewport and offset decide whether any scroll is needed.
-pub fn reveal_list_region<Message: Send + 'static>(id: Id, top: f32, height: f32) -> iced::Task<Message> {
+pub fn reveal_list_region<Message: Send + 'static>(
+    id: Id,
+    top: f32,
+    height: f32,
+) -> iced::Task<Message> {
     iced::advanced::widget::operate(RevealSelection { id, top, height })
 }
 

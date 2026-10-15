@@ -2653,7 +2653,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::ChromeUi(chrome_ui::Action::Launch(_))
             | Message::FocusCard(_)
             | Message::Palette(palette_ui::Action::FocusPane(_))
-        | Message::FocusAttention(_)
+            | Message::FocusAttention(_)
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
@@ -2867,7 +2867,6 @@ pub enum SettingsField {
     ShortcutMarkAllRead,
     ShortcutSearchInProject,
     ShortcutCloneRepository,
-
 }
 
 impl SettingsField {
@@ -2950,7 +2949,6 @@ impl SettingsField {
         Self::ShortcutMarkAllRead,
         Self::ShortcutSearchInProject,
         Self::ShortcutCloneRepository,
-
     ];
 
     /// The label the settings pane shows for this setting, which is also
@@ -3031,7 +3029,6 @@ impl SettingsField {
             Self::ShortcutMarkAllRead => "Mark all as read",
             Self::ShortcutSearchInProject => "Search in project",
             Self::ShortcutCloneRepository => "Clone repository",
-
 
             Self::ShortcutCommandPalette => "Command palette",
             Self::ShortcutNewThread => "New thread",
@@ -3271,7 +3268,6 @@ struct ShortcutDraft {
     search_in_project: String,
     clone_repository: String,
 
-
     command_palette: String,
     new_native_thread: String,
     chat_permissions: String,
@@ -3357,7 +3353,6 @@ impl ShortcutDraft {
             mark_all_read: settings::format_chords(&shortcuts.mark_all_read),
             search_in_project: settings::format_chords(&shortcuts.search_in_project),
             clone_repository: settings::format_chords(&shortcuts.clone_repository),
-
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
             new_native_thread: settings::format_chords(&shortcuts.new_native_thread),
@@ -3654,9 +3649,12 @@ impl SettingsDraft {
             }
             SettingsField::ShortcutSettingsAbout => self.keyboard_shortcuts.settings_about = value,
             SettingsField::ShortcutMarkAllRead => self.keyboard_shortcuts.mark_all_read = value,
-            SettingsField::ShortcutSearchInProject => self.keyboard_shortcuts.search_in_project = value,
-            SettingsField::ShortcutCloneRepository => self.keyboard_shortcuts.clone_repository = value,
-
+            SettingsField::ShortcutSearchInProject => {
+                self.keyboard_shortcuts.search_in_project = value
+            }
+            SettingsField::ShortcutCloneRepository => {
+                self.keyboard_shortcuts.clone_repository = value
+            }
 
             SettingsField::ShortcutCommandPalette => {
                 self.keyboard_shortcuts.command_palette = value
@@ -7938,12 +7936,15 @@ impl Cagents {
             .into_iter()
             .map(|card| {
                 if (self.sidebar_state.has_card_update(card)
-                    || self.sidebar_state.card_attention(card).is_some_and(sidebar::AttentionState::needs_attention))
+                    || self
+                        .sidebar_state
+                        .card_attention(card)
+                        .is_some_and(sidebar::AttentionState::needs_attention))
                     && let Some(channel) = self
-                    .durable
-                    .channels
-                    .iter()
-                    .find(|channel| channel.cards.contains(&card))
+                        .durable
+                        .channels
+                        .iter()
+                        .find(|channel| channel.cards.contains(&card))
                 {
                     self.sidebar_state.retain_attention_channel(channel.id);
                 }
@@ -7965,7 +7966,10 @@ impl Cagents {
     }
 
     fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
-        if self.workspace_inputs_blocked() || self.focused_repository_is_saving() || self.update_prepared {
+        if self.workspace_inputs_blocked()
+            || self.focused_repository_is_saving()
+            || self.update_prepared
+        {
             return Task::none();
         }
         let Some(card) = self
@@ -8371,8 +8375,16 @@ impl Cagents {
                 .map(|card| self.repository_chrome(card).0)
                 .unwrap_or(Cow::Borrowed(APPLICATION_NAME));
             let showing = showing.trim();
-            let showing = if showing.is_empty() { APPLICATION_NAME } else { showing };
-            if self.core.window.header_title == showing && self.window_waiting_count == self.sidebar_state.waiting_count() { return Task::none(); }
+            let showing = if showing.is_empty() {
+                APPLICATION_NAME
+            } else {
+                showing
+            };
+            if self.core.window.header_title == showing
+                && self.window_waiting_count == self.sidebar_state.waiting_count()
+            {
+                return Task::none();
+            }
             showing.to_owned()
         };
         let waiting = self.sidebar_state.waiting_count();
@@ -26379,11 +26391,20 @@ mod tests {
         let project = ProjectId::new();
         let primary = WorktreeId::new();
         let linked = WorktreeId::new();
-        let roots = [(primary, "/repo", "main"), (linked, "/repo/.worktrees/login", "feature/login")];
+        let roots = [
+            (primary, "/repo", "main"),
+            (linked, "/repo/.worktrees/login", "feature/login"),
+        ];
         let mut cards = Vec::new();
-        for directory in ["/repo/.worktrees/login/src", "/repo/.worktrees/login/tests", "/repo/src"] {
+        for directory in [
+            "/repo/.worktrees/login/src",
+            "/repo/.worktrees/login/tests",
+            "/repo/src",
+        ] {
             let mut card = terminal_card_state();
-            let CardKind::Terminal(session) = &mut card.kind else { unreachable!() };
+            let CardKind::Terminal(session) = &mut card.kind else {
+                unreachable!()
+            };
             session.launch.working_directory = directory.into();
             app.cards.insert(card.id, CardRuntime::Loading);
             cards.push(card);
@@ -26392,30 +26413,85 @@ mod tests {
         let channel = ChannelId::new();
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.extend(cards);
-        durable.channels.push(ProjectChannel { title_source: Default::default(), id: channel, project_id: project, title: "Login".into(), ordinal: 0, shared: false, cards: ids[..2].to_vec(), focused: Some(ids[0]) });
-        app.observe_agent_activity_for_card(ids[0], Some(Activity { provider: Provider::Omp, state: ActivityState::Working }));
-        app.observe_agent_activity_for_card(ids[1], Some(Activity { provider: Provider::Omp, state: ActivityState::Waiting }));
+        durable.channels.push(ProjectChannel {
+            title_source: Default::default(),
+            id: channel,
+            project_id: project,
+            title: "Login".into(),
+            ordinal: 0,
+            shared: false,
+            cards: ids[..2].to_vec(),
+            focused: Some(ids[0]),
+        });
+        app.observe_agent_activity_for_card(
+            ids[0],
+            Some(Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Working,
+            }),
+        );
+        app.observe_agent_activity_for_card(
+            ids[1],
+            Some(Activity {
+                provider: Provider::Omp,
+                state: ActivityState::Waiting,
+            }),
+        );
         assert!(app.agent_worktree(ids[0]).is_none());
         app.sidebar_model.projects.push(SidebarProject::new(
-            project, RepositoryId::new(), "Repository".into(), "/repo".into(),
-            roots.into_iter().map(|(id, path, branch)| SidebarWorktree::new(id, path.into(), Some(branch.into()), false, false, None, None, None)).collect(), Vec::new(),
+            project,
+            RepositoryId::new(),
+            "Repository".into(),
+            "/repo".into(),
+            roots
+                .into_iter()
+                .map(|(id, path, branch)| {
+                    SidebarWorktree::new(
+                        id,
+                        path.into(),
+                        Some(branch.into()),
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            Vec::new(),
         ));
-        app.known_worktree_roots = roots.into_iter().map(|(_, path, _)| PathBuf::from(path)).collect();
+        app.known_worktree_roots = roots
+            .into_iter()
+            .map(|(_, path, _)| PathBuf::from(path))
+            .collect();
         assert!(app.reconcile_agent_attention_owners());
         app.refresh_sidebar_channels();
-        assert_eq!(app.sidebar_state.agent_activity(project, linked), Some(ActivityState::Waiting));
-        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, linked),
+            Some(ActivityState::Waiting)
+        );
+        assert_eq!(
+            app.sidebar_state.worktree_attention(project, linked),
+            Some(sidebar::AttentionState::Waiting)
+        );
         let row = &app.sidebar_model.projects[0].channels[0];
         assert_eq!(row.worktree, Some((linked, "feature/login".into())));
         assert!(row.tooltip.contains("feature/login"));
-        for id in &ids { app.observe_agent_update_for_card(*id); }
-        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(project, linked))));
+        for id in &ids {
+            app.observe_agent_update_for_card(*id);
+        }
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+            project, linked,
+        ))));
         assert!(!app.sidebar_state.has_card_update(ids[0]));
         assert!(!app.sidebar_state.has_card_update(ids[1]));
         assert!(app.sidebar_state.has_card_update(ids[2]));
         drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
         assert!(!app.sidebar_state.has_card_update(ids[2]));
-        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+        assert_eq!(
+            app.sidebar_state.worktree_attention(project, linked),
+            Some(sidebar::AttentionState::Waiting)
+        );
     }
 
     #[test]
@@ -26426,18 +26502,40 @@ mod tests {
         let other = terminal_card_state();
         let target = other.id;
         let project = ProjectId::new();
-        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Attention".into(), "/tmp".into(), Vec::new(), Vec::new()));
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project,
+            RepositoryId::new(),
+            "Attention".into(),
+            "/tmp".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
         let channels = [ChannelId::new(), ChannelId::new()];
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.push(other);
         for (index, card) in [first, target].into_iter().enumerate() {
-            durable.channels.push(ProjectChannel { title_source: Default::default(), id: channels[index], project_id: project, title: format!("Channel{index}"), ordinal: index as u32, shared: false, cards: vec![card], focused: Some(card) });
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
+                id: channels[index],
+                project_id: project,
+                title: format!("Channel{index}"),
+                ordinal: index as u32,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
         }
         drop(app.select_channel(channels[0]));
         app.sidebar_state.observe_card_update(target);
-        drop(app.update(Message::Repository(RepositoryAction::Save { card: first, overwrite: false })));
+        drop(app.update(Message::Repository(RepositoryAction::Save {
+            card: first,
+            overwrite: false,
+        })));
         assert!(app.focused_repository_is_saving());
-        for command in [workspace_widget::GlobalShortcut::NextAttention, workspace_widget::GlobalShortcut::PreviousAttention] {
+        for command in [
+            workspace_widget::GlobalShortcut::NextAttention,
+            workspace_widget::GlobalShortcut::PreviousAttention,
+        ] {
             drop(app.update(Message::RunCommand(command)));
             assert_eq!(app.workspace.focused(), Some(first));
             assert_eq!(app.durable.active_channel, Some(channels[0]));

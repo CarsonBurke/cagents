@@ -3297,17 +3297,38 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
-    pub(super) fn chat_control_available(&self, card: CardId, command: crate::workspace_widget::GlobalShortcut) -> bool {
+    pub(super) fn chat_control_available(
+        &self,
+        card: CardId,
+        command: crate::workspace_widget::GlobalShortcut,
+    ) -> bool {
         use crate::workspace_widget::GlobalShortcut;
-        if self.chat_start_pending(card) { return false; }
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else { return false; };
+        if self.chat_start_pending(card) {
+            return false;
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return false;
+        };
         match command {
-            GlobalShortcut::ChatAccount => runtime.choosing()
-                && self.chat_accounts(runtime.session.launch.provider, &runtime.session.launch.recipe).is_some(),
-            GlobalShortcut::ChatModel => runtime.is_draft()
-                || (runtime.snapshot.capabilities.model_selection && !runtime.snapshot.models.is_empty()),
-            GlobalShortcut::ChatPermissions => !runtime.snapshot.capabilities.permission_modes.is_empty()
-                && !(runtime.session.launch.provider == Provider::Codex && runtime.snapshot.busy),
+            GlobalShortcut::ChatAccount => {
+                runtime.choosing()
+                    && self
+                        .chat_accounts(
+                            runtime.session.launch.provider,
+                            &runtime.session.launch.recipe,
+                        )
+                        .is_some()
+            }
+            GlobalShortcut::ChatModel => {
+                runtime.is_draft()
+                    || (runtime.snapshot.capabilities.model_selection
+                        && !runtime.snapshot.models.is_empty())
+            }
+            GlobalShortcut::ChatPermissions => {
+                !runtime.snapshot.capabilities.permission_modes.is_empty()
+                    && !(runtime.session.launch.provider == Provider::Codex
+                        && runtime.snapshot.busy)
+            }
             _ => false,
         }
     }
@@ -3322,13 +3343,21 @@ impl Cagents {
         let Some(card) = self.workspace.focused() else {
             return Task::none();
         };
-        if !self.chat_control_available(card, command) { return Task::none(); }
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else { return Task::none(); };
+        if !self.chat_control_available(card, command) {
+            return Task::none();
+        }
+        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
+            return Task::none();
+        };
         let target = runtime.target;
         let action = match command {
             GlobalShortcut::ChatAccount => Action::AccountPicker(target, !runtime.account_picker),
-            GlobalShortcut::ChatModel => Action::ModelPicker(target, runtime.model_picker.is_none()),
-            GlobalShortcut::ChatPermissions => Action::PermissionPicker(target, !runtime.permission_picker),
+            GlobalShortcut::ChatModel => {
+                Action::ModelPicker(target, runtime.model_picker.is_none())
+            }
+            GlobalShortcut::ChatPermissions => {
+                Action::PermissionPicker(target, !runtime.permission_picker)
+            }
             _ => return Task::none(),
         };
         let permission_controls = runtime.permission_controls(
@@ -11267,8 +11296,15 @@ mod tests {
             snapshot.capabilities.model_selection = false;
             snapshot.capabilities.permission_modes.clear();
         }
-        for command in [Command::ChatAccount, Command::ChatModel, Command::ChatPermissions] {
-            assert!(!app.command_available(command), "unavailable live control: {command:?}");
+        for command in [
+            Command::ChatAccount,
+            Command::ChatModel,
+            Command::ChatPermissions,
+        ] {
+            assert!(
+                !app.command_available(command),
+                "unavailable live control: {command:?}"
+            );
         }
         {
             let snapshot = Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot);
@@ -11279,12 +11315,27 @@ mod tests {
         }
         assert!(app.command_available(Command::ChatModel));
         assert!(app.command_available(Command::ChatPermissions));
-        assert!(!app.command_available(Command::ChatAccount), "live conversations cannot select a draft account");
+        assert!(
+            !app.command_available(Command::ChatAccount),
+            "live conversations cannot select a draft account"
+        );
         Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).busy = true;
-        assert!(!app.command_available(Command::ChatPermissions), "busy Codex cannot change permissions");
-        app.chat_runtime_mut(target).unwrap().attachment_chooser_pending = true;
-        for command in [Command::ChatAccount, Command::ChatModel, Command::ChatPermissions] {
-            assert!(!app.command_available(command), "pending start control: {command:?}");
+        assert!(
+            !app.command_available(Command::ChatPermissions),
+            "busy Codex cannot change permissions"
+        );
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .attachment_chooser_pending = true;
+        for command in [
+            Command::ChatAccount,
+            Command::ChatModel,
+            Command::ChatPermissions,
+        ] {
+            assert!(
+                !app.command_available(command),
+                "pending start control: {command:?}"
+            );
         }
     }
 
