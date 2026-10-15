@@ -1379,6 +1379,28 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_hidden_source_baseline_distinguishes_a_later_rotation() {
+        let mut runtime = runtime();runtime.visible.store(false, Ordering::Relaxed);
+        runtime.recovery.submitting(&runtime.snapshot, &Command::Prompt {
+            text: "explicit hidden branch input".into(), attachments: vec![], mode: PromptMode::Send,
+        });
+        let mut prompt = runtime.recovery.submitted.take().unwrap();prompt.origin_backend = true;
+        runtime.recovery.prepared_prompt = Some(Arc::new(prompt));runtime.recovery.connection_replaced();
+        let weak = Arc::downgrade(runtime.recovery.prepared_prompt.as_ref().unwrap());
+        let first = Some(uuid::Uuid::from_u128(1));
+        runtime.revoke_changed_source_originals(first);runtime.forget_transcript();
+        runtime.recovery.record_source(first);
+        assert!(weak.upgrade().is_some(), "first hidden attachment preserves intentional branch input");
+        assert!(runtime.recovery.submitted.is_none());assert!(runtime.recovery.originals.metadata.is_none());
+        assert!(runtime.cache.is_empty(), "recording a source baseline hydrates no transcript");
+        runtime.replace_draft(text_editor::Content::with_text("typed while hidden"));
+        runtime.revoke_changed_source_originals(Some(uuid::Uuid::from_u128(2)));
+        runtime.forget_transcript();runtime.recovery.record_source(Some(uuid::Uuid::from_u128(2)));
+        assert!(weak.upgrade().is_none(), "a second hidden source is an actual known-source rotation");
+        assert_eq!(runtime.composer.text(), "typed while hidden");
+    }
+
+    #[test]
     fn edited_send_keeps_private_dispatch_bytes_and_carries_only_display_hint() {
         let mut runtime = runtime();
         runtime.recovery.attachment_labels.insert(

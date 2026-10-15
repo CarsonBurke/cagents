@@ -145,6 +145,11 @@ impl State {
     pub(super) fn source_changed(&self, incarnation: Option<uuid::Uuid>) -> bool {
         self.source_incarnation.is_some() && self.source_incarnation != incarnation
     }
+    /// Metadata-only attachment baseline, including parked/hidden views.
+    /// This grants neither original-input eligibility nor transcript ownership.
+    pub(super) fn record_source(&mut self, incarnation: Option<uuid::Uuid>) {
+        self.source_incarnation = incarnation;
+    }
     pub fn observe(&mut self, snapshot: &Snapshot) {
         // A known source lifetime changing inside one connection proves that
         // old read/replay eligibility ended, even if Session was coalesced.
@@ -173,7 +178,7 @@ impl State {
                 self.prepared_prompt = None;
             }
         }
-        self.source_incarnation = snapshot.source_incarnation;
+        self.record_source(snapshot.source_incarnation);
         self.last_user = None;
         self.last_assistant = None;
         self.assistant_user = None;
