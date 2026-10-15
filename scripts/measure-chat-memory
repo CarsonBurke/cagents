@@ -229,12 +229,21 @@ def main():
         manifest = root / ("actors-cycle" + str(args.cycle) + ".json")
         if args.action == "seed":
             cli_call(args.cli, env, ["project", "open", str(root / "project")], root)
+            channel_path = root / "channel.json"
+            if channel_path.exists():
+                channel = json.loads(channel_path.read_text())
+            else:
+                channel = cli_call(args.cli, env, [
+                    "channel", "spawn", "--repository", str(root / "project"),
+                    "--title", "Native chat memory workload"], root)["channel"]
+                write_json(channel_path, channel)
             actors = []
             for index in range(args.count):
                 name = "memory-" + str(args.cycle) + "-" + str(index).zfill(3)
                 actors.append(cli_call(args.cli, env, [
                     "agent", "spawn", "--provider", "claude", "--model", "haiku", "--name", name,
-                    "--directory", str(root / "project"), "--idempotency-key", name,
+                    "--directory", str(root / "project"), "--channel", channel["id"],
+                    "--idempotency-key", name,
                     "memory 512 32 " + name], root))
                 write_json(manifest, actors)
                 print(index + 1, flush=True)
