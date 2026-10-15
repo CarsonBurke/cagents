@@ -5761,7 +5761,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         let branch = ValidatedBranchName::parse(name)?;
         let mut candidates: Vec<_> = refs.remote.iter()
-            .filter(|reference| reference.branch == branch.as_str())
+            .filter(|reference| remotes.iter().any(|remote| reference.name.as_str() == format!("refs/remotes/{}/{}", remote.name, branch.as_str())))
             .map(|reference| reference.name.as_str().to_owned()).collect();
         if candidates.len() == 1 {
             return Ok(BaseRevision::remote_ref(candidates.remove(0))?);
@@ -12190,6 +12190,9 @@ mod worktree_journal_tests {
         assert!(matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic"));
         assert_eq!(fixture.run(&CancellationToken::new()).state, WorktreeOperationState::Created);
         assert_eq!(fixture.git(&["config", "branch.topic.remote"]), "team/nested");
+        let mut input = fixture.input("from-cached-topic"); input.base = "topic".into();
+        fixture.resolve(input);
+        assert!(matches!(&fixture.request.base, BaseRevision::RemoteRef(reference) if reference == "refs/remotes/team/nested/topic"));
     }
 
     #[test]
