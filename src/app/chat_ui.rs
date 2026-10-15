@@ -158,6 +158,7 @@ pub enum Action {
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
+    RestartCommitted(Target, Ready, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
@@ -314,6 +315,7 @@ impl Action {
             Self::Ready(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
+                | Self::RestartCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
@@ -411,6 +413,7 @@ struct Attempt {
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
+    restart_committed: bool,
 }
 
 struct LocalReturn {
@@ -3891,6 +3894,7 @@ impl Cagents {
                 target,
                 session: replacement.clone(),
                 upgrade_committed: false,
+                restart_committed: false,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
                     committed: false,
@@ -5317,6 +5321,7 @@ impl Cagents {
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
+                restart_committed: false,
             }),
         );
         let sender = self.chat_ui.sender.clone();
@@ -6174,6 +6179,13 @@ impl Cagents {
                     _ => return Task::none(),
                 }
             }
+            Action::RestartCommitted(target,ready,result)=>{
+                match result {
+                    Ok(())=>{if let Some(Phase::Starting(attempt))=self.chat_ui.phases.get_mut(&target.card) && attempt.target==target {attempt.restart_committed=true;}},
+                    Err(error)=>{if let Ok(mut reply)=ready.0.lock(){*reply=Some(Err(chat::StartFailure::retry(format!("The restarted console identity was not saved: {error}. The exact provider was retained; retry this pane to finish recovery."))));}}
+                }
+                return self.update(Message::ChatUi(Action::Ready(target,ready)));
+            }
             Action::UpgradeCommitted(target, ready, result) => {
                 match result {
                     Ok(()) => {
@@ -6243,12 +6255,14 @@ impl Cagents {
                     .ok()
                     .and_then(|handle| handle.upgrade_recovery())
                     .map(|(source, _)| source);
+                let restart_source=result.as_ref().ok().and_then(|handle|handle.restart_recovery()).map(|receipt|receipt.source());
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
                             CardKind::Chat(session) => account_source
                                 .as_ref()
                                 .or(upgrade_source)
+                                .or(restart_source)
                                 .map_or(session.id == attempt.session.id, |source| {
                                     session == source
                                 }),
@@ -6281,8 +6295,8 @@ impl Cagents {
                             let replacement = handle.session();
                             if account_source.is_some()
                                 || source != &attempt.session
-                                || &replacement != resolved
-                                || !chat::is_upgrade_recovery(source, &replacement)
+                                || (&replacement != resolved && !handle.restart_recovery().is_some_and(|receipt|receipt.source()==resolved && receipt.replacement()==&replacement))
+                                || !chat::is_upgrade_recovery(source, resolved)
                                 || handle.snapshot().session_id != replacement.launch.session_id
                             {
                                 self.status = Some(TransientNotice::error(
@@ -6299,7 +6313,7 @@ impl Cagents {
                                         writer.rebind_chat_upgrade(
                                             target.card,
                                             source.clone(),
-                                            replacement,
+                                            resolved.clone(),
                                         )
                                     });
                                 self.chat_ui
@@ -6322,6 +6336,28 @@ impl Cagents {
                                         Err(error) => Err(error),
                                     };
                                     Message::ChatUi(Action::UpgradeCommitted(target, ready, result))
+                                });
+                            }
+                        }
+                        if let Some(receipt)=handle.restart_recovery() {
+                            let expected=handle.upgrade_recovery().map(|(_,resolved)|resolved).unwrap_or(&attempt.session);
+                            if account_source.is_some() || !receipt.is_valid() || receipt.source()!=expected
+                                || receipt.replacement()!=&handle.session() || handle.snapshot().session_id!=receipt.replacement().launch.session_id {
+                                self.status=Some(TransientNotice::error("The provider did not confirm its exact restarted console. The saved pane and composer were retained."));
+                                return Task::none();
+                            }
+                            if !attempt.restart_committed {
+                                let receipt=self.session.as_ref().ok_or_else(||"Session storage is unavailable".to_owned())
+                                    .and_then(|writer|writer.rebind_chat_restart(target.card,receipt.clone()));
+                                self.chat_ui.phases.insert(target.card,Phase::Starting(attempt));
+                                let ready=Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+                                return cosmic::task::future(async move {
+                                    let result=match receipt {
+                                        Ok(receipt)=>tokio::task::spawn_blocking(move ||receipt.recv().map_err(|error|format!("Session writer disconnected: {error}")).and_then(|result|result))
+                                            .await.map_err(|error|error.to_string()).and_then(|result|result),
+                                        Err(error)=>Err(error),
+                                    };
+                                    Message::ChatUi(Action::RestartCommitted(target,ready,result))
                                 });
                             }
                         }
@@ -12758,7 +12794,7 @@ mod tests {
                 while let Some(action) = stream.next().await {
                     if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
                         message @ Message::ChatUi(
-                            Action::AccountCommitted(..) | Action::UpgradeCommitted(..),
+                            Action::AccountCommitted(..) | Action::UpgradeCommitted(..) | Action::RestartCommitted(..),
                         ),
                     )) = action
                     {
@@ -15500,6 +15536,57 @@ mod tests {
     }
 
     #[test]
+    fn restarted_console_activates_only_after_save_and_keeps_composer() {
+        for (saved,upgraded) in [(true,false),(false,false),(true,true)] {
+            let mut app=crate::app::tests::context_inspector_test_app(false);
+            let card=live_chat(&mut app,Some(KNOWN_THREAD));
+            let runtime=match app.cards.get_mut(&card).unwrap(){CardRuntime::Chat(runtime)=>runtime,_=>unreachable!()};
+            runtime.replace_draft(text_editor::Content::with_text("unsent restart draft"));
+            let source=runtime.session.clone();
+            let directory=tempfile::tempdir().unwrap();
+            if saved {
+                let (writer,_)=crate::session::SessionRuntime::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("restart-boot")).unwrap();
+                app.session=Some(writer);app.persist();app.session.as_ref().unwrap().flush(Duration::from_secs(10)).unwrap();
+            } else {app.session=None;}
+            let mut resolved=source.clone();
+            if upgraded {resolved.proof.as_mut().unwrap().host_incarnation="upgraded-before-console-restart".into();}
+            let mut replacement=resolved.clone();
+            let recipe=LaunchRecipe{program:"/matched/cagents".into(),arguments:vec!["agent".into(),"console".into(),crate::model::AgentId::new().to_string()],working_directory:source.launch.recipe.working_directory.clone(),environment:Default::default(),unset_environment:Default::default()};
+            let mut terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(source.id,recipe,None).session;
+            let proof=resolved.proof.as_ref().unwrap();
+            terminal.continuity=TerminalContinuity::Live{host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone()};
+            terminal.transcript_path=Some(directory.path().join("replacement-console.log"));
+            replacement.terminal=Some(terminal);
+            let receipt=chat::RestartReceipt::confirm(resolved,replacement.clone()).unwrap();
+            let snapshot=Snapshot{session_id:replacement.launch.session_id.clone(),ready:true,..Snapshot::default()};
+            let handle=Arc::new(if upgraded{ClientHandle::fixture_upgrade_restart(source.clone(),receipt,snapshot)}else{ClientHandle::fixture_restart(receipt,snapshot)});
+            let target=app.chat_ui.next_target(card);
+            app.chat_ui.phases.insert(card,Phase::Starting(Attempt{target,session:source.clone(),recovery:None,upgrade_committed:false,restart_committed:false}));
+            let task=app.update(Message::ChatUi(Action::Ready(target,Ready(Arc::new(Mutex::new(Some(Ok(handle))))))));
+            assert!(app.chat_start_pending(card));
+            assert_eq!(app.card_state(card).unwrap().kind,CardKind::Chat(source.clone()));
+            assert_eq!(chat_runtime(&app,card).composer.text(),"unsent restart draft");
+            let mut message=account_commit_reply(task);
+            if upgraded {
+                assert!(matches!(&message,Message::ChatUi(Action::UpgradeCommitted(_,_,Ok(())))));
+                let next=app.update(message);
+                assert_eq!(app.card_state(card).unwrap().kind,CardKind::Chat(source.clone()));
+                assert_eq!(chat_runtime(&app,card).composer.text(),"unsent restart draft");
+                message=account_commit_reply(next);
+            }
+            assert!(matches!(&message,Message::ChatUi(Action::RestartCommitted(_,_,result)) if result.is_ok()==saved));
+            drop(app.update(message));
+            assert_eq!(chat_runtime(&app,card).composer.text(),"unsent restart draft");
+            assert_eq!(app.card_state(card).unwrap().kind,CardKind::Chat(if saved{replacement.clone()}else{source}));
+            if saved {
+                app.session.as_ref().unwrap().flush(Duration::from_secs(10)).unwrap();
+                let store=crate::persistence::StateStore::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("restart-boot")).unwrap();
+                assert_eq!(store.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(replacement));
+            }
+        }
+    }
+
+    #[test]
     fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
         for (stale_reply, codex_resume) in
             [(false, false), (true, false), (false, true), (true, true)]
@@ -15564,6 +15651,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                restart_committed: false,
                 }),
             );
             app.cards.remove(&card);
@@ -15591,6 +15679,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                restart_committed: false,
                     }),
                 );
                 let _ = app.update(receipt);

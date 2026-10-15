@@ -1283,6 +1283,12 @@ impl StateStore {
         self.rebind_chat_descriptor(card_id, source, replacement)
     }
 
+    /// Only a correlated daemon restart receipt may replace a saved console.
+    pub fn rebind_chat_restart(&self,card_id:CardId,receipt:&crate::chat::RestartReceipt)->Result<()> {
+        if !receipt.is_valid() {return Err(StoreError::InvalidState("Provider restart lacks an exact conversation and console receipt".into()));}
+        self.rebind_chat_descriptor(card_id,receipt.source(),receipt.replacement())
+    }
+
     fn rebind_chat_descriptor(
         &self,
         card_id: CardId,
@@ -6712,6 +6718,41 @@ mod tests {
         assert_eq!(restored_metadata.byte_len, 128);
         assert_eq!(restored_metadata.durable_offset, 96);
         assert!(store.load_transcript_metadata(chat.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn restarted_console_requires_typed_receipt_and_preserves_saved_card_on_stale_cas() {
+        let directory=tempdir().unwrap();
+        let path=directory.path().join("restart.sqlite3");
+        let store=StateStore::open(&path,boot("chat-boot")).unwrap();
+        let (mut workspace,mut source)=agent_workspace(crate::agent::Provider::Claude);
+        source.proof=source.terminal.as_ref().unwrap().continuity.live_proof();
+        source.terminal=None;
+        let card=workspace.cards[0].id;
+        workspace.cards[0].kind=CardKind::Chat(source.clone());
+        let mut lane=SaveLane::default();
+        lane.save(&store,&workspace).unwrap();
+        let mut replacement=source.clone();
+        let recipe=LaunchRecipe{program:"/matched/cagents".into(),arguments:vec!["agent".into(),"console".into(),crate::model::AgentId::new().to_string()],working_directory:source.launch.recipe.working_directory.clone(),environment:Default::default(),unset_environment:Default::default()};
+        let mut terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(source.id,recipe,None).session;
+        let proof=source.proof.as_ref().unwrap();
+        terminal.continuity=TerminalContinuity::Live{host_session_id:proof.host_session_id.clone(),boot_id:proof.boot_id.clone(),host_incarnation:proof.host_incarnation.clone()};
+        terminal.transcript_path=Some(directory.path().join("new-console.log"));
+        replacement.terminal=Some(terminal);
+        let receipt=crate::chat::RestartReceipt::confirm(source.clone(),replacement.clone()).unwrap();
+        workspace.cards[0].kind=CardKind::Chat(replacement.clone());
+        assert!(lane.save(&store,&workspace).is_err(),"ordinary snapshots cannot replace a pair");
+        let mut stale=source.clone();stale.launch.recipe.arguments.push("--changed".into());
+        let mut stale_replacement=replacement.clone();stale_replacement.launch.recipe=stale.launch.recipe.clone();
+        let stale=crate::chat::RestartReceipt::confirm(stale,stale_replacement).unwrap();
+        assert!(store.rebind_chat_restart(card,&stale).is_err());
+        assert_eq!(store.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(source));
+        store.rebind_chat_restart(card,&receipt).unwrap();
+        store.rebind_chat_restart(card,&receipt).unwrap();
+        lane.save(&store,&workspace).unwrap();
+        drop(store);
+        let reopened=StateStore::open(path,boot("chat-boot")).unwrap();
+        assert_eq!(reopened.load_card(card,None).unwrap().unwrap().kind,CardKind::Chat(replacement));
     }
 
     #[test]

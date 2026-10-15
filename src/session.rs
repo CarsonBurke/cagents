@@ -380,6 +380,7 @@ enum ConversionCheckpoint {
 enum ChatRecoveryKind {
     Account,
     Upgrade,
+    Restart(crate::chat::RestartReceipt),
 }
 
 #[derive(Debug)]
@@ -765,6 +766,12 @@ impl SessionRuntime {
         self.rebind_chat(ChatRecoveryKind::Upgrade, card_id, source, replacement)
     }
 
+    pub fn rebind_chat_restart(&self,card_id:CardId,receipt:crate::chat::RestartReceipt)
+        ->std::result::Result<std::sync::mpsc::Receiver<std::result::Result<(),String>>,String> {
+        if !receipt.is_valid(){return Err("Invalid exact provider restart receipt".into());}
+        self.rebind_chat(ChatRecoveryKind::Restart(receipt.clone()),card_id,receipt.source().clone(),receipt.replacement().clone())
+    }
+
     fn rebind_chat(
         &self,
         kind: ChatRecoveryKind,
@@ -1009,7 +1016,7 @@ struct PendingWrites {
     /// Successful, explicit chat transitions translate only old snapshots
     /// queued while the UI awaited acknowledgment. Other card fields, including
     /// tombstones, remain exactly as submitted.
-    chat_rebindings: HashMap<CardId, (crate::chat::Session, crate::chat::Session)>,
+    chat_rebindings: HashMap<CardId, (Vec<crate::chat::Session>, crate::chat::Session)>,
 }
 
 /// When storage first refused a subject, and why it refuses it now.
@@ -1338,6 +1345,9 @@ trait SessionStore {
             "This store does not support terminal ownership recovery".into(),
         ))
     }
+    fn rebind_chat_restart(&self,_card_id:CardId,_receipt:&crate::chat::RestartReceipt)->Result<(),StoreError>{
+        Err(StoreError::InvalidState("This store does not support provider restart recovery".into()))
+    }
     fn rebind_chat_upgrade(
         &self,
         _card_id: CardId,
@@ -1426,6 +1436,9 @@ impl SessionStore for StateStore {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    fn rebind_chat_restart(&self,card_id:CardId,receipt:&crate::chat::RestartReceipt)->Result<(),StoreError>{
+        StateStore::rebind_chat_restart(self,card_id,receipt)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -1523,6 +1536,9 @@ impl SessionStore for Arc<StateStore> {
         recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
         StateStore::save_workspace_recovering_terminal_owner(self, state, base, recovery)
+    }
+    fn rebind_chat_restart(&self,card_id:CardId,receipt:&crate::chat::RestartReceipt)->Result<(),StoreError>{
+        StateStore::rebind_chat_restart(self,card_id,receipt)
     }
     fn rebind_chat_upgrade(
         &self,
@@ -1793,7 +1809,7 @@ impl PendingWrites {
     fn translate_chat_rebindings(&self, snapshot: &mut Arc<WorkspaceState>) {
         let needs_translation = |state: &crate::model::CardState| {
             self.chat_rebindings.get(&state.id).is_some_and(
-                |(source, _)| matches!(&state.kind, CardKind::Chat(session) if session == source),
+                |(sources, _)| matches!(&state.kind, CardKind::Chat(session) if sources.contains(session)),
             )
         };
         if !self.chat_rebindings.is_empty() && snapshot.cards.iter().any(needs_translation) {
@@ -1892,6 +1908,7 @@ impl PendingWrites {
                 }
                 ConversionCheckpoint::ChatRecovery(recovery) => {
                     let result = match recovery.kind {
+                        ChatRecoveryKind::Restart(ref receipt)=>store.rebind_chat_restart(recovery.card,receipt),
                         ChatRecoveryKind::Account => store.rebind_chat_account(
                             recovery.card,
                             &recovery.source,
@@ -1904,8 +1921,14 @@ impl PendingWrites {
                         ),
                     };
                     if result.is_ok() {
-                        self.chat_rebindings
-                            .insert(recovery.card, (recovery.source, recovery.replacement));
+                        let mut sources=self.chat_rebindings.get(&recovery.card)
+                            .filter(|(_,replacement)|replacement==&recovery.source)
+                            .map(|(sources,_)|sources.clone()).unwrap_or_default();
+                        if !sources.contains(&recovery.source) {sources.push(recovery.source);}
+                        // Older offers beyond the bounded history are refused
+                        // by ordinary CAS instead of being silently rewritten.
+                        if sources.len()>32 {sources.remove(0);}
+                        self.chat_rebindings.insert(recovery.card,(sources,recovery.replacement));
                     }
                     // An explicit identity change is one-shot. In particular an
                     // I/O failure must not silently commit after the UI has
