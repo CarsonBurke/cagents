@@ -24201,8 +24201,49 @@ mod tests {
         // replace its current buffer or restore an anchor from another source.
         let (other, _) = RepositoryRuntime::open_fixture(origin, "unrelated.rs", "keep this buffer");
         app.cards.insert(origin, CardRuntime::Repository(Box::new(other)));
-        assert!(app.navigate_cross_card_location(target, false).is_none());
-        assert_eq!(app.workspace.focused(), Some(target));
+        assert!(app.navigate_cross_card_location(target, false).is_some());
+        let reopened = app.workspace.focused().unwrap();
+        assert_ne!(reopened, origin);
+        assert_ne!(reopened, target);
+        assert!(matches!(app.cards.get(&origin), Some(CardRuntime::Repository(runtime)) if runtime.editor_text().as_deref() == Some("keep this buffer")));
+    }
+
+    #[test]
+    fn history_reopens_a_prior_same_card_file_with_its_native_anchor() {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            async fn settle(app: &mut Cagents, first: Task<Message>) {
+                let mut tasks = VecDeque::from([first]);
+                while let Some(task) = tasks.pop_front() {
+                    if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                        while let Some(action) = stream.next().await {
+                            if let iced::runtime::Action::Output(cosmic::Action::App(message @ Message::Repository(_))) = action { tasks.push_back(app.update(message)); }
+                        }
+                    }
+                }
+            }
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("a.rs"), "first\na😀éX\n").unwrap();
+            std::fs::write(root.path().join("b.rs"), "keep B\n").unwrap();
+            let (mut app, card) = editing_repository_app();
+            let runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: None });
+            app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+            let open = app.update(Message::Repository(RepositoryAction::OpenLocation { card, path: "a.rs".into(), line: 1, column: 3 })); settle(&mut app, open).await;
+            let a = app.capture_editor_location(card).unwrap();
+            let open = app.update(Message::Repository(RepositoryAction::OpenLocation { card, path: "b.rs".into(), line: 0, column: 0 })); settle(&mut app, open).await;
+            let current = app.capture_editor_location(card).unwrap();
+            assert_ne!(a.source, current.source);
+            if let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&card) { runtime.set_auto_save(false); }
+            let edit = app.update(Message::Repository(RepositoryAction::EditorAction { card, action: repository_widget::EditorAction::Edit(repository_widget::EditorEdit::Insert('!')) })); settle(&mut app, edit).await;
+            let retained = match app.cards.get(&card) { Some(CardRuntime::Repository(runtime)) => runtime.editor_text(), _ => None };
+            let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card, forward: false })); settle(&mut app, back).await;
+            let restored = app.workspace.focused().unwrap();
+            assert_ne!(restored, card);
+            assert_eq!(app.capture_editor_location(restored).unwrap().source, a.source);
+            assert_eq!(app.capture_editor_location(restored).unwrap().anchor, a.anchor);
+            assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.editor_text() == retained && runtime.is_dirty()));
+            let forward = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: restored, forward: true })); settle(&mut app, forward).await;
+            assert_eq!(app.workspace.focused(), Some(card));
+        });
     }
 
     #[test]

@@ -454,6 +454,33 @@ mod tests {
     }
 
     #[test]
+    fn history_reopens_a_reused_tab_source_without_replacing_its_dirty_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in [("a.rs", "first\na😀éX\n"), ("b.rs", "destination\n"), ("c.rs", "keep C\n")] { std::fs::write(root.path().join(path), text).unwrap(); }
+        let mut app = editor();
+        let a = open_file(&mut app, root.path(), "a.rs");
+        assert!(app.tab_mut(a).unwrap().runtime.move_cursor_to(LspPosition::new(1, 3)));
+        let origin = app.capture_editor_location(a).unwrap();
+        let b = open_file(&mut app, root.path(), "b.rs");
+        let destination = app.capture_editor_location(b).unwrap();
+        app.lsp_navigation.history.record_jump(origin.clone(), destination);
+        let replace = app.request_file(a, "c.rs".into()); run_tasks(&mut app, replace);
+        app.tab_mut(a).unwrap().runtime.set_auto_save(false);
+        let edit = app.update(Message::Repository(RepositoryAction::EditorAction { card: a, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('!')) })); run_tasks(&mut app, edit);
+        let retained = app.tab(a).unwrap().runtime.editor_text();
+        app.active = Some(b);
+        let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: b, forward: false })); run_tasks(&mut app, back);
+        let restored = app.active.unwrap();
+        assert_ne!(restored, a);
+        assert_eq!(app.capture_editor_location(restored).unwrap().source, origin.source);
+        assert_eq!(app.capture_editor_location(restored).unwrap().anchor, origin.anchor);
+        assert_eq!(app.tab(a).unwrap().runtime.editor_text(), retained);
+        assert!(app.tab(a).unwrap().runtime.is_dirty());
+        let forward = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: restored, forward: true })); run_tasks(&mut app, forward);
+        assert_eq!(app.active, Some(b));
+    }
+
+    #[test]
     fn loaded_navigation_applies_position_without_focusing_behind_a_modal() {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("main.rs"), "a😀éX\n").unwrap();
