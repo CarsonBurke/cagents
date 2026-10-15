@@ -6537,7 +6537,7 @@ fn project_view<'a>(
             .height(Length::Fixed(ICON_CONTROL_SIZE))
             .into()
     };
-    let add_worktree = project_creation_control(entity, modal_open, creation_allowed);
+    let add_worktree = project_creation_control(entity, modal_open, creation_allowed, shortcuts);
     let add_channel = project_icon_action(
         Icon::ChannelAdd,
         chrome.new_channel_name.to_string(),
@@ -7826,13 +7826,16 @@ fn new_conversation_label(worktree_id: Option<WorktreeId>) -> &'static str {
 
 /// A press belongs to the published creation owner and its enabled state.
 /// Named button state must not survive replacing that owner under the same project ID.
-fn project_creation_control(project: &SidebarProject, modal_open: bool, allowed: bool) -> Element<'static, SidebarAction> {
+fn project_creation_control(project: &SidebarProject, modal_open: bool, allowed: bool, shortcuts: &crate::settings::KeyboardShortcuts) -> Element<'static, SidebarAction> {
     let target = commands::ProjectCreationTarget::capture_project(project, None, false)
         .filter(|_| !modal_open && allowed);
     let enabled = target.is_some();
+    let chords = crate::workspace_widget::shortcut_chords(crate::workspace_widget::GlobalShortcut::NewWorktree, shortcuts);
+    let label = if chords.is_empty() { project.chrome.new_worktree_name.to_string() }
+        else { format!("{} · {chords}", project.chrome.new_worktree_name) };
     crate::interaction::owned_surface(project_icon_action(
         Icon::WorktreeAdd,
-        project.chrome.new_worktree_name.to_string(),
+        label,
         target.map(SidebarAction::CreateProjectWorktree),
         project.chrome.new_worktree_id.clone(),
     ), (project.creation_binding, enabled))
@@ -8003,7 +8006,7 @@ fn context_controls<'a>(
             };
             entries.push(item(
                 if creation_unavailable {
-                    format!("{label} (repository unavailable)")
+                    format!("{label} (unavailable now)")
                 } else if !has_branch
                     && matches!(
                         command,
@@ -18325,10 +18328,6 @@ pub(crate) mod tests {
             .collect()
     }
 
-    /// A project whose checkout could not be read is still a row, and that row
-    /// offers exactly one thing: reading it again. Its worktrees, channels and
-    /// pull requests came from the read that failed, so nothing built from
-    /// them may be pressable.
     #[test]
     fn project_context_creation_message_keeps_captured_branch_and_owner_after_model_replacement() {
         use widget::menu::Action;
@@ -18385,7 +18384,7 @@ pub(crate) mod tests {
         let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
         let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
         let mut feed = |entry: &SidebarProject, allowed, events: &[Event]| {
-            let mut ui = UserInterface::build(project_creation_control(entry, false, allowed),
+            let mut ui = UserInterface::build(project_creation_control(entry, false, allowed, &crate::settings::KeyboardShortcuts::default()),
                 Size::new(ICON_CONTROL_SIZE, ICON_CONTROL_SIZE), std::mem::take(&mut cache), &mut renderer);
             let mut messages = Vec::new();
             ui.update(events, mouse::Cursor::Available(cursor), &mut renderer, &mut clipboard::Null, &mut messages);
@@ -18430,6 +18429,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn project_creation_header_hint_tracks_configured_shortcut_without_changing_target() {
+        let renderer = headless_renderer();
+        let mut entry = project();
+        entry.creation_binding = Some(crate::model::OperationId::new());
+        let mut shortcuts = crate::settings::KeyboardShortcuts::default();
+        shortcuts.new_worktree = vec!["ctrl+alt+w".into()];
+        let names = accessible_names(&renderer, project_creation_control(&entry, false, true, &shortcuts));
+        let chords = crate::workspace_widget::shortcut_chords(crate::workspace_widget::GlobalShortcut::NewWorktree, &shortcuts);
+        assert!(!chords.is_empty());
+        assert!(names.iter().any(|name| name == &format!("{} · {chords}", entry.chrome.new_worktree_name)));
+        shortcuts.new_worktree.clear();
+        let names = accessible_names(&renderer, project_creation_control(&entry, false, true, &shortcuts));
+        assert!(names.iter().any(|name| name == entry.chrome.new_worktree_name.as_ref()));
+        assert!(names.iter().all(|name| !name.contains('·')));
+    }
+
+    #[test]
     fn folder_projects_remain_selectable_without_git_actions_in_both_sidebar_modes() {
         let renderer = headless_renderer();
         let mut entry = project().with_kind(ProjectKind::Folder);
@@ -18454,6 +18470,10 @@ pub(crate) mod tests {
         }
     }
 
+    /// A project whose checkout could not be read is still a row, and that row
+    /// offers exactly one thing: reading it again. Its worktrees, channels and
+    /// pull requests came from the read that failed, so nothing built from
+    /// them may be pressable.
     #[test]
     fn an_unreadable_project_keeps_its_row_and_offers_only_a_reload() {
         let renderer = headless_renderer();
