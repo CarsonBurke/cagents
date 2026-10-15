@@ -9,7 +9,7 @@ use accesskit_atspi_common::{Adapter as AdapterImpl, AppContext, Event};
 use async_channel::Sender;
 use atspi::proxy::bus::StatusProxy;
 #[cfg(not(feature = "tokio"))]
-use futures_util::{FutureExt, StreamExt, pin_mut as pin, select};
+use futures_util::{pin_mut as pin, select, FutureExt, StreamExt};
 use std::{
     sync::{Arc, Mutex, OnceLock, RwLock},
     thread,
@@ -426,13 +426,16 @@ mod connection_tests {
     fn expired_retry_deadline_cannot_be_reset_by_continuous_adapter_messages() {
         let executor = Executor::new();
         block_on(executor.run(async {
-            let mut messages = futures_lite::stream::repeat_with(|| Message::RemoveAdapter {
-                id: usize::MAX,
-            }).take(10_000);
+            let mut messages =
+                futures_lite::stream::repeat_with(|| Message::RemoveAdapter { id: usize::MAX })
+                    .take(10_000);
             let mut adapters = Vec::new();
             let expired = std::time::Instant::now() - std::time::Duration::from_secs(1);
             assert!(wait_for_retry_until(&mut messages, &mut adapters, expired).await);
-            assert!(messages.next().await.is_some(), "traffic was drained instead of retrying");
+            assert!(
+                messages.next().await.is_some(),
+                "traffic was drained instead of retrying"
+            );
         }));
     }
 
