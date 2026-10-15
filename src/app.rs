@@ -2191,6 +2191,20 @@ impl SettingsSave {
         {
             return Ok(saved.clone());
         }
+        let base = if self.reset.is_some() && self.reset_keys.is_empty() {
+            self.base.clone()
+        } else {
+            // Earlier queued saves can contain edits this capture reverses.
+            // Rebase those edits onto this capture's observed external baseline;
+            // completion time alone cannot make an old snapshot authoritative.
+            match lane.as_ref().filter(|saved| {
+                !saved.undo && self.base_observed_at.is_none_or(|at| at < saved.observed_at)
+            }) {
+                Some(saved) => settings::merge_live(&saved.captured_base, &saved.desired, &self.base)
+                    .map_err(|error| error.to_string())?,
+                None => self.base.clone(),
+            }
+        };
         if let Some(store) = self.store {
             let value = serde_json::to_string(&self.view).map_err(|error| error.to_string())?;
             store
@@ -2203,28 +2217,23 @@ impl SettingsSave {
                 .filter(|saved| saved.reset == Some(reset))
                 .and_then(|saved| saved.backup.clone())
             {
-                settings::save(&self.path, &self.desired).map_err(|error| error.to_string())?;
+                if self.reset_keys.is_empty() {
+                    settings::save(&self.path, &self.desired).map_err(|error| error.to_string())?;
+                } else {
+                    settings::save_merged_observed(&self.path, &base, &self.desired)
+                        .map_err(|error| error.to_string())?;
+                }
                 (Some(backup), settings::load_live_observed(&self.path))
             } else {
                 let backup = if self.reset_keys.is_empty() {
                     settings::reset_with_backup(&self.path, &self.desired)
                 } else {
-                    settings::reset_keys_with_backup(&self.path, &self.desired, &self.reset_keys)
+                    settings::reset_keys_merged_with_backup(&self.path, &base, &self.desired, &self.reset_keys)
                 }
                 .map_err(|error| error.to_string())?;
                 (Some(backup), settings::load_live_observed(&self.path))
             }
         } else {
-            // Earlier queued saves can contain edits this capture reverses.
-            // Rebase those edits onto this capture's observed external baseline;
-            // completion time alone cannot make an old snapshot authoritative.
-            let base = match lane.as_ref().filter(|saved| {
-                !saved.undo && self.base_observed_at.is_none_or(|at| at < saved.observed_at)
-            }) {
-                Some(saved) => settings::merge_live(&saved.captured_base, &saved.desired, &self.base)
-                    .map_err(|error| error.to_string())?,
-                None => self.base.clone(),
-            };
             let saved = settings::save_merged_observed(&self.path, &base, &self.desired)
                 .map_err(|error| error.to_string())?;
             (
@@ -13406,6 +13415,21 @@ impl Cagents {
                     {
                         draft.preserve_field(&self.settings_draft, field);
                     }
+                    // An unrelated external edit must not erase a valid raw
+                    // numeric spelling (for example `1.` between keystrokes).
+                    if !self.settings_draft.numeric_display.is_empty()
+                        && let (Ok(before), Ok(after)) = (
+                            toml::Value::try_from(&previous),
+                            toml::Value::try_from(&self.settings),
+                        )
+                    {
+                        for field in self.settings_draft.numeric_display.keys().copied() {
+                            let key = field.config_key();
+                            if before.get(key.as_str()) == after.get(key.as_str()) {
+                                draft.preserve_field(&self.settings_draft, field);
+                            }
+                        }
+                    }
                     self.settings_draft = draft;
                 }
                 let save = if retry_changed {
@@ -20649,6 +20673,56 @@ mod tests {
         drop(app.acknowledge_settings_save(second_ack));
         drop(app.acknowledge_settings_save(first_ack));
         assert_eq!(settings::load(&path).unwrap().terminal_font_size, original);
+    }
+
+    #[test]
+    fn settings_category_reset_preserves_unobserved_external_and_local_other_fields() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.settings.terminal_font_size = 14.0;
+        app.save_settings_now().unwrap();
+        let mut external = settings::load_live(&path).unwrap();
+        external.terminal_font_size = 18.0;
+        settings::save(&path, &external).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        app.settings.terminal_padding = 12.0;
+        app.settings.keyboard_shortcuts.command_palette.clear();
+        let reset = app.reset_settings_category(SettingsCategory::Keyboard);
+        settle_settings_task(&mut app, reset);
+        let saved = settings::load_live(&path).unwrap();
+        assert_eq!(saved.terminal_font_size, 18.0);
+        assert_eq!(saved.terminal_padding, 12.0);
+        assert_eq!(saved.keyboard_shortcuts, KeyboardShortcuts::default());
+        assert_eq!(app.settings.terminal_font_size, 18.0);
+        assert_eq!(std::fs::read(app.settings_backup.as_ref().unwrap()).unwrap(), before);
+    }
+
+    #[test]
+    fn settings_unrelated_reload_preserves_autosaved_decimal_spelling() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        app.save_settings_now().unwrap();
+        let field = SettingsField::TerminalScrollSpeed;
+        drop(app.queue_number_setting_input(field, "1.".into()));
+        drop(app.autosave_setting(field, app.settings_generation));
+        assert!(!app.settings_pending.contains_key(&field));
+        assert!(!app.settings_invalid.contains_key(&field));
+        let mut external = settings::load_live(&path).unwrap();
+        external.show_status_bar = !external.show_status_bar;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert_eq!(app.settings_draft.numeric_display.get(&field).unwrap(), "1.");
+        external.terminal_scroll_speed = 2.0;
+        settings::save(&path, &external).unwrap();
+        drop(app.reload_settings(settings::load_live_observed(&path)));
+        assert!(!app.settings_draft.numeric_display.contains_key(&field));
+        assert_eq!(app.settings_draft.terminal_scroll_speed, "2");
     }
 
     #[test]

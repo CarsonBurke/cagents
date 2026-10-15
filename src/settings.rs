@@ -2227,7 +2227,7 @@ pub fn reset_with_backup(
         ]
         .map(str::to_owned),
     );
-    reset_keys_with_backup_inner(path, settings, &keys, true)
+    reset_keys_with_backup_inner(path, settings, &keys, true, None)
 }
 
 /// Reset selected top-level keys while keeping unrelated hand-written values.
@@ -2236,7 +2236,18 @@ pub fn reset_keys_with_backup(
     settings: &AppSettings,
     keys: &[String],
 ) -> Result<PathBuf, SettingsError> {
-    reset_keys_with_backup_inner(path, settings, keys, false)
+    reset_keys_with_backup_inner(path, settings, keys, false, Some(settings))
+}
+
+/// Reset one category while retaining local edits and unobserved disk changes
+/// outside its keys. The baseline, merge, backup and replacement share one lock.
+pub fn reset_keys_merged_with_backup(
+    path: impl AsRef<Path>,
+    base: &AppSettings,
+    desired: &AppSettings,
+    keys: &[String],
+) -> Result<PathBuf, SettingsError> {
+    reset_keys_with_backup_inner(path, desired, keys, false, Some(base))
 }
 
 fn reset_keys_with_backup_inner(
@@ -2244,6 +2255,7 @@ fn reset_keys_with_backup_inner(
     settings: &AppSettings,
     keys: &[String],
     replace_future_schema: bool,
+    base: Option<&AppSettings>,
 ) -> Result<PathBuf, SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
@@ -2266,6 +2278,24 @@ fn reset_keys_with_backup_inner(
     let (_, backup_path) = backup
         .keep()
         .map_err(|error| SettingsError::Io(error.error))?;
+    let merged;
+    let settings = if let Some(base) = base {
+        let mut current = toml::Value::try_from(load_unlocked(path)?.settings)?;
+        let desired = toml::Value::try_from(settings)?;
+        merge_changed_fields(&toml::Value::try_from(base)?, &desired, &mut current);
+        let table = current.as_table_mut().expect("settings table");
+        for key in keys {
+            if let Some(value) = desired.get(key.as_str()) {
+                table.insert(key.clone(), value.clone());
+            } else {
+                table.remove(key);
+            }
+        }
+        merged = current.try_into::<AppSettings>()?.validate()?;
+        &merged
+    } else {
+        settings
+    };
     save_unlocked_for_keys(path, settings, keys, replace_future_schema)?;
     Ok(backup_path)
 }
@@ -3237,6 +3267,23 @@ mod tests {
                 .unwrap()
                 .contains("[future_preferences]")
         );
+    }
+
+    #[test]
+    fn selected_settings_reset_keeps_unobserved_known_values_outside_its_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let cached = AppSettings::default();
+        let mut external = cached.clone();
+        external.terminal_font_size = 18.0;
+        external.keyboard_shortcuts.command_palette.clear();
+        save(&path, &external).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let backup = reset_keys_with_backup(&path, &cached, &["keyboard_shortcuts".into()]).unwrap();
+        let saved = load_live(&path).unwrap();
+        assert_eq!(saved.terminal_font_size, 18.0);
+        assert_eq!(saved.keyboard_shortcuts, cached.keyboard_shortcuts);
+        assert_eq!(std::fs::read(backup).unwrap(), before);
     }
 
     #[test]
