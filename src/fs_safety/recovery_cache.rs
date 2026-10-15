@@ -26,18 +26,6 @@ impl RecoveryParentCandidates {
         Ok(Self { cursor: source, source: stamp, walked: 0, yielded: 0, finished: false })
     }
 }
-#[cfg(target_os = "linux")]
-fn retained_parent(root: &Root) -> io::Result<Root> {
-    let directory = open_at(root.descriptor(), OsStr::new(".."),
-        libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)?;
-    // Diagnostic spelling only. All candidate proofs use this actual FD.
-    Ok(Root { directory, path: root.path().join("..") })
-}
-#[cfg(not(target_os = "linux"))]
-fn retained_parent(_root: &Root) -> io::Result<Root> {
-    Err(io::Error::new(io::ErrorKind::Unsupported,
-        "Recovery ancestor candidates require qualified native mount-identity inspection"))
-}
 impl Iterator for RecoveryParentCandidates {
     type Item = io::Result<Arc<Root>>;
     fn next(&mut self) -> Option<Self::Item> {
@@ -46,7 +34,7 @@ impl Iterator for RecoveryParentCandidates {
             self.walked += 1;
             let step = (|| -> io::Result<Option<Arc<Root>>> {
                 let previous = recovery_directory_stamp(&self.cursor)?;
-                let parent = Arc::new(retained_parent(&self.cursor)?);
+                let parent = Arc::new(retained_parent_directory(&self.cursor)?);
                 let current = recovery_directory_stamp(&parent)?;
                 if current == previous || current.device != self.source.device
                     || current.mount_id != self.source.mount_id {
