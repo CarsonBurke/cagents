@@ -521,14 +521,54 @@ pub struct FixedShortcut {
 }
 
 pub const FIXED_SHORTCUTS: &[FixedShortcut] = &[
-    FixedShortcut { label: "Cycle recent panes", chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"], scope: "Navigation", refusal: "This chord is reserved for Cycle recent panes" },
-    FixedShortcut { label: "Increase font size", chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"], scope: "Editor", refusal: "This chord is reserved for Increase font size" },
-    FixedShortcut { label: "Decrease font size", chords: &["Ctrl+-"], scope: "Editor", refusal: "This chord is reserved for Decrease font size" },
-    FixedShortcut { label: "Reset font size", chords: &["Ctrl+0"], scope: "Editor", refusal: "This chord is reserved for Reset font size" },
-    FixedShortcut { label: "Save file", chords: &["Ctrl+S"], scope: "Editor", refusal: "This chord is reserved for Save file" },
-    FixedShortcut { label: "Stage / unstage selected lines", chords: &["Ctrl+Shift+S"], scope: "Editor", refusal: "This chord is reserved for Stage / unstage selected lines" },
-    FixedShortcut { label: "Copy terminal selection", chords: &["Ctrl+Shift+C"], scope: "Panes", refusal: "This chord is reserved for Copy terminal selection" },
-    FixedShortcut { label: "Paste into terminal", chords: &["Ctrl+Shift+V"], scope: "Panes", refusal: "This chord is reserved for Paste into terminal" },
+    FixedShortcut {
+        label: "Cycle recent panes",
+        chords: &["Ctrl+Tab", "Ctrl+Shift+Tab"],
+        scope: "Navigation",
+        refusal: "This chord is reserved for Cycle recent panes",
+    },
+    FixedShortcut {
+        label: "Increase font size",
+        chords: &["Ctrl+=", "Ctrl+Plus", "Ctrl+Shift+=", "Ctrl+Shift+Plus"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Increase font size",
+    },
+    FixedShortcut {
+        label: "Decrease font size",
+        chords: &["Ctrl+-"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Decrease font size",
+    },
+    FixedShortcut {
+        label: "Reset font size",
+        chords: &["Ctrl+0"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Reset font size",
+    },
+    FixedShortcut {
+        label: "Save file",
+        chords: &["Ctrl+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Save file",
+    },
+    FixedShortcut {
+        label: "Stage / unstage selected lines",
+        chords: &["Ctrl+Shift+S"],
+        scope: "Editor",
+        refusal: "This chord is reserved for Stage / unstage selected lines",
+    },
+    FixedShortcut {
+        label: "Copy terminal selection",
+        chords: &["Ctrl+Shift+C"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Copy terminal selection",
+    },
+    FixedShortcut {
+        label: "Paste into terminal",
+        chords: &["Ctrl+Shift+V"],
+        scope: "Panes",
+        refusal: "This chord is reserved for Paste into terminal",
+    },
 ];
 
 /// The same refusal is used by the recorder, typed edits and file validation.
@@ -536,7 +576,15 @@ pub fn shortcut_chord_refusal(binding: ShortcutBinding) -> Option<&'static str> 
     if let Some(reason) = withheld_from_the_card(binding) {
         return Some(reason);
     }
-    FIXED_SHORTCUTS.iter().find(|fixed| fixed.chords.iter().any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))).map(|fixed| fixed.refusal)
+    FIXED_SHORTCUTS
+        .iter()
+        .find(|fixed| {
+            fixed
+                .chords
+                .iter()
+                .any(|chord| parse_shortcut(chord).is_ok_and(|fixed| fixed == binding))
+        })
+        .map(|fixed| fixed.refusal)
 }
 
 /// Legacy actions that must retain a route back to the workspace.
@@ -704,23 +752,40 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
 /// Canonical keys for searching bindings accepted with aliases, whitespace or
 /// reordered modifiers. Display text remains exactly as the user entered it.
 pub fn shortcut_search_keywords(value: &str) -> String {
-    parse_chords(value).iter().filter_map(|chord| parse_shortcut(chord).ok()).map(|binding| {
-        let mut parts = Vec::new();
-        if binding.control { parts.push("Ctrl".to_owned()); }
-        if binding.alt { parts.push("Alt".to_owned()); }
-        if binding.logo { parts.push("Super".to_owned()); }
-        if binding.shift { parts.push("Shift".to_owned()); }
-        parts.push(match binding.key {
-            ShortcutKey::Character(',') => "Comma".into(),
-            ShortcutKey::Character('+') => "Plus".into(),
-            ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
-            ShortcutKey::ArrowLeft => "Left".into(), ShortcutKey::ArrowRight => "Right".into(),
-            ShortcutKey::ArrowUp => "Up".into(), ShortcutKey::ArrowDown => "Down".into(),
-            ShortcutKey::Tab => "Tab".into(), ShortcutKey::PageUp => "PageUp".into(), ShortcutKey::PageDown => "PageDown".into(),
-            ShortcutKey::Function(number) => format!("F{number}"),
-        });
-        parts.join("+")
-    }).collect::<Vec<_>>().join(" ")
+    parse_chords(value)
+        .iter()
+        .filter_map(|chord| parse_shortcut(chord).ok())
+        .map(|binding| {
+            let mut parts = Vec::new();
+            if binding.control {
+                parts.push("Ctrl".to_owned());
+            }
+            if binding.alt {
+                parts.push("Alt".to_owned());
+            }
+            if binding.logo {
+                parts.push("Super".to_owned());
+            }
+            if binding.shift {
+                parts.push("Shift".to_owned());
+            }
+            parts.push(match binding.key {
+                ShortcutKey::Character(',') => "Comma".into(),
+                ShortcutKey::Character('+') => "Plus".into(),
+                ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
+                ShortcutKey::ArrowLeft => "Left".into(),
+                ShortcutKey::ArrowRight => "Right".into(),
+                ShortcutKey::ArrowUp => "Up".into(),
+                ShortcutKey::ArrowDown => "Down".into(),
+                ShortcutKey::Tab => "Tab".into(),
+                ShortcutKey::PageUp => "PageUp".into(),
+                ShortcutKey::PageDown => "PageDown".into(),
+                ShortcutKey::Function(number) => format!("F{number}"),
+            });
+            parts.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 const fn default_interface_font_size() -> f32 {
     13.0
@@ -3279,7 +3344,8 @@ mod tests {
         external.keyboard_shortcuts.command_palette.clear();
         save(&path, &external).unwrap();
         let before = std::fs::read(&path).unwrap();
-        let backup = reset_keys_with_backup(&path, &cached, &["keyboard_shortcuts".into()]).unwrap();
+        let backup =
+            reset_keys_with_backup(&path, &cached, &["keyboard_shortcuts".into()]).unwrap();
         let saved = load_live(&path).unwrap();
         assert_eq!(saved.terminal_font_size, 18.0);
         assert_eq!(saved.keyboard_shortcuts, cached.keyboard_shortcuts);
@@ -4592,10 +4658,18 @@ new_thread = "Alt+Shift+G"
 
     #[test]
     fn native_fixed_chords_refuse_conflicting_actions_by_name() {
-        for (chord, label) in [("Ctrl+Tab", "Cycle recent panes"), ("Ctrl+=", "Increase font size"), ("Ctrl+Shift+C", "Copy terminal selection"), ("Ctrl+Shift+S", "Stage / unstage selected lines")] {
+        for (chord, label) in [
+            ("Ctrl+Tab", "Cycle recent panes"),
+            ("Ctrl+=", "Increase font size"),
+            ("Ctrl+Shift+C", "Copy terminal selection"),
+            ("Ctrl+Shift+S", "Stage / unstage selected lines"),
+        ] {
             let mut settings = AppSettings::default();
             settings.keyboard_shortcuts.new_terminal = vec![chord.into()];
-            assert!(matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)), "{chord}");
+            assert!(
+                matches!(settings.validate(), Err(SettingsError::InvalidShortcut(reason)) if reason.contains(label)),
+                "{chord}"
+            );
         }
     }
 

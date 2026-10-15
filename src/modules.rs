@@ -69,13 +69,13 @@ pub mod instance;
 pub mod interaction;
 #[cfg(feature = "latency-harness")]
 pub mod latency_fixture;
+pub mod layout_metrics;
 #[cfg(feature = "ui")]
 pub mod lifecycle;
 pub mod linear;
 pub mod location;
 #[cfg(feature = "ui")]
 pub mod lsp;
-pub mod layout_metrics;
 pub mod model;
 pub mod notifications;
 pub mod performance;

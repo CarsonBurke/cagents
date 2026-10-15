@@ -118,7 +118,9 @@ fn highlighted<'a, Message: 'a>(
         return iced::widget::rich_text([span])
             .size(size)
             .font(font)
-            .line_height(iced::widget::text::LineHeight::Absolute((size + 5.0).into()))
+            .line_height(iced::widget::text::LineHeight::Absolute(
+                (size + 5.0).into(),
+            ))
             .width(Length::Fill)
             .into();
     }
@@ -159,7 +161,9 @@ fn highlighted<'a, Message: 'a>(
     iced::widget::rich_text(spans)
         .size(size)
         .font(font)
-        .line_height(iced::widget::text::LineHeight::Absolute((size + 5.0).into()))
+        .line_height(iced::widget::text::LineHeight::Absolute(
+            (size + 5.0).into(),
+        ))
         .width(Length::Fill)
         .into()
 }

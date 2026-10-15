@@ -2198,10 +2198,15 @@ impl SettingsSave {
             // Rebase those edits onto this capture's observed external baseline;
             // completion time alone cannot make an old snapshot authoritative.
             match lane.as_ref().filter(|saved| {
-                !saved.undo && self.base_observed_at.is_none_or(|at| at < saved.observed_at)
+                !saved.undo
+                    && self
+                        .base_observed_at
+                        .is_none_or(|at| at < saved.observed_at)
             }) {
-                Some(saved) => settings::merge_live(&saved.captured_base, &saved.desired, &self.base)
-                    .map_err(|error| error.to_string())?,
+                Some(saved) => {
+                    settings::merge_live(&saved.captured_base, &saved.desired, &self.base)
+                        .map_err(|error| error.to_string())?
+                }
                 None => self.base.clone(),
             }
         };
@@ -2228,7 +2233,12 @@ impl SettingsSave {
                 let backup = if self.reset_keys.is_empty() {
                     settings::reset_with_backup(&self.path, &self.desired)
                 } else {
-                    settings::reset_keys_merged_with_backup(&self.path, &base, &self.desired, &self.reset_keys)
+                    settings::reset_keys_merged_with_backup(
+                        &self.path,
+                        &base,
+                        &self.desired,
+                        &self.reset_keys,
+                    )
                 }
                 .map_err(|error| error.to_string())?;
                 (Some(backup), settings::load_live_observed(&self.path))
@@ -3641,9 +3651,15 @@ impl SettingsDraft {
                 .set(field, previous.notifications.get(field)),
             SettingsField::AppTheme => self.app_theme = previous.app_theme.clone(),
             SettingsField::UiScale => self.ui_scale = previous.ui_scale.clone(),
-            SettingsField::InterfaceFontFamily => self.interface_font_family = previous.interface_font_family.clone(),
-            SettingsField::InterfaceFontSize => self.interface_font_size = previous.interface_font_size.clone(),
-            SettingsField::ChatFontFamily => self.chat_font_family = previous.chat_font_family.clone(),
+            SettingsField::InterfaceFontFamily => {
+                self.interface_font_family = previous.interface_font_family.clone()
+            }
+            SettingsField::InterfaceFontSize => {
+                self.interface_font_size = previous.interface_font_size.clone()
+            }
+            SettingsField::ChatFontFamily => {
+                self.chat_font_family = previous.chat_font_family.clone()
+            }
             SettingsField::ChatFontSize => self.chat_font_size = previous.chat_font_size.clone(),
             SettingsField::TerminalLineHeight => {
                 self.terminal_line_height = previous.terminal_line_height.clone()
@@ -4419,7 +4435,9 @@ fn refusal(field: SettingsField, attempted: &AppSettings) -> Option<String> {
 fn shortcut_refusal(action: usize, shortcuts: &KeyboardShortcuts) -> Option<String> {
     let fault = shortcuts.fault()?;
     let Some(owner) = fault.conflicts_with else {
-        if fault.action != action { return None; }
+        if fault.action != action {
+            return None;
+        }
         let settings::SettingsError::InvalidShortcut(reason) = fault.error else {
             return None;
         };
@@ -13104,21 +13122,39 @@ impl Cagents {
     fn retry_shortcut_drafts(&mut self) {
         loop {
             let mut progressed = false;
-            let fields: Vec<_> = SettingsField::SHORTCUTS.into_iter().filter(|field| self.settings_invalid.contains_key(field)).collect();
+            let fields: Vec<_> = SettingsField::SHORTCUTS
+                .into_iter()
+                .filter(|field| self.settings_invalid.contains_key(field))
+                .collect();
             for field in fields {
                 let action = field.shortcut_action().expect("shortcut field");
-                let value = self.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).expect("registered shortcut").1.to_owned();
+                let value = self
+                    .settings_draft
+                    .keyboard_shortcuts
+                    .shortcut_values()
+                    .into_iter()
+                    .find(|(candidate, _)| *candidate == action)
+                    .expect("registered shortcut")
+                    .1
+                    .to_owned();
                 match settings_update(&self.settings, field, &value) {
                     SettingsDecision::Persist(settings) => {
                         self.settings = settings;
                         self.settings_invalid.remove(&field);
                         progressed = true;
                     }
-                    SettingsDecision::Unchanged => { self.settings_invalid.remove(&field); progressed = true; }
-                    SettingsDecision::Invalid(reason) => { self.settings_invalid.insert(field, reason); }
+                    SettingsDecision::Unchanged => {
+                        self.settings_invalid.remove(&field);
+                        progressed = true;
+                    }
+                    SettingsDecision::Invalid(reason) => {
+                        self.settings_invalid.insert(field, reason);
+                    }
                 }
             }
-            if !progressed { break; }
+            if !progressed {
+                break;
+            }
         }
     }
 
@@ -13136,9 +13172,17 @@ impl Cagents {
                 let previous = self.settings.clone();
                 self.retry_shortcut_drafts();
                 let changed = previous != self.settings;
-                let save = if changed || self.settings_save_error.is_some() { self.save_settings_task(false) } else { Task::none() };
+                let save = if changed || self.settings_save_error.is_some() {
+                    self.save_settings_task(false)
+                } else {
+                    Task::none()
+                };
                 self.refresh_settings_feedback();
-                let effect = if changed { self.synchronize_settings(&previous) } else { Task::none() };
+                let effect = if changed {
+                    self.synchronize_settings(&previous)
+                } else {
+                    Task::none()
+                };
                 Task::batch([save, effect])
             }
             SettingsDecision::Persist(settings) => {
@@ -20534,7 +20578,10 @@ mod tests {
         let second_ack = second.run().unwrap();
         assert_eq!(second_ack.settings.terminal_font_size, 18.0);
         assert_eq!(second_ack.settings.terminal_padding, 12.0);
-        assert_eq!(second_ack.settings.show_status_bar, app.settings.show_status_bar);
+        assert_eq!(
+            second_ack.settings.show_status_bar,
+            app.settings.show_status_bar
+        );
         drop(app.acknowledge_settings_save(second_ack));
         drop(app.acknowledge_settings_save(first_ack));
         assert_eq!(app.settings.terminal_font_size, 18.0);
@@ -20697,7 +20744,10 @@ mod tests {
         assert_eq!(saved.terminal_padding, 12.0);
         assert_eq!(saved.keyboard_shortcuts, KeyboardShortcuts::default());
         assert_eq!(app.settings.terminal_font_size, 18.0);
-        assert_eq!(std::fs::read(app.settings_backup.as_ref().unwrap()).unwrap(), before);
+        assert_eq!(
+            std::fs::read(app.settings_backup.as_ref().unwrap()).unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -20717,7 +20767,10 @@ mod tests {
         external.show_status_bar = !external.show_status_bar;
         settings::save(&path, &external).unwrap();
         drop(app.reload_settings(settings::load_live_observed(&path)));
-        assert_eq!(app.settings_draft.numeric_display.get(&field).unwrap(), "1.");
+        assert_eq!(
+            app.settings_draft.numeric_display.get(&field).unwrap(),
+            "1."
+        );
         external.terminal_scroll_speed = 2.0;
         settings::save(&path, &external).unwrap();
         drop(app.reload_settings(settings::load_live_observed(&path)));
@@ -20967,8 +21020,10 @@ mod tests {
         settle_settings_task(&mut app, reload);
         assert!(app.settings_invalid.is_empty());
         assert_eq!(app.settings.keyboard_shortcuts.toggle_projects, [chord]);
-        assert_eq!(settings::load_live(&path).unwrap().keyboard_shortcuts,
-            app.settings.keyboard_shortcuts);
+        assert_eq!(
+            settings::load_live(&path).unwrap().keyboard_shortcuts,
+            app.settings.keyboard_shortcuts
+        );
         assert!(app.settings.keyboard_shortcuts.command_palette.is_empty());
     }
 
@@ -20982,16 +21037,22 @@ mod tests {
         app.save_settings_now().unwrap();
         let field = SettingsField::InterfaceFontSize;
         app.settings_draft.interface_font_size = "20".into();
-        app.settings_draft.numeric_display.insert(field, "20.00".into());
+        app.settings_draft
+            .numeric_display
+            .insert(field, "20.00".into());
         app.settings_pending.insert(field, (1, "20".into()));
         app.settings_draft.chat_font_family = "pending family".into();
-        app.settings_invalid.insert(SettingsField::ChatFontFamily, "test refusal".into());
+        app.settings_invalid
+            .insert(SettingsField::ChatFontFamily, "test refusal".into());
         let mut external = settings::load_live(&path).unwrap();
         external.chat_font_size = 18.0;
         settings::save(&path, &external).unwrap();
         drop(app.reload_settings(settings::load_live_observed(&path)));
         assert_eq!(app.settings_draft.interface_font_size, "20");
-        assert_eq!(app.settings_draft.numeric_display.get(&field).unwrap(), "20.00");
+        assert_eq!(
+            app.settings_draft.numeric_display.get(&field).unwrap(),
+            "20.00"
+        );
         assert_eq!(app.settings_draft.chat_font_family, "pending family");
         assert_eq!(app.settings_draft.chat_font_size, "18");
         assert_eq!(app.settings.chat_font_size, 18.0);
