@@ -55,6 +55,36 @@ impl<E: ProcessExecutor> GitHubService<E> {
         Ok(result)
     }
 
+    /// Ordinary inspector reads cap long threads. A deliberate agent handoff
+    /// completes only those selected threads, with a separate context budget.
+    pub fn complete_review_thread_comments(&self, repository: &GitHubRepoKey, mut thread: PullRequestReviewThread, cancellation: &CancellationToken) -> Result<PullRequestReviewThread, GitHubError> {
+        repository.validate()?;
+        validate_node_id("thread_id", &thread.id)?;
+        let query = format!("query($id:ID!,$cursor:String){{node(id:$id){{... on PullRequestReviewThread{{comments(first:50,after:$cursor){{nodes{{{REVIEW_COMMENT_FIELDS}}} pageInfo{{hasNextPage endCursor}}}}}}}}}}");
+        let mut cursor: Option<String> = None;
+        let mut comments = Vec::new();
+        let mut bytes = 0usize;
+        for _ in 0..40 {
+            let mut variables = vec![("id", thread.id.as_str().into())];
+            if let Some(cursor) = &cursor { variables.push(("cursor", cursor.as_str().into())); }
+            let data = self.graphql(repository, &query, variables, cancellation)?;
+            let connection = data.pointer("/node/comments").ok_or_else(|| GitHubError::Inspection("The selected review thread is no longer available.".into()))?;
+            let page: Connection<PullRequestComment> = decode_value(connection)?;
+            for comment in page.nodes {
+                bytes = bytes.saturating_add(comment.body.len()).saturating_add(comment.url.as_str().len()).saturating_add(256);
+                if bytes > MAX_THREAD_PROMPT_BYTES { return Err(GitHubError::Inspection("The selected thread exceeds the 2 MiB agent context limit. Open its full discussion on GitHub.".into())); }
+                comments.push(comment);
+            }
+            if !page.page_info.has_next_page {
+                thread.comments = comments;
+                thread.truncated = false;
+                return Ok(thread);
+            }
+            cursor = Some(next_cursor(&page.page_info, cursor.as_deref())?);
+        }
+        Err(GitHubError::Inspection("The selected thread has more than 2,000 comments. Open its full discussion on GitHub instead of sending partial context.".into()))
+    }
+
 
 }
 
@@ -95,6 +125,7 @@ pub fn failed_check_prompt(pr: &PullRequest, check: &PullRequestCheck, logs: &st
 pub fn review_threads_prompt(pr: &PullRequest, threads: &[(PullRequestReviewThread, String)]) -> Result<String,String> {
     let mut prompt = format!("Address the selected review threads on PR #{}: {}\n{}\nBranch: {}\nHead: {}\n", pr.number, pr.title, pr.url, pr.head_ref_name, pr.head_ref_oid);
     for (thread, hunk) in threads {
+        if thread.truncated { return Err("The selected thread is incomplete. Refresh its full discussion before sending it to an agent.".into()); }
         prompt.push_str(&format!("\nFile: {}\nLines: {}..{} ({:?})\nThread: {}\nDiff hunk:\n{}\nComments:\n",
             thread.path, thread.start_line.or(thread.line).map_or("file".into(), |n| n.to_string()),
             thread.line.map_or("file".into(), |n| n.to_string()), thread.side, thread.id, hunk));
@@ -103,7 +134,6 @@ pub fn review_threads_prompt(pr: &PullRequest, threads: &[(PullRequestReviewThre
             prompt.push_str(&format!("\n{} ({}):\n{}\n", comment.author.as_ref().map_or("Deleted account", |a| a.login.as_str()), comment.url, comment.body));
             if prompt.len()>MAX_THREAD_PROMPT_BYTES{return Err("The selected review context exceeds 2 MiB. Select fewer threads to include their complete context.".into());}
         }
-        if thread.truncated { prompt.push_str("\n[More comments exist on GitHub; open the thread for full discussion.]\n"); }
     }
     prompt.push_str("\nMake the requested changes, verify them, and summarize how each thread was addressed. Leave thread resolution to the reviewer.\n");
     Ok(prompt)
@@ -183,5 +213,43 @@ mod batch_tests {
         let executor=Arc::new(Fake(Default::default()));let service=GitHubService::new("gh",executor.clone());let repo=GitHubRepoKey::new("batch-context.invalid",None,"owner","repo").unwrap();
         let ids=(0..61).map(|index|format!("thread-id-{index}")).collect::<Vec<_>>();let result=service.review_thread_hunks(&repo,&ids,&CancellationToken::new()).unwrap();assert_eq!(result.len(),61);assert_eq!(result[50],"hunk-0");
         let calls=executor.0.lock().unwrap();assert_eq!(calls.len(),2);assert!(calls[1].arguments.iter().any(|argument|argument=="thread0=thread-id-50"));assert!(!calls[0].arguments.iter().find(|argument|argument.to_string_lossy().starts_with("query=")).unwrap().to_string_lossy().contains("thread-id-0"));
+    }
+
+    struct LongThread { calls: Mutex<Vec<CommandSpec>>, oversized: bool }
+    impl ProcessExecutor for LongThread {
+        fn execute(&self, command: &CommandSpec, _: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+            let mut calls = self.calls.lock().unwrap();
+            let page = calls.len(); calls.push(command.clone());
+            let range = if self.oversized { 0..1 } else { match page { 0 => 0..50, 1 => 50..100, _ => 100..101 } };
+            let nodes: Vec<_> = range.map(|index| serde_json::json!({"id":format!("comment-{index}"),"body":if self.oversized {"x".repeat(MAX_THREAD_PROMPT_BYTES + 1)} else {format!("Complete comment {index}")},"createdAt":"now","url":format!("https://github.com/owner/repo/pull/7#discussion_r{index}"),"diffHunk":"@@ -1 +1 @@ full context","commentState":"SUBMITTED"})).collect();
+            let response = serde_json::json!({"data":{"node":{"comments":{"nodes":nodes,"pageInfo":{"hasNextPage":page<2,"endCursor":format!("page{}",page+1)}}}}});
+            Ok(ProcessOutput { success: true, exit_code: Some(0), signal: None, stdout: response.to_string().into_bytes(), stderr: Vec::new() })
+        }
+    }
+    fn truncated_thread() -> PullRequestReviewThread {
+        let page: ReviewThreadPage = serde_json::from_value(serde_json::json!({"id":"thread","path":"src/file.rs","line":1,"diffSide":"RIGHT","isOutdated":false,"isResolved":false,"comments":{"nodes":[],"pageInfo":{"hasNextPage":true,"endCursor":"cached"}}})).unwrap();
+        page.into_thread(Vec::new(), true)
+    }
+    #[test]
+    fn agent_handoff_completes_a_selected_thread_beyond_the_inspector_comment_cap() {
+        let executor = Arc::new(LongThread { calls: Mutex::new(Vec::new()), oversized: false });
+        let service = GitHubService::new("gh", executor.clone());
+        let repository = GitHubRepoKey::new("thread-context.invalid", None, "owner", "repo").unwrap();
+        let thread = service.complete_review_thread_comments(&repository, truncated_thread(), &CancellationToken::new()).unwrap();
+        assert_eq!(thread.comments.len(), 101); assert!(!thread.truncated);
+        assert_eq!(thread.comments[100].body, "Complete comment 100");
+        let calls = executor.calls.lock().unwrap(); assert_eq!(calls.len(), 3);
+        assert!(calls[1].arguments.iter().any(|arg| arg == "cursor=page1"));
+        assert!(calls[2].arguments.iter().any(|arg| arg == "cursor=page2"));
+    }
+    #[test]
+    fn agent_handoff_refuses_oversized_or_incomplete_thread_context() {
+        let executor = Arc::new(LongThread { calls: Mutex::new(Vec::new()), oversized: true });
+        let service = GitHubService::new("gh", executor.clone());
+        let repository = GitHubRepoKey::new("thread-budget.invalid", None, "owner", "repo").unwrap();
+        assert!(service.complete_review_thread_comments(&repository, truncated_thread(), &CancellationToken::new()).unwrap_err().to_string().contains("2 MiB"));
+        assert_eq!(executor.calls.lock().unwrap().len(), 1);
+        let pr: PullRequest = serde_json::from_value(serde_json::json!({"number":7,"title":"Review","state":"OPEN","headRefName":"feature","headRefOid":"abc","baseRefName":"main","updatedAt":"now","url":"https://github.com/owner/repo/pull/7"})).unwrap();
+        assert!(review_threads_prompt(&pr, &[(truncated_thread(), "hunk".into())]).unwrap_err().contains("incomplete"));
     }
 }
