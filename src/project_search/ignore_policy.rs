@@ -440,8 +440,8 @@ mod tests {
         let token = cancel.clone();
         let mut walker = ignore::WalkBuilder::new(directory.path());
         walker.standard_filters(false).filter_entry(move |entry| {
-            visits.fetch_add(1, Ordering::Relaxed);
             if entry.depth() > 0 {
+                visits.fetch_add(1, Ordering::Relaxed);
                 token.cancel();
             }
             policy.lock().unwrap().allows(entry)
@@ -456,8 +456,8 @@ mod tests {
         }
         assert_eq!(
             seen.load(Ordering::Relaxed),
-            2,
-            "filter must yield root+one child, not enumerate every canceled sibling"
+            1,
+            "filter must yield the first canceled child, not enumerate every canceled sibling"
         );
     }
     #[test]
