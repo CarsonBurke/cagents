@@ -152,7 +152,10 @@ pub enum FocusedPane {
 
 impl FocusedPane {
     pub fn is_text_editing(self) -> bool {
-        matches!(self, Self::Editor | Self::Chat | Self::TextInput | Self::Browser)
+        matches!(
+            self,
+            Self::Editor | Self::Chat | Self::TextInput | Self::Browser
+        )
     }
 }
 
@@ -3204,9 +3207,14 @@ mod tests {
             global_shortcut(&redo, &shortcuts, FocusedPane::Terminal),
             Some(GlobalShortcut::ReopenPane)
         );
-        assert_eq!(global_shortcut(
-            &key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false),
-            &shortcuts, FocusedPane::Browser), Some(GlobalShortcut::FindInPane));
+        assert_eq!(
+            global_shortcut(
+                &key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false),
+                &shortcuts,
+                FocusedPane::Browser
+            ),
+            Some(GlobalShortcut::FindInPane)
+        );
         assert_eq!(
             global_shortcut(
                 &key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false),
@@ -3996,7 +4004,9 @@ mod tests {
             );
             for event in [
                 Event::Keyboard(key_press("f", Code::KeyF, keyboard::Modifiers::CTRL, false)),
-                Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit("input".into())),
+                Event::InputMethod(cosmic::iced::advanced::input_method::Event::Commit(
+                    "input".into(),
+                )),
             ] {
                 let mut messages = Vec::new();
                 let mut shell = Shell::new(&mut messages);

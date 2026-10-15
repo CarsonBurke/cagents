@@ -8113,7 +8113,9 @@ impl Cagents {
         if focus_changed {
             // Parked widget trees do not receive the focus operation. Release
             // input against the original browser before handing off a pane.
-            if let Some(CardRuntime::Browser(browser)) = self.durable.focused.and_then(|id| self.cards.get(&id)) {
+            if let Some(CardRuntime::Browser(browser)) =
+                self.durable.focused.and_then(|id| self.cards.get(&id))
+            {
                 let _ = browser.handle.set_focused(false);
             }
         }
