@@ -12,6 +12,7 @@ const OBJECTS: &[(&str,&str,&str)] = &[
         CHECK(phase!='started' OR started_receipt IS NOT NULL)
     ) STRICT;"###),
     ("index","created_start_requirements_required_card",r###"CREATE UNIQUE INDEX created_start_requirements_required_card ON created_start_requirements(card_id) WHERE phase='required';"###),
+    ("index","created_start_requirements_card_phase",r###"CREATE INDEX created_start_requirements_card_phase ON created_start_requirements(card_id,phase);"###),
     ("table","automation_notifications",r###"CREATE TABLE automation_notifications (key TEXT PRIMARY KEY, event TEXT NOT NULL) STRICT;"###),
     ("table","automation_retired_manual_requests",r###"CREATE TABLE automation_retired_manual_requests (
         automation TEXT NOT NULL, request TEXT NOT NULL, revision INTEGER NOT NULL,
@@ -260,6 +261,17 @@ mod tests {
         let registry=Registry::at(&path).unwrap();
         assert_eq!(registry.db.query_row("SELECT phase,started_receipt FROM created_start_requirements WHERE session_id=?1",[&first],|row|Ok((row.get::<_,String>(0)?,row.get::<_,Option<String>>(1)?))).unwrap(),("retired".into(),None));
         assert_eq!(registry.db.query_row("SELECT count(*) FROM created_start_requirements",[],|row|row.get::<_,u64>(0)).unwrap(),2);
+    }
+
+    #[test]
+    fn registry19_started_history_lookup_seeks_the_exact_card_without_scanning_permanent_history() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("registry.sqlite3");
+        let registry=Registry::at(&path).unwrap();
+        let plan:Vec<String>=registry.db.prepare("EXPLAIN QUERY PLAN SELECT EXISTS(SELECT 1 FROM created_start_requirements WHERE card_id=?1 AND phase='started')").unwrap()
+            .query_map([uuid::Uuid::new_v4().to_string()],|row|row.get(3)).unwrap().map(Result::unwrap).collect();
+        assert!(plan.iter().any(|step|step.contains("SEARCH created_start_requirements USING COVERING INDEX created_start_requirements_card_phase (card_id=? AND phase=?)")),"{plan:?}");
+        registry.db.execute_batch("DROP INDEX created_start_requirements_card_phase").unwrap();
+        assert!(validate(&registry.db,19).unwrap_err().contains("created_start_requirements_card_phase"),"a matching version must not admit a partial cost-bound checkpoint");
     }
 
     #[test]
