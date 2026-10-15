@@ -4067,6 +4067,37 @@ for line in sys.stdin:
 
     #[test]
     fn legacy_codex_upgrade_publishes_issued_arguments_and_hydrates_the_exact_thread() {
+        const CHILD: &str = "CAGENTS_LEGACY_CODEX_UPGRADE_CONTRACT";
+        let exact = thread::current().name().expect("named owning contract").to_owned();
+        if std::env::var(CHILD).as_deref() != Ok(exact.as_str()) {
+            use crate::repository::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+            // Keep private evidence on success AND failure; a child result does
+            // not establish that every descendant has positively retired.
+            let root = tempfile::Builder::new().prefix("cagents-legacy-upgrade-")
+                .tempdir_in("/var/tmp").unwrap().keep();
+            for name in ["home", "run", "data", "config", "cache"] {
+                std::fs::create_dir(root.join(name)).unwrap();
+            }
+            let command = CommandSpec::new(std::env::current_exe().unwrap())
+                .args(["--exact", exact.as_str(), "--nocapture", "--test-threads=1"])
+                .env(CHILD, &exact)
+                .env("HOME", root.join("home"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .timeout(Duration::from_secs(35)).output_limits(128 * 1024, 128 * 1024);
+            let output = SystemProcessExecutor.execute(&command, &CancellationToken::new()).unwrap();
+            std::fs::write(root.join("stdout.log"), &output.stdout).unwrap();
+            std::fs::write(root.join("stderr.log"), &output.stderr).unwrap();
+            let output = output.require_success(&command.program).unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(stdout.lines().any(|line| line == "running 1 test")
+                && stdout.lines().any(|line| line == format!("test {exact} ... ok"))
+                && stdout.lines().any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
+                "exact owning contract did not execute; retained evidence {}", root.display());
+            return;
+        }
         use std::os::unix::net::UnixListener;
         let (directory, host, mut saved) = upgrade_fixture();
         let socket = directory.path().join("codex.sock");
@@ -4076,10 +4107,31 @@ for line in sys.stdin:
         let identity = saved.launch.session_id.clone().unwrap();
         let expected = identity.clone();
         let reported_home = home.clone();
+        let (finished, completion) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(12);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "exact Codex peer never connected");
+                        thread::sleep(Duration::from_millis(2));
+                    }
+                    Err(error) => panic!("fixture accept: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(2))).unwrap();
             let mut socket = tungstenite::accept(stream).unwrap();
-            while let Ok(message) = socket.read() {
+            loop {
+                assert!(Instant::now() < deadline, "exact Codex peer did not close");
+                let message = match socket.read() {
+                    Ok(message) => message,
+                    Err(tungstenite::Error::Io(error)) if matches!(error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+                    Err(_) => break,
+                };
                 let tungstenite::Message::Text(text) = message else {
                     continue;
                 };
@@ -4115,6 +4167,7 @@ for line in sys.stdin:
                     break;
                 }
             }
+            let _ = finished.send(());
         });
         saved.source.launch.provider = Provider::Codex;
         saved.source.launch.recipe.program = "codex".into();
@@ -4154,6 +4207,7 @@ for line in sys.stdin:
         assert!(snapshot.items.iter().any(|item| matches!(&item.content,
             chat::ItemContent::Text { text, .. } if text == "existing exact-thread answer")));
         handle.close().unwrap();
+        completion.recv_timeout(Duration::from_secs(3)).expect("bounded Codex fixture completion");
         server.join().unwrap();
     }
 
