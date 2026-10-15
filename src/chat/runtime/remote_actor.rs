@@ -3,8 +3,8 @@
 mod journal;
 pub(crate) mod restart;
 pub(crate) use restart::{RestartCleanup, RestartFailure, RestartReceipt, RestartState};
-pub(crate) mod final_snapshot;
 mod deadline_io;
+pub(crate) mod final_snapshot;
 use super::{LocalHandle, Rejection, Update};
 use crate::{
     chat::{
@@ -377,7 +377,9 @@ impl RemoteActor {
             (self.0.notify)(Update::RetainedOutcomes);
         }
     }
-    pub fn native_holder_record(&self)->&Record {&self.0.identity.record}
+    pub fn native_holder_record(&self) -> &Record {
+        &self.0.identity.record
+    }
     pub fn identity(&self) -> ActorIdentity {
         self.0.identity.clone()
     }
@@ -602,21 +604,43 @@ impl RemoteActor {
         Ok(handle)
     }
     pub fn inspect(record: &Record, proof: HostSessionProof) -> Result<ActorInspection, String> {
-        Self::inspect_until(record,proof,Instant::now()+TIMEOUT)
+        Self::inspect_until(record, proof, Instant::now() + TIMEOUT)
     }
-    pub fn inspect_until(record:&Record,proof:HostSessionProof,deadline:Instant)->Result<ActorInspection,String> {
-        let socket=registry::socket(&registry::directory(Kind::Native)?,record.terminal);
-        Self::inspect_at_until(record,proof,&socket,deadline)
+    pub fn inspect_until(
+        record: &Record,
+        proof: HostSessionProof,
+        deadline: Instant,
+    ) -> Result<ActorInspection, String> {
+        let socket = registry::socket(&registry::directory(Kind::Native)?, record.terminal);
+        Self::inspect_at_until(record, proof, &socket, deadline)
     }
-    fn inspect_at_until(record:&Record,proof:HostSessionProof,socket:&std::path::Path,deadline:Instant)->Result<ActorInspection,String> {
-        if Instant::now()>=deadline {return Err("Retained actor inspection deadline expired".into());}
+    fn inspect_at_until(
+        record: &Record,
+        proof: HostSessionProof,
+        socket: &std::path::Path,
+        deadline: Instant,
+    ) -> Result<ActorInspection, String> {
+        if Instant::now() >= deadline {
+            return Err("Retained actor inspection deadline expired".into());
+        }
         validate_record(record)?;
-        let control=registry::connect_until(socket,deadline).map_err(|error|error.to_string())?;
-        verify_peer(&control,record)?;
-        deadline_io::send_until(&control,&Invocation {proof,epoch:None,method:"inspect".into(),args:Value::Null},deadline)?;
-        let response:Result<ActorInspection,String>=deadline_io::receive_until(&control,deadline)?;
-        let response=response?;
-        if response.identity.record!=*record || response.source.id!=record.terminal {
+        let control =
+            registry::connect_until(socket, deadline).map_err(|error| error.to_string())?;
+        verify_peer(&control, record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof,
+                epoch: None,
+                method: "inspect".into(),
+                args: Value::Null,
+            },
+            deadline,
+        )?;
+        let response: Result<ActorInspection, String> =
+            deadline_io::receive_until(&control, deadline)?;
+        let response = response?;
+        if response.identity.record != *record || response.source.id != record.terminal {
             return Err("Retained actor inspection returned another exact holder identity".into());
         }
         Ok(response)
@@ -1392,42 +1416,78 @@ impl RemoteActor {
             thread::sleep(Duration::from_millis(10));
         }
     }
-    pub fn account_switch_generation(&self)->Result<Option<u64>,String> {
+    pub fn account_switch_generation(&self) -> Result<Option<u64>, String> {
         if self.state().completed {
-            if let Some(snapshot)=self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {return Ok(Some(snapshot.generation));}
+            if let Some(snapshot) = self
+                .0
+                .final_snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
+                return Ok(Some(snapshot.generation));
+            }
         }
-        self.call("account_switch_generation",Value::Null)
+        self.call("account_switch_generation", Value::Null)
     }
-    pub fn completed_account_options(&self)->Result<Option<super::AccountSwitchOptions>,String> {
+    pub fn completed_account_options(&self) -> Result<Option<super::AccountSwitchOptions>, String> {
         // A finally retired helper cannot answer RPC. Its exact final attached
         // publication remains immutable in this proxy, without hydrating disk.
         if self.state().completed {
-            if let Some(snapshot)=self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref() {
+            if let Some(snapshot) = self
+                .0
+                .final_snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+            {
                 return Ok(Some(super::AccountSwitchOptions::capture(snapshot)));
             }
         }
-        self.call("completed_account_options",Value::Null)
+        self.call("completed_account_options", Value::Null)
     }
-    pub fn close_for_account_switch(&self,generation:u64)->Result<Option<super::AccountSwitchOptions>,String> {
-        let cached=if self.state().completed {
-            self.0.final_snapshot.lock().unwrap_or_else(|p|p.into_inner()).as_ref().map(|snapshot|(snapshot.generation,super::AccountSwitchOptions::capture(snapshot)))
-        } else {None};
-        if let Some((current,options))=cached {
-            if current!=generation {return Ok(None);}
+    pub fn close_for_account_switch(
+        &self,
+        generation: u64,
+    ) -> Result<Option<super::AccountSwitchOptions>, String> {
+        let cached = if self.state().completed {
+            self.0
+                .final_snapshot
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .as_ref()
+                .map(|snapshot| {
+                    (
+                        snapshot.generation,
+                        super::AccountSwitchOptions::capture(snapshot),
+                    )
+                })
+        } else {
+            None
+        };
+        if let Some((current, options)) = cached {
+            if current != generation {
+                return Ok(None);
+            }
             // Options metadata alone never proves ownership release.
             self.finish_close()?;
             return Ok(Some(options));
         }
-        let result:AccountSwitchClose=self.call("close_for_account_switch",json!([generation]))?;
-        match (result.options,result.publication) {
-            (None,None)=>Ok(None),
-            (Some(options),Some(publication))=>{
-                *self.0.state.lock().unwrap_or_else(|p|p.into_inner())=Arc::new(publication.resident);
+        let result: AccountSwitchClose =
+            self.call("close_for_account_switch", json!([generation]))?;
+        match (result.options, result.publication) {
+            (None, None) => Ok(None),
+            (Some(options), Some(publication)) => {
+                *self.0.state.lock().unwrap_or_else(|p| p.into_inner()) =
+                    Arc::new(publication.resident);
                 self.publish_closed(publication.snapshot);
                 (self.0.notify)(Update::RetainedOutcomes);
                 Ok(Some(options))
-            },
-            _=>Err("The account handoff did not return matching final options and cleanup publication".into()),
+            }
+            _ => Err(
+                "The account handoff did not return matching final options and cleanup publication"
+                    .into(),
+            ),
         }
     }
     pub fn close(&self) -> Result<(), String> {
@@ -1907,32 +1967,56 @@ impl Server {
                 serde_json::to_value($expression).map_err(|error| error.to_string())
             };
         }
-        if self.attachment_preserved && matches!(request.method.as_str(),
-            "restart" | "fence_session_stop" | "close" | "close_until" |
-            "close_if_revision" | "close_if_idle" | "relocate_directory" | "update_source"
-        ) {
+        if self.attachment_preserved
+            && matches!(
+                request.method.as_str(),
+                "restart"
+                    | "fence_session_stop"
+                    | "close"
+                    | "close_until"
+                    | "close_if_revision"
+                    | "close_if_idle"
+                    | "relocate_directory"
+                    | "update_source"
+            )
+        {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
             "account_switch_generation" => value!(self.actor.account_switch_generation()?),
             "completed_account_options" => value!(self.actor.completed_account_options()?),
             "account_switch_notice" => {
-                let (source,target)=decode!((chat::Launch,chat::Launch));
-                self.actor.account_switch_notice(&source,&target)?;
+                let (source, target) = decode!((chat::Launch, chat::Launch));
+                self.actor.account_switch_notice(&source, &target)?;
                 Ok(Value::Null)
-            },
+            }
             "restore_account_options" => {
-                let (options,budget)=decode!((super::AccountSwitchOptions,u64));
-                if self.session_stopping || budget==0 {return Err("Account option restoration is unavailable while the actor is stopping or its budget expired".into());}
-                self.actor.restore_account_options(&options,Instant::now()+Duration::from_millis(budget.min(4000)),||false)?;
+                let (options, budget) = decode!((super::AccountSwitchOptions, u64));
+                if self.session_stopping || budget == 0 {
+                    return Err("Account option restoration is unavailable while the actor is stopping or its budget expired".into());
+                }
+                self.actor.restore_account_options(
+                    &options,
+                    Instant::now() + Duration::from_millis(budget.min(4000)),
+                    || false,
+                )?;
                 Ok(Value::Null)
-            },
+            }
             "close_for_account_switch" => {
-                let (generation,)=decode!((u64,));
-                let options=self.actor.close_for_account_switch(generation)?;
-                let publication=if options.is_some() {reap_orphans()?;self.finish_inputs();Some(self.publish_close()?)} else {None};
-                value!(AccountSwitchClose{options,publication})
-            },
+                let (generation,) = decode!((u64,));
+                let options = self.actor.close_for_account_switch(generation)?;
+                let publication = if options.is_some() {
+                    reap_orphans()?;
+                    self.finish_inputs();
+                    Some(self.publish_close()?)
+                } else {
+                    None
+                };
+                value!(AccountSwitchClose {
+                    options,
+                    publication
+                })
+            }
             "execution_environment" => value!(self.environment.clone()),
             "restart" => {
                 if self.session_stopping {
@@ -2555,7 +2639,7 @@ extern "C" fn serve_if_requested() {
     let result = (|| {
         // Startup control and the pinned directory survived helper exec;
         // seal them before spawning any provider or provider descendants.
-        crate::daemon::seal_inherited_descriptors().map_err(|error|error.to_string())?;
+        crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
         let startup: Startup = receive(&control, Duration::from_secs(30))?;
         authorize(
             &control,
@@ -2693,49 +2777,105 @@ mod tests {
     }
     #[test]
     fn helper_restores_descriptor_seal_before_any_provider_exec() {
-        const CHILD:&str="CAGENTS_ACTOR_DESCRIPTOR_SEAL_TEST";
+        const CHILD: &str = "CAGENTS_ACTOR_DESCRIPTOR_SEAL_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let isolated=tempfile::tempdir_in("/var/tmp").unwrap();
-            let test=thread::current().name().unwrap().to_owned();
-            let output=ChildCommand::new(std::env::current_exe().unwrap()).args(["--exact",&test,"--nocapture"])
-                .env(CHILD,"1").env("XDG_RUNTIME_DIR",isolated.path()).env("XDG_DATA_HOME",isolated.path().join("data"))
-                .env("XDG_CONFIG_HOME",isolated.path().join("config")).env("XDG_CACHE_HOME",isolated.path().join("cache"))
-                .env("HOME",isolated.path().join("home")).env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));return;
+            let isolated = tempfile::tempdir_in("/var/tmp").unwrap();
+            let test = thread::current().name().unwrap().to_owned();
+            let output = ChildCommand::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_RUNTIME_DIR", isolated.path())
+                .env("XDG_DATA_HOME", isolated.path().join("data"))
+                .env("XDG_CONFIG_HOME", isolated.path().join("config"))
+                .env("XDG_CACHE_HOME", isolated.path().join("cache"))
+                .env("HOME", isolated.path().join("home"))
+                .env("CAGENTS_LOCAL_DEBUG", "0")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
         }
-        let root=tempfile::tempdir_in("/var/tmp").unwrap();
-        let mut source=chat::native_holder::fixture_source();
-        source.launch.provider=crate::agent::Provider::Claude;source.launch.session_id=None;
-        source.launch.recipe=crate::model::LaunchRecipe {program:"/bin/sleep".into(),arguments:vec!["600".into()],working_directory:root.path().into(),
-            environment:BTreeMap::from([("HOME".into(),root.path().to_string_lossy().into_owned()),("CLAUDE_CONFIG_DIR".into(),root.path().join("claude").to_string_lossy().into_owned())]),unset_environment:Default::default()};
-        source.owned_codex_listener=None;source.terminal=None;source.native_continuity=chat::NativeContinuity::ReconnectOnly;
-        source.proof.as_mut().unwrap().boot_id=crate::daemon::read_boot_id().unwrap();
-        let paths=crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
-        let context=Arc::new(ExecutionContext::capture(root.path()).unwrap());
-        let mut spec=ProcessSpec::from(&source.launch.recipe);spec.execution=Some(context.clone());
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut source = chat::native_holder::fixture_source();
+        source.launch.provider = crate::agent::Provider::Claude;
+        source.launch.session_id = None;
+        source.launch.recipe = crate::model::LaunchRecipe {
+            program: "/bin/sleep".into(),
+            arguments: vec!["600".into()],
+            working_directory: root.path().into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), root.path().to_string_lossy().into_owned()),
+                (
+                    "CLAUDE_CONFIG_DIR".into(),
+                    root.path().join("claude").to_string_lossy().into_owned(),
+                ),
+            ]),
+            unset_environment: Default::default(),
+        };
+        source.owned_codex_listener = None;
+        source.terminal = None;
+        source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        source.proof.as_mut().unwrap().boot_id = crate::daemon::read_boot_id().unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let context = Arc::new(ExecutionContext::capture(root.path()).unwrap());
+        let mut spec = ProcessSpec::from(&source.launch.recipe);
+        spec.execution = Some(context.clone());
         // This execs the real retained-helper entry and its real provider
         // spawning path. Omitting the entry seal leaks both inherited FDs.
-        let actor=RemoteActor::spawn(spec,source,BTreeMap::new(),|_|{}).unwrap();
+        let actor = RemoteActor::spawn(spec, source, BTreeMap::new(), |_| {}).unwrap();
         struct Owner(RemoteActor);
-        impl Drop for Owner {fn drop(&mut self) {let _=self.0.close();let _=self.0.finish_close();}}
-        let owner=Owner(actor);let actor=&owner.0;actor.commit_installation().unwrap();
-        let provider=actor.state().provider_process.clone().unwrap();
-        assert!(provider.is_current());
-        let inherited=std::fs::read_dir(format!("/proc/{}/fd",provider.pid)).unwrap().filter_map(|entry| {
-            let path=entry.unwrap().path();match std::fs::read_link(path) {
-                Ok(target)=>Some(target),
-                Err(error) if error.kind()==std::io::ErrorKind::NotFound=>None,
-                Err(error)=>panic!("Cannot inspect exact fixture provider FD: {error}"),
+        impl Drop for Owner {
+            fn drop(&mut self) {
+                let _ = self.0.close();
+                let _ = self.0.finish_close();
             }
-        }).collect::<Vec<_>>();
-        actor.close().unwrap();actor.finish_close().unwrap();
+        }
+        let owner = Owner(actor);
+        let actor = &owner.0;
+        actor.commit_installation().unwrap();
+        let provider = actor.state().provider_process.clone().unwrap();
+        assert!(provider.is_current());
+        let inherited = std::fs::read_dir(format!("/proc/{}/fd", provider.pid))
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                match std::fs::read_link(path) {
+                    Ok(target) => Some(target),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => panic!("Cannot inspect exact fixture provider FD: {error}"),
+                }
+            })
+            .collect::<Vec<_>>();
+        actor.close().unwrap();
+        actor.finish_close().unwrap();
         assert!(!provider.is_current());
-        assert!(!inherited.iter().any(|target|target.to_string_lossy().starts_with("socket:[")),"provider exec must not inherit the private helper startup control socket");
-        assert!(!inherited.iter().any(|target|target==root.path()),"provider exec must not retain the helper's approved-directory FD");
-        assert!(context.directory_descriptor().unwrap().metadata().unwrap().is_dir(),"the caller's approved pin remains usable");
+        assert!(
+            !inherited
+                .iter()
+                .any(|target| target.to_string_lossy().starts_with("socket:[")),
+            "provider exec must not inherit the private helper startup control socket"
+        );
+        assert!(
+            !inherited.iter().any(|target| target == root.path()),
+            "provider exec must not retain the helper's approved-directory FD"
+        );
+        assert!(
+            context
+                .directory_descriptor()
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .is_dir(),
+            "the caller's approved pin remains usable"
+        );
     }
-
 
     #[test]
     fn explicit_restart_reuses_the_store_and_never_repeats_a_deduplicated_launch() {
@@ -3001,29 +3141,48 @@ done"#;
 
     #[test]
     fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_changes() {
-        let fixture=resident_fixture();
-        let mut record=fixture.server.identity.record.clone();
-        record.boot=crate::daemon::read_boot_id().unwrap();
-        record.build.as_mut().unwrap().capabilities.push(CAPABILITY.into());
-        let socket=fixture._root.path().join("deadline-inspect.sock");
-        let listener=UnixListener::bind(&socket).unwrap();
-        let (release,wait)=crossbeam_channel::bounded(1);
-        let peer=thread::spawn(move|| {
-            let (control,_)=listener.accept().unwrap();
-            let request:Invocation=receive(&control,TIMEOUT).unwrap();
-            assert_eq!(request.method,"inspect");assert!(request.epoch.is_none());
+        let fixture = resident_fixture();
+        let mut record = fixture.server.identity.record.clone();
+        record.boot = crate::daemon::read_boot_id().unwrap();
+        record
+            .build
+            .as_mut()
+            .unwrap()
+            .capabilities
+            .push(CAPABILITY.into());
+        let socket = fixture._root.path().join("deadline-inspect.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let (release, wait) = crossbeam_channel::bounded(1);
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "inspect");
+            assert!(request.epoch.is_none());
             // SO_PEERCRED has identified this exact Record.holder process, but
             // its inspection response stalls. The client must still return.
-            let _=wait.recv_timeout(Duration::from_secs(2));
+            let _ = wait.recv_timeout(Duration::from_secs(2));
         });
-        let epoch=fixture.server.epoch;let source=fixture.server.source.clone();
-        let started=Instant::now();
-        let error=RemoteActor::inspect_at_until(&record,fixture.server.proof.clone(),&socket,started+Duration::from_millis(40)).err().expect("stalled inspection must time out");
-        let elapsed=started.elapsed();let _=release.send(());peer.join().unwrap();
-        assert!(error.contains("deadline"));assert!(elapsed<Duration::from_millis(250));
-        assert_eq!(fixture.server.epoch,epoch);assert_eq!(fixture.server.source,source);
+        let epoch = fixture.server.epoch;
+        let source = fixture.server.source.clone();
+        let started = Instant::now();
+        let error = RemoteActor::inspect_at_until(
+            &record,
+            fixture.server.proof.clone(),
+            &socket,
+            started + Duration::from_millis(40),
+        )
+        .err()
+        .expect("stalled inspection must time out");
+        let elapsed = started.elapsed();
+        let _ = release.send(());
+        peer.join().unwrap();
+        assert!(error.contains("deadline"));
+        assert!(elapsed < Duration::from_millis(250));
+        assert_eq!(fixture.server.epoch, epoch);
+        assert_eq!(fixture.server.source, source);
         assert!(!fixture.server.actor.0.stop.load(Ordering::Acquire));
-        assert!(fixture.server.pending.is_empty());assert_eq!(fixture.server.journal.lock().unwrap().latest().unwrap(),0);
+        assert!(fixture.server.pending.is_empty());
+        assert_eq!(fixture.server.journal.lock().unwrap().latest().unwrap(), 0);
     }
 
     #[test]
@@ -3105,71 +3264,163 @@ done"#;
             let mut fixture = resident_fixture();
             let server = &mut fixture.server;
             let invoke = |server: &mut Server, method: &str, args: Value| {
-                server.invoke(Invocation { proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args })
+                server.invoke(Invocation {
+                    proof: server.proof.clone(),
+                    epoch: Some(server.epoch),
+                    method: method.into(),
+                    args,
+                })
             };
             let actor_id = server.identity.instance;
             if preserve_first {
-                invoke(server,"preserve",Value::Null).unwrap();
-                invoke(server,"preserve",Value::Null).unwrap(); // Lost-ACK retry is idempotent.
+                invoke(server, "preserve", Value::Null).unwrap();
+                invoke(server, "preserve", Value::Null).unwrap(); // Lost-ACK retry is idempotent.
                 assert!(server.attachment_preserved);
-                assert!(invoke(server,"fence_session_stop",json!([actor_id,1000])).unwrap_err().contains("preserved"));
+                assert!(
+                    invoke(server, "fence_session_stop", json!([actor_id, 1000]))
+                        .unwrap_err()
+                        .contains("preserved")
+                );
                 assert!(!server.session_stopping);
                 assert!(!server.actor.0.stop.load(Ordering::Acquire));
-                assert!(invoke(server,"restart",Value::Null).unwrap_err().contains("preserved"));
-                assert!(invoke(server,"close_until",json!([1000])).unwrap_err().contains("preserved"));
-                let payload=serde_json::to_value(InputPayload::Command {run:None,command:Command::Refresh}).unwrap();
-                let identity=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:payload_digest(&serde_json::to_vec(&payload).unwrap())};
-                assert!(invoke(server,"input",json!([identity,payload])).unwrap_err().contains("preserved"));
-                assert_eq!(server.journal.lock().unwrap().next_input().unwrap(),1);
-                assert!(invoke(server,"outbox_unacked",Value::Null).is_ok());
-                assert!(invoke(server,"input_receipts",json!([Vec::<InputIdentity>::new()])).is_ok());
-                let epoch=server.epoch; let source=server.source.clone();
-                invoke(server,"attach",json!([source])).unwrap();
-                assert_ne!(server.epoch,epoch);
+                assert!(
+                    invoke(server, "restart", Value::Null)
+                        .unwrap_err()
+                        .contains("preserved")
+                );
+                assert!(
+                    invoke(server, "close_until", json!([1000]))
+                        .unwrap_err()
+                        .contains("preserved")
+                );
+                let payload = serde_json::to_value(InputPayload::Command {
+                    run: None,
+                    command: Command::Refresh,
+                })
+                .unwrap();
+                let identity = InputIdentity {
+                    sequence: 1,
+                    id: uuid::Uuid::new_v4(),
+                    hash: payload_digest(&serde_json::to_vec(&payload).unwrap()),
+                };
+                assert!(
+                    invoke(server, "input", json!([identity, payload]))
+                        .unwrap_err()
+                        .contains("preserved")
+                );
+                assert_eq!(server.journal.lock().unwrap().next_input().unwrap(), 1);
+                assert!(invoke(server, "outbox_unacked", Value::Null).is_ok());
+                assert!(
+                    invoke(
+                        server,
+                        "input_receipts",
+                        json!([Vec::<InputIdentity>::new()])
+                    )
+                    .is_ok()
+                );
+                let epoch = server.epoch;
+                let source = server.source.clone();
+                invoke(server, "attach", json!([source])).unwrap();
+                assert_ne!(server.epoch, epoch);
                 assert!(!server.attachment_preserved);
-                invoke(server,"fence_session_stop",json!([actor_id,1000])).unwrap();
+                invoke(server, "fence_session_stop", json!([actor_id, 1000])).unwrap();
             } else {
-                invoke(server,"fence_session_stop",json!([actor_id,1000])).unwrap();
-                assert!(invoke(server,"preserve",Value::Null).unwrap_err().contains("stopping"));
+                invoke(server, "fence_session_stop", json!([actor_id, 1000])).unwrap();
+                assert!(
+                    invoke(server, "preserve", Value::Null)
+                        .unwrap_err()
+                        .contains("stopping")
+                );
                 assert!(!server.attachment_preserved);
-                let source=server.source.clone();
-                invoke(server,"attach",json!([source])).unwrap();
+                let source = server.source.clone();
+                invoke(server, "attach", json!([source])).unwrap();
                 assert!(server.session_stopping);
-                assert!(invoke(server,"preserve",Value::Null).unwrap_err().contains("stopping"));
+                assert!(
+                    invoke(server, "preserve", Value::Null)
+                        .unwrap_err()
+                        .contains("stopping")
+                );
             }
         }
     }
 
     #[test]
     fn preserved_attachment_cannot_rewrite_paired_ownership_metadata() {
-        let mut fixture=resident_fixture();
-        let server=&mut fixture.server;
-        let recipe=server.source.launch.recipe.clone();
-        let proof=server.proof.clone();
-        server.source.terminal=Some(crate::model::TerminalSession {
-            id:server.source.id,owned_codex_listener:None,recovery_origin:None,predecessor:None,
-            launch:recipe.clone(),transcript_path:None,resume_hint:None,
-            continuity:crate::model::TerminalContinuity::Live {
-                host_session_id:proof.host_session_id,boot_id:proof.boot_id,host_incarnation:proof.host_incarnation,
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        let recipe = server.source.launch.recipe.clone();
+        let proof = server.proof.clone();
+        server.source.terminal = Some(crate::model::TerminalSession {
+            id: server.source.id,
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            launch: recipe.clone(),
+            transcript_path: None,
+            resume_hint: None,
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
             },
         });
-        let mut pair=server.identity.record.clone(); pair.kind=Kind::Terminal;
-        server.execution_console=Some(recipe); server.paired_holder=Some(pair);
-        validate_pair(&server.source,server.execution_console.as_ref(),server.paired_holder.as_ref(),None).unwrap();
-        let original=(server.source.clone(),server.lineage.clone(),server.execution_console.clone(),server.paired_holder.clone());
-        let mut unpaired=server.source.clone();unpaired.terminal=None;
-        let invoke=|server:&mut Server,method:&str,args:Value| {
-            server.invoke(Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args})
+        let mut pair = server.identity.record.clone();
+        pair.kind = Kind::Terminal;
+        server.execution_console = Some(recipe);
+        server.paired_holder = Some(pair);
+        validate_pair(
+            &server.source,
+            server.execution_console.as_ref(),
+            server.paired_holder.as_ref(),
+            None,
+        )
+        .unwrap();
+        let original = (
+            server.source.clone(),
+            server.lineage.clone(),
+            server.execution_console.clone(),
+            server.paired_holder.clone(),
+        );
+        let mut unpaired = server.source.clone();
+        unpaired.terminal = None;
+        let invoke = |server: &mut Server, method: &str, args: Value| {
+            server.invoke(Invocation {
+                proof: server.proof.clone(),
+                epoch: Some(server.epoch),
+                method: method.into(),
+                args,
+            })
         };
-        invoke(server,"preserve",Value::Null).unwrap();
-        assert!(invoke(server,"update_source",json!([unpaired.clone(),null,null])).unwrap_err().contains("preserved"));
-        assert_eq!((server.source.clone(),server.lineage.clone(),server.execution_console.clone(),server.paired_holder.clone()),original);
-        let source=server.source.clone();
-        invoke(server,"attach",json!([source])).unwrap();
-        invoke(server,"update_source",json!([unpaired.clone(),null,null])).unwrap();
-        assert_eq!(server.source,unpaired);
+        invoke(server, "preserve", Value::Null).unwrap();
+        assert!(
+            invoke(
+                server,
+                "update_source",
+                json!([unpaired.clone(), null, null])
+            )
+            .unwrap_err()
+            .contains("preserved")
+        );
+        assert_eq!(
+            (
+                server.source.clone(),
+                server.lineage.clone(),
+                server.execution_console.clone(),
+                server.paired_holder.clone()
+            ),
+            original
+        );
+        let source = server.source.clone();
+        invoke(server, "attach", json!([source])).unwrap();
+        invoke(
+            server,
+            "update_source",
+            json!([unpaired.clone(), null, null]),
+        )
+        .unwrap();
+        assert_eq!(server.source, unpaired);
         assert!(server.execution_console.is_none() && server.paired_holder.is_none());
-        assert_eq!(server.lineage,vec![original.0]);
+        assert_eq!(server.lineage, vec![original.0]);
     }
 
     #[test]
@@ -3625,7 +3876,14 @@ done"#;
         // after preserve would test a forbidden ordering rather than a lost ACK.
         actor.0.stop.store(true, Ordering::Release);
         let deadline = Instant::now() + Duration::from_secs(6);
-        while actor.0.worker.lock().unwrap().as_ref().is_some_and(|worker| !worker.is_finished()) {
+        while actor
+            .0
+            .worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
             assert!(Instant::now() < deadline, "old metadata pump did not stop");
             thread::sleep(Duration::from_millis(5));
         }
@@ -3818,87 +4076,158 @@ done"#;
 
     #[test]
     fn account_switch_helper_refuses_live_replacement_and_preserves_completed_controls() {
-        const CHILD:&str="CAGENTS_ACCOUNT_SWITCH_HELPER_TEST";
+        const CHILD: &str = "CAGENTS_ACCOUNT_SWITCH_HELPER_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let name=thread::current().name().unwrap().to_owned();
-            let output=std::process::Command::new(std::env::current_exe().unwrap())
-                .args(["--exact",&name,"--nocapture"]).env(CHILD,"1").output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            let name = thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
-        assert_eq!(unsafe{libc::prctl(libc::PR_SET_CHILD_SUBREAPER,1,0,0,0)},0);
-        let mut fixture=resident_fixture();
-        let server=&mut fixture.server;
-        let issued=server.source.clone();
-        let process=server.actor.provider_process().unwrap();
-        let invoke=|server:&mut Server,method:&str,args:Value|server.invoke(Invocation{
-            proof:server.proof.clone(),epoch:Some(server.epoch),method:method.into(),args,
-        });
-        let generation:Option<u64>=serde_json::from_value(invoke(server,"account_switch_generation",Value::Null).unwrap()).unwrap();
-        let error=invoke(server,"close_for_account_switch",json!([generation.unwrap()])).unwrap_err();
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let mut fixture = resident_fixture();
+        let server = &mut fixture.server;
+        let issued = server.source.clone();
+        let process = server.actor.provider_process().unwrap();
+        let invoke = |server: &mut Server, method: &str, args: Value| {
+            server.invoke(Invocation {
+                proof: server.proof.clone(),
+                epoch: Some(server.epoch),
+                method: method.into(),
+                args,
+            })
+        };
+        let generation: Option<u64> = serde_json::from_value(
+            invoke(server, "account_switch_generation", Value::Null).unwrap(),
+        )
+        .unwrap();
+        let error = invoke(
+            server,
+            "close_for_account_switch",
+            json!([generation.unwrap()]),
+        )
+        .unwrap_err();
         assert!(error.contains("cannot prove safe exact account handoff"));
-        assert!(process.is_current(),"a scalar idle observation cannot stop the live fixture provider");
+        assert!(
+            process.is_current(),
+            "a scalar idle observation cannot stop the live fixture provider"
+        );
         assert!(!server.actor.0.stop.load(Ordering::Acquire));
         assert!(server.closed_snapshot.is_none());
-        assert_eq!(server.source,issued,"account choice cannot mutate issued launch provenance");
+        assert_eq!(
+            server.source, issued,
+            "account choice cannot mutate issued launch provenance"
+        );
         {
-            let mut state=server.actor.0.state.lock().unwrap();
-            state.selected_model=Some("chosen-before-next-send".into());
-            state.reasoning=Some("high".into());
-            state.permission_mode=Some("plan".into());
+            let mut state = server.actor.0.state.lock().unwrap();
+            state.selected_model = Some("chosen-before-next-send".into());
+            state.reasoning = Some("high".into());
+            state.permission_mode = Some("plan".into());
         }
         // Explicit fixture teardown is separate from the account selector.
         server.actor.close().unwrap();
-        let options:Option<super::super::AccountSwitchOptions>=serde_json::from_value(invoke(server,"completed_account_options",Value::Null).unwrap()).unwrap();
-        let options=options.unwrap();
-        assert_eq!(options.model.as_deref(),Some("chosen-before-next-send"));
-        assert_eq!(options.reasoning.as_deref(),Some("high"));
-        assert_eq!(options.permission_mode.as_deref(),Some("plan"));
-        let generation:Option<u64>=serde_json::from_value(invoke(server,"account_switch_generation",Value::Null).unwrap()).unwrap();
-        let stale:AccountSwitchClose=serde_json::from_value(invoke(server,"close_for_account_switch",json!([generation.unwrap().wrapping_add(1)])).unwrap()).unwrap();
-        assert!(stale.options.is_none()&&stale.publication.is_none());
-        let admitted:AccountSwitchClose=serde_json::from_value(invoke(server,"close_for_account_switch",json!([generation.unwrap()])).unwrap()).unwrap();
-        assert_eq!(admitted.options,Some(options));
+        let options: Option<super::super::AccountSwitchOptions> = serde_json::from_value(
+            invoke(server, "completed_account_options", Value::Null).unwrap(),
+        )
+        .unwrap();
+        let options = options.unwrap();
+        assert_eq!(options.model.as_deref(), Some("chosen-before-next-send"));
+        assert_eq!(options.reasoning.as_deref(), Some("high"));
+        assert_eq!(options.permission_mode.as_deref(), Some("plan"));
+        let generation: Option<u64> = serde_json::from_value(
+            invoke(server, "account_switch_generation", Value::Null).unwrap(),
+        )
+        .unwrap();
+        let stale: AccountSwitchClose = serde_json::from_value(
+            invoke(
+                server,
+                "close_for_account_switch",
+                json!([generation.unwrap().wrapping_add(1)]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(stale.options.is_none() && stale.publication.is_none());
+        let admitted: AccountSwitchClose = serde_json::from_value(
+            invoke(
+                server,
+                "close_for_account_switch",
+                json!([generation.unwrap()]),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(admitted.options, Some(options));
         assert!(admitted.publication.unwrap().resident.completed);
         assert!(!process.is_current());
-        assert_eq!(server.source,issued);
+        assert_eq!(server.source, issued);
     }
 
     #[test]
     fn account_switch_proxy_refuses_partial_final_publication_without_cleanup_or_options_claim() {
-        let root=tempfile::tempdir_in("/var/tmp").unwrap();
-        let socket=root.path().join("account-switch.sock");
-        let listener=UnixListener::bind(&socket).unwrap();
-        let mut actor=RemoteActor::fixture();
-        Arc::get_mut(&mut actor.0).unwrap().socket=socket;
-        let peer=thread::spawn(move||{
-            let (control,_)=listener.accept().unwrap();
-            let request:Invocation=receive(&control,TIMEOUT).unwrap();
-            assert_eq!(request.method,"close_for_account_switch");
-            assert_eq!(request.args,json!([42]));
-            send(&control,&Ok::<_,String>(AccountSwitchClose{options:Some(super::super::AccountSwitchOptions{
-                model:Some("acknowledged-model".into()),reasoning:Some("high".into()),permission_mode:None,fast_mode:None,permissions:None,
-            }),publication:None}),TIMEOUT).unwrap();
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("account-switch.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut actor = RemoteActor::fixture();
+        Arc::get_mut(&mut actor.0).unwrap().socket = socket;
+        let peer = thread::spawn(move || {
+            let (control, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&control, TIMEOUT).unwrap();
+            assert_eq!(request.method, "close_for_account_switch");
+            assert_eq!(request.args, json!([42]));
+            send(
+                &control,
+                &Ok::<_, String>(AccountSwitchClose {
+                    options: Some(super::super::AccountSwitchOptions {
+                        model: Some("acknowledged-model".into()),
+                        reasoning: Some("high".into()),
+                        permission_mode: None,
+                        fast_mode: None,
+                        permissions: None,
+                    }),
+                    publication: None,
+                }),
+                TIMEOUT,
+            )
+            .unwrap();
         });
-        let error=actor.close_for_account_switch(42).unwrap_err();
+        let error = actor.close_for_account_switch(42).unwrap_err();
         assert!(error.contains("matching final options"));
-        assert!(actor.owns_work(),"a partial reply is not cleanup proof");
+        assert!(actor.owns_work(), "a partial reply is not cleanup proof");
         assert!(!actor.state().completed);
         peer.join().unwrap();
     }
 
-
     #[test]
     fn completed_account_metadata_survives_helper_retirement_without_a_new_rpc_or_read_authority() {
-        let actor=RemoteActor::fixture(); // Its endpoint deliberately does not exist.
-        actor.publish_closed(Snapshot{generation:77,selected_model:Some("final-confirmed-model".into()),reasoning:Some("high".into()),exited:true,..Snapshot::default()});
-        assert_eq!(actor.account_switch_generation().unwrap(),Some(77));
-        let options=actor.completed_account_options().unwrap().unwrap();
-        assert_eq!(options.model.as_deref(),Some("final-confirmed-model"));
-        assert_eq!(options.reasoning.as_deref(),Some("high"));
-        assert!(actor.close_for_account_switch(76).unwrap().is_none(),"a stale generation grants no handoff");
+        let actor = RemoteActor::fixture(); // Its endpoint deliberately does not exist.
+        actor.publish_closed(Snapshot {
+            generation: 77,
+            selected_model: Some("final-confirmed-model".into()),
+            reasoning: Some("high".into()),
+            exited: true,
+            ..Snapshot::default()
+        });
+        assert_eq!(actor.account_switch_generation().unwrap(), Some(77));
+        let options = actor.completed_account_options().unwrap().unwrap();
+        assert_eq!(options.model.as_deref(), Some("final-confirmed-model"));
+        assert_eq!(options.reasoning.as_deref(), Some("high"));
+        assert!(
+            actor.close_for_account_switch(76).unwrap().is_none(),
+            "a stale generation grants no handoff"
+        );
         // Metadata alone does not call publish_retirement or reconstruct scope.
         assert!(actor.launch_account_scope().is_err());
     }
-
 }

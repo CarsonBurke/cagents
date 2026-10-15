@@ -753,7 +753,7 @@ impl Claude {
         self.suggestion_turn = None;
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
-        self.turn_inputs.submit(&id,&step.events);
+        self.turn_inputs.submit(&id, &step.events);
         if self.async_input {
             let mut preview = chat::QueuedMessage::new(id.clone(), text);
             preview.attachments = attachments;
@@ -1685,7 +1685,6 @@ impl Adapter for Claude {
             )
         })
     }
-
 
     fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
         self.cwd = directory.to_path_buf();
@@ -2636,8 +2635,13 @@ impl Adapter for Claude {
         }
         // A configured --session-id is a routing constraint, not provider
         // confirmation. Only an actual validated native frame can seed proof.
-        let native_session=if frame["type"]!="prompt_suggestion" && frame["parent_tool_use_id"].is_null(){frame["session_id"].as_str()}else{None};
-        self.turn_inputs.observe(&frame,&mut step,native_session);
+        let native_session =
+            if frame["type"] != "prompt_suggestion" && frame["parent_tool_use_id"].is_null() {
+                frame["session_id"].as_str()
+            } else {
+                None
+            };
+        self.turn_inputs.observe(&frame, &mut step, native_session);
         Ok(step)
     }
 }

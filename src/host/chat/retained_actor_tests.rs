@@ -126,13 +126,26 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     // format simulates a real, recoverable refusal without deleting data or
     // changing the actor/account identity. The helper must retain this proof
     // through daemon loss even after its execution cursor already committed.
-    let scope=handle.launch_account_scope().unwrap().clone();
+    let scope = handle.launch_account_scope().unwrap().clone();
     drop(chat::annotations::storage::Store::pending_installation(&scope).unwrap());
-    let annotations=crate::instance::project_dirs().unwrap().data_dir().join("conversation-annotations");
-    let annotation_paths=fs::read_dir(&annotations).unwrap().map(|entry|entry.unwrap().path().join("annotations.sqlite")).filter(|path|path.is_file()).collect::<Vec<_>>();
-    assert_eq!(annotation_paths.len(),1,"fixture has one exact captured physical account");
-    let annotation_fault=rusqlite::Connection::open(&annotation_paths[0]).unwrap();
-    annotation_fault.pragma_update(None,"user_version",3).unwrap();
+    let annotations = crate::instance::project_dirs()
+        .unwrap()
+        .data_dir()
+        .join("conversation-annotations");
+    let annotation_paths = fs::read_dir(&annotations)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join("annotations.sqlite"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        annotation_paths.len(),
+        1,
+        "fixture has one exact captured physical account"
+    );
+    let annotation_fault = rusqlite::Connection::open(&annotation_paths[0]).unwrap();
+    annotation_fault
+        .pragma_update(None, "user_version", 3)
+        .unwrap();
     let active_proof = Arc::new(std::sync::Mutex::new(first.clone()));
     struct Cleanup {
         owner: crate::daemon::holder_registry::Record,
@@ -331,17 +344,37 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     );
     let retained = retained_actor::retained_runs(&successor);
     let registry = super::super::agent_execution::registry(&successor).unwrap();
-    let mut retained_turn=None;
-    wait_until(|| {
-        let page=handle.uncommitted_outcomes().unwrap();
-        let Some(entry)=page.iter().find(|entry|matches!(&entry.update,Update::TurnOutcome {..})) else {return false;};
-        if registry.lock().unwrap().native_actor_cursor_for_test(identity.instance).unwrap().is_none_or(|cursor|cursor<entry.sequence) {return false;}
-        if let Update::TurnOutcome {update}=&entry.update {retained_turn=Some(update.clone());}
-        true
-    },"the Store refusal must leave the real helper turn proof unacknowledged despite a committed registry cursor");
-    let retained_turn=retained_turn.unwrap();
-    assert!(retained_turn.identity().session_id.len()>0);
-    annotation_fault.pragma_update(None,"user_version",2).unwrap();
+    let mut retained_turn = None;
+    wait_until(
+        || {
+            let page = handle.uncommitted_outcomes().unwrap();
+            let Some(entry) = page
+                .iter()
+                .find(|entry| matches!(&entry.update, Update::TurnOutcome { .. }))
+            else {
+                return false;
+            };
+            if registry
+                .lock()
+                .unwrap()
+                .native_actor_cursor_for_test(identity.instance)
+                .unwrap()
+                .is_none_or(|cursor| cursor < entry.sequence)
+            {
+                return false;
+            }
+            if let Update::TurnOutcome { update } = &entry.update {
+                retained_turn = Some(update.clone());
+            }
+            true
+        },
+        "the Store refusal must leave the real helper turn proof unacknowledged despite a committed registry cursor",
+    );
+    let retained_turn = retained_turn.unwrap();
+    assert!(retained_turn.identity().session_id.len() > 0);
+    annotation_fault
+        .pragma_update(None, "user_version", 2)
+        .unwrap();
     drop(annotation_fault);
     registry
         .lock()
@@ -405,9 +438,22 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
         1,
         "adoption must never resend the accepted prompt"
     );
-    wait_until(||handle.uncommitted_outcomes().unwrap().is_empty(),"all semantic stores must commit before helper ACK");
-    let mut annotation=chat::annotations::storage::Store::installation(&scope,&retained_turn.identity().session_id).unwrap();
-    assert!(!annotation.apply_turn_update(&retained_turn).unwrap().changed,"replay after an already committed registry cursor must still have committed the independent annotation Store before ACK");
+    wait_until(
+        || handle.uncommitted_outcomes().unwrap().is_empty(),
+        "all semantic stores must commit before helper ACK",
+    );
+    let mut annotation = chat::annotations::storage::Store::installation(
+        &scope,
+        &retained_turn.identity().session_id,
+    )
+    .unwrap();
+    assert!(
+        !annotation
+            .apply_turn_update(&retained_turn)
+            .unwrap()
+            .changed,
+        "replay after an already committed registry cursor must still have committed the independent annotation Store before ACK"
+    );
     super::super::agent_execution::close(&successor, &Authority::default(), accepted.agent.id)
         .unwrap();
     wait_until(
@@ -1044,10 +1090,21 @@ fn unnamed_actor_adopts_then_commits_exact_pane_before_first_provider_result() {
     handle.close().unwrap();
     retained_actor::finish_close(&successor, &handle, &replacement).unwrap();
     assert!(!identity.record.root.is_current() && !identity.record.holder.is_current());
-    let registry=super::super::agent_execution::registry(&successor).unwrap();
-    let retirement=registry.lock().unwrap().native_actor_retirement(identity.instance).unwrap().unwrap();
+    let registry = super::super::agent_execution::registry(&successor).unwrap();
+    let retirement = registry
+        .lock()
+        .unwrap()
+        .native_actor_retirement(identity.instance)
+        .unwrap()
+        .unwrap();
     assert_eq!(retirement.owner(), &identity.record);
-    assert_eq!(retirement.confirmed_session(), handle.confirmed_session_id().as_deref());
-    assert_eq!(retirement.scope().unwrap(), handle.launch_account_scope().unwrap());
+    assert_eq!(
+        retirement.confirmed_session(),
+        handle.confirmed_session_id().as_deref()
+    );
+    assert_eq!(
+        retirement.scope().unwrap(),
+        handle.launch_account_scope().unwrap()
+    );
     drop(lease);
 }

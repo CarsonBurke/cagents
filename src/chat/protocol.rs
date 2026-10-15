@@ -3,11 +3,11 @@ use super::{Command, Event, Launch};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
-pub(crate) mod input_proof;
 pub mod claude;
 mod claude_edits;
 mod claude_permissions;
 pub mod codex;
+pub(crate) mod input_proof;
 pub mod omp;
 pub(crate) use super::terminal_output;
 
@@ -349,7 +349,9 @@ pub trait Adapter: Send {
     }
     /// Pending setting acknowledgments must settle before account metadata can
     /// describe an idle choice. This is not a backend conditional-close proof.
-    fn account_switch_ready(&self)->bool {true}
+    fn account_switch_ready(&self) -> bool {
+        true
+    }
     fn initialize(&mut self) -> Result<Step, String>;
     fn command(&mut self, command: Command) -> Result<Step, String>;
     fn command_for_run(

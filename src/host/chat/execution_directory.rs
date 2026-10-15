@@ -39,15 +39,21 @@ pub(super) fn prepare_at(
         ));
     }
     if let Some(path) = operational_directory {
-        supplied.as_ref().expect("checked captured handoff").verify_directory(path).map_err(unavailable)?;
+        supplied
+            .as_ref()
+            .expect("checked captured handoff")
+            .verify_directory(path)
+            .map_err(unavailable)?;
         // History classification must use the approved private location too:
         // an issued Claude path becoming absent after Locate does not make
         // the same still-pinned operational directory a history-only reader.
-        launch.recipe.working_directory=path.to_path_buf();
+        launch.recipe.working_directory = path.to_path_buf();
     }
     if launch.needs_read_only_history() {
         if operational_directory.is_some() {
-            return Err(error("Read-only history cannot consume an execution-directory handoff"));
+            return Err(error(
+                "Read-only history cannot consume an execution-directory handoff",
+            ));
         }
         return Ok(Prepared {
             launch,
@@ -261,20 +267,37 @@ mod tests {
         let context = Arc::new(ExecutionContext::capture(&issued_path).unwrap());
         std::fs::rename(&issued_path, &moved).unwrap();
         let prepared = prepare_at(&issued, Some(context.clone()), Some(&moved)).unwrap();
-        assert_eq!(issued, before, "private execution does not rewrite the issued identity");
+        assert_eq!(
+            issued, before,
+            "private execution does not rewrite the issued identity"
+        );
         assert_eq!(prepared.launch.recipe.working_directory, moved);
         assert!(Arc::ptr_eq(prepared.context.as_ref().unwrap(), &context));
         assert!(!issued_path.exists());
-        assert!(!context.provider_directory_observed(&moved).unwrap(), "a physical pin alone does not claim resumed-tool scope");
-        let mut claude=issued.clone();claude.provider=Provider::Claude;claude.recipe.program="claude".into();
-        assert!(claude.needs_read_only_history(),"the immutable original spelling is now missing");
-        let prepared_claude=prepare_at(&claude,Some(context.clone()),Some(&moved)).unwrap();
-        assert!(!prepared_claude.launch.needs_read_only_history(),"the verified same-inode operational handoff remains runnable");
-        assert_eq!(claude.recipe.working_directory,issued_path);
+        assert!(
+            !context.provider_directory_observed(&moved).unwrap(),
+            "a physical pin alone does not claim resumed-tool scope"
+        );
+        let mut claude = issued.clone();
+        claude.provider = Provider::Claude;
+        claude.recipe.program = "claude".into();
+        assert!(
+            claude.needs_read_only_history(),
+            "the immutable original spelling is now missing"
+        );
+        let prepared_claude = prepare_at(&claude, Some(context.clone()), Some(&moved)).unwrap();
+        assert!(
+            !prepared_claude.launch.needs_read_only_history(),
+            "the verified same-inode operational handoff remains runnable"
+        );
+        assert_eq!(claude.recipe.working_directory, issued_path);
         assert!(prepare_at(&issued, Some(context.clone()), Some(&other)).is_err());
         assert!(prepare_at(&issued, None, Some(&moved)).is_err());
         std::fs::rename(&moved, root.path().join("moved-again")).unwrap();
         std::fs::create_dir(&moved).unwrap();
-        assert!(prepare_at(&issued, Some(context), Some(&moved)).is_err(), "a replacement clone must not consume the captured handoff");
+        assert!(
+            prepare_at(&issued, Some(context), Some(&moved)).is_err(),
+            "a replacement clone must not consume the captured handoff"
+        );
     }
 }

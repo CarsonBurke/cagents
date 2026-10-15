@@ -849,11 +849,16 @@ async fn wait_for_work(receiver: &mut mpsc::Receiver<()>, retry: Option<Instant>
 }
 
 fn record_attention_committed_policy(
-    journal:&mut Journal,mut event:Event,suppressed:bool,
-    receipt:Option<std::sync::mpsc::Sender<Result<(),String>>>,policy:&Preferences,
-)->Result<Option<Notice>,String> {
-    if !policy.message_previews {event.content=None;}
-    record_attention_committed(journal,event,suppressed,receipt)
+    journal: &mut Journal,
+    mut event: Event,
+    suppressed: bool,
+    receipt: Option<std::sync::mpsc::Sender<Result<(), String>>>,
+    policy: &Preferences,
+) -> Result<Option<Notice>, String> {
+    if !policy.message_previews {
+        event.content = None;
+    }
+    record_attention_committed(journal, event, suppressed, receipt)
 }
 
 fn record_attention_committed(
@@ -876,37 +881,91 @@ mod tests {
 
     #[test]
     fn private_default_strips_ordinary_and_receipted_actor_and_automation_events_before_commit() {
-        for previews in [false,true] {
-            let directory=tempfile::tempdir().unwrap();let path=directory.path().join("privacy.sqlite3");
-            let mut journal=Journal::open(&path).unwrap();
-            let policy=Preferences {message_previews:previews,..Default::default()};
-            for path in ["ordinary","retained","automation"] {
-                let mut event=Event::session(TerminalId::new(),crate::agent::Provider::Claude,"/repo".into(),
-                    crate::notifications::Evidence {key:path.into(),kind:crate::notifications::Kind::Succeeded});
-                if path=="automation" {event.target=Target::AgentRun(crate::model::RunId::new());}
-                event.content=Some(crate::notifications::Content {conversation:"Private conversation".into(),preview:"Private response".into(),request:None});
-                let original=event.clone();
-                let (receipt,result)=std::sync::mpsc::channel();
-                let receipt=(path!="ordinary").then_some(receipt);
-                let notice=record_attention_committed_policy(&mut journal,event,false,receipt,&policy).unwrap().unwrap();
-                if path!="ordinary" {assert_eq!(result.recv().unwrap(),Ok(()));}
-                assert_eq!(notice.event.evidence,original.evidence);
-                assert_eq!(notice.event.target,original.target);
-                assert_eq!(notice.event.content.is_some(),previews);
+        for previews in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("privacy.sqlite3");
+            let mut journal = Journal::open(&path).unwrap();
+            let policy = Preferences {
+                message_previews: previews,
+                ..Default::default()
+            };
+            for path in ["ordinary", "retained", "automation"] {
+                let mut event = Event::session(
+                    TerminalId::new(),
+                    crate::agent::Provider::Claude,
+                    "/repo".into(),
+                    crate::notifications::Evidence {
+                        key: path.into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
+                );
+                if path == "automation" {
+                    event.target = Target::AgentRun(crate::model::RunId::new());
+                }
+                event.content = Some(crate::notifications::Content {
+                    conversation: "Private conversation".into(),
+                    preview: "Private response".into(),
+                    request: None,
+                });
+                let original = event.clone();
+                let (receipt, result) = std::sync::mpsc::channel();
+                let receipt = (path != "ordinary").then_some(receipt);
+                let notice =
+                    record_attention_committed_policy(&mut journal, event, false, receipt, &policy)
+                        .unwrap()
+                        .unwrap();
+                if path != "ordinary" {
+                    assert_eq!(result.recv().unwrap(), Ok(()));
+                }
+                assert_eq!(notice.event.evidence, original.evidence);
+                assert_eq!(notice.event.target, original.target);
+                assert_eq!(notice.event.content.is_some(), previews);
             }
             drop(journal);
-            let mut reopened=Journal::open(&path).unwrap();
-            let notices=reopened.list().unwrap();assert_eq!(notices.len(),3);
-            assert!(notices.iter().all(|notice|notice.event.content.is_some()==previews));
+            let mut reopened = Journal::open(&path).unwrap();
+            let notices = reopened.list().unwrap();
+            assert_eq!(notices.len(), 3);
+            assert!(
+                notices
+                    .iter()
+                    .all(|notice| notice.event.content.is_some() == previews)
+            );
             if previews {
-                let before=notices.iter().map(|notice|(notice.id,notice.acknowledged)).collect::<Vec<_>>();
-                let mut snapshot=Snapshot {notices,diagnostic:None};let mut withdrawals=Withdrawals::default();
-                revoke_previews(&mut snapshot,&mut withdrawals);
+                let before = notices
+                    .iter()
+                    .map(|notice| (notice.id, notice.acknowledged))
+                    .collect::<Vec<_>>();
+                let mut snapshot = Snapshot {
+                    notices,
+                    diagnostic: None,
+                };
+                let mut withdrawals = Withdrawals::default();
+                revoke_previews(&mut snapshot, &mut withdrawals);
                 reopened.clear_content().unwrap();
-                assert!(snapshot.notices.iter().all(|notice|notice.event.content.is_none()));
-                assert_eq!(snapshot.notices.iter().map(|notice|(notice.id,notice.acknowledged)).collect::<Vec<_>>(),before);
-                assert!(snapshot.notices.iter().all(|notice|withdrawals.contains(&batching::desktop_id(&notice.event.target))));
-                assert!(reopened.list().unwrap().iter().all(|notice|notice.event.content.is_none()));
+                assert!(
+                    snapshot
+                        .notices
+                        .iter()
+                        .all(|notice| notice.event.content.is_none())
+                );
+                assert_eq!(
+                    snapshot
+                        .notices
+                        .iter()
+                        .map(|notice| (notice.id, notice.acknowledged))
+                        .collect::<Vec<_>>(),
+                    before
+                );
+                assert!(snapshot.notices.iter().all(|notice| {
+                    withdrawals.contains(&batching::desktop_id(&notice.event.target))
+                }));
+                assert!(
+                    reopened
+                        .list()
+                        .unwrap()
+                        .iter()
+                        .all(|notice| notice.event.content.is_none())
+                );
             }
         }
     }
@@ -924,7 +983,11 @@ mod tests {
                 kind: crate::notifications::Kind::Succeeded,
             },
         );
-        event.content=Some(crate::notifications::Content {conversation:"Original turn".into(),preview:"Immutable response captured before daemon replacement".into(),request:None});
+        event.content = Some(crate::notifications::Content {
+            conversation: "Original turn".into(),
+            preview: "Immutable response captured before daemon replacement".into(),
+            request: None,
+        });
         let receipt = handle.record_committed(event.clone()).unwrap();
         assert!(
             matches!(
@@ -1741,10 +1804,17 @@ async fn run(
                 withdraw_notice(&mut withdrawals, notice);
             }
         }
-        let events=pending.events.into_values().map(|event|(event,None)).chain(
-            pending.committed_events.into_iter().map(|(event,receipt)|(event,Some(receipt)))
-        );
-        for (event,receipt) in events {
+        let events = pending
+            .events
+            .into_values()
+            .map(|event| (event, None))
+            .chain(
+                pending
+                    .committed_events
+                    .into_iter()
+                    .map(|(event, receipt)| (event, Some(receipt))),
+            );
+        for (event, receipt) in events {
             if stopped(&shared) {
                 return;
             }
@@ -1755,7 +1825,7 @@ async fn run(
                     || window.focused_target.as_ref() == Some(&event.target)
             });
             let suppressed = !policy.allows(event.evidence.kind, focused);
-            match record_attention_committed_policy(journal,event,suppressed,receipt,&policy) {
+            match record_attention_committed_policy(journal, event, suppressed, receipt, &policy) {
                 Ok(Some(notice)) => {
                     delivery.remove(&notice.event.target());
                     if let Some(old) = snapshot.notices.iter().find(|old| {

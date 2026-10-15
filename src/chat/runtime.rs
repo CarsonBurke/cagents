@@ -80,7 +80,10 @@ impl AccountSwitchOptions {
 enum ActorCommand {
     AccountNotice(String),
     AccountSwitchGeneration(crossbeam_channel::Sender<Option<u64>>),
-    CheckAccountSwitch {generation:u64,admitted:crossbeam_channel::Sender<Option<AccountSwitchOptions>>},
+    CheckAccountSwitch {
+        generation: u64,
+        admitted: crossbeam_channel::Sender<Option<AccountSwitchOptions>>,
+    },
     RetainedProvider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -181,7 +184,9 @@ pub(crate) enum Update {
     /// metadata only; the host reads its exact current actor under its fence.
     Identity,
     /// Persist/replay this semantic update before acknowledging its journal entry.
-    TurnOutcome { update: crate::chat::turn_outcomes::TurnUpdate },
+    TurnOutcome {
+        update: crate::chat::turn_outcomes::TurnUpdate,
+    },
 }
 
 #[derive(Clone)]
@@ -224,7 +229,9 @@ impl Drop for OwnedSocket {
 }
 
 impl LocalHandle {
-    pub(crate) fn native_holder_record(&self)->Option<&crate::daemon::holder_registry::Record> {self.0.native_holder_record.as_ref()}
+    pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
+        self.0.native_holder_record.as_ref()
+    }
 
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
@@ -554,7 +561,7 @@ impl LocalHandle {
         let store = retained_store.unwrap_or_else(|| Arc::new(Mutex::new(store)));
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
-        let ownership_admission=Arc::new(Mutex::new(()));
+        let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -568,7 +575,7 @@ impl LocalHandle {
                 .and_then(|context| context.directory_descriptor()),
         ));
         let inner = Arc::new(Inner {
-            native_holder_record:native_holder.as_ref().map(|holder|holder.record().clone()),
+            native_holder_record: native_holder.as_ref().map(|holder| holder.record().clone()),
             pinned_directory: pinned_directory.clone(),
             provider_process: provider_process.clone(),
             commands,
@@ -594,7 +601,7 @@ impl LocalHandle {
             ),
             launch_account_scope,
             recovery_environment,
-            ownership_admission:ownership_admission.clone(),
+            ownership_admission: ownership_admission.clone(),
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
@@ -1115,13 +1122,20 @@ impl LocalHandle {
             return Err("The provider actor was replaced; its replacement was preserved".into());
         }
         if self.0.preserve_native.load(Ordering::Acquire) {
-            return Err("Provider ownership is being preserved for a successor; refresh before stopping it".into());
+            return Err(
+                "Provider ownership is being preserved for a successor; refresh before stopping it"
+                    .into(),
+            );
         }
         if self.is_completed() || self.0.stop.load(Ordering::Acquire) {
-            let _admission=match self.0.ownership_admission.try_lock() {
-                Ok(admission)=>admission,
-                Err(std::sync::TryLockError::Poisoned(p))=>p.into_inner(),
-                Err(std::sync::TryLockError::WouldBlock)=>return Err("Provider ownership admission is busy; retain its owner and retry".into()),
+            let _admission = match self.0.ownership_admission.try_lock() {
+                Ok(admission) => admission,
+                Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    return Err(
+                        "Provider ownership admission is busy; retain its owner and retry".into(),
+                    );
+                }
             };
             // Teardown can publish retained ownership after our initial identity
             // read. Completion/stop alone cannot authorize that unknown owner.
@@ -1129,7 +1143,8 @@ impl LocalHandle {
                 Ok(close) => close,
                 Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
                 Err(std::sync::TryLockError::WouldBlock) => return Err(
-                    "Provider ownership is being updated; retain its owner and retry session stop".into(),
+                    "Provider ownership is being updated; retain its owner and retry session stop"
+                        .into(),
                 ),
             };
             return if self.0.preserve_native.load(Ordering::Acquire) {
@@ -1137,7 +1152,7 @@ impl LocalHandle {
             } else if close.unobserved_native {
                 Err("Retained provider ownership must be reattached before session stop".into())
             } else {
-                self.0.release_native.store(true,Ordering::Release);
+                self.0.release_native.store(true, Ordering::Release);
                 Ok(())
             };
         }
@@ -1193,23 +1208,35 @@ impl LocalHandle {
 
     /// A live provider supplies no authoritative conditional-close barrier.
     /// An observed idle generation never authorizes stopping autonomous work.
-    pub(crate) fn close_for_account_switch(&self,generation:u64)->Result<Option<AccountSwitchOptions>,String> {
+    pub(crate) fn close_for_account_switch(
+        &self,
+        generation: u64,
+    ) -> Result<Option<AccountSwitchOptions>, String> {
         if !self.is_completed() {
-            let (admitted,response)=crossbeam_channel::bounded(1);
-            self.ownership_command(ActorCommand::CheckAccountSwitch{generation,admitted})?;
-            return response.try_recv().map_err(|error|format!("Account-switch admission was not acknowledged: {error}"));
+            let (admitted, response) = crossbeam_channel::bounded(1);
+            self.ownership_command(ActorCommand::CheckAccountSwitch {
+                generation,
+                admitted,
+            })?;
+            return response.try_recv().map_err(|error| {
+                format!("Account-switch admission was not acknowledged: {error}")
+            });
         }
-        let options={
-            let state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
-            if state.generation!=generation {return Ok(None);}
+        let options = {
+            let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.generation != generation {
+                return Ok(None);
+            }
             AccountSwitchOptions::capture(&state)
         };
         self.close_for_resume()?;
         Ok(Some(options))
     }
 
-    pub(crate) fn completed_account_options(&self)->Result<Option<AccountSwitchOptions>,String> {
-        Ok(self.is_completed().then(||AccountSwitchOptions::capture(&self.0.state.lock().unwrap_or_else(|p|p.into_inner()))))
+    pub(crate) fn completed_account_options(&self) -> Result<Option<AccountSwitchOptions>, String> {
+        Ok(self.is_completed().then(|| {
+            AccountSwitchOptions::capture(&self.0.state.lock().unwrap_or_else(|p| p.into_inner()))
+        }))
     }
 
     /// Restore controls only after exact-thread confirmation. No prompt is issued,
@@ -1231,15 +1258,36 @@ impl LocalHandle {
             if let Some(failure) = self.failure() {
                 return Err(failure);
             }
-            let (ready,model_matches,permission_matches,fast_matches,permissions_match,fast_enabled,model_available)={
-                let snapshot=self.0.state.lock().unwrap_or_else(|p|p.into_inner());
-                (snapshot.ready,
-                    options.model.is_none() || (snapshot.selected_model==options.model && snapshot.reasoning==options.reasoning),
-                    options.permission_mode.is_none() || snapshot.permission_mode==options.permission_mode,
-                    options.fast_mode.is_none() || snapshot.fast_mode.as_ref().map(super::FastMode::enabled)==options.fast_mode,
-                    options.permissions.is_none() || snapshot.permissions==options.permissions,
-                    snapshot.fast_mode.as_ref().is_some_and(super::FastMode::enabled),
-                    snapshot.models.iter().any(|model|Some(&model.id)==options.model.as_ref()))
+            let (
+                ready,
+                model_matches,
+                permission_matches,
+                fast_matches,
+                permissions_match,
+                fast_enabled,
+                model_available,
+            ) = {
+                let snapshot = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    snapshot.ready,
+                    options.model.is_none()
+                        || (snapshot.selected_model == options.model
+                            && snapshot.reasoning == options.reasoning),
+                    options.permission_mode.is_none()
+                        || snapshot.permission_mode == options.permission_mode,
+                    options.fast_mode.is_none()
+                        || snapshot.fast_mode.as_ref().map(super::FastMode::enabled)
+                            == options.fast_mode,
+                    options.permissions.is_none() || snapshot.permissions == options.permissions,
+                    snapshot
+                        .fast_mode
+                        .as_ref()
+                        .is_some_and(super::FastMode::enabled),
+                    snapshot
+                        .models
+                        .iter()
+                        .any(|model| Some(&model.id) == options.model.as_ref()),
+                )
             };
             // Inspect only current controls. Restoring settings must never page
             // or clone a transcript merely because the source pane is hidden.
@@ -1255,10 +1303,7 @@ impl LocalHandle {
                         self.command(Command::SetFastMode { enabled: false })?;
                         fast_sent = true;
                     }
-                } else if !model_matches
-                    && !model_sent
-                    && model_available
-                {
+                } else if !model_matches && !model_sent && model_available {
                     self.command(Command::SetModel {
                         model: options.model.clone().expect("a differing known model"),
                         reasoning: options.reasoning.clone(),
@@ -1295,7 +1340,15 @@ impl LocalHandle {
 
     /// An actor-ordered metadata barrier; never hydrates transcript history.
     pub(crate) fn account_switch_generation(&self) -> Result<Option<u64>, String> {
-        if self.is_completed() {return Ok(Some(self.0.state.lock().unwrap_or_else(|p|p.into_inner()).generation));}
+        if self.is_completed() {
+            return Ok(Some(
+                self.0
+                    .state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .generation,
+            ));
+        }
         let (reply, response) = crossbeam_channel::bounded(1);
         self.ownership_command(ActorCommand::AccountSwitchGeneration(reply))?;
         response
@@ -1829,12 +1882,16 @@ impl LocalHandle {
         self.close_inner(true, None)
     }
 
-    fn claim_native_preservation(&self)->Result<(),String> {
-        let _admission=self.0.ownership_admission.lock().unwrap_or_else(|p|p.into_inner());
+    fn claim_native_preservation(&self) -> Result<(), String> {
+        let _admission = self
+            .0
+            .ownership_admission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         if self.0.release_native.load(Ordering::Acquire) {
             return Err("Native provider session stop already owns cleanup".into());
         }
-        self.0.preserve_native.store(true,Ordering::Release);
+        self.0.preserve_native.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -3049,14 +3106,19 @@ impl Actor {
                 self.adapter.after_close_input_drained();
             }
             let (run, command) = match command {
-                ActorCommand::CheckAccountSwitch{generation,admitted} => {
-                    let state=self.state.lock().unwrap_or_else(|p|p.into_inner());
-                    let idle=state.generation==generation && self.update_readiness(&state)==UpdateReadiness::Idle
-                        && self.adapter.account_switch_ready() && state.queued_messages.is_empty();
+                ActorCommand::CheckAccountSwitch {
+                    generation,
+                    admitted,
+                } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let idle = state.generation == generation
+                        && self.update_readiness(&state) == UpdateReadiness::Idle
+                        && self.adapter.account_switch_ready()
+                        && state.queued_messages.is_empty();
                     // Busy/stale is a proved refusal before effects, so the UI
                     // can retain its queued choice. Idle is not backend consent
                     // or a provider barrier; preserve autonomous work as f45 does.
-                    let _=admitted.send(None);
+                    let _ = admitted.send(None);
                     let _=reply.send(if idle {Err("This live provider cannot prove safe exact account handoff. Continue on the selected account as a new conversation (cache lost); the original session stays open.".into())} else {Ok(())});
                     continue;
                 }
@@ -3219,15 +3281,18 @@ impl Actor {
                     }));
                     continue;
                 }
-                ActorCommand::StopSession {actor_id} => {
-                    let _admission=self.ownership_admission.lock().unwrap_or_else(|p|p.into_inner());
-                    let close = self.close_state.lock().unwrap_or_else(|p|p.into_inner());
+                ActorCommand::StopSession { actor_id } => {
+                    let _admission = self
+                        .ownership_admission
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    let close = self.close_state.lock().unwrap_or_else(|p| p.into_inner());
                     let result = if self.preserve_native.load(Ordering::Acquire) {
                         Err("Provider ownership is being preserved for a successor; its owner was preserved".into())
                     } else if close.actor_id != actor_id {
                         Err("The provider actor was replaced; its replacement was preserved".into())
                     } else {
-                        self.release_native.store(true,Ordering::Release);
+                        self.release_native.store(true, Ordering::Release);
                         self.stop.store(true, Ordering::Release);
                         Ok(())
                     };
@@ -3496,7 +3561,9 @@ impl Actor {
         for event in &step.events {
             if let Event::TurnOutcome(update) = event {
                 update.validate()?;
-                (self.notify)(Update::TurnOutcome { update: update.clone() });
+                (self.notify)(Update::TurnOutcome {
+                    update: update.clone(),
+                });
             }
         }
         // A new Codex thread is created asynchronously after initialize; check
@@ -3537,7 +3604,7 @@ impl Actor {
         });
         let mut execution_events = Vec::new();
         let frame_context = {
-            let state = self.state.lock().unwrap_or_else(|p|p.into_inner());
+            let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
             super::notification::FrameContext::capture(&state)
         };
         // Project once before storage or callbacks; both successful reduction
@@ -3548,7 +3615,9 @@ impl Actor {
         // bounded semantic proof, then return the original cache error.
         let mut frame_error = None;
         for mut event in step.events {
-            if matches!(&event, Event::TurnOutcome(_)) { continue; }
+            if matches!(&event, Event::TurnOutcome(_)) {
+                continue;
+            }
             if let Event::Error { message, .. } | Event::HistoryError(message) = &mut event {
                 *message = super::protocol::preview(message.as_bytes(), 1024);
             }
@@ -3579,7 +3648,7 @@ impl Actor {
                 _ => None,
             };
             if matches!(&event, Event::Item(_) | Event::TextDelta { .. }) {
-                let mut state = self.state.lock().unwrap_or_else(|p|p.into_inner());
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 Arc::make_mut(&mut state.notification_preview).observe(&event);
             }
             // Clone only small semantic fields, never transcript/tool data.
@@ -3612,13 +3681,17 @@ impl Actor {
                 Some(events) if events.is_empty() => self.touch(),
                 Some(events) => {
                     for event in events {
-                        let content = matches!(&event,Event::TurnFinished {..}).then(||frame_contents.pop_front()).flatten();
+                        let content = matches!(&event, Event::TurnFinished { .. })
+                            .then(|| frame_contents.pop_front())
+                            .flatten();
                         self.apply_with_attention(event, content);
                     }
                 }
                 None => {
                     if let Some(event) = authority {
-                        let content = matches!(&event,Event::TurnFinished {..}).then(||frame_contents.pop_front()).flatten();
+                        let content = matches!(&event, Event::TurnFinished { .. })
+                            .then(|| frame_contents.pop_front())
+                            .flatten();
                         self.apply_with_attention(event, content);
                     }
                 }
@@ -3676,14 +3749,25 @@ impl Actor {
             None => Ok(()),
         }
     }
-    fn publish_current_attention(&self,evidence:crate::notifications::Evidence) {
-        let content=self.state.lock().unwrap_or_else(|p|p.into_inner()).notification_content(evidence.kind);
-        (self.notify)(Update::AttentionContext { evidence,content:Some(content) });
+    fn publish_current_attention(&self, evidence: crate::notifications::Evidence) {
+        let content = self
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notification_content(evidence.kind);
+        (self.notify)(Update::AttentionContext {
+            evidence,
+            content: Some(content),
+        });
     }
     fn apply(&mut self, event: Event) {
-        self.apply_with_attention(event,None);
+        self.apply_with_attention(event, None);
     }
-    fn apply_with_attention(&mut self,event:Event,content:Option<crate::notifications::Content>) {
+    fn apply_with_attention(
+        &mut self,
+        event: Event,
+        content: Option<crate::notifications::Content>,
+    ) {
         if let Event::TurnOutcome(update) = event {
             (self.notify)(Update::TurnOutcome { update });
             return;
@@ -3730,7 +3814,7 @@ impl Actor {
             Event::TurnStarted | Event::TurnSettled | Event::TurnFinished { .. }
         ) {
             if let Some(evidence) = self.attention.apply(&event) {
-                (self.notify)(Update::AttentionContext { evidence,content });
+                (self.notify)(Update::AttentionContext { evidence, content });
             }
             if matches!(event, Event::TurnSettled) {
                 return;
@@ -3801,9 +3885,13 @@ impl Actor {
         let activity = state.activity();
         let outcome = state.outcome.clone();
         let generation = state.generation;
-        let waiting_fingerprint=if activity==ActivityState::Waiting {state.waiting_fingerprint()}else{None};
-        let waiting_changed=waiting_fingerprint!=self.waiting_fingerprint;
-        self.waiting_fingerprint=waiting_fingerprint;
+        let waiting_fingerprint = if activity == ActivityState::Waiting {
+            state.waiting_fingerprint()
+        } else {
+            None
+        };
+        let waiting_changed = waiting_fingerprint != self.waiting_fingerprint;
+        self.waiting_fingerprint = waiting_fingerprint;
         let became_ready = state.ready && !self.ready;
         self.ready = state.ready;
         drop(state);
@@ -3816,10 +3904,11 @@ impl Actor {
                 (self.notify)(Update::Execution { run, update });
             }
         }
-        if activity==ActivityState::Waiting && baselined && (activity_changed || waiting_changed) {
+        if activity == ActivityState::Waiting && baselined && (activity_changed || waiting_changed)
+        {
             self.publish_current_attention(crate::notifications::Evidence {
-                key:format!("{}:waiting:{generation}",self.attention.key),
-                kind:crate::notifications::Kind::Waiting,
+                key: format!("{}:waiting:{generation}", self.attention.key),
+                kind: crate::notifications::Kind::Waiting,
             });
         }
         // Outcomes can change without an activity transition (e.g. idle death).
@@ -4145,7 +4234,10 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
                 _ => state.outcome.take(),
             };
         }
-        Event::TurnSettled | Event::Execution { .. } | Event::PastTurnFinished { .. } | Event::TurnOutcome(_) => {}
+        Event::TurnSettled
+        | Event::Execution { .. }
+        | Event::PastTurnFinished { .. }
+        | Event::TurnOutcome(_) => {}
         Event::ItemsRemoved { ids } => {
             let removed: std::collections::BTreeSet<_> = ids.into_iter().collect();
             state.items.retain(|item| !removed.contains(&item.id));
@@ -4916,7 +5008,9 @@ mod tests {
         let evidence = updates
             .iter()
             .filter_map(|update| match update {
-                Update::Attention(evidence) | Update::AttentionContext {evidence,..} => Some(evidence),
+                Update::Attention(evidence) | Update::AttentionContext { evidence, .. } => {
+                    Some(evidence)
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -4926,9 +5020,25 @@ mod tests {
             "known success must not be replaced by a cache-error failure alert"
         );
         assert_eq!(evidence[0].kind, crate::notifications::Kind::Succeeded);
-        let contexts=updates.iter().filter_map(|update|match update {Update::AttentionContext {content:Some(content),..}=>Some(content),_=>None}).collect::<Vec<_>>();
-        assert_eq!(contexts.len(),1,"the direct semantic fallback preserves one immutable context");
-        assert_eq!(contexts[0].preview,"Exact final response","a failed cache must not fall back to partial or current-turn text");
+        let contexts = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::AttentionContext {
+                    content: Some(content),
+                    ..
+                } => Some(content),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            contexts.len(),
+            1,
+            "the direct semantic fallback preserves one immutable context"
+        );
+        assert_eq!(
+            contexts[0].preview, "Exact final response",
+            "a failed cache must not fall back to partial or current-turn text"
+        );
         assert!(
             handle.failure().is_some(),
             "the transcript I/O failure remains visible independently of provider success"
@@ -5620,108 +5730,268 @@ mod tests {
 
     #[test]
     fn native_stop_and_preservation_have_one_admission_winner() {
-        for preserve_first in [false,true] {
-            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-            let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-            let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
-            let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
-            let actor=handle.close_observation().actor_id;
+        for preserve_first in [false, true] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let spec = ProcessSpec {
+                execution: None,
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+            };
+            let mut initial = Step {
+                events: vec![Event::Ready(true)],
+                ..Default::default()
+            };
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle =
+                LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+            until(&handle, |state| state.ready);
+            let actor = handle.close_observation().actor_id;
             if preserve_first {
                 handle.claim_native_preservation().unwrap();
-                assert!(handle.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(2)).is_err());
+                assert!(
+                    handle
+                        .fence_session_stop_until(actor, Instant::now() + Duration::from_secs(2))
+                        .is_err()
+                );
                 assert!(!handle.0.stop.load(Ordering::Acquire));
             } else {
-                handle.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(2)).unwrap();
-                assert!(handle.0.release_native.load(Ordering::Acquire),"release ownership must be fenced before stop ACK and gate release");
+                handle
+                    .fence_session_stop_until(actor, Instant::now() + Duration::from_secs(2))
+                    .unwrap();
+                assert!(
+                    handle.0.release_native.load(Ordering::Acquire),
+                    "release ownership must be fenced before stop ACK and gate release"
+                );
                 assert!(handle.claim_native_preservation().is_err());
             }
-            handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+            handle
+                .close_until(Instant::now() + Duration::from_secs(5))
+                .unwrap();
         }
     }
 
     #[test]
     fn whole_session_stop_checks_actor_identity_then_fences_all_later_work() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step {events:vec![Event::Ready(true),Event::TurnStarted],..Default::default()};
-        let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
-        until(&handle,|state|state.ready);
-        let observed=handle.close_observation();
-        assert!(handle.fence_session_stop_until(uuid::Uuid::new_v4(),Instant::now()+Duration::from_secs(2)).is_err());
-        assert!(!handle.0.stop.load(Ordering::Acquire),"a replacement refusal must not stop the original actor");
-        handle.fence_session_stop_until(observed.actor_id,Instant::now()+Duration::from_secs(2)).unwrap();
-        assert!(handle.0.stop.load(Ordering::Acquire),"the stop fence must be published before acknowledgement");
-        assert!(handle.enqueue_command(Command::Prompt{text:"must never run".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send}).is_err());
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: Some(observed_fixture_directory(directory.path())),
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![Event::Ready(true), Event::TurnStarted],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        until(&handle, |state| state.ready);
+        let observed = handle.close_observation();
+        assert!(
+            handle
+                .fence_session_stop_until(
+                    uuid::Uuid::new_v4(),
+                    Instant::now() + Duration::from_secs(2)
+                )
+                .is_err()
+        );
+        assert!(
+            !handle.0.stop.load(Ordering::Acquire),
+            "a replacement refusal must not stop the original actor"
+        );
+        handle
+            .fence_session_stop_until(observed.actor_id, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(
+            handle.0.stop.load(Ordering::Acquire),
+            "the stop fence must be published before acknowledgement"
+        );
+        assert!(
+            handle
+                .enqueue_command(Command::Prompt {
+                    text: "must never run".into(),
+                    attachments: Vec::new(),
+                    mode: super::super::PromptMode::Send
+                })
+                .is_err()
+        );
+        handle
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
         assert!(handle.is_completed());
-        handle.stop_session_until(observed.actor_id,Instant::now()+Duration::from_secs(2)).unwrap();
+        handle
+            .stop_session_until(observed.actor_id, Instant::now() + Duration::from_secs(2))
+            .unwrap();
     }
 
     #[test]
     fn completed_stop_cleanup_does_not_wait_for_resident_proof_publication() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
-        let metadata=handle.0.close_state.lock().unwrap();
-        let stopped=handle.clone();let (reply,result)=crossbeam_channel::bounded(1);
-        let call=thread::spawn(move|| {let started=Instant::now();let outcome=stopped.close_until(started+Duration::from_millis(40));let _=reply.send((outcome,started.elapsed()));});
-        let bounded=result.recv_timeout(Duration::from_millis(250));
-        drop(metadata);call.join().unwrap();
-        let (outcome,elapsed)=bounded.expect("completed cleanup must not wait past its budget on held metadata");
-        assert!(outcome.is_err(),"contended proof publication is retryable, never false success");
-        assert!(elapsed<Duration::from_millis(250));
-        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle =
+            LocalHandle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let metadata = handle.0.close_state.lock().unwrap();
+        let stopped = handle.clone();
+        let (reply, result) = crossbeam_channel::bounded(1);
+        let call = thread::spawn(move || {
+            let started = Instant::now();
+            let outcome = stopped.close_until(started + Duration::from_millis(40));
+            let _ = reply.send((outcome, started.elapsed()));
+        });
+        let bounded = result.recv_timeout(Duration::from_millis(250));
+        drop(metadata);
+        call.join().unwrap();
+        let (outcome, elapsed) =
+            bounded.expect("completed cleanup must not wait past its budget on held metadata");
+        assert!(
+            outcome.is_err(),
+            "contended proof publication is retryable, never false success"
+        );
+        assert!(elapsed < Duration::from_millis(250));
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
     }
 
     #[test]
     fn whole_session_stop_preempts_saturated_commands_and_blocked_provider_stdin() {
         struct Stalled {
-            entered:crossbeam_channel::Sender<()>, release:crossbeam_channel::Receiver<()>,
-            prompts:Arc<std::sync::atomic::AtomicUsize>,
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+            prompts: Arc<std::sync::atomic::AtomicUsize>,
         }
         impl Adapter for Stalled {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
-            fn command(&mut self,command:Command)->Result<Step,String> {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
                 match command {
-                    Command::SetFastMode {..}=> {
-                        self.entered.send(()).unwrap();self.release.recv().unwrap();
+                    Command::SetFastMode { .. } => {
+                        self.entered.send(()).unwrap();
+                        self.release.recv().unwrap();
                         // Two individually legal frames exceed normal outbound
                         // backpressure while the real provider never reads stdin.
-                        let frame=serde_json::Value::String("x".repeat(17*1024*1024));
-                        Ok(Step {writes:vec![frame.clone(),frame],..Default::default()})
+                        let frame = serde_json::Value::String("x".repeat(17 * 1024 * 1024));
+                        Ok(Step {
+                            writes: vec![frame.clone(), frame],
+                            ..Default::default()
+                        })
                     }
-                    Command::Prompt {..}=> {self.prompts.fetch_add(1,Ordering::AcqRel);Ok(Step::default())},
-                    _=>Err("Unexpected stalled fixture command".into()),
+                    Command::Prompt { .. } => {
+                        self.prompts.fetch_add(1, Ordering::AcqRel);
+                        Ok(Step::default())
+                    }
+                    _ => Err("Unexpected stalled fixture command".into()),
                 }
             }
-            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:Some(observed_fixture_directory(directory.path())),messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/sleep".into(),arguments:vec!["600".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let (entered,waiting)=crossbeam_channel::bounded(1);let (release,resume)=crossbeam_channel::bounded(1);
-        let prompts=Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut initial=Step {events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
-        let handle=LocalHandle::start(spec,Box::new(Stalled {entered,release:resume,prompts:prompts.clone()}),initial,store,None,|_|{}).unwrap();
-        until(&handle,|state|state.ready);
-        let command=handle.enqueue_command(Command::SetFastMode {enabled:true}).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: Some(observed_fixture_directory(directory.path())),
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sleep".into(),
+            arguments: vec!["600".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let (entered, waiting) = crossbeam_channel::bounded(1);
+        let (release, resume) = crossbeam_channel::bounded(1);
+        let prompts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(
+            spec,
+            Box::new(Stalled {
+                entered,
+                release: resume,
+                prompts: prompts.clone(),
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        until(&handle, |state| state.ready);
+        let command = handle
+            .enqueue_command(Command::SetFastMode { enabled: true })
+            .unwrap();
         waiting.recv_timeout(Duration::from_secs(2)).unwrap();
         for _ in 0..64 {
-            let (reply,_)=crossbeam_channel::bounded(1);
-            handle.0.commands.try_send((ActorCommand::Provider {run:None,command:Command::Prompt {text:"queued work".into(),attachments:Vec::new(),mode:super::super::PromptMode::Send}},reply)).unwrap();
+            let (reply, _) = crossbeam_channel::bounded(1);
+            handle
+                .0
+                .commands
+                .try_send((
+                    ActorCommand::Provider {
+                        run: None,
+                        command: Command::Prompt {
+                            text: "queued work".into(),
+                            attachments: Vec::new(),
+                            mode: super::super::PromptMode::Send,
+                        },
+                    },
+                    reply,
+                ))
+                .unwrap();
         }
         assert!(handle.0.commands.is_full());
-        let stopping=handle.clone();let actor=handle.close_observation().actor_id;
-        let stop=thread::spawn(move||stopping.fence_session_stop_until(actor,Instant::now()+Duration::from_secs(15)));
-        let deadline=Instant::now()+Duration::from_secs(2);
-        while handle.0.session_stop.lock().unwrap().is_none() {assert!(Instant::now()<deadline);thread::yield_now();}
+        let stopping = handle.clone();
+        let actor = handle.close_observation().actor_id;
+        let stop = thread::spawn(move || {
+            stopping.fence_session_stop_until(actor, Instant::now() + Duration::from_secs(15))
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while handle.0.session_stop.lock().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
         release.send(()).unwrap();
-        command.recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        command
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
         stop.join().unwrap().unwrap();
-        assert_eq!(prompts.load(Ordering::Acquire),0,"whole-session stop must preempt every queued authorizing command");
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
+        assert_eq!(
+            prompts.load(Ordering::Acquire),
+            0,
+            "whole-session stop must preempt every queued authorizing command"
+        );
+        handle
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
     }
 
     #[test]
@@ -6448,9 +6718,15 @@ mod tests {
                 .unwrap_err()
                 .contains("reattach")
         );
-        assert!(handle.fence_session_stop_until(
-            observation.actor_id, Instant::now() + Duration::from_millis(40),
-        ).unwrap_err().contains("reattached"));
+        assert!(
+            handle
+                .fence_session_stop_until(
+                    observation.actor_id,
+                    Instant::now() + Duration::from_millis(40),
+                )
+                .unwrap_err()
+                .contains("reattached")
+        );
         handle.0.close_state.lock().unwrap().unobserved_native = false;
     }
 
@@ -7116,11 +7392,24 @@ mod tests {
     #[test]
     fn exact_historical_outcome_never_changes_current_turn_scalars() {
         use crate::chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnUpdate};
-        let mut state = Snapshot { busy: true, turn_generation: 2, ..Default::default() };
-        apply_event(&mut state, &mut BTreeMap::new(), Event::TurnOutcome(TurnUpdate::Finish {
-            identity: TurnIdentity { session_id:"confirmed".into(), kind:TurnIdentityKind::NativeTurn, id:"A".into() },
-            outcome:crate::agent::ActivityOutcome::Cancelled, finished_at:1234,
-        }));
+        let mut state = Snapshot {
+            busy: true,
+            turn_generation: 2,
+            ..Default::default()
+        };
+        apply_event(
+            &mut state,
+            &mut BTreeMap::new(),
+            Event::TurnOutcome(TurnUpdate::Finish {
+                identity: TurnIdentity {
+                    session_id: "confirmed".into(),
+                    kind: TurnIdentityKind::NativeTurn,
+                    id: "A".into(),
+                },
+                outcome: crate::agent::ActivityOutcome::Cancelled,
+                finished_at: 1234,
+            }),
+        );
         assert!(state.busy);
         assert_eq!(state.turn_generation, 2);
         assert!(state.finished_at.is_none());

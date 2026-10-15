@@ -14,21 +14,33 @@ use uuid::Uuid;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(in crate::host) enum NativeActorEvent {
-    Execution { run: RunId, update: Update },
+    Execution {
+        run: RunId,
+        update: Update,
+    },
     Attention(crate::notifications::Evidence),
     AttentionContext {
         evidence: crate::notifications::Evidence,
         content: Option<crate::notifications::Content>,
     },
-    TurnOutcome { update:chat::turn_outcomes::TurnUpdate },
+    TurnOutcome {
+        update: chat::turn_outcomes::TurnUpdate,
+    },
 }
 
 impl NativeActorEvent {
-    pub(in crate::host) fn attention(&self) -> Option<(crate::notifications::Evidence, Option<crate::notifications::Content>)> {
+    pub(in crate::host) fn attention(
+        &self,
+    ) -> Option<(
+        crate::notifications::Evidence,
+        Option<crate::notifications::Content>,
+    )> {
         match self {
             Self::Attention(evidence) => Some((evidence.clone(), None)),
-            Self::AttentionContext {evidence,content} => Some((evidence.clone(),content.clone())),
-            Self::Execution {..} | Self::TurnOutcome {..} => None,
+            Self::AttentionContext { evidence, content } => {
+                Some((evidence.clone(), content.clone()))
+            }
+            Self::Execution { .. } | Self::TurnOutcome { .. } => None,
         }
     }
 }
@@ -44,8 +56,18 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
 
 impl Registry {
     #[cfg(test)]
-    pub(in crate::host) fn native_actor_cursor_for_test(&self, actor:Uuid)->Result<Option<u64>,String> {
-        self.db.query_row("SELECT sequence FROM native_actor_cursors WHERE actor=?1",[actor.to_string()],|row|row.get::<_,u64>(0)).optional().map_err(|error|error.to_string())
+    pub(in crate::host) fn native_actor_cursor_for_test(
+        &self,
+        actor: Uuid,
+    ) -> Result<Option<u64>, String> {
+        self.db
+            .query_row(
+                "SELECT sequence FROM native_actor_cursors WHERE actor=?1",
+                [actor.to_string()],
+                |row| row.get::<_, u64>(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())
     }
     /// A typed loss is already durable in the authenticated helper. Commit all
     /// affected runs together before its separate loss ACK permits recovery.
@@ -141,7 +163,9 @@ impl Registry {
         event: &NativeActorEvent,
         now_ms: u64,
     ) -> Result<bool, String> {
-        if let NativeActorEvent::TurnOutcome {update}=event {update.validate()?;}
+        if let NativeActorEvent::TurnOutcome { update } = event {
+            update.validate()?;
+        }
         if actor.is_nil()
             || sequence == 0
             || sequence > i64::MAX as u64
@@ -591,16 +615,50 @@ mod tests {
                 .is_err()
         );
         assert_eq!(registry.agent_run(accepted.run.id).unwrap(), done);
-        let evidence=crate::notifications::Evidence {key:"retained-exact-final-context".into(),kind:crate::notifications::Kind::Succeeded};
-        let content=crate::notifications::Content {conversation:"Original turn".into(),preview:"Exact provider result before daemon restart".into(),request:None};
-        let attention=NativeActorEvent::AttentionContext {evidence:evidence.clone(),content:Some(content.clone())};
-        assert!(!registry.commit_native_actor_event(actor,&owner,&source,3,&attention,6).unwrap());
+        let evidence = crate::notifications::Evidence {
+            key: "retained-exact-final-context".into(),
+            kind: crate::notifications::Kind::Succeeded,
+        };
+        let content = crate::notifications::Content {
+            conversation: "Original turn".into(),
+            preview: "Exact provider result before daemon restart".into(),
+            request: None,
+        };
+        let attention = NativeActorEvent::AttentionContext {
+            evidence: evidence.clone(),
+            content: Some(content.clone()),
+        };
+        assert!(
+            !registry
+                .commit_native_actor_event(actor, &owner, &source, 3, &attention, 6)
+                .unwrap()
+        );
         drop(registry);
-        let mut registry=Registry::at(&path).unwrap();
-        assert!(!registry.commit_native_actor_event(actor,&owner,&source,3,&attention,7).unwrap());
-        let mut other=content.clone();other.preview="A later unrelated snapshot".into();
-        assert!(registry.commit_native_actor_event(actor,&owner,&source,3,&NativeActorEvent::AttentionContext {evidence,content:Some(other)},8).is_err(),"replay cannot replace the same semantic sequence's immutable context");
-        assert_eq!(attention.attention().unwrap().1,Some(content));
-        assert_eq!(registry.agent_run(accepted.run.id).unwrap(),done);
+        let mut registry = Registry::at(&path).unwrap();
+        assert!(
+            !registry
+                .commit_native_actor_event(actor, &owner, &source, 3, &attention, 7)
+                .unwrap()
+        );
+        let mut other = content.clone();
+        other.preview = "A later unrelated snapshot".into();
+        assert!(
+            registry
+                .commit_native_actor_event(
+                    actor,
+                    &owner,
+                    &source,
+                    3,
+                    &NativeActorEvent::AttentionContext {
+                        evidence,
+                        content: Some(other)
+                    },
+                    8
+                )
+                .is_err(),
+            "replay cannot replace the same semantic sequence's immutable context"
+        );
+        assert_eq!(attention.attention().unwrap().1, Some(content));
+        assert_eq!(registry.agent_run(accepted.run.id).unwrap(), done);
     }
 }

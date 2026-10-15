@@ -30,11 +30,16 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
 /// Required paths retain the same byte-preserving framing without an option.
 pub(crate) mod required {
     use super::*;
-    pub(crate) fn serialize<S:Serializer>(path:&PathBuf,serializer:S)->Result<S::Ok,S::Error> {
+    pub(crate) fn serialize<S: Serializer>(
+        path: &PathBuf,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
         PathRef(path).serialize(serializer)
     }
-    pub(crate) fn deserialize<'de,D:Deserializer<'de>>(deserializer:D)->Result<PathBuf,D::Error> {
-        OwnedPath::deserialize(deserializer).map(|path|path.0)
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<PathBuf, D::Error> {
+        OwnedPath::deserialize(deserializer).map(|path| path.0)
     }
 }
 

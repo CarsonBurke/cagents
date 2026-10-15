@@ -57,10 +57,16 @@ pub(super) struct Journal {
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
 /// independently authoritative evidence or block later execution settlements.
-fn valid_attention_context(evidence:&crate::notifications::Evidence,content:&crate::notifications::Content)->bool {
-    let bounded=|text:&str,limit| text.chars().take(limit+1).count()<=limit && !text.chars().any(char::is_control);
-    bounded(&content.conversation,80) && bounded(&content.preview,240)
-        && (content.request.is_none() || evidence.kind==crate::notifications::Kind::Waiting)
+fn valid_attention_context(
+    evidence: &crate::notifications::Evidence,
+    content: &crate::notifications::Content,
+) -> bool {
+    let bounded = |text: &str, limit| {
+        text.chars().take(limit + 1).count() <= limit && !text.chars().any(char::is_control)
+    };
+    bounded(&content.conversation, 80)
+        && bounded(&content.preview, 240)
+        && (content.request.is_none() || evidence.kind == crate::notifications::Kind::Waiting)
 }
 impl Journal {
     pub fn open(directory: &Path) -> Result<Self, String> {
@@ -161,21 +167,33 @@ impl Journal {
     pub fn append(&mut self, update: &Update) -> Result<(), String> {
         // These can change once per streaming frame. Their authoritative
         // bounded state is queried, so only durable outcomes enter the outbox.
-        if !matches!(update,Update::Execution {..}|Update::Attention(_)|Update::AttentionContext {..}|Update::TurnOutcome {..}) {
+        if !matches!(
+            update,
+            Update::Execution { .. }
+                | Update::Attention(_)
+                | Update::AttentionContext { .. }
+                | Update::TurnOutcome { .. }
+        ) {
             return Ok(());
         }
-        if let Update::TurnOutcome {update}=update {
+        if let Update::TurnOutcome { update } = update {
             // Native turn/input identities retain their exact source proof.
             // They never settle or remove a managed current RunId by inference.
             update.validate()?;
         }
         // Keep bounded supplied context byte-for-byte. Never consult a later
         // snapshot or modify evidence to repair malformed optional display data.
-        let metadata_only=match update {
-            Update::AttentionContext {evidence,content:Some(content)} if !valid_attention_context(evidence,content)=>Some(Update::AttentionContext {evidence:evidence.clone(),content:None}),
-            _=>None,
+        let metadata_only = match update {
+            Update::AttentionContext {
+                evidence,
+                content: Some(content),
+            } if !valid_attention_context(evidence, content) => Some(Update::AttentionContext {
+                evidence: evidence.clone(),
+                content: None,
+            }),
+            _ => None,
         };
-        let update=metadata_only.as_ref().unwrap_or(update);
+        let update = metadata_only.as_ref().unwrap_or(update);
         if self.loss()?.is_some() {
             return Err("Actor outcome journal already has a recorded loss".into());
         }
@@ -641,89 +659,220 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn historical_turn(id:&str)->crate::chat::turn_outcomes::TurnIdentity {
-        crate::chat::turn_outcomes::TurnIdentity {session_id:"confirmed-session".into(),kind:crate::chat::turn_outcomes::TurnIdentityKind::NativeTurn,id:id.into()}
+    fn historical_turn(id: &str) -> crate::chat::turn_outcomes::TurnIdentity {
+        crate::chat::turn_outcomes::TurnIdentity {
+            session_id: "confirmed-session".into(),
+            kind: crate::chat::turn_outcomes::TurnIdentityKind::NativeTurn,
+            id: id.into(),
+        }
     }
     #[test]
     fn exact_historical_turn_proof_repeats_until_ack_without_settling_current_run() {
         use crate::chat::turn_outcomes::TurnUpdate;
-        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),16*1024).unwrap();
-        let current=crate::model::RunId::new();let input=InputIdentity {sequence:1,id:uuid::Uuid::new_v4(),hash:[5;32]};
-        journal.admit_with_run(&input,Some(current)).unwrap();
-        let identity=historical_turn("earlier-turn");
-        let updates=[Update::TurnOutcome {update:TurnUpdate::Bind {identity:identity.clone(),item_ids:vec!["actual-provider-item-A".into()]}},
-            Update::TurnOutcome {update:TurnUpdate::Finish {identity:identity.clone(),outcome:crate::agent::ActivityOutcome::Cancelled,finished_at:1234}}];
-        for update in &updates {journal.append(update).unwrap();}
-        let first=journal.page(0).unwrap();let repeated=journal.page(0).unwrap();
-        assert_eq!(serde_json::to_value(&first).unwrap(),serde_json::to_value(repeated).unwrap());
-        for (entry,expected) in first.iter().zip(&updates) {assert_eq!(serde_json::to_value(&entry.update).unwrap(),serde_json::to_value(expected).unwrap());}
-        assert!(matches!(&first[1].update,Update::TurnOutcome {update:TurnUpdate::Finish {identity:at,finished_at:1234,..}} if at==&identity));
-        journal.ack(2).unwrap();assert!(journal.page(2).unwrap().is_empty());
-        assert_eq!(journal.retained_runs().unwrap(),vec![current],"past proof ACK never commits the current managed run");
-        assert_eq!(journal.input(&input).unwrap().unwrap().state,InputState::Accepted);
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), 16 * 1024).unwrap();
+        let current = crate::model::RunId::new();
+        let input = InputIdentity {
+            sequence: 1,
+            id: uuid::Uuid::new_v4(),
+            hash: [5; 32],
+        };
+        journal.admit_with_run(&input, Some(current)).unwrap();
+        let identity = historical_turn("earlier-turn");
+        let updates = [
+            Update::TurnOutcome {
+                update: TurnUpdate::Bind {
+                    identity: identity.clone(),
+                    item_ids: vec!["actual-provider-item-A".into()],
+                },
+            },
+            Update::TurnOutcome {
+                update: TurnUpdate::Finish {
+                    identity: identity.clone(),
+                    outcome: crate::agent::ActivityOutcome::Cancelled,
+                    finished_at: 1234,
+                },
+            },
+        ];
+        for update in &updates {
+            journal.append(update).unwrap();
+        }
+        let first = journal.page(0).unwrap();
+        let repeated = journal.page(0).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(repeated).unwrap()
+        );
+        for (entry, expected) in first.iter().zip(&updates) {
+            assert_eq!(
+                serde_json::to_value(&entry.update).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        assert!(
+            matches!(&first[1].update,Update::TurnOutcome {update:TurnUpdate::Finish {identity:at,finished_at:1234,..}} if at==&identity)
+        );
+        journal.ack(2).unwrap();
+        assert!(journal.page(2).unwrap().is_empty());
+        assert_eq!(
+            journal.retained_runs().unwrap(),
+            vec![current],
+            "past proof ACK never commits the current managed run"
+        );
+        assert_eq!(
+            journal.input(&input).unwrap().unwrap().state,
+            InputState::Accepted
+        );
     }
     #[test]
     fn malformed_turn_proof_is_refused_before_journal_publication() {
-        use crate::chat::turn_outcomes::{TurnUpdate,MAX_TURN_ID_BYTES,MAX_TURN_ITEM_IDS};
-        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),DEFAULT_BUDGET).unwrap();
-        let invalid=Update::TurnOutcome {update:TurnUpdate::Bind {identity:historical_turn("old"),item_ids:vec!["duplicate".into(),"duplicate".into()]}};
-        assert!(journal.append(&invalid).is_err());assert_eq!(journal.latest().unwrap(),0);
+        use crate::chat::turn_outcomes::{MAX_TURN_ID_BYTES, MAX_TURN_ITEM_IDS, TurnUpdate};
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), DEFAULT_BUDGET).unwrap();
+        let invalid = Update::TurnOutcome {
+            update: TurnUpdate::Bind {
+                identity: historical_turn("old"),
+                item_ids: vec!["duplicate".into(), "duplicate".into()],
+            },
+        };
+        assert!(journal.append(&invalid).is_err());
+        assert_eq!(journal.latest().unwrap(), 0);
         // Shared TurnUpdate validation caps the aggregate raw proof at 64 KiB;
         // this refusal occurs before encoded-entry capacity/loss accounting.
-        let ids=(0..MAX_TURN_ITEM_IDS).map(|index|format!("{index}{}","a".repeat(MAX_TURN_ID_BYTES-4))).collect();
-        let large=Update::TurnOutcome {update:TurnUpdate::Bind {identity:historical_turn("old"),item_ids:ids}};
+        let ids = (0..MAX_TURN_ITEM_IDS)
+            .map(|index| format!("{index}{}", "a".repeat(MAX_TURN_ID_BYTES - 4)))
+            .collect();
+        let large = Update::TurnOutcome {
+            update: TurnUpdate::Bind {
+                identity: historical_turn("old"),
+                item_ids: ids,
+            },
+        };
         assert!(journal.append(&large).is_err());
-        assert_eq!(journal.latest().unwrap(),0);assert!(journal.continuity_loss().unwrap().is_none());
+        assert_eq!(journal.latest().unwrap(), 0);
+        assert!(journal.continuity_loss().unwrap().is_none());
     }
     #[test]
     fn encoded_semantic_entry_cap_records_a_typed_loss() {
-        let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),DEFAULT_BUDGET).unwrap();
-        let large=Update::Attention(crate::notifications::Evidence {
-            key:"k".repeat(1024*1024),kind:crate::notifications::Kind::Succeeded,
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), DEFAULT_BUDGET).unwrap();
+        let large = Update::Attention(crate::notifications::Evidence {
+            key: "k".repeat(1024 * 1024),
+            kind: crate::notifications::Kind::Succeeded,
         });
         assert!(journal.append(&large).unwrap_err().contains("overflowed"));
-        assert_eq!(journal.latest().unwrap(),0);assert!(journal.continuity_loss().unwrap().is_some());
+        assert_eq!(journal.latest().unwrap(), 0);
+        assert!(journal.continuity_loss().unwrap().is_some());
     }
 
     #[test]
     fn immutable_attention_context_repeats_verbatim_until_full_ack() {
-        let dir=tempfile::tempdir_in("/var/tmp").unwrap();
-        let mut journal=Journal::with_budget(dir.path(),16*1024).unwrap();
-        let evidence=crate::notifications::Evidence {key:"exact-provider-turn".into(),kind:crate::notifications::Kind::Waiting};
-        let content=crate::notifications::Content {conversation:"名".repeat(80),preview:"😀".repeat(240),request:Some(crate::notifications::RequestType::Question)};
-        let update=Update::AttentionContext {evidence:evidence.clone(),content:Some(content.clone())};
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::with_budget(dir.path(), 16 * 1024).unwrap();
+        let evidence = crate::notifications::Evidence {
+            key: "exact-provider-turn".into(),
+            kind: crate::notifications::Kind::Waiting,
+        };
+        let content = crate::notifications::Content {
+            conversation: "名".repeat(80),
+            preview: "😀".repeat(240),
+            request: Some(crate::notifications::RequestType::Question),
+        };
+        let update = Update::AttentionContext {
+            evidence: evidence.clone(),
+            content: Some(content.clone()),
+        };
         journal.append(&update).unwrap();
-        let first=journal.page(0).unwrap();let second=journal.page(0).unwrap();
-        assert_eq!(serde_json::to_value(&first).unwrap(),serde_json::to_value(&second).unwrap());
-        assert!(matches!(&first[0].update,Update::AttentionContext {evidence:at,content:Some(at_content)} if at==&evidence && at_content==&content));
+        let first = journal.page(0).unwrap();
+        let second = journal.page(0).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&second).unwrap()
+        );
+        assert!(
+            matches!(&first[0].update,Update::AttentionContext {evidence:at,content:Some(at_content)} if at==&evidence && at_content==&content)
+        );
         // The committed bytes themselves retain the immutable payload; this
         // helper never reconstructs its Store or journal during daemon adoption.
-        let bytes:Vec<u8>=journal.db.query_row("SELECT payload FROM outcomes WHERE sequence=1",[],|row|row.get(0)).unwrap();
-        assert_eq!(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),serde_json::to_value(&update).unwrap());
-        journal.append(&Update::PastAttention(evidence.clone())).unwrap();
+        let bytes: Vec<u8> = journal
+            .db
+            .query_row("SELECT payload FROM outcomes WHERE sequence=1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+            serde_json::to_value(&update).unwrap()
+        );
+        journal
+            .append(&Update::PastAttention(evidence.clone()))
+            .unwrap();
         journal.append(&Update::Presentation).unwrap();
-        assert_eq!(journal.latest().unwrap(),1,"old-turn evidence/stream wakes never become current attention");
-        journal.ack(1).unwrap();assert!(journal.page(1).unwrap().is_empty());
+        assert_eq!(
+            journal.latest().unwrap(),
+            1,
+            "old-turn evidence/stream wakes never become current attention"
+        );
+        journal.ack(1).unwrap();
+        assert!(journal.page(1).unwrap().is_empty());
     }
 
     #[test]
     fn malformed_optional_context_keeps_exact_semantic_evidence_without_later_enrichment() {
-        use crate::notifications::{Content,Evidence,Kind,RequestType};
+        use crate::notifications::{Content, Evidence, Kind, RequestType};
         for content in [
-            Content {conversation:"x".repeat(81),..Default::default()},
-            Content {preview:"x".repeat(241),..Default::default()},
-            Content {preview:"line\ncontrol".into(),..Default::default()},
-            Content {conversation:"\u{1b}title".into(),..Default::default()},
-            Content {request:Some(RequestType::Approval),..Default::default()},
+            Content {
+                conversation: "x".repeat(81),
+                ..Default::default()
+            },
+            Content {
+                preview: "x".repeat(241),
+                ..Default::default()
+            },
+            Content {
+                preview: "line\ncontrol".into(),
+                ..Default::default()
+            },
+            Content {
+                conversation: "\u{1b}title".into(),
+                ..Default::default()
+            },
+            Content {
+                request: Some(RequestType::Approval),
+                ..Default::default()
+            },
         ] {
-            let dir=tempfile::tempdir_in("/var/tmp").unwrap();let mut journal=Journal::with_budget(dir.path(),4096).unwrap();
-            let evidence=Evidence {key:"known-final-turn".into(),kind:Kind::Succeeded};
-            journal.append(&Update::AttentionContext {evidence:evidence.clone(),content:Some(content)}).unwrap();
-            let page=journal.page(0).unwrap();
-            assert!(matches!(&page[0].update,Update::AttentionContext {evidence:at,content:None} if at==&evidence));
-            assert!(journal.continuity_loss().unwrap().is_none(),"invalid optional display data does not make known execution uncertain");
-            journal.append(&Update::Attention(Evidence {key:"legacy-turn".into(),kind:Kind::Cancelled})).unwrap();
-            assert_eq!(journal.latest().unwrap(),2,"legacy/new metadata evidence coexist without later Snapshot reads");
+            let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut journal = Journal::with_budget(dir.path(), 4096).unwrap();
+            let evidence = Evidence {
+                key: "known-final-turn".into(),
+                kind: Kind::Succeeded,
+            };
+            journal
+                .append(&Update::AttentionContext {
+                    evidence: evidence.clone(),
+                    content: Some(content),
+                })
+                .unwrap();
+            let page = journal.page(0).unwrap();
+            assert!(
+                matches!(&page[0].update,Update::AttentionContext {evidence:at,content:None} if at==&evidence)
+            );
+            assert!(
+                journal.continuity_loss().unwrap().is_none(),
+                "invalid optional display data does not make known execution uncertain"
+            );
+            journal
+                .append(&Update::Attention(Evidence {
+                    key: "legacy-turn".into(),
+                    kind: Kind::Cancelled,
+                }))
+                .unwrap();
+            assert_eq!(
+                journal.latest().unwrap(),
+                2,
+                "legacy/new metadata evidence coexist without later Snapshot reads"
+            );
         }
     }
 

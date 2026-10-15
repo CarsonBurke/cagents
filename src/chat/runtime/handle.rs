@@ -18,10 +18,10 @@ enum Owner {
 impl Handle {
     /// Exact authenticated helper metadata. Callers must compare the complete
     /// record against an installed host entry; this is never cleanup authority.
-    pub(crate) fn native_holder_record(&self)->Option<&crate::daemon::holder_registry::Record> {
+    pub(crate) fn native_holder_record(&self) -> Option<&crate::daemon::holder_registry::Record> {
         match &self.0 {
-            Owner::Local(local)=>local.native_holder_record(),
-            Owner::Remote(remote)=>Some(remote.native_holder_record()),
+            Owner::Local(local) => local.native_holder_record(),
+            Owner::Remote(remote) => Some(remote.native_holder_record()),
         }
     }
     #[cfg(test)]
@@ -162,8 +162,12 @@ impl Handle {
     }
     /// Read-only authenticated census with one absolute connect/frame budget.
     /// No attach epoch, source, provider input or ownership is changed.
-    pub(crate) fn inspect_remote_until(record:&crate::daemon::holder_registry::Record,proof:crate::model::HostSessionProof,deadline:std::time::Instant)->Result<super::remote_actor::ActorInspection,String> {
-        RemoteActor::inspect_until(record,proof,deadline)
+    pub(crate) fn inspect_remote_until(
+        record: &crate::daemon::holder_registry::Record,
+        proof: crate::model::HostSessionProof,
+        deadline: std::time::Instant,
+    ) -> Result<super::remote_actor::ActorInspection, String> {
+        RemoteActor::inspect_until(record, proof, deadline)
     }
     pub(crate) fn is_remote_record(record: &crate::daemon::holder_registry::Record) -> bool {
         RemoteActor::is_record(record)
@@ -316,28 +320,66 @@ impl Handle {
             }
         }
     }
-    pub(crate) fn account_switch_generation(&self)->Result<Option<u64>,String> {
-        match &self.0 {Owner::Local(local)=>local.account_switch_generation(),Owner::Remote(remote)=>remote.account_switch_generation()}
-    }
-    pub(crate) fn completed_account_options(&self)->Result<Option<super::AccountSwitchOptions>,String> {
-        match &self.0 {Owner::Local(local)=>local.completed_account_options(),Owner::Remote(remote)=>remote.completed_account_options()}
-    }
-    pub(crate) fn close_for_account_switch(&self,generation:u64)->Result<Option<super::AccountSwitchOptions>,String> {
-        match &self.0 {Owner::Local(local)=>local.close_for_account_switch(generation),Owner::Remote(remote)=>remote.close_for_account_switch(generation)}
-    }
-    pub(crate) fn restore_account_options(&self,options:&super::AccountSwitchOptions,deadline:std::time::Instant,cancelled:impl Fn()->bool)->Result<(),String> {
-        if cancelled() {return Err("Account options restoration was cancelled".into());}
+    pub(crate) fn account_switch_generation(&self) -> Result<Option<u64>, String> {
         match &self.0 {
-            Owner::Local(local)=>local.restore_account_options(options,deadline,cancelled),
-            Owner::Remote(remote)=>{
-                let budget=deadline.saturating_duration_since(std::time::Instant::now()).as_millis().min(4000) as u64;
-                if budget==0 {return Err("Account options restoration budget expired".into());}
-                remote.call("restore_account_options",serde_json::json!([options,budget]))
+            Owner::Local(local) => local.account_switch_generation(),
+            Owner::Remote(remote) => remote.account_switch_generation(),
+        }
+    }
+    pub(crate) fn completed_account_options(
+        &self,
+    ) -> Result<Option<super::AccountSwitchOptions>, String> {
+        match &self.0 {
+            Owner::Local(local) => local.completed_account_options(),
+            Owner::Remote(remote) => remote.completed_account_options(),
+        }
+    }
+    pub(crate) fn close_for_account_switch(
+        &self,
+        generation: u64,
+    ) -> Result<Option<super::AccountSwitchOptions>, String> {
+        match &self.0 {
+            Owner::Local(local) => local.close_for_account_switch(generation),
+            Owner::Remote(remote) => remote.close_for_account_switch(generation),
+        }
+    }
+    pub(crate) fn restore_account_options(
+        &self,
+        options: &super::AccountSwitchOptions,
+        deadline: std::time::Instant,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<(), String> {
+        if cancelled() {
+            return Err("Account options restoration was cancelled".into());
+        }
+        match &self.0 {
+            Owner::Local(local) => local.restore_account_options(options, deadline, cancelled),
+            Owner::Remote(remote) => {
+                let budget = deadline
+                    .saturating_duration_since(std::time::Instant::now())
+                    .as_millis()
+                    .min(4000) as u64;
+                if budget == 0 {
+                    return Err("Account options restoration budget expired".into());
+                }
+                remote.call(
+                    "restore_account_options",
+                    serde_json::json!([options, budget]),
+                )
             }
         }
     }
-    pub(crate) fn account_switch_notice(&self,source:&chat::Launch,target:&chat::Launch)->Result<(),String> {
-        match &self.0 {Owner::Local(local)=>local.account_switch_notice(source,target),Owner::Remote(remote)=>remote.call("account_switch_notice",serde_json::json!([source,target]))}
+    pub(crate) fn account_switch_notice(
+        &self,
+        source: &chat::Launch,
+        target: &chat::Launch,
+    ) -> Result<(), String> {
+        match &self.0 {
+            Owner::Local(local) => local.account_switch_notice(source, target),
+            Owner::Remote(remote) => {
+                remote.call("account_switch_notice", serde_json::json!([source, target]))
+            }
+        }
     }
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
         match &self.0 {

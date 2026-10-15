@@ -178,8 +178,10 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         let semantic = match entry.update {
             Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
             Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
-            Update::AttentionContext {evidence,content} => NativeActorEvent::AttentionContext {evidence,content},
-            Update::TurnOutcome {update} => NativeActorEvent::TurnOutcome {update},
+            Update::AttentionContext { evidence, content } => {
+                NativeActorEvent::AttentionContext { evidence, content }
+            }
+            Update::TurnOutcome { update } => NativeActorEvent::TurnOutcome { update },
             _ => return Err("The retained semantic outbox contains an unsupported event".into()),
         };
         let (changed, automation) = {
@@ -203,22 +205,27 @@ fn drain(host: &SharedHost, id: TerminalId) -> Result<bool, String> {
         if changed {
             super::super::agent_execution::announce(host, &registry);
         }
-        if let NativeActorEvent::TurnOutcome {update}=&semantic {
+        if let NativeActorEvent::TurnOutcome { update } = &semantic {
             // The registry cursor and annotation DB are separate transactions.
             // Even a repeated cursor must reach the idempotent Store commit:
             // cursor success alone never authorizes the helper's ACK.
-            let _receipt=commit_turn_outcome(&handle,update)?;
+            let _receipt = commit_turn_outcome(&handle, update)?;
         }
-        if let Some((evidence,content)) = semantic.attention() {
+        if let Some((evidence, content)) = semantic.attention() {
             // Scheduled notifications are produced from committed run outcomes.
             if !automation
                 && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded)
             {
-                let mut event=crate::notifications::Event::session(id,source.launch.provider,source.launch.recipe.working_directory.clone(),evidence);
+                let mut event = crate::notifications::Event::session(
+                    id,
+                    source.launch.provider,
+                    source.launch.recipe.working_directory.clone(),
+                    evidence,
+                );
                 // This bounded immutable context belongs to this exact semantic
                 // event; neither a later snapshot nor a transcript page can
                 // replace it while the FULL notification commit is retried.
-                event.content=content;
+                event.content = content;
                 let receipt = notifications
                     .as_ref()
                     .ok_or("The notification journal is unavailable; attention remains retained")?
@@ -585,8 +592,10 @@ pub(in crate::host) fn finish_close(
             let event = match entry.update {
                 Update::Execution { run, update } => NativeActorEvent::Execution { run, update },
                 Update::Attention(evidence) => NativeActorEvent::Attention(evidence),
-            Update::AttentionContext {evidence,content} => NativeActorEvent::AttentionContext {evidence,content},
-                Update::TurnOutcome {update} => NativeActorEvent::TurnOutcome {update},
+                Update::AttentionContext { evidence, content } => {
+                    NativeActorEvent::AttentionContext { evidence, content }
+                }
+                Update::TurnOutcome { update } => NativeActorEvent::TurnOutcome { update },
                 _ => {
                     return Err(
                         "Closing actor journal contains an unsupported semantic event".into(),
@@ -614,15 +623,20 @@ pub(in crate::host) fn finish_close(
             if changed {
                 super::super::agent_execution::announce(host, &registry);
             }
-            if let NativeActorEvent::TurnOutcome {update}=&event {
-                let _receipt=commit_turn_outcome(handle,update)?;
+            if let NativeActorEvent::TurnOutcome { update } = &event {
+                let _receipt = commit_turn_outcome(handle, update)?;
             }
-            if let Some((evidence,content)) = event.attention()
+            if let Some((evidence, content)) = event.attention()
                 && !automation
                 && !(loss.is_some() && evidence.kind == crate::notifications::Kind::Succeeded)
             {
-                let mut notification=crate::notifications::Event::session(source.id,source.launch.provider,source.launch.recipe.working_directory.clone(),evidence);
-                notification.content=content;
+                let mut notification = crate::notifications::Event::session(
+                    source.id,
+                    source.launch.provider,
+                    source.launch.recipe.working_directory.clone(),
+                    evidence,
+                );
+                notification.content = content;
                 notifications
                     .as_ref()
                     .ok_or("Final attention journal is unavailable; helper is retained")?
@@ -657,30 +671,61 @@ pub(in crate::host) fn finish_close(
 /// Transfer the exact final proof before native cleanup consumes its temporary
 /// file. Unknown account/confirmed identity remains explicit in this actor-only
 /// proof and never creates session read/delete authority.
-pub(super) fn publish_retirement(host: &SharedHost, handle: &Handle, source: &Session) -> Result<(), String> {
+pub(super) fn publish_retirement(
+    host: &SharedHost,
+    handle: &Handle,
+    source: &Session,
+) -> Result<(), String> {
     handle.finish_retained_close()?;
-    let identity = handle.actor_identity().ok_or("Final retirement lost its exact retained actor identity")?;
+    let identity = handle
+        .actor_identity()
+        .ok_or("Final retirement lost its exact retained actor identity")?;
     let registry = super::super::agent_execution::registry(host)?;
-    registry.lock().unwrap_or_else(|p| p.into_inner()).commit_native_actor_retirement(
-        identity.instance, &identity.record, source, handle.launch_account_scope(), handle.confirmed_session_id().as_deref(),
-    )
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .commit_native_actor_retirement(
+            identity.instance,
+            &identity.record,
+            source,
+            handle.launch_account_scope(),
+            handle.confirmed_session_id().as_deref(),
+        )
 }
 
 /// No global state lock is held across the durable census publication. A
 /// failed publication leaves the exact helper owned, without exposing input.
-pub(super) fn register_ownership(host: &SharedHost, handle: &Handle, source: &Session) -> Result<(), String> {
-    let identity = handle.actor_identity().ok_or("Retained actor registration has no authenticated helper identity")?;
-    let registry=super::super::agent_execution::registry(host)?;
-    registry.lock().unwrap_or_else(|p|p.into_inner()).register_native_actor_ownership(
-        identity.instance,&identity.record,source,handle.launch_account_scope(),
-    )
+pub(super) fn register_ownership(
+    host: &SharedHost,
+    handle: &Handle,
+    source: &Session,
+) -> Result<(), String> {
+    let identity = handle
+        .actor_identity()
+        .ok_or("Retained actor registration has no authenticated helper identity")?;
+    let registry = super::super::agent_execution::registry(host)?;
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .register_native_actor_ownership(
+            identity.instance,
+            &identity.record,
+            source,
+            handle.launch_account_scope(),
+        )
 }
 
-fn commit_turn_outcome(handle:&Handle,update:&chat::turn_outcomes::TurnUpdate)->Result<chat::turn_outcomes::TurnWriteReceipt,String> {
+fn commit_turn_outcome(
+    handle: &Handle,
+    update: &chat::turn_outcomes::TurnUpdate,
+) -> Result<chat::turn_outcomes::TurnWriteReceipt, String> {
     update.validate()?;
-    let scope=handle.launch_account_scope().map_err(|reason|format!("The retained actor's captured account is unavailable for outcome commit: {reason}"))?;
+    let scope = handle.launch_account_scope().map_err(|reason| {
+        format!("The retained actor's captured account is unavailable for outcome commit: {reason}")
+    })?;
     // Use immutable provider-supplied thread/turn identity and the original
     // authenticated launch account; never a UI account choice or current page.
-    let mut store=chat::annotations::storage::Store::installation(scope,&update.identity().session_id)?;
+    let mut store =
+        chat::annotations::storage::Store::installation(scope, &update.identity().session_id)?;
     store.apply_turn_update(update)
 }

@@ -41,13 +41,22 @@ impl TurnIdentity {
 /// neither update is permission to settle another turn's current activity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TurnUpdate {
-    Bind { identity: TurnIdentity, item_ids: Vec<String> },
-    Finish { identity: TurnIdentity, outcome: ActivityOutcome, finished_at: u64 },
+    Bind {
+        identity: TurnIdentity,
+        item_ids: Vec<String>,
+    },
+    Finish {
+        identity: TurnIdentity,
+        outcome: ActivityOutcome,
+        finished_at: u64,
+    },
 }
 
 impl TurnUpdate {
     pub fn identity(&self) -> &TurnIdentity {
-        match self { Self::Bind { identity, .. } | Self::Finish { identity, .. } => identity }
+        match self {
+            Self::Bind { identity, .. } | Self::Finish { identity, .. } => identity,
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -58,12 +67,21 @@ impl TurnUpdate {
                     return Err("Turn item binding exceeds its bounded identity window".into());
                 }
                 let mut seen = HashSet::new();
-                if item_ids.iter().any(|id| !valid_id(id) || !seen.insert(id.as_str())) {
+                if item_ids
+                    .iter()
+                    .any(|id| !valid_id(id) || !seen.insert(id.as_str()))
+                {
                     return Err("Invalid or duplicate turn item identity".into());
                 }
-                let bytes = 64 + self.identity().session_id.len() + self.identity().id.len()
+                let bytes = 64
+                    + self.identity().session_id.len()
+                    + self.identity().id.len()
                     + item_ids.iter().map(|id| id.len() + 8).sum::<usize>();
-                if bytes > MAX_TURN_UPDATE_BYTES { return Err("Turn binding exceeds its byte budget; split the binding batch".into()); }
+                if bytes > MAX_TURN_UPDATE_BYTES {
+                    return Err(
+                        "Turn binding exceeds its byte budget; split the binding batch".into(),
+                    );
+                }
             }
             Self::Finish { outcome, .. } => validate_outcome(outcome)?,
         }
@@ -128,19 +146,34 @@ impl TurnOutcomeProjection {
         let mut bytes = 32usize;
         for record in &self.records {
             record.outcome.validate()?;
-            bytes = bytes.saturating_add(64 + record.outcome.identity.session_id.len()
-                + record.outcome.identity.id.len() + record.outcome.outcome.reason().map_or(0, str::len));
-            if !turns.insert(&record.outcome.identity) || record.item_ids.is_empty()
-                || record.item_ids.len() > MAX_TURN_ITEM_IDS {
+            bytes = bytes.saturating_add(
+                64 + record.outcome.identity.session_id.len()
+                    + record.outcome.identity.id.len()
+                    + record.outcome.outcome.reason().map_or(0, str::len),
+            );
+            if !turns.insert(&record.outcome.identity)
+                || record.item_ids.is_empty()
+                || record.item_ids.len() > MAX_TURN_ITEM_IDS
+            {
                 return Err("Invalid or duplicate projected turn".into());
             }
-            if record.item_ids.iter().any(|id| id.is_empty() || id.len() > MAX_TURN_ID_BYTES + 256 || !items.insert(id.as_str())) {
+            if record.item_ids.iter().any(|id| {
+                id.is_empty() || id.len() > MAX_TURN_ID_BYTES + 256 || !items.insert(id.as_str())
+            }) {
                 return Err("A projected item has invalid or conflicting ownership".into());
             }
-            for id in &record.item_ids { bytes = bytes.saturating_add(8 + id.len()); }
-            if bytes > MAX_PROJECTION_BYTES { return Err("Turn outcome projection exceeds its byte budget".into()); }
+            for id in &record.item_ids {
+                bytes = bytes.saturating_add(8 + id.len());
+            }
+            if bytes > MAX_PROJECTION_BYTES {
+                return Err("Turn outcome projection exceeds its byte budget".into());
+            }
         }
-        if postcard::to_stdvec(self).map_err(|error| error.to_string())?.len() > MAX_PROJECTION_BYTES {
+        if postcard::to_stdvec(self)
+            .map_err(|error| error.to_string())?
+            .len()
+            > MAX_PROJECTION_BYTES
+        {
             return Err("Turn outcome projection exceeds its byte budget".into());
         }
         Ok(())
@@ -149,24 +182,34 @@ impl TurnOutcomeProjection {
 
 /// Bounded parent history-source proof. This carries no turn outcome,
 /// original-command eligibility, live-session authority or child attribution.
-pub fn validate_history_origins(session:&str,item_ids:&[String]) -> Result<(),String> {
-    if !valid_id(session) || item_ids.is_empty() || item_ids.len()>MAX_TURN_ITEM_IDS {
+pub fn validate_history_origins(session: &str, item_ids: &[String]) -> Result<(), String> {
+    if !valid_id(session) || item_ids.is_empty() || item_ids.len() > MAX_TURN_ITEM_IDS {
         return Err("Invalid history origin window".into());
     }
-    let mut seen=HashSet::new();
-    if item_ids.iter().any(|id|!valid_id(id)||!seen.insert(id.as_str())) {
+    let mut seen = HashSet::new();
+    if item_ids
+        .iter()
+        .any(|id| !valid_id(id) || !seen.insert(id.as_str()))
+    {
         return Err("Invalid or duplicate history source alias".into());
     }
-    if 64+session.len()+item_ids.iter().map(|id|id.len()+8).sum::<usize>()>MAX_TURN_UPDATE_BYTES {
+    if 64 + session.len() + item_ids.iter().map(|id| id.len() + 8).sum::<usize>()
+        > MAX_TURN_UPDATE_BYTES
+    {
         return Err("History origin proof exceeds its byte budget".into());
     }
     Ok(())
 }
 
-fn valid_id(id: &str) -> bool { !id.is_empty() && id.len() <= MAX_TURN_ID_BYTES }
+fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= MAX_TURN_ID_BYTES
+}
 
 fn validate_outcome(outcome: &ActivityOutcome) -> Result<(), String> {
-    if outcome.reason().is_some_and(|reason| reason.len() > MAX_TURN_REASON_BYTES) {
+    if outcome
+        .reason()
+        .is_some_and(|reason| reason.len() > MAX_TURN_REASON_BYTES)
+    {
         return Err("Turn outcome reason exceeds its byte budget".into());
     }
     Ok(())
@@ -176,55 +219,116 @@ fn validate_outcome(outcome: &ActivityOutcome) -> Result<(), String> {
 mod tests {
     use super::*;
     fn identity(id: &str) -> TurnIdentity {
-        TurnIdentity { session_id: "confirmed-session".into(), kind: TurnIdentityKind::AcceptedInput, id: id.into() }
+        TurnIdentity {
+            session_id: "confirmed-session".into(),
+            kind: TurnIdentityKind::AcceptedInput,
+            id: id.into(),
+        }
     }
     fn record(id: &str, item: &str, outcome: ActivityOutcome) -> VisibleTurnOutcome {
-        VisibleTurnOutcome { outcome: TurnOutcome { identity: identity(id), outcome, finished_at: 1234 }, item_ids: vec![item.into()] }
+        VisibleTurnOutcome {
+            outcome: TurnOutcome {
+                identity: identity(id),
+                outcome,
+                finished_at: 1234,
+            },
+            item_ids: vec![item.into()],
+        }
     }
 
     #[test]
     fn accepted_input_and_native_turn_proofs_are_distinct_and_round_trip() {
         let accepted = identity("provider-id");
-        let mut native = accepted.clone(); native.kind = TurnIdentityKind::NativeTurn;
+        let mut native = accepted.clone();
+        native.kind = TurnIdentityKind::NativeTurn;
         assert_ne!(accepted, native);
-        for update in [TurnUpdate::Bind { identity: accepted.clone(), item_ids: vec!["actual-user:input/0".into()] },
-            TurnUpdate::Finish { identity: accepted, outcome: ActivityOutcome::Cancelled, finished_at: 1234 }] {
+        for update in [
+            TurnUpdate::Bind {
+                identity: accepted.clone(),
+                item_ids: vec!["actual-user:input/0".into()],
+            },
+            TurnUpdate::Finish {
+                identity: accepted,
+                outcome: ActivityOutcome::Cancelled,
+                finished_at: 1234,
+            },
+        ] {
             update.validate().unwrap();
-            assert_eq!(postcard::from_bytes::<TurnUpdate>(&postcard::to_stdvec(&update).unwrap()).unwrap(), update);
+            assert_eq!(
+                postcard::from_bytes::<TurnUpdate>(&postcard::to_stdvec(&update).unwrap()).unwrap(),
+                update
+            );
         }
     }
 
     #[test]
     fn earlier_cancelled_turn_coexists_with_later_failure_without_rekeying() {
-        let projection = TurnOutcomeProjection { revision: 2, complete: true, records: vec![
-            record("A", "input-A", ActivityOutcome::Cancelled),
-            record("B", "input-B", ActivityOutcome::Failed { reason: "provider exited with code 3".into() }),
-        ] };
+        let projection = TurnOutcomeProjection {
+            revision: 2,
+            complete: true,
+            records: vec![
+                record("A", "input-A", ActivityOutcome::Cancelled),
+                record(
+                    "B",
+                    "input-B",
+                    ActivityOutcome::Failed {
+                        reason: "provider exited with code 3".into(),
+                    },
+                ),
+            ],
+        };
         projection.validate().unwrap();
-        assert_eq!(postcard::from_bytes::<TurnOutcomeProjection>(&postcard::to_stdvec(&projection).unwrap()).unwrap(), projection);
+        assert_eq!(
+            postcard::from_bytes::<TurnOutcomeProjection>(
+                &postcard::to_stdvec(&projection).unwrap()
+            )
+            .unwrap(),
+            projection
+        );
         assert_eq!(projection.records[0].outcome.identity.id, "A");
-        assert_eq!(projection.records[0].outcome.outcome, ActivityOutcome::Cancelled);
+        assert_eq!(
+            projection.records[0].outcome.outcome,
+            ActivityOutcome::Cancelled
+        );
     }
 
     #[test]
     fn unqualified_legacy_projection_is_not_success_and_conflicting_joins_refuse() {
         assert!(!TurnOutcomeProjection::default().complete);
-        let mut projection = TurnOutcomeProjection { revision: 1, complete: true, records: vec![
-            record("A", "same-item", ActivityOutcome::Succeeded), record("B", "same-item", ActivityOutcome::Cancelled),
-        ] };
+        let mut projection = TurnOutcomeProjection {
+            revision: 1,
+            complete: true,
+            records: vec![
+                record("A", "same-item", ActivityOutcome::Succeeded),
+                record("B", "same-item", ActivityOutcome::Cancelled),
+            ],
+        };
         assert!(projection.validate().is_err());
-        projection.records.pop(); projection.validate().unwrap();
-        projection.records[0].outcome.outcome = ActivityOutcome::Failed { reason: "x".repeat(MAX_TURN_REASON_BYTES + 1) };
+        projection.records.pop();
+        projection.validate().unwrap();
+        projection.records[0].outcome.outcome = ActivityOutcome::Failed {
+            reason: "x".repeat(MAX_TURN_REASON_BYTES + 1),
+        };
         assert!(projection.validate().is_err());
     }
 
     #[test]
     fn terminal_projection_does_not_replace_current_turn_scalars() {
-        let mut snapshot = crate::chat::Snapshot { turn_generation: 2, busy: true, ..Default::default() };
-        snapshot.turn_outcomes = std::sync::Arc::new(TurnOutcomeProjection { revision: 3, complete: true,
-            records: vec![record("A", "input-A", ActivityOutcome::Cancelled)] });
-        let decoded: crate::chat::Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
-        assert!(decoded.busy); assert_eq!(decoded.turn_generation, 2); assert!(decoded.outcome.is_none());
+        let mut snapshot = crate::chat::Snapshot {
+            turn_generation: 2,
+            busy: true,
+            ..Default::default()
+        };
+        snapshot.turn_outcomes = std::sync::Arc::new(TurnOutcomeProjection {
+            revision: 3,
+            complete: true,
+            records: vec![record("A", "input-A", ActivityOutcome::Cancelled)],
+        });
+        let decoded: crate::chat::Snapshot =
+            postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
+        assert!(decoded.busy);
+        assert_eq!(decoded.turn_generation, 2);
+        assert!(decoded.outcome.is_none());
         assert_eq!(decoded.turn_outcomes.records[0].outcome.identity.id, "A");
     }
 }

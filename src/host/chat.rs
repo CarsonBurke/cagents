@@ -426,7 +426,10 @@ fn changed_from(
         }
         super::agent_execution::retain_chat_identity(&host, id);
     }
-    if matches!(&update, Update::Attention(_) | Update::AttentionContext {..}) {
+    if matches!(
+        &update,
+        Update::Attention(_) | Update::AttentionContext { .. }
+    ) {
         // Scheduled outcomes belong to the accepted run, not its temporary
         // provider process. The scheduler publishes committed run evidence.
         // Read outside HostState; a failed ownership read cannot safely turn
@@ -475,22 +478,22 @@ fn changed_from(
     {
         courier.wake();
     }
-    let attention=match &update {
-        Update::Attention(evidence)=>Some((evidence,None)),
-        Update::AttentionContext {evidence,content}=>Some((evidence,content.clone())),
-        _=>None,
+    let attention = match &update {
+        Update::Attention(evidence) => Some((evidence, None)),
+        Update::AttentionContext { evidence, content } => Some((evidence, content.clone())),
+        _ => None,
     };
-    if let Some((evidence,content)) = attention {
+    if let Some((evidence, content)) = attention {
         if let Some(record) = state.chats.get(&id)
             && let Some(notifications) = &state.notifications
         {
-            let mut event=crate::notifications::Event::session(
+            let mut event = crate::notifications::Event::session(
                 id,
                 record.session.launch.provider,
                 record.session.launch.recipe.working_directory.clone(),
                 evidence.clone(),
             );
-            event.content=content;
+            event.content = content;
             notifications.record(event);
         }
         return;
