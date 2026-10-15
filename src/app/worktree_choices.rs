@@ -78,7 +78,7 @@ impl Choices {
             let [reference, oid, tracking, symbolic, head] = fields.as_slice() else { return Err("Git returned an invalid branch list".into()); };
             if !symbolic.is_empty() {
                 if *reference == "refs/remotes/origin/HEAD" || choices.default_base.is_empty() {
-                    choices.default_base = symbolic.strip_prefix("refs/remotes/").unwrap_or(symbolic).to_string();
+                    choices.default_base = symbolic.to_string();
                 }
                 continue;
             }
@@ -86,7 +86,7 @@ impl Choices {
                 else if let Some(name) = reference.strip_prefix("refs/remotes/") { (Kind::Remote, name) }
                 else if let Some(name) = reference.strip_prefix("refs/tags/") { (Kind::Tag, name) }
                 else { continue; };
-            if *head == "*" { local_head = Some(name.to_string()); }
+            if *head == "*" { local_head = Some(reference.to_string()); }
             let counts = tracking.trim_matches(['[', ']']).split(", ").collect::<Vec<_>>();
             let count = |prefix| counts.iter().find_map(|part| part.strip_prefix(prefix).and_then(|value| value.parse().ok())).unwrap_or(0);
             choices.refs.push(Choice { name: name.to_string(), reference: reference.to_string(), oid: oid.to_string(), kind, ahead: count("ahead "), behind: count("behind "), remote_branch: (kind == Kind::Remote).then(|| name.split_once('/').map(|(_, branch)| branch.to_string())).flatten() });
@@ -95,8 +95,8 @@ impl Choices {
             choices.default_base.clear();
         }
         if choices.default_base.is_empty() {
-            choices.default_base = ["origin/main", "origin/master"].into_iter()
-                .find(|name| choices.refs.iter().any(|choice| choice.kind == Kind::Remote && choice.name == *name))
+            choices.default_base = ["refs/remotes/origin/main", "refs/remotes/origin/master"].into_iter()
+                .find(|reference| choices.refs.iter().any(|choice| choice.kind == Kind::Remote && choice.reference == *reference))
                 .map(str::to_owned).or(local_head).unwrap_or_default();
         }
         Ok(choices)
@@ -209,7 +209,15 @@ mod tests {
         assert_eq!(choices.outcome("origin/feature/y", ""), "Checks out existing origin/feature/y");
         assert_eq!(choices.outcome("new", "main"), "New branch new from main · local main is 14 behind its upstream");
     }
-    #[test] fn selected_local_identity_wins_over_a_matching_remote_display_name() {
+    #[test] fn remote_default_stays_distinct_from_a_local_branch_with_its_display_name() {
+        let mut choices = choices();
+        let mut collision = choices.refs.iter().find(|choice| choice.name == "main").unwrap().clone();
+        collision.name = "origin/main".into(); collision.reference = "refs/heads/origin/main".into(); collision.oid = "ffff".into();
+        choices.refs.insert(0, collision);
+        assert_eq!(choices.default_base, "refs/remotes/origin/main");
+        assert_eq!(choices.creation_base("new", "", None), "refs/remotes/origin/main");
+    }
+        #[test] fn selected_local_identity_wins_over_a_matching_remote_display_name() {
         let mut choices = choices();
         let mut local = choices.refs.iter().find(|choice| choice.name == "origin/feature/y").unwrap().clone();
         local.kind = Kind::Local; local.reference = "refs/heads/origin/feature/y".into(); local.ahead = 7;
