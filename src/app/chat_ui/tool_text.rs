@@ -42,13 +42,14 @@ pub(super) struct ToolText {
 /// What a closed step's row says beyond its verb.
 ///
 /// `text` is what the step is: the command that ran, the target it was applied
-/// to, a tool's input. `tail` is the last line of what it has printed, which
+/// to, a tool's input. `tail` is a diagnostic or the latest output line, which
 /// is how a reader follows a build without opening it. The two are kept
 /// apart because the output used to take the command's place on the row, and
 /// a transcript of `Compiling…` lines no longer said what had been run.
 pub(super) struct Preview {
     pub(super) text: String,
     pub(super) tail: String,
+    pub(super) builtin: bool,
     language: Language,
     /// The text highlighted in both palettes, drawn from on every frame.
     block: prose::CodeBlock,
@@ -61,6 +62,10 @@ impl Preview {
         content: &ItemContent,
         theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
+        let builtin=match content {
+            ItemContent::Tool {name,input,..} if input.len()<=64*1024=>builtin_target(name,input),
+            _=>None,
+        };
         let (source, language, output) = match content {
             // Only a shell command is shell: a read's or a search's command
             // is the path or the pattern it was given.
@@ -76,8 +81,11 @@ impl Preview {
             // The row already names the tool, so its second line is what
             // the tool was called with. That stays once there is output: a
             // name alone does not tell one call of a tool from the next.
-            ItemContent::Tool { input, output, .. } => {
-                (input.as_str(), Language::structured(input), output.as_str())
+            ItemContent::Tool { name,input, output, .. } => {
+                let (source,language)=builtin.as_ref().map_or((input.as_str(),Language::structured(input)),
+                    |(text,language)|(text.as_str(),*language));
+                let output=if turn::builtin_action(name).is_some_and(|action|action!=chat::CommandAction::Run) {""} else {output.as_str()};
+                (source,language,output)
             }
             _ => (turn::step_label(content), Language::Plain, ""),
         };
@@ -92,24 +100,19 @@ impl Preview {
             text
         };
         let text = bounded(source);
-        let tail = bounded(
-            output
-                .rsplit('\n')
-                .map(str::trim_end)
-                .find(|line| !line.trim().is_empty())
-                .unwrap_or_default(),
-        );
+        let tail = bounded(output_summary(output, content.status() == Some(ToolStatus::Failed)));
         if let Some(previous) = previous
             && previous.text == text
             && previous.language == language
             && previous.theme == theme
         {
-            return Self { tail, ..previous };
+            return Self { tail, builtin:builtin.is_some(), ..previous };
         }
         let block = prose::CodeBlock::new(language.token(), &text, theme);
         Self {
             text,
             tail,
+            builtin:builtin.is_some(),
             language,
             block,
             theme,
@@ -154,6 +157,45 @@ impl Preview {
                 .into()
         })
     }
+}
+
+fn builtin_target(name:&str,input:&str)->Option<(String,Language)> {
+    let field=match turn::builtin_action(name)? {
+        chat::CommandAction::Run=>"command",
+        chat::CommandAction::Read=>"file_path",
+        chat::CommandAction::Search|chat::CommandAction::List=>"pattern",
+    };
+    let input:serde_json::Value=serde_json::from_str(input).ok()?;
+    let text=input[field].as_str()?.trim();
+    (!text.is_empty()).then(||(turn::first_line(text).to_owned(),if field=="command" {Language::Shell} else {Language::Plain}))
+}
+
+/// Scan only a bounded output tail. Failed commands often end in a wrapper's
+/// exit summary or whitespace; retain the last concrete diagnostic when one is
+/// present instead of replacing it with that wrapper line.
+fn output_summary(output: &str, failed: bool) -> &str {
+    let mut start=output.len().saturating_sub(32*1024);
+    while !output.is_char_boundary(start) {start+=1;}
+    let mut latest=None;
+    let mut diagnostic=None;let mut best=0;
+    for line in output[start..].lines().rev().take(128) {
+        let line=line.trim_end();
+        if line.trim().is_empty() {continue;}
+        latest.get_or_insert(line);
+        if !failed {break;}
+        let folded=line.to_ascii_lowercase();let folded=folded.trim_start();
+        let wrapper=folded.starts_with("command failed with exit") || folded.starts_with("process exited with")
+            || folded.starts_with("error: could not compile") || folded.starts_with("error: aborting due to");
+        let score=if wrapper {0}
+            else if folded.starts_with("error[") || folded.starts_with("fatal:") || folded.starts_with("assertion")
+                || folded.contains(": error") || folded.contains("permission denied")
+                || folded.contains("no such file or directory") || folded.contains("command not found") {3}
+            else if folded.starts_with("error") || folded.starts_with("caused by:") {2}
+            else if folded.contains("test result: failed") || folded.ends_with("... failed") {1}
+            else {0};
+        if score>best {best=score;diagnostic=Some(line);}
+    }
+    diagnostic.or(latest).unwrap_or_default()
 }
 
 impl ToolText {
@@ -750,4 +792,18 @@ mod tests {
             node.size()
         );
     }
+    #[test]
+    fn failed_command_preview_keeps_a_diagnostic_instead_of_wrapper_tail() {
+        assert_eq!(output_summary("compiling\nerror[E0425]: cannot find value\n\nCommand failed with exit code 101\n",true),
+            "error[E0425]: cannot find value");
+        assert_eq!(output_summary("error[E0425]: cannot find value\nerror: could not compile `fixture` due to 1 previous error\n",true),
+            "error[E0425]: cannot find value");
+        assert_eq!(output_summary("fatal: unable to access repository\nProcess exited with code 128\n",true),
+            "fatal: unable to access repository");
+        assert_eq!(output_summary("error count: 0\nall done\n",false),"all done");
+        assert_eq!(output_summary("\n\n",true),"");
+        let huge=format!("error: old unrelated failure\n{}\nlatest progress", "🦀".repeat(100_000));
+        assert_eq!(output_summary(&huge,true),"latest progress");
+    }
+
 }

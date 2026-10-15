@@ -235,7 +235,8 @@ impl Turn {
         }
         match self.outcome {
             Some(ToolStatus::Failed) => self.summary.push_str(" · failed"),
-            Some(ToolStatus::Denied) => self.summary.push_str(" · denied"),
+            Some(ToolStatus::Denied) if !self.summary.starts_with("Denied ") => self.summary.push_str(" · denied"),
+            Some(ToolStatus::Denied) => {},
             Some(ToolStatus::Stopped) => self.summary.push_str(" · stopped"),
             Some(ToolStatus::Running | ToolStatus::Succeeded | ToolStatus::AwaitingApproval)
             | None => {}
@@ -504,7 +505,13 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
             _ => "File changes",
         },
         ItemContent::WebSearch { query, .. } => query.as_str(),
-        ItemContent::Tool { name, .. } => name.as_str(),
+        ItemContent::Tool { name, .. } => match builtin_action(name) {
+            Some(chat::CommandAction::Run)=>"Command",
+            Some(chat::CommandAction::Read)=>"File",
+            Some(chat::CommandAction::Search)=>"Search",
+            Some(chat::CommandAction::List)=>"Directory",
+            None=>name.as_str(),
+        },
         ItemContent::Image { description, .. } => description.as_str(),
         // As `chat::delivery_heading` has it, less a named sender's summary.
         ItemContent::Delivery {
@@ -547,7 +554,33 @@ fn target(action: chat::CommandAction, label: &str) -> &str {
 
 /// The verb a step is introduced with, kept separate from its target so the two
 /// can be typeset differently.
+pub(super) fn builtin_action(name:&str)->Option<chat::CommandAction> {
+    match name {
+        "Bash"=>Some(chat::CommandAction::Run),
+        "Read"=>Some(chat::CommandAction::Read),
+        "Grep"=>Some(chat::CommandAction::Search),
+        "Glob"=>Some(chat::CommandAction::List),
+        _=>None,
+    }
+}
+
 pub(super) fn step_verb(content: &ItemContent) -> &'static str {
+    if content.status()==Some(ToolStatus::Denied) {return "Denied";}
+    if content.status()==Some(ToolStatus::AwaitingApproval) {
+        let action=match content {
+            ItemContent::Command {action,..}=>Some(*action),
+            ItemContent::Tool {name,..}=>builtin_action(name),
+            _=>None,
+        };
+        return match action {
+            Some(chat::CommandAction::Run)=>"Run",
+            Some(chat::CommandAction::Read)=>"Read",
+            Some(chat::CommandAction::Search)=>"Search",
+            Some(chat::CommandAction::List)=>"List",
+            None if matches!(content,ItemContent::Changes {..})=>"Edit",
+            None=>"Call",
+        };
+    }
     match content {
         ItemContent::Text { .. } => "",
         ItemContent::Command { action, .. } => match action {
@@ -566,7 +599,14 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
             _ => "Edited",
         },
         ItemContent::WebSearch { .. } => "Searched the web for",
-        ItemContent::Tool { .. } => "Called",
+        ItemContent::Tool { name,.. } => match builtin_action(name) {
+            Some(chat::CommandAction::Run)=>"Ran",
+            Some(chat::CommandAction::Read)=>"Read",
+            Some(chat::CommandAction::Search)=>"Searched",
+            Some(chat::CommandAction::List)=>"Listed",
+            None if matches!(name.as_str(),"Edit"|"MultiEdit"|"Write")=>"Edited",
+            None=>"Called",
+        },
         ItemContent::Image { .. } => "Viewed",
         ItemContent::Delivery { from, summary, .. } if from.is_empty() && !summary.is_empty() => "",
         ItemContent::Delivery { kind, .. } => kind.verb(),
@@ -589,6 +629,9 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     let mut coordinating = 0;
     for placed in steps {
         let item = items.get(placed.index)?.borrow();
+        // Proposed or declined work did not execute. The outcome counts below
+        // still include it without claiming that a denied command ran.
+        if matches!(item.content.status(),Some(ToolStatus::Denied|ToolStatus::Stopped|ToolStatus::AwaitingApproval)) {continue;}
         if coordinated(item).is_some_and(|coordinated| coordinated.reading.involves_agents()) {
             coordinating += 1;
             continue;
@@ -604,7 +647,13 @@ fn summarize_steps<'c, T: Borrow<Item>>(
                 chat::CommandAction::List => listed += 1,
             },
             ItemContent::WebSearch { .. } => web += 1,
-            ItemContent::Tool { .. } => called += 1,
+            ItemContent::Tool { name,.. } => match builtin_action(name) {
+                Some(chat::CommandAction::Run)=>ran+=1,
+                Some(chat::CommandAction::Read)=>read+=1,
+                Some(chat::CommandAction::Search)=>searched+=1,
+                Some(chat::CommandAction::List)=>listed+=1,
+                None=>called+=1,
+            },
             ItemContent::Image { .. } => viewed += 1,
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {}
         }

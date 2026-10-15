@@ -79,6 +79,26 @@ fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<des
     }
 }
 
+/// Provider durations take precedence. The fallback is explicitly labelled as
+/// observed elapsed time and never manufactures a shell exit code.
+fn step_detail_label(item: &chat::Item, detail: Option<&str>, now: Option<u64>) -> Option<String> {
+    if matches!(item.content,ItemContent::Command {duration_ms:Some(_),..}) {
+        return detail.map(str::to_owned);
+    }
+    let Some(status)=item.content.status() else {return detail.map(str::to_owned);};
+    let Some(started)=item.started_at else {return detail.map(str::to_owned);};
+    let end=if matches!(status,ToolStatus::Running|ToolStatus::AwaitingApproval) {now} else {item.at};
+    let Some(end)=end else {return detail.map(str::to_owned);};
+    let elapsed=end.saturating_sub(started);
+    let elapsed=if matches!(status,ToolStatus::Running|ToolStatus::AwaitingApproval) {
+        format!("{}s elapsed",elapsed/1000)
+    } else {format!("{} elapsed",format_duration(elapsed))};
+    Some(match detail.filter(|detail| !detail.is_empty()) {
+        Some(detail)=>format!("{detail} · {elapsed}"),
+        None=>elapsed,
+    })
+}
+
 fn summary_spans(summary: &str) -> Vec<iced::widget::text::Span<'static, String>> {
     let mut spans = Vec::new();
     for (index, part) in summary.split(" · ").enumerate() {
@@ -109,7 +129,14 @@ fn kind_glyph(content: &ItemContent) -> Icon {
         },
         ItemContent::Changes { .. } => Icon::Changes,
         ItemContent::WebSearch { .. } => Icon::WebBrowser,
-        ItemContent::Tool { .. } => Icon::Utilities,
+        ItemContent::Tool { name,.. } => match turn::builtin_action(name) {
+            Some(chat::CommandAction::Run)=>Icon::Terminal,
+            Some(chat::CommandAction::Read)=>Icon::TextFile,
+            Some(chat::CommandAction::Search)=>Icon::Search,
+            Some(chat::CommandAction::List)=>Icon::Folder,
+            None if matches!(name.as_str(),"Edit"|"MultiEdit"|"Write")=>Icon::Changes,
+            None=>Icon::Utilities,
+        },
         ItemContent::Image { .. } => Icon::Image,
         ItemContent::Delivery {
             kind: chat::DeliveryKind::Notice,
@@ -626,6 +653,9 @@ impl Runtime {
                     .into(),
                 );
             }
+        } else if matches!(item.content, ItemContent::Tool { .. }) && cached.preview.builtin {
+            label=cached.preview.text.clone();
+            preview.push(cached.preview.view());
         } else if matches!(item.content, ItemContent::Tool { .. }) {
             preview.push(design::body(label.clone()).into());
             if !cached.preview.text.is_empty() {
@@ -687,8 +717,8 @@ impl Runtime {
             let (indicator, _) = status_indicator(status);
             line.push(indicator);
         }
-        if let Some(detail) = &cached.detail {
-            line.push(design::caption(detail.clone()).into());
+        if let Some(detail) = step_detail_label(item, cached.detail.as_deref(), self.source_now_ms()) {
+            line.push(design::caption(detail).into());
         }
         let name = if verb.is_empty() {
             label
@@ -1064,4 +1094,33 @@ mod presentation_tests {
         }];
         assert_eq!(diff_stat(&changes), (2, 1));
     }
+    #[test]
+    fn observed_step_time_is_labelled_and_provider_measurement_wins() {
+        let mut item=chat::Item {id:"tool".into(),role:chat::Role::Assistant,started_at:Some(1000),at:Some(2000),
+            content:ItemContent::Command {command:"cargo test".into(),working_directory:"/repo".into(),
+                label:String::new(),action:chat::CommandAction::Run,output:String::new(),
+                status:ToolStatus::Running,exit_code:None,duration_ms:None}};
+        assert_eq!(step_detail_label(&item,Some("Working"),Some(3999)).as_deref(),Some("Working · 2s elapsed"));
+        item.content.set_status(ToolStatus::Denied);
+        assert_eq!(step_detail_label(&item,Some("Denied"),Some(9000)).as_deref(),Some("Denied · 1.0s elapsed"));
+        if let ItemContent::Command {duration_ms,exit_code,..}=&mut item.content {*duration_ms=Some(120);*exit_code=Some(2);}
+        assert_eq!(step_detail_label(&item,Some("exit 2 · 120ms"),Some(9000)).as_deref(),Some("exit 2 · 120ms"));
+        item.started_at=None;
+        if let ItemContent::Command {duration_ms,..}=&mut item.content {*duration_ms=None;}
+        assert_eq!(step_detail_label(&item,Some("Denied"),Some(9000)).as_deref(),Some("Denied"));
+    }
+
+    #[test]
+    fn builtin_streaming_steps_keep_their_kind_and_verb_when_classified() {
+        for (name,action,icon) in [("Bash",chat::CommandAction::Run,Icon::Terminal),
+            ("Read",chat::CommandAction::Read,Icon::TextFile),("Grep",chat::CommandAction::Search,Icon::Search),
+            ("Glob",chat::CommandAction::List,Icon::Folder)] {
+            let streaming=ItemContent::Tool {name:name.into(),input:"{\"".into(),output:String::new(),status:ToolStatus::Running};
+            let classified=ItemContent::Command {command:"target".into(),label:"target".into(),working_directory:"/repo".into(),
+                action,output:String::new(),status:ToolStatus::Running,exit_code:None,duration_ms:None};
+            assert_eq!(kind_glyph(&streaming),icon);assert_eq!(kind_glyph(&streaming),kind_glyph(&classified));
+            assert_eq!(turn::step_verb(&streaming),turn::step_verb(&classified));
+        }
+    }
+
 }
