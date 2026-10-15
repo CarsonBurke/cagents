@@ -423,11 +423,9 @@ impl Cagents {
 
     /// Closes every channel that `retired` has just left without an open card.
     ///
-    /// A channel is its conversations; once the last one is closed there is
-    /// nothing to come back to, and an empty channel left in the sidebar is
-    /// one more row the user has to delete by hand. Only channels one of
-    /// these cards belonged to are considered: a channel that has just been
-    /// created is empty too, and is waiting for its first card.
+    /// Retain a saved conversation's destination even when its last pane
+    /// closes. Otherwise, remove channels these cards have just emptied;
+    /// a newly created channel still waits for its first card.
     pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
         let emptied = self.channels_emptied_by(retired);
         self.delete_channels(emptied)
@@ -445,6 +443,11 @@ impl Cagents {
     /// channel is shared with every window, whose conversations it would end
     /// - and it does not keep an otherwise empty channel alive either.
     pub(super) fn channels_emptied_by(&self, retired: &[CardId]) -> Vec<ChannelId> {
+        // A conversation can retain a channel after its pane ends. Build the
+        // membership index once, rather than scanning all saved conversations
+        // again for every candidate channel.
+        let saved_channels: std::collections::HashSet<ChannelId> = self.durable
+            .conversation_channels.values().copied().collect();
         self.durable
             .channels
             .iter()
@@ -467,7 +470,7 @@ impl Cagents {
             // channel when its last pane ends. Only explicit channel deletion
             // removes that destination; automatic empty-channel cleanup must
             // not force resume into a newly invented channel.
-            .filter(|channel| !self.durable.conversation_channels.values().any(|id| *id == channel.id))
+            .filter(|channel| !saved_channels.contains(&channel.id))
             .map(|channel| channel.id)
             .collect()
     }
