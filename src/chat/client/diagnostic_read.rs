@@ -1629,6 +1629,243 @@ mod tests {
         drop(request);
         wait_capacity(0);
     }
+fn wait_diagnostic_idle() {
+    let deadline=Instant::now()+Duration::from_secs(5);
+    loop {
+        let usage=diagnostic_resource_usage();
+        if usage.queued_owners==0 && usage.worker_slots==0 && usage.weighted_capacity==0 && usage.response_owners==0 && usage.retiring_capacity==0 { break; }
+        assert!(Instant::now()<deadline,"diagnostic retirement did not settle: {usage:?}");thread::sleep(Duration::from_millis(1));
+    }
+}
+#[derive(Clone, Copy, Debug)]
+enum DelayedDiagnosticReply {
+    Page,
+    LargeError,
+    WrongChat,
+    Disconnect,
+}
+fn delayed_diagnostic_reply_preserves_reservation(mode: DelayedDiagnosticReply, cancel_before_reply: bool) {
+    wait_capacity(0);
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let peer = thread::spawn(move || {
+        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let proof = super::super::tests::host_proof("typed-diagnostic-late-peer");
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        let write = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+            codec.write(server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id, proof: proof.clone(), message }).unwrap();
+        };
+        let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        write(&mut codec, &mut server, Some(connect.request_id), ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![] } });
+        let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        let ClientRequest::ChatStart { session, .. } = start.request else { panic!("expected ChatStart") };
+        let chat_id = session.id;
+        write(&mut codec, &mut server, Some(start.request_id), ServerMessage::Response { response: ServerResponse::ChatAttached { session, snapshot: Snapshot::default() } });
+        let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        let ClientRequest::ChatProviderExitOutput { chat_id: requested_chat, log_id, offset } = request.request else { panic!("expected typed diagnostic page") };
+        assert_eq!(requested_chat, chat_id); assert_eq!(log_id, "late-log"); assert_eq!(offset, 0);
+        arrived_tx.send(request.request_id).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        if matches!(mode, DelayedDiagnosticReply::Disconnect) { return; }
+        let message = match mode {
+            DelayedDiagnosticReply::LargeError => ServerMessage::Error(ipc::ProtocolError::new(ipc::ProtocolErrorCode::TerminalUnavailable, "late diagnostic failure".repeat(32 * 1024), false)),
+            DelayedDiagnosticReply::Page | DelayedDiagnosticReply::WrongChat => ServerMessage::Response { response: ServerResponse::ChatProviderExitOutput { chat_id: if matches!(mode, DelayedDiagnosticReply::WrongChat) { TerminalId::new() } else { chat_id }, log_id, offset: 0, bytes: vec![b'x'; 256 * 1024], next_offset: None, omitted: 0 } },
+            DelayedDiagnosticReply::Disconnect => unreachable!(),
+        };
+        write(&mut codec, &mut server, Some(request.request_id), message);
+        // Reader ordering proves the preceding late reply has been decoded and
+        // retired before this disconnected wake; no guessed scheduling sleep.
+        write(&mut codec, &mut server, None, ServerMessage::HostShuttingDown);
+    });
+    let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+    let handle = ClientHandle::connect_on(client, super::super::tests::omp_card(None, None), Intent::Start, None, false, None, None, move |wake| { let _ = wake_tx.send(wake); }).unwrap();
+    handle.install_snapshot_for_test(Snapshot { error: Some("Original provider crash".into()), ..Default::default() });
+    let log = super::super::super::ProviderExitLog { id: "late-log".into(), bytes: 4, omitted: 0 };
+    let weak = Arc::downgrade(&handle.inner);
+    let request = handle.diagnostic_request(CardId::new(), 7, 3, &log, false, true, Arc::new(move || weak.upgrade().is_some())).unwrap();
+    let reader_handle = handle.clone(); let reader_request = request.clone();
+    let reader = thread::spawn(move || runtime().block_on(reader_handle.read_provider_exit_job(reader_request)));
+    let request_id = arrived_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    if cancel_before_reply {
+        request.cancel();
+        let completion = reader.join().unwrap();
+        assert!(completion.take_result().unwrap().is_err());
+        drop(completion); drop(request);
+        wait_capacity(ipc::MAX_FRAME_BYTES);
+        let usage = diagnostic_resource_usage();
+        assert_eq!(usage.response_owners, 1, "{mode:?}: actual posted response retains its admission");
+        assert_eq!(usage.queued_owners, 1);
+        {
+            let pending = handle.inner.diagnostic_pending.lock().unwrap();
+            assert!(pending[&request_id].reply.is_none());
+            assert!(pending[&request_id].ownership.is_some());
+        }
+        release_tx.send(()).unwrap();
+    } else {
+        assert!(matches!(mode,DelayedDiagnosticReply::LargeError));
+        assert_eq!(diagnostic_resource_usage().response_owners,1);
+        release_tx.send(()).unwrap();
+        let completion=reader.join().unwrap();
+        let error=completion.take_result().unwrap().err().unwrap();
+        assert!(error.len()<=512);assert!(error.capacity()<=512,"queued Error body must have a fresh bounded allocation");
+        drop(error);drop(completion);drop(request);
+    }
+    loop { if matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(_)) { break; } }
+    peer.join().unwrap();
+    assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());
+    wait_diagnostic_idle();
+    assert_eq!(diagnostic_resource_usage().response_owners, 0);
+    assert_eq!(diagnostic_resource_usage().queued_owners, 0);
+    assert_eq!(handle.snapshot().error.as_deref(), Some("Original provider crash"));
+    drop(handle); // Inner joins its exact reader and visibility helper.
+}
+#[test]
+fn canceled_posted_wire_keeps_page_error_and_unexpected_payload_admission_until_retired() {
+    let _guard = diagnostic_test_guard();
+    for mode in [DelayedDiagnosticReply::Page, DelayedDiagnosticReply::LargeError, DelayedDiagnosticReply::WrongChat, DelayedDiagnosticReply::Disconnect] {
+        delayed_diagnostic_reply_preserves_reservation(mode, true);
+    }
+}
+#[test]
+fn active_wire_error_compacts_allocation_before_queueing_completion() {
+    let _guard=diagnostic_test_guard();
+    delayed_diagnostic_reply_preserves_reservation(DelayedDiagnosticReply::LargeError,false);
+}
+fn small_send_buffer(stream: &UnixStream) -> usize {
+    use std::os::fd::AsRawFd;
+    let size: libc::c_int = 4096;
+    // SAFETY: owned socket fd, initialized integer and exact integer length.
+    assert_eq!(unsafe { libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF, (&size as *const libc::c_int).cast(), std::mem::size_of_val(&size) as libc::socklen_t) }, 0);
+    let mut actual:libc::c_int=0;let mut length=std::mem::size_of_val(&actual) as libc::socklen_t;
+    // SAFETY: initialized integer output and exact writable length on owned fd.
+    assert_eq!(unsafe{libc::getsockopt(stream.as_raw_fd(),libc::SOL_SOCKET,libc::SO_SNDBUF,(&mut actual as *mut libc::c_int).cast(),&mut length)},0);
+    assert!(actual>0);actual as usize
+}
+fn fixture_frame(text: &str) -> Vec<u8> {
+    let mut frame = vec![0u8; 16 * 1024];
+    let length = postcard::to_slice(&text, &mut frame[4..]).unwrap().len();
+    frame[..4].copy_from_slice(&(length as u32).to_be_bytes()); frame.truncate(length + 4); frame
+}
+#[test]
+fn cancellation_after_actual_frame_prefix_finishes_then_preserves_next_frame() {
+    use std::io::Read;
+    let _guard = diagnostic_test_guard();
+    let (stream, mut peer) = UnixStream::pair().unwrap(); let actual_send_buffer=small_send_buffer(&stream);
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let payload = "x".repeat(16_000); let frame = fixture_frame(&payload);assert!(frame.len()>actual_send_buffer,"fixture frame must exceed effective socket capacity before partial-progress cancellation");
+    let first = request(Duration::from_secs(2), false, true); let cancel = first.clone();
+    let sender = thread::spawn(move || {
+        send_frame(&stream, &frame, &first).unwrap();
+        assert!(first.cancelled(), "fixture must cancel after first prefix and before its full frame finishes");
+        let next = request(Duration::from_secs(2), false, true);
+        send_frame(&stream, &fixture_frame("next-valid-frame"), &next).unwrap();
+    });
+    let mut prefix = [0; 4]; peer.read_exact(&mut prefix).unwrap();
+    let length = u32::from_be_bytes(prefix) as usize; assert!(length > 8 * 1024);
+    cancel.cancel();
+    let mut actual = vec![0; length]; peer.read_exact(&mut actual).unwrap();
+    assert_eq!(postcard::from_bytes::<String>(&actual).unwrap(), payload);
+    peer.read_exact(&mut prefix).unwrap(); let mut next = vec![0; u32::from_be_bytes(prefix) as usize]; peer.read_exact(&mut next).unwrap();
+    assert_eq!(postcard::from_bytes::<String>(&next).unwrap(), "next-valid-frame");
+    sender.join().unwrap();
+}
+#[test]
+fn stalled_actual_partial_frame_closes_connection_at_whole_operation_deadline() {
+    use std::io::Read;
+    let _guard = diagnostic_test_guard();
+    let (stream, mut peer) = UnixStream::pair().unwrap(); let actual_send_buffer=small_send_buffer(&stream);
+    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let frame = fixture_frame(&"x".repeat(16_000));assert!(frame.len()>actual_send_buffer,"fixture frame must exceed effective socket capacity");
+    let first = request(Duration::from_secs(2), false, true); let cancel = first.clone();
+    let sender = thread::spawn(move || {
+        assert!(send_frame(&stream, &frame, &first).is_err());
+        let fresh = request(Duration::from_secs(1), false, true);
+        assert!(send_frame(&stream, &fixture_frame("must-not-follow-partial"), &fresh).is_err());
+    });
+    let mut prefix = [0; 4]; peer.read_exact(&mut prefix).unwrap();
+    let length = u32::from_be_bytes(prefix) as usize; assert!(length > 8 * 1024);
+    cancel.cancel(); sender.join().unwrap();
+    let mut tail = Vec::new(); peer.read_to_end(&mut tail).unwrap();
+    assert!(tail.len() < length, "peer received an incomplete first frame and no reusable next frame");
+}
+#[test]
+fn typed_authenticated_pages_normalize_once_across_utf8_boundary_and_keep_crash_summary() {
+    let _guard = diagnostic_test_guard(); wait_capacity(0);
+    let (client, mut server) = UnixStream::pair().unwrap();
+    let raw = format!("{}€\x1b[31mred\x1b[0m\rkept\n", "x".repeat(256 * 1024 - 1)).into_bytes();
+    let expected = provider_exit::readable(raw.clone());
+    let log = super::super::super::ProviderExitLog { id: "typed-pages".into(), bytes: raw.len() as u64, omitted: 17 };
+    let server_log = log.clone();
+    let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+    let peer = thread::spawn(move || {
+        server.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let proof = super::super::tests::host_proof("typed-diagnostic-paged-peer"); let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        let write = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| { codec.write(server, &ServerEnvelope { version: PROTOCOL_VERSION, request_id, proof: proof.clone(), message }).unwrap(); };
+        let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        write(&mut codec, &mut server, Some(connect.request_id), ServerMessage::Response { response: ServerResponse::Connected { proof: proof.clone(), resumed: vec![] } });
+        let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap(); let ClientRequest::ChatStart { session, .. } = start.request else { panic!("expected ChatStart") }; let chat_id=session.id;
+        write(&mut codec, &mut server, Some(start.request_id), ServerMessage::Response { response: ServerResponse::ChatAttached { session, snapshot: Snapshot { error: Some("Original provider crash".into()), ..Default::default() } } });
+        let mut offset=0;
+        for _ in 0..2 {
+            let request: ClientEnvelope=codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatProviderExitOutput { chat_id:requested_chat, log_id, offset:requested_offset } = request.request else { panic!("expected diagnostic page") };
+            assert_eq!(requested_chat,chat_id);assert_eq!(log_id,server_log.id);assert_eq!(requested_offset,offset as u64);
+            let end=(offset+256*1024).min(raw.len());
+            write(&mut codec,&mut server,Some(request.request_id),ServerMessage::Response{response:ServerResponse::ChatProviderExitOutput{chat_id,log_id,offset:requested_offset,bytes:raw[offset..end].to_vec(),next_offset:(end<raw.len()).then_some(end as u64),omitted:server_log.omitted}});
+            offset=end;
+        }
+        assert_eq!(offset,raw.len());finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let handle=ClientHandle::connect_on(client,super::super::tests::omp_card(None,None),Intent::Start,None,false,None,None,|_|{}).unwrap();
+    let weak=Arc::downgrade(&handle.inner);
+    let request=handle.diagnostic_request(CardId::new(),7,3,&log,true,false,Arc::new(move||weak.upgrade().is_some())).unwrap();
+    let completion=runtime().block_on(handle.read_provider_exit_job(request.clone()));
+    let output=completion.take_result().unwrap().unwrap();assert_eq!(output.as_str(),expected);assert_eq!(output.omitted(),17);
+    assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty());assert_eq!(diagnostic_resource_usage().response_owners,0);
+    assert_eq!(handle.snapshot().error.as_deref(),Some("Original provider crash"));
+    assert!(output.capacity()<=log.bytes as usize); assert_eq!(diagnostic_resource_usage().reserved_layout_capacity,output.capacity());
+    drop(output);drop(completion);drop(request);wait_capacity(0);finish_tx.send(()).unwrap();peer.join().unwrap();drop(handle);
+}
+#[test]
+fn retained_cap_invalid_utf8_cleanup_and_copy_report_actual_layout_and_process_rss() {
+    let _guard=diagnostic_test_guard();wait_capacity(0);
+    lane().peak_capacity.store(0,Ordering::Release);
+    let before=rss_kib();let job=request(Duration::from_secs(30),true,true);let worker=worker();
+    let suffix=b"\x1b[31mred\x1b[0m\n";let invalid=provider_exit::MAX_OUTPUT_BYTES-suffix.len();
+    let mut input=vec![0xff;invalid];input.extend_from_slice(suffix);
+    let text=normalize(raw(&input,&job,&worker),&job,&worker).unwrap();drop(input);
+    assert!(text.starts_with('\u{fffd}'));assert!(text.ends_with("red\n"));assert_eq!(text.len(),invalid*3+4);
+    let resident=text.capacity();text.installed();let normalized_rss=rss_kib();
+    let output=DiagnosticOutput{text:Arc::new(text),omitted:1024,source:job.source().clone()};
+    let copy=copy_output(&job,&worker,output.clone(),"Provider failed").unwrap();let copied=copy.capacity();
+    let completion=DiagnosticCopyCompletion::new(job.clone(),Ok(copy));let (string,receipt)=completion.take_effect().unwrap().unwrap();
+    assert!(string.ends_with("[1024 raw output bytes were not retained]"));
+    assert_eq!(diagnostic_resource_usage().reserved_layout_capacity,resident+copied);
+    println!("diagnostic-cap-fixture raw_cap={} resident_layout={resident} copy_layout={copied} peak_reserved_layout={} rss_before_kib={before:?} rss_normalized_kib={normalized_rss:?} rss_with_copy_kib={:?} (unit-process point observations; no native RSS ceiling/OS clipboard ownership claim)",provider_exit::MAX_OUTPUT_BYTES,lane().peak_capacity.load(Ordering::Acquire),rss_kib());
+    drop(string);drop(receipt);drop(completion);drop(output);drop(worker);drop(job);wait_capacity(0);
+    println!("diagnostic-cap-fixture rss_after_retirement_kib={:?} (allocator retention/process state may remain)",rss_kib());
+}
+#[test]
+fn canceled_typed_request_waiting_for_actual_wire_lock_releases_unposted_response_reservation() {
+    let _guard=diagnostic_test_guard();wait_diagnostic_idle();
+    let handle=ClientHandle::fixture(super::super::tests::omp_card(None,None),Snapshot::default());
+    let log=super::super::super::ProviderExitLog{id:"locked-unposted".into(),bytes:4,omitted:0};
+    let request=handle.diagnostic_request(CardId::new(),1,1,&log,false,true,Arc::new(||true)).unwrap();
+    let held=handle.inner.wire.lock().unwrap();
+    let other=handle.clone();let loading=request.clone();
+    let reader=thread::spawn(move||runtime().block_on(other.read_provider_exit_job(loading)));
+    let deadline=Instant::now()+Duration::from_secs(5);
+    while handle.inner.diagnostic_pending.lock().unwrap().is_empty() {
+        assert!(Instant::now()<deadline,"typed request never reached its locked transmit stage");thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(diagnostic_resource_usage().response_owners,1);
+    request.cancel();let completion=reader.join().unwrap();assert!(completion.take_result().unwrap().is_err());
+    assert!(handle.inner.diagnostic_pending.lock().unwrap().is_empty(),"no complete request was posted, so no late response tombstone is needed");
+    drop(completion);drop(request);wait_diagnostic_idle();drop(held);drop(handle);
+}
+
 #[test]
 fn oversized_existing_host_proof_refuses_before_diagnostic_admission_or_clone() {
     let _guard=diagnostic_test_guard();wait_capacity(0);
