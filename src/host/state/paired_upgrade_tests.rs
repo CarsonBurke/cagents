@@ -57,6 +57,9 @@ fn isolated_with_environment(environment: &[(&str, &str)]) -> bool {
         .env_remove("PI_CONFIG_DIR")
         .timeout(Duration::from_secs(60))
         .output_limits(128 * 1024, 128 * 1024);
+    for name in crate::account::credential_overrides(Provider::Codex) {
+        command = command.env_remove(*name);
+    }
     for (name, value) in environment {
         command = command.env(*name, *value);
     }
