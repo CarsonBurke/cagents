@@ -18053,6 +18053,7 @@ fn load_repository(
                     service
                         .status_with_untracked(&worktree.path, true, &cancellation)
                         .ok()
+                        .map(|status| status.display_summary())
                 })
                 .flatten();
             (worktree, status)

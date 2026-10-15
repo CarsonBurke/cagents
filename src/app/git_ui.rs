@@ -29,6 +29,15 @@ pub struct Snapshot {
     status_reads: HashMap<WorktreeId, u64>,
 }
 
+/// Sidebar snapshots retain scalar row facts, never the Changes panel's file
+/// listing. Build the projection directly so the UI does not first clone a
+/// potentially large entries vector merely to discard it.
+fn display_worktrees(worktrees: &[(WorktreeRecord, Option<StatusSnapshot>)])
+    -> Vec<(WorktreeRecord, Option<StatusSnapshot>)> {
+    worktrees.iter().map(|(record, status)|
+        (record.clone(), status.as_ref().map(StatusSnapshot::display_summary))).collect()
+}
+
 impl Snapshot {
     /// Independent read streams order row authority by read start, rather than
     /// callback delivery. A delayed result cannot overwrite newer accepted facts.
@@ -416,7 +425,7 @@ impl Cagents {
             Entry {
                 snapshot: Snapshot {
                     repository: repository.clone(),
-                    worktrees: loaded.worktrees.clone(),
+                    worktrees: display_worktrees(&loaded.worktrees),
                     heads: loaded.head_repositories.clone(),
                     operations: loaded.operations.clone(),
                     status_errors: HashMap::new(),
@@ -1034,7 +1043,7 @@ fn read_local_with_plan(
                 snapshot.heads.insert(record.id, head);
             }
         }
-        *status = Some(current);
+        *status = Some(current.display_summary());
     }
     snapshot
         .worktrees
@@ -2933,6 +2942,96 @@ mod tests {
                 .dirty
                 .is_dirty()
         );
+    }
+
+    fn dense_display_rows(worktrees: usize, entries: usize) -> Vec<(WorktreeRecord, Option<StatusSnapshot>)> {
+        let mut porcelain = b"# branch.oid (initial)\0# branch.head main\0".to_vec();
+        for index in 0..entries {
+            porcelain.extend_from_slice(format!("? generated/file-{index:05}.txt\0").as_bytes());
+        }
+        let status = crate::repository::parse_status(&porcelain).unwrap();
+        (0..worktrees).map(|index| (WorktreeRecord {
+            id: WorktreeId::new(), path: PathBuf::from(format!("/synthetic/sidebar/worktree-{index}")),
+            created_at_unix_ms: None, head_oid: None, branch: Some("refs/heads/main".into()),
+            detached: false, bare: false, lock: Default::default(), prunable_reason: None,
+        }, Some(status.clone()))).collect()
+    }
+
+    #[test]
+    fn sidebar_status_projection_drops_dense_path_storage_before_ui_clones() {
+        let mut source = dense_display_rows(1, 40_000);
+        let mut record = source[0].0.clone();
+        record.id = WorktreeId::new();
+        record.path = PathBuf::from("/synthetic/sidebar/unread");
+        source.push((record, None));
+        let projected = display_worktrees(&source);
+        let original = source[0].1.as_ref().unwrap();
+        let summary = projected[0].1.as_ref().unwrap();
+        assert_eq!(original.entries.len(), 40_000);
+        assert!(original.entries.capacity() >= 40_000);
+        assert_eq!(summary.entries.capacity(), 0);
+        assert_eq!(summary.dirty.untracked, 40_000);
+        assert_eq!(summary.head, original.head);
+        assert_eq!(summary.tracking, original.tracking);
+        assert_eq!(summary.untracked_omitted, original.untracked_omitted);
+        assert!(projected[1].1.is_none());
+        let cloned = projected.clone();
+        assert!(cloned.iter().all(|(_, status)| status.as_ref().is_none_or(|status| status.entries.capacity() == 0)));
+        assert_eq!(source[0].1.as_ref().unwrap().entries.len(), 40_000,
+            "the independent full listing remains available to its owner");
+    }
+
+    #[test]
+    fn initial_and_watcher_sidebar_statuses_keep_counts_without_retaining_paths() {
+        const TEST: &str = "app::git_ui::tests::initial_and_watcher_sidebar_statuses_keep_counts_without_retaining_paths";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let files = tempfile::tempdir().unwrap();
+        let root = files.path().join("repo");
+        let baseline = fixture(&root);
+        let id = baseline.worktrees[0].0.id;
+        for index in 0..200 { fs::write(root.join(format!("untracked-{index}.txt")), "new\n").unwrap(); }
+        let cancel = CancellationToken::new();
+        let full = RepositoryService::system("git").status(&root, &cancel).unwrap();
+        assert_eq!(full.entries.len(), 200, "fresh safety reads keep their complete listing");
+        let loaded = super::super::load_repository(&root, None, cancel.clone()).unwrap();
+        let initial = loaded.worktrees[0].1.as_ref().unwrap();
+        assert_eq!(initial.dirty, full.dirty);
+        assert_eq!(initial.untracked_omitted, full.untracked_omitted);
+        assert_eq!(initial.entries.capacity(), 0, "initial publication is already compact");
+        let (read, _) = read_local(ProjectId::new(), baseline, git_watch::Change {
+            worktrees: [id].into(), untracked: true, ..Default::default()
+        }, cancel).unwrap();
+        let watched = read.worktrees[0].1.as_ref().unwrap();
+        assert_eq!(watched.dirty, full.dirty);
+        assert_eq!(watched.head, full.head);
+        assert_eq!(watched.tracking, full.tracking);
+        assert_eq!(watched.untracked_omitted, full.untracked_omitted);
+        assert_eq!(watched.entries.capacity(), 0, "watcher publication drops file paths on its worker");
+        assert_eq!(full.entries.len(), 200);
+    }
+
+    #[test]
+    #[ignore = "focused clone timing; run explicitly with --ignored --nocapture under the build queue"]
+    fn benchmark_sidebar_status_snapshot_clone_retention() {
+        let full = dense_display_rows(13, 4_000);
+        let compact = display_worktrees(&full);
+        let slots = |rows: &[(WorktreeRecord, Option<StatusSnapshot>)]| rows.iter()
+            .filter_map(|(_, status)| status.as_ref()).map(|status| status.entries.capacity()).sum::<usize>();
+        let before_slots = slots(&full);
+        let after_slots = slots(&compact);
+        let iterations = 25;
+        let started = Instant::now();
+        for _ in 0..iterations { std::hint::black_box(full.clone()); }
+        let before = started.elapsed();
+        let started = Instant::now();
+        for _ in 0..iterations { std::hint::black_box(compact.clone()); }
+        let after = started.elapsed();
+        println!("sidebar_snapshot_clone worktrees=13 entries_each=4000 iterations={iterations} before_ns={} after_ns={} retained_entry_slots_before={before_slots} retained_entry_slots_after={after_slots} entry_struct_bytes={}",
+            before.as_nanos(), after.as_nanos(), std::mem::size_of::<crate::repository::ChangedPath>());
+        assert!(before_slots >= 52_000);
+        assert_eq!(after_slots, 0);
+        // Structural owned-vector capacity and this focused CPU timing do not
+        // establish native process RSS/PSS, allocator retention or UI latency.
     }
 
     #[test]
