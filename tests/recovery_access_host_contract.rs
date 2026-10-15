@@ -376,3 +376,122 @@ fn recoverable_discard_restores_blob_under_restrictive_umask() {
     );
     assert!(!discarded.recovery.live_recovery.needs_resolution());
 }
+
+#[test]
+fn recoverable_discard_executable_runs_while_original_cleanup_is_retained() {
+    const NAME: &str = "recoverable_discard_executable_runs_while_original_cleanup_is_retained";
+    if recovery_context::run_isolated_case(NAME) {
+        return;
+    }
+    use std::sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+    struct RetainCleanup {
+        armed: AtomicBool,
+        original_holding: Mutex<Option<fs::File>>,
+    }
+    impl ProcessExecutor for RetainCleanup {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancel: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            if command.arguments.iter().any(|arg| arg == "hash-object")
+                && command.arguments.iter().any(|arg| arg == "--no-filters")
+                && self.armed.swap(false, Ordering::SeqCst)
+            {
+                let scope = command
+                    .arguments
+                    .windows(2)
+                    .filter(|pair| pair[0] == "-C")
+                    .last()
+                    .expect("fixed original holding scope");
+                let root = fs::File::open(&scope[1]).unwrap();
+                // Exact original directory FD survives command-owner release
+                // and any cleanup quarantine; no stale procFD path is reused.
+                let anchor = PathBuf::from(format!("/proc/self/fd/{}", root.as_raw_fd()));
+                fs::write(anchor.join("retain-unknown"), b"fixture foreign entry").unwrap();
+                *self.original_holding.lock().unwrap() = Some(root);
+            }
+            IsolatedExecutor.execute(command, cancel)
+        }
+    }
+    let fixture = Fixture::new().expect("the isolated executable recovery contract requires Git");
+    fixture.write("tracked.sh", b"#!/bin/sh\nprintf base");
+    fs::set_permissions(
+        fixture.work().join("tracked.sh"),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    fixture.git_in_work(&["add", "--", "tracked.sh"]);
+    fixture.commit("base executable");
+    fixture.write("tracked.sh", b"#!/bin/sh\nprintf restored-exec");
+    let executor = Arc::new(RetainCleanup {
+        armed: AtomicBool::new(false),
+        original_holding: Mutex::new(None),
+    });
+    let service = RepositoryService::new("git", executor.clone())
+        .with_worktree_authority(WorktreeAuthority::capture(&fixture.work()).unwrap())
+        .unwrap()
+        .with_recovery_context(fixture.recovery_context());
+    let cancel = CancellationToken::new();
+    let discarded = service
+        .discard_recoverable(
+            &DiscardRequest {
+                worktree: fixture.work(),
+                tracked: vec![PathSelection::new(path("tracked.sh"))],
+                untracked: vec![],
+                confirmed: true,
+            },
+            &cancel,
+        )
+        .unwrap();
+    assert!(matches!(discarded.outcome, MutationOutcome::Applied { .. }));
+    executor.armed.store(true, Ordering::SeqCst);
+    let outcome = service.undo_discard(&discarded.recovery, &cancel).unwrap();
+    assert!(
+        matches!(outcome, MutationOutcome::Applied { .. }),
+        "{outcome:?}"
+    );
+    let authority = discarded
+        .recovery
+        .live_recovery
+        .authority()
+        .expect("foreign cleanup keeps original custody");
+    assert!(discarded.recovery.live_recovery.needs_resolution());
+    assert!(!authority.is_resolved());
+    let output = SystemProcessExecutor
+        .execute(
+            &CommandSpec::new(fixture.work().join("tracked.sh")).timeout(Duration::from_secs(5)),
+            &cancel,
+        )
+        .unwrap();
+    assert!(
+        output.success,
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"restored-exec");
+    assert!(
+        !authority.is_resolved(),
+        "execution must precede cleanup resolution"
+    );
+    assert!(
+        authority.retry().is_err(),
+        "foreign entry still refuses cleanup"
+    );
+    let original = executor.original_holding.lock().unwrap();
+    let original = original
+        .as_ref()
+        .expect("actual original holding was pinned");
+    assert_eq!(
+        unsafe { libc::unlinkat(original.as_raw_fd(), c"retain-unknown".as_ptr(), 0) },
+        0
+    );
+    service
+        .resolve_discard_recovery(&discarded.recovery, &cancel)
+        .unwrap();
+    assert!(!discarded.recovery.live_recovery.needs_resolution());
+    assert!(authority.is_resolved());
+}

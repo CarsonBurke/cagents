@@ -131,6 +131,81 @@ impl Holding {
         Ok(file)
     }
 
+    fn pin_readable_blob(&mut self, writer: &Arc<fs::File>) -> Result<Arc<fs::File>, String> {
+        self.validate()?;
+        let before = writer.metadata().map_err(|error| error.to_string())?;
+        // This runs while the proven creator is still private0600, before
+        // archived ownership/mode/ACL can remove permission to open for read.
+        let readable = self.open(Path::new("restored-blob"))?;
+        if full_version(&before)
+            != full_version(&readable.metadata().map_err(|error| error.to_string())?)
+            || full_version(&before)
+                != full_version(&writer.metadata().map_err(|error| error.to_string())?)
+        {
+            return Err("Recovery read pin no longer identifies the original creator".into());
+        }
+        Ok(readable)
+    }
+
+    fn release_blob_writers(
+        &mut self,
+        writer: Arc<fs::File>,
+        proof: &Proof,
+        name: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        self.validate()?;
+        let flags = unsafe { libc::fcntl(proof.identity_pin.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error().to_string());
+        }
+        if flags & libc::O_ACCMODE != libc::O_RDONLY {
+            return Err("Recovery publication has no read-only original pin".into());
+        }
+        proof.verify(self, name, cancellation)?;
+        let mut release = Vec::new();
+        for (index, file) in self.files.iter().enumerate() {
+            let metadata = file.metadata().map_err(|error| error.to_string())?;
+            if (metadata.dev(), metadata.ino()) == (proof.metadata.dev(), proof.metadata.ino()) {
+                if full_version(&metadata) != full_version(&proof.metadata) {
+                    return Err("Recovery writer changed before read-only handoff".into());
+                }
+                let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+                if flags < 0 {
+                    return Err(io::Error::last_os_error().to_string());
+                }
+                if flags & libc::O_ACCMODE != libc::O_RDONLY {
+                    let owned = self
+                        .files
+                        .iter()
+                        .filter(|candidate| Arc::ptr_eq(candidate, file))
+                        .count()
+                        + usize::from(Arc::ptr_eq(file, &writer));
+                    if Arc::strong_count(file) != owned {
+                        return Err(
+                            "Recovery writer still has an outstanding executor owner".into()
+                        );
+                    }
+                    release.push(index);
+                }
+            }
+        }
+        if full_version(&writer.metadata().map_err(|error| error.to_string())?)
+            != full_version(&proof.metadata)
+        {
+            return Err("Recovery writer changed during read-only handoff".into());
+        }
+        // Every fallible proof completed while original writer custody stayed
+        // intact. Keep the SAME early read pin, then close ALL owned writers
+        // before the first public rename; try_clone cannot downgrade access.
+        for index in release.into_iter().rev() {
+            self.files.remove(index);
+        }
+        drop(writer);
+        Ok(())
+    }
+
     fn validate(&self) -> Result<(), String> {
         self.verify_private()?;
         self.context
@@ -489,6 +564,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             } => {
                 let generated = PathBuf::from("restored-blob");
                 let file = holding.create_private_blob()?;
+                let readable = holding.pin_readable_blob(&file)?;
                 // The creator's exact FD survives every error, including a
                 // failed/partial cat-file write. No returned Git name is trusted.
                 holding.validate()?;
@@ -524,13 +600,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     holding,
                     &generated,
                     access.clone(),
-                    file,
+                    readable,
                     before,
                     digest,
                     *mode,
                     cancellation,
                     |_| Ok(()),
                 )?;
+                holding.release_blob_writers(file, &proof, &generated, cancellation)?;
                 Some((generated, proof))
             }
             SavedEntry::Trashed => return Err("The Trash receipt is missing".into()),
@@ -738,6 +815,118 @@ mod tests {
             fs::read(directory.path().join("original")).unwrap(),
             b"preserved"
         );
+    }
+
+    #[test]
+    fn undo_early_read_pin_survives_archived_no_read_modes_and_closes_all_writers() {
+        use std::os::fd::AsRawFd;
+        for mode in [0o000, 0o111] {
+            let (_directory, _recovery, mut holding) = fixture();
+            let writer = holding.create_private_blob().unwrap();
+            let readable = holding.pin_readable_blob(&writer).unwrap();
+            writer.write_all_at(b"immutable bytes", 0).unwrap();
+            writer.sync_all().unwrap();
+            let before = writer.metadata().unwrap();
+            let access = SavedFileAccess::capture(&writer).unwrap();
+            let digest = digest_file(&writer, before.len(), &CancellationToken::new()).unwrap();
+            let proof = Proof::after_blob_access_change(
+                &holding,
+                Path::new("restored-blob"),
+                access,
+                readable,
+                before,
+                digest,
+                mode,
+                &CancellationToken::new(),
+                |_| Ok(()),
+            )
+            .unwrap();
+            holding
+                .release_blob_writers(
+                    writer,
+                    &proof,
+                    Path::new("restored-blob"),
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(proof.identity_pin.metadata().unwrap().mode() & 0o7777, mode);
+            assert_eq!(
+                unsafe { libc::fcntl(proof.identity_pin.as_raw_fd(), libc::F_GETFL) }
+                    & libc::O_ACCMODE,
+                libc::O_RDONLY
+            );
+            assert_eq!(
+                digest_file(
+                    &proof.identity_pin,
+                    proof.metadata.len(),
+                    &CancellationToken::new()
+                )
+                .unwrap(),
+                digest
+            );
+            for file in &holding.files {
+                assert_eq!(
+                    unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE,
+                    libc::O_RDONLY
+                );
+            }
+            fs_safety::unlink_within(holding.root(), OsStr::new("restored-blob")).unwrap();
+            holding.publication.cleanup_empty().unwrap();
+        }
+    }
+
+    #[test]
+    fn undo_read_only_handoff_refuses_outstanding_writer_without_publishing_or_losing_custody() {
+        let (directory, recovery, mut holding) = fixture();
+        let writer = holding.create_private_blob().unwrap();
+        let readable = holding.pin_readable_blob(&writer).unwrap();
+        writer.write_all_at(b"original bytes", 0).unwrap();
+        writer.sync_all().unwrap();
+        let before = writer.metadata().unwrap();
+        let access = SavedFileAccess::capture(&writer).unwrap();
+        let digest = digest_file(&writer, before.len(), &CancellationToken::new()).unwrap();
+        let proof = Proof::after_blob_access_change(
+            &holding,
+            Path::new("restored-blob"),
+            access,
+            readable,
+            before,
+            digest,
+            0o700,
+            &CancellationToken::new(),
+            |_| Ok(()),
+        )
+        .unwrap();
+        let outstanding = writer.clone();
+        let error = holding
+            .release_blob_writers(
+                writer,
+                &proof,
+                Path::new("restored-blob"),
+                &CancellationToken::new(),
+            )
+            .unwrap_err();
+        assert!(error.contains("outstanding executor owner"));
+        assert!(
+            fs::read_dir(directory.path()).unwrap().next().is_none(),
+            "no public entry was published"
+        );
+        let private = holding.root().path().to_owned();
+        let original = outstanding.metadata().unwrap();
+        drop(outstanding);
+        holding.retain(&recovery);
+        let authority = recovery.live_recovery.authority().unwrap();
+        assert!(authority.retry().is_err());
+        let retained = fs::metadata(private.join("restored-blob")).unwrap();
+        assert_eq!(
+            (retained.dev(), retained.ino()),
+            (original.dev(), original.ino())
+        );
+        assert!(!authority.is_resolved());
+        // Explicit fixture resolution of the known unpublished original.
+        fs::remove_file(private.join("restored-blob")).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
     }
 
     #[test]
