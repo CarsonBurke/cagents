@@ -481,7 +481,9 @@ pub enum ClientRequest {
         allow_active: bool,
     },
     /// Exact actor/worker identities for a guarded project removal census.
-    ProjectCloseInventory { project: crate::project_recovery::ProjectInstance },
+    ProjectCloseInventory {
+        project: crate::project_recovery::ProjectInstance,
+    },
     /// Explicit project removal, fenced before teardown and final deletion.
     CloseProjectGuarded {
         project: crate::project_recovery::ProjectInstance,
@@ -794,7 +796,9 @@ pub enum ServerResponse {
         chat_id: TerminalId,
         page: crate::chat::FileChangePage,
     },
-    ProjectCloseInventory { sessions: Vec<crate::project_recovery::SessionClose> },
+    ProjectCloseInventory {
+        sessions: Vec<crate::project_recovery::SessionClose>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

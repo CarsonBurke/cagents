@@ -26,8 +26,8 @@ mod history_ui;
 mod latency_ui;
 mod notification_ui;
 mod palette_ui;
-mod project_ui;
 mod project_recovery_ui;
+mod project_ui;
 mod pull_request_ui;
 mod refresh_ui;
 mod resume_ui;
@@ -9438,7 +9438,9 @@ impl Cagents {
         if let Some(toolbar) = browser_toolbar {
             rows.push(toolbar);
         }
-        if let Some(notice) = self.project_location_notice(id) { rows.push(notice); }
+        if let Some(notice) = self.project_location_notice(id) {
+            rows.push(notice);
+        }
         rows.push(content);
         if let Some(session) = ended_terminal(card).filter(|_| !closing_terminal) {
             // Under the final screen, where the reader's eye already is when
@@ -10882,7 +10884,9 @@ impl Cagents {
     /// to. A snapshot for a worktree the panel left is a read of a tree nobody
     /// is looking at.
     fn source_control_is_bound(&self, key: &ActiveWorktreeKey) -> bool {
-        if self.project_missing(key.project_id) { return false; }
+        if self.project_missing(key.project_id) {
+            return false;
+        }
         self.sidebar_model
             .source_control
             .as_ref()
@@ -10913,7 +10917,9 @@ impl Cagents {
     }
 
     fn source_control_snapshot_task(&mut self, key: ActiveWorktreeKey) -> Task<Message> {
-        if self.project_missing(key.project_id) { return Task::none(); }
+        if self.project_missing(key.project_id) {
+            return Task::none();
+        }
         if crate::device::is_remote() {
             return Task::none();
         }

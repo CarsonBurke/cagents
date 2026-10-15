@@ -54,7 +54,11 @@ fn exited_target_matches(intent: &CloseIntent, state: Option<&CardState>) -> boo
 impl Cagents {
     pub(super) fn close_cards_in_order(&mut self, cards: Vec<CardId>) -> Task<Message> {
         self.project_recovery_ui.closing_panes = true;
-        self.queued_card_closes.extend(cards.into_iter().map(|card| QueuedCardClose { card, unasked: false }));
+        self.queued_card_closes
+            .extend(cards.into_iter().map(|card| QueuedCardClose {
+                card,
+                unasked: false,
+            }));
         self.next_queued_card_close()
     }
 

@@ -2058,12 +2058,21 @@ impl RepositoryRuntime {
 
     /// Retain the mounted buffer/undo state while fencing reads of the old
     /// project location. Relative editor paths keep naming the same files.
-    pub(crate) fn relocate_project(&mut self, card: CardId, relocation: &crate::project_recovery::Relocation) -> Task<RepositoryAction> {
+    pub(crate) fn relocate_project(
+        &mut self,
+        card: CardId,
+        relocation: &crate::project_recovery::Relocation,
+    ) -> Task<RepositoryAction> {
         let previous = self.descriptor.worktree.clone();
         relocation.path(&mut self.descriptor.repository);
         relocation.path(&mut self.descriptor.worktree);
-        if previous == self.descriptor.worktree { return Task::none(); }
-        let reload_document = matches!(&self.document, DocumentState::Loading | DocumentState::Failed { .. });
+        if previous == self.descriptor.worktree {
+            return Task::none();
+        }
+        let reload_document = matches!(
+            &self.document,
+            DocumentState::Loading | DocumentState::Failed { .. }
+        );
         self.push_lsp_close();
         self.generation = self.generation.wrapping_add(1).max(1);
         self.file_list_generation = self.file_list_generation.wrapping_add(1).max(1);
@@ -2079,24 +2088,42 @@ impl RepositoryRuntime {
                 document.diagram_cancel = None;
                 document.diagram_pending = None;
             }
-            DocumentState::Pdf { path, page, tone, zoom, rendering, .. } => {
+            DocumentState::Pdf {
+                path,
+                page,
+                tone,
+                zoom,
+                rendering,
+                ..
+            } => {
                 relocation.path(path);
                 if let Some(active) = rendering.take() {
                     pdf = Some(active.pending.unwrap_or(active.requested));
-                    (*page, *tone, *zoom) = (active.drawn.page, active.drawn.tone, active.drawn.zoom);
+                    (*page, *tone, *zoom) =
+                        (active.drawn.page, active.drawn.tone, active.drawn.zoom);
                     self.pdf_request = self.pdf_request.wrapping_add(1);
                 }
             }
             _ => {}
         }
-        if let Some(navigation) = &mut self.restored_navigation { relocation.path(&mut navigation.worktree); }
+        if let Some(navigation) = &mut self.restored_navigation {
+            relocation.path(&mut navigation.worktree);
+        }
         if let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone()) {
-            self.files = FileListState::Failed(format!("Could not protect located worktree: {error}"));
+            self.files =
+                FileListState::Failed(format!("Could not protect located worktree: {error}"));
         }
         self.push_lsp_open(&self.descriptor.worktree.clone());
         let listing = self.refresh_visible(card);
         let diagrams = self.diagram_task(card);
-        let page = pdf.map_or_else(Task::none, |wanted| self.update(RepositoryAction::PdfPage { card, page: wanted.page, tone: wanted.tone, zoom: wanted.zoom }));
+        let page = pdf.map_or_else(Task::none, |wanted| {
+            self.update(RepositoryAction::PdfPage {
+                card,
+                page: wanted.page,
+                tone: wanted.tone,
+                zoom: wanted.zoom,
+            })
+        });
         if reload_document && let Some(file) = self.selected.clone() {
             let pending = self.pending_editor_navigation.take();
             let document = self.open_file_entry(card, file);

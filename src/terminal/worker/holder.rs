@@ -184,7 +184,9 @@ pub(super) fn spawn(
 }
 
 fn validate_execution_directory(directory: &File) -> Result<(), String> {
-    let metadata = directory.metadata().map_err(|error| format!("inspect terminal working directory: {error}"))?;
+    let metadata = directory
+        .metadata()
+        .map_err(|error| format!("inspect terminal working directory: {error}"))?;
     if !metadata.is_dir() || metadata.nlink() == 0 {
         return Err("The terminal's verified working directory is no longer available".into());
     }
@@ -258,7 +260,10 @@ pub(super) fn spawn_recoverable_at_directory(
     let command = postcard::to_stdvec(&command)
         .map(|command| STANDARD.encode(command))
         .map_err(|error| format!("encode terminal command: {error}"))?;
-    let directory_descriptors: Vec<RawFd> = directory.iter().map(|directory| directory.as_raw_fd()).collect();
+    let directory_descriptors: Vec<RawFd> = directory
+        .iter()
+        .map(|directory| directory.as_raw_fd())
+        .collect();
     let started = holder
         .control
         .set_read_timeout(Some(START_TIMEOUT))
@@ -1059,20 +1064,23 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery, anchored_directory, mut descriptors) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
-                command,
-                size,
-                recovery,
-                anchored_directory,
-            },
-            descriptors,
-        ))) => (command, size, recovery, anchored_directory, descriptors),
-        _ => return 1,
-    };
+    let (command, size, mut recovery, anchored_directory, mut descriptors) =
+        match receive::<Request>(&control) {
+            Ok(Some((
+                Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                    anchored_directory,
+                },
+                descriptors,
+            ))) => (command, size, recovery, anchored_directory, descriptors),
+            _ => return 1,
+        };
     let directory = match (anchored_directory, descriptors.len()) {
-        (true, 1) => Some(File::from(descriptors.pop().expect("checked directory descriptor"))),
+        (true, 1) => Some(File::from(
+            descriptors.pop().expect("checked directory descriptor"),
+        )),
         (false, 0) => None,
         _ => return fail("terminal spawn sent the wrong working-directory descriptors".into()),
     };
@@ -1118,7 +1126,11 @@ fn serve(control: UnixStream) -> i32 {
         // extra child descriptors in pre_exec. Reference the holder's pinned
         // descriptor so both cwd and relative executable resolution survive
         // that close; spawn keeps this descriptor alive through exec success.
-        command.cwd(format!("/proc/{}/fd/{}", std::process::id(), directory.as_raw_fd()));
+        command.cwd(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            directory.as_raw_fd()
+        ));
     }
     let program = command
         .get_argv()
@@ -2053,28 +2065,52 @@ mod tests {
         // before opening the anchored script. This makes an early FD drop a
         // deterministic failure instead of relying on interpreter scheduling.
         let interpreter = root.path().join("delayed-interpreter");
-        std::fs::write(&interpreter,
-            "#!/bin/sh\nprintf 'INTERPRETER_READY\\n'\nread latch\nexec /bin/sh \"$@\"\n").unwrap();
+        std::fs::write(
+            &interpreter,
+            "#!/bin/sh\nprintf 'INTERPRETER_READY\\n'\nread latch\nexec /bin/sh \"$@\"\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&interpreter, std::fs::Permissions::from_mode(0o700)).unwrap();
-        std::fs::write(old.join("probe"), format!("#!{}\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n", interpreter.display())).unwrap();
-        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            old.join("probe"),
+            format!(
+                "#!{}\npwd -P\ncat marker\nprintf 'PINNED_DONE\\n'\n",
+                interpreter.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let directory = std::sync::Arc::new(File::open(&old).unwrap());
         std::fs::rename(&old, &moved).unwrap();
         std::fs::create_dir(&old).unwrap();
         std::fs::write(old.join("marker"), "WRONG_DIRECTORY\n").unwrap();
-        std::fs::write(old.join("probe"), "#!/bin/sh\nprintf 'WRONG_EXECUTABLE\\n'\nexit 43\n").unwrap();
-        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(
+            old.join("probe"),
+            "#!/bin/sh\nprintf 'WRONG_EXECUTABLE\\n'\nexit 43\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(old.join("probe"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let mut command = CommandBuilder::new("./probe");
         command.cwd(&old);
         let (exits, exited) = crossbeam_channel::bounded(1);
-        let held = spawn_recoverable_at_directory(command, size(), exits, None, Some(directory)).unwrap();
+        let held =
+            spawn_recoverable_at_directory(command, size(), exits, None, Some(directory)).unwrap();
         read_until(&held.master, "INTERPRETER_READY");
-        std::io::Write::write_all(&mut File::from(held.master.duplicate().unwrap()), b"\n").unwrap();
+        std::io::Write::write_all(&mut File::from(held.master.duplicate().unwrap()), b"\n")
+            .unwrap();
         let output = read_until(&held.master, "PINNED_DONE");
         assert!(output.contains(moved.to_str().unwrap()), "{output}");
         assert!(output.contains("ORIGINAL_DIRECTORY"), "{output}");
         assert!(!output.contains("WRONG_"), "{output}");
-        assert!(exited.recv_timeout(Duration::from_secs(5)).unwrap().unwrap().success());
+        assert!(
+            exited
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap()
+                .success()
+        );
         drop(held);
     }
 
@@ -2086,10 +2122,17 @@ mod tests {
         let directory = std::sync::Arc::new(File::open(&removed).unwrap());
         std::fs::remove_dir(&removed).unwrap();
         let marker = root.path().join("must-not-execute");
-        for directory in [directory, std::sync::Arc::new(tempfile::tempfile().unwrap())] {
+        for directory in [
+            directory,
+            std::sync::Arc::new(tempfile::tempfile().unwrap()),
+        ] {
             let (exits, _) = crossbeam_channel::bounded(1);
             let result = spawn_recoverable_at_directory(
-                command(&format!("touch '{}'", marker.display())), size(), exits, None, Some(directory),
+                command(&format!("touch '{}'", marker.display())),
+                size(),
+                exits,
+                None,
+                Some(directory),
             );
             assert!(result.is_err());
             assert!(!marker.exists());

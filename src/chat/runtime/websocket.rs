@@ -252,7 +252,10 @@ impl Actor {
                     "Retained Codex endpoint belongs to a different app-server process".into(),
                 );
             }
-            *self.provider_process.lock().unwrap_or_else(|p| p.into_inner()) = Some(peer.clone());
+            *self
+                .provider_process
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()) = Some(peer.clone());
             self.native_peer = Some(peer);
         }
         let config = WebSocketConfig::default()

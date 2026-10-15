@@ -202,10 +202,17 @@ pub(super) fn read(
     })
 }
 
-fn logical_membership(model: &crate::workspace_model::WorkspaceModel, scope: Option<&crate::agent_execution::Placement>) -> Option<(Option<PathBuf>, Option<PathBuf>)> {
+fn logical_membership(
+    model: &crate::workspace_model::WorkspaceModel,
+    scope: Option<&crate::agent_execution::Placement>,
+) -> Option<(Option<PathBuf>, Option<PathBuf>)> {
     match scope? {
-        crate::agent_execution::Placement::Worktree { repository, path } => Some((Some(path.clone()), Some(repository.clone()))),
-        crate::agent_execution::Placement::Channel(id) => model.channel(*id).map(|channel| (None, Some(channel.repository.clone()))),
+        crate::agent_execution::Placement::Worktree { repository, path } => {
+            Some((Some(path.clone()), Some(repository.clone())))
+        }
+        crate::agent_execution::Placement::Channel(id) => model
+            .channel(*id)
+            .map(|channel| (None, Some(channel.repository.clone()))),
     }
 }
 
@@ -307,11 +314,38 @@ mod tests {
 
     #[test]
     fn located_membership_uses_current_exact_scope_without_rewriting_launch_cwd() {
-        use crate::{model::{ChannelId, ChannelTitleSource}, workspace_model::{WorkspaceModel, ModelChannel}};
+        use crate::{
+            model::{ChannelId, ChannelTitleSource},
+            workspace_model::{ModelChannel, WorkspaceModel},
+        };
         let id = ChannelId::new();
-        let model = WorkspaceModel { channels: vec![ModelChannel { id, repository: "/moved/.git".into(), title: "Moved".into(), title_source: ChannelTitleSource::Manual, ordinal: 0 }], ..Default::default() };
-        assert_eq!(logical_membership(&model, Some(&crate::agent_execution::Placement::Channel(id))), Some((None, Some("/moved/.git".into()))));
-        assert_eq!(logical_membership(&model, Some(&crate::agent_execution::Placement::Worktree { repository: "/moved/.git".into(), path: "/moved".into() })), Some((Some("/moved".into()), Some("/moved/.git".into()))));
+        let model = WorkspaceModel {
+            channels: vec![ModelChannel {
+                id,
+                repository: "/moved/.git".into(),
+                title: "Moved".into(),
+                title_source: ChannelTitleSource::Manual,
+                ordinal: 0,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            logical_membership(
+                &model,
+                Some(&crate::agent_execution::Placement::Channel(id))
+            ),
+            Some((None, Some("/moved/.git".into())))
+        );
+        assert_eq!(
+            logical_membership(
+                &model,
+                Some(&crate::agent_execution::Placement::Worktree {
+                    repository: "/moved/.git".into(),
+                    path: "/moved".into()
+                })
+            ),
+            Some((Some("/moved".into()), Some("/moved/.git".into())))
+        );
         assert_eq!(logical_membership(&model, None), None);
     }
 

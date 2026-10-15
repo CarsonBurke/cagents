@@ -20,13 +20,13 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
-mod execution;
 mod directory;
+mod execution;
 mod native_reconcile;
 mod store;
 mod websocket;
-use store::Store;
 pub(crate) use directory::DirectoryProof;
+use store::Store;
 
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 const STATE_LIMIT: usize = 1024 * 1024;
@@ -132,10 +132,18 @@ impl Drop for OwnedSocket {
 impl Handle {
     /// Retain the latest actual provider identity after exit as well as while
     /// live, so completed→restart→completed cannot match an older roster.
-    pub(crate) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> { self.0.provider_process.lock().unwrap_or_else(|p| p.into_inner()).clone() }
+    pub(crate) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> {
+        self.0
+            .provider_process
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
     /// Local actors publish their metadata directly. Retained-actor builds
     /// replace this with the authenticated remote refresh before close fences.
-    pub(crate) fn refresh_retained_state(&self) -> Result<(), String> { Ok(()) }
+    pub(crate) fn refresh_retained_state(&self) -> Result<(), String> {
+        Ok(())
+    }
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -163,8 +171,8 @@ struct Inner {
     retain_cleanup_receipt: Arc<AtomicBool>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
-    native_reconciling:AtomicBool,
-    native_reconcile_error:Mutex<Option<String>>,
+    native_reconciling: AtomicBool,
+    native_reconcile_error: Mutex<Option<String>>,
     native_installed: Arc<AtomicBool>,
     history_only: bool,
 }
@@ -319,7 +327,11 @@ impl Handle {
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
-        let pinned_directory = Arc::new(Mutex::new(spec.execution.as_ref().and_then(|context| context.directory_descriptor())));
+        let pinned_directory = Arc::new(Mutex::new(
+            spec.execution
+                .as_ref()
+                .and_then(|context| context.directory_descriptor()),
+        ));
         let provider_process = Arc::new(Mutex::new(None));
         let inner = Arc::new(Inner {
             provider_process: provider_process.clone(),
@@ -346,8 +358,8 @@ impl Handle {
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
-            native_reconciling:AtomicBool::new(false),
-            native_reconcile_error:Mutex::new(None),
+            native_reconciling: AtomicBool::new(false),
+            native_reconcile_error: Mutex::new(None),
             native_installed: native_installed.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
         });
@@ -417,7 +429,14 @@ impl Handle {
                             spawn_provider(&spec, &actor.stop)
                         };
                         if let Ok(Some(child)) = &child {
-                            *actor.provider_process.lock().unwrap_or_else(|p| p.into_inner()) = crate::daemon::holder_registry::Process::read(child.child.id() as i32).ok();
+                            *actor
+                                .provider_process
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner()) =
+                                crate::daemon::holder_registry::Process::read(
+                                    child.child.id() as i32
+                                )
+                                .ok();
                         }
                         let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                         actor.child = child?;
@@ -631,8 +650,13 @@ impl Handle {
             })?
             .map_err(Rejection::Refused)
     }
-    pub(crate) fn relocate_execution_directory(&self, directory: &std::path::Path) -> Result<(), String> {
-        self.ownership_command(ActorCommand::RelocateExecutionDirectory(directory.to_path_buf()))
+    pub(crate) fn relocate_execution_directory(
+        &self,
+        directory: &std::path::Path,
+    ) -> Result<(), String> {
+        self.ownership_command(ActorCommand::RelocateExecutionDirectory(
+            directory.to_path_buf(),
+        ))
     }
 
     fn ownership_command(&self, command: ActorCommand) -> Result<(), String> {
@@ -1087,7 +1111,7 @@ impl Handle {
             return Err("Native provider has already been explicitly closed".into());
         }
         self.0.preserve_native.store(true, Ordering::Release);
-        self.close_inner(true,None)
+        self.close_inner(true, None)
     }
 
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
@@ -1101,7 +1125,12 @@ impl Handle {
     }
 
     pub(crate) fn close_for_resume_until(&self, deadline: Instant) -> Result<(), String> {
-        if matches!(self.native_continuity(), super::NativeContinuity::Durable { .. }) { self.0.retain_cleanup_receipt.store(true, Ordering::Release); }
+        if matches!(
+            self.native_continuity(),
+            super::NativeContinuity::Durable { .. }
+        ) {
+            self.0.retain_cleanup_receipt.store(true, Ordering::Release);
+        }
         self.close_until(deadline)
     }
 
@@ -1109,111 +1138,146 @@ impl Handle {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
         }
-        self.close_inner(false,None)
+        self.close_inner(false, None)
     }
 
     /// A caller-owned teardown budget. An unfinished worker or retained native
     /// reconciliation remains owned and retryable; timeout is never cleanup.
-    pub(crate) fn close_until(&self,deadline:Instant)->Result<(),String> {
+    pub(crate) fn close_until(&self, deadline: Instant) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
-            self.0.release_native.store(true,Ordering::Release);
+            self.0.release_native.store(true, Ordering::Release);
         }
-        self.close_inner(false,Some(deadline))
+        self.close_inner(false, Some(deadline))
     }
 
-    fn join_worker_until(&self,deadline:Instant)->Result<(),String> {
+    fn join_worker_until(&self, deadline: Instant) -> Result<(), String> {
         loop {
-            let joined=match self.0.worker.try_lock() {
-                Ok(mut worker)=>match worker.as_ref() {
-                    Some(current) if !current.is_finished()=>None,
-                    _=>Some(worker.take().map(|worker|worker.join())),
+            let joined = match self.0.worker.try_lock() {
+                Ok(mut worker) => match worker.as_ref() {
+                    Some(current) if !current.is_finished() => None,
+                    _ => Some(worker.take().map(|worker| worker.join())),
                 },
-                Err(std::sync::TryLockError::Poisoned(poisoned))=> {
-                    let mut worker=poisoned.into_inner();
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    let mut worker = poisoned.into_inner();
                     match worker.as_ref() {
-                        Some(current) if !current.is_finished()=>None,
-                        _=>Some(worker.take().map(|worker|worker.join())),
+                        Some(current) if !current.is_finished() => None,
+                        _ => Some(worker.take().map(|worker| worker.join())),
                     }
                 }
-                Err(std::sync::TryLockError::WouldBlock)=>None,
+                Err(std::sync::TryLockError::WouldBlock) => None,
             };
             match joined {
-                Some(Some(Err(_)))=> {
+                Some(Some(Err(_))) => {
                     let error="Native chat worker did not shut down cleanly; provider state is unconfirmed".to_owned();
-                    self.0.completed.store(false,Ordering::Release);
-                    *self.0.failure.lock().unwrap_or_else(|p|p.into_inner())=Some(error.clone());
+                    self.0.completed.store(false, Ordering::Release);
+                    *self.0.failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error.clone());
                     return Err(error);
                 }
-                Some(_)=>return Ok(()),
-                None=> {}
+                Some(_) => return Ok(()),
+                None => {}
             }
-            let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err("Native chat close is still pending; its exact provider cleanup owner is retained".into());
             };
             thread::sleep(remaining.min(Duration::from_millis(5)));
         }
     }
 
-    fn close_inner(&self, preserving: bool, deadline:Option<Instant>) -> Result<(), String> {
+    fn close_inner(&self, preserving: bool, deadline: Option<Instant>) -> Result<(), String> {
         self.0.stop.store(true, Ordering::Release);
         self.wake();
         // Never hold a worker mutex while waiting for provider code. Only
         // join after is_finished proves that its user cleanup has returned.
-        self.join_worker_until(deadline.unwrap_or_else(||Instant::now()+IO_TIMEOUT+super::TERMINATE_GRACE))?;
-        if let Some(deadline)=deadline {return self.reconcile_native_until(deadline);}
+        self.join_worker_until(
+            deadline.unwrap_or_else(|| Instant::now() + IO_TIMEOUT + super::TERMINATE_GRACE),
+        )?;
+        if let Some(deadline) = deadline {
+            return self.reconcile_native_until(deadline);
+        }
         {
-            let mut retained=self.0.retained_native.lock().unwrap_or_else(|p|p.into_inner());
-            if let Some(holder)=retained.as_mut() {
+            let mut retained = self
+                .0
+                .retained_native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(holder) = retained.as_mut() {
                 holder.close_inner(self.0.retain_cleanup_receipt.load(Ordering::Acquire))?;
                 retained.take();
-                self.0.completed.store(true,Ordering::Release);
+                self.0.completed.store(true, Ordering::Release);
             }
         }
         if !preserving && self.0.native_installed.load(Ordering::Acquire) {
-            let mut detached=self.0.detached_native.lock().unwrap_or_else(|p|p.into_inner());
-            if let Some(owner)=detached.as_ref() {
-                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {owner.close_retaining_receipt()?;} else {owner.close()?;}
+            let mut detached = self
+                .0
+                .detached_native
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(owner) = detached.as_ref() {
+                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {
+                    owner.close_retaining_receipt()?;
+                } else {
+                    owner.close()?;
+                }
                 detached.take();
             }
         }
         self.close_result()
     }
 
-    fn reconcile_native_until(&self,deadline:Instant)->Result<(),String> {
-        let mut attempted=false;
+    fn reconcile_native_until(&self, deadline: Instant) -> Result<(), String> {
+        let mut attempted = false;
         loop {
-            let retained=match self.0.retained_native.try_lock() {
-                Ok(owner)=>Some(owner.is_some()),
-                Err(std::sync::TryLockError::Poisoned(poisoned))=>Some(poisoned.into_inner().is_some()),
-                Err(std::sync::TryLockError::WouldBlock)=>None,
-            };
-            let detached=if self.0.native_installed.load(Ordering::Acquire) {
-                match self.0.detached_native.try_lock() {
-                    Ok(owner)=>Some(owner.is_some()),
-                    Err(std::sync::TryLockError::Poisoned(poisoned))=>Some(poisoned.into_inner().is_some()),
-                    Err(std::sync::TryLockError::WouldBlock)=>None,
+            let retained = match self.0.retained_native.try_lock() {
+                Ok(owner) => Some(owner.is_some()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().is_some())
                 }
-            } else {Some(false)};
-            if retained==Some(false) && detached==Some(false) && !self.0.native_reconciling.load(Ordering::Acquire) {
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            let detached = if self.0.native_installed.load(Ordering::Acquire) {
+                match self.0.detached_native.try_lock() {
+                    Ok(owner) => Some(owner.is_some()),
+                    Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                        Some(poisoned.into_inner().is_some())
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                }
+            } else {
+                Some(false)
+            };
+            if retained == Some(false)
+                && detached == Some(false)
+                && !self.0.native_reconciling.load(Ordering::Acquire)
+            {
                 return self.close_result();
             }
-            if retained==Some(true) || detached==Some(true) {
+            if retained == Some(true) || detached == Some(true) {
                 if !attempted {
                     native_reconcile::request(self)?;
-                    attempted=true;
+                    attempted = true;
                 } else if !self.0.native_reconciling.load(Ordering::Acquire) {
-                    let reason=self.0.native_reconcile_error.try_lock().ok().and_then(|error|error.clone());
-                    return Err(format!("Retained native cleanup is unconfirmed; its exact owner is retained for retry{}",reason.map(|reason|format!(": {reason}")).unwrap_or_default()));
+                    let reason = self
+                        .0
+                        .native_reconcile_error
+                        .try_lock()
+                        .ok()
+                        .and_then(|error| error.clone());
+                    return Err(format!(
+                        "Retained native cleanup is unconfirmed; its exact owner is retained for retry{}",
+                        reason
+                            .map(|reason| format!(": {reason}"))
+                            .unwrap_or_default()
+                    ));
                 }
             }
-            let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return Err("Native cleanup is still pending; its exact owner and bounded reconciliation task are retained for retry".into());
             };
             thread::sleep(remaining.min(Duration::from_millis(5)));
         }
     }
 
-    fn close_result(&self)->Result<(),String> {
+    fn close_result(&self) -> Result<(), String> {
         if self.is_completed() {
             return Ok(());
         }
@@ -1350,9 +1414,11 @@ impl Drop for Inner {
             .take()
         {
             if worker.is_finished() {
-                let _=worker.join();
+                let _ = worker.join();
             } else {
-                tracing::warn!("Final chat handle dropped while its existing provider cleanup worker remains active; cleanup is unconfirmed");
+                tracing::warn!(
+                    "Final chat handle dropped while its existing provider cleanup worker remains active; cleanup is unconfirmed"
+                );
             }
         }
     }
@@ -2021,21 +2087,37 @@ impl Actor {
                 ActorCommand::Provider { run, command } => (run, command),
                 ActorCommand::RelocateExecutionDirectory(directory) => {
                     let result: Result<(), String> = (|| {
-                        let context = self.launch_context.as_ref().ok_or("The provider has no approved directory identity")?;
-                        if context.directory_identity()?.is_none() { return Err("The provider has no approved directory identity".into()); }
-                        crate::secure_file::reject_symlink_components(&directory).map_err(|error| error.to_string())?;
+                        let context = self
+                            .launch_context
+                            .as_ref()
+                            .ok_or("The provider has no approved directory identity")?;
+                        if context.directory_identity()?.is_none() {
+                            return Err("The provider has no approved directory identity".into());
+                        }
+                        crate::secure_file::reject_symlink_components(&directory)
+                            .map_err(|error| error.to_string())?;
                         context.verify_directory(&directory)?;
-                        if self.working_directory == directory { return Ok(()); }
-                        let provider_observed = context.provider_directory_was_observed(&self.working_directory);
+                        if self.working_directory == directory {
+                            return Ok(());
+                        }
+                        let provider_observed =
+                            context.provider_directory_was_observed(&self.working_directory);
                         self.adapter.relocate_directory(&directory)?;
-                        if let Err(error) = self.store.lock().unwrap_or_else(|p| p.into_inner()).relocate_file_directory(&directory) {
+                        if let Err(error) = self
+                            .store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .relocate_file_directory(&directory)
+                        {
                             let _ = self.adapter.relocate_directory(&self.working_directory);
                             return Err(error);
                         }
                         // Only carry an existing provider scope receipt. A pinned
                         // cwd and a default adapter hook cannot certify legacy
                         // resumed/OMP tool scope. Failure leaves scope unknown.
-                        if provider_observed { let _ = context.observe_provider_directory(&directory); }
+                        if provider_observed {
+                            let _ = context.observe_provider_directory(&directory);
+                        }
                         self.working_directory = directory;
                         self.dirty = true;
                         Ok(())
@@ -3379,37 +3461,109 @@ mod tests {
 
     #[test]
     fn same_inode_project_move_updates_actor_paths_without_new_process_authority() {
-        struct PathAware { directory: std::path::PathBuf, calls: Arc<Mutex<Vec<std::path::PathBuf>>> }
+        struct PathAware {
+            directory: std::path::PathBuf,
+            calls: Arc<Mutex<Vec<std::path::PathBuf>>>,
+        }
         impl Adapter for PathAware {
-            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
-            fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> { self.directory = directory.into(); Ok(()) }
-            fn command(&mut self, _command: Command) -> Result<Step, String> { self.calls.lock().unwrap().push(self.directory.clone()); Ok(Step::default()) }
-            fn command_for_run(&mut self, _run: crate::model::RunId, command: Command) -> Result<Step, String> { self.command(command) }
-            fn receive(&mut self, _frame: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn relocate_directory(&mut self, directory: &std::path::Path) -> Result<(), String> {
+                self.directory = directory.into();
+                Ok(())
+            }
+            fn command(&mut self, _command: Command) -> Result<Step, String> {
+                self.calls.lock().unwrap().push(self.directory.clone());
+                Ok(Step::default())
+            }
+            fn command_for_run(
+                &mut self,
+                _run: crate::model::RunId,
+                command: Command,
+            ) -> Result<Step, String> {
+                self.command(command)
+            }
+            fn receive(&mut self, _frame: serde_json::Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
         for observed in [false, true] {
-        let fixture = tempfile::tempdir().unwrap();
-        let old = fixture.path().join("old"); std::fs::create_dir(&old).unwrap();
-        let original = Arc::new(std::fs::File::open(&old).unwrap());
-        let context = Arc::new(super::super::protocol::ExecutionContext::new(Some(original)));
-        if observed { context.observe_provider_directory(&old).unwrap(); }
-        let spec = ProcessSpec { execution: Some(context.clone()), messages: None, unset_environment: Default::default(), transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(), working_directory: old.clone(), environment: BTreeMap::new() };
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut initial = Step { events: vec![Event::Ready(true)], ..Default::default() };
-        let store = preflight(&spec, &mut initial).unwrap();
-        let handle = Handle::start(spec, Box::new(PathAware { directory: old.clone(), calls: calls.clone() }), initial, store, None, |_| {}).unwrap();
-        let moved = fixture.path().join("moved"); std::fs::rename(&old, &moved).unwrap();
-        std::fs::create_dir(&old).unwrap();
-        handle.relocate_execution_directory(&moved).unwrap();
-        assert_eq!(context.provider_directory_observed(&moved).unwrap(), observed, "Locate carries only pre-existing provider authority");
-        handle.command_for_run(crate::model::RunId::new(), Command::Prompt { text: "fixture".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).unwrap();
-        assert_eq!(*calls.lock().unwrap(), vec![moved.clone()]);
-        assert!(handle.relocate_execution_directory(&old).is_err(), "reused path is another inode, not the approved process directory");
-        std::fs::rename(&moved, fixture.path().join("retained")).unwrap();
-        std::fs::create_dir(&moved).unwrap();
-        assert!(handle.command(Command::Prompt { text: "replacement must refuse".into(), attachments: Vec::new(), mode: super::super::PromptMode::Send }).is_err());
-        assert_eq!(calls.lock().unwrap().len(), 1);
-        handle.close().unwrap();
+            let fixture = tempfile::tempdir().unwrap();
+            let old = fixture.path().join("old");
+            std::fs::create_dir(&old).unwrap();
+            let original = Arc::new(std::fs::File::open(&old).unwrap());
+            let context = Arc::new(super::super::protocol::ExecutionContext::new(Some(
+                original,
+            )));
+            if observed {
+                context.observe_provider_directory(&old).unwrap();
+            }
+            let spec = ProcessSpec {
+                execution: Some(context.clone()),
+                messages: None,
+                unset_environment: Default::default(),
+                transport: TransportSpec::JsonLines,
+                program: "/bin/cat".into(),
+                arguments: Vec::new(),
+                working_directory: old.clone(),
+                environment: BTreeMap::new(),
+            };
+            let calls = Arc::new(Mutex::new(Vec::new()));
+            let mut initial = Step {
+                events: vec![Event::Ready(true)],
+                ..Default::default()
+            };
+            let store = preflight(&spec, &mut initial).unwrap();
+            let handle = Handle::start(
+                spec,
+                Box::new(PathAware {
+                    directory: old.clone(),
+                    calls: calls.clone(),
+                }),
+                initial,
+                store,
+                None,
+                |_| {},
+            )
+            .unwrap();
+            let moved = fixture.path().join("moved");
+            std::fs::rename(&old, &moved).unwrap();
+            std::fs::create_dir(&old).unwrap();
+            handle.relocate_execution_directory(&moved).unwrap();
+            assert_eq!(
+                context.provider_directory_observed(&moved).unwrap(),
+                observed,
+                "Locate carries only pre-existing provider authority"
+            );
+            handle
+                .command_for_run(
+                    crate::model::RunId::new(),
+                    Command::Prompt {
+                        text: "fixture".into(),
+                        attachments: Vec::new(),
+                        mode: super::super::PromptMode::Send,
+                    },
+                )
+                .unwrap();
+            assert_eq!(*calls.lock().unwrap(), vec![moved.clone()]);
+            assert!(
+                handle.relocate_execution_directory(&old).is_err(),
+                "reused path is another inode, not the approved process directory"
+            );
+            std::fs::rename(&moved, fixture.path().join("retained")).unwrap();
+            std::fs::create_dir(&moved).unwrap();
+            assert!(
+                handle
+                    .command(Command::Prompt {
+                        text: "replacement must refuse".into(),
+                        attachments: Vec::new(),
+                        mode: super::super::PromptMode::Send
+                    })
+                    .is_err()
+            );
+            assert_eq!(calls.lock().unwrap().len(), 1);
+            handle.close().unwrap();
         }
     }
 
@@ -5390,37 +5544,92 @@ mod tests {
 
     #[test]
     fn bounded_close_preserves_a_stuck_worker_and_does_not_hold_the_join_mutex() {
-        struct Blocked {entered:crossbeam_channel::Sender<()>,release:crossbeam_channel::Receiver<()>}
+        struct Blocked {
+            entered: crossbeam_channel::Sender<()>,
+            release: crossbeam_channel::Receiver<()>,
+        }
         impl Adapter for Blocked {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
-            fn command(&mut self,_:Command)->Result<Step,String> {
-                self.entered.send(()).unwrap();
-                self.release.recv_timeout(Duration::from_secs(5)).map_err(|error|error.to_string())?;
+            fn initialize(&mut self) -> Result<Step, String> {
                 Ok(Step::default())
             }
-            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                self.entered.send(()).unwrap();
+                self.release
+                    .recv_timeout(Duration::from_secs(5))
+                    .map_err(|error| error.to_string())?;
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();
-        let store=preflight(&spec,&mut initial).unwrap();
-        let (entered,entered_command)=crossbeam_channel::bounded(1);
-        let (release,released)=crossbeam_channel::bounded(1);
-        let handle=Handle::start(spec,Box::new(Blocked {entered,release:released}),initial,store,None,|_|{}).unwrap();
-        let command_handle=handle.clone();
-        let command=thread::spawn(move||command_handle.command(Command::SetFastMode {enabled:true}));
-        entered_command.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started=Instant::now();
-        assert!(handle.close_until(Instant::now()+Duration::from_millis(40)).unwrap_err().contains("retained"));
-        assert!(started.elapsed()<Duration::from_secs(1));
-        assert!(!handle.is_completed()); assert!(handle.owns_work());
-        assert!(handle.0.worker.try_lock().unwrap().as_ref().is_some_and(|worker|!worker.is_finished()),"the exact join handle is retained without a held mutex");
-        let held=handle.0.worker.lock().unwrap();
-        assert!(handle.close_until(Instant::now()+Duration::from_millis(20)).is_err(),"even another caller holding worker metadata cannot block this deadline");
-        assert!(held.is_some());drop(held);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (entered, entered_command) = crossbeam_channel::bounded(1);
+        let (release, released) = crossbeam_channel::bounded(1);
+        let handle = Handle::start(
+            spec,
+            Box::new(Blocked {
+                entered,
+                release: released,
+            }),
+            initial,
+            store,
+            None,
+            |_| {},
+        )
+        .unwrap();
+        let command_handle = handle.clone();
+        let command =
+            thread::spawn(move || command_handle.command(Command::SetFastMode { enabled: true }));
+        entered_command
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let started = Instant::now();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(40))
+                .unwrap_err()
+                .contains("retained")
+        );
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!handle.is_completed());
+        assert!(handle.owns_work());
+        assert!(
+            handle
+                .0
+                .worker
+                .try_lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished()),
+            "the exact join handle is retained without a held mutex"
+        );
+        let held = handle.0.worker.lock().unwrap();
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_millis(20))
+                .is_err(),
+            "even another caller holding worker metadata cannot block this deadline"
+        );
+        assert!(held.is_some());
+        drop(held);
         release.send(()).unwrap();
-        let _=command.join().unwrap();
-        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        let _ = command.join().unwrap();
+        handle
+            .close_until(Instant::now() + Duration::from_secs(2))
+            .unwrap();
         assert!(handle.is_completed());
         assert!(handle.0.worker.lock().unwrap().is_none());
     }
@@ -5428,66 +5637,154 @@ mod tests {
     #[test]
     fn bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure() {
         use std::os::unix::fs::OpenOptionsExt;
-        const CHILD:&str="CAGENTS_RETAINED_CLOSE_RETRY_TEST";
+        const CHILD: &str = "CAGENTS_RETAINED_CLOSE_RETRY_TEST";
         if std::env::var_os(CHILD).is_none() {
-            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let output=Process::new(std::env::current_exe().unwrap()).args(["--exact","chat::runtime::tests::bounded_close_retries_the_exact_retained_holder_after_transient_cleanup_failure","--nocapture"])
                 .env(CHILD,"1").env("XDG_RUNTIME_DIR",directory.path()).env("XDG_DATA_HOME",directory.path().join("data"))
                 .env("XDG_CONFIG_HOME",directory.path().join("config")).env("XDG_CACHE_HOME",directory.path().join("cache"))
                 .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             return;
         }
-        let mut source=super::super::native_holder::fixture_source();
-        let boot=crate::daemon::read_boot_id().unwrap();
-        source.proof.as_mut().unwrap().boot_id=boot.clone();
-        source.owned_codex_listener.as_mut().unwrap().allocator.boot_id=boot;
-        let paths=crate::daemon::RuntimePaths::discover().unwrap();
-        let _lease=crate::daemon::HostLease::acquire(&paths,source.proof.as_ref().unwrap()).unwrap();
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::OwnedUnixWebSocket {socket:source.owned_codex_listener.as_ref().unwrap().socket.clone()},program:"/bin/sleep".into(),arguments:vec!["60".into()],working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let holder=super::super::native_holder::spawn(spec,source.clone()).unwrap();
-        let root=crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native).unwrap();
-        let record=crate::daemon::holder_registry::evidence(&crate::daemon::holder_registry::socket(&root,source.id),crate::daemon::holder_registry::Kind::Native).unwrap().unwrap();
+        let mut source = super::super::native_holder::fixture_source();
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease =
+            crate::daemon::HostLease::acquire(&paths, source.proof.as_ref().unwrap()).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::OwnedUnixWebSocket {
+                socket: source.owned_codex_listener.as_ref().unwrap().socket.clone(),
+            },
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let holder = super::super::native_holder::spawn(spec, source.clone()).unwrap();
+        let root =
+            crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)
+                .unwrap();
+        let record = crate::daemon::holder_registry::evidence(
+            &crate::daemon::holder_registry::socket(&root, source.id),
+            crate::daemon::holder_registry::Kind::Native,
+        )
+        .unwrap()
+        .unwrap();
         assert!(record.root.is_current());
-        let receipt=root.join(format!("{}-{}-{}.closed",source.id,record.holder.pid,record.holder.start));
-        let mut invalid=std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&receipt).unwrap();
-        invalid.write_all(b"transient invalid cleanup receipt").unwrap();drop(invalid);
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let receipt = root.join(format!(
+            "{}-{}-{}.closed",
+            source.id, record.holder.pid, record.holder.start
+        ));
+        let mut invalid = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&receipt)
+            .unwrap();
+        invalid
+            .write_all(b"transient invalid cleanup receipt")
+            .unwrap();
+        drop(invalid);
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         handle.close().unwrap();
-        *handle.0.retained_native.lock().unwrap()=Some(holder);
-        handle.0.completed.store(false,Ordering::Release);
-        *handle.0.failure.lock().unwrap()=Some("Native teardown remains unconfirmed".into());
-        assert!(handle.close_until(Instant::now()+Duration::from_secs(2)).is_err());
-        let deadline=Instant::now()+Duration::from_secs(2);
+        *handle.0.retained_native.lock().unwrap() = Some(holder);
+        handle.0.completed.store(false, Ordering::Release);
+        *handle.0.failure.lock().unwrap() = Some("Native teardown remains unconfirmed".into());
+        assert!(
+            handle
+                .close_until(Instant::now() + Duration::from_secs(2))
+                .is_err()
+        );
+        let deadline = Instant::now() + Duration::from_secs(2);
         while handle.0.native_reconciling.load(Ordering::Acquire) {
-            assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(5));
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
         }
         assert!(handle.0.retained_native.lock().unwrap().is_some());
-        assert!(record.root.is_current(),"the failed attempt must retain the same actual provider owner");
-        assert!(!handle.is_completed());assert!(handle.owns_work());
+        assert!(
+            record.root.is_current(),
+            "the failed attempt must retain the same actual provider owner"
+        );
+        assert!(!handle.is_completed());
+        assert!(handle.owns_work());
         std::fs::remove_file(&receipt).unwrap();
-        handle.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
-        assert!(handle.0.retained_native.lock().unwrap().is_none());assert!(handle.is_completed());
-        assert!(!record.root.is_current(),"the later same close API must progress through exact native cleanup");
+        handle
+            .close_until(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(handle.0.retained_native.lock().unwrap().is_none());
+        assert!(handle.is_completed());
+        assert!(
+            !record.root.is_current(),
+            "the later same close API must progress through exact native cleanup"
+        );
     }
 
     #[test]
     fn final_handle_drop_does_not_wait_for_an_unfinished_cleanup_thread() {
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step::default();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Echo), initial, store, None, |_| {}).unwrap();
         handle.close().unwrap();
-        let (release,released)=crossbeam_channel::bounded(1);
-        let (finished,finished_worker)=crossbeam_channel::bounded(1);
-        *handle.0.worker.lock().unwrap()=Some(thread::spawn(move|| {let _=released.recv_timeout(Duration::from_secs(5));let _=finished.send(());}));
-        let started=Instant::now();drop(handle);
-        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join arbitrary provider code");
-        assert!(finished_worker.try_recv().is_err(),"dropping a frontend handle is not proof that its cleanup thread finished");
-        release.send(()).unwrap();finished_worker.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (release, released) = crossbeam_channel::bounded(1);
+        let (finished, finished_worker) = crossbeam_channel::bounded(1);
+        *handle.0.worker.lock().unwrap() = Some(thread::spawn(move || {
+            let _ = released.recv_timeout(Duration::from_secs(5));
+            let _ = finished.send(());
+        }));
+        let started = Instant::now();
+        drop(handle);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "destruction must not join arbitrary provider code"
+        );
+        assert!(
+            finished_worker.try_recv().is_err(),
+            "dropping a frontend handle is not proof that its cleanup thread finished"
+        );
+        release.send(()).unwrap();
+        finished_worker
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
     }
 
     #[test]

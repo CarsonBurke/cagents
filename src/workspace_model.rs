@@ -289,48 +289,97 @@ impl WorkspaceModel {
                 }
             }
             ModelEdit::RelocateProject { relocation } => {
-                if relocation.verification_only() || (relocation.repository != relocation.destination && self.projects.iter().any(|project| project.repository == relocation.destination)) { return; }
+                if relocation.verification_only()
+                    || (relocation.repository != relocation.destination
+                        && self
+                            .projects
+                            .iter()
+                            .any(|project| project.repository == relocation.destination))
+                {
+                    return;
+                }
                 for project in &mut self.projects {
                     if project.repository == relocation.repository {
                         project.repository = relocation.destination.clone();
-                        if let Some(checkout) = &mut project.checkout { relocation.path(checkout); }
-                        if let Some(primary) = &mut project.primary_checkout { relocation.path(primary); }
+                        if let Some(checkout) = &mut project.checkout {
+                            relocation.path(checkout);
+                        }
+                        if let Some(primary) = &mut project.primary_checkout {
+                            relocation.path(primary);
+                        }
                     }
                 }
-                let channels = self.channels.iter().filter(|channel| channel.repository == relocation.repository).map(|channel| channel.id).collect::<std::collections::HashSet<_>>();
+                let channels = self
+                    .channels
+                    .iter()
+                    .filter(|channel| channel.repository == relocation.repository)
+                    .map(|channel| channel.id)
+                    .collect::<std::collections::HashSet<_>>();
                 for channel in &mut self.channels {
-                    if channel.repository == relocation.repository { channel.repository = relocation.destination.clone(); }
+                    if channel.repository == relocation.repository {
+                        channel.repository = relocation.destination.clone();
+                    }
                 }
                 for order in &mut self.navigation_orders {
                     if order.repository == relocation.repository {
                         order.repository = relocation.destination.clone();
                         for item in &mut order.items {
-                            if let NavigationItem::Worktree(path) = item { relocation.path(path); }
+                            if let NavigationItem::Worktree(path) = item {
+                                relocation.path(path);
+                            }
                         }
                     }
                 }
                 for view in &mut self.views {
                     let owned = match &view.scope {
                         views::Scope::Channel(channel) => channels.contains(channel),
-                        views::Scope::Worktree { repository, .. } => *repository == relocation.repository,
+                        views::Scope::Worktree { repository, .. } => {
+                            *repository == relocation.repository
+                        }
                     };
-                    if owned { relocation.view(view); view.revision = view.revision.saturating_add(1); }
+                    if owned {
+                        relocation.view(view);
+                        view.revision = view.revision.saturating_add(1);
+                    }
                 }
-                let owned_agents = self.agent_locations.iter().filter(|location| location.repository == relocation.repository).map(|location| location.agent).collect::<std::collections::HashSet<_>>();
+                let owned_agents = self
+                    .agent_locations
+                    .iter()
+                    .filter(|location| location.repository == relocation.repository)
+                    .map(|location| location.agent)
+                    .collect::<std::collections::HashSet<_>>();
                 for location in &mut self.agent_locations {
-                    if location.repository == relocation.repository { location.repository = relocation.destination.clone(); }
+                    if location.repository == relocation.repository {
+                        location.repository = relocation.destination.clone();
+                    }
                 }
                 for agent in &mut self.agents {
-                    if owned_agents.contains(&agent.id) || agent.spec.target.repository == relocation.repository { relocation.agent(agent); }
+                    if owned_agents.contains(&agent.id)
+                        || agent.spec.target.repository == relocation.repository
+                    {
+                        relocation.agent(agent);
+                    }
                 }
                 if relocation.repository != relocation.destination {
-                    self.closed_projects.retain(|path| *path != relocation.destination);
-                    if !self.closed_projects.contains(&relocation.repository) { self.closed_projects.push(relocation.repository.clone()); }
+                    self.closed_projects
+                        .retain(|path| *path != relocation.destination);
+                    if !self.closed_projects.contains(&relocation.repository) {
+                        self.closed_projects.push(relocation.repository.clone());
+                    }
                 }
             }
-            ModelEdit::CloseProject { repository } | ModelEdit::CloseProjectInstance { project: crate::project_recovery::ProjectInstance { repository, .. } } => {
+            ModelEdit::CloseProject { repository }
+            | ModelEdit::CloseProjectInstance {
+                project: crate::project_recovery::ProjectInstance { repository, .. },
+            } => {
                 if let ModelEdit::CloseProjectInstance { project } = edit
-                    && (self.identity != project.registry || self.project(repository).is_none_or(|current| current.ordinal != project.ordinal)) { return; }
+                    && (self.identity != project.registry
+                        || self
+                            .project(repository)
+                            .is_none_or(|current| current.ordinal != project.ordinal))
+                {
+                    return;
+                }
                 self.navigation_orders
                     .retain(|order| order.repository != *repository);
                 if !self.closed_projects.contains(repository) {
@@ -441,7 +490,9 @@ pub enum ModelEdit {
     /// open cannot keep channels reachable.
     CloseProject { repository: PathBuf },
     /// Atomically preserve project/channel/pane identity at a located path.
-    RelocateProject { relocation: crate::project_recovery::Relocation },
+    RelocateProject {
+        relocation: crate::project_recovery::Relocation,
+    },
     /// Idempotent by id. The id is minted by the client, the rank by the
     /// registry.
     CreateChannel {
@@ -487,7 +538,9 @@ pub enum ModelEdit {
         change: views::Change,
     },
     /// Remove only the exact registry/project incarnation the user selected.
-    CloseProjectInstance { project: crate::project_recovery::ProjectInstance },
+    CloseProjectInstance {
+        project: crate::project_recovery::ProjectInstance,
+    },
 }
 
 fn verified_primary_checkout(
@@ -569,14 +622,19 @@ impl ModelEdit {
             },
             Self::RelocateProject { relocation } => {
                 relocation.validate()?;
-                Self::RelocateProject { relocation: crate::project_recovery::Relocation {
-                    repository: canonical_repository(&relocation.repository)?,
-                    destination: canonical_repository(&relocation.destination)?,
-                    old_root: canonical_repository(&relocation.old_root)?,
-                    new_root: canonical_repository(&relocation.new_root)?,
-                } }
+                Self::RelocateProject {
+                    relocation: crate::project_recovery::Relocation {
+                        repository: canonical_repository(&relocation.repository)?,
+                        destination: canonical_repository(&relocation.destination)?,
+                        old_root: canonical_repository(&relocation.old_root)?,
+                        new_root: canonical_repository(&relocation.new_root)?,
+                    },
+                }
             }
-            Self::CloseProjectInstance { project } => { project.validate()?; Self::CloseProjectInstance { project } },
+            Self::CloseProjectInstance { project } => {
+                project.validate()?;
+                Self::CloseProjectInstance { project }
+            }
             Self::CloseProject { repository } => Self::CloseProject {
                 repository: canonical_repository(&repository)?,
             },
@@ -680,12 +738,33 @@ mod tests {
 
     #[test]
     fn session_location_refusals_roundtrip_and_missing_legacy_field_defaults_empty() {
-        let model = WorkspaceModel { session_location_refusals: vec![SessionLocationRefusal { session: crate::model::TerminalId::new(), directory: "/located/project".into(), reason: "Recover the original provider or close this pane explicitly".into() }], ..Default::default() };
-        assert_eq!(serde_json::from_slice::<WorkspaceModel>(&serde_json::to_vec(&model).unwrap()).unwrap(), model);
-        assert_eq!(postcard::from_bytes::<WorkspaceModel>(&postcard::to_stdvec(&model).unwrap()).unwrap(), model);
+        let model = WorkspaceModel {
+            session_location_refusals: vec![SessionLocationRefusal {
+                session: crate::model::TerminalId::new(),
+                directory: "/located/project".into(),
+                reason: "Recover the original provider or close this pane explicitly".into(),
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::from_slice::<WorkspaceModel>(&serde_json::to_vec(&model).unwrap()).unwrap(),
+            model
+        );
+        assert_eq!(
+            postcard::from_bytes::<WorkspaceModel>(&postcard::to_stdvec(&model).unwrap()).unwrap(),
+            model
+        );
         let mut legacy = serde_json::to_value(&model).unwrap();
-        legacy.as_object_mut().unwrap().remove("session_location_refusals");
-        assert!(serde_json::from_value::<WorkspaceModel>(legacy).unwrap().session_location_refusals.is_empty());
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("session_location_refusals");
+        assert!(
+            serde_json::from_value::<WorkspaceModel>(legacy)
+                .unwrap()
+                .session_location_refusals
+                .is_empty()
+        );
     }
 
     #[test]
@@ -737,7 +816,8 @@ mod tests {
             Some(Path::new("/checkouts/project"))
         );
         assert_eq!(model.projects[0].ordinal, 7);
-        assert_eq!(model.projects[0].name, "renamed");    }
+        assert_eq!(model.projects[0].name, "renamed");
+    }
 
     #[test]
     fn prompt_names_skip_attached_context_and_preserve_word_boundaries() {

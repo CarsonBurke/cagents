@@ -33,7 +33,10 @@ pub enum ModelUpdate {
     Connected(WorkspaceModel),
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
-    Relocated { relocation: crate::project_recovery::Relocation, model: WorkspaceModel },
+    Relocated {
+        relocation: crate::project_recovery::Relocation,
+        model: WorkspaceModel,
+    },
     Reopened {
         repository: PathBuf,
         model: WorkspaceModel,
@@ -122,8 +125,12 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
             continue;
         }
         if let ModelEdit::RelocateProject { relocation } = edit {
-            let model = client.read_workspace_model().map_err(|error| error.to_string())?;
-            sender.send_blocking(ModelUpdate::Relocated { relocation, model }).map_err(|error| error.to_string())?;
+            let model = client
+                .read_workspace_model()
+                .map_err(|error| error.to_string())?;
+            sender
+                .send_blocking(ModelUpdate::Relocated { relocation, model })
+                .map_err(|error| error.to_string())?;
             continue;
         }
         let ranked = matches!(
@@ -446,7 +453,11 @@ impl Cagents {
                 Task::batch([closed, self.reconcile_workspace_model()])
             }
             ModelUpdate::Relocated { relocation, model } => {
-                if model.identity != self.workspace_model.identity || model.sequence < self.workspace_model.sequence { return Task::none(); }
+                if model.identity != self.workspace_model.identity
+                    || model.sequence < self.workspace_model.sequence
+                {
+                    return Task::none();
+                }
                 self.workspace_model = model;
                 let relocated = self.apply_project_relocation(&relocation);
                 let closed = self.apply_closed_project_tombstones();
@@ -495,7 +506,10 @@ impl Cagents {
                     _ => None,
                 };
                 let closing = match &edit {
-                    ModelEdit::CloseProject { repository } | ModelEdit::CloseProjectInstance { project: crate::project_recovery::ProjectInstance { repository, .. } } => Some(repository.clone()),
+                    ModelEdit::CloseProject { repository }
+                    | ModelEdit::CloseProjectInstance {
+                        project: crate::project_recovery::ProjectInstance { repository, .. },
+                    } => Some(repository.clone()),
                     ModelEdit::ReopenProject { repository, .. } => {
                         self.cancel_shared_project_close(repository);
                         self.project_ui.closed.remove(repository);
@@ -510,7 +524,9 @@ impl Cagents {
                 self.workspace_model.fold(sequence, &edit);
                 let relocation = if let ModelEdit::RelocateProject { relocation } = &edit {
                     self.apply_project_relocation(relocation)
-                } else { Task::none() };
+                } else {
+                    Task::none()
+                };
                 let removed = closing.map_or_else(Task::none, |repository| {
                     self.close_shared_project(&repository)
                 });
@@ -527,7 +543,12 @@ impl Cagents {
                     }
                     self.retire_peer_channel(id)
                 });
-                Task::batch([relocation, removed, retired, self.reconcile_workspace_model()])
+                Task::batch([
+                    relocation,
+                    removed,
+                    retired,
+                    self.reconcile_workspace_model(),
+                ])
             }
             ModelUpdate::Ranked { channel, ordinal } => {
                 let Some(index) = self
@@ -576,9 +597,13 @@ impl Cagents {
             })
             .cloned()
             .collect::<Vec<_>>();
-        Task::batch(std::iter::once(relocated).chain(
-            closed.into_iter().map(|repository| self.close_shared_project(&repository)),
-        ))
+        Task::batch(
+            std::iter::once(relocated).chain(
+                closed
+                    .into_iter()
+                    .map(|repository| self.close_shared_project(&repository)),
+            ),
+        )
     }
 
     /// Settles what this window has shared with the registry it just reached.
@@ -813,7 +838,13 @@ impl Cagents {
         durable.cards.push(card.clone());
         let scope_path = match &agent.placement {
             crate::agent_execution::Placement::Worktree { path, .. } => path.clone(),
-            crate::agent_execution::Placement::Channel(_) => self.workspace_model.agent_locations.iter().find(|location| location.agent == agent.id).map(|location| location.logical_directory().to_path_buf()).unwrap_or_else(|| agent.spec.target.directory.clone()),
+            crate::agent_execution::Placement::Channel(_) => self
+                .workspace_model
+                .agent_locations
+                .iter()
+                .find(|location| location.agent == agent.id)
+                .map(|location| location.logical_directory().to_path_buf())
+                .unwrap_or_else(|| agent.spec.target.directory.clone()),
         };
         durable.card_scopes.insert(card_id, scope_path.clone());
         if let Some(index) = channel_index {
@@ -959,7 +990,8 @@ impl Cagents {
             if needs_checkout_read
                 || (crate::device::is_remote()
                     && !self.workspace_model_opens.contains(&shared.repository))
-            {                return Adoption::Opening(self.project_load_task(
+            {
+                return Adoption::Opening(self.project_load_task(
                     shared.repository.clone(),
                     Some(project_id),
                     false,

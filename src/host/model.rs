@@ -26,8 +26,8 @@ use crate::{
 
 mod agent_locations;
 mod session_locations;
+pub(crate) use agent_locations::{AgentMove, Location as AgentLocation};
 pub(crate) use session_locations::{Location as SessionLocation, SessionMove};
-pub(crate) use agent_locations::{Location as AgentLocation, AgentMove};
 mod automation_proposals;
 mod automations;
 pub(super) use automations::Claimed;
@@ -35,9 +35,9 @@ mod execution;
 mod lineage;
 mod mailbox;
 mod navigation;
-mod relocation;
 mod project_checkout;
 mod project_instances;
+mod relocation;
 mod terminal_owners;
 mod views;
 
@@ -103,7 +103,10 @@ impl Registry {
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
         // Writers commit independently of HostState. One read transaction
         // keeps metadata, views and agents on the same WAL snapshot.
-        let transaction = self.db.unchecked_transaction().map_err(|error| error.to_string())?;
+        let transaction = self
+            .db
+            .unchecked_transaction()
+            .map_err(|error| error.to_string())?;
         let (identity, sequence) = self
             .db
             .query_row(
@@ -230,21 +233,39 @@ impl Registry {
         self.apply_with_session_moves(edit, &[])
     }
 
-    pub(crate) fn apply_with_session_moves(&mut self, edit: &ModelEdit, moves: &[SessionMove]) -> Result<Applied, String> {
+    pub(crate) fn apply_with_session_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+    ) -> Result<Applied, String> {
         // Direct registry users own no HostState lock. The live host route uses
         // apply_with_location_moves with evidence prepared outside every lock.
         let agent_moves = if let ModelEdit::RelocateProject { relocation } = edit {
-            self.agent_relocation_inputs(relocation)?.into_iter().map(|input| input.verify()).collect::<Vec<_>>()
-        } else { Vec::new() };
+            self.agent_relocation_inputs(relocation)?
+                .into_iter()
+                .map(|input| input.verify())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
         self.apply_with_location_moves(edit, moves, &agent_moves)
     }
 
-    pub(crate) fn apply_with_location_moves(&mut self, edit: &ModelEdit, moves: &[SessionMove], agent_moves: &[AgentMove]) -> Result<Applied, String> {
+    pub(crate) fn apply_with_location_moves(
+        &mut self,
+        edit: &ModelEdit,
+        moves: &[SessionMove],
+        agent_moves: &[AgentMove],
+    ) -> Result<Applied, String> {
         if !moves.is_empty() && !matches!(edit, ModelEdit::RelocateProject { .. }) {
-            return Err("Session directory proofs may only accompany their project relocation".into());
+            return Err(
+                "Session directory proofs may only accompany their project relocation".into(),
+            );
         }
         if let ModelEdit::RelocateProject { relocation } = edit
-            && moves.iter().any(|movement| movement.repository != relocation.destination)
+            && moves
+                .iter()
+                .any(|movement| movement.repository != relocation.destination)
         {
             return Err("Session proofs do not belong to the requested destination project".into());
         }
@@ -442,8 +463,19 @@ impl Registry {
         };
         if !moves.is_empty() {
             if let ModelEdit::RelocateProject { relocation } = edit {
-                let open: bool = transaction.query_row("SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)", [repository_key(&relocation.destination)?], |row| row.get(0)).map_err(|error| error.to_string())?;
-                if !open { return Err("The located project is no longer open; no session authority changed".into()); }
+                let open: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM projects WHERE repository=?1)",
+                        [repository_key(&relocation.destination)?],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| error.to_string())?;
+                if !open {
+                    return Err(
+                        "The located project is no longer open; no session authority changed"
+                            .into(),
+                    );
+                }
             }
             session_locations::apply(&transaction, moves)?;
         }
@@ -707,16 +739,34 @@ mod tests {
         let mut registry = Registry::at(&path).unwrap();
         registry.apply(&open("/metadata/project.git")).unwrap();
         registry.db.execute("UPDATE projects SET checkout='/checkout/project',primary_checkout='/checkout/primary'", []).unwrap();
-        registry.db.execute_batch("DROP TABLE agent_locations; DROP TABLE session_locations; PRAGMA user_version=13;").unwrap();
+        registry
+            .db
+            .execute_batch(
+                "DROP TABLE agent_locations; DROP TABLE session_locations; PRAGMA user_version=13;",
+            )
+            .unwrap();
         drop(registry);
         let registry = Registry::at(&path).unwrap();
         for table in ["agent_locations", "session_locations"] {
-            let exists: bool = registry.db.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)", [table], |row| row.get(0)).unwrap();
+            let exists: bool = registry
+                .db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1)",
+                    [table],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert!(exists, "{table}");
         }
         let model = registry.model().unwrap();
-        assert_eq!(model.projects[0].checkout.as_deref(), Some(Path::new("/checkout/project")));
-        assert_eq!(model.projects[0].primary_checkout.as_deref(), Some(Path::new("/checkout/primary")));
+        assert_eq!(
+            model.projects[0].checkout.as_deref(),
+            Some(Path::new("/checkout/project"))
+        );
+        assert_eq!(
+            model.projects[0].primary_checkout.as_deref(),
+            Some(Path::new("/checkout/primary"))
+        );
     }
 
     #[test]

@@ -15,7 +15,11 @@ pub(crate) struct DirectoryProof {
 impl DirectoryProof {
     /// The caller must have obtained this exact process from an authenticated
     /// original holder or retained child, never by rediscovering a numeric ID.
-    pub(crate) fn capture_owned_process(process: &Process, candidate: &Path, approved: Option<DirectoryIdentity>) -> Result<Self, String> {
+    pub(crate) fn capture_owned_process(
+        process: &Process,
+        candidate: &Path,
+        approved: Option<DirectoryIdentity>,
+    ) -> Result<Self, String> {
         prove(process, candidate, approved)
     }
 }
@@ -23,11 +27,18 @@ impl DirectoryProof {
 impl Handle {
     /// A completed actor cannot prove a live cwd, but its still-open original
     /// directory descriptor can authorize an explicit replacement session.
-    pub(crate) fn pinned_execution_directory(&self, candidate: &Path) -> Result<Arc<super::super::protocol::ExecutionContext>, String> {
+    pub(crate) fn pinned_execution_directory(
+        &self,
+        candidate: &Path,
+    ) -> Result<Arc<super::super::protocol::ExecutionContext>, String> {
         let original = self.0.pinned_directory.lock().unwrap_or_else(|p| p.into_inner()).clone()
             .ok_or("The completed provider has no retained approved directory descriptor; recover its original context or create a new session explicitly")?;
-        let identity = DirectoryIdentity::from_metadata(&original.metadata().map_err(|error| error.to_string())?);
-        let candidate = Arc::new(super::super::protocol::ExecutionContext::capture(candidate)?);
+        let identity = DirectoryIdentity::from_metadata(
+            &original.metadata().map_err(|error| error.to_string())?,
+        );
+        let candidate = Arc::new(super::super::protocol::ExecutionContext::capture(
+            candidate,
+        )?);
         if candidate.directory_identity()? != Some(identity) {
             return Err("The completed provider's original directory was replaced; its approval cannot transfer to this folder".into());
         }
@@ -36,16 +47,32 @@ impl Handle {
     /// Call outside HostState: this is serialized with the owning actor and
     /// may wait behind provider work. An unavailable proof never authorizes a
     /// guessed relocation or a replacement provider.
-    pub(crate) fn capture_execution_directory(&self, candidate: &Path) -> Result<DirectoryProof, String> {
-        if self.is_completed() || self.0.draining.load(Ordering::Acquire) || self.0.stop.load(Ordering::Acquire) {
-            return Err("The original provider actor has stopped; its directory cannot be relocated".into());
+    pub(crate) fn capture_execution_directory(
+        &self,
+        candidate: &Path,
+    ) -> Result<DirectoryProof, String> {
+        if self.is_completed()
+            || self.0.draining.load(Ordering::Acquire)
+            || self.0.stop.load(Ordering::Acquire)
+        {
+            return Err(
+                "The original provider actor has stopped; its directory cannot be relocated".into(),
+            );
         }
         let (proof, response) = crossbeam_channel::bounded(1);
         let (reply, _) = crossbeam_channel::bounded(1);
-        self.0.commands.try_send((ActorCommand::CaptureExecutionDirectory {
-            directory: candidate.to_owned(),
-            proof,
-        }, reply)).map_err(|error| format!("Provider directory verification queue unavailable: {error}"))?;
+        self.0
+            .commands
+            .try_send((
+                ActorCommand::CaptureExecutionDirectory {
+                    directory: candidate.to_owned(),
+                    proof,
+                },
+                reply,
+            ))
+            .map_err(|error| {
+                format!("Provider directory verification queue unavailable: {error}")
+            })?;
         self.wake();
         response.recv_timeout(Duration::from_secs(2))
             .map_err(|_| "The provider did not return a directory ownership proof; retry Locate after it is ready".to_owned())?
@@ -56,7 +83,11 @@ fn owned_process(actor: &Actor) -> Result<Process, String> {
     if let Some(child) = &actor.child {
         // The retained pidfd is tied to this Child, including after numeric
         // PID reuse. An exited process cannot establish a current cwd proof.
-        let mut descriptor = libc::pollfd { fd: child.identity.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+        let mut descriptor = libc::pollfd {
+            fd: child.identity.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
         let ready = unsafe { libc::poll(&mut descriptor, 1, 0) };
         if ready != 0 {
             return Err("The original provider process has exited or cannot be verified; its directory was not relocated".into());
@@ -70,49 +101,76 @@ fn owned_process(actor: &Actor) -> Result<Process, String> {
 
 fn cwd(process: &Process) -> Result<File, String> {
     if !process.is_current() {
-        return Err("The provider process incarnation changed; its directory was not relocated".into());
+        return Err(
+            "The provider process incarnation changed; its directory was not relocated".into(),
+        );
     }
-    std::fs::OpenOptions::new().read(true)
+    std::fs::OpenOptions::new()
+        .read(true)
         .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
         .open(format!("/proc/{}/cwd", process.pid))
         .map_err(|error| format!("Cannot verify the original provider working directory: {error}"))
 }
 
-fn prove(process: &Process, candidate: &Path, approved: Option<DirectoryIdentity>) -> Result<DirectoryProof, String> {
+fn prove(
+    process: &Process,
+    candidate: &Path,
+    approved: Option<DirectoryIdentity>,
+) -> Result<DirectoryProof, String> {
     let original = cwd(process)?;
-    let identity = DirectoryIdentity::from_metadata(&original.metadata().map_err(|error| error.to_string())?);
+    let identity =
+        DirectoryIdentity::from_metadata(&original.metadata().map_err(|error| error.to_string())?);
     if approved.is_some_and(|approved| approved != identity) {
         return Err("The provider no longer occupies its approved directory; close it before locating a replacement folder".into());
     }
     let candidate_context = super::super::protocol::ExecutionContext::capture(candidate)?;
     if candidate_context.directory_identity()? != Some(identity) {
-        return Err(format!("{} is a different directory from the original provider process; close this session and start a new one for the replacement folder", candidate.display()));
+        return Err(format!(
+            "{} is a different directory from the original provider process; close this session and start a new one for the replacement folder",
+            candidate.display()
+        ));
     }
     let after = cwd(process)?;
-    if DirectoryIdentity::from_metadata(&after.metadata().map_err(|error| error.to_string())?) != identity
+    if DirectoryIdentity::from_metadata(&after.metadata().map_err(|error| error.to_string())?)
+        != identity
         || !process.is_current()
     {
-        return Err("The provider working directory changed during Locate; retry after it is stable".into());
+        return Err(
+            "The provider working directory changed during Locate; retry after it is stable".into(),
+        );
     }
     Ok(DirectoryProof {
-        process: process.clone(), identity,
-        directory: candidate_context.directory.expect("capture always retains the opened directory"),
+        process: process.clone(),
+        identity,
+        directory: candidate_context
+            .directory
+            .expect("capture always retains the opened directory"),
         path: candidate.to_owned(),
     })
 }
 
 pub(super) fn capture(actor: &mut Actor, candidate: &Path) -> Result<DirectoryProof, String> {
     let process = owned_process(actor)?;
-    let approved = actor.launch_context.as_ref().map(|context| context.directory_identity()).transpose()?.flatten();
+    let approved = actor
+        .launch_context
+        .as_ref()
+        .map(|context| context.directory_identity())
+        .transpose()?
+        .flatten();
     let proof = prove(&process, candidate, approved)?;
     if let Some(context) = &actor.launch_context {
         context.pin_owned_directory(proof.directory.clone())?;
     } else {
         // A legacy actor may acquire a pin only from its positively identified
         // live cwd. This changes no issued recipe or operational path.
-        actor.launch_context = Some(Arc::new(super::super::protocol::ExecutionContext::new(Some(proof.directory.clone()))));
+        actor.launch_context = Some(Arc::new(super::super::protocol::ExecutionContext::new(
+            Some(proof.directory.clone()),
+        )));
     }
-    *actor.pinned_directory.lock().unwrap_or_else(|p| p.into_inner()) = Some(proof.directory.clone());
+    *actor
+        .pinned_directory
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = Some(proof.directory.clone());
     Ok(proof)
 }
 
@@ -135,18 +193,38 @@ mod tests {
         let moved = root.path().join("moved");
         std::fs::create_dir(&original).unwrap();
         let expected = DirectoryIdentity::from_metadata(&std::fs::metadata(&original).unwrap());
-        let child = Running(std::process::Command::new("/bin/sleep").arg("30").current_dir(&original).spawn().unwrap());
+        let child = Running(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .current_dir(&original)
+                .spawn()
+                .unwrap(),
+        );
         let process = Process::read(child.0.id() as i32).unwrap();
         std::fs::rename(&original, &moved).unwrap();
         std::fs::create_dir(&original).unwrap();
         let proof = prove(&process, &moved, Some(expected)).unwrap();
         assert_eq!(proof.identity, expected);
-        assert_eq!(DirectoryIdentity::from_metadata(&proof.directory.metadata().unwrap()), expected);
-        assert!(prove(&process, &original, Some(expected)).unwrap_err().contains("different directory"));
-        assert!(original.is_dir(), "refusal preserves the replacement folder");
+        assert_eq!(
+            DirectoryIdentity::from_metadata(&proof.directory.metadata().unwrap()),
+            expected
+        );
+        assert!(
+            prove(&process, &original, Some(expected))
+                .unwrap_err()
+                .contains("different directory")
+        );
+        assert!(
+            original.is_dir(),
+            "refusal preserves the replacement folder"
+        );
         let mut reused_process = process;
         reused_process.start = reused_process.start.saturating_add(1);
-        assert!(prove(&reused_process, &moved, Some(expected)).unwrap_err().contains("incarnation changed"));
+        assert!(
+            prove(&reused_process, &moved, Some(expected))
+                .unwrap_err()
+                .contains("incarnation changed")
+        );
     }
 
     #[test]
@@ -156,12 +234,22 @@ mod tests {
         let replacement = root.path().join("replacement");
         std::fs::create_dir(&actual).unwrap();
         std::fs::create_dir(&replacement).unwrap();
-        let child = Running(std::process::Command::new("/bin/sleep").arg("30").current_dir(&actual).spawn().unwrap());
+        let child = Running(
+            std::process::Command::new("/bin/sleep")
+                .arg("30")
+                .current_dir(&actual)
+                .spawn()
+                .unwrap(),
+        );
         let process = Process::read(child.0.id() as i32).unwrap();
         assert!(prove(&process, &actual, None).is_ok());
         assert!(prove(&process, &replacement, None).is_err());
         let wrong = DirectoryIdentity::from_metadata(&std::fs::metadata(&replacement).unwrap());
-        assert!(prove(&process, &actual, Some(wrong)).unwrap_err().contains("approved directory"));
+        assert!(
+            prove(&process, &actual, Some(wrong))
+                .unwrap_err()
+                .contains("approved directory")
+        );
     }
 
     #[test]
@@ -169,7 +257,10 @@ mod tests {
         use super::super::super::protocol::{ExecutionContext, LaunchCleanup, LaunchOutcome};
         struct Cleanup(Arc<std::sync::atomic::AtomicUsize>);
         impl LaunchCleanup for Cleanup {
-            fn cleanup(&self) -> Result<LaunchOutcome,String> { self.0.fetch_add(1, Ordering::SeqCst); Ok(LaunchOutcome::TeardownProved) }
+            fn cleanup(&self) -> Result<LaunchOutcome, String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(LaunchOutcome::TeardownProved)
+            }
         }
         let fixture = tempfile::tempdir().unwrap();
         let context = Arc::new(ExecutionContext::new(None));
@@ -177,11 +268,25 @@ mod tests {
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         context.claim_owner(Arc::new(Cleanup(calls.clone())));
         let pinned = ExecutionContext::capture(fixture.path()).unwrap();
-        context.pin_owned_directory(pinned.directory.unwrap()).unwrap();
+        context
+            .pin_owned_directory(pinned.directory.unwrap())
+            .unwrap();
         assert!(other_owner.directory_identity().unwrap().is_some());
-        assert_eq!(other_owner.reconcile_cleanup().unwrap(), LaunchOutcome::TeardownProved);
+        assert_eq!(
+            other_owner.reconcile_cleanup().unwrap(),
+            LaunchOutcome::TeardownProved
+        );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         let replacement = tempfile::tempdir().unwrap();
-        assert!(context.pin_owned_directory(ExecutionContext::capture(replacement.path()).unwrap().directory.unwrap()).is_err());
+        assert!(
+            context
+                .pin_owned_directory(
+                    ExecutionContext::capture(replacement.path())
+                        .unwrap()
+                        .directory
+                        .unwrap()
+                )
+                .is_err()
+        );
     }
 }

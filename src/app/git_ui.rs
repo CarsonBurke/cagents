@@ -434,7 +434,13 @@ impl Cagents {
     }
 
     fn start_git_reads(&mut self) -> Task<Message> {
-        let missing = self.sidebar_model.projects.iter().filter(|project| project.missing).map(|project| project.id).collect::<HashSet<_>>();
+        let missing = self
+            .sidebar_model
+            .projects
+            .iter()
+            .filter(|project| project.missing)
+            .map(|project| project.id)
+            .collect::<HashSet<_>>();
         let state = &mut self.refresh_ui.git;
         let mut running = state
             .entries
@@ -451,7 +457,10 @@ impl Cagents {
             let Some(entry) = state.entries.get_mut(&project) else {
                 continue;
             };
-            if missing.contains(&project) { entry.pending = git_watch::Change::default(); continue; }
+            if missing.contains(&project) {
+                entry.pending = git_watch::Change::default();
+                continue;
+            }
             if entry.cancellation.is_some() {
                 state.queue.push_back(project);
                 continue;
@@ -773,14 +782,35 @@ mod tests {
         let snapshot = fixture(&parent.path().join("repo"));
         let id = ProjectId::new();
         let mut app = super::super::tests::context_inspector_test_app(false);
-        let mut row = SidebarProject::new(id, snapshot.repository.id, "Missing".into(), snapshot.repository.common_dir.clone(), Vec::new(), Vec::new());
+        let mut row = SidebarProject::new(
+            id,
+            snapshot.repository.id,
+            "Missing".into(),
+            snapshot.repository.common_dir.clone(),
+            Vec::new(),
+            Vec::new(),
+        );
         row.missing = true;
         app.sidebar_model.projects.push(row);
-        app.refresh_ui.git.entries.insert(id, Entry {
-            snapshot, generation: 1, plan: None, archived: Vec::new(), remote_started: false,
-            cancellation: None, pending: git_watch::Change { topology: true, ..Default::default() },
-            fallback: None, read_failure: None, read_full_scan: false, last_full_scan: Instant::now(),
-        });
+        app.refresh_ui.git.entries.insert(
+            id,
+            Entry {
+                snapshot,
+                generation: 1,
+                plan: None,
+                archived: Vec::new(),
+                remote_started: false,
+                cancellation: None,
+                pending: git_watch::Change {
+                    topology: true,
+                    ..Default::default()
+                },
+                fallback: None,
+                read_failure: None,
+                read_full_scan: false,
+                last_full_scan: Instant::now(),
+            },
+        );
         app.refresh_ui.git.queue.push_back(id);
         drop(app.start_git_reads());
         assert!(app.refresh_ui.git.entries[&id].cancellation.is_none());

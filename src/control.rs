@@ -1014,15 +1014,25 @@ impl ControlClient {
     /// Close the exact source and worker returned by inventory. This does not
     /// attach by ID first: attachment could resolve a replacement before the
     /// source check and needlessly change its presentation state.
-    pub fn project_close_inventory(&mut self, project: crate::project_recovery::ProjectInstance) -> Result<Vec<crate::project_recovery::SessionClose>, ControlError> {
+    pub fn project_close_inventory(
+        &mut self,
+        project: crate::project_recovery::ProjectInstance,
+    ) -> Result<Vec<crate::project_recovery::SessionClose>, ControlError> {
         match self.request_strict(ClientRequest::ProjectCloseInventory { project })? {
             ServerResponse::ProjectCloseInventory { sessions } => Ok(sessions),
             response => Err(unexpected_response("project removal inventory", &response)),
         }
     }
 
-    pub fn close_project_guarded(&mut self, project: crate::project_recovery::ProjectInstance, sessions: Vec<crate::project_recovery::SessionClose>) -> Result<WorkspaceModel, ControlError> {
-        match self.request_with_deadline(ClientRequest::CloseProjectGuarded { project, sessions }, Instant::now() + Duration::from_secs(75))? {
+    pub fn close_project_guarded(
+        &mut self,
+        project: crate::project_recovery::ProjectInstance,
+        sessions: Vec<crate::project_recovery::SessionClose>,
+    ) -> Result<WorkspaceModel, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::CloseProjectGuarded { project, sessions },
+            Instant::now() + Duration::from_secs(75),
+        )? {
             ServerResponse::WorkspaceModel { model } => Ok(model),
             response => Err(unexpected_response("guarded project removal", &response)),
         }
@@ -1036,11 +1046,21 @@ impl ControlClient {
     ) -> Result<terminal::ipc::TerminalCloseResult, ControlError> {
         let id = source.id;
         match self.request_with_deadline(
-            ClientRequest::CloseTerminalSourceChecked { source, execution_instance, allow_active },
+            ClientRequest::CloseTerminalSourceChecked {
+                source,
+                execution_instance,
+                allow_active,
+            },
             Instant::now() + CHAT_CLOSE_TIMEOUT,
         )? {
-            ServerResponse::TerminalCloseChecked { terminal_id, outcome } if terminal_id == id => Ok(outcome),
-            response => Err(unexpected_response("a source-checked terminal close", &response)),
+            ServerResponse::TerminalCloseChecked {
+                terminal_id,
+                outcome,
+            } if terminal_id == id => Ok(outcome),
+            response => Err(unexpected_response(
+                "a source-checked terminal close",
+                &response,
+            )),
         }
     }
 

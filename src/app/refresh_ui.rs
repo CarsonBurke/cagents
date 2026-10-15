@@ -230,7 +230,8 @@ impl Cagents {
         tasks.push(self.commit_terminal_handoffs());
         let missing_cards = self.missing_project_cards();
         for (&card, runtime) in &mut self.cards {
-            if !missing_cards.contains(&card) && self.workspace.visibility(card) == Some(VisibilityClass::Visible)
+            if !missing_cards.contains(&card)
+                && self.workspace.visibility(card) == Some(VisibilityClass::Visible)
                 && let CardRuntime::Repository(runtime) = runtime
             {
                 tasks.push(repository_task(runtime.refresh_visible(card)));

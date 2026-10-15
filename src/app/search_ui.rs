@@ -70,14 +70,29 @@ impl Cagents {
         self.schedule_project_search()
     }
 
-    pub(super) fn project_search_availability_changed(&mut self, project: ProjectId) -> Task<Message> {
-        if self.search_ui.root.as_ref().is_some_and(|root| root.project_id == project) {
+    pub(super) fn project_search_availability_changed(
+        &mut self,
+        project: ProjectId,
+    ) -> Task<Message> {
+        if self
+            .search_ui
+            .root
+            .as_ref()
+            .is_some_and(|root| root.project_id == project)
+        {
             self.schedule_project_search()
-        } else { Task::none() }
+        } else {
+            Task::none()
+        }
     }
 
     pub(super) fn invalidate_project_search(&mut self, project: ProjectId) {
-        if self.search_ui.root.as_ref().is_some_and(|root| root.project_id == project) {
+        if self
+            .search_ui
+            .root
+            .as_ref()
+            .is_some_and(|root| root.project_id == project)
+        {
             self.search_ui.root = None;
             drop(self.schedule_project_search());
         }
@@ -94,8 +109,14 @@ impl Cagents {
         self.search_ui.error = None;
         self.search_ui.capped = false;
         self.search_ui.skipped = 0;
-        let missing = self.search_ui.root.as_ref().is_some_and(|root| self.project_missing(root.project_id));
-        if missing { self.search_ui.error = Some("This project folder was moved or deleted. Locate it from Projects to search again.".into()); }
+        let missing = self
+            .search_ui
+            .root
+            .as_ref()
+            .is_some_and(|root| self.project_missing(root.project_id));
+        if missing {
+            self.search_ui.error = Some("This project folder was moved or deleted. Locate it from Projects to search again.".into());
+        }
         self.search_ui.running = self.context_tab == ContextTab::Search
             && !missing
             && self.search_ui.root.is_some()
@@ -149,7 +170,9 @@ impl Cagents {
                 let Some(root) = self.search_ui.root.clone() else {
                     return Task::none();
                 };
-                if self.project_missing(root.project_id) { return Task::none(); }
+                if self.project_missing(root.project_id) {
+                    return Task::none();
+                }
                 let options = self.search_ui.options.clone();
                 let token = CancellationToken::default();
                 self.search_ui.cancel = Some(token.clone());
@@ -288,7 +311,9 @@ impl Cagents {
                     return Task::none();
                 };
                 if self.project_missing(root.project_id) {
-                    self.status = Some(TransientNotice::warning("Locate this missing project before opening a search result."));
+                    self.status = Some(TransientNotice::warning(
+                        "Locate this missing project before opening a search result.",
+                    ));
                     return Task::none();
                 }
                 let Some(matched) = self.search_ui.matches.get(index).cloned() else {
@@ -565,7 +590,12 @@ mod tests {
         app.sidebar_model = sidebar::tests::panel_model();
         app.sidebar_state = sidebar::tests::panel_state(&app.sidebar_model);
         let root = app.sidebar_state.active_worktree().unwrap().clone();
-        let repository = app.sidebar_model.project(root.project_id).unwrap().repository.clone();
+        let repository = app
+            .sidebar_model
+            .project(root.project_id)
+            .unwrap()
+            .repository
+            .clone();
         app.search_ui.root = Some(root.clone());
         app.context_tab = ContextTab::Search;
         app.search_ui.options.query = "needle".into();
@@ -573,16 +603,44 @@ mod tests {
         let generation = app.search_ui.generation;
         let token = CancellationToken::default();
         app.search_ui.cancel = Some(token.clone());
-        drop(app.update_project_recovery(super::project_recovery_ui::Action::Checked(vec![(root.project_id, repository.clone(), Some("missing".into()))])));
+        drop(
+            app.update_project_recovery(super::project_recovery_ui::Action::Checked(vec![(
+                root.project_id,
+                repository.clone(),
+                Some("missing".into()),
+            )])),
+        );
         assert!(token.is_cancelled());
         assert!(!app.search_ui.running);
-        assert!(app.search_ui.error.as_deref().is_some_and(|error| error.contains("Locate")));
-        let matched = project_search::Match { path: "file.rs".into(), line: 0, column: 0, length: 6, snippet: "needle".into(), highlight: 0..6 };
-        drop(app.update_project_search(Action::Progress { root: root.clone(), generation, progress: Progress::Batch(vec![matched]) }));
+        assert!(
+            app.search_ui
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Locate"))
+        );
+        let matched = project_search::Match {
+            path: "file.rs".into(),
+            line: 0,
+            column: 0,
+            length: 6,
+            snippet: "needle".into(),
+            highlight: 0..6,
+        };
+        drop(app.update_project_search(Action::Progress {
+            root: root.clone(),
+            generation,
+            progress: Progress::Batch(vec![matched]),
+        }));
         assert!(app.search_ui.matches.is_empty());
         drop(app.update_project_search(Action::Query("updated needle".into())));
         assert!(!app.search_ui.running);
-        drop(app.update_project_recovery(super::project_recovery_ui::Action::Checked(vec![(root.project_id, repository, None)])));
+        drop(
+            app.update_project_recovery(super::project_recovery_ui::Action::Checked(vec![(
+                root.project_id,
+                repository,
+                None,
+            )])),
+        );
         assert!(app.search_ui.running);
         assert!(app.search_ui.error.is_none());
         assert_eq!(app.search_ui.options.query, "updated needle");
