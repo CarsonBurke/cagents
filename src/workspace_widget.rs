@@ -74,6 +74,7 @@ pub enum GlobalShortcut {
     CloseFocusedCard,
     FocusProjectSearch,
     FindInPane,
+    TerminalReview,
     FocusAdjacent(FocusDirection),
     CyclePaneWidth,
     /// Moves between the top-level workspaces: every project's worktrees and
@@ -108,6 +109,7 @@ pub enum ShortcutScope {
     Review,
     /// Only in a native chat pane; other panes retain the configured keys.
     Chat,
+    Terminal,
 }
 
 impl ShortcutScope {
@@ -119,6 +121,7 @@ impl ShortcutScope {
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => focused == FocusedPane::Chat,
+            Self::Terminal => focused == FocusedPane::Terminal,
         }
     }
 }
@@ -153,6 +156,12 @@ pub struct ShortcutDescriptor {
 pub const HOVER_ACTIVATION_DWELL: Duration = Duration::from_millis(300);
 
 pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
+    ShortcutDescriptor {
+        action: GlobalShortcut::TerminalReview,
+        label: "Toggle terminal text review",
+        repeatable: false,
+        scope: ShortcutScope::Terminal,
+    },
     ShortcutDescriptor {
         action: GlobalShortcut::ChatPermissions,
         label: "Choose chat permission mode",
@@ -420,6 +429,7 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::CloseFocusedCard => &shortcuts.close_focused_column,
         GlobalShortcut::FocusProjectSearch => &shortcuts.search_projects,
         GlobalShortcut::FindInPane => &shortcuts.find_in_pane,
+        GlobalShortcut::TerminalReview => &shortcuts.terminal_review,
         GlobalShortcut::FocusAdjacent(FocusDirection::Left) => &shortcuts.previous_column,
         GlobalShortcut::FocusAdjacent(FocusDirection::Right) => &shortcuts.next_column,
         GlobalShortcut::CyclePaneWidth => &shortcuts.cycle_pane_width,

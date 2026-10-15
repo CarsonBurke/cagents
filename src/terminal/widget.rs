@@ -1394,6 +1394,9 @@ pub struct TerminalWidget<Message> {
     review_input_barrier: ReviewInputBarrier,
     suppress_focus_reports: bool,
     review_active: bool,
+    assistive_technology_active: bool,
+    always_show_review_bar: bool,
+    review_shortcuts: Vec<crate::settings::ShortcutBinding>,
     review_revision: u64,
     on_review: Option<Box<dyn Fn(bool) -> Message>>,
     terminal_identity: crate::model::TerminalId,
@@ -1406,6 +1409,7 @@ pub struct TerminalWidget<Message> {
     padding: f32,
     scroll_size: isize,
     scroll_speed: f32,
+    scroll_to_bottom_on_input: bool,
     cursor_style: TerminalCursorStyle,
     scale_factor: f32,
     model_focused: bool,
@@ -1450,6 +1454,9 @@ impl<Message> TerminalWidget<Message> {
             review_input_barrier: ReviewInputBarrier::default(),
             suppress_focus_reports: false,
             review_active: false,
+            assistive_technology_active: false,
+            always_show_review_bar: false,
+            review_shortcuts: Vec::new(),
             review_revision: 0,
             on_review: None,
             terminal_identity,
@@ -1462,6 +1469,7 @@ impl<Message> TerminalWidget<Message> {
             padding: DEFAULT_PADDING,
             scroll_size: DEFAULT_ROWS_PER_WHEEL_NOTCH,
             scroll_speed: 1.0,
+            scroll_to_bottom_on_input: true,
             cursor_style: TerminalCursorStyle::default(),
             scale_factor: 1.0,
             model_focused: false,
@@ -1517,6 +1525,11 @@ impl<Message> TerminalWidget<Message> {
         self
     }
 
+    pub fn scroll_to_bottom_on_input(mut self, enabled: bool) -> Self {
+        self.scroll_to_bottom_on_input = enabled;
+        self
+    }
+
     /// Names the input surface for focus handoffs from tabs and other panes.
     pub(crate) fn review_boundary(
         mut self,
@@ -1566,8 +1579,27 @@ impl<Message> TerminalWidget<Message> {
         }
     }
 
-    fn grid_bounds(bounds: Rectangle) -> Rectangle {
-        let height = REVIEW_BAR_HEIGHT.min(bounds.height);
+    pub fn review_shortcuts(mut self, chords: &[String]) -> Self {
+        self.review_shortcuts = chords
+            .iter()
+            .filter_map(|chord| crate::settings::parse_shortcut(chord).ok())
+            .collect();
+        self
+    }
+    pub fn review_bar(mut self, assistive_technology_active: bool, always_show: bool) -> Self {
+        self.assistive_technology_active = assistive_technology_active;
+        self.always_show_review_bar = always_show;
+        self
+    }
+    fn review_bar_visible(&self) -> bool {
+        self.assistive_technology_active || self.always_show_review_bar || self.review_active
+    }
+    fn grid_bounds(&self, bounds: Rectangle) -> Rectangle {
+        let height = if self.review_bar_visible() {
+            REVIEW_BAR_HEIGHT.min(bounds.height)
+        } else {
+            0.0
+        };
         Rectangle {
             y: bounds.y + height,
             height: bounds.height - height,
@@ -1987,7 +2019,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         };
         let bounds = layout.bounds() - layout.virtual_offset();
         let geometry = TerminalGeometry::new(
-            Self::grid_bounds(bounds),
+            self.grid_bounds(bounds),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -2001,7 +2033,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         a11y.refresh(
             &self.snapshot,
             accessibility::View {
-                rows: if bounds.height > REVIEW_BAR_HEIGHT {
+                rows: if self.grid_bounds(bounds).height > 0.0 {
                     geometry.rows
                 } else {
                     0
@@ -2201,7 +2233,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
     ) {
         let bounds = layout.bounds();
         let geometry = TerminalGeometry::new(
-            Self::grid_bounds(bounds),
+            self.grid_bounds(bounds),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -2220,7 +2252,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             self.reconcile_review(state);
         }
         let view = accessibility::View {
-            rows: if bounds.height > REVIEW_BAR_HEIGHT {
+            rows: if self.grid_bounds(bounds).height > 0.0 {
                 geometry.rows
             } else {
                 0
@@ -2248,7 +2280,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         if matches!(
             event,
             Event::Mouse(mouse::Event::ButtonPressed(IcedMouseButton::Left))
-        ) && cursor.is_over(Self::review_control(bounds))
+        ) && self.review_bar_visible()
+            && cursor.is_over(Self::review_control(bounds))
         {
             let mut a11y = state.a11y.borrow_mut();
             a11y.refresh(&self.snapshot, view, Instant::now(), true);
@@ -2262,6 +2295,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             }
             state.preedit = None;
             state.review_control_pressed = true;
+            self.review_active = a11y.review;
             self.publish_review(a11y.review, shell);
             shell.capture_event();
             shell.request_redraw();
@@ -2272,14 +2306,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             event,
             Event::Mouse(mouse::Event::ButtonPressed(_) | mouse::Event::WheelScrolled { .. })
         ) && cursor.is_over(bounds)
-            && !cursor.is_over(Self::grid_bounds(bounds))
+            && !cursor.is_over(self.grid_bounds(bounds))
         {
             shell.capture_event();
             return;
         }
         if matches!(event, Event::Mouse(mouse::Event::CursorMoved { .. }))
             && cursor.is_over(bounds)
-            && !cursor.is_over(Self::grid_bounds(bounds))
+            && !cursor.is_over(self.grid_bounds(bounds))
             && state.pressed_buttons == 0
             && !state.selecting
             && state.scrollbar_drag.is_none()
@@ -2312,6 +2346,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         a11y.move_review(0, 0, false);
                         state.preedit = None;
                         state.input_focused = true;
+                        self.review_active = true;
                         self.publish_review(true, shell);
                     }
                     Action::Click if control => {
@@ -2321,6 +2356,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                         if a11y.review {
                             a11y.move_review(0, 0, false);
                         }
+                        self.review_active = a11y.review;
                         self.publish_review(a11y.review, shell);
                     }
                     Action::SetTextSelection if ours => {
@@ -2329,6 +2365,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 a11y.review = true;
                                 a11y.selection = Some(selection.clone());
                                 state.preedit = None;
+                                self.review_active = true;
                                 self.publish_review(true, shell);
                             }
                         }
@@ -2352,9 +2389,39 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             }
             _ => false,
         };
+        if self.model_focused
+            && let Event::Keyboard(
+                key_event @ keyboard::Event::KeyPressed {
+                    physical_key,
+                    repeat: false,
+                    ..
+                },
+            ) = event
+            && self
+                .review_shortcuts
+                .iter()
+                .any(|binding| crate::workspace_widget::shortcut_event_matches(*binding, key_event))
+        {
+            let mut a11y = state.a11y.borrow_mut();
+            a11y.review = !a11y.review;
+            a11y.selection = None;
+            if a11y.review {
+                a11y.move_review(0, 0, false);
+            }
+            self.review_active = a11y.review;
+            state.preedit = None;
+            if !state.shortcut_keys.contains(physical_key) {
+                state.shortcut_keys.push(*physical_key);
+            }
+            self.publish_review(a11y.review, shell);
+            shell.capture_event();
+            shell.request_redraw();
+            return;
+        }
         let was_review = state.a11y.borrow().review;
         let consumed_review_input = review_target && state.a11y.borrow_mut().review_input(event);
         if consumed_review_input {
+            self.review_active = state.a11y.borrow().review;
             if was_review && !state.a11y.borrow().review {
                 self.publish_review(false, shell);
             }
@@ -2397,7 +2464,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         // Only the focused terminal's rail is draggable. An unfocused card may
         // still paint one (see [`TerminalScrollbar::visible`]), but the click
         // that reaches it focuses the terminal instead of grabbing the thumb.
-        let scrollbar = TerminalScrollbar::new(Self::grid_bounds(bounds), self.snapshot.scroll)
+        let scrollbar = TerminalScrollbar::new(self.grid_bounds(bounds), self.snapshot.scroll)
             .filter(|_| self.model_focused);
         if scrollbar.is_none() {
             state.scrollbar_drag = None;
@@ -2464,6 +2531,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 key,
                 modified_key,
                 physical_key,
+                location,
                 modifiers,
                 text,
                 repeat,
@@ -2537,7 +2605,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                let input = key_press(
+                let mut input = key_press(
                     key,
                     modified_key,
                     *physical_key,
@@ -2545,6 +2613,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     text.as_deref(),
                     *repeat,
                 );
+                input.key = map_key_location(input.key, key, *location);
+                input.scroll_to_bottom_on_input = self.scroll_to_bottom_on_input;
                 match self.handle.key(input) {
                     Ok(()) => shell.capture_event(),
                     Err(error) => self.publish_error(error, shell),
@@ -2553,6 +2623,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
             Event::Keyboard(keyboard::Event::KeyReleased {
                 key,
                 physical_key,
+                location,
                 modifiers,
                 ..
             }) if self.model_focused => {
@@ -2587,7 +2658,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                let input = key_release(key, *physical_key, *modifiers);
+                let mut input = key_release(key, *physical_key, *modifiers);
+                input.key = map_key_location(input.key, key, *location);
                 match self.handle.key(input) {
                     Ok(()) => shell.capture_event(),
                     Err(error) => self.publish_error(error, shell),
@@ -2868,6 +2940,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                                 modifiers: state.modifiers,
                                 text: None,
                                 unshifted_codepoint: None,
+                                scroll_to_bottom_on_input: false,
                             };
                             if let Err(error) = self.handle.key(input) {
                                 self.publish_error(error, shell);
@@ -2958,7 +3031,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
 
         let bounds = layout.bounds();
         let geometry = TerminalGeometry::new(
-            Self::grid_bounds(bounds),
+            self.grid_bounds(bounds),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -3205,7 +3278,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 }
             });
             if let Some(bar) =
-                TerminalScrollbar::new(Self::grid_bounds(bounds), self.snapshot.scroll).filter(
+                TerminalScrollbar::new(self.grid_bounds(bounds), self.snapshot.scroll).filter(
                     |_| TerminalScrollbar::visible(self.snapshot.scroll, self.model_focused),
                 )
             {
@@ -3232,6 +3305,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         });
         // Create a later clipped layer: drawing into the restored parent
         // would place this chrome beneath the terminal's opaque grid layer.
+        if self.review_bar_visible() {
         renderer.with_layer(widget_clip, |renderer| {
             use cosmic::iced::advanced::text::Renderer as _;
             let review = tree
@@ -3311,6 +3385,7 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 );
             }
         });
+        }
         if let Some(started) = draw_started {
             // This records CPU draw-command construction, not GPU completion
             // or compositor presentation/scanout.
@@ -3331,17 +3406,17 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
-        if cursor.is_over(Self::review_control(layout.bounds())) {
+        if self.review_bar_visible() && cursor.is_over(Self::review_control(layout.bounds())) {
             return mouse::Interaction::Pointer;
         }
         if self.model_focused
-            && TerminalScrollbar::new(Self::grid_bounds(layout.bounds()), self.snapshot.scroll)
+            && TerminalScrollbar::new(self.grid_bounds(layout.bounds()), self.snapshot.scroll)
                 .is_some_and(|bar| cursor.is_over(bar.track))
         {
             return mouse::Interaction::Pointer;
         }
         let geometry = TerminalGeometry::new(
-            Self::grid_bounds(layout.bounds()),
+            self.grid_bounds(layout.bounds()),
             self.font_size,
             self.scale_factor,
             self.font_family,
@@ -3721,6 +3796,7 @@ fn key_press(
         modifiers: map_iced_modifiers(modifiers),
         text: key_text(text, modified_key),
         unshifted_codepoint: character_from_key(key),
+        scroll_to_bottom_on_input: true,
     }
 }
 
@@ -3736,6 +3812,7 @@ fn key_release(
         modifiers: map_iced_modifiers(modifiers),
         text: None,
         unshifted_codepoint: character_from_key(key),
+        scroll_to_bottom_on_input: true,
     }
 }
 
@@ -3785,7 +3862,246 @@ fn character_from_key(key: &keyboard::Key) -> Option<char> {
 /// carries the layout's own text and unshifted character, so a child reading
 /// the kitty protocol sees `с`, and `c` as its base-layout key when it asks for
 /// alternates.
+/// Fall back to native location when a backend cannot name a physical key.
+/// Physical identities take precedence; location still distinguishes keypad
+/// Enter and left/right modifiers on platforms without a physical key code.
+fn map_key_location(
+    current: TerminalKey,
+    key: &keyboard::Key,
+    location: keyboard::Location,
+) -> TerminalKey {
+    use keyboard::{Key, Location, key::Named};
+    if !matches!(
+        current,
+        TerminalKey::Unidentified
+            | TerminalKey::Character(_)
+            | TerminalKey::Enter
+            | TerminalKey::Backspace
+            | TerminalKey::ArrowUp
+            | TerminalKey::ArrowDown
+            | TerminalKey::ArrowLeft
+            | TerminalKey::ArrowRight
+            | TerminalKey::Home
+            | TerminalKey::End
+            | TerminalKey::PageUp
+            | TerminalKey::PageDown
+            | TerminalKey::Insert
+            | TerminalKey::Delete
+    ) {
+        return current;
+    }
+    if location == Location::Numpad {
+        let keypad = match key.as_ref() {
+            Key::Character(text) => match text {
+                "0" => Some(TerminalKey::Numpad0),
+                "1" => Some(TerminalKey::Numpad1),
+                "2" => Some(TerminalKey::Numpad2),
+                "3" => Some(TerminalKey::Numpad3),
+                "4" => Some(TerminalKey::Numpad4),
+                "5" => Some(TerminalKey::Numpad5),
+                "6" => Some(TerminalKey::Numpad6),
+                "7" => Some(TerminalKey::Numpad7),
+                "8" => Some(TerminalKey::Numpad8),
+                "9" => Some(TerminalKey::Numpad9),
+                "+" => Some(TerminalKey::NumpadAdd),
+                "-" => Some(TerminalKey::NumpadSubtract),
+                "*" => Some(TerminalKey::NumpadMultiply),
+                "/" => Some(TerminalKey::NumpadDivide),
+                "." => Some(TerminalKey::NumpadDecimal),
+                "," => Some(TerminalKey::NumpadComma),
+                "=" => Some(TerminalKey::NumpadEqual),
+                _ => None,
+            },
+            Key::Named(named) => match named {
+                Named::Enter => Some(TerminalKey::NumpadEnter),
+                Named::Backspace => Some(TerminalKey::NumpadBackspace),
+                Named::ArrowUp => Some(TerminalKey::NumpadUp),
+                Named::ArrowDown => Some(TerminalKey::NumpadDown),
+                Named::ArrowLeft => Some(TerminalKey::NumpadLeft),
+                Named::ArrowRight => Some(TerminalKey::NumpadRight),
+                Named::Home => Some(TerminalKey::NumpadHome),
+                Named::End => Some(TerminalKey::NumpadEnd),
+                Named::PageUp => Some(TerminalKey::NumpadPageUp),
+                Named::PageDown => Some(TerminalKey::NumpadPageDown),
+                Named::Insert => Some(TerminalKey::NumpadInsert),
+                Named::Delete => Some(TerminalKey::NumpadDelete),
+                Named::Clear => Some(TerminalKey::NumpadBegin),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(key) = keypad {
+            return key;
+        }
+    }
+    if current != TerminalKey::Unidentified {
+        return current;
+    }
+    match key.as_ref() {
+        Key::Named(Named::Shift) => {
+            if location == Location::Right {
+                TerminalKey::ShiftRight
+            } else {
+                TerminalKey::ShiftLeft
+            }
+        }
+        Key::Named(Named::Control) => {
+            if location == Location::Right {
+                TerminalKey::ControlRight
+            } else {
+                TerminalKey::ControlLeft
+            }
+        }
+        Key::Named(Named::Alt) => {
+            if location == Location::Right {
+                TerminalKey::AltRight
+            } else {
+                TerminalKey::AltLeft
+            }
+        }
+        Key::Named(Named::Super | Named::Meta) => {
+            if location == Location::Right {
+                TerminalKey::SuperRight
+            } else {
+                TerminalKey::SuperLeft
+            }
+        }
+        Key::Named(Named::CapsLock) => TerminalKey::CapsLock,
+        Key::Named(Named::NumLock) => TerminalKey::NumLock,
+        Key::Named(Named::Fn) => TerminalKey::Fn,
+        Key::Named(Named::FnLock) => TerminalKey::FnLock,
+        Key::Named(Named::ScrollLock) => TerminalKey::ScrollLock,
+        _ => current,
+    }
+}
+
 fn map_iced_key(key: &keyboard::Key, physical_key: keyboard::key::Physical) -> TerminalKey {
+    use keyboard::key::{Code, Physical};
+    if let Physical::Code(code) = physical_key {
+        // NumLock changes the logical identity but preserves its keypad origin.
+        let navigation = match (code, key.as_ref()) {
+            (Code::Numpad0, keyboard::Key::Named(keyboard::key::Named::Insert)) => {
+                Some(TerminalKey::NumpadInsert)
+            }
+            (Code::Numpad1, keyboard::Key::Named(keyboard::key::Named::End)) => {
+                Some(TerminalKey::NumpadEnd)
+            }
+            (Code::Numpad2, keyboard::Key::Named(keyboard::key::Named::ArrowDown)) => {
+                Some(TerminalKey::NumpadDown)
+            }
+            (Code::Numpad3, keyboard::Key::Named(keyboard::key::Named::PageDown)) => {
+                Some(TerminalKey::NumpadPageDown)
+            }
+            (Code::Numpad4, keyboard::Key::Named(keyboard::key::Named::ArrowLeft)) => {
+                Some(TerminalKey::NumpadLeft)
+            }
+            (Code::Numpad5, keyboard::Key::Named(keyboard::key::Named::Clear)) => {
+                Some(TerminalKey::NumpadBegin)
+            }
+            (Code::Numpad6, keyboard::Key::Named(keyboard::key::Named::ArrowRight)) => {
+                Some(TerminalKey::NumpadRight)
+            }
+            (Code::Numpad7, keyboard::Key::Named(keyboard::key::Named::Home)) => {
+                Some(TerminalKey::NumpadHome)
+            }
+            (Code::Numpad8, keyboard::Key::Named(keyboard::key::Named::ArrowUp)) => {
+                Some(TerminalKey::NumpadUp)
+            }
+            (Code::Numpad9, keyboard::Key::Named(keyboard::key::Named::PageUp)) => {
+                Some(TerminalKey::NumpadPageUp)
+            }
+            (Code::NumpadDecimal, keyboard::Key::Named(keyboard::key::Named::Delete)) => {
+                Some(TerminalKey::NumpadDelete)
+            }
+            _ => None,
+        };
+        if let Some(key) = navigation {
+            return key;
+        }
+        let terminal_key = match code {
+            Code::Numpad0 => Some(TerminalKey::Numpad0),
+            Code::Numpad1 => Some(TerminalKey::Numpad1),
+            Code::Numpad2 => Some(TerminalKey::Numpad2),
+            Code::Numpad3 => Some(TerminalKey::Numpad3),
+            Code::Numpad4 => Some(TerminalKey::Numpad4),
+            Code::Numpad5 => Some(TerminalKey::Numpad5),
+            Code::Numpad6 => Some(TerminalKey::Numpad6),
+            Code::Numpad7 => Some(TerminalKey::Numpad7),
+            Code::Numpad8 => Some(TerminalKey::Numpad8),
+            Code::Numpad9 => Some(TerminalKey::Numpad9),
+            Code::NumpadAdd => Some(TerminalKey::NumpadAdd),
+            Code::NumpadBackspace => Some(TerminalKey::NumpadBackspace),
+            Code::NumpadClear => Some(TerminalKey::NumpadClear),
+            Code::NumpadClearEntry => Some(TerminalKey::NumpadClearEntry),
+            Code::NumpadComma => Some(TerminalKey::NumpadComma),
+            Code::NumpadDecimal => Some(TerminalKey::NumpadDecimal),
+            Code::NumpadDivide => Some(TerminalKey::NumpadDivide),
+            Code::NumpadEnter => Some(TerminalKey::NumpadEnter),
+            Code::NumpadEqual => Some(TerminalKey::NumpadEqual),
+            Code::NumpadMemoryAdd => Some(TerminalKey::NumpadMemoryAdd),
+            Code::NumpadMemoryClear => Some(TerminalKey::NumpadMemoryClear),
+            Code::NumpadMemoryRecall => Some(TerminalKey::NumpadMemoryRecall),
+            Code::NumpadMemoryStore => Some(TerminalKey::NumpadMemoryStore),
+            Code::NumpadMemorySubtract => Some(TerminalKey::NumpadMemorySubtract),
+            Code::NumpadMultiply => Some(TerminalKey::NumpadMultiply),
+            Code::NumpadParenLeft => Some(TerminalKey::NumpadParenLeft),
+            Code::NumpadParenRight => Some(TerminalKey::NumpadParenRight),
+            Code::NumpadSubtract => Some(TerminalKey::NumpadSubtract),
+            Code::AltLeft => Some(TerminalKey::AltLeft),
+            Code::AltRight => Some(TerminalKey::AltRight),
+            Code::ControlLeft => Some(TerminalKey::ControlLeft),
+            Code::ControlRight => Some(TerminalKey::ControlRight),
+            Code::SuperLeft => Some(TerminalKey::SuperLeft),
+            Code::SuperRight => Some(TerminalKey::SuperRight),
+            Code::ShiftLeft => Some(TerminalKey::ShiftLeft),
+            Code::ShiftRight => Some(TerminalKey::ShiftRight),
+            Code::CapsLock => Some(TerminalKey::CapsLock),
+            Code::NumLock => Some(TerminalKey::NumLock),
+            Code::IntlBackslash => Some(TerminalKey::IntlBackslash),
+            Code::IntlRo => Some(TerminalKey::IntlRo),
+            Code::IntlYen => Some(TerminalKey::IntlYen),
+            Code::ContextMenu => Some(TerminalKey::ContextMenu),
+            Code::Convert => Some(TerminalKey::Convert),
+            Code::KanaMode => Some(TerminalKey::KanaMode),
+            Code::NonConvert => Some(TerminalKey::NonConvert),
+            Code::Help => Some(TerminalKey::Help),
+            Code::Fn => Some(TerminalKey::Fn),
+            Code::FnLock => Some(TerminalKey::FnLock),
+            Code::PrintScreen => Some(TerminalKey::PrintScreen),
+            Code::ScrollLock => Some(TerminalKey::ScrollLock),
+            Code::Pause => Some(TerminalKey::Pause),
+            Code::BrowserBack => Some(TerminalKey::BrowserBack),
+            Code::BrowserFavorites => Some(TerminalKey::BrowserFavorites),
+            Code::BrowserForward => Some(TerminalKey::BrowserForward),
+            Code::BrowserHome => Some(TerminalKey::BrowserHome),
+            Code::BrowserRefresh => Some(TerminalKey::BrowserRefresh),
+            Code::BrowserSearch => Some(TerminalKey::BrowserSearch),
+            Code::BrowserStop => Some(TerminalKey::BrowserStop),
+            Code::Eject => Some(TerminalKey::Eject),
+            Code::LaunchApp1 => Some(TerminalKey::LaunchApp1),
+            Code::LaunchApp2 => Some(TerminalKey::LaunchApp2),
+            Code::LaunchMail => Some(TerminalKey::LaunchMail),
+            Code::MediaPlayPause => Some(TerminalKey::MediaPlayPause),
+            Code::MediaSelect => Some(TerminalKey::MediaSelect),
+            Code::MediaStop => Some(TerminalKey::MediaStop),
+            Code::MediaTrackNext => Some(TerminalKey::MediaTrackNext),
+            Code::MediaTrackPrevious => Some(TerminalKey::MediaTrackPrevious),
+            Code::Power => Some(TerminalKey::Power),
+            Code::Sleep => Some(TerminalKey::Sleep),
+            Code::AudioVolumeDown => Some(TerminalKey::AudioVolumeDown),
+            Code::AudioVolumeMute => Some(TerminalKey::AudioVolumeMute),
+            Code::AudioVolumeUp => Some(TerminalKey::AudioVolumeUp),
+            Code::WakeUp => Some(TerminalKey::WakeUp),
+            Code::Copy => Some(TerminalKey::Copy),
+            Code::Cut => Some(TerminalKey::Cut),
+            Code::Paste => Some(TerminalKey::Paste),
+
+            _ => None,
+        };
+        if let Some(key) = terminal_key {
+            return key;
+        }
+    }
     match key.as_ref() {
         keyboard::Key::Character(text) => key
             .to_latin(physical_key)
@@ -4006,6 +4322,42 @@ fn is_escape(key: &keyboard::Key) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_location_preserves_keypad_and_modifier_identity() {
+        use keyboard::{Key, Location, key::Named};
+        assert_eq!(
+            map_key_location(
+                TerminalKey::Enter,
+                &Key::Named(Named::Enter),
+                Location::Numpad
+            ),
+            TerminalKey::NumpadEnter
+        );
+        assert_eq!(
+            map_key_location(
+                TerminalKey::Character('9'),
+                &Key::Character("9".into()),
+                Location::Numpad
+            ),
+            TerminalKey::Numpad9
+        );
+        assert_eq!(
+            map_key_location(
+                TerminalKey::Unidentified,
+                &Key::Named(Named::Shift),
+                Location::Right
+            ),
+            TerminalKey::ShiftRight
+        );
+        assert_eq!(
+            map_key_location(
+                TerminalKey::ControlLeft,
+                &Key::Named(Named::Control),
+                Location::Right
+            ),
+            TerminalKey::ControlLeft
+        );
+    }
     use crate::terminal::CellText;
 
     use super::*;
@@ -5569,7 +5921,7 @@ mod tests {
         let translation = cosmic::iced::Vector::new(690.0, 0.0);
         let layout = Layout::new(&node).with_virtual_offset(translation);
         let geometry = TerminalGeometry::new(
-            TerminalWidget::<()>::grid_bounds(layout.bounds()),
+            layout.bounds(),
             DEFAULT_FONT_SIZE,
             1.0,
             "",

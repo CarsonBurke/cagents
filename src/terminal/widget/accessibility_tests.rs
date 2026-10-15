@@ -750,3 +750,92 @@ fn remounted_owner_blocks_input_and_identity_replacement_drops_selection() {
     tree.diff(&mut widget as &mut dyn Widget<Message, Theme, Renderer>);
     assert!(!reviewing(&tree));
 }
+
+#[test]
+fn review_bar_activation_changes_geometry_without_removing_accessible_action() {
+    let peer = Peer::new();
+    let mut widget = widget(
+        &peer,
+        "review-bar",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    );
+    let tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let bounds = Rectangle {
+        x: 15.0,
+        y: 20.0,
+        width: 300.0,
+        height: 200.0,
+    };
+    assert_eq!(widget.grid_bounds(bounds), bounds);
+    let layout = layout::Node::new(bounds.size());
+    for active in [false, true, false] {
+        widget.assistive_technology_active = active;
+        assert_eq!(
+            widget.grid_bounds(bounds).height,
+            bounds.height - if active { REVIEW_BAR_HEIGHT } else { 0.0 }
+        );
+        let nodes = widget.a11y_nodes(Layout::new(&layout), &tree, mouse::Cursor::Unavailable);
+        assert!(nodes.children().iter().any(|node| node.node().role()
+            == iced_accessibility::accesskit::Role::Button
+            && node.node().supports_action(Action::Click)));
+    }
+    widget.always_show_review_bar = true;
+    assert_eq!(
+        widget.grid_bounds(bounds).height,
+        bounds.height - REVIEW_BAR_HEIGHT
+    );
+    widget.always_show_review_bar = false;
+    widget.review_active = true;
+    assert_eq!(
+        widget.grid_bounds(bounds).height,
+        bounds.height - REVIEW_BAR_HEIGHT
+    );
+}
+
+#[test]
+fn configured_review_shortcut_toggles_both_ways_without_reaching_the_pty() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(
+        &peer,
+        "review-shortcut",
+        ReviewInputBarrier::default(),
+        true,
+        false,
+    )
+    .review_shortcuts(&["Ctrl+Alt+Shift+R".into()]);
+    let mut tree = Tree::new(&widget as &dyn Widget<Message, Theme, Renderer>);
+    let press = || {
+        Event::Keyboard(keyboard::Event::KeyPressed {
+            key: keyboard::Key::Character("r".into()),
+            modified_key: keyboard::Key::Character("R".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyR),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL
+                | keyboard::Modifiers::ALT
+                | keyboard::Modifiers::SHIFT,
+            text: Some("R".into()),
+            repeat: false,
+        })
+    };
+    let release = || {
+        Event::Keyboard(keyboard::Event::KeyReleased {
+            key: keyboard::Key::Character("r".into()),
+            modified_key: keyboard::Key::Character("R".into()),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyR),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::CTRL
+                | keyboard::Modifiers::ALT
+                | keyboard::Modifiers::SHIFT,
+        })
+    };
+    assert!(dispatch(&mut widget, &mut tree, &renderer, press()).contains(&Message::Review(true)));
+    assert!(reviewing(&tree));
+    dispatch(&mut widget, &mut tree, &renderer, release());
+    assert!(dispatch(&mut widget, &mut tree, &renderer, press()).contains(&Message::Review(false)));
+    assert!(!reviewing(&tree));
+    dispatch(&mut widget, &mut tree, &renderer, release());
+    assert_no_pty_input(&peer.fence());
+}

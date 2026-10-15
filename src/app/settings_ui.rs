@@ -731,6 +731,40 @@ fn settings_category_controls<'a>(
                         1.0,
                         "×",
                     ),
+                    setting_field(
+                        "Terminal accessibility",
+                        "The review action is always available to assistive technology. Ctrl+Alt+Shift+R toggles text review.",
+                        crate::settings_widgets::toggle(
+                            "Always show terminal review bar",
+                            draft.always_show_terminal_review_bar,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::AlwaysShowTerminalReviewBar,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
+                    settings_choice(
+                        "Terminal clipboard writes",
+                        "OSC 52 writes from programs, including remote shells. Ask remembers your decision for each terminal; clipboard reads are disabled.",
+                        SettingsField::TerminalClipboardWrite,
+                        [
+                            ("Allow", "allow", draft.terminal_clipboard_write == "allow"),
+                            ("Ask", "ask", draft.terminal_clipboard_write == "ask"),
+                            ("Deny", "deny", draft.terminal_clipboard_write == "deny"),
+                        ],
+                    ),
+                    setting_field(
+                        "Follow terminal input",
+                        "Return to the live prompt when typing. Scrollback shortcuts keep their position.",
+                        crate::settings_widgets::toggle(
+                            "Scroll to bottom on input",
+                            draft.terminal_scroll_to_bottom_on_input,
+                            |enabled| Message::SettingsChanged {
+                                field: SettingsField::TerminalScrollToBottomOnInput,
+                                value: enabled.to_string(),
+                            },
+                        ),
+                    ),
                     terminal_theme_choice(&draft.terminal_theme, draft.has_custom_terminal_theme),
                     setting_field(
                         "Multiline paste",
@@ -1070,6 +1104,13 @@ fn settings_category_controls<'a>(
                     "Finds in the focused conversation, terminal, editor, or settings pane.",
                     &draft.keyboard_shortcuts.find_in_pane,
                     SettingsField::ShortcutFindInPane,
+                    &draft.keyboard_shortcuts,
+                ),
+                shortcut_input(
+                    "Terminal text review",
+                    "Toggle review of the focused terminal. Typing is blocked during review; Escape returns to input.",
+                    &draft.keyboard_shortcuts.terminal_review,
+                    SettingsField::ShortcutTerminalReview,
                     &draft.keyboard_shortcuts,
                 ),
                 shortcut_input(
