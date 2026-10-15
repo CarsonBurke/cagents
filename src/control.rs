@@ -1748,7 +1748,7 @@ impl HandshakeClient {
                 )
                 .map_err(|error| reply_error(error, timeout))?
                 .ok_or(ControlError::ConnectionClosed)?;
-                decode_upgrade_handshake(&payload)?
+                decode_upgrade_handshake(&payload, PROTOCOL_VERSION)?
             }
             None => read_frame(&mut self.stream)
                 .map_err(|error| reply_error(error, timeout))?
@@ -1797,9 +1797,10 @@ impl HandshakeClient {
 /// authenticates the complete version-pinned handshake before any operation.
 fn decode_upgrade_handshake<T: serde::de::DeserializeOwned>(
     payload: &[u8],
+    expected_version: u16,
 ) -> Result<T, ControlError> {
     let (version, _) = postcard::take_from_bytes::<u16>(payload).map_err(FrameError::from)?;
-    if version != PROTOCOL_VERSION {
+    if version != expected_version {
         return Err(ControlError::UnsupportedVersion { actual: version });
     }
     postcard::from_bytes(payload)
@@ -4838,8 +4839,8 @@ mod tests {
             message_tag: u32,
             error: ExtendedError,
         }
-        let payload = postcard::to_stdvec(&LegacyEnvelope {
-            version: 77,
+        let encode = |version| postcard::to_stdvec(&LegacyEnvelope {
+            version,
             request_id: Some(1),
             proof: proof("session", "boot", "incarnation"),
             message_tag: 6,
@@ -4850,12 +4851,17 @@ mod tests {
             },
         })
         .unwrap();
+        let payload = encode(77);
         assert!(postcard::from_bytes::<ExtendedEnvelope>(&payload).is_err());
         assert!(matches!(
-            decode_upgrade_handshake::<ExtendedEnvelope>(&payload),
+            decode_upgrade_handshake::<ExtendedEnvelope>(&payload, 79),
             Err(ControlError::UnsupportedVersion { actual: 77 })
         ));
 
+        // This concern also compiles on the baseline-77 checkout; use a
+        // genuinely mismatched version for the complete socket route there.
+        let wire_version = if PROTOCOL_VERSION == 77 { 76 } else { 77 };
+        let payload = encode(wire_version);
         let (client, mut server) = UnixStream::pair().unwrap();
         let worker = std::thread::spawn(move || {
             let _: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
@@ -4867,7 +4873,7 @@ mod tests {
                 client,
                 Instant::now() + Duration::from_secs(1)
             ),
-            Err(ControlError::UnsupportedVersion { actual: 77 })
+            Err(ControlError::UnsupportedVersion { actual }) if actual == wire_version
         ));
         worker.join().unwrap();
     }
