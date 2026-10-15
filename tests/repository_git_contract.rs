@@ -6063,6 +6063,7 @@ fn recovery_refuses_late_writes_during_other_batches_and_destructive_prechecks()
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn undo_discard_refuses_a_same_size_substituted_unpack_file_and_preserves_it() {
     struct SubstituteUnpacked { changed: std::sync::atomic::AtomicBool }

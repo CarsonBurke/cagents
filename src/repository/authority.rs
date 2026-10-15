@@ -302,7 +302,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let oid = std::str::from_utf8(&output.stdout).map_err(|error| RepositoryError::InvalidOutput {
             field: "recovery object hash", reason: error.to_string(),
         })?;
-        Oid::parse_object(oid.trim()).map_err(Into::into)
+        Oid::parse_object(oid.trim()).map_err(|error| RepositoryError::InvalidOutput {
+            field: "recovery object hash", reason: error.to_string(),
+        })
     }
 
     fn run_recovery_object(
@@ -341,7 +343,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .env("GIT_COMMON_DIR", common_path.into_os_string())
             .env("GIT_CONFIG_GLOBAL", "/dev/null").env("GIT_CONFIG_SYSTEM", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1").env("GIT_TERMINAL_PROMPT", "0")
-            .env("GIT_PAGER", "cat").output_limits(8192, 256 * 1024)
+            .env("GIT_PAGER", "cat").env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_ALLOW_PROTOCOL", "").output_limits(8192, 256 * 1024)
             .inherit_file(holding_file).map_err(metadata_error)?
             .inherit_file(source.child_root.clone()).map_err(metadata_error)?
             .inherit_file(source.child_git.clone()).map_err(metadata_error)?
