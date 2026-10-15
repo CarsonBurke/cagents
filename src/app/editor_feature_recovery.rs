@@ -11,6 +11,11 @@ pub(super) struct State {
     message: String,
 }
 impl Cagents {
+    /// Pure original-project attribution, including an unopened-only publisher
+    /// whose source card has already closed. No displayed-path lookup occurs.
+    pub(super) fn pending_publication_ticket_for_project(&self, project: crate::model::ProjectId, cards: &HashSet<CardId>) -> Option<u64> {
+        self.editor_features.pending_publication_ticket_for_project(project, cards)
+    }
     pub(super) fn publication_recovery_pending(&self) -> bool {
         self.editor_features.recovery.as_ref().is_some_and(|state| !state.authority.is_resolved())
     }
@@ -36,6 +41,9 @@ impl Cagents {
             Ok(report) => (report.recovery.as_ref(), report.worktree.as_ref(), report.durability_warnings.join("\n")),
             Err(failure) => (failure.recovery.as_ref(), failure.worktree.as_ref(), failure.message.clone()),
         };
+        // The project owner retires the exact pending ticket even on a result
+        // with no recovery, before this helper's stale-owner/empty return.
+        self.retain_relocated_publication_recovery(ticket, authority.filter(|authority| !authority.is_resolved()));
         let Some(authority) = authority.filter(|authority| !authority.is_resolved()) else { return; };
         let origin = self.editor_features.publication_origin(ticket);
         if let Some(CardRuntime::Repository(runtime)) = origin.and_then(|card| self.cards.get_mut(&card)) {

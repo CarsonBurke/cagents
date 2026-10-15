@@ -706,7 +706,7 @@ mod tests {
         let mut app = app();
         let card = CardId::new();
         let operation = operation(&app, card);
-        app.editor_features.publication = Some(Publication { hidden: false, ticket: 8, operation, cards: Vec::new(), server_lease: None });
+        app.editor_features.publication = Some(Publication { project: None, hidden: false, ticket: 8, operation, cards: Vec::new(), server_lease: None });
         assert!(app.window_close_transient_blocker().is_some());
         let window = window::Id::unique();
         drop(app.update(Message::WindowCloseRequested(window)));
@@ -783,6 +783,9 @@ struct Preview {
 pub(super) enum DialogKind { Preview, Publication }
 
 struct Publication {
+    // Captured before worker dispatch; remains attributable after its readonly
+    // origin closes or the project changes its displayed root during Locate.
+    project: Option<crate::model::ProjectId>,
     hidden: bool,
     ticket: u64,
     operation: Operation,
@@ -819,6 +822,11 @@ impl State {
     pub fn modal_open(&self) -> bool { self.modal_dialog().is_some() }
     pub fn publishing(&self) -> bool { self.publication.is_some() }
     pub(super) fn publication_origin(&self, ticket: u64) -> Option<CardId> { self.publication.as_ref().filter(|publication| publication.ticket == ticket).map(|publication| publication.operation.card) }
+    pub(super) fn pending_publication_ticket_for_project(&self, project: crate::model::ProjectId, cards: &HashSet<CardId>) -> Option<u64> {
+        self.publication.as_ref().filter(|publication| publication.project == Some(project)
+            || cards.contains(&publication.operation.card) || publication.cards.iter().any(|card| cards.contains(card))).map(|publication| publication.ticket)
+    }
+
     fn next(&mut self) -> u64 { self.next_ticket = self.next_ticket.wrapping_add(1).max(1); self.next_ticket }
 }
 
@@ -1474,6 +1482,23 @@ impl Cagents {
             self.feature_failure(operation.card, "The open file tabs changed; prepare the edit again");
             return Task::none();
         }
+        // Target-specific Locate admission runs before claiming a backend
+        // request, freezing any participant, or dispatching filesystem work.
+        let target_paths = plan.documents.iter().flat_map(|document| std::iter::once(&document.path).chain(document.open_paths.iter())).collect::<HashSet<_>>();
+        let mut participants = self.cards.iter().filter_map(|(card, runtime)| match runtime {
+            CardRuntime::Repository(runtime) if runtime.workspace_edit_candidate_source().is_some_and(|path| target_paths.contains(&path)) => Some(*card),
+            _ => None,
+        }).collect::<HashSet<_>>();
+        participants.insert(operation.card);
+        if self.project_relocation_blocks_publication(&participants) {
+            self.reject_server_edit(&operation, "Finish locating this edit's project before applying another workspace edit");
+            self.feature_failure(operation.card, "Finish locating this edit's project before applying another workspace edit");
+            return Task::none();
+        }
+        let project = match self.cards.get(&operation.card) {
+            Some(CardRuntime::Repository(runtime)) => Some(runtime.descriptor.project),
+            _ => None,
+        };
         // Publication authority and the server response move together. An
         // expired/canceled preview must fail before any buffer freezes or I/O.
         let server_lease = match operation.server_request {
@@ -1510,7 +1535,7 @@ impl Cagents {
             self.feature_failure(operation.card, error);
             return Task::none();
         }
-        self.editor_features.publication = Some(Publication { hidden: false, ticket, operation, cards, server_lease });
+        self.editor_features.publication = Some(Publication { project, hidden: false, ticket, operation, cards, server_lease });
         let publication = cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || workspace::publish_unopened(&plan)).await.map_err(|error| workspace::PublicationFailure::from(error.to_string())).and_then(|result| result);
             Message::EditorFeatures(Action::Published { ticket, result })
