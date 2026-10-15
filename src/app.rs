@@ -8644,6 +8644,9 @@ impl Cagents {
         if self.card_chrome.len() != self.durable.cards.len() {
             self.card_chrome
                 .retain(|id, _| self.card_indices.contains_key(id));
+            self.chrome_ui
+                .terminal_ordinals
+                .retain(|id, _| self.card_indices.contains_key(id));
         }
         self.sync_window_title()
     }
