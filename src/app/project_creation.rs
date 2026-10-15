@@ -10,7 +10,33 @@ pub(super) struct PublishedSource {
     source: WorktreeCreationSource,
 }
 
+/// A completed original-directory handoff, retained before any shared pane,
+/// path-based selection or default-start publication. The actual authenticated
+/// host grant/required-row acknowledgment is the next admission boundary.
+#[derive(Debug)]
+pub(super) struct PendingCreatedWorktree {
+    pub(super) project: ProjectId,
+    pub(super) source_id: OperationId,
+    pub(super) project_generation: u64,
+    pub(super) repository: PathBuf,
+    pub(super) created: Arc<crate::repository::SettledCreatedWorktree>,
+}
+
 impl Cagents {
+    pub(super) fn retain_created_worktree_for_start(&mut self, project: ProjectId,
+        source_id: OperationId, operation: OperationId, project_generation: u64,
+        repository: PathBuf, created: Arc<crate::repository::SettledCreatedWorktree>,
+    ) -> Task<Message> {
+        self.project_ui.pending_created_worktrees.entry(operation).or_insert(PendingCreatedWorktree {
+            project, source_id, project_generation, repository, created,
+        });
+        // A pathname cannot substitute for the pending original-directory
+        // registration. Preserve the settled result while the actual host
+        // retained-root grant is unavailable; do not publish or start a pane.
+        self.status = Some(TransientNotice::warning("Worktree created. Automatic opening is unavailable; its creation receipt was retained."));
+        Task::none()
+    }
+
     /// Consume the original displayed project token; never upgrade an old row
     /// action to the source that happens to occupy the same project today.
     pub(super) fn run_project_creation_target(&mut self, target: sidebar::commands::ProjectCreationTarget) -> Task<Message> {

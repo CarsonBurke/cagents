@@ -31,6 +31,11 @@ pub struct ModalTarget {
 #[derive(Debug, Default)]
 pub struct State {
     pub(super) creation_sources: HashMap<ProjectId, super::project_creation::PublishedSource>,
+    /// Original in-process ownership survives stale callbacks and dismissed rows.
+    /// Only an explicit recovery/host adoption may release a started receipt;
+    /// report state and path descriptions grant no release authority.
+    pub(super) retained_creations: Vec<Arc<crate::repository::RetainedWorktreeCreation>>,
+    pub(super) pending_created_worktrees: HashMap<OperationId, super::project_creation::PendingCreatedWorktree>,
     owners: HashMap<OwnerKey, Option<iced::advanced::image::Handle>>,
     projects: HashMap<ProjectId, OwnerKey>,
     dialog: Option<Dialog>,

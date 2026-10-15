@@ -17,6 +17,8 @@ pub(super) struct ActiveWorktreeOperation {
     project_creation_id: Option<OperationId>,
     project_generation: Option<u64>,
     settled_outcome: Option<WorktreeCreationOutcome>,
+    retained: Option<Arc<crate::repository::RetainedWorktreeCreation>>,
+    created_authority: Option<Arc<crate::repository::SettledCreatedWorktree>>,
     token: Option<CancellationToken>,
     receiver: Option<async_channel::Receiver<WorktreeProgressEvent>>,
     stage: Option<WorktreeProgressStage>,
@@ -230,6 +232,8 @@ impl Cagents {
                 project_creation_id,
                 project_generation,
                 settled_outcome: None,
+                retained: None,
+                created_authority: None,
                 token: Some(token.clone()),
                 receiver: Some(receiver),
                 stage: None,
@@ -247,15 +251,10 @@ impl Cagents {
         self.sync_worktree_operation_rows();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let refused = |detail: String| WorktreeOperationReport {
-                    operation_id: request.operation_id,
-                    generation,
-                    request: Some(request.clone()),
-                    state: WorktreeOperationState::NotCreated,
-                    outcome: None,
-                    detail: format!("The original creation source is unavailable; no creation was started: {detail}"),
-                    created_at_unix_ms: unix_millis(),
-                };
+                let refused = |detail: String| crate::repository::RetainedWorktreeCreation::not_started(
+                    &request, generation,
+                    format!("The original creation source is unavailable; no creation was started: {detail}"),
+                );
                 if project_generation.is_none() {
                     return refused("the original logical project generation is unavailable; reload the project".to_owned());
                 }
@@ -269,7 +268,7 @@ impl Cagents {
                             Err(error) => return refused(error.to_string()),
                         };
                         match source.service() {
-                            Ok(service) => service.create_worktree_journaled(&store, &request, generation, &token, &sender),
+                            Ok(service) => service.create_worktree_journaled_retained(&store, &request, generation, &token, &sender),
                             Err(error) => refused(error.to_string()),
                         }
                     }
@@ -350,8 +349,19 @@ impl Cagents {
         &mut self,
         id: OperationId,
         generation: u64,
-        result: Result<WorktreeOperationReport, String>,
+        result: Result<crate::repository::RetainedWorktreeCreation, String>,
     ) -> Task<Message> {
+        // Retain every started result BEFORE callback admission. An orphaned,
+        // stale or repeated callback cannot drop a live publication receipt.
+        // This collection awaits explicit recovery/host adoption; it is not a
+        // claim that retaining a descriptor resolves its recovery obligation.
+        let result = result.map(|retained| {
+            let retained = Arc::new(retained);
+            if retained.retention().is_some() {
+                self.project_ui.retained_creations.push(retained.clone());
+            }
+            retained
+        });
         let Some(operation) = self.worktree_operations.get_mut(&id) else {
             return Task::none();
         };
@@ -360,7 +370,7 @@ impl Cagents {
         }
         if result
             .as_ref()
-            .is_ok_and(|report| report.operation_id != id || report.generation != generation)
+            .is_ok_and(|retained| retained.report.operation_id != id || retained.report.generation != generation)
         {
             return Task::none();
         }
@@ -377,7 +387,10 @@ impl Cagents {
             .as_ref()
             .map(|request| request.repository.clone());
         let outcome = match result {
-            Ok(report) => {
+            Ok(retained) => {
+                let report = &retained.report;
+                operation.created_authority = retained.created.as_ref().cloned().map(Arc::new);
+                operation.retained = Some(retained.clone());
                 operation.settled_outcome = report.outcome.clone();
                 operation.created_worktree = match &report.outcome {
                     Some(WorktreeCreationOutcome::Created { worktree, .. }) => {
@@ -386,16 +399,21 @@ impl Cagents {
                     _ => None,
                 };
                 operation.state = Some(report.state);
-                operation.detail = report.detail;
-                report.outcome
+                operation.detail = retained.authority_error.as_ref().map_or_else(
+                    || report.detail.clone(),
+                    |error| format!("{} Automatic opening withheld: {error}", report.detail),
+                );
+                report.outcome.clone()
             }
             Err(error) => {
+                operation.created_authority = None;
                 operation.settled_outcome = None;
                 operation.state = Some(WorktreeOperationState::OutcomeUnknown);
                 operation.detail = error;
                 None
             }
         };
+        let created_authority = operation.created_authority.clone();
         self.sync_worktree_operation_rows();
         if !self.creation_project_is_current(project_id, project_generation)
             || project_creation_id.is_some_and(|binding| !self.current_project_creation_source(project_id, binding)) {
@@ -410,7 +428,7 @@ impl Cagents {
                 return Task::none();
             };
             return cosmic::task::message(Message::ProjectWorktreeCreated {
-                project_id, source_id, project_generation, operation: id, repository, result: Ok(outcome),
+                project_id, source_id, project_generation, operation: id, repository, result: Ok(outcome), created: created_authority,
             });
         }
         Task::none()
@@ -432,6 +450,17 @@ impl Cagents {
                 && matches!(outcome, WorktreeCreationOutcome::Created { .. })
                 && operation.settled_outcome.as_ref() == Some(outcome)
         })
+    }
+
+
+    pub(super) fn completed_created_authority_matches(
+        &self, operation: OperationId, created: &Arc<crate::repository::SettledCreatedWorktree>,
+        outcome: &WorktreeCreationOutcome,
+    ) -> bool {
+        self.worktree_operations.get(&operation).is_some_and(|active|
+            active.created_authority.as_ref().is_some_and(|original| Arc::ptr_eq(original, created))
+                && created.operation() == operation && created.generation() == active.generation
+                && created.matches_outcome(outcome))
     }
 
     pub(super) fn rehydrate_worktree_operations(&self) -> Task<Message> {
@@ -494,6 +523,8 @@ impl Cagents {
                             project_creation_id: None,
                             project_generation: None,
                             settled_outcome: report.outcome.clone(),
+                            retained: None,
+                            created_authority: None,
                             token: None,
                             receiver: None,
                             stage: None,
@@ -600,6 +631,8 @@ mod tests {
                     project_creation_id: None,
                     project_generation: None,
                     settled_outcome: None,
+                retained: None,
+                created_authority: None,
                     token: Some(token.clone()),
                     receiver: None,
                     stage,
@@ -673,6 +706,8 @@ mod tests {
             project_creation_id: None,
             project_generation: None,
             settled_outcome: None,
+            retained: None,
+            created_authority: None,
             token: None,
             receiver: None,
             stage: Some(WorktreeProgressStage::Finished),

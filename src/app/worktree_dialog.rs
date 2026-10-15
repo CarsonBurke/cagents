@@ -1154,15 +1154,7 @@ mod tests {
         let _ = app.finish_worktree_operation(
             id,
             1,
-            Ok(crate::repository::WorktreeOperationReport {
-                operation_id: id,
-                generation: 1,
-                request: Some(request(id)),
-                state: WorktreeOperationState::NotCreated,
-                outcome: None,
-                detail: detail.into(),
-                created_at_unix_ms: 0,
-            }),
+            Ok(crate::repository::RetainedWorktreeCreation::not_started(&request(id), 1, detail.into())),
         );
     }
 
@@ -1474,7 +1466,7 @@ mod tests {
                             Message::WorktreeInputResolved { project_id, operation_id, result } =>
                                 pending.push(app.finish_worktree_input(project_id, operation_id, result)),
                             Message::WorktreeOperationFinished { operation, generation, result } => {
-                                report = Some(result.as_ref().expect("journal worker completed").clone());
+                                report = Some(result.as_ref().expect("journal worker completed").report.clone());
                                 pending.push(app.finish_worktree_operation(operation, generation, result));
                             },
                             final_message @ Message::ProjectWorktreeCreated { .. } =>
@@ -1599,10 +1591,11 @@ mod tests {
             let Message::WorktreeOperationFinished { result: Ok(report), .. } = &finished else {
                 panic!("the refusing worker must settle explicitly");
             };
-            assert_eq!(report.operation_id, operation);
-            assert_eq!(report.state, WorktreeOperationState::NotCreated);
-            assert!(report.outcome.is_none());
-            assert!(report.detail.contains("unavailable"));
+            assert_eq!(report.report.operation_id, operation);
+            assert_eq!(report.report.state, WorktreeOperationState::NotCreated);
+            assert!(report.report.outcome.is_none());
+            assert!(report.report.detail.contains("unavailable"));
+            assert!(report.retention().is_none());
             assert!(!destination.exists());
             assert!(!root.join(".worktrees").exists());
             assert!(isolated_git(&root, &["for-each-ref", "--format=%(refname)", "refs/heads/history-topic"]).is_empty());
@@ -1616,36 +1609,69 @@ mod tests {
     async fn a_created_report_without_original_source_proof_is_retained_without_publication() {
         const TEST: &str = "app::worktree_dialog::tests::a_created_report_without_original_source_proof_is_retained_without_publication";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
-        for missing_source in [true, false] {
-            let (mut fixture, _files, _root, _oid) = real_history_source();
-            let source = dialog(&fixture.app).source.clone().unwrap();
-            let (project, operation, request) = resolve_history_input(fixture.app.submit_worktree_dialog()).await;
-            let generation = fixture.app.project_creation_generation(project).unwrap();
-            let created = crate::model::WorktreeId::new();
-            let record = crate::repository::WorktreeRecord {
-                id: created, path: request.destination.clone(), created_at_unix_ms: None,
-                head_oid: None, branch: Some("refs/heads/history-topic".into()),
-                detached: false, bare: false, lock: crate::repository::WorktreeLock::default(),
-                prunable_reason: None,
+        let (mut fixture, _files, _root, _oid) = real_history_source();
+        let (project, operation, request) = resolve_history_input(fixture.app.submit_worktree_dialog()).await;
+        let created = crate::model::WorktreeId::new();
+        let record = crate::repository::WorktreeRecord {
+            id: created, path: request.destination.clone(), created_at_unix_ms: None,
+            head_oid: None, branch: Some("refs/heads/history-topic".into()),
+            detached: false, bare: false, lock: crate::repository::WorktreeLock::default(),
+            prunable_reason: None,
+        };
+        // Rehydration accepts only a path description. It cannot construct the
+        // retained worker wrapper or a settled-created capability.
+        drop(fixture.app.restore_worktree_operations(Ok(vec![crate::repository::WorktreeOperationReport {
+            operation_id: operation, generation: 1, request: Some(request),
+            state: WorktreeOperationState::Created,
+            outcome: Some(WorktreeCreationOutcome::Created { worktree: record, warnings: vec![] }),
+            detail: "Created restored report".into(), created_at_unix_ms: 1,
+        }])));
+        assert!(fixture.app.worktree_operations.contains_key(&operation));
+        assert!(!fixture.app.has_active_worktree_operations());
+        assert!(fixture.app.project_ui.retained_creations.is_empty());
+        assert!(fixture.app.project_ui.pending_created_worktrees.is_empty());
+        assert!(!fixture.app.sidebar_model.project(project).unwrap().worktrees.iter().any(|row| row.id == created));
+        fixture.app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
+        assert!(fixture.app.session.as_ref().unwrap().operation_store().load_worktree(created).unwrap().is_none());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn queued_completion_keeps_original_created_carrier_before_start_registration() {
+        const TEST: &str = "app::worktree_dialog::tests::queued_completion_keeps_original_created_carrier_before_start_registration";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        for replace_destination in [false, true] {
+            let (mut fixture, _files, root, _oid) = real_history_source();
+            let task = fixture.app.submit_worktree_dialog();
+            let (report, final_message) = creation_final_message(&mut fixture.app, task).await;
+            let Message::ProjectWorktreeCreated { operation, created: Some(original), .. } = &final_message else {
+                panic!("actual worker must carry its original settled-created authority");
             };
-            // A synthetic worker answer exercises the final reducer only.
-            // The unbound task is never driven and no worktree is created.
-            drop(fixture.app.start_worktree_operation_with_project_source(project, request.clone(), None,
-                (!missing_source).then_some(source), None, missing_source.then_some(generation)));
-            let next = fixture.app.finish_worktree_operation(operation, 1, Ok(crate::repository::WorktreeOperationReport {
-                operation_id: operation, generation: 1, request: Some(request),
-                state: WorktreeOperationState::Created,
-                outcome: Some(WorktreeCreationOutcome::Created { worktree: record, warnings: vec![] }),
-                detail: "Created fixture answer".into(), created_at_unix_ms: 1,
-            }));
-            assert!(iced::runtime::task::into_stream(next).is_none(), "no raw or guarded publication may escape missing consent");
-            assert!(fixture.app.worktree_operations.contains_key(&operation));
-            assert!(!fixture.app.has_active_worktree_operations());
-            let row = fixture.app.sidebar_model.project(project).unwrap().operations.iter().find(|row| row.id == operation).unwrap();
-            assert!(row.detail.contains("publication withheld"));
-            assert!(!fixture.app.sidebar_model.project(project).unwrap().worktrees.iter().any(|row| row.id == created));
+            let operation = *operation;
+            let original = original.clone();
+            let destination = original.record().path.clone();
+            original.validate().unwrap();
+            assert!(fixture.app.project_ui.retained_creations.iter().any(|receipt|
+                receipt.report.operation_id == operation && receipt.retention().is_some()));
+            let replaced = if replace_destination { destination.clone() } else { root.clone() };
+            let parked = replaced.with_extension("held-original");
+            std::fs::rename(&replaced, &parked).unwrap();
+            super::super::git_binding::tests::init(&replaced, "replacement stays untouched\n");
+            let worker_authority = original.clone();
+            assert!(tokio::task::spawn_blocking(move || worker_authority.validate()).await.unwrap().is_err());
+            // Do not reread or invalidate the project: the queued callback must
+            // preserve its ORIGINAL carrier rather than recapturing this path.
+            let sequence = fixture.app.repository_load_sequence;
+            drop(fixture.app.update(final_message));
+            let pending = &fixture.app.project_ui.pending_created_worktrees[&operation];
+            assert!(Arc::ptr_eq(&pending.created, &original));
+            assert_eq!(fixture.app.repository_load_sequence, sequence);
+            assert!(!fixture.app.sidebar_model.project(fixture.project).unwrap().worktrees.iter()
+                .any(|row| row.id == original.record().id));
             fixture.app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
-            assert!(fixture.app.session.as_ref().unwrap().operation_store().load_worktree(created).unwrap().is_none());
+            assert!(fixture.app.session.as_ref().unwrap().operation_store().load_worktree(original.record().id).unwrap().is_none());
+            assert_eq!(std::fs::read_to_string(replaced.join("file.txt")).unwrap(), "replacement stays untouched\n");
+            assert_eq!(report.operation_id, operation);
         }
     }
 

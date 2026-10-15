@@ -7141,7 +7141,7 @@ pub enum Message {
     WorktreeOperationFinished {
         operation: crate::model::OperationId,
         generation: u64,
-        result: Result<crate::repository::WorktreeOperationReport, String>,
+        result: Result<crate::repository::RetainedWorktreeCreation, String>,
     },
     WorktreeOperationsRehydrated(Result<Vec<crate::repository::WorktreeOperationReport>, String>),
     ProjectWorktreeCreated {
@@ -7151,6 +7151,7 @@ pub enum Message {
         project_generation: u64,
         repository: PathBuf,
         result: Result<WorktreeCreationOutcome, String>,
+        created: Option<Arc<crate::repository::SettledCreatedWorktree>>,
     },
     PullRequestBaseChanged(String),
     PullRequestHeadChanged(String),
@@ -20455,12 +20456,18 @@ impl Application for Cagents {
                 self.restore_worktree_operations(result)
             }
             Message::SubmitWorktree => self.submit_worktree_dialog(),
-            Message::ProjectWorktreeCreated { project_id, source_id, operation, project_generation, repository, result } => {
+            Message::ProjectWorktreeCreated { project_id, source_id, operation, project_generation, repository, result, created } => {
                 if !result.as_ref().is_ok_and(|outcome|
                     self.completed_project_creation_matches(operation, project_id, source_id, project_generation, &repository, outcome)) {
                     return Task::none();
                 }
-                self.apply_worktree_created(project_id, repository, result)
+                let Some(created) = created.filter(|created| result.as_ref().is_ok_and(|outcome|
+                    self.completed_created_authority_matches(operation, created, outcome))) else {
+                    self.status = Some(TransientNotice::warning("The worktree was created, but its original directory authority is unavailable. The receipt was retained; automatic opening was withheld."));
+                    return Task::none();
+                };
+                self.retain_created_worktree_for_start(project_id, source_id, operation,
+                    project_generation, repository, created)
             }
             Message::PullRequestBaseChanged(value) => {
                 if let Some(dialog) = &mut self.pull_request_dialog {
