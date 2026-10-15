@@ -331,7 +331,10 @@ impl Registry {
         {
             return Err("Session proofs do not belong to the requested destination project".into());
         }
-        let transaction = self.db.transaction().map_err(|error| error.to_string())?;
+        let transaction = self.db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        schema::require_current_write(&transaction)?;
         session_locations::pin_owned_agents(&transaction, moves)?;
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,

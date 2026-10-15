@@ -5061,6 +5061,9 @@ mod tests {
                 registry.acknowledge_automation_notifications(&Default::default()).is_err(),
                 registry.prune_automation_history(HISTORY_TTL_MS + 1000).is_err(),
                 registry.apply(&remove).is_err(),
+                registry.apply(&ModelEdit::CloseProject {
+                    repository: agent.spec.target.repository.clone(),
+                }).is_err(),
             ];
             assert!(refuses.into_iter().all(|refused| refused), "{alteration}");
             assert_eq!(registry.db.query_row("SELECT total_changes()", [], |row| row.get::<_, u64>(0)).unwrap(), changes,
