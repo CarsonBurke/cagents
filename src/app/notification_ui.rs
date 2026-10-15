@@ -78,6 +78,10 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn scope_changed(&mut self) {
+        self.activation_attempt = None;
+    }
+
     fn changed(&self, change: impl FnOnce(&mut Pending)) {
         change(&mut self.pending.lock().unwrap_or_else(|p| p.into_inner()));
         if let Some(wake) = &self.wake {
@@ -578,6 +582,9 @@ impl Cagents {
             }
             return Task::none();
         };
+        if self.durable.channels.iter().find(|channel| channel.cards.contains(&id))
+            .is_some_and(|channel| self.sidebar_model.project(channel.project_id).is_none())
+        { return Task::none(); }
         let focus = self.focus_attention_card(id);
         if self.workspace.focused() == Some(id) {
             self.notification_ui.session_activation = None;
@@ -1042,6 +1049,31 @@ mod tests {
             session: latest,
             generation,
         }));
+        assert!(app.notification_ui.session_activation.is_none());
+    }
+
+    #[test]
+    fn attention_activation_retries_when_its_project_arrives_without_card_membership_changes() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let target = super::super::tests::terminal_card_state();
+        let card = target.id;
+        let session = card_session(&target).unwrap();
+        let project = ProjectId::new();
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(target);
+        durable.channels.push(ProjectChannel { title_source: Default::default(), id: channel, project_id: project, title: "Arriving project".into(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card) });
+        drop(app.update_notifications(Action::Activated(Target::Session(session))));
+        assert!(app.workspace.focused().is_none());
+        assert_eq!(app.notification_ui.session_activation, Some(session));
+        let unchanged_cards = Arc::as_ptr(&app.durable);
+        app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "Project".into(), "/tmp".into(), Vec::new(), Vec::new()));
+        assert!(!app.reconcile_agent_attention_owners());
+        assert_eq!(Arc::as_ptr(&app.durable), unchanged_cards);
+        drop(app.retry_notification_activation());
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert_eq!(app.durable.active_channel, Some(channel));
         assert!(app.notification_ui.session_activation.is_none());
     }
 

@@ -7263,6 +7263,7 @@ impl Cagents {
     /// Reconcile only when repository roots change, not on runtime/frame wakes.
     /// Existing scalar activity and restored unread must acquire late roots too.
     fn reconcile_agent_attention_owners(&mut self) -> bool {
+        self.notification_ui.scope_changed();
         let mut roots = HashMap::new();
         for project in &self.sidebar_model.projects {
             if let Some(key) = project.folder_key() {
@@ -13849,7 +13850,7 @@ impl Application for Cagents {
                                     self.publish_project_opened(existing_id);
                                 }
                             }
-                            return task;
+                            return Task::batch([task, self.retry_notification_activation()]);
                         }
                         if let Some(session) = &self.session {
                             session.save_project(loaded.project.clone());
