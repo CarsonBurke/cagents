@@ -257,12 +257,13 @@ impl State {
     pub(super) fn suspended_paths(&self,item:&str)->Vec<Vec<u32>> {
         let Some(entry)=self.aliases.get(item).and_then(|key|self.entries.get(key)) else {return Vec::new();};
         let mut paths=Vec::new();
-        for (index,(renamed,offset)) in &entry.suspended_paths {if (entry.pages.contains_key(offset) || entry.requested.contains_key(offset)) && let Ok(index)=u32::try_from(*index) {
+        for (index,(renamed,offset)) in &entry.suspended_paths {if (entry.pages.contains_key(offset) || entry.wanted_pages.contains(offset)) && let Ok(index)=u32::try_from(*index) {
             paths.push(vec![7,index,0]);if *renamed {paths.push(vec![7,index,1]);}
         }}
         for index in &entry.suspended {
-            let waiting=entry.current(*index).is_some() || entry.patch_requests.contains_key(index)
-                || entry.suspended_paths.get(index).is_some_and(|(_,offset)|entry.requested.contains_key(offset));
+            // demand() prunes deliberate close/Find-only removals. A demanded
+            // same-source retry error still preserves cheap selection intent.
+            let waiting=entry.suspended.contains(index);
             if waiting && let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}
         }
         paths.sort_by_key(|path|(path[1],if path[0]==6 {2}else {path[2]}));paths
