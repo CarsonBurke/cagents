@@ -5386,7 +5386,7 @@ fn external_stash_push_cannot_retarget_apply_pop_or_drop() {
             {
                 fs::write(self.worktree.join("f.txt"), b"external shifted stash\n").unwrap();
                 let push = CommandSpec::new("git")
-                    .current_dir(&self.worktree)
+                    .cwd(&self.worktree)
                     .args(["stash", "push", "-m", "external"]);
                 let output = SystemProcessExecutor
                     .execute(&isolate(push), &CancellationToken::new())
