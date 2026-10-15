@@ -2724,7 +2724,7 @@ mod tests {
             while Instant::now() < deadline {
                 let (control, _) = match fixture.server.listener.accept() {
                     Ok(pair) => pair,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2)); continue;
                     }
                     Err(error) => panic!("fixture accept: {error}"),
