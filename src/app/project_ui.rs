@@ -1019,7 +1019,20 @@ impl Cagents {
             && self.dirty_repository_close.is_none() && self.sidebar_selection_ui.dialog.is_none()
     }
 
+    fn worktree_delete_dialog_on_top(&self) -> bool {
+        self.project_dialog_on_top() && self.project_ui.force_branches.is_empty()
+            && self.project_ui.cleanup_dialog.is_none() && self.project_ui.dialog.is_some()
+    }
+
     pub(super) fn handle_project_action(&mut self, action: Action) -> Task<Message> {
+        let hidden_control = match &action {
+            Action::ForceDeleteBranch(_) | Action::KeepBranch(_) => self.project_ui.force_branches.is_empty(),
+            Action::CleanupPolicyChanged(_) | Action::SaveCleanupPolicy => !self.project_ui.force_branches.is_empty() || self.project_ui.cleanup_dialog.is_none(),
+            Action::ConfirmDelete | Action::DeleteBranchChanged(_) | Action::BusyAgentsConfirmed(_) => !self.worktree_delete_dialog_on_top(),
+            Action::ConfirmRemove => !self.project_ui.force_branches.is_empty() || self.project_ui.cleanup_dialog.is_some() || self.project_ui.dialog.is_some(),
+            _ => false,
+        };
+        if hidden_control { return Task::none(); }
         if action.user_input() && (self.update_prepared || (self.modal_is_open() && !self.project_dialog_on_top())) {
             return Task::none();
         }
@@ -1603,7 +1616,7 @@ impl Cagents {
                 confirming,
                 result,
             } => {
-                let on_top = self.project_dialog_on_top();
+                let on_top = self.worktree_delete_dialog_on_top();
                 let default_branch = self.project_ui.dialog.as_ref().filter(|dialog| dialog.request == request)
                     .and_then(|dialog| result.as_ref().ok().map(|(snapshot, _)| self.delete_branch_default(&dialog.target, snapshot))).unwrap_or(false);
                 let Some(dialog) = self
@@ -3485,6 +3498,30 @@ mod tests {
         }
         assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::ForceDeleteBranch(crate::model::OperationId::new()))));
         assert!(user_message_blocked_during_update(&Message::ProjectUi(Action::BusyAgentsConfirmed(true))));
+    }
+
+    #[test]
+    fn force_confirmation_blocks_retained_lower_delete_controls_and_async_confirmation() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+        let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let target = app.project_target(project, Some(linked.id)).unwrap();
+        drop(app.open_worktree_delete_dialog(target));
+        let request = app.project_ui.dialog.as_ref().unwrap().request;
+        drop(app.handle_project_action(Action::DeleteOptionsRead { request, result: Ok(DeleteOptions { branch_elsewhere: false, stale_lock: false, lock_error: None }) }));
+        drop(app.handle_project_action(Action::SafetyRead { request, confirming: false, result: Ok((clean_snapshot(), AgentCensus::default())) }));
+        let force = BranchDeletion { id: crate::model::OperationId::new(), repository, branch: "other".into(), expected_oid: "a".repeat(40), warnings: vec![] };
+        app.project_ui.force_branches.push_back((force, "Unmerged".into()));
+        drop(app.handle_project_action(Action::DeleteBranchChanged(true)));
+        assert!(!app.project_ui.dialog.as_ref().unwrap().delete_branch);
+        drop(app.handle_project_action(Action::ConfirmDelete));
+        drop(app.handle_project_action(Action::SafetyRead { request, confirming: true, result: Ok((clean_snapshot(), AgentCensus::default())) }));
+        assert!(!app.project_ui.is_deleting(linked.id));
+        assert!(app.project_ui.dialog.is_some());
+        drop(app.handle_project_action(Action::Dismiss));
+        assert!(app.project_ui.force_branches.is_empty());
+        assert!(app.project_ui.dialog.is_some(), "dismissing the upper force dialog preserves lower deletion");
     }
 
     #[test]
