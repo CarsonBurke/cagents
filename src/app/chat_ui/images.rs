@@ -623,7 +623,10 @@ impl Gallery {
             crate::ui_controls::button::secondary("Open externally")
                 .on_press_maybe(self.url().map(|_| action(Action::ImageExternal)))
                 .into(),
-            icon(Icon::Close, "Close image (Esc)", true, Action::CloseImage),
+            crate::ui_controls::button::secondary("Close")
+                .id(widget::Id::new("image-viewer.close"))
+                .on_press(action(Action::CloseImage))
+                .into(),
         ])
         .spacing(step::GAP_S)
         .align_y(iced::Alignment::Center);

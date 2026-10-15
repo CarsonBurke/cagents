@@ -41,6 +41,32 @@ pub(super) struct State {
 mod tests {
     use super::*;
 
+    #[test]
+    fn retained_popup_keeps_the_readers_navigation_choice_after_modal_unwind() {
+        for enabled in [false, true] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            app.core.set_keyboard_nav(enabled);
+            app.chrome_ui.popup = Some(Popup::Notices);
+            app.sync_popup_keyboard_nav();
+            assert!(!app.core.keyboard_nav());
+            drop(app.finish_modal_update(Task::none()));
+            app.settings_reset_confirm = true;
+            app.settings_reset_keyboard_nav = Some(false);
+            app.sync_popup_keyboard_nav();
+            drop(app.finish_modal_update(Task::none()));
+            drop(app.close_settings_reset());
+            // The popup may reacquire before the final modal reconciliation;
+            // its restore slot must still inherit the original reader choice.
+            app.sync_popup_keyboard_nav();
+            drop(app.finish_modal_update(Task::none()));
+            assert!(!app.core.keyboard_nav());
+            assert_eq!(app.chrome_ui.restore_keyboard_nav, Some(enabled));
+            app.chrome_ui.popup = None;
+            app.sync_popup_keyboard_nav();
+            assert_eq!(app.core.keyboard_nav(), enabled);
+        }
+    }
+
     /// Retain the actual Settings pane while rename and palette modals change.
     /// Apply runtime operations to every real control in this same tree.
     fn rename_fixture_view(app: &Cagents) -> Element<'_, Message> {
@@ -734,6 +760,7 @@ enum PaneMenuCommand {
     Switch,
     Fork(chat_ui::Target),
     ReviewChanges(chat_ui::Target),
+    EndConversation,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -751,9 +778,16 @@ impl widget::menu::Action for PaneMenu {
             PaneMenuCommand::CloseOthers => Action::CloseOthers(id),
             PaneMenuCommand::CloseToRight => Action::CloseToRight(id),
             PaneMenuCommand::Close => return Message::CloseCard(id),
+            PaneMenuCommand::EndConversation => {
+                return Message::ChatClose(chat_ui::closing::Action::End(id));
+            }
             PaneMenuCommand::Switch => return Message::ChatUi(chat_ui::Action::Switch(id)),
-            PaneMenuCommand::Fork(target) => return Message::ChatUi(chat_ui::Action::BranchPicker(target, true)),
-            PaneMenuCommand::ReviewChanges(target) => return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true)),
+            PaneMenuCommand::Fork(target) => {
+                return Message::ChatUi(chat_ui::Action::BranchPicker(target, true));
+            }
+            PaneMenuCommand::ReviewChanges(target) => {
+                return Message::ChatUi(chat_ui::Action::ChangesPicker(target, true));
+            }
         })
     }
 }
@@ -969,6 +1003,18 @@ impl Cagents {
         iced::widget::operation::focus(widget::Id::new(id)).map(cosmic::Action::App)
     }
 
+    /// A retained popup still owns navigation after the final dialog closes.
+    /// Keep the reader's choice until that popup itself relinquishes it.
+    pub(super) fn restore_modal_keyboard_nav(&mut self, enabled: bool) {
+        if self.chrome_ui.popup.is_some() || self.chat_picker_owns_keyboard() {
+            self.chrome_ui.restore_keyboard_nav = Some(enabled);
+            self.core.set_keyboard_nav(false);
+        } else {
+            self.chrome_ui.restore_keyboard_nav = None;
+            self.core.set_keyboard_nav(enabled);
+        }
+    }
+
     /// Gives an open popup sole ownership of Tab, and hands it back to the
     /// shell's traversal once the popup is gone or a dialog has taken over.
     pub(super) fn sync_popup_keyboard_nav(&mut self) {
@@ -981,6 +1027,7 @@ impl Cagents {
             }
             (false, Some(restore)) => {
                 self.chrome_ui.restore_keyboard_nav = None;
+                self.modal_stack.adopt_keyboard_nav(restore);
                 // A close dialog that opened over the popup recorded the
                 // popup's suppressed traversal as its own restore point, and
                 // it owns Tab now: hand it the reader's real choice instead.
@@ -2053,6 +2100,16 @@ impl Cagents {
                     PaneMenu(id, PaneMenuCommand::Close),
                 ),
             ];
+            if self
+                .card_state(id)
+                .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+            {
+                entries.push(widget::menu::Item::Button(
+                    "Close conversation…".into(),
+                    None,
+                    PaneMenu(id, PaneMenuCommand::EndConversation),
+                ));
+            }
             if self.chat_switch_available(id) && self.chat_switch_ready(id) {
                 entries.push(widget::menu::Item::Button(
                     self.chat_switch_label(id).into(),

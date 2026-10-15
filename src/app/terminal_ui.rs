@@ -777,11 +777,11 @@ impl Cagents {
             crate::design::title("Paste multiple lines?").into(),
             notice_body("This program does not use bracketed paste. Each newline may run a command immediately."),
             widget::text(format!("{} lines · {} characters", text.lines().count(), text.chars().count())).into(),
-            widget::row::with_children(vec![
+            super::dialog_ui::confirmation_controls(vec![
                 crate::ui_controls::button::secondary("Cancel").id(widget::Id::from("terminal-paste-cancel"))
                     .on_press(Message::TerminalFind(Action::ConfirmPaste(card, false))).into(),
                 crate::ui_controls::button::primary("Paste").on_press(Message::TerminalFind(Action::ConfirmPaste(card, true))).into(),
-            ]).spacing(space::S).into(),
+            ]),
         ]).spacing(space::M), 480.0), Some(Message::TerminalFind(Action::ConfirmPaste(card, false))), 1.0))
     }
 }
