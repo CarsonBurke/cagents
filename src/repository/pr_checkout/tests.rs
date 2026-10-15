@@ -2616,3 +2616,73 @@ fn new_pr_creation_restart_rejects_changed_source_head_and_forged_consent() {
         );
     }
 }
+
+#[test]
+#[cfg(feature = "ui")]
+fn new_pr_creation_reuses_only_an_exact_matching_unmounted_read_only_branch() {
+    if isolated_fixture_case(concat!(
+        module_path!(),
+        "::new_pr_creation_reuses_only_an_exact_matching_unmounted_read_only_branch"
+    )) {
+        return;
+    }
+    for resolve in [false, true] {
+        let fixture = Fixture::new(false);
+        let (mut request, consent, store) = creation_request(&fixture, false);
+        run_git(
+            &fixture.root,
+            &["branch", "reviewed", fixture.original.as_str()],
+        );
+        if resolve {
+            let input = WorktreeInput {
+                repository: fixture.root.clone(),
+                input: "reviewed".into(),
+                base: fixture.original.as_str().into(),
+                managed_directory: request.managed_root.to_str().unwrap().into(),
+                destination: request.destination.to_str().unwrap().into(),
+                operation_id: request.operation_id,
+            };
+            assert!(
+                fixture
+                    .service
+                    .resolve_worktree_request(&input, &CancellationToken::new())
+                    .is_err()
+            );
+            let resolved = fixture
+                .service
+                .resolve_worktree_request_for_pr(&input, &consent, &CancellationToken::new())
+                .unwrap();
+            assert_eq!(
+                resolved.base,
+                BaseRevision::LocalBranch(request.branch.clone())
+            );
+            assert!(!resolved.track);
+            request.base = resolved.base;
+        }
+        let report = create_reviewed(&fixture, &request, &consent, &store);
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        assert_eq!(
+            git_text(&request.destination, &["rev-parse", "HEAD"]),
+            fixture.original.as_str()
+        );
+        assert!(
+            fixture
+                .service
+                .pr_values(
+                    &request.destination,
+                    "branch.reviewed.remote",
+                    &CancellationToken::new()
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .service
+                .rehydrate_worktree_operations(&store)
+                .unwrap()[0]
+                .state,
+            WorktreeOperationState::Created
+        );
+    }
+}

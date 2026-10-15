@@ -80,6 +80,7 @@ impl PrWorktreeCreationConsent {
             matches!(&request.base, BaseRevision::RemoteRef(reference) if reference == &self.remote_ref())
         } else {
             matches!(&request.base, BaseRevision::ObjectId(oid) if oid == self.expected_head.as_str())
+                || matches!(&request.base, BaseRevision::LocalBranch(branch) if branch == &request.branch)
         };
         if request.track != self.track || !matches {
             return Err(ValidationError::InvalidBase(
@@ -104,6 +105,46 @@ impl WorktreeJournal {
 }
 
 impl<E: ProcessExecutor> RepositoryService<E> {
+    /// Resolve the original PR draft without turning a matching unmounted
+    /// read-only branch into an ordinary base-override error. The worker still
+    /// requires its exact original commit before accepting any Git effect.
+    pub fn resolve_worktree_request_for_pr(
+        &self,
+        input: &WorktreeInput,
+        consent: &PrWorktreeCreationConsent,
+        cancellation: &CancellationToken,
+    ) -> Result<CreateWorktreeRequest, RepositoryError> {
+        consent.validate()?;
+        let mut input = input.clone();
+        if !consent.track {
+            if input.base.trim() != consent.expected_head.as_str() {
+                return Err(ValidationError::InvalidBase(
+                    "The read-only PR base changed; prepare checkout again".into(),
+                )
+                .into());
+            }
+            input.base.clear();
+        }
+        let mut request = self.resolve_worktree_request(&input, cancellation)?;
+        if !consent.track && !request.track {
+            let existing = self.resolve_optional_revision(
+                &request.repository,
+                &request.branch.full_ref(),
+                cancellation,
+            )?;
+            if let Some(existing) = existing {
+                if existing != consent.expected_head {
+                    return Err(ValidationError::InvalidBranch("The existing local branch differs from the reviewed PR commit; explicitly open local work or choose another branch".into()).into());
+                }
+                request.base = BaseRevision::LocalBranch(request.branch.clone());
+            } else {
+                request.base = BaseRevision::object_id(consent.expected_head.as_str())?;
+            }
+        }
+        consent.validate_request(&request)?;
+        Ok(request)
+    }
+
     pub(super) fn reviewed_pr_creation_endpoint(
         &self,
         request: &CreateWorktreeRequest,

@@ -11118,7 +11118,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             if journal.existing_branch_oid.is_some()
                 && !(matches!(&journal.request.base, BaseRevision::LocalBranch(branch) if branch == &journal.request.branch)
                     || (journal.request.track
-                        && matches!(&journal.request.base, BaseRevision::RemoteRef(_))))
+                        && matches!(&journal.request.base, BaseRevision::RemoteRef(_)))
+                    || journal.pr_checkout.as_ref().is_some_and(|consent| {
+                        !consent.tracks_remote()
+                            && journal.existing_branch_oid.as_deref() == Some(consent.expected_head().as_str())
+                            && matches!(&journal.request.base, BaseRevision::ObjectId(oid) if oid == consent.expected_head().as_str())
+                    }))
             {
                 return Err(ValidationError::InvalidBranch(
                     "Branch already exists; resolve it as an existing branch instead of overriding its base".into()
