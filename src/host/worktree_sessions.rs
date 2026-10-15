@@ -33,7 +33,7 @@ struct Actor {
     native: Option<Native>,
     starting: bool,
 }
-type Directory = (PathBuf, crate::agent_execution::DirectoryIdentity);
+type Directory = (std::sync::Arc<std::fs::File>, crate::agent_execution::DirectoryIdentity);
 struct NativeCandidate {
     execution_instance: uuid::Uuid,
     session: chat::Session,
@@ -116,13 +116,22 @@ fn admitted_scope(directory: &Path, identity: crate::agent_execution::DirectoryI
     }
     Ok(physical.starts_with(selected))
 }
+fn terminal_scope(directory: &std::fs::File, identity: crate::agent_execution::DirectoryIdentity, selected: &Path) -> Result<bool, String> {
+    use std::os::fd::AsRawFd;
+    // The retained descriptor follows same-inode renames without ever
+    // reinterpreting a mutable launch alias. This I/O is outside HostLock.
+    let physical = std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd())).map_err(|error| error.to_string())?;
+    if !physical.is_absolute() { return Err("A terminal directory has no physical attribution".into()); }
+    if !physical.starts_with(selected) { return Ok(false); }
+    admitted_scope(&physical, identity, selected)
+}
 fn candidates(host: &SharedHost) -> Result<Candidates, String> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down || state.has_unscoped_spawn() {
         return Err("A daemon transition has not established an attributable working directory; refresh after it settles".into());
     }
     let terminals = state.terminals.values().map(|record| (
-        record.handle.execution_instance(), record.session.clone(), record.handle.clone(), record.handle.admitted_directory().map(|(path, identity)| (path.to_owned(), identity)),
+        record.handle.execution_instance(), record.session.clone(), record.handle.clone(), record.handle.admitted_directory(),
     )).collect();
     let natives = state.chats.values().map(|record| {
         let pair_valid = match (record.paired_terminal.as_ref(), state.terminals.get(&record.session.id)) {
@@ -136,7 +145,7 @@ fn candidates(host: &SharedHost) -> Result<Candidates, String> {
         };
         NativeCandidate {
             execution_instance: record.execution_instance, session: record.session.clone(), handle: record.handle.clone(), pair_valid,
-            paired_directory: record.paired_terminal.as_ref().map(|handle| handle.admitted_directory().map(|(path, identity)| (path.to_owned(), identity))),
+            paired_directory: record.paired_terminal.as_ref().map(|handle| handle.admitted_directory()),
         }
     }).collect();
     let mut starting: Vec<_> = state.spawning_scopes.iter().map(|(id, (instance, path))| (*id, *instance, path.clone())).collect();
@@ -156,7 +165,7 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         let (directory, identity) = directory.ok_or_else(|| format!("Terminal {} has no authoritative admitted physical directory; close it explicitly before worktree removal", session.id))?;
         // Operational/launch aliases may expand removal protection, but cannot
         // newly authorize closing an actor admitted in another physical scope.
-        if !admitted_scope(&directory, identity, path)? { continue; }
+        if !terminal_scope(&directory, identity, path)? { continue; }
         let (revision, busy) = handle.close_observation()?;
         let token = BusyAgent { session: session.id, instance, close_revision: Some(revision), turn_generation: None };
         actors.insert(session.id, Actor { token, busy, terminal: Some(Terminal { instance, session, handle, revision }), native: None, starting: false });
@@ -167,7 +176,7 @@ fn census(host: &SharedHost, path: &Path) -> Result<Vec<Actor>, String> {
         let native_inside = admitted_scope(&observation.working_directory, identity, path)?;
         if let Some(paired_directory) = paired_directory {
             let (directory, identity) = paired_directory.ok_or("A paired terminal has no authoritative physical scope; its actors were preserved")?;
-            let terminal_inside = admitted_scope(&directory, identity, path)?;
+            let terminal_inside = terminal_scope(&directory, identity, path)?;
             if native_inside != terminal_inside {
                 return Err("A native actor and its console span different worktree scopes; close them explicitly before removing either scope".into());
             }

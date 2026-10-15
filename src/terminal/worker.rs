@@ -999,8 +999,8 @@ impl TerminalHandle {
         self.inner.published.execution_instance
     }
     /// Physical scope captured from the exact root process when installed.
-    pub(crate) fn admitted_directory(&self) -> Option<(&std::path::Path, crate::agent_execution::DirectoryIdentity)> {
-        self.inner.published.admitted_directory.get().map(|directory| (directory.path.as_path(), directory.identity))
+    pub(crate) fn admitted_directory(&self) -> Option<(Arc<File>, crate::agent_execution::DirectoryIdentity)> {
+        self.inner.published.admitted_directory.get().map(|directory| (Arc::clone(&directory.directory), directory.identity))
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
@@ -6532,10 +6532,15 @@ mod tests {
         session.launch.working_directory = alias.clone();
         let handle = TerminalHandle::spawn(session, TerminalConfig::default(), |_| {}).unwrap();
         wait_for_text(&handle, "PHYSICAL_READY");
-        assert_eq!(handle.admitted_directory().map(|(path, _)| path), Some(outside.as_path()));
+        let (directory, _) = handle.admitted_directory().unwrap();
+        let physical = || std::fs::read_link(format!("/proc/self/fd/{}", directory.as_raw_fd())).unwrap();
+        assert_eq!(physical(), outside);
         std::fs::remove_file(&alias).unwrap(); std::os::unix::fs::symlink(&selected, &alias).unwrap();
         assert_eq!(alias.canonicalize().unwrap(), selected);
-        assert_eq!(handle.admitted_directory().map(|(path, _)| path), Some(outside.as_path()), "changing a recipe alias must never grant close authority over another worktree");
+        assert_eq!(physical(), outside, "changing a recipe alias must never grant close authority over another worktree");
+        let moved = root.path().join("moved-original");
+        std::fs::rename(&outside, &moved).unwrap();
+        assert_eq!(physical(), moved, "verified same-inode moves retain physical source authority");
         handle.shutdown().unwrap();
     }
 
