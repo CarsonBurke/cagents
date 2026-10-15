@@ -21,6 +21,7 @@ pub enum Action {
     PreviewRepository { ticket: u64, action: RepositoryAction },
     ApplyPreview,
     CancelPreview,
+    ExpireServerNotice { id: u64, ticket: u64 },
     Published { ticket: u64, result: Result<workspace::PublicationReport, String> },
 }
 
@@ -126,6 +127,25 @@ mod tests {
     }
 
     #[test]
+    fn server_errors_publish_immediately_and_info_expiry_does_not_dismiss_errors_or_newer_repeats() {
+        let mut app = app();
+        let card = CardId::new();
+        let doc = LspDocumentId(1);
+        app.lsp_documents.insert(doc, card);
+        drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Error, message: "server failed".into() })));
+        assert!(app.notices.recent().any(|entry| entry.notice.message == "server failed"));
+        drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Info, message: "indexing complete".into() })));
+        let (id, previous) = app.editor_features.notice_expiry.iter().map(|(id, ticket)| (*id, *ticket)).next().unwrap();
+        drop(app.update(Message::Lsp(LspEvent::ServerMessage { doc, level: LspMessageLevel::Info, message: "indexing complete".into() })));
+        let current = app.editor_features.notice_expiry[&id];
+        drop(app.update_editor_features(Action::ExpireServerNotice { id, ticket: previous }));
+        assert!(app.notices.recent().any(|entry| entry.notice.message == "indexing complete"));
+        drop(app.update_editor_features(Action::ExpireServerNotice { id, ticket: current }));
+        assert!(!app.notices.recent().any(|entry| entry.notice.message == "indexing complete"));
+        assert!(app.notices.recent().any(|entry| entry.notice.message == "server failed"));
+    }
+
+    #[test]
     fn retired_manager_response_cannot_consume_a_new_documents_reused_request_id() {
         let mut app = app();
         let request = LspRequestId(7);
@@ -192,6 +212,7 @@ struct Publication {
 #[derive(Default)]
 pub(super) struct State {
     next_ticket: u64,
+    notice_expiry: HashMap<u64, u64>,
     requests: HashMap<LspRequestId, Operation>,
     preparing: HashMap<u64, Operation>,
     renames: HashMap<CardId, Rename>,
@@ -335,7 +356,18 @@ impl Cagents {
                     LspMessageLevel::Log => tracing::info!(target: "cagents::lsp::server", ?doc, message),
                     LspMessageLevel::Error => self.feature_failure(card, message.clone()),
                     LspMessageLevel::Warning => self.status = Some(TransientNotice::warning(message.clone())),
-                    LspMessageLevel::Info => self.status = Some(TransientNotice::success(message.clone())),
+                    LspMessageLevel::Info => {
+                        let notice = TransientNotice::success(message.clone());
+                        self.notices.record(notice.clone());
+                        let id = self.notices.recent().find(|entry| entry.notice == notice).map(|entry| entry.id).unwrap();
+                        self.editor_features.notice_expiry.retain(|id, _| self.notices.entries.iter().any(|entry| entry.id == *id));
+                        let ticket = self.editor_features.next();
+                        self.editor_features.notice_expiry.insert(id, ticket);
+                        return Some(cosmic::task::future(async move {
+                            tokio::time::sleep(Duration::from_secs(5)).await;
+                            Message::EditorFeatures(Action::ExpireServerNotice { id, ticket })
+                        }));
+                    },
                 }
                 Some(Task::none())
             }
@@ -595,6 +627,13 @@ impl Cagents {
                 if let Some(preview) = self.editor_features.preview.take() {
                     preview.cancellation.cancel();
                     self.reject_server_edit(&preview.operation, "The user canceled the preview");
+                }
+                Task::none()
+            }
+            Action::ExpireServerNotice { id, ticket } => {
+                if self.editor_features.notice_expiry.get(&id) == Some(&ticket) {
+                    self.editor_features.notice_expiry.remove(&id);
+                    self.notices.dismiss(id);
                 }
                 Task::none()
             }

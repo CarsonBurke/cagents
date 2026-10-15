@@ -10438,6 +10438,45 @@ impl Cagents {
         })
     }
 
+    fn update_lsp_message(&mut self, event: LspEvent) -> Task<Message> {
+        if let Some(task) = self.editor_feature_event(&event) { return task; }
+        let navigation = if let LspEvent::Locations {
+            doc,
+            kind: crate::lsp::LocationKind::Definition,
+            items,
+            request,
+            ..
+        } = &event
+        {
+            self.lsp_documents.get(doc).copied().and_then(|card| {
+                let state = self.lsp_contexts.get_mut(&card)?;
+                if state.editor_navigation != Some(*request) {
+                    return None;
+                }
+                state.editor_navigation = None;
+                Some((card, items.clone()))
+            })
+        } else {
+            None
+        };
+        self.apply_lsp_event(event);
+        if let Some((card, locations)) = navigation {
+            if locations.len() == 1
+                && let (crate::lsp::LspTarget::Workspace { path } | crate::lsp::LspTarget::External { path }) = &locations[0].target
+            {
+                return self.jump_to_lsp_location(
+                    card,
+                    path.clone(),
+                    locations[0].range.start,
+                    locations[0].coordinates,
+                );
+            }
+            self.context_tab = ContextTab::Details;
+            self.context_inspector_open = true;
+        }
+        Task::none()
+    }
+
     /// Routes one language-server event onto the card whose document it names.
     fn apply_lsp_event(&mut self, event: LspEvent) {
         if let LspEvent::RootDiscovered { doc, ticket, root } = event {
@@ -16251,44 +16290,7 @@ impl Application for Cagents {
                 close.chain(self.reset_settings())
             }
             Message::EditorFeatures(action) => self.update_editor_features(action),
-            Message::Lsp(event) => {
-                if let Some(task) = self.editor_feature_event(&event) { return task; }
-                let navigation = if let LspEvent::Locations {
-                    doc,
-                    kind: crate::lsp::LocationKind::Definition,
-                    items,
-                    request,
-                    ..
-                } = &event
-                {
-                    self.lsp_documents.get(doc).copied().and_then(|card| {
-                        let state = self.lsp_contexts.get_mut(&card)?;
-                        if state.editor_navigation != Some(*request) {
-                            return None;
-                        }
-                        state.editor_navigation = None;
-                        Some((card, items.clone()))
-                    })
-                } else {
-                    None
-                };
-                self.apply_lsp_event(event);
-                if let Some((card, locations)) = navigation {
-                    if locations.len() == 1
-                        && let (crate::lsp::LspTarget::Workspace { path } | crate::lsp::LspTarget::External { path }) = &locations[0].target
-                    {
-                        return self.jump_to_lsp_location(
-                            card,
-                            path.clone(),
-                            locations[0].range.start,
-                            locations[0].coordinates,
-                        );
-                    }
-                    self.context_tab = ContextTab::Details;
-                    self.context_inspector_open = true;
-                }
-                Task::none()
-            }
+            Message::Lsp(event) => self.update_lsp_message(event),
             Message::LanguageServersReaped => self.advance_exit(|exit| exit.servers_reaped = true),
             Message::WindowClosed(window) => self.advance_exit(|exit| {
                 if exit.closing == Some(window) {
