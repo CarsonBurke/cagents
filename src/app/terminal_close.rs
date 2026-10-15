@@ -328,6 +328,13 @@ impl Cagents {
 
     pub(super) fn resolve_queued_card_close(&mut self, queued: QueuedCardClose) -> Option<Message> {
         if !self.pane_close_decision_current(queued.card,queued.batch) {return None;}
+        // Admission precedes normalization to CloseCard. Otherwise a modal
+        // could consume the already-dequeued message and strand its batch.
+        if self.modal_is_open() {
+            self.stop_pane_close_batch(queued.batch);
+            self.status=Some(TransientNotice::warning("The selected panes were kept because another dialog is open. Finish that dialog, then choose Close panes again."));
+            return None;
+        }
         self.capture_terminal_close_binding(queued.card, false);
         let current = self
             .card_state(queued.card)
@@ -1308,6 +1315,25 @@ mod tests {
             }else{assert!(!app.project_recovery_ui.closing_panes);}
         }
     }
+    #[test]
+    fn emitted_batch_blocked_by_independent_modal_stops_without_stranding_selection() {
+        let (mut app,card,_)=bound_fixture();
+        let another=super::super::tests::terminal_card_state();let other=another.id;
+        Arc::make_mut(&mut app.durable).cards.push(another);
+        let held=super::super::tests::task_app_message(app.close_cards_in_order(vec![other]));
+        drop(app.begin_card_close(card));let intent=app.terminal_close.as_ref().unwrap().clone();
+        assert!(intent.batch.is_none());
+        drop(app.terminal_close_finished(card,intent.terminal,intent.proof,intent.generation,CloseOutcome::Active));
+        assert!(app.modal_is_open());
+        drop(app.update(held));
+        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());
+        assert!(app.status.as_ref().unwrap().message.contains("another dialog"));
+        assert!(app.card_state(other).unwrap().existence.is_open());
+        drop(app.cancel_terminal_close());
+        assert!(!app.project_recovery_ui.closing_panes);assert!(app.queued_card_closes.is_empty());assert!(app.terminal_close.is_none());
+        assert!(app.card_state(other).unwrap().existence.is_open());
+    }
+
     #[test]
     fn revoked_batch_dialog_cannot_persist_optout_or_submit_close_for_same_worker() {
         let (mut app,card,_)=bound_fixture();
