@@ -21301,7 +21301,7 @@ mod tests {
             &RepositoryAction::FindLoaded {
                 card,
                 ticket: card.as_uuid(),
-                result: Ok(Some(Vec::new())),
+                result: Ok(Some(Default::default())),
             }
         ));
         let editor = RepositoryAction::EditorAction {
