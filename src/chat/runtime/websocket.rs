@@ -298,6 +298,7 @@ impl Actor {
         let mut interrupt_sent = false;
         let mut interrupt_error = String::new();
         loop {
+            self.wait_source_claim()?;
             if self.stop.load(Ordering::Acquire)
                 && self
                     .native_holder
@@ -430,6 +431,7 @@ impl Actor {
             }
             if !flushing && !close_sent && !peer_closed {
                 self.drain_commands(closing.is_some())?;
+                self.wait_source_claim()?;
             }
             let partial_started = socket.get_ref().progress.partial_started();
             if partial_started.is_some_and(|at| at.elapsed() > IO_TIMEOUT) {

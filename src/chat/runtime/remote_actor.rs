@@ -1400,6 +1400,9 @@ impl RemoteActor {
                 publication.snapshot
             }
             Err(error) => {
+                // A backend-bound refusal cannot borrow another incarnation's
+                // generic helper cleanup receipt to turn refusal into success.
+                if method == "close_backend_source" { return Err(error); }
                 if !chat::native_holder::actor_close_proved(&self.0.identity.record, &self.0.proof)?
                 {
                     return Err(error);
@@ -2141,12 +2144,42 @@ impl Server {
                 }
                 Ok(Value::Null)
             }
-            "update_source" => {
-                let (source, console, pair) = decode!((
+            "claim_backend_source" => {
+                let (expected,) = decode!((super::BackendIdentity,));
+                if !expected.belongs_to_helper(self.identity.instance) {
+                    return Err("The retained backend helper changed".into());
+                }
+                value!(self.actor.claim_backend_source(&expected)?)
+            }
+            "release_backend_source" => {
+                let (expected, claim) = decode!((super::BackendIdentity, uuid::Uuid));
+                if !expected.belongs_to_helper(self.identity.instance) {
+                    return Err("The retained backend helper changed".into());
+                }
+                self.actor.release_backend_source(&expected, claim)?;
+                Ok(Value::Null)
+            }
+            "update_claimed_source" | "update_source" => {
+                let claimed = if request.method == "update_claimed_source" {
+                    let (expected, claim, source, console, pair) = serde_json::from_value::<(
+                        super::BackendIdentity, uuid::Uuid, chat::Session,
+                        Option<crate::model::LaunchRecipe>, Option<crate::terminal::holder::Record>
+                    )>(request.args.clone()).map_err(|error| error.to_string())?;
+                    if !expected.belongs_to_helper(self.identity.instance) {
+                        return Err("The retained backend helper changed".into());
+                    }
+                    Some((expected, claim, source, console, pair))
+                } else { None };
+                let (source, console, pair) = if let Some((_, _, source, console, pair)) = &claimed {
+                    (source.clone(), console.clone(), pair.clone())
+                } else { decode!((
                     chat::Session,
                     Option<crate::model::LaunchRecipe>,
                     Option<crate::terminal::holder::Record>
-                ));
+                )) };
+                if claimed.is_none() && self.actor.has_backend_source_claim() {
+                    return Err("A pending handoff owns this backend source; retain its exact operation".into());
+                }
                 let mut permitted = self.published_sources();
                 permitted.push(self.source.clone());
                 let matches = permitted.iter().any(|previous| {
@@ -2176,6 +2209,12 @@ impl Server {
                     .len();
                 if lineage.len() > 1024 || retained > 4 * 1024 * 1024 {
                     return Err("Retained source lineage capacity reached".into());
+                }
+                // Validate on the actual actor's ordering before any helper
+                // lineage/ownership field is changed. The claim freezes further
+                // provider reduction until its explicit disposition.
+                if let Some((expected, claim, _, _, _)) = &claimed {
+                    self.actor.update_claimed_native_source(expected, *claim, source.clone(), console.clone(), pair.clone())?;
                 }
                 self.lineage = lineage;
                 self.source = source;
@@ -2227,6 +2266,16 @@ impl Server {
                     reap_orphans()?;
                     self.finish_inputs();
                 }
+                value!(self.publish_close()?)
+            }
+            "close_backend_source" => {
+                let (expected, claim) = decode!((super::BackendIdentity, uuid::Uuid));
+                if !expected.belongs_to_helper(self.identity.instance) {
+                    return Err("The retained backend helper changed; no provider was stopped".into());
+                }
+                self.actor.close_backend_source(&expected, claim)?;
+                reap_orphans()?;
+                self.finish_inputs();
                 value!(self.publish_close()?)
             }
             "close" => {

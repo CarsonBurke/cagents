@@ -200,6 +200,9 @@ impl Server {
         Ok(RestartReceipt { id, state })
     }
     fn replace_provider(&mut self, request: Request) -> Result<Process, String> {
+        if self.actor.has_backend_source_claim() {
+            return Err("An unresolved terminal handoff retains this exact backend; finish or explicitly stop it before restart".into());
+        }
         let context = self
             .actor
             .pinned_execution_directory(&request.working_directory)?;

@@ -57,6 +57,16 @@ const FRAMES_PER_POLL: usize = 256;
 /// Queued stdin bytes above which new commands wait for the provider to read.
 const QUEUE_BACKPRESSURE: usize = QUEUE_LIMIT / 2;
 enum ActorCommand {
+    ClaimBackendSource {
+        expected: BackendIdentity,
+        result: crossbeam_channel::Sender<Result<uuid::Uuid, String>>,
+    },
+    ReleaseBackendSource { expected: BackendIdentity, claim: uuid::Uuid },
+    CloseBackendSource { expected: BackendIdentity, claim: uuid::Uuid },
+    UpdateClaimedSource {
+        expected: BackendIdentity, claim: uuid::Uuid, source: super::Session,
+        console: Option<crate::model::LaunchRecipe>, pair: Option<crate::terminal::holder::Record>,
+    },
     RetainedProvider {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -248,6 +258,9 @@ impl LocalHandle {
         action();
     }
 
+    pub(crate) fn has_backend_source_claim(&self) -> bool {
+        self.0.source_claimed.load(Ordering::Acquire)
+    }
     pub(crate) fn backend_instance(&self) -> uuid::Uuid {
         self.0.backend_instance
     }
@@ -305,6 +318,7 @@ struct Inner {
     close_state: Arc<Mutex<CloseState>>,
     confirmed_session: Arc<Mutex<Option<String>>>,
     backend_conversation: Arc<Mutex<BackendConversation>>,
+    source_claimed: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -638,6 +652,7 @@ impl LocalHandle {
         let stderr_lease = Arc::new(Mutex::new(None));
         let confirmed_session = Arc::new(Mutex::new(None));
         let backend_conversation = Arc::new(Mutex::new(BackendConversation::default()));
+        let source_claimed = Arc::new(AtomicBool::new(false));
         let ownership_admission = Arc::new(Mutex::new(()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
@@ -651,8 +666,9 @@ impl LocalHandle {
                 .as_ref()
                 .and_then(|context| context.directory_descriptor()),
         ));
+        let backend_instance = uuid::Uuid::new_v4();
         let inner = Arc::new(Inner {
-            backend_instance: uuid::Uuid::new_v4(),
+            backend_instance,
             native_holder_record: native_holder.as_ref().map(|holder| holder.record().clone()),
             pinned_directory: pinned_directory.clone(),
             provider_process: provider_process.clone(),
@@ -664,6 +680,7 @@ impl LocalHandle {
             close_state: close_state.clone(),
             confirmed_session: confirmed_session.clone(),
             backend_conversation: backend_conversation.clone(),
+            source_claimed: source_claimed.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             stop: stop.clone(),
@@ -700,6 +717,9 @@ impl LocalHandle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    backend_instance,
+                    source_claim: None,
+                    provider_process: provider_process.clone(),
                     pinned_directory,
                     launch_context: spec.execution.clone(),
                     working_directory: spec.working_directory.clone(),
@@ -719,6 +739,7 @@ impl LocalHandle {
                     close_input_drained:true,
                     confirmed_session,
                     backend_conversation,
+                    source_claimed,
                     store,
                     visible,
                     observe_next,
@@ -953,6 +974,12 @@ impl LocalHandle {
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
+                if native_closed && direct_closed {
+                    // A proved completed incarnation cannot reduce another
+                    // frame. Explicit Stop releases its source pause, without
+                    // claiming completion when native cleanup is uncertain.
+                    actor.source_claimed.store(false, Ordering::Release);
+                }
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
@@ -1364,6 +1391,39 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .write(&[1]);
+    }
+    pub(crate) fn claim_backend_source(&self, expected: &BackendIdentity) -> Result<uuid::Uuid, String> {
+        if self.is_completed() {
+            return expected.matches_local(self).then(uuid::Uuid::new_v4)
+                .ok_or_else(|| "The completed backend changed; no owner was modified".into());
+        }
+        let (send, recv) = crossbeam_channel::bounded(1);
+        self.ownership_command(ActorCommand::ClaimBackendSource { expected: expected.clone(), result: send })?;
+        recv.recv_timeout(Duration::from_secs(10)).map_err(|_| "Source claim result was lost; retain the exact owner".to_string())?
+    }
+    #[cfg(test)]
+    pub(crate) fn claim_backend_source_losing_reply_for_test(&self, expected: &BackendIdentity) -> Result<(), String> {
+        let (send, recv) = crossbeam_channel::bounded(1);
+        drop(recv);
+        self.ownership_command(ActorCommand::ClaimBackendSource { expected: expected.clone(), result: send })
+    }
+    pub(crate) fn release_backend_source(&self, expected: &BackendIdentity, claim: uuid::Uuid) -> Result<(), String> {
+        if self.is_completed() {
+            return expected.matches_local(self).then_some(()).ok_or_else(|| "Completed backend changed".into());
+        }
+        self.ownership_command(ActorCommand::ReleaseBackendSource { expected: expected.clone(), claim })
+    }
+    pub(crate) fn close_backend_source(&self, expected: &BackendIdentity, claim: uuid::Uuid) -> Result<(), String> {
+        if self.is_completed() {
+            if !expected.matches_local(self) { return Err("The completed backend changed; no provider was stopped".into()); }
+        } else {
+            self.ownership_command(ActorCommand::CloseBackendSource { expected: expected.clone(), claim })?;
+        }
+        self.close()
+    }
+    pub(crate) fn update_claimed_native_source(&self, expected: &BackendIdentity, claim: uuid::Uuid,
+        source: super::Session, console: Option<crate::model::LaunchRecipe>, pair: Option<crate::terminal::holder::Record>) -> Result<(), String> {
+        self.ownership_command(ActorCommand::UpdateClaimedSource { expected: expected.clone(), claim, source, console, pair })
     }
     pub(crate) fn update_native_source(
         &self,
@@ -2428,6 +2488,9 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    backend_instance: uuid::Uuid,
+    source_claim: Option<(uuid::Uuid, BackendIdentity)>,
+    provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
@@ -2448,6 +2511,7 @@ struct Actor {
     close_input_drained: bool,
     confirmed_session: Arc<Mutex<Option<String>>>,
     backend_conversation: Arc<Mutex<BackendConversation>>,
+    source_claimed: Arc<AtomicBool>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -2621,6 +2685,7 @@ impl Actor {
         }
         self.step(initial)?;
         while !self.stop.load(Ordering::Acquire) {
+            self.wait_source_claim()?;
             self.drain_commands(false)?;
             if !self.pending.is_empty() {
                 return Err("History reader attempted a provider write".into());
@@ -2692,6 +2757,7 @@ impl Actor {
             let mut garbage_lines = 0usize;
             let mut garbage_total = 0u64;
             loop {
+                self.wait_source_claim()?;
                 let housekeeping = self.adapter.tick();
                 self.step(housekeeping)?;
                 if self.stop.load(Ordering::Acquire) {
@@ -2773,6 +2839,7 @@ impl Actor {
                 }
                 self.close_input_drained = self.output.is_empty();
                 self.drain_commands(closing.is_some())?;
+                self.wait_source_claim()?;
                 if self.output.len() > FRAME_LIMIT {
                     return Err("Provider stdout frame exceeds 32 MiB".into());
                 }
@@ -2960,6 +3027,27 @@ impl Actor {
         self.stderr_reader = Some(stderr);
         result
     }
+    /// One exact source claim pauses provider/ordinary command reduction at its
+    /// serialized cut. Only explicit disposition or Stop wakes it; ambiguity
+    /// retains this owner rather than silently moving consent to a new thread.
+    fn wait_source_claim(&mut self) -> Result<(), String> {
+        while self.source_claim.is_some() && !self.stop.load(Ordering::Acquire) {
+            self.drain_commands(false)?;
+            if self.source_claim.is_none() || self.stop.load(Ordering::Acquire) { break; }
+            let mut fd = libc::pollfd { fd: self.wake.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            if unsafe { libc::poll(&mut fd, 1, -1) } < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted { return Err(error.to_string()); }
+            }
+            let mut buffer = [0; 256];
+            while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
+        }
+        Ok(())
+    }
+    fn source_claim_matches(&self, expected: &BackendIdentity, claim: uuid::Uuid) -> bool {
+        !claim.is_nil() && self.source_claim.as_ref().is_some_and(|(token, original)| *token == claim && original == expected)
+            && expected.matches_actor(self)
+    }
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
         for _ in 0..64 {
             // Backpressure applies to queued bytes, not to the mere existence of a
@@ -2996,6 +3084,13 @@ impl Actor {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
             }
+            if self.source_claim.is_some() && !matches!(&command,
+                ActorCommand::ClaimBackendSource { .. } | ActorCommand::ReleaseBackendSource { .. }
+                | ActorCommand::CloseBackendSource { .. } | ActorCommand::UpdateClaimedSource { .. }
+                | ActorCommand::StopSession { .. }) {
+                let _ = reply.send(Err("This exact backend is retained by a pending terminal handoff; finish or explicitly stop it before other input".into()));
+                continue;
+            }
             if matches!(
                 &command,
                 ActorCommand::CloseIfRevision { .. } | ActorCommand::CloseIfIdle { .. }
@@ -3009,6 +3104,64 @@ impl Actor {
                 self.adapter.after_close_input_drained();
             }
             let (run, command) = match command {
+                ActorCommand::ClaimBackendSource { expected, result } => {
+                    let admitted = if !expected.matches_actor(self) {
+                        Err("The actual provider conversation changed; no owner was stopped".to_string())
+                    } else if let Some((token, original)) = &self.source_claim {
+                        if original == &expected { Ok(*token) } else { Err("Another source claim retains this backend".into()) }
+                    } else if !self.pending.is_empty() || !self.control_replies.is_empty() || !self.close_input_is_clear() {
+                        // Already admitted provider bytes/replies belong to the
+                        // original ordering. Keep them intact; do not claim a
+                        // handoff which would flush a queued /clear after consent.
+                        Err("Provider input/confirmation is pending; no handoff owner was claimed".into())
+                    } else {
+                        let token = uuid::Uuid::new_v4();
+                        self.source_claim = Some((token, expected));
+                        self.source_claimed.store(true, Ordering::Release);
+                        Ok(token)
+                    };
+                    let _ = result.send(admitted);
+                    let _ = reply.send(Ok(()));
+                    continue;
+                }
+                ActorCommand::ReleaseBackendSource { expected, claim } => {
+                    let result = if self.source_claim_matches(&expected, claim) {
+                        self.source_claim = None;
+                        self.source_claimed.store(false, Ordering::Release);
+                        Ok(())
+                    } else { Err("Source claim changed; its exact owner remains retained".into()) };
+                    let _ = reply.send(result);
+                    continue;
+                }
+                ActorCommand::CloseBackendSource { expected, claim } => {
+                    let result = if !self.source_claim_matches(&expected, claim) {
+                        Err("The actual provider conversation changed; no provider was stopped".into())
+                    } else {
+                        let _admission = self.ownership_admission.lock().unwrap_or_else(|p| p.into_inner());
+                        if self.preserve_native.load(Ordering::Acquire) {
+                            Err("Provider ownership is being preserved; no provider was stopped".into())
+                        } else {
+                            self.release_native.store(true, Ordering::Release);
+                            self.stop.store(true, Ordering::Release);
+                            Ok(())
+                        }
+                    };
+                    let _ = reply.send(result);
+                    continue;
+                }
+                ActorCommand::UpdateClaimedSource { expected, claim, source, console, pair } => {
+                    if !self.source_claim_matches(&expected, claim) {
+                        let _ = reply.send(Err("The actual provider conversation changed; no source was updated".into()));
+                        continue;
+                    }
+                    let result = if let Some(holder) = self.native_holder.as_mut() {
+                        holder.update_source(source, console, pair)
+                    } else { Ok(()) };
+                    let failed = result.is_err();
+                    let _ = reply.send(result);
+                    if failed { return Err("Claimed native source update was not acknowledged".into()); }
+                    continue;
+                }
                 ActorCommand::CaptureExecutionDirectory { directory, proof } => {
                     let result = directory::capture(self, &directory);
                     let _ = proof.send(result);

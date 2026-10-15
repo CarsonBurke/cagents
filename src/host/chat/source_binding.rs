@@ -832,6 +832,81 @@ mod tests {
     }
 
     #[test]
+    fn lost_source_claim_reply_retains_exact_actor_and_refuses_queued_conversation_changes() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let owner = actor_with(&source, Box::new(Learns));
+        let proof = source.proof.as_ref().unwrap();
+        owner.0.command(chat::Command::SetModel { model: "first".into(), reasoning: None }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.0.confirmed_session_id().as_deref() != Some("first") {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        let witness = owner.0.backend_identity(proof).unwrap();
+        owner.0.claim_backend_source_losing_reply_for_test(&witness).unwrap();
+        let refusal = owner.0.command(chat::Command::SetModel { model: "second".into(), reasoning: None }).unwrap_err();
+        assert!(refusal.contains("pending terminal handoff"));
+        assert_eq!(owner.0.confirmed_session_id().as_deref(), Some("first"));
+        let token = owner.0.claim_backend_source(&witness).unwrap();
+        assert_eq!(owner.0.claim_backend_source(&witness).unwrap(), token,
+            "retry recovers the actual retained operation, not a new claim");
+        assert!(owner.0.release_backend_source(&witness, uuid::Uuid::new_v4()).is_err());
+        assert!(!owner.0.is_completed());
+        owner.0.release_backend_source(&witness, token).unwrap();
+        owner.0.command(chat::Command::SetModel { model: "second".into(), reasoning: None }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while owner.0.confirmed_session_id().as_deref() != Some("second") {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(owner.0.close_backend_source(&witness, token).unwrap_err().contains("changed"));
+        assert!(!owner.0.is_completed(), "stale consent cannot stop the actual successor conversation");
+        let current = owner.0.backend_identity(proof).unwrap();
+        let token = owner.0.claim_backend_source(&current).unwrap();
+        owner.0.close_backend_source(&current, token).unwrap();
+        assert!(owner.0.is_completed());
+    }
+
+    #[test]
+    fn source_claim_refuses_prior_blocked_provider_writes_without_discarding_them() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        struct Queued;
+        impl Adapter for Queued {
+            fn initialize(&mut self) -> Result<Step, String> { Ok(Step::default()) }
+            fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, _: chat::Command) -> Result<Step, String> {
+                Ok(Step { writes: vec![serde_json::json!({"queued": "x".repeat(1024 * 1024)})], ..Step::default() })
+            }
+        }
+        struct Resume(std::fs::File);
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                // Only the original already-validated owned process is signaled.
+                unsafe { libc::syscall(libc::SYS_pidfd_send_signal, self.0.as_raw_fd(), libc::SIGCONT, std::ptr::null::<libc::siginfo_t>(), 0); }
+            }
+        }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let source = source(directory.path());
+        let owner = actor_with(&source, Box::new(Queued));
+        let process = owner.0.provider_process().unwrap();
+        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
+        assert!(raw >= 0);
+        let descriptor = unsafe { std::fs::File::from_raw_fd(raw as i32) };
+        assert_eq!(crate::daemon::holder_registry::Process::read(process.pid).unwrap(), process);
+        let resume = Resume(descriptor);
+        assert_eq!(unsafe { libc::syscall(libc::SYS_pidfd_send_signal, resume.0.as_raw_fd(), libc::SIGSTOP, std::ptr::null::<libc::siginfo_t>(), 0) }, 0);
+        let witness = owner.0.backend_identity(source.proof.as_ref().unwrap()).unwrap();
+        owner.0.command(chat::Command::Refresh).unwrap();
+        let reason = owner.0.claim_backend_source(&witness).unwrap_err();
+        assert!(reason.contains("input/confirmation is pending"), "{reason}");
+        assert!(!owner.0.is_completed());
+        assert!(owner.0.backend_identity_is_current(&witness));
+        drop(resume);
+        owner.0.close().unwrap();
+    }
+
+    #[test]
     fn first_confirmed_thread_learning_keeps_only_the_original_unknown_intent() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let source = source(directory.path());
