@@ -13282,7 +13282,7 @@ mod tests {
             let task = app.handle_chat_action(action);
             let mut outputs =
                 iced::runtime::task::into_stream(task).expect("actual dispatch starts shaping");
-            let reply = tokio::time::timeout(Duration::from_secs(20), async {
+            tokio::time::timeout(Duration::from_secs(20), async {
                 while let Some(output) = outputs.next().await {
                     if let iced::runtime::Action::Output(cosmic::Action::App(Message::ChatUi(
                         action @ Action::FlowReady(..),

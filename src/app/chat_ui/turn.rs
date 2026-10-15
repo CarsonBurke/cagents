@@ -395,7 +395,7 @@ pub(super) fn same_structure(
             && (matches!((&old.content, &new.content),
                 (ItemContent::Text { thinking: a, phase: ap, .. }, ItemContent::Text { thinking: b, phase: bp, .. })
                 if a == b && ap == bp && renders(&old.content) == renders(&new.content))
-                || old.content == new.content)))
+                || old.content == new.content))
     })
 }
 
