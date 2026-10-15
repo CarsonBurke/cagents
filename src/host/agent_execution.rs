@@ -159,11 +159,13 @@ pub(super) fn submit(
         if !selected.target.directory.is_dir() {
             return Err("The agent working directory is not a directory".into());
         }
+        super::project_removal::ensure_available(host, Some(&selected.target.repository), Some(&selected.target.directory), None).map_err(|error| error.message)?;
         selected.account = Some(selected_account(&selected)?.id());
         Some(selected)
     } else {
         None
     };
+    if let Destination::Existing(id) = &request.destination { super::project_removal::ensure_agent_available(host, *id).map_err(|error| error.message)?; }
     let pinned_directory = selected.as_ref().map(|spec| {
         chat::protocol::ExecutionContext::capture(&spec.target.directory)?.directory_descriptor().ok_or_else(|| "The selected agent directory could not be pinned".to_owned())
     }).transpose()?;
@@ -275,6 +277,8 @@ fn dispatch(
     let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
     let operational_directory = registry.lock().unwrap_or_else(|p| p.into_inner()).agent_execution_directory(accepted.agent.id).map_err(before)?;
+    let operational_repository = registry.lock().unwrap_or_else(|p| p.into_inner()).agent_location(accepted.agent.id).map_err(before)?.repository;
+    super::project_removal::ensure_available(host, Some(&operational_repository), Some(&operational_directory), accepted.agent.session.as_ref().map(HostedSession::id)).map_err(|error| before(error.message))?;
     let mut context = Arc::new(chat::protocol::ExecutionContext::new(directory));
     context
         .verify_directory(&operational_directory)
@@ -819,6 +823,10 @@ pub(super) fn process(
     operation: crate::agent_execution::Operation,
 ) -> Result<crate::agent_execution::Reply, String> {
     use crate::agent_execution::{Operation, Reply, Summary};
+    match &operation {
+        Operation::Console { agent, .. } | Operation::Control { agent, .. } | Operation::Close(agent) => super::project_removal::ensure_agent_available(host, *agent).map_err(|error| error.message)?,
+        _ => {},
+    }
     match operation {
         Operation::Console { agent, command } => console(host, &authority, agent, command),
         Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),

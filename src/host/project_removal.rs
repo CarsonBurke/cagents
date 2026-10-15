@@ -1,9 +1,13 @@
-//! Project removal holds control admission, never a database transaction,
-//! across source-bound provider teardown. Both identity components are checked
-//! before effects and again in the final atomic edit.
+//! Project removal reserves only the selected logical project. Slow source-
+//! bound teardown shares control admission with unrelated input and reads;
+//! short exclusive admission installs the reservation and commits the edit.
 use super::state::{ClientId, SharedHost};
 use crate::{agent_execution::HostedSession, project_recovery::{ProjectInstance, SessionClose}, terminal_ipc::{ClientRequest, ProtocolError, ProtocolErrorCode, ServerMessage, ServerResponse}, workspace_model::{ModelEdit, views::Scope}};
 use std::{collections::HashSet, time::{Duration, Instant}};
+
+mod reservation;
+pub(super) use reservation::{Reservations, admit, ensure_available, ensure_agent_available, reserve};
+use reservation::Reservation;
 
 const MAX_SESSIONS: usize = 4096;
 fn error(message: impl Into<String>) -> ProtocolError { ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false) }
@@ -25,7 +29,7 @@ pub(super) fn inventory(host: &SharedHost, client: ClientId, project: &ProjectIn
     Ok(sessions)
 }
 
-pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstance, sessions: Vec<SessionClose>) -> Result<(ServerResponse, Vec<ServerMessage>, bool), ProtocolError> {
+pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstance, sessions: Vec<SessionClose>, _reservation: &Reservation) -> Result<(ServerResponse, Vec<ServerMessage>, bool), ProtocolError> {
     if sessions.len() > MAX_SESSIONS { return Err(error("Too many project sessions to close at once; close some panes and retry")); }
     let registry = super::agent_execution::registry(host).map_err(error)?;
     let model = {
@@ -111,8 +115,11 @@ pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstan
             return Err(error("A selected native thread or source changed; no project sessions were closed"));
         }
     }
+    let gate = host.lock().unwrap_or_else(|p| p.into_inner()).control_gate.clone();
     let deadline = Instant::now() + Duration::from_secs(60);
     for (selected, (owner, _)) in sessions.into_iter().zip(owners) {
+        let _shared = gate.read().unwrap_or_else(|p| p.into_inner());
+        super::client::ensure_control_open(host)?;
         if Instant::now() >= deadline { return Err(error("Project teardown reached its time limit. The project remains open; retry to close the remaining sessions.")); }
         registry.lock().unwrap_or_else(|p| p.into_inner()).require_project_instance(&project).map_err(error)?;
         let id = selected.source.id();
@@ -139,6 +146,8 @@ pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstan
             _ => unreachable!("preflight retained the selected source kind"),
         }
     }
+    let _commit = gate.write().unwrap_or_else(|p| p.into_inner());
+    super::client::ensure_control_open(host)?;
     super::client::process_admitted(host, client, ClientRequest::EditWorkspaceModel { edit: ModelEdit::CloseProjectInstance { project } })
 }
 
@@ -161,8 +170,9 @@ mod tests {
             let mut state = HostState::new(proof); state.install_model(registry); state.register_client(1);
             Self { _directory: directory, root, host: Arc::new(HostLock::new(state)), expected, handles: Vec::new() }
         }
-        fn spawn(&mut self, id: crate::model::TerminalId) -> SessionClose {
-            let mut recipe = LaunchRecipe::shell(self.root.clone()).unwrap(); recipe.program = "/bin/cat".into(); recipe.arguments.clear();
+        fn spawn(&mut self, id: crate::model::TerminalId) -> SessionClose { let root = self.root.clone(); self.spawn_at(id,&root) }
+        fn spawn_at(&mut self, id: crate::model::TerminalId, directory: &std::path::Path) -> SessionClose {
+            let mut recipe = LaunchRecipe::shell(directory.to_owned()).unwrap(); recipe.program = "/bin/cat".into(); recipe.arguments.clear();
             let session = TerminalSession { id, launch: recipe.clone(), owned_codex_listener: None, recovery_origin: None, predecessor: None, transcript_path: None, resume_hint: None, continuity: TerminalContinuity::RelaunchAvailable { recipe, last_exit: None } };
             let handle = TerminalHandle::spawn(session.clone(), Default::default(), |_| {}).unwrap();
             let descriptor = { let mut state = self.host.lock().unwrap(); state.reserve_spawn(id).unwrap(); state.finish_spawn(1, session, handle.clone(), true).unwrap() };
@@ -173,6 +183,57 @@ mod tests {
             super::super::client::process_request(&self.host, 1, ClientRequest::CloseProjectGuarded { project: expected, sessions })
         }
     }
+    #[test]
+    fn slow_project_teardown_keeps_unrelated_input_responsive_and_releases_reservation() {
+        use crate::{agent::Provider, chat::{self, Command, protocol::{Adapter, ProcessSpec, Step}, runtime::Handle}};
+        use std::{collections::BTreeMap, thread};
+        struct Delayed { entered: crossbeam_channel::Sender<()>, release: crossbeam_channel::Receiver<()> }
+        impl Adapter for Delayed {
+            fn initialize(&mut self) -> Result<Step,String> { Ok(Step::default()) }
+            fn command(&mut self,_:Command) -> Result<Step,String> { self.entered.send(()).unwrap(); self.release.recv_timeout(Duration::from_secs(5)).map_err(|error| error.to_string())?; Ok(Step::default()) }
+            fn receive(&mut self,_:serde_json::Value) -> Result<Step,String> { Ok(Step::default()) }
+        }
+        struct Release(crossbeam_channel::Sender<()>);
+        impl Drop for Release { fn drop(&mut self) { let _ = self.0.try_send(()); } }
+        let mut fixture = Fixture::new();
+        let unrelated_dir = fixture._directory.path().join("unrelated"); std::fs::create_dir(&unrelated_dir).unwrap();
+        let unrelated = fixture.spawn_at(crate::model::TerminalId::new(), &unrelated_dir);
+        let mut recipe = LaunchRecipe::shell(fixture.root.clone()).unwrap(); recipe.program = "/bin/cat".into(); recipe.arguments.clear();
+        let spec = ProcessSpec::from(&recipe); let mut initial = Step::default(); let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let (entered, pending) = crossbeam_channel::bounded(1); let (release, released) = crossbeam_channel::bounded(1); let release = Release(release);
+        let handle = Handle::start(spec,Box::new(Delayed { entered, release: released }),initial,store,None,|_|{}).unwrap();
+        let id = crate::model::TerminalId::new(); let instance = uuid::Uuid::new_v4();
+        let session = {
+            let mut state = fixture.host.lock().unwrap();
+            let session = chat::Session { id, launch: chat::Launch { provider: Provider::Claude, recipe, session_id: None }, proof: Some(state.proof().clone()), terminal: None, native_continuity: Default::default(), owned_codex_listener: None };
+            state.chats.insert(id,super::super::chat::Record { execution_instance: instance, console_recipe: None, paired_terminal: None, session: session.clone(), handle: handle.clone(), source_process: None, subscribers: BTreeMap::from([(1,false)]), observations: BTreeMap::new(), completion_observed: false, returning_terminal: false });
+            session
+        };
+        let actor = handle.clone(); let command = thread::spawn(move || actor.command(Command::Interrupt));
+        pending.recv_timeout(Duration::from_secs(2)).unwrap();
+        let host = fixture.host.clone(); let expected = fixture.expected.clone();
+        let (closed, closing) = crossbeam_channel::bounded(1);
+        let close = thread::spawn(move || { let result = super::super::client::process_request(&host,1,ClientRequest::CloseProjectGuarded { project: expected, sessions: vec![SessionClose { source: HostedSession::Chat(session), execution_instance: Some(instance) }] }); closed.send(result).unwrap(); });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty() { assert!(Instant::now() < deadline,"scoped removal was not admitted"); thread::yield_now(); }
+        assert!(closing.recv_timeout(Duration::from_millis(50)).is_err(),"provider remains blocked until explicitly released");
+        let host = fixture.host.clone(); let unrelated_id = unrelated.source.id();
+        let (answered, answering) = crossbeam_channel::bounded(1);
+        let input = thread::spawn(move || { let listed = super::super::client::process_request(&host,1,ClientRequest::List); let input = super::super::client::process_request(&host,1,ClientRequest::Input { terminal_id: unrelated_id, bytes: b"hello\n".to_vec() }); answered.send((listed,input)).unwrap(); });
+        let (listed,input_result) = answering.recv_timeout(Duration::from_secs(1)).expect("unrelated input/list must complete before provider release");
+        assert!(listed.is_ok()); assert!(input_result.is_ok()); input.join().unwrap();
+        let blocked = super::super::client::process_request(&fixture.host,1,ClientRequest::EditWorkspaceModel { edit: ModelEdit::ReopenProject { repository: fixture.root.clone(), name: "Retry".into(), kind: ProjectKind::Folder, checkout: None, primary_checkout: None } }).unwrap_err();
+        assert!(blocked.message.contains("being removed"));
+        let transfer = ClientRequest::EditWorkspaceModel { edit: ModelEdit::ChangeView { scope: Scope::Worktree { repository: unrelated_dir.clone(), path: unrelated_dir }, expected_revision:0, operation:uuid::Uuid::new_v4(), change:crate::workspace_model::views::Change::Transfer { id: crate::model::CardId::new(), destination: Scope::Worktree { repository: fixture.root.clone(), path: fixture.root.clone() }, before:None } } };
+        assert!(super::super::client::process_request(&fixture.host,1,transfer).unwrap_err().message.contains("being removed"));
+        assert!(ensure_available(&fixture.host,None,Some(&fixture.root),None).is_err());
+        release.0.send(()).unwrap(); let _ = command.join().unwrap();
+        assert!(closing.recv_timeout(Duration::from_secs(5)).unwrap().is_ok()); close.join().unwrap();
+        assert!(!fixture.handles[0].is_completed()); assert!(handle.is_completed());
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty());
+        assert!(ensure_available(&fixture.host,None,Some(&fixture.root),None).is_ok());
+    }
+
     #[test]
     fn stale_project_and_registry_incarnations_refuse_before_teardown() {
         let mut fixture = Fixture::new(); let selected = fixture.spawn(crate::model::TerminalId::new());
@@ -201,6 +262,7 @@ mod tests {
         let mut fixture = Fixture::new(); let first = fixture.spawn(crate::model::TerminalId::new());
         let second = fixture.spawn(crate::model::TerminalId::new());
         assert!(fixture.request(fixture.expected.clone(), vec![first.clone()]).is_err());
+        assert!(fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty(), "failed preflight releases its scoped reservation");
         assert!(fixture.handles.iter().all(|handle| !handle.is_completed()), "a missing new session must not partially close the earlier roster");
         fixture.handles[1].shutdown().unwrap(); fixture.host.lock().unwrap().retire_terminal(second.source.id());
         let successor = fixture.spawn(second.source.id());

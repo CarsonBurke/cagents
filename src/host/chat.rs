@@ -967,6 +967,7 @@ fn start_with_execution(
         if context.directory_descriptor().is_none() { return Err(unavailable("An operational directory override requires its original approved descriptor")); }
         operational_launch.recipe.working_directory = directory.to_owned();
     }
+    super::project_removal::ensure_available(host, None, Some(&operational_launch.recipe.working_directory), Some(session.id))?;
     let saved_history_only = operational_launch.needs_read_only_history();
     if session.launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&session.launch)?;
@@ -1491,6 +1492,7 @@ fn codex_terminal_view(
     mut session: Session,
     recipe: crate::model::LaunchRecipe,
 ) -> Result<ServerResponse, ProtocolError> {
+    super::project_removal::ensure_available(host, None, None, Some(chat_id))?;
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, chat_id)?;
@@ -1562,6 +1564,7 @@ fn codex_terminal_view(
             return Err(unavailable(message));
         }
     };
+    super::project_removal::ensure_available(host, None, Some(&directory), Some(chat_id))?;
     let mut recipe = recipe;
     recipe.working_directory = directory;
     if let Some((source, terminal, proof)) = completed {
@@ -2431,6 +2434,7 @@ fn process_inner(
             // never authority for the replacement's working directory.
             let (directory, execution) = super::session_locations::verified_chat_directory(host, &session, &handle)
                 .map_err(unavailable)?;
+            super::project_removal::ensure_available(host, None, Some(&directory), Some(chat_id))?;
             let mut recipe = recipe;
             recipe.working_directory = directory.clone();
             let terminal_id = crate::model::TerminalId::new();

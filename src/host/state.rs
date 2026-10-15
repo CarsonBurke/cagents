@@ -297,6 +297,7 @@ pub(crate) struct HostState {
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
+    pub(super) project_removals: super::project_removal::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
@@ -326,6 +327,7 @@ impl HostState {
     pub(crate) fn new(proof: HostSessionProof) -> Self {
         Self {
             recover_holders: false,
+            project_removals: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -3483,6 +3485,7 @@ fn start_terminal_view_owned(
     pending_pane: Option<crate::model::CardId>,
     execution_directory: Option<Arc<std::fs::File>>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
+    super::project_removal::ensure_available(shared, None, Some(&session.launch.working_directory), Some(session.id))?;
     validate_launch(&session)?;
     validate_spawn_options(&options)?;
     if let Some(environment) = &mut execution_environment {
