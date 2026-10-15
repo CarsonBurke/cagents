@@ -57,7 +57,7 @@ pub(crate) fn execute(operation: Operation, live_sessions: impl Fn(&Path) -> Res
             request.linear_issue=linear.map(|issue|crate::linear::context::LinkedIssue { issue_id:issue, workspace:None });
             let report=service.create_worktree_journaled_sync(&store,&request,0,&cancellation, |_|{});
             match report.outcome {
-                Some(WorktreeCreationOutcome::Created {worktree,warnings}) => {
+                Some(WorktreeCreationOutcome::Created {worktree,warnings}) if report.state==crate::repository::WorktreeOperationState::Created => {
                     let mut warnings=warnings.into_iter().map(|warning|warning.reported_detail()).collect::<Vec<_>>();
                     let setup=if let Some(plan)=setup_plan {
                         match crate::worktree_setup::prepare(&primary,&worktree.path,&plan,false,&cancellation) {
