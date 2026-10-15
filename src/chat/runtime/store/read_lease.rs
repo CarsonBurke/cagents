@@ -270,16 +270,16 @@ mod tests {
     fn rollback_success_cannot_publish_if_an_unfinished_statement_retains_the_snapshot() {
         let mut store=populated();
         let mut statement=store.db.prepare("SELECT id FROM items ORDER BY ordinal").unwrap();
-        let mut retained=None;
+        let mut rows=statement.query([]).unwrap();
+        assert_eq!(store.db.transaction_state::<&str>(None).unwrap(),rusqlite::TransactionState::None);
         let result=store.with_source_read(|e|e,|_| {
-            retained=Some(statement.query([]).unwrap());
-            assert!(retained.as_mut().unwrap().next().unwrap().is_some());
+            assert!(rows.next().unwrap().is_some());
             Ok("a successful rollback alone is not release proof")
         });
         assert!(result.is_err());
         assert!(store.db.is_autocommit(),"explicit rollback itself succeeded");
         assert_eq!(store.db.transaction_state::<&str>(None).unwrap(),rusqlite::TransactionState::Read);
-        drop(retained);drop(statement);
+        drop(rows);drop(statement);
         assert_all_reads_and_retry_refuse(&mut store);
     }
 
