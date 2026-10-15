@@ -9580,6 +9580,26 @@ mod tests {
     }); }
 
     #[test]
+    fn original_language_capabilities_require_a_live_ready_session() { block_on(async {
+        let (_guard,worktree,file)=workspace();
+        let mut manager=rust_manager();
+        let slot=install_fake(&mut manager,json!({"textDocumentSync":2,"completionProvider":{},"definitionProvider":true,"referencesProvider":{},"hoverProvider":true}),|_|vec![]);
+        let doc=LspDocumentId(1);let events=manager.events();
+        assert_eq!(manager.capabilities(doc),LspCapabilities::default());
+        manager.open_for_test(doc,&file,&worktree,rust_language(),1,"foo");
+        assert!(!manager.capabilities(doc).ready);
+        let _handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        let caps=manager.capabilities(doc);
+        assert!(caps.ready && caps.completion && caps.definition && caps.references && caps.hover);
+        let key=manager.documents[&doc].session.clone();
+        manager.sessions[&key].request_retirement();
+        assert!(!manager.capabilities(doc).ready);
+        manager.close(doc);
+        assert_eq!(manager.capabilities(doc),LspCapabilities::default());
+        manager.begin_shutdown().await;
+    }); }
+
+    #[test]
     fn workspace_edit_conversion_refuses_stale_targets_and_preserves_document_changes_precedence(){
         let store=SnapshotStore::default();let uri=Arc::new(Url::parse("file:///repo/a.rs").unwrap());let key=SessionKey{root:Arc::from(Path::new("/repo")),server_id:Arc::from("rust")};
         store.register(LspDocumentId(1),&uri,&key,2,Arc::from("a𝄞foo"));

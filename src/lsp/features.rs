@@ -45,6 +45,11 @@ impl Default for LspFormattingOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LspCapabilities {
     pub ready: bool,
+    /// Advertised providers; callers must also require `ready`.
+    pub completion: bool,
+    pub definition: bool,
+    pub references: bool,
+    pub hover: bool,
     pub rename: bool,
     pub prepare_rename: bool,
     pub format_document: bool,
@@ -232,7 +237,7 @@ impl LspManager {
 
 pub(super) fn negotiate(c:&lsp_types::ServerCapabilities)->LspCapabilities {
     fn enabled<T>(v:&Option<lsp_types::OneOf<bool,T>>)->bool{!matches!(v,None|Some(lsp_types::OneOf::Left(false)))}
-    LspCapabilities {ready:true,rename:enabled(&c.rename_provider),prepare_rename:matches!(&c.rename_provider,Some(lsp_types::OneOf::Right(o)) if o.prepare_provider==Some(true)),format_document:enabled(&c.document_formatting_provider),format_selection:enabled(&c.document_range_formatting_provider),code_actions:!matches!(c.code_action_provider,None|Some(lsp_types::CodeActionProviderCapability::Simple(false))),code_action_resolve:matches!(&c.code_action_provider,Some(lsp_types::CodeActionProviderCapability::Options(o)) if o.resolve_provider==Some(true)),execute_commands:c.execute_command_provider.as_ref().map(|o|o.commands.clone()).unwrap_or_default(),signature_help:c.signature_help_provider.is_some(),signature_triggers:c.signature_help_provider.as_ref().and_then(|o|o.trigger_characters.clone()).unwrap_or_default(),signature_retriggers:c.signature_help_provider.as_ref().and_then(|o|o.retrigger_characters.clone()).unwrap_or_default()}
+    LspCapabilities {ready:true,completion:c.completion_provider.is_some(),definition:enabled(&c.definition_provider),references:enabled(&c.references_provider),hover:!matches!(c.hover_provider,None|Some(lsp_types::HoverProviderCapability::Simple(false))),rename:enabled(&c.rename_provider),prepare_rename:matches!(&c.rename_provider,Some(lsp_types::OneOf::Right(o)) if o.prepare_provider==Some(true)),format_document:enabled(&c.document_formatting_provider),format_selection:enabled(&c.document_range_formatting_provider),code_actions:!matches!(c.code_action_provider,None|Some(lsp_types::CodeActionProviderCapability::Simple(false))),code_action_resolve:matches!(&c.code_action_provider,Some(lsp_types::CodeActionProviderCapability::Options(o)) if o.resolve_provider==Some(true)),execute_commands:c.execute_command_provider.as_ref().map(|o|o.commands.clone()).unwrap_or_default(),signature_help:c.signature_help_provider.is_some(),signature_triggers:c.signature_help_provider.as_ref().and_then(|o|o.trigger_characters.clone()).unwrap_or_default(),signature_retriggers:c.signature_help_provider.as_ref().and_then(|o|o.retrigger_characters.clone()).unwrap_or_default()}
 }
 
 pub(super) async fn perform_feature(server:ServerSocket,kind:RequestKind,position:lsp_types::TextDocumentPositionParams,args:RequestArgs)->Result<RawFeatureResult,async_lsp::Error> {
@@ -649,6 +654,24 @@ impl LspCodeAction {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn original_language_providers_are_negotiated_independently() {
+        for (raw,expected) in [
+            (json!({}),[false,false,false,false]),
+            (json!({"completionProvider":null,"definitionProvider":false,"referencesProvider":false,"hoverProvider":false}),[false,false,false,false]),
+            (json!({"completionProvider":{},"definitionProvider":true,"referencesProvider":true,"hoverProvider":true}),[true,true,true,true]),
+            (json!({"completionProvider":{},"definitionProvider":{},"referencesProvider":{},"hoverProvider":{}}),[true,true,true,true]),
+            (json!({"completionProvider":{}}),[true,false,false,false]),
+            (json!({"definitionProvider":true}),[false,true,false,false]),
+            (json!({"referencesProvider":true}),[false,false,true,false]),
+            (json!({"hoverProvider":true}),[false,false,false,true]),
+        ] {
+            let server:lsp_types::ServerCapabilities=serde_json::from_value(raw).unwrap();
+            let caps=negotiate(&server);
+            assert_eq!([caps.completion,caps.definition,caps.references,caps.hover],expected);
+        }
+    }
 
     #[test]
     fn code_action_queue_accounts_for_opaque_diagnostic_metadata() {
