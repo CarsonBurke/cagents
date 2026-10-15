@@ -32,6 +32,7 @@ struct RemovalCardOwner {
     runtime: RemovalRuntimeOwner,
     card: CardState,
     scope: Option<PathBuf>,
+    channels: Vec<ChannelId>,
     user_title: Option<String>,
 }
 
@@ -675,6 +676,7 @@ impl Cagents {
     }
 
     fn capture_removal_projections(&self, target: Target) -> RemovalProjection {
+        let channels = self.removal_channel_owners();
         let owners = self.durable.cards.iter()
             .filter(|card| card.existence.is_open() && (card_belongs_to(card, &target.path)
                 || self.durable.card_scopes.get(&card.id).is_some_and(|scope| scope.starts_with(&target.path))))
@@ -687,6 +689,7 @@ impl Cagents {
                     _ => RemovalRuntimeOwner::Descriptor,
                 },
                 scope: self.durable.card_scopes.get(&card.id).cloned(),
+                channels: channels.get(&card.id).cloned().unwrap_or_default(),
                 user_title: self.chrome_ui.user_titles.get(&card.id).cloned()})
             .collect();
         RemovalProjection {request: crate::model::OperationId::new(),
@@ -702,13 +705,17 @@ impl Cagents {
     fn complete_removal_projections(&mut self, completed: RemovalProjection) -> Task<Message> {
         let target = completed.target;
         // A Repository descriptor can retain its card/path through checkout
-        // replacement. Any newer inventory intake invalidates old UI custody.
+        // replacement. New inventory invalidates path-only custody; exact live
+        // client/proof custody survives this removal's own inventory edge.
         let same_device = completed.device == stop_device_key();
         if !same_device { return Task::none(); }
         let same_inventory = same_device && self.repository_generations.get(&target.project).copied()
             == completed.repository_generation;
+        let channels = self.removal_channel_owners();
         let current = completed.owners.into_iter().filter(|owner| {
-            same_inventory && self.removal_owner_is_current(owner)
+            (same_inventory || !matches!(owner.runtime, RemovalRuntimeOwner::Descriptor))
+                && self.removal_owner_is_current(owner)
+                && channels.get(&owner.card.id).map(Vec::as_slice).unwrap_or_default() == owner.channels.as_slice()
                 && self.durable.card_scopes.get(&owner.card.id) == owner.scope.as_ref()
                 && self.chrome_ui.user_titles.get(&owner.card.id) == owner.user_title.as_ref()
                 && !matches!(self.cards.get(&owner.card.id), Some(CardRuntime::Repository(runtime))
@@ -763,6 +770,14 @@ impl Cagents {
         tasks.push(self.lifecycle_sweep());
         tasks.push(self.sync_chrome());
         Task::batch(tasks)
+    }
+
+    fn removal_channel_owners(&self) -> HashMap<CardId, Vec<ChannelId>> {
+        let mut owners = HashMap::<CardId, Vec<ChannelId>>::new();
+        for channel in &self.durable.channels {
+            for &card in &channel.cards { owners.entry(card).or_default().push(channel.id); }
+        }
+        owners
     }
 
     fn removal_owner_is_current(&self, owner: &RemovalCardOwner) -> bool {
@@ -5973,7 +5988,8 @@ mod tests {
 
     #[test]
     fn removal_live_chat_custody_uses_original_weak_client_not_mutable_presentation() {
-        for replacement in [false, true] {
+        for mode in 0..3 {
+            let replacement = mode == 1;
             let repository = PathBuf::from("/repo");
             let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
             let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
@@ -5990,14 +6006,28 @@ mod tests {
             app.cards.insert(card, CardRuntime::Chat(Box::new(chat_ui::Runtime::removal_fixture(runtime_target, session.clone(), Arc::clone(&handle), app.settings.editor_syntax_theme))));
             let custody = app.capture_removal_projections(target.clone());
             assert_eq!(Arc::strong_count(&handle), 2, "custody retains only a Weak client allocation");
+            let old_generation = app.repository_generations.get(&project).copied();
+            app.workspace_model.identity = uuid::Uuid::new_v4();
+            // The host announces this edge before its correlated Removed
+            // response; the original live UI owner must still retire.
+            drop(app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::WorktreesChanged {
+                registry: app.workspace_model.identity, repository: repository.clone(),
+            }));
+            assert_ne!(app.repository_generations.get(&project).copied(), old_generation);
             app.card_state_mut(card).unwrap().title = "Actor settled during Stop".into();
             if replacement {
                 let next = Arc::new(crate::chat::client::ClientHandle::fixture(session.clone(), crate::chat::Snapshot::default()));
                 app.cards.insert(card, CardRuntime::Chat(Box::new(chat_ui::Runtime::removal_fixture(runtime_target, session, next, app.settings.editor_syntax_theme))));
             }
+            if mode == 2 {
+                // Same live actor, but a later explicit channel filing owns its
+                // presentation. The old removal cannot sweep that new intent.
+                Arc::make_mut(&mut app.durable).channels.push(ProjectChannel {id: ChannelId::new(), project_id: project,
+                    title: "Later filing".into(), title_source: Default::default(), ordinal: 0, shared: false, cards: vec![card], focused: Some(card)});
+            }
             drop(app.complete_removal_projections(custody));
-            assert_eq!(app.card_state(card).unwrap().existence.is_open(), replacement,
-                "same-ID/same-descriptor client replacement survives; unchanged original client retires despite mutable title");
+            assert_eq!(app.card_state(card).unwrap().existence.is_open(), mode != 0,
+                "new client or explicit filing survives; exact original live client retires across its own inventory edge");
         }
     }
 
