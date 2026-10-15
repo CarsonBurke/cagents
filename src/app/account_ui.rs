@@ -3632,25 +3632,19 @@ impl Cagents {
     }
 
     /// Closes a sign-in card that is not on the strip on screen, which has
-    /// no card close to run: the daemon closes its terminal - a no-op for
-    /// one that has ended - and the card is then retired.
+    /// no card close to run: the daemon releases its completed record or
+    /// stops its live terminal before the card is retired.
     fn close_offstrip_sign_in(&mut self, card: CardId) -> Task<Message> {
         let hosted = match self.card_state(card) {
-            Some(CardState {
-                kind: CardKind::Terminal(session),
-                ..
-            }) => session
-                .continuity
-                .live_proof()
-                .map(|proof| (session.id, proof)),
+            Some(CardState { kind: CardKind::Terminal(session), .. })
+                if session.continuity.live_proof().is_some() || terminal_ended(session) => Some(session.clone()),
             _ => None,
         };
-        let Some((terminal, proof)) = hosted else {
-            // Ended already, or never taken on by the daemon: nothing runs.
+        let Some(session) = hosted else {
             return Task::batch([self.retire_offstrip_card(card), self.check_logins()]);
         };
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || stop_hosted(terminal, &proof))
+            let result = tokio::task::spawn_blocking(move || stop_hosted(&session))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -3665,12 +3659,7 @@ impl Cagents {
             Some(card) if !self.workspace.order().any(|id| id == card) => {
                 self.close_offstrip_sign_in(card)
             }
-            Some(card)
-                if ended_terminal(self.card_state(card)).is_some()
-                    || matches!(self.cards.get(&card), Some(CardRuntime::Failed(_))) =>
-            {
-                cosmic::task::message(Message::CloseCard(card))
-            }
+            Some(card) => self.close_card_unasked(card),
             _ => Task::none(),
         }
     }
@@ -5028,36 +5017,33 @@ fn ended_on_host(
 /// Closes the hosted `terminal` for good. A daemon that restored it under
 /// a session of its own is asked again with that session, so a close is
 /// only reported done once the terminal has ended or is gone.
-fn stop_hosted(terminal: TerminalId, proof: &HostSessionProof) -> Result<(), String> {
+fn stop_hosted(source: &crate::model::TerminalSession) -> Result<(), String> {
+    let path = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    let mut client = crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
+    stop_hosted_on(&mut client, source)
+}
+
+fn stop_hosted_on(client: &mut crate::control::ControlClient, source: &crate::model::TerminalSession) -> Result<(), String> {
     use super::terminal_close::{CloseOutcome, close_hosted_terminal};
-    let outcome = match close_hosted_terminal(terminal, proof, true) {
-        CloseOutcome::Stale => {
-            let path =
-                crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-            let mut client =
-                crate::control::ControlClient::connect(&path).map_err(|error| error.to_string())?;
-            let hosted = client.list().map_err(|error| error.to_string())?;
-            match hosted
-                .iter()
-                .find(|descriptor| descriptor.session.id == terminal)
-            {
-                None => return Ok(()),
-                Some(descriptor) if terminal_ended(&descriptor.session) => return Ok(()),
-                Some(descriptor) => match descriptor.session.continuity.live_proof() {
-                    Some(current) if current != *proof => {
-                        close_hosted_terminal(terminal, &current, true)
-                    }
-                    _ => CloseOutcome::Stale,
-                },
-            }
-        }
-        outcome => outcome,
+    let hosted = client.list().map_err(|error| error.to_string())?;
+    let Some(descriptor) = hosted.iter().find(|descriptor| descriptor.session.id == source.id) else {
+        return Ok(());
     };
+    if descriptor.session.launch != source.launch {
+        return Err("The sign-in terminal changed; its replacement was kept".into());
+    }
+    if terminal_ended(&descriptor.session) {
+        return match client.release_completed_terminal(descriptor.session.clone(), true)
+            .map_err(|error| error.to_string())? {
+            crate::terminal_ipc::TerminalCloseResult::Closed => Ok(()),
+            crate::terminal_ipc::TerminalCloseResult::Active => Err("The sign-in still owns work".into()),
+            crate::terminal_ipc::TerminalCloseResult::Unknown(error) => Err(error),
+        };
+    }
+    let outcome = close_hosted_terminal(source.id, client.proof(), true);
     match outcome {
         CloseOutcome::Closed => Ok(()),
-        CloseOutcome::Active | CloseOutcome::Stale => {
-            Err("its terminal is still running and could not be closed".to_owned())
-        }
+        CloseOutcome::Active | CloseOutcome::Stale => Err("Its sign-in terminal could not be closed".into()),
         CloseOutcome::Unreachable(error) => Err(error),
     }
 }
@@ -5972,6 +5958,63 @@ mod app_tests {
             .map(|card| card.id)
             .expect("the login opens a card");
         (card, terminal)
+    }
+
+    #[test]
+    fn settling_a_completed_login_requests_daemon_release_before_retiring_its_card() {
+        let mut app = app_in_repo();
+        let key = pending_login(&mut app, 1156);
+        let home = app.account_ui.logins[0].home.clone();
+        let launch = login_launch(&Account::managed(Provider::Claude, key, home),
+            Path::new("/opt/bin/claude"), PathBuf::from("/home/reader"), false).unwrap();
+        let (_, terminal) = app.open_login_terminal(launch, "Sign in".into());
+        let card = app.durable.cards.iter().find(|card|
+            matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal)).unwrap().id;
+        if let Some(CardState { kind: CardKind::Terminal(session), .. }) = app.card_state_mut(card) {
+            session.continuity = TerminalContinuity::RelaunchAvailable {
+                recipe: session.launch.clone(), last_exit: Some(crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: NOW as i64 }),
+            };
+        }
+        let registry = app.account_ui.registry.clone();
+        let _ = app.update(Message::AccountUi(Action::LoginSettled {
+            key, result: Ok(Settled::Registered { registry, identity: None, snapshot: None }),
+        }));
+        assert!(app.terminal_close_attempts.contains(&terminal), "completed login was locally forgotten without requesting daemon release");
+        assert!(app.card_state(card).is_some_and(|state| state.existence.is_open()),
+            "card remains until the daemon confirms its exact completed terminal was released");
+    }
+
+    #[test]
+    fn completed_offstrip_login_is_released_on_the_daemon() {
+        use crate::terminal_ipc::{ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage,
+            ServerResponse, TerminalDescriptor, TerminalCloseResult, PROTOCOL_VERSION, read_frame, write_frame};
+        let (client, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/tmp")).unwrap());
+        session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: session.launch.clone(), last_exit: Some(crate::model::TerminalExit { code: Some(0), signal: None, occurred_at_unix_ms: NOW as i64 }),
+        };
+        let proof = crate::model::HostSessionProof { host_session_id: crate::model::HostSessionId::new("login"),
+            boot_id: crate::model::BootId::new("boot"), host_incarnation: crate::model::HostIncarnation::new("host") };
+        let source = session.clone();
+        let server = std::thread::spawn(move || {
+            let send = |peer: &mut std::os::unix::net::UnixStream, id, response| {
+                write_frame(peer, &ServerEnvelope { version: PROTOCOL_VERSION, request_id: Some(id), proof: proof.clone(),
+                    message: ServerMessage::Response { response } }).unwrap();
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            send(&mut peer, hello.request_id, ServerResponse::Connected { proof: proof.clone(), resumed: Vec::new() });
+            let list: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert!(matches!(list.request, ClientRequest::List));
+            let mut descriptor = TerminalDescriptor::relaunchable(source.id, source.launch.clone(), None);
+            descriptor.session = source.clone();
+            send(&mut peer, list.request_id, ServerResponse::Listed { terminals: vec![descriptor] });
+            let close: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert!(matches!(close.request, ClientRequest::ReleaseCompletedTerminal { session, allow_active: true } if session == source));
+            send(&mut peer, close.request_id, ServerResponse::TerminalCloseChecked { terminal_id: source.id, outcome: TerminalCloseResult::Closed });
+        });
+        let mut client = crate::control::ControlClient::from_stream(client).unwrap();
+        stop_hosted_on(&mut client, &session).unwrap();
+        server.join().unwrap();
     }
 
     #[test]
