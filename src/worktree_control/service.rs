@@ -28,8 +28,15 @@ pub(crate) fn execute(operation: Operation, mut live_sessions: impl FnMut(&Path)
     let cancellation = CancellationToken::new();
     let service = RepositoryService::system("git");
     let store=journal_store()?;
-    if let Ok(_idle)=OPERATIONS.try_write() {
-        service.rehydrate_pending_worktree_operations(&store).map_err(|error|error.to_string())?;
+    {
+        let idle=match OPERATIONS.try_write() {
+            Ok(guard)=>Some(guard),
+            Err(std::sync::TryLockError::Poisoned(error))=>Some(error.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock)=>None,
+        };
+        if let Some(_idle)=idle {
+            service.rehydrate_pending_worktree_operations(&store).map_err(|error|error.to_string())?;
+        }
     }
     let _active=OPERATIONS.read().unwrap_or_else(|poison|poison.into_inner());
     match operation {
