@@ -508,6 +508,10 @@ impl Default for State {
     }
 }
 impl State {
+    pub(super) fn parked_runtime(&self, card: CardId) -> Option<&Runtime> {
+        self.parked.get(&card).map(Box::as_ref)
+    }
+
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,

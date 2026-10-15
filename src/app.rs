@@ -47,6 +47,7 @@ mod workspace_model_sync;
 mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
+use worktree_ui::card_directory;
 pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
@@ -7341,16 +7342,14 @@ impl Cagents {
     ) {
         let activity = self
             .chat_ui
-            .parked
-            .get(&card)
+            .parked_runtime(card)
             .and_then(|runtime| runtime.native_activity())
             .or(activity);
         let outcome = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.activity_outcome(),
-            _ if self.chat_ui.parked.contains_key(&card) => self
+            _ if self.chat_ui.parked_runtime(card).is_some() => self
                 .chat_ui
-                .parked
-                .get(&card)
+                .parked_runtime(card)
                 .and_then(|runtime| runtime.activity_outcome()),
             _ if activity
                 .is_some_and(|activity| activity.state == crate::agent::ActivityState::Working) =>
