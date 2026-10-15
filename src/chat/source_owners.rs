@@ -64,7 +64,7 @@ fn emit(pool:&Arc<Mutex<Owners>>,state:&mut Owners) {
     let usage=Usage {admitted_bytes:state.bytes(),reserved_bytes:state.reserved};
     if state.last_emitted==Some(usage) {return;}
     state.last_emitted=Some(usage);
-    tracing::trace!(target:"cagents::memory",owner="chat_source_pool",pool_id=1u64,
+    tracing::trace!(target:"cagents::memory",owner="chat_source_pool",process_id=std::process::id(),pool_id=1u64,
         accounting="logical_source_payload",admitted_bytes=usage.admitted_bytes,reserved_bytes=usage.reserved_bytes,
         "logical source payload ownership changed");
 }
