@@ -168,12 +168,6 @@ impl Cagents {
         // while the bounded copy operation completed.
         let select = self.select_worktree(worktree, false);
         let start = self.insert_terminal_card(session, None);
-        if let Some(card) = self.durable.cards.iter().find(|card| matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal)).map(|card| card.id) {
-            self.chrome_ui.user_titles.insert(card, "Worktree setup".into());
-            if let Some(state) = self.card_state_mut(card) { state.title = "Worktree setup".into(); }
-            let _ = self.workspace.rename_card(card, "Worktree setup");
-            self.persist();
-        }
         self.refresh_worktree_setup_rows();
         Task::batch([select, start])
     }

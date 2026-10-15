@@ -5834,6 +5834,7 @@ impl Cagents {
         }
         let working_directory = session.launch.working_directory.clone();
         let card_id = CardId::new();
+        let setup = session.launch.environment.get("CAGENTS_WORKTREE_SETUP").map(String::as_str) == Some("1");
         tracing::debug!(target: "cagents::pane_open", stage = "requested", card = ?card_id, kind = "terminal");
         let card = CardState {
             id: card_id,
@@ -5841,10 +5842,10 @@ impl Cagents {
             // A directory name is chosen outside the application, so it needs
             // the same normalisation a reported title gets: it reaches the card
             // header, the accessibility strings and the window title.
-            title: working_directory
+            title: if setup { "Worktree setup".into() } else { working_directory
                 .file_name()
                 .and_then(|name| normalize_card_name(&name.to_string_lossy()))
-                .unwrap_or_else(|| "Terminal".into()),
+                .unwrap_or_else(|| "Terminal".into()) },
             width_fraction: self.settings.default_column_fraction,
             existence: Existence::Open,
             exposure: Exposure::Visible,
@@ -5884,6 +5885,7 @@ impl Cagents {
         } else if session.continuity.live_proof().is_none() {
             self.reserve_terminal_creation(card_id);
         }
+        if setup { self.chrome_ui.user_titles.insert(card_id, "Worktree setup".into()); }
         self.persist();
         Task::batch([
             self.start_terminal(card_id, session, true, false),
