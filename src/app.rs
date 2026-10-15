@@ -7251,7 +7251,8 @@ impl Cagents {
 
     fn agent_worktree(&self, card: CardId) -> Option<ActiveWorktreeKey> {
         let state = self.card_state(card)?;
-        let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
+        let locations =
+            crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
         let roots = self.indexed_worktree_roots();
         let loaded = self.loaded_worktree_keys();
         self.agent_worktree_indexed(state, &locations, &roots, &loaded)
@@ -7264,7 +7265,9 @@ impl Cagents {
         roots: &worktree_ui::WorktreeRoots<'a>,
         loaded: &HashMap<PathBuf, ActiveWorktreeKey>,
     ) -> Option<ActiveWorktreeKey> {
-        if !state.existence.is_open() || !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_)) {
+        if !state.existence.is_open()
+            || !matches!(state.kind, CardKind::Terminal(_) | CardKind::Chat(_))
+        {
             return None;
         }
         // Explicit filing remains display authority. Verified operational
@@ -7275,10 +7278,16 @@ impl Cagents {
         use crate::workspace_model::views::AttentionDirectory;
         let directory = match locations.directory(state) {
             AttentionDirectory::Verified(directory) => directory,
-            AttentionDirectory::Launch => return loaded.get(self.unchanneled_card_worktree_indexed(state, roots)?).cloned(),
+            AttentionDirectory::Launch => {
+                return loaded
+                    .get(self.unchanneled_card_worktree_indexed(state, roots)?)
+                    .cloned();
+            }
             AttentionDirectory::Unavailable => return None,
         };
-        loaded.get(roots.resolve(directory).unwrap_or(directory)).cloned()
+        loaded
+            .get(roots.resolve(directory).unwrap_or(directory))
+            .cloned()
     }
 
     /// Reconcile only when repository roots change, not on runtime/frame wakes.
@@ -7288,10 +7297,12 @@ impl Cagents {
         let loaded = self.loaded_worktree_keys();
         let roots = self.indexed_worktree_roots();
         let resolve = |directory: &Path| {
-            loaded.get(roots.resolve(directory).unwrap_or(directory))
+            loaded
+                .get(roots.resolve(directory).unwrap_or(directory))
                 .map(|key| (key.project_id, key.worktree_id))
         };
-        let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
+        let locations =
+            crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
         let owners: Vec<_> = self
             .durable
             .cards
@@ -7303,14 +7314,20 @@ impl Cagents {
             })
             .map(|card| {
                 let owner = if let Some(scope) = self.durable.card_scopes.get(&card.id) {
-                    loaded.get(scope).map(|key| (key.project_id, key.worktree_id))
+                    loaded
+                        .get(scope)
+                        .map(|key| (key.project_id, key.worktree_id))
                 } else {
                     use crate::workspace_model::views::AttentionDirectory;
                     match locations.directory(card) {
                         AttentionDirectory::Verified(directory) => resolve(directory),
-                        AttentionDirectory::Launch => card_directory(card).and_then(resolve).or_else(|| {
-                            self.worktree_owners.get(&card.id).and_then(|scope| resolve(scope))
-                        }),
+                        AttentionDirectory::Launch => {
+                            card_directory(card).and_then(resolve).or_else(|| {
+                                self.worktree_owners
+                                    .get(&card.id)
+                                    .and_then(|scope| resolve(scope))
+                            })
+                        }
                         AttentionDirectory::Unavailable => None,
                     }
                 };
@@ -11569,8 +11586,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13434,15 +13454,19 @@ impl Application for Cagents {
                 workspace_model_sync::ModelUpdate::Connected(model)
                 | workspace_model_sync::ModelUpdate::Read(model)
                 | workspace_model_sync::ModelUpdate::Reopened { model, .. }
-                | workspace_model_sync::ModelUpdate::ViewApplied { model, .. }
-            ) => (model.identity != self.workspace_model.identity
+                | workspace_model_sync::ModelUpdate::ViewApplied { model, .. },
+            ) => {
+                (model.identity != self.workspace_model.identity
                     || model.sequence >= self.workspace_model.sequence)
-                && (model.identity != self.workspace_model.identity
-                    || model.agent_locations != self.workspace_model.agent_locations
-                    || model.agents != self.workspace_model.agents
-                    || model.views != self.workspace_model.views),
-            Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Edited { sequence, .. }) =>
-                *sequence > self.workspace_model.sequence,
+                    && (model.identity != self.workspace_model.identity
+                        || model.agent_locations != self.workspace_model.agent_locations
+                        || model.agents != self.workspace_model.agents
+                        || model.views != self.workspace_model.views)
+            }
+            Message::WorkspaceModelObserved(workspace_model_sync::ModelUpdate::Edited {
+                sequence,
+                ..
+            }) => *sequence > self.workspace_model.sequence,
             _ => false,
         };
         self.reconcile_terminal_review_owner();

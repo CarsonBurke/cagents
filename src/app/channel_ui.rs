@@ -867,14 +867,22 @@ impl Cagents {
             .retain(|id, _| durable.channels.iter().any(|channel| channel.id == *id));
         let channel_ui = &self.channel_ui;
         let state = &self.sidebar_state;
-        let locations = crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
+        let locations =
+            crate::workspace_model::views::AttentionDirectoryIndex::new(&self.workspace_model);
         let loaded = self.loaded_worktree_keys();
-        let roots = super::worktree_ui::WorktreeRoots::new(self.known_worktree_roots.iter()
-            .map(PathBuf::as_path).chain(loaded.keys().map(PathBuf::as_path)));
+        let roots = super::worktree_ui::WorktreeRoots::new(
+            self.known_worktree_roots
+                .iter()
+                .map(PathBuf::as_path)
+                .chain(loaded.keys().map(PathBuf::as_path)),
+        );
         let cards: HashMap<_, _> = durable.cards.iter().map(|card| (card.id, card)).collect();
         let mut channels: HashMap<_, Vec<_>> = HashMap::new();
         for channel in &durable.channels {
-            channels.entry(channel.project_id).or_default().push(channel);
+            channels
+                .entry(channel.project_id)
+                .or_default()
+                .push(channel);
         }
         for project in &mut self.sidebar_model.projects {
             let worktrees = sidebar::WorktreeIndex::new(&project.worktrees);
@@ -883,8 +891,7 @@ impl Cagents {
             // ascending creation ranks. Display order is not decided here:
             // `sidebar::channels_in_display_order` owns it, one named ordering
             // helper per row kind beside the one the worktree rows use.
-            for channel in channels.get(&project.id).into_iter().flatten()
-            {
+            for channel in channels.get(&project.id).into_iter().flatten() {
                 let title = channel_display_title(channel);
                 let selected = durable.active_channel == Some(channel.id);
                 let deletion = channel_ui.row_deletion(channel.id);
@@ -897,9 +904,10 @@ impl Cagents {
                 let mut outcome = None;
                 for id in &channel.cards {
                     // A visiting utility pane is not what the channel holds.
-                    let Some(card) = cards.get(id).filter(|card| {
-                        card.existence.is_open() && !card.kind.is_utility()
-                    }) else {
+                    let Some(card) = cards
+                        .get(id)
+                        .filter(|card| card.existence.is_open() && !card.kind.is_utility())
+                    else {
                         continue;
                     };
                     has_panes = true;
@@ -907,8 +915,10 @@ impl Cagents {
                     match locations.directory(card) {
                         AttentionDirectory::Verified(directory) => directories.push(directory),
                         AttentionDirectory::Launch => {
-                            if let Some(directory) = card_directory(card) { directories.push(directory); }
-                        },
+                            if let Some(directory) = card_directory(card) {
+                                directories.push(directory);
+                            }
+                        }
                         AttentionDirectory::Unavailable => attribution_unavailable = true,
                     }
                     if let Some(next) = state.card_outcome(*id)
@@ -939,9 +949,15 @@ impl Cagents {
                 }
                 attribution_unavailable |= directories.iter().any(|directory| {
                     let boundary = roots.resolve(directory).unwrap_or(directory);
-                    loaded.get(boundary).is_none_or(|key| key.project_id != project.id)
+                    loaded
+                        .get(boundary)
+                        .is_none_or(|key| key.project_id != project.id)
                 });
-                let worktree = if attribution_unavailable { None } else { worktrees.channel(directories) };
+                let worktree = if attribution_unavailable {
+                    None
+                } else {
+                    worktrees.channel(directories)
+                };
                 let acknowledged_attention = state
                     .attention_retained(sidebar::SelectionRow::Channel(channel.id))
                     && !unread
@@ -1414,21 +1430,45 @@ mod tests {
     #[test]
     fn attention_verified_relocation_updates_channel_branch_and_rollup_without_rewriting_launch() {
         use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
-        use crate::workspace_model::{AgentLocation, views::{Pane, Scope, View}};
+        use crate::workspace_model::{
+            AgentLocation,
+            views::{Pane, Scope, View},
+        };
         let (mut app, channel, _, card) = channel_with_a_conversation();
         app.context_inspector_open = false;
         let project = app.sidebar_model.projects[0].id;
         let worktree = crate::model::WorktreeId::new();
         let old_worktree = crate::model::WorktreeId::new();
-        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
-            old_worktree, "/old/worktree".into(), Some("old-branch".into())));
-        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
-            crate::model::WorktreeId::new(), "/located".into(), Some("parent-control".into())));
-        app.sidebar_model.projects[0].worktrees.push(crate::sidebar::SidebarWorktree::from_durable(
-            worktree, "/located/worktree".into(), Some("relocated-branch".into())));
+        app.sidebar_model.projects[0].worktrees.push(
+            crate::sidebar::SidebarWorktree::from_durable(
+                old_worktree,
+                "/old/worktree".into(),
+                Some("old-branch".into()),
+            ),
+        );
+        app.sidebar_model.projects[0].worktrees.push(
+            crate::sidebar::SidebarWorktree::from_durable(
+                crate::model::WorktreeId::new(),
+                "/located".into(),
+                Some("parent-control".into()),
+            ),
+        );
+        app.sidebar_model.projects[0].worktrees.push(
+            crate::sidebar::SidebarWorktree::from_durable(
+                worktree,
+                "/located/worktree".into(),
+                Some("relocated-branch".into()),
+            ),
+        );
         let durable = Arc::make_mut(&mut app.durable);
-        let saved = durable.cards.iter_mut().find(|saved| saved.id == card).unwrap();
-        let CardKind::Chat(session) = &mut saved.kind else { unreachable!() };
+        let saved = durable
+            .cards
+            .iter_mut()
+            .find(|saved| saved.id == card)
+            .unwrap();
+        let CardKind::Chat(session) = &mut saved.kind else {
+            unreachable!()
+        };
         session.launch.recipe.working_directory = "/old/worktree/src".into();
         session.proof = Some(crate::model::HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("location-host"),
@@ -1439,101 +1479,220 @@ mod tests {
         let pane = Pane::from_card(saved, None).unwrap();
         let placement = Scope::Channel(channel);
         let agent = Agent {
-            id: crate::model::AgentId::from_uuid(card.as_uuid()), name: None,
+            id: crate::model::AgentId::from_uuid(card.as_uuid()),
+            name: None,
             origin: Origin::User,
-            spec: Spec { provider: crate::agent::Provider::Omp, account: None,
-                target: Target { repository: "/old/repository".into(),
+            spec: Spec {
+                provider: crate::agent::Provider::Omp,
+                account: None,
+                target: Target {
+                    repository: "/old/repository".into(),
                     directory: accepted.launch.recipe.working_directory.clone(),
-                    placement: Some(placement.clone()) }, surface: Surface::Chat,
-                model: None, permission_mode: None, reasoning_effort: None },
-            placement: placement.clone(), session: Some(HostedSession::Chat(accepted.clone())),
-            console: None, created_ms: 0, closed: false,
+                    placement: Some(placement.clone()),
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: placement.clone(),
+            session: Some(HostedSession::Chat(accepted.clone())),
+            console: None,
+            created_ms: 0,
+            closed: false,
         };
         // Populate the ordinary derived launch cache before relocation. It is
         // not explicit filing authority and cannot override verified evidence.
         app.refresh_worktree_owners(None);
-        assert_eq!(app.worktree_owners.get(&card).map(PathBuf::as_path), Some(Path::new("/old/worktree")));
+        assert_eq!(
+            app.worktree_owners.get(&card).map(PathBuf::as_path),
+            Some(Path::new("/old/worktree"))
+        );
         app.workspace_model.identity = uuid::Uuid::new_v4();
         app.workspace_model.sequence = 1;
         app.workspace_model.projects = vec![crate::workspace_model::ModelProject {
-            repository: "/repo".into(), name: "project".into(), kind: ProjectKind::Git, ordinal: 0,
+            repository: "/repo".into(),
+            name: "project".into(),
+            kind: ProjectKind::Git,
+            ordinal: 0,
         }];
-        app.workspace_model.channels = app.durable.channels.iter().map(|row| crate::workspace_model::ModelChannel {
-            id: row.id, repository: "/repo".into(), title: row.title.clone(),
-            title_source: row.title_source, ordinal: row.ordinal,
-        }).collect();
+        app.workspace_model.channels = app
+            .durable
+            .channels
+            .iter()
+            .map(|row| crate::workspace_model::ModelChannel {
+                id: row.id,
+                repository: "/repo".into(),
+                title: row.title.clone(),
+                title_source: row.title_source,
+                ordinal: row.ordinal,
+            })
+            .collect();
         app.workspace_model.agents = vec![agent.clone()];
         app.workspace_model.agent_locations = vec![AgentLocation {
-            agent: agent.id, repository: "/old/repository".into(),
-            directory: "/old/worktree/src".into(), blocked_directory: None,
+            agent: agent.id,
+            repository: "/old/repository".into(),
+            directory: "/old/worktree/src".into(),
+            blocked_directory: None,
         }];
-        app.workspace_model.views = vec![View { scope: placement, revision: 1, panes: vec![pane], retired: vec![] }];
-        app.observe_agent_activity_for_card(card, Some(crate::agent::Activity {
-            provider: crate::agent::Provider::Omp, state: ActivityState::Waiting,
-        }));
+        app.workspace_model.views = vec![View {
+            scope: placement,
+            revision: 1,
+            panes: vec![pane],
+            retired: vec![],
+        }];
+        app.observe_agent_activity_for_card(
+            card,
+            Some(crate::agent::Activity {
+                provider: crate::agent::Provider::Omp,
+                state: ActivityState::Waiting,
+            }),
+        );
         app.refresh_sidebar_channels();
-        assert_eq!(app.sidebar_state.agent_activity(project, old_worktree), Some(ActivityState::Waiting));
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, old_worktree),
+            Some(ActivityState::Waiting)
+        );
         let mut incoming = app.workspace_model.clone();
         incoming.sequence += 1;
         incoming.agent_locations[0].repository = "/located/repository".into();
         incoming.agent_locations[0].directory = "/located/worktree/src".into();
-        drop(app.update(Message::WorkspaceModelObserved(super::super::workspace_model_sync::ModelUpdate::Read(incoming))));
-        assert_eq!(app.sidebar_model.projects[0].channels[0].worktree,
-            Some((worktree, "relocated-branch".into())));
-        assert!(app.sidebar_model.projects[0].channels[0].tooltip_for_test().contains("relocated-branch"));
-        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
-        assert_eq!(app.agent_worktree(card).map(|key| key.worktree_id), Some(worktree));
-        app.sidebar_state.observe_agent_update(card, project, worktree);
-        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(project, worktree))));
-        assert!(!app.sidebar_state.has_card_update(card), "bulk read uses verified current ownership");
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(incoming),
+        )));
+        assert_eq!(
+            app.sidebar_model.projects[0].channels[0].worktree,
+            Some((worktree, "relocated-branch".into()))
+        );
+        assert!(
+            app.sidebar_model.projects[0].channels[0]
+                .tooltip_for_test()
+                .contains("relocated-branch")
+        );
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, worktree),
+            Some(ActivityState::Waiting)
+        );
+        assert_eq!(
+            app.agent_worktree(card).map(|key| key.worktree_id),
+            Some(worktree)
+        );
+        app.sidebar_state
+            .observe_agent_update(card, project, worktree);
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(
+            project, worktree,
+        ))));
+        assert!(
+            !app.sidebar_state.has_card_update(card),
+            "bulk read uses verified current ownership"
+        );
         assert_eq!(app.workspace_model.agents[0], agent);
-        assert_eq!(app.durable.cards.iter().find(|saved| saved.id == card).unwrap().kind,
-            CardKind::Chat(accepted.clone()));
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .find(|saved| saved.id == card)
+                .unwrap()
+                .kind,
+            CardKind::Chat(accepted.clone())
+        );
 
         // A separate valid card cannot hide another card's refused provenance.
         let durable = Arc::make_mut(&mut app.durable);
-        let mut other = durable.cards.iter().find(|saved| saved.id == card).unwrap().clone();
+        let mut other = durable
+            .cards
+            .iter()
+            .find(|saved| saved.id == card)
+            .unwrap()
+            .clone();
         other.id = CardId::new();
-        let CardKind::Chat(session) = &mut other.kind else { unreachable!() };
+        let CardKind::Chat(session) = &mut other.kind else {
+            unreachable!()
+        };
         session.id = crate::model::TerminalId::new();
         session.launch.recipe.working_directory = "/located/worktree/other".into();
         let other_id = other.id;
         let other_pane = Pane::from_card(&other, None).unwrap();
-        durable.channels.iter_mut().find(|row| row.id == channel).unwrap().cards.push(other_id);
+        durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(other_id);
         durable.cards.push(other);
         app.workspace_model.views[0].panes.push(other_pane);
         let mut incoming = app.workspace_model.clone();
         incoming.sequence += 1;
         incoming.agent_locations[0].blocked_directory = Some("/located/candidate".into());
-        drop(app.update(Message::WorkspaceModelObserved(super::super::workspace_model_sync::ModelUpdate::Read(incoming))));
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(incoming),
+        )));
         assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none());
-        assert!(app.durable.channels.iter().find(|row| row.id == channel).unwrap().cards.contains(&other_id),
-            "valid other-card control survives actual shared-model reconciliation");
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .find(|row| row.id == channel)
+                .unwrap()
+                .cards
+                .contains(&other_id),
+            "valid other-card control survives actual shared-model reconciliation"
+        );
         assert!(app.agent_worktree(card).is_none());
         assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
-        Arc::make_mut(&mut app.durable).card_scopes.insert(card, "/located/worktree".into());
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(card, "/located/worktree".into());
         app.reconcile_agent_attention_owners();
-        assert_eq!(app.agent_worktree(card).map(|key| key.worktree_id), Some(worktree),
-            "explicit saved filing remains display authority even when process relocation refuses");
-        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
-        Arc::make_mut(&mut app.durable).card_scopes.insert(card, "/located/unloaded-explicit".into());
+        assert_eq!(
+            app.agent_worktree(card).map(|key| key.worktree_id),
+            Some(worktree),
+            "explicit saved filing remains display authority even when process relocation refuses"
+        );
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, worktree),
+            Some(ActivityState::Waiting)
+        );
+        Arc::make_mut(&mut app.durable)
+            .card_scopes
+            .insert(card, "/located/unloaded-explicit".into());
         app.reconcile_agent_attention_owners();
-        assert!(app.agent_worktree(card).is_none(), "explicit scope requires its exact loaded checkout");
+        assert!(
+            app.agent_worktree(card).is_none(),
+            "explicit scope requires its exact loaded checkout"
+        );
         assert_eq!(app.sidebar_state.agent_activity(project, worktree), None);
         Arc::make_mut(&mut app.durable).card_scopes.remove(&card);
         let mut incoming = app.workspace_model.clone();
         incoming.sequence += 1;
         incoming.agent_locations[0].blocked_directory = None;
-        drop(app.update(Message::WorkspaceModelObserved(super::super::workspace_model_sync::ModelUpdate::Read(incoming))));
-        assert_eq!(app.sidebar_state.agent_activity(project, worktree), Some(ActivityState::Waiting));
-        app.sidebar_model.projects[0].worktrees.retain(|row| row.id != worktree);
+        drop(app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(incoming),
+        )));
+        assert_eq!(
+            app.sidebar_state.agent_activity(project, worktree),
+            Some(ActivityState::Waiting)
+        );
+        app.sidebar_model.projects[0]
+            .worktrees
+            .retain(|row| row.id != worktree);
         app.reconcile_agent_attention_owners();
         app.refresh_sidebar_channels();
-        assert!(app.sidebar_model.projects[0].channels[0].worktree.is_none(),
-            "removed nested checkout cannot fall through to the loaded parent control");
+        assert!(
+            app.sidebar_model.projects[0].channels[0].worktree.is_none(),
+            "removed nested checkout cannot fall through to the loaded parent control"
+        );
         assert!(app.agent_worktree(card).is_none());
-        assert_eq!(app.durable.cards.iter().find(|saved| saved.id == card).unwrap().kind,
-            CardKind::Chat(accepted));
+        assert_eq!(
+            app.durable
+                .cards
+                .iter()
+                .find(|saved| saved.id == card)
+                .unwrap()
+                .kind,
+            CardKind::Chat(accepted)
+        );
     }
 
     /// A channel's conversations are reachable nowhere else, so deleting one

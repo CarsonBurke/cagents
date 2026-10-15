@@ -334,27 +334,41 @@ impl<'a> AttentionDirectoryIndex<'a> {
     pub fn new(model: &'a super::WorkspaceModel) -> Self {
         let mut agents = std::collections::HashMap::new();
         for agent in &model.agents {
-            agents.entry(CardId::from_uuid(agent.id.as_uuid()))
-                .and_modify(|entry| *entry = None).or_insert(Some(agent));
+            agents
+                .entry(CardId::from_uuid(agent.id.as_uuid()))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(agent));
         }
         let mut locations = std::collections::HashMap::new();
         for location in &model.agent_locations {
-            locations.entry(CardId::from_uuid(location.agent.as_uuid()))
-                .and_modify(|entry| *entry = None).or_insert(Some(location));
+            locations
+                .entry(CardId::from_uuid(location.agent.as_uuid()))
+                .and_modify(|entry| *entry = None)
+                .or_insert(Some(location));
         }
-        Self { displays: ManagedDisplayIndex::new(model), agents, locations }
+        Self {
+            displays: ManagedDisplayIndex::new(model),
+            agents,
+            locations,
+        }
     }
 
     pub fn directory(&self, card: &CardState) -> AttentionDirectory<'a> {
-        if !card.existence.is_open() { return AttentionDirectory::Unavailable; }
+        if !card.existence.is_open() {
+            return AttentionDirectory::Unavailable;
+        }
         let location = self.locations.get(&card.id);
         let Some(actor) = self.agents.get(&card.id) else {
-            return if location.is_none() { AttentionDirectory::Launch }
-                else { AttentionDirectory::Unavailable };
+            return if location.is_none() {
+                AttentionDirectory::Launch
+            } else {
+                AttentionDirectory::Unavailable
+            };
         };
-        let Some(agent) = *actor else { return AttentionDirectory::Unavailable; };
-        if agent.closed || self.displays.scope(agent).is_none()
-        {
+        let Some(agent) = *actor else {
+            return AttentionDirectory::Unavailable;
+        };
+        if agent.closed || self.displays.scope(agent).is_none() {
             return AttentionDirectory::Unavailable;
         }
         // No fallback placement: location metadata needs current saved canonical
@@ -363,19 +377,32 @@ impl<'a> AttentionDirectoryIndex<'a> {
             return AttentionDirectory::Unavailable;
         };
         let matches = match (&card.kind, &pane.kind) {
-            (CardKind::Chat(current), CardKind::Chat(saved)) => current.proof.as_ref()
-                .is_some_and(crate::model::HostSessionProof::is_complete)
-                && crate::agent_execution::same_chat_process(current, saved),
-            (CardKind::Terminal(current), CardKind::Terminal(saved)) => current.continuity
-                .live_proof().is_some_and(|proof| proof.is_complete())
-                && crate::agent_execution::same_terminal_process(current, saved),
+            (CardKind::Chat(current), CardKind::Chat(saved)) => {
+                current
+                    .proof
+                    .as_ref()
+                    .is_some_and(crate::model::HostSessionProof::is_complete)
+                    && crate::agent_execution::same_chat_process(current, saved)
+            }
+            (CardKind::Terminal(current), CardKind::Terminal(saved)) => {
+                current
+                    .continuity
+                    .live_proof()
+                    .is_some_and(|proof| proof.is_complete())
+                    && crate::agent_execution::same_terminal_process(current, saved)
+            }
             _ => false,
         };
-        if !matches { return AttentionDirectory::Unavailable; }
+        if !matches {
+            return AttentionDirectory::Unavailable;
+        }
         match location {
             None => AttentionDirectory::Launch,
-            Some(Some(location)) if location.blocked_directory.is_none()
-                && location.directory.is_absolute() => AttentionDirectory::Verified(&location.directory),
+            Some(Some(location))
+                if location.blocked_directory.is_none() && location.directory.is_absolute() =>
+            {
+                AttentionDirectory::Verified(&location.directory)
+            }
             Some(_) => AttentionDirectory::Unavailable,
         }
     }
@@ -980,9 +1007,15 @@ mod managed_display_tests {
             let model = location_model(&agent, &pane);
             let card = location_card(&pane);
             let before = (model.clone(), card.clone());
-            assert_eq!(AttentionDirectoryIndex::new(&model).directory(&card),
-                AttentionDirectory::Verified(std::path::Path::new("/relocated/worktree")));
-            assert_eq!((model, card), before, "display metadata cannot rewrite launch or filing");
+            assert_eq!(
+                AttentionDirectoryIndex::new(&model).directory(&card),
+                AttentionDirectory::Verified(std::path::Path::new("/relocated/worktree"))
+            );
+            assert_eq!(
+                (model, card),
+                before,
+                "display metadata cannot rewrite launch or filing"
+            );
         }
     }
 
@@ -994,7 +1027,9 @@ mod managed_display_tests {
         for case in 0..8 {
             let mut model = base.clone();
             match case {
-                0 => model.agent_locations[0].blocked_directory = Some("/candidate/worktree".into()),
+                0 => {
+                    model.agent_locations[0].blocked_directory = Some("/candidate/worktree".into())
+                }
                 1 => model.agent_locations.push(model.agent_locations[0].clone()),
                 2 => model.agents.push(agent.clone()),
                 3 => model.agents.clear(),
@@ -1004,12 +1039,18 @@ mod managed_display_tests {
                 7 => model.agent_locations[0].directory = "relative".into(),
                 _ => unreachable!(),
             }
-            assert_eq!(AttentionDirectoryIndex::new(&model).directory(&card),
-                AttentionDirectory::Unavailable, "refusal case {case}");
+            assert_eq!(
+                AttentionDirectoryIndex::new(&model).directory(&card),
+                AttentionDirectory::Unavailable,
+                "refusal case {case}"
+            );
         }
         let mut old = base;
         old.agent_locations.clear();
-        assert_eq!(AttentionDirectoryIndex::new(&old).directory(&card), AttentionDirectory::Launch);
+        assert_eq!(
+            AttentionDirectoryIndex::new(&old).directory(&card),
+            AttentionDirectory::Launch
+        );
         for case in 0..4 {
             let mut stale = old.clone();
             match case {
@@ -1018,14 +1059,20 @@ mod managed_display_tests {
                 2 => {
                     stale.views[0].panes.clear();
                     stale.views[0].retired.push(card.id);
-                },
+                }
                 3 => stale.views.push(stale.views[0].clone()),
                 _ => unreachable!(),
             }
-            assert_eq!(AttentionDirectoryIndex::new(&stale).directory(&card),
-                AttentionDirectory::Unavailable, "missing DTO cannot bypass known managed refusal {case}");
+            assert_eq!(
+                AttentionDirectoryIndex::new(&stale).directory(&card),
+                AttentionDirectory::Unavailable,
+                "missing DTO cannot bypass known managed refusal {case}"
+            );
         }
-        assert_eq!(AttentionDirectoryIndex::new(&Default::default()).directory(&card), AttentionDirectory::Launch);
+        assert_eq!(
+            AttentionDirectoryIndex::new(&Default::default()).directory(&card),
+            AttentionDirectory::Launch
+        );
     }
 
     #[test]
@@ -1036,24 +1083,38 @@ mod managed_display_tests {
             for case in 0..4 {
                 let mut card = location_card(&pane);
                 match case {
-                    0 => card.existence = Existence::Closing { operation_id: OperationId::new() },
+                    0 => {
+                        card.existence = Existence::Closing {
+                            operation_id: OperationId::new(),
+                        }
+                    }
                     1 => match &mut card.kind {
                         CardKind::Chat(session) => session.proof = None,
-                        CardKind::Terminal(session) => session.continuity = TerminalContinuity::RelaunchAvailable {
-                            recipe: session.launch.clone(), last_exit: None,
-                        },
+                        CardKind::Terminal(session) => {
+                            session.continuity = TerminalContinuity::RelaunchAvailable {
+                                recipe: session.launch.clone(),
+                                last_exit: None,
+                            }
+                        }
                         _ => unreachable!(),
                     },
                     2 => match &mut card.kind {
-                        CardKind::Chat(session) => session.launch.recipe.arguments.push("different".into()),
-                        CardKind::Terminal(session) => session.launch.arguments.push("different".into()),
+                        CardKind::Chat(session) => {
+                            session.launch.recipe.arguments.push("different".into())
+                        }
+                        CardKind::Terminal(session) => {
+                            session.launch.arguments.push("different".into())
+                        }
                         _ => unreachable!(),
                     },
                     3 => card.kind = CardKind::Settings,
                     _ => unreachable!(),
                 }
-                assert_eq!(AttentionDirectoryIndex::new(&model).directory(&card),
-                    AttentionDirectory::Unavailable, "card refusal {case}");
+                assert_eq!(
+                    AttentionDirectoryIndex::new(&model).directory(&card),
+                    AttentionDirectory::Unavailable,
+                    "card refusal {case}"
+                );
             }
         }
     }

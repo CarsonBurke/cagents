@@ -563,10 +563,13 @@ impl Cagents {
                 loaded.entry(project.repository.clone()).or_insert(key);
             }
             for worktree in &project.worktrees {
-                loaded.entry(worktree.path.clone()).or_insert_with(|| ActiveWorktreeKey {
-                    project_id: project.id, worktree_id: worktree.id,
-                    canonical_path: worktree.path.clone(),
-                });
+                loaded
+                    .entry(worktree.path.clone())
+                    .or_insert_with(|| ActiveWorktreeKey {
+                        project_id: project.id,
+                        worktree_id: worktree.id,
+                        canonical_path: worktree.path.clone(),
+                    });
             }
         }
         loaded

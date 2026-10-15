@@ -1082,7 +1082,9 @@ impl Runtime {
         ) {
             // The invocation ended; independently owned requests and background
             // work still report their own state until native proof settles them.
-            let state = if !snapshot.exited && snapshot.activity() == crate::agent::ActivityState::Waiting {
+            let state = if !snapshot.exited
+                && snapshot.activity() == crate::agent::ActivityState::Waiting
+            {
                 "Cancelled · waiting for you"
             } else if !snapshot.exited && snapshot.is_working() {
                 "Cancelled · work continues"
@@ -1412,15 +1414,12 @@ impl Runtime {
             content.push(
                 widget::row::with_children(vec![
                     crate::interaction::focused_escape(
-                        crate::ui_controls::field::search(
-                            "Find in conversation",
-                            query,
-                        )
-                        .id(card_control_id(target.card, "chat-find"))
-                        .on_input(move |query| action(Action::Find(target, query)))
-                        .on_focus(action(Action::FindFocused(target, true)))
-                        .on_unfocus(action(Action::FindFocused(target, false)))
-                        .width(Length::Fill),
+                        crate::ui_controls::field::search("Find in conversation", query)
+                            .id(card_control_id(target.card, "chat-find"))
+                            .on_input(move |query| action(Action::Find(target, query)))
+                            .on_focus(action(Action::FindFocused(target, true)))
+                            .on_unfocus(action(Action::FindFocused(target, false)))
+                            .width(Length::Fill),
                         move || action(Action::CloseFind(target)),
                     ),
                     design::caption(if self.find_matches.is_empty() {
@@ -2888,7 +2887,12 @@ impl Runtime {
     ) -> Element<'a, Message> {
         let target = self.target;
         let open = self.model_picker.is_some();
-        let label = if self.snapshot.fast_mode.as_ref().is_some_and(|mode| mode.enabled()) {
+        let label = if self
+            .snapshot
+            .fast_mode
+            .as_ref()
+            .is_some_and(|mode| mode.enabled())
+        {
             Cow::Owned(format!("{label} · Fast"))
         } else {
             label
@@ -2978,14 +2982,18 @@ impl Runtime {
             crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
                 action(Action::Command(
                     self.target,
-                    Command::SetFastMode { enabled: !mode.enabled() },
+                    Command::SetFastMode {
+                        enabled: !mode.enabled(),
+                    },
                 ))
             })),
             fast_mode_tooltip(mode),
         );
-        Some(widget::column::with_children(vec![models, control])
-            .spacing(step::GAP_XS)
-            .into())
+        Some(
+            widget::column::with_children(vec![models, control])
+                .spacing(step::GAP_XS)
+                .into(),
+        )
     }
 
     /// One exchange: what was asked, what was done, and what came back.
@@ -3101,7 +3109,10 @@ impl Runtime {
             // The latest observation can change at provider heartbeat speed
             // even when the rendered content and elapsed second are unchanged.
             (&item.id, item.started_at.or(item.at), slot).hash(&mut hasher);
-            self.turn_outcome_markers.get(&item.id).map(|marker| marker.signature).hash(&mut hasher);
+            self.turn_outcome_markers
+                .get(&item.id)
+                .map(|marker| marker.signature)
+                .hash(&mut hasher);
             // Only this item's badge changes on copy. Its dismissal timer
             // does not affect what the turn draws.
             self.copied
@@ -3199,18 +3210,36 @@ impl Runtime {
     fn turn_outcome_marker(&self, item: &chat::Item) -> Option<Element<'static, Message>> {
         let marker = self.turn_outcome_markers.get(&item.id)?;
         let (icon, class) = match marker.tone {
-            outcomes::Tone::Finished => (Icon::Check, design::muted_text as fn(&cosmic::Theme) -> iced::widget::text::Style),
-            outcomes::Tone::Cancelled => (Icon::Cancel, design::muted_text as fn(&cosmic::Theme) -> iced::widget::text::Style),
-            outcomes::Tone::Failed => (Icon::Warning, design::destructive_text as fn(&cosmic::Theme) -> iced::widget::text::Style),
+            outcomes::Tone::Finished => (
+                Icon::Check,
+                design::muted_text as fn(&cosmic::Theme) -> iced::widget::text::Style,
+            ),
+            outcomes::Tone::Cancelled => (
+                Icon::Cancel,
+                design::muted_text as fn(&cosmic::Theme) -> iced::widget::text::Style,
+            ),
+            outcomes::Tone::Failed => (
+                Icon::Warning,
+                design::destructive_text as fn(&cosmic::Theme) -> iced::widget::text::Style,
+            ),
         };
-        Some(widget::tooltip(
-            widget::row::with_children(vec![
-                widget::icon(icon.handle()).size(design::COMPACT_ICON_SIZE).into(),
-                design::caption(marker.label.clone()).class(cosmic::theme::Text::Custom(class)).into(),
-            ]).spacing(step::GAP_S).align_y(Alignment::Center),
-            design::caption(marker.detail.clone()),
-            widget::tooltip::Position::Top,
-        ).into())
+        Some(
+            widget::tooltip(
+                widget::row::with_children(vec![
+                    widget::icon(icon.handle())
+                        .size(design::COMPACT_ICON_SIZE)
+                        .into(),
+                    design::caption(marker.label.clone())
+                        .class(cosmic::theme::Text::Custom(class))
+                        .into(),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+                design::caption(marker.detail.clone()),
+                widget::tooltip::Position::Top,
+            )
+            .into(),
+        )
     }
 
     /// The rows of one exchange, with `step` drawing each of its steps and
@@ -3266,7 +3295,10 @@ impl Runtime {
             }
             rows.push(strip);
             for placed in &turn.steps {
-                if let Some(marker) = items.get(placed.index).and_then(|item| self.turn_outcome_marker(item)) {
+                if let Some(marker) = items
+                    .get(placed.index)
+                    .and_then(|item| self.turn_outcome_marker(item))
+                {
                     rows.push(marker);
                 }
             }
@@ -3282,7 +3314,9 @@ impl Runtime {
                     scroll::item(&item.id, card(item, cached, coordinated)),
                     Self::prose_action_footer(item, cached, prose.slot),
                 );
-                if let Some(marker) = self.turn_outcome_marker(item) { rows.push(marker); }
+                if let Some(marker) = self.turn_outcome_marker(item) {
+                    rows.push(marker);
+                }
                 continue;
             }
             rows.message(
@@ -3300,7 +3334,9 @@ impl Runtime {
                 ),
                 Self::prose_action_footer(item, cached, prose.slot),
             );
-            if let Some(marker) = self.turn_outcome_marker(item) { rows.push(marker); }
+            if let Some(marker) = self.turn_outcome_marker(item) {
+                rows.push(marker);
+            }
         }
         widget::container(widget::column::with_children(rows.children).width(Length::Fill))
             .id(iced::advanced::widget::Id::new(format!(
@@ -5038,7 +5074,9 @@ mod tests {
         snapshot.finished_at = Some(42);
         snapshot.outcome = Some(crate::agent::ActivityOutcome::Cancelled);
         // The producer has confirmed cleanup of this exact foreground tool.
-        if let ItemContent::Command { status, .. } = &mut Arc::make_mut(&mut snapshot.items[0]).content {
+        if let ItemContent::Command { status, .. } =
+            &mut Arc::make_mut(&mut snapshot.items[0]).content
+        {
             *status = chat::ToolStatus::Stopped;
         }
         handle.replace_snapshot_for_test(snapshot);
@@ -5097,14 +5135,28 @@ mod tests {
     }
 
     #[test]
-    fn attention_persisted_cancelled_marker_survives_queued_work_and_invalidates_only_its_exact_row() {
-        use chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome};
-        let item = |id: &str, role| chat::Item {
-            id: id.into(), role, started_at: None, at: Some(1000),
-            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final },
+    fn attention_persisted_cancelled_marker_survives_queued_work_and_invalidates_only_its_exact_row()
+     {
+        use chat::turn_outcomes::{
+            TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome,
         };
-        let items = [item("input-A", chat::Role::User), item("answer-A", chat::Role::Assistant),
-            item("input-B", chat::Role::User), item("answer-B", chat::Role::Assistant)];
+        let item = |id: &str, role| chat::Item {
+            id: id.into(),
+            role,
+            started_at: None,
+            at: Some(1000),
+            content: ItemContent::Text {
+                text: id.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let items = [
+            item("input-A", chat::Role::User),
+            item("answer-A", chat::Role::Assistant),
+            item("input-B", chat::Role::User),
+            item("answer-B", chat::Role::Assistant),
+        ];
         let (mut runtime, handle) = frame_cost::live_runtime(&items);
         let mut snapshot = (*runtime.snapshot).clone();
         snapshot.session_id = Some("proved-session".into());
@@ -5114,23 +5166,59 @@ mod tests {
         handle.replace_snapshot_for_test(snapshot.clone());
         runtime.refresh();
         assert_eq!(runtime.turns.len(), 2);
-        let before = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
+        let before = runtime
+            .turns
+            .iter()
+            .map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000)))
+            .collect::<Vec<_>>();
         snapshot.generation += 1;
-        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![VisibleTurnOutcome {
-            outcome: TurnOutcome { identity: TurnIdentity { session_id: "proved-session".into(), kind: TurnIdentityKind::AcceptedInput, id: "confirmed-A".into() },
-                outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 1234 }, item_ids: vec!["input-A".into()],
-        }] });
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            revision: 1,
+            complete: true,
+            records: vec![VisibleTurnOutcome {
+                outcome: TurnOutcome {
+                    identity: TurnIdentity {
+                        session_id: "proved-session".into(),
+                        kind: TurnIdentityKind::AcceptedInput,
+                        id: "confirmed-A".into(),
+                    },
+                    outcome: crate::agent::ActivityOutcome::Cancelled,
+                    finished_at: 1234,
+                },
+                item_ids: vec!["input-A".into()],
+            }],
+        });
         handle.replace_snapshot_for_test(snapshot.clone());
         runtime.refresh();
         assert!(runtime.snapshot.busy);
         assert_eq!(runtime.snapshot.turn_generation, 2);
-        assert!(runtime.snapshot.outcome.is_none(), "late historical proof cannot settle B");
-        assert_eq!(runtime.conversation_status(false), (Some(Icon::AgentWorking), "Responding"));
-        assert!(runtime.turn_outcome_markers["input-A"].label.starts_with("Cancelled"));
+        assert!(
+            runtime.snapshot.outcome.is_none(),
+            "late historical proof cannot settle B"
+        );
+        assert_eq!(
+            runtime.conversation_status(false),
+            (Some(Icon::AgentWorking), "Responding")
+        );
+        assert!(
+            runtime.turn_outcome_markers["input-A"]
+                .label
+                .starts_with("Cancelled")
+        );
         assert!(!runtime.turn_outcome_markers.contains_key("input-B"));
-        let after = runtime.turns.iter().map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000))).collect::<Vec<_>>();
-        assert_ne!(before[0], after[0], "an outcome-only projection must invalidate the retained row that draws it");
-        assert_eq!(before[1], after[1], "unrelated streaming work must retain its existing row");
+        let after = runtime
+            .turns
+            .iter()
+            .map(|turn| runtime.turn_fingerprint_at(turn, false, Some(5000)))
+            .collect::<Vec<_>>();
+        assert_ne!(
+            before[0], after[0],
+            "an outcome-only projection must invalidate the retained row that draws it"
+        );
+        assert_eq!(
+            before[1], after[1],
+            "unrelated streaming work must retain its existing row"
+        );
         // A subsequent delta can carry the unchanged projection by Arc. It
         // must not erase A's marker when B completes and its footer changes.
         snapshot.generation += 1;
@@ -5139,7 +5227,11 @@ mod tests {
         snapshot.outcome = Some(crate::agent::ActivityOutcome::Succeeded);
         handle.replace_snapshot_for_test(snapshot.clone());
         runtime.refresh();
-        assert!(runtime.turn_outcome_markers["input-A"].label.starts_with("Cancelled"));
+        assert!(
+            runtime.turn_outcome_markers["input-A"]
+                .label
+                .starts_with("Cancelled")
+        );
         assert_eq!(runtime.conversation_status(false).1, "Finished");
         let same_snapshot = runtime.snapshot.clone();
         let expected_markers = runtime.turn_outcome_markers.clone();
@@ -5147,95 +5239,211 @@ mod tests {
         assert!(runtime.turn_outcome_markers.is_empty());
         runtime.refresh();
         assert!(Arc::ptr_eq(&same_snapshot, &runtime.snapshot));
-        assert_eq!(runtime.turn_outcome_markers, expected_markers,
-            "revealing an evicted presentation rebuilds even with the exact same snapshot/projection Arc");
-        let replay: Snapshot = postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
+        assert_eq!(
+            runtime.turn_outcome_markers, expected_markers,
+            "revealing an evicted presentation rebuilds even with the exact same snapshot/projection Arc"
+        );
+        let replay: Snapshot =
+            postcard::from_bytes(&postcard::to_stdvec(&snapshot).unwrap()).unwrap();
         let (mut reattached, new_handle) = frame_cost::live_runtime(&items);
         new_handle.replace_snapshot_for_test(replay);
         reattached.refresh();
-        assert_eq!(reattached.turn_outcome_markers, runtime.turn_outcome_markers,
-            "a newly attached UI projects the same supplied durable outcome without local history state");
+        assert_eq!(
+            reattached.turn_outcome_markers, runtime.turn_outcome_markers,
+            "a newly attached UI projects the same supplied durable outcome without local history state"
+        );
     }
 
     #[test]
     fn attention_turn_markers_reproject_middle_bindings_and_role_changes_with_unchanged_edges() {
-        use chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome};
-        let item = |id: &str, role| chat::Item { id: id.into(), role, started_at: None, at: None,
-            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final } };
-        let items = [item("edge-first", chat::Role::User), item("part-A1", chat::Role::User),
-            item("part-B", chat::Role::Assistant), item("edge-last", chat::Role::Assistant)];
+        use chat::turn_outcomes::{
+            TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome,
+        };
+        let item = |id: &str, role| chat::Item {
+            id: id.into(),
+            role,
+            started_at: None,
+            at: None,
+            content: ItemContent::Text {
+                text: id.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let items = [
+            item("edge-first", chat::Role::User),
+            item("part-A1", chat::Role::User),
+            item("part-B", chat::Role::Assistant),
+            item("edge-last", chat::Role::Assistant),
+        ];
         let (mut runtime, handle) = frame_cost::live_runtime(&items);
         let mut snapshot = (*runtime.snapshot).clone();
         snapshot.session_id = Some("proved-session".into());
-        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![VisibleTurnOutcome {
-            outcome: TurnOutcome { identity: TurnIdentity { session_id: "proved-session".into(), kind: TurnIdentityKind::AcceptedInput, id: "confirmed".into() },
-                outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 1234 }, item_ids: vec!["part-A1".into(), "part-A2".into(), "part-B".into()],
-        }] });
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            revision: 1,
+            complete: true,
+            records: vec![VisibleTurnOutcome {
+                outcome: TurnOutcome {
+                    identity: TurnIdentity {
+                        session_id: "proved-session".into(),
+                        kind: TurnIdentityKind::AcceptedInput,
+                        id: "confirmed".into(),
+                    },
+                    outcome: crate::agent::ActivityOutcome::Cancelled,
+                    finished_at: 1234,
+                },
+                item_ids: vec!["part-A1".into(), "part-A2".into(), "part-B".into()],
+            }],
+        });
         snapshot.generation += 1;
-        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
         assert!(runtime.turn_outcome_markers.contains_key("part-A1"));
         let projection = snapshot.turn_outcomes.clone();
         snapshot.generation += 1;
         snapshot.items[1] = Arc::new(item("part-A2", chat::Role::User));
-        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
         assert!(Arc::ptr_eq(&projection, &runtime.snapshot.turn_outcomes));
         assert_eq!(runtime.snapshot.items.len(), 4);
         assert_eq!(runtime.snapshot.items.first().unwrap().id, "edge-first");
         assert_eq!(runtime.snapshot.items.last().unwrap().id, "edge-last");
         assert!(!runtime.turn_outcome_markers.contains_key("part-A1"));
-        assert!(runtime.turn_outcome_markers.contains_key("part-A2"), "middle replacement must rebind without a new projection Arc");
+        assert!(
+            runtime.turn_outcome_markers.contains_key("part-A2"),
+            "middle replacement must rebind without a new projection Arc"
+        );
         snapshot.generation += 1;
         snapshot.items[1] = Arc::new(item("part-A2", chat::Role::Assistant));
-        handle.replace_snapshot_for_test(snapshot); runtime.refresh();
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
         assert!(Arc::ptr_eq(&projection, &runtime.snapshot.turn_outcomes));
         assert!(!runtime.turn_outcome_markers.contains_key("part-A2"));
-        assert!(runtime.turn_outcome_markers.contains_key("part-B"), "role correction changes user preference without changing any item ID");
+        assert!(
+            runtime.turn_outcome_markers.contains_key("part-B"),
+            "role correction changes user preference without changing any item ID"
+        );
     }
 
     #[test]
-    fn attention_exact_foreground_status_stops_only_its_old_turn_and_preserves_busy_and_background_work() {
-        use chat::turn_outcomes::{TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome};
-        let user = |id: &str| chat::Item { id: id.into(), role: chat::Role::User, started_at: Some(1000), at: Some(1000),
-            content: ItemContent::Text { text: id.into(), thinking: false, phase: chat::Phase::Final } };
-        let tool = |id: &str| chat::Item { id: id.into(), role: chat::Role::Assistant, started_at: Some(1000), at: Some(2000),
-            content: ItemContent::Command { label: id.into(), command: "sleep 600".into(), working_directory: "/project".into(),
-                action: chat::CommandAction::Run, status: chat::ToolStatus::Running, exit_code: None, duration_ms: None, output: String::new() } };
-        let items = [user("input-A"), tool("tool-A"), user("unknown-owner"), tool("background-control"), user("input-B"), tool("tool-B")];
+    fn attention_exact_foreground_status_stops_only_its_old_turn_and_preserves_busy_and_background_work()
+     {
+        use chat::turn_outcomes::{
+            TurnIdentity, TurnIdentityKind, TurnOutcome, TurnOutcomeProjection, VisibleTurnOutcome,
+        };
+        let user = |id: &str| chat::Item {
+            id: id.into(),
+            role: chat::Role::User,
+            started_at: Some(1000),
+            at: Some(1000),
+            content: ItemContent::Text {
+                text: id.into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        };
+        let tool = |id: &str| chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            started_at: Some(1000),
+            at: Some(2000),
+            content: ItemContent::Command {
+                label: id.into(),
+                command: "sleep 600".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Running,
+                exit_code: None,
+                duration_ms: None,
+                output: String::new(),
+            },
+        };
+        let items = [
+            user("input-A"),
+            tool("tool-A"),
+            user("unknown-owner"),
+            tool("background-control"),
+            user("input-B"),
+            tool("tool-B"),
+        ];
         let (mut runtime, handle) = frame_cost::live_runtime(&items);
         let mut snapshot = (*runtime.snapshot).clone();
         snapshot.session_id = Some("proved-session".into());
         snapshot.turn_generation = 2;
         snapshot.busy = true;
         snapshot.generation += 1;
-        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
         assert!(runtime.turns.iter().all(|turn| turn.running));
         // EndItems/producer cleanup supplies this exact terminal tool status.
         // The UI does not infer tool ownership from the preceding user bubble.
-        if let ItemContent::Command { status, .. } = &mut Arc::make_mut(&mut snapshot.items[1]).content { *status = chat::ToolStatus::Stopped; }
-        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection { revision: 1, complete: true, records: vec![VisibleTurnOutcome {
-            outcome: TurnOutcome { identity: TurnIdentity { session_id: "proved-session".into(), kind: TurnIdentityKind::AcceptedInput, id: "confirmed-A".into() },
-                outcome: crate::agent::ActivityOutcome::Cancelled, finished_at: 3000 }, item_ids: vec!["input-A".into(), "tool-A".into()],
-        }] });
+        if let ItemContent::Command { status, .. } =
+            &mut Arc::make_mut(&mut snapshot.items[1]).content
+        {
+            *status = chat::ToolStatus::Stopped;
+        }
+        snapshot.turn_outcomes = Arc::new(TurnOutcomeProjection {
+            revision: 1,
+            complete: true,
+            records: vec![VisibleTurnOutcome {
+                outcome: TurnOutcome {
+                    identity: TurnIdentity {
+                        session_id: "proved-session".into(),
+                        kind: TurnIdentityKind::AcceptedInput,
+                        id: "confirmed-A".into(),
+                    },
+                    outcome: crate::agent::ActivityOutcome::Cancelled,
+                    finished_at: 3000,
+                },
+                item_ids: vec!["input-A".into(), "tool-A".into()],
+            }],
+        });
         snapshot.generation += 1;
-        handle.replace_snapshot_for_test(snapshot.clone()); runtime.refresh();
-        let glyph = |runtime: &Runtime, id: &str| runtime.turns.iter().find(|turn| turn.steps.iter()
-            .any(|placed| runtime.snapshot.items[placed.index].id == id)).unwrap().glyph();
+        handle.replace_snapshot_for_test(snapshot.clone());
+        runtime.refresh();
+        let glyph = |runtime: &Runtime, id: &str| {
+            runtime
+                .turns
+                .iter()
+                .find(|turn| {
+                    turn.steps
+                        .iter()
+                        .any(|placed| runtime.snapshot.items[placed.index].id == id)
+                })
+                .unwrap()
+                .glyph()
+        };
         assert_eq!(glyph(&runtime, "tool-A"), Some(chat::ToolStatus::Stopped));
         assert_eq!(glyph(&runtime, "tool-B"), Some(chat::ToolStatus::Running));
-        assert_eq!(glyph(&runtime, "background-control"), Some(chat::ToolStatus::Running));
-        assert!(runtime.turn_outcome_markers["input-A"].label.starts_with("Cancelled"));
+        assert_eq!(
+            glyph(&runtime, "background-control"),
+            Some(chat::ToolStatus::Running)
+        );
+        assert!(
+            runtime.turn_outcome_markers["input-A"]
+                .label
+                .starts_with("Cancelled")
+        );
         assert!(runtime.snapshot.outcome.is_none());
         assert!(runtime.snapshot.busy);
-        if let ItemContent::Command { status, .. } = &mut Arc::make_mut(&mut snapshot.items[5]).content { *status = chat::ToolStatus::Succeeded; }
+        if let ItemContent::Command { status, .. } =
+            &mut Arc::make_mut(&mut snapshot.items[5]).content
+        {
+            *status = chat::ToolStatus::Succeeded;
+        }
         snapshot.busy = false;
         snapshot.finished_at = Some(4000);
         snapshot.outcome = Some(crate::agent::ActivityOutcome::Succeeded);
         snapshot.generation += 1;
-        handle.replace_snapshot_for_test(snapshot); runtime.refresh();
+        handle.replace_snapshot_for_test(snapshot);
+        runtime.refresh();
         assert_eq!(glyph(&runtime, "tool-A"), Some(chat::ToolStatus::Stopped));
         assert_eq!(glyph(&runtime, "tool-B"), Some(chat::ToolStatus::Succeeded));
-        assert_eq!(glyph(&runtime, "background-control"), Some(chat::ToolStatus::Running),
-            "a terminal current scalar never proves an unbound/background task stopped");
+        assert_eq!(
+            glyph(&runtime, "background-control"),
+            Some(chat::ToolStatus::Running),
+            "a terminal current scalar never proves an unbound/background task stopped"
+        );
     }
 
     #[test]
@@ -5244,18 +5452,32 @@ mod tests {
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.outcome = Some(crate::agent::ActivityOutcome::Cancelled);
         snapshot.subagents.push(native_child_fixture());
-        assert_eq!(runtime.conversation_status(false),
-            (Some(Icon::Cancel), "Cancelled · work continues"));
-        assert_eq!(runtime.snapshot.subagents[0].status, chat::ToolStatus::Running);
+        assert_eq!(
+            runtime.conversation_status(false),
+            (Some(Icon::Cancel), "Cancelled · work continues")
+        );
+        assert_eq!(
+            runtime.snapshot.subagents[0].status,
+            chat::ToolStatus::Running
+        );
         Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
-        assert_eq!(runtime.conversation_status(false).1, "Cancelled · waiting for you");
+        assert_eq!(
+            runtime.conversation_status(false).1,
+            "Cancelled · waiting for you"
+        );
         let snapshot = Arc::make_mut(&mut runtime.snapshot);
         snapshot.outcome = None; // Confirmed next parent turn started.
         snapshot.busy = true;
         snapshot.subagents[0].waiting = false;
-        assert_eq!(runtime.conversation_status(false).0, Some(Icon::AgentWorking));
+        assert_eq!(
+            runtime.conversation_status(false).0,
+            Some(Icon::AgentWorking)
+        );
         assert!(!runtime.conversation_status(false).1.contains("Cancelled"));
-        assert_eq!(runtime.snapshot.subagents[0].status, chat::ToolStatus::Running);
+        assert_eq!(
+            runtime.snapshot.subagents[0].status,
+            chat::ToolStatus::Running
+        );
     }
 
     #[test]
@@ -7764,8 +7986,14 @@ mod tests {
                 iced::mouse::Cursor::Unavailable,
             );
             assert!(
-                !accessible.root().iter().chain(accessible.children()).any(|node|
-                    node.node().label().is_some_and(|name| name.starts_with("Reported edits 1"))),
+                !accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .any(|node| node
+                        .node()
+                        .label()
+                        .is_some_and(|name| name.starts_with("Reported edits 1"))),
                 "file review must not add a permanent footer action"
             );
             for label in ["Send message", "Close"] {
@@ -8015,10 +8243,11 @@ mod tests {
                     message,
                     Message::ChatUi(Action::ComposerActions(actual, false)) if *actual == target
                 )));
-                assert!(!messages.iter().any(|message| matches!(
-                    message,
-                    Message::ChatUi(Action::Interrupt(..))
-                )));
+                assert!(
+                    !messages
+                        .iter()
+                        .any(|message| matches!(message, Message::ChatUi(Action::Interrupt(..))))
+                );
             } else {
                 assert!(
                     messages.iter().any(|message| matches!(
