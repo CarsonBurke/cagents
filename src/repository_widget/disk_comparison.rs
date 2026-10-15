@@ -19,6 +19,15 @@ pub(super) struct Job {
 }
 impl Drop for Job { fn drop(&mut self) { self.cancellation.cancel(); } }
 impl RepositoryRuntime {
+    pub fn can_compare_disk(&self) -> bool {
+        !self.has_editor_recovery() && !self.is_saving() && !self.is_read_only_source()
+            && !matches!(self.disk_comparison, Some(DiffState::Loading { .. }))
+            && matches!(&self.document, DocumentState::Editable(document) if document.external_version.is_some())
+    }
+    pub fn can_keep_mine(&self) -> bool {
+        !self.has_editor_recovery() && !self.is_saving() && !self.is_read_only_source()
+            && matches!(&self.document, DocumentState::Editable(document) if document.external_version.is_some() || document.external_deleted)
+    }
     fn disk_comparison_key(&self, card: CardId) -> Option<Key> {
         if self.has_editor_recovery() || self.workspace_edit_pending() || self.is_saving() { return None; }
         let DocumentState::Editable(document) = &self.document else { return None; };

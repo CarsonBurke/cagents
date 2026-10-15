@@ -10959,8 +10959,8 @@ fn selected_file_view<'a>(card: CardId, runtime: &'a RepositoryRuntime, review: 
     if document.external_version.is_none() && !document.external_deleted { return content; }
     let actions: Vec<Element<'a, RepositoryAction>> = vec![
         crate::ui_controls::button::secondary("Reload").on_press_maybe((!runtime.is_saving() && document.external_version.is_some()).then_some(RepositoryAction::Reload { card })).into(),
-        crate::ui_controls::button::secondary("Compare").on_press_maybe((!runtime.is_saving() && !matches!(runtime.disk_comparison, Some(DiffState::Loading { .. })) && document.external_version.is_some()).then_some(RepositoryAction::CompareDisk { card })).into(),
-        crate::ui_controls::button::secondary(if document.external_deleted { "Save again" } else { "Keep mine" }).on_press_maybe((!runtime.is_saving()).then_some(RepositoryAction::KeepMine { card })).into(),
+        crate::ui_controls::button::secondary("Compare").on_press_maybe(runtime.can_compare_disk().then_some(RepositoryAction::CompareDisk { card })).into(),
+        crate::ui_controls::button::secondary(if document.external_deleted { "Save again" } else { "Keep mine" }).on_press_maybe(runtime.can_keep_mine().then_some(RepositoryAction::KeepMine { card })).into(),
     ];
     let mut rows: Vec<Element<'a, RepositoryAction>> = vec![
         crate::design::body(if document.external_deleted { "File deleted or renamed on disk. Your buffer has been kept." } else { "File changed on disk" }).width(Length::Fill).into(),
