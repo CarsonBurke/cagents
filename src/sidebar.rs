@@ -395,6 +395,9 @@ pub struct SidebarProject {
     /// and every other project stays listed beside it.
     pub unreachable: Option<String>,
     pub missing: bool,
+    /// The originally bound checkout needs Locate, while another verified
+    /// checkout keeps this project's navigation and Git reads available.
+    pub location_repair: Option<String>,
     pub missing_details: bool,
     /// Whether a read of this project is in flight. An unreadable project's
     /// retry is the one control whose effect is invisible until it finishes,
@@ -509,6 +512,7 @@ impl SidebarProject {
             avatar: None,
             unreachable: None,
             missing: false,
+            location_repair: None,
             missing_details: false,
             reloading: false,
             chrome,
@@ -535,6 +539,7 @@ impl SidebarProject {
         self.repository = relocation.destination.clone();
         self.chrome = ProjectChrome::new(self.id, &self.name, &self.repository);
         self.missing = false;
+        self.location_repair = None;
         self.unreachable = None;
         self.reloading = false;
         for worktree in &mut self.worktrees {
@@ -5293,6 +5298,36 @@ fn unreachable_project<'a>(
 }
 
 fn project_view<'a>(
+    project: &FilteredProject<'a>,
+    expanded: bool,
+    compact: bool,
+    selection: Option<SidebarSelection>,
+    modal_open: bool,
+    sticky_viewport: row_interaction::StickyViewport,
+) -> Element<'static, SidebarAction> {
+    let normal=project_view_inner(project,expanded,compact,selection,modal_open,sticky_viewport);
+    let entity=project.project;
+    let Some(reason)=entity.location_repair.as_ref().filter(|_|!entity.missing) else {return normal};
+    let action=|action|gated(SidebarAction::RecoverProject {project_id:entity.id,action},modal_open || entity.reloading && action!=ProjectRecoveryAction::Details);
+    let repair:Element<'static,SidebarAction>=if compact {
+        crate::ui_controls::icon_button(Icon::Warning,format!("{}: original checkout needs Locate; another checkout remains available",entity.name))
+            .tone(design::Tone::Themed(design::warning_color))
+            .on_press_maybe(action(ProjectRecoveryAction::Locate)).into()
+    } else {
+        let mut repair=widget::column::with_children(vec![
+            design::caption("The original checkout was moved or deleted. Other worktrees remain available.").into(),
+            widget::row::with_children(vec![
+                crate::ui_controls::button::quiet("Locate checkout…").on_press_maybe(action(ProjectRecoveryAction::Locate)).into(),
+                crate::ui_controls::button::quiet(if entity.missing_details {"Hide details"} else {"Details"}).on_press_maybe(action(ProjectRecoveryAction::Details)).into(),
+            ]).spacing(space::XS).into(),
+        ]).spacing(space::XS).width(Length::Fill);
+        if entity.missing_details {repair=repair.push(design::caption(reason.clone()).wrapping(cosmic::iced::widget::text::Wrapping::Word));}
+        widget::container(repair).padding([space::XS,space::S]).width(Length::Fill).into()
+    };
+    widget::column::with_children(vec![normal,repair]).width(Length::Fill).into()
+}
+
+fn project_view_inner<'a>(
     project: &FilteredProject<'a>,
     expanded: bool,
     compact: bool,

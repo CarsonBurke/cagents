@@ -17,6 +17,7 @@ pub(super) struct State {
 pub enum Action {
     Tick,
     Checked(Vec<(ProjectId, PathBuf, Option<String>)>),
+    AvailabilityChecked(Vec<(ProjectId, PathBuf, Option<String>, bool)>),
     Command(ProjectId, ProjectRecoveryAction),
     VerifyProject(ProjectId),
     SessionDetails(CardId),
@@ -311,6 +312,14 @@ impl Cagents {
             .map(|_| Message::ProjectRecovery(Action::Tick))
     }
     pub(super) fn update_project_recovery(&mut self, action: Action) -> Task<Message> {
+        // Preserve the direct probe fixture/API while the live worker also
+        // verifies alternative checkouts before declaring a whole Git project missing.
+        let action=match action {
+            Action::Checked(projects)=>Action::AvailabilityChecked(projects.into_iter().map(|(id,path,reason)| {
+                let available=reason.is_none(); (id,path,reason,available)
+            }).collect()),
+            action=>action,
+        };
         match action {
             Action::Tick => {
                 if self.project_recovery_ui.checking {
@@ -325,6 +334,9 @@ impl Cagents {
                             project.id,
                             project.repository.clone(),
                             self.project_root(project),
+                            project.kind,
+                            self.project_ui.checkout_roots.get(&project.repository).cloned(),
+                            project.worktrees.iter().map(|worktree|worktree.path.clone()).collect::<Vec<_>>(),
                         )
                     })
                     .collect::<Vec<_>>();
@@ -333,21 +345,27 @@ impl Cagents {
                     let checked = tokio::task::spawn_blocking(move || {
                         projects
                             .into_iter()
-                            .map(|(id, path, root)| {
-                                (id, path, project_recovery::missing_reason(&root))
+                            .map(|(id, path, root, kind, checkout, worktrees)| {
+                                let reason=project_recovery::missing_reason(&root);
+                                let available=reason.is_none() || kind==ProjectKind::Git && (
+                                    crate::project_location::read_checkout(&path,checkout.as_deref(),Some(&root)).is_some()
+                                    || worktrees.iter().any(|worktree|crate::project_location::read_checkout(&path,Some(worktree),None).is_some())
+                                );
+                                (id,path,reason,available)
                             })
                             .collect()
                     })
                     .await
                     .unwrap_or_default();
-                    Message::ProjectRecovery(Action::Checked(checked))
+                    Message::ProjectRecovery(Action::AvailabilityChecked(checked))
                 })
             }
-            Action::Checked(projects) => {
+            Action::Checked(_) => unreachable!("direct probes normalize to availability results"),
+            Action::AvailabilityChecked(projects) => {
                 self.project_recovery_ui.checking = false;
                 let mut tasks = Vec::new();
-                for (id, path, reason) in projects {
-                    let missing = reason.is_some();
+                for (id, path, reason, available) in projects {
+                    let missing = reason.is_some() && !available;
                     let known_root = self
                         .sidebar_model
                         .project(id)
@@ -366,6 +384,7 @@ impl Cagents {
                             known_root.as_deref().unwrap_or(&path).display()
                         )
                     });
+                    project.location_repair=(!missing).then(||detail.clone()).flatten();
                     if project.missing == missing {
                         if missing {
                             project.unreachable = detail;
@@ -1380,6 +1399,55 @@ mod tests {
             new_root: new,
         };
         assert!(!belongs_to_relocated_worktree(&linked, &relocation));
+    }
+
+    #[test]
+    fn missing_primary_keeps_verified_linked_checkout_available_and_retains_repair() {
+        let parent=tempfile::tempdir().unwrap();
+        let primary=parent.path().join("primary");
+        let metadata=parent.path().join("metadata.git");
+        let linked=parent.path().join("linked");
+        let foreign=parent.path().join("foreign");
+        let git=|directory:&Path,args:&[&std::ffi::OsStr]| {
+            let result=std::process::Command::new("git").current_dir(directory).args(args)
+                .env_remove("GIT_DIR").env_remove("GIT_COMMON_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE").output().unwrap();
+            assert!(result.status.success(),"{}",String::from_utf8_lossy(&result.stderr));
+        };
+        git(parent.path(),&["init".as_ref(),"--separate-git-dir".as_ref(),metadata.as_os_str(),primary.as_os_str()]);
+        git(&primary,&["-c".as_ref(),"user.name=Fixture".as_ref(),"-c".as_ref(),"user.email=fixture@example.invalid".as_ref(),"commit".as_ref(),"--allow-empty".as_ref(),"-m".as_ref(),"fixture".as_ref()]);
+        git(&primary,&["worktree".as_ref(),"add".as_ref(),"-b".as_ref(),"linked".as_ref(),linked.as_os_str()]);
+        git(parent.path(),&["init".as_ref(),foreign.as_os_str()]);
+        let (mut app,id)=app(&metadata);
+        let project=app.sidebar_model.projects.iter_mut().find(|project|project.id==id).unwrap();
+        project.kind=ProjectKind::Git;
+        app.project_ui.checkout_roots.insert(metadata.clone(),linked.clone());
+        app.project_ui.primary_checkout_roots.insert(metadata.clone(),primary.clone());
+        Arc::make_mut(&mut app.durable).shared_project_bindings.insert(id,crate::model::SharedProjectBinding {ordinal:7,root:Some(primary.clone())});
+        let cancellation=CancellationToken::default();
+        app.refresh_ui.projects.insert(id,cancellation.clone());
+        let tick=|app:&mut Cagents| {
+            let message=super::super::tests::task_app_message(app.update_project_recovery(Action::Tick));
+            let Message::ProjectRecovery(action)=message else {panic!()};
+            let _=app.update_project_recovery(action);
+        };
+        std::fs::remove_dir_all(&primary).unwrap();
+        tick(&mut app);
+        let project=app.sidebar_model.project(id).unwrap();
+        assert!(!project.missing,"the verified same-repository linked checkout remains available");
+        assert!(project.location_repair.as_deref().unwrap().contains(primary.to_str().unwrap()));
+        assert!(project.unreachable.is_none(),"repair notice must not replace working navigation");
+        assert_eq!(app.project_root(project),primary,"repair retains original root association");
+        assert!(!cancellation.is_cancelled(),"valid linked checkout keeps its in-flight Git read");
+        assert_eq!(app.project_ui.checkout_roots[&metadata],linked);
+        git(&linked,&["status".as_ref(),"--porcelain".as_ref()]);
+        // An unrelated valid repository is not an availability fallback.
+        std::fs::remove_dir_all(&linked).unwrap();
+        app.project_ui.checkout_roots.insert(metadata,foreign);
+        tick(&mut app);
+        let project=app.sidebar_model.project(id).unwrap();
+        assert!(project.missing);
+        assert!(project.location_repair.is_none());
+        assert!(cancellation.is_cancelled(),"all known same-project checkouts are unavailable");
     }
 
     #[test]
