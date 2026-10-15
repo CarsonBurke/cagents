@@ -59,7 +59,10 @@ fn setting_input<'a>(
     if let Some(error) = error {
         input = input.error(error);
     }
-    setting_field(label, detail, input.into()).error(error)
+    setting_field(label, detail, input.into())
+        .keywords(value)
+        .keywords(field.config_key())
+        .error(error)
 }
 
 fn setting_stepper<'a>(
@@ -106,6 +109,12 @@ fn settings_choice<'a>(
     field: SettingsField,
     choices: impl IntoIterator<Item = (&'static str, &'static str, bool)>,
 ) -> Setting<'a, Message> {
+    let choices: Vec<_> = choices.into_iter().collect();
+    let keywords = choices
+        .iter()
+        .map(|(label, value, _)| format!("{label} {value}"))
+        .collect::<Vec<_>>()
+        .join(" ");
     let buttons: Vec<Element<'a, Message>> = choices
         .into_iter()
         .map(|(choice, value, selected)| {
@@ -141,6 +150,8 @@ fn settings_choice<'a>(
             .width(Length::Fill)
             .into(),
     )
+    .keywords(keywords)
+    .keywords(field.config_key())
 }
 
 /// One provider's default-account choice: the accounts it has, each marked
@@ -189,6 +200,8 @@ fn default_account_choice<'a>(
 /// from the rest of the application once per frame.
 pub(super) struct SettingsContext<'a> {
     pub feedback: Option<&'a SettingsFeedback>,
+    pub reload_error: Option<&'a str>,
+    pub can_undo: bool,
     /// Refused values, by the field that refused them.
     pub invalid: &'a HashMap<SettingsField, String>,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
@@ -253,7 +266,7 @@ fn settings_category_controls<'a>(
                                 value: enabled.to_string(),
                             },
                         ),
-                    )
+                    ).keywords(SettingsField::Notifications(field).config_key())
                     .label_in_control()
                 })
                 .collect();
@@ -353,7 +366,7 @@ fn settings_category_controls<'a>(
                                 value: enabled.to_string(),
                             },
                         ),
-                    ),
+                    ).keywords(SettingsField::CheckForUpdates.config_key()).keywords("Check for updates automatically"),
                 ],
             )]
         }
@@ -378,13 +391,20 @@ fn settings_category_controls<'a>(
             )]
         }
         SettingsCategory::General => {
+            let file = setting_field(
+                "Settings file",
+                "Hand edits apply live in every open window. Invalid edits keep your working settings.",
+                widget::row::with_children(vec![
+                    crate::ui_controls::button::secondary("Open settings.toml").on_press(Message::OpenSettingsFile { reveal: false }).into(),
+                    crate::ui_controls::button::secondary("Reveal settings.toml").on_press(Message::OpenSettingsFile { reveal: true }).into(),
+                ]).spacing(space::S).into(),
+            ).keywords("configuration TOML dotfiles language_servers custom_terminal_theme");
             let reset = setting_field(
                 "Reset all settings",
-                "Restore default preferences; saved conversations and tabs are preserved.",
+                "Restore default preferences. A backup is saved first, and Undo restores it. Conversations and tabs are preserved.",
                 crate::ui_controls::button::destructive("Reset all settings")
                     .id(widget::Id::new("settings.reset"))
-                    .on_press(Message::ResetSettings)
-                    .into(),
+                    .on_press(Message::ResetSettings).into(),
             );
             let directory = setting_input(
                 "Absolute path, or relative to the repository root. Defaults to worktrees/. Each new worktree gets its own subdirectory.",
@@ -415,7 +435,7 @@ fn settings_category_controls<'a>(
                         value: enabled.to_string(),
                     },
                 ),
-            );
+            ).keywords(SettingsField::AutoDeleteMergedWorktrees.config_key()).keywords("Delete merged worktrees automatically");
             let channel_pane = settings_choice(
                 "Default channel pane",
                 "Open this pane in an empty channel. An unused native chat is removed when you switch channels.",
@@ -448,7 +468,7 @@ fn settings_category_controls<'a>(
                         value: enabled.to_string(),
                     },
                 ),
-            );
+            ).keywords(SettingsField::FocusFollowsMouse.config_key()).keywords("Activate panes on hover").keywords("focus_follows_mouse hover activate panes on hover");
             let hot_panes = setting_input(
                 "At least 1 pane. Extra background panes may hibernate.",
                 &draft.max_hot_cards,
@@ -480,7 +500,7 @@ fn settings_category_controls<'a>(
                 settings_group(
                     "Reset",
                     "Restore preferences without removing conversations or panes.",
-                    vec![reset],
+                    vec![file, reset],
                 ),
             ]
         }
@@ -499,7 +519,7 @@ fn settings_category_controls<'a>(
                             value: enabled.to_string(),
                         },
                     ),
-                ),
+                ).keywords(SettingsField::ChatEnterSends.config_key()).keywords("Enter sends a chat message"),
                 setting_field(
                     "Tool groups",
                     "New tool-call groups start collapsed. Individual disclosure choices are remembered while paging.",
@@ -511,7 +531,7 @@ fn settings_category_controls<'a>(
                             value: enabled.to_string(),
                         },
                     ),
-                ),
+                ).keywords(SettingsField::ChatExpandToolGroups.config_key()).keywords("Expand tool groups by default"),
                 setting_stepper(
                     "Chat content width",
                     "Fraction of the whole workspace used by messages and the composer; fits inside narrower panes.",
@@ -573,7 +593,7 @@ fn settings_category_controls<'a>(
                             value: enabled.to_string(),
                         },
                     ),
-                ));
+                ).keywords(SettingsField::DiffHideUnchanged.config_key()).keywords("Hide unchanged diff lines"));
                 options
             }),
         ],
@@ -599,7 +619,7 @@ fn settings_category_controls<'a>(
                             },
                         )
                         .into(),
-                    ),
+                    ).keywords(SettingsField::AppTheme.config_key()),
                     setting_stepper(
                         "Interface scale",
                         "Scales the entire interface independently of display scaling.",
@@ -622,7 +642,7 @@ fn settings_category_controls<'a>(
                                 value: enabled.to_string(),
                             },
                         ),
-                    ),
+                    ).keywords(SettingsField::ShowStatusBar.config_key()).keywords("Show the status bar"),
                     setting_field(
                         "Worktree changes icons",
                         "Show a changes badge beside worktrees with uncommitted changes in Projects.",
@@ -634,7 +654,7 @@ fn settings_category_controls<'a>(
                                 value: enabled.to_string(),
                             },
                         ),
-                    ),
+                    ).keywords(SettingsField::ShowWorktreeChangesIcons.config_key()).keywords("Show worktree changes icons"),
                 ],
             ),
             settings_group(
@@ -743,7 +763,7 @@ fn settings_category_controls<'a>(
                                 value: enabled.to_string(),
                             },
                         ),
-                    ),
+                    ).keywords(SettingsField::ConfirmMultilinePaste.config_key()).keywords("Confirm multiline paste"),
                     settings_choice(
                         "Cursor shape",
                         "Bar is the default. Application follows program cursor requests; explicit shapes override requests without forcing a hidden cursor visible.",
@@ -789,7 +809,7 @@ fn settings_category_controls<'a>(
                             value: enabled.to_string(),
                         },
                     ),
-                )],
+                ).keywords(SettingsField::ConfirmTerminalClose.config_key()).keywords("Confirm closing active processes")],
             ),
             settings_group(
                 "Upgrades",
@@ -805,7 +825,7 @@ fn settings_category_controls<'a>(
                             value: enabled.to_string(),
                         },
                     ),
-                )],
+                ).keywords(SettingsField::RelaunchAgentsOnUpgrade.config_key()).keywords("Relaunch agents on upgrade")],
             ),
         ],
         SettingsCategory::Links => vec![settings_group(
@@ -1173,9 +1193,13 @@ fn settings_icon(name: Icon) -> widget::icon::Icon {
     name.handle().icon().size(16)
 }
 
+fn selected_category(category: SettingsCategory, query: &str) -> Option<SettingsCategory> {
+    query.trim().is_empty().then_some(category)
+}
+
 fn category_button<'a>(
     item: SettingsCategory,
-    selected: SettingsCategory,
+    selected: Option<SettingsCategory>,
     refused: bool,
 ) -> Element<'a, Message> {
     let mut row = vec![
@@ -1208,8 +1232,8 @@ fn category_button<'a>(
         } else {
             Cow::Borrowed(item.label())
         })
-        .class(crate::sidebar::sidebar_button_style(item == selected))
-        .selected(item == selected)
+        .class(crate::sidebar::sidebar_button_style(Some(item) == selected))
+        .selected(Some(item) == selected)
         .on_press(Message::SelectSettingsCategory(item))
         .padding([space::XS, space::S])
         .height(design::ROW_HEIGHT)
@@ -1329,11 +1353,9 @@ fn settings_layout<'a>(
     } else {
         let categories = widget::scrollable(
             widget::container(
-                widget::column::with_children(
-                    SettingsCategory::ALL
-                        .into_iter()
-                        .map(|item| category_button(item, category, refused(item))),
-                )
+                widget::column::with_children(SettingsCategory::ALL.into_iter().map(|item| {
+                    category_button(item, selected_category(category, query), refused(item))
+                }))
                 .spacing(space::XS)
                 .width(Length::Fill),
             )
@@ -1370,11 +1392,7 @@ fn settings_layout<'a>(
     };
     let mut results = Vec::new();
     for category in categories {
-        let filter = if crate::settings_widgets::matches(category.label(), query) {
-            ""
-        } else {
-            query
-        };
+        let filter = query;
         results.extend(
             settings_category_controls(category, draft, context)
                 .into_iter()
@@ -1382,7 +1400,7 @@ fn settings_layout<'a>(
         );
     }
     if results.is_empty() {
-        results.push(design::body("No matching settings").into());
+        results.push(design::body(format!("No settings match “{query}”")).into());
     }
     if let Some(SettingsFeedback::Error(message)) = feedback {
         // Not any one field's fault, so it leads the page rather than
@@ -1396,6 +1414,23 @@ fn settings_layout<'a>(
                 .into(),
         );
     }
+    if let Some(error) = context.reload_error {
+        results.insert(
+            0,
+            widget::column::with_children(vec![
+                design::body(format!(
+                    "Could not reload settings.toml. Your working settings remain active. {error}"
+                ))
+                .class(cosmic::theme::Text::Custom(design::destructive_text))
+                .into(),
+                crate::ui_controls::button::secondary("Open file")
+                    .on_press(Message::OpenSettingsFile { reveal: false })
+                    .into(),
+            ])
+            .spacing(space::S)
+            .into(),
+        );
+    }
     let mut header = vec![
         design::heading(if searching {
             "Search results"
@@ -1406,6 +1441,25 @@ fn settings_layout<'a>(
         .into(),
     ];
     header.extend(save_status(feedback, invalid.len()));
+    if !searching
+        && !matches!(
+            category,
+            SettingsCategory::Accounts | SettingsCategory::About
+        )
+    {
+        header.push(
+            crate::ui_controls::button::secondary("Reset category")
+                .on_press(Message::ResetSettingsCategory(category))
+                .into(),
+        );
+    }
+    if context.can_undo {
+        header.push(
+            crate::ui_controls::button::secondary("Undo reset")
+                .on_press(Message::UndoSettingsReset)
+                .into(),
+        );
+    }
     let header = widget::container(
         widget::container(
             widget::row::with_children(header)
@@ -1479,6 +1533,7 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
         .iter()
         .map(|(label, _)| (*label).to_owned())
         .collect();
+    let keywords = labels.join(" ");
     setting_field(
         "Color theme",
         "Live terminal colors. Add a custom_terminal_theme table to settings.toml to create your own; application color overrides remain intact.",
@@ -1487,7 +1542,7 @@ fn terminal_theme_choice<'a>(selected: &str, has_custom: bool) -> Setting<'a, Me
             value: choices[index].1.to_owned(),
         })
         .into(),
-    )
+    ).keywords(SettingsField::TerminalTheme.config_key()).keywords(keywords).keywords("terminal_theme custom_terminal_theme palette")
 }
 
 fn shortcut_input<'a>(
@@ -1597,4 +1652,84 @@ fn shortcut_input<'a>(
             .spacing(space::XS)
             .into(),
     )
+    .keywords(value)
+    .keywords(field.config_key())
+}
+
+impl Cagents {
+    pub(super) fn settings_reload_banner(&self) -> Element<'_, Message> {
+        let Some(error) = self.settings_reload_error.as_deref() else {
+            return iced::widget::Space::new().height(Length::Shrink).into();
+        };
+        widget::container(
+            widget::row::with_children(vec![
+                widget::column::with_children(vec![
+                    design::heading(
+                        "Could not reload settings.toml; your working settings are still active.",
+                    )
+                    .into(),
+                    design::caption(error.lines().next().unwrap_or(error))
+                        .wrapping(iced::widget::text::Wrapping::Word)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .width(Length::Fill)
+                .into(),
+                crate::ui_controls::button::secondary("Open file")
+                    .on_press_maybe(
+                        (!self.modal_is_open())
+                            .then_some(Message::OpenSettingsFile { reveal: false }),
+                    )
+                    .into(),
+            ])
+            .spacing(space::M)
+            .align_y(Alignment::Center),
+        )
+        .padding(space::M)
+        .width(Length::Fill)
+        .class(cosmic::theme::Container::Dialog(false))
+        .into()
+    }
+}
+
+#[cfg(test)]
+mod search_tests {
+    use super::*;
+    #[test]
+    fn settings_search_finds_real_controls_by_key_choice_caption_and_chord() {
+        let app = super::super::tests::context_inspector_test_app(false);
+        let invalid = HashMap::new();
+        let context = SettingsContext {
+            feedback: None,
+            reload_error: None,
+            can_undo: false,
+            invalid: &invalid,
+            accounts: vec![],
+            updates: app.update_summary(),
+            testing_notification: false,
+        };
+        for (category, query) in [
+            (SettingsCategory::General, "focus_follows_mouse"),
+            (SettingsCategory::General, "hover"),
+            (SettingsCategory::Terminal, "dracula"),
+            (SettingsCategory::Keyboard, "ctrl+t"),
+        ] {
+            let result = settings_category_controls(category, &app.settings_draft, &context)
+                .into_iter()
+                .any(|group| group.view(category.label(), query).is_some());
+            assert!(result, "{query} should match {}", category.label());
+        }
+    }
+
+    #[test]
+    fn search_deselects_category_navigation() {
+        assert_eq!(
+            selected_category(SettingsCategory::Appearance, "font"),
+            None
+        );
+        assert_eq!(
+            selected_category(SettingsCategory::Appearance, ""),
+            Some(SettingsCategory::Appearance)
+        );
+    }
 }

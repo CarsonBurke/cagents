@@ -216,6 +216,16 @@ impl Cagents {
             })
             .collect();
         entries.push((
+            "Open settings.toml".into(),
+            "Edit application configuration".into(),
+            Message::OpenSettingsFile { reveal: false },
+        ));
+        entries.push((
+            "Reveal settings.toml".into(),
+            "Show configuration in file manager".into(),
+            Message::OpenSettingsFile { reveal: true },
+        ));
+        entries.push((
             "Resume conversation".into(),
             "Search saved native chats".into(),
             Message::ResumeConversation(resume_ui::Action::Open),

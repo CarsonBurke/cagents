@@ -1882,6 +1882,32 @@ pub fn save_merged(
 ) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired).map(|_| ())
+}
+
+/// A save and its actual merged file contents, ordered while holding the file lock.
+#[derive(Clone, Debug)]
+pub struct SavedSettings {
+    pub settings: AppSettings,
+    pub reload_error: Option<String>,
+    pub observed_at: std::time::Instant,
+}
+
+pub fn save_merged_observed(
+    path: impl AsRef<Path>,
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<SavedSettings, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    save_merged_observed_unlocked(path, base, desired)
+}
+
+fn save_merged_observed_unlocked(
+    path: &Path,
+    base: &AppSettings,
+    desired: &AppSettings,
+) -> Result<SavedSettings, SettingsError> {
     let current = load_unlocked(path)?.settings;
     let mut current = toml::Value::try_from(current)?;
     merge_changed_fields(
@@ -1889,7 +1915,17 @@ pub fn save_merged(
         &toml::Value::try_from(desired)?,
         &mut current,
     );
-    save_unlocked(path, &current.try_into::<AppSettings>()?.validate()?)
+    let settings = current.try_into::<AppSettings>()?.validate()?;
+    save_unlocked(path, &settings)?;
+    // Unknown values are preserved by saving. A known-but-invalid foreign
+    // value in another category must keep its banner after this save too.
+    let loaded = load_unlocked(path)?;
+    let reload_error = live_validation_error(&loaded);
+    Ok(SavedSettings {
+        settings: loaded.settings,
+        reload_error,
+        observed_at: std::time::Instant::now(),
+    })
 }
 
 fn merge_changed_fields(base: &toml::Value, desired: &toml::Value, current: &mut toml::Value) {
@@ -1941,6 +1977,171 @@ fn load_unlocked(path: &Path) -> Result<Loaded, SettingsError> {
     }
 }
 
+/// Creates a documented, editable snapshot without replacing an existing file.
+pub fn ensure_file(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    reject_unsafe_destination(path)?;
+    if !path.exists() {
+        save_unlocked(path, settings)?;
+    }
+    Ok(())
+}
+
+/// Merge in-flight UI changes onto an externally edited configuration.
+pub fn merge_live(
+    base: &AppSettings,
+    desired: &AppSettings,
+    external: &AppSettings,
+) -> Result<AppSettings, SettingsError> {
+    let mut current = toml::Value::try_from(external)?;
+    merge_changed_fields(
+        &toml::Value::try_from(base)?,
+        &toml::Value::try_from(desired)?,
+        &mut current,
+    );
+    current.try_into::<AppSettings>()?.validate()
+}
+
+/// Live edits are atomic: a known setting that cannot be used rejects the whole
+/// edit, leaving the window's last working settings in force.
+pub fn load_live(path: impl AsRef<Path>) -> Result<AppSettings, String> {
+    load_live_observed(path).result
+}
+
+/// File reads may finish on a blocking thread in a different order from UI
+/// delivery. Stamp both valid and invalid snapshots inside the settings lock.
+#[derive(Clone, Debug)]
+pub struct LiveSettings {
+    pub result: Result<AppSettings, String>,
+    pub observed_at: std::time::Instant,
+}
+
+impl LiveSettings {
+    pub fn now(result: Result<AppSettings, String>) -> Self {
+        Self {
+            result,
+            observed_at: std::time::Instant::now(),
+        }
+    }
+}
+
+pub fn load_live_observed(path: impl AsRef<Path>) -> LiveSettings {
+    let path = path.as_ref();
+    let result = (|| {
+        let _lock = settings_lock(path).map_err(|error| error.to_string())?;
+        let result = load_unlocked(path)
+            .map_err(|error| error.to_string())
+            .and_then(|loaded| match live_validation_error(&loaded) {
+                Some(error) => Err(error),
+                None => Ok(loaded.settings),
+            });
+        Ok::<_, String>(LiveSettings::now(result))
+    })();
+    result.unwrap_or_else(|error| LiveSettings::now(Err(error)))
+}
+
+fn live_validation_error(loaded: &Loaded) -> Option<String> {
+    let errors: Vec<_> = loaded
+        .foreign
+        .iter()
+        .filter_map(|setting| match &setting.reason {
+            ForeignReason::UnknownKey => None,
+            ForeignReason::UnreadableValue(error) => Some(format!(
+                "settings.toml: “{}” is invalid ({error}).",
+                dotted(&setting.path)
+            )),
+        })
+        .collect();
+    (!errors.is_empty()).then(|| errors.join("\n"))
+}
+
+/// Save a byte-for-byte recovery copy before resetting any preferences.
+pub fn reset_with_backup(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+) -> Result<PathBuf, SettingsError> {
+    let mut keys: Vec<String> = written(settings)?
+        .as_table()
+        .expect("settings table")
+        .keys()
+        .cloned()
+        .collect();
+    keys.extend(
+        [
+            "custom_terminal_theme",
+            "editor_font_family",
+            "editor_font_size",
+        ]
+        .map(str::to_owned),
+    );
+    reset_keys_with_backup_inner(path, settings, &keys, true)
+}
+
+/// Reset selected top-level keys while keeping unrelated hand-written values.
+pub fn reset_keys_with_backup(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+    keys: &[String],
+) -> Result<PathBuf, SettingsError> {
+    reset_keys_with_backup_inner(path, settings, keys, false)
+}
+
+fn reset_keys_with_backup_inner(
+    path: impl AsRef<Path>,
+    settings: &AppSettings,
+    keys: &[String],
+    replace_future_schema: bool,
+) -> Result<PathBuf, SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    if !path.exists() {
+        save_unlocked(path, settings)?;
+    }
+    let bytes = read_private_file(path)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let mut backup = tempfile::Builder::new()
+        .prefix(&format!("settings.toml.bak-{stamp}-"))
+        .tempfile_in(settings_parent(path)?)?;
+    backup
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    backup.write_all(&bytes)?;
+    backup.as_file().sync_all()?;
+    let (_, backup_path) = backup
+        .keep()
+        .map_err(|error| SettingsError::Io(error.error))?;
+    save_unlocked_for_keys(path, settings, keys, replace_future_schema)?;
+    Ok(backup_path)
+}
+
+/// Restore the original bytes, including comments, whitespace and unknown tables.
+pub fn restore_backup(
+    path: impl AsRef<Path>,
+    backup: impl AsRef<Path>,
+) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    let bytes = read_private_file(backup.as_ref())?;
+    reject_unsafe_destination(path)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".settings-undo-")
+        .tempfile_in(settings_parent(path)?)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(path)
+        .map_err(|error| SettingsError::Io(error.error))?;
+    open_private_directory(settings_parent(path)?)?.sync_all()?;
+    Ok(())
+}
+
 pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), SettingsError> {
     let path = path.as_ref();
     let _lock = settings_lock(path)?;
@@ -1948,6 +2149,15 @@ pub fn save(path: impl AsRef<Path>, settings: &AppSettings) -> Result<(), Settin
 }
 
 fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsError> {
+    save_unlocked_for_keys(path, settings, &[], false)
+}
+
+fn save_unlocked_for_keys(
+    path: &Path,
+    settings: &AppSettings,
+    reset_keys: &[String],
+    replace_future_schema: bool,
+) -> Result<(), SettingsError> {
     let settings = settings.clone().validate()?;
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
@@ -1955,11 +2165,36 @@ fn save_unlocked(path: &Path, settings: &AppSettings) -> Result<(), SettingsErro
     reject_unsafe_destination(path)?;
 
     let mut document = written(&settings)?;
+    let reset_values = document.clone();
     // Whatever a newer build wrote, and this one cannot represent, survives.
-    if let Some(current) = current_document(path)? {
-        keep_foreign_settings(&current, &mut document);
+    match current_document(path) {
+        Ok(Some(current)) => keep_foreign_settings(&current, &mut document),
+        Ok(None) => {}
+        Err(SettingsError::UnsupportedSchema(_)) if replace_future_schema => {}
+        Err(error) => return Err(error),
+    }
+    // Explicit reset overrides even a foreign/unreadable value whose decoded
+    // baseline was already the default. Other categories retain their values.
+    for key in reset_keys {
+        let table = document.as_table_mut().expect("settings table");
+        if let Some(value) = reset_values.get(key.as_str()) {
+            table.insert(key.clone(), value.clone());
+        } else {
+            table.remove(key);
+        }
     }
     let mut document = toml::to_string_pretty(&document)?;
+    if !path.exists() {
+        let defaults = toml::to_string_pretty(&AppSettings::default())?;
+        let reference = defaults
+            .lines()
+            .map(|line| format!("# {line}\n"))
+            .collect::<String>();
+        let (header, current) = document.split_once('\n').unwrap_or((&document, ""));
+        document = format!(
+            "{header}\n\n# Default values for reference (commented out).\n{reference}\n# Current settings; changes apply live in every window.\n{current}"
+        );
+    }
     if !document.ends_with('\n') {
         document.push('\n');
     }
@@ -2807,6 +3042,99 @@ fn unsafe_path_error(path: &Path, message: impl std::fmt::Display) -> io::Error 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn live_settings_merge_retains_unrelated_changes_and_reports_conflicts() {
+        let base = AppSettings::default();
+        let mut desired = base.clone();
+        desired.terminal_font_size = 20.0;
+        let mut external = base.clone();
+        external.terminal_font_family = "monospace".into();
+        let merged = merge_live(&base, &desired, &external).unwrap();
+        assert_eq!(merged.terminal_font_size, 20.0);
+        assert_eq!(merged.terminal_font_family, "monospace");
+        desired.keyboard_shortcuts.new_terminal = vec!["Ctrl+Alt+X".into()];
+        external.keyboard_shortcuts.new_native_thread = vec!["Ctrl+Alt+X".into()];
+        assert!(merge_live(&base, &desired, &external).is_err());
+    }
+
+    #[test]
+    fn settings_reset_replaces_invalid_known_values_without_erasing_other_categories() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = std::fs::read_to_string(&path)
+            .unwrap()
+            .replace("terminal_font_size = 14.0", "terminal_font_size = -5.0");
+        std::fs::write(
+            &path,
+            format!("{original}\n[future_preferences]\nkeep = true\n"),
+        )
+        .unwrap();
+        let error = load_live(&path).unwrap_err();
+        assert!(error.contains("terminal_font_size"));
+        assert!(!error.contains("default is in effect"));
+        reset_keys_with_backup(
+            &path,
+            &AppSettings::default(),
+            &["terminal_font_size".into()],
+        )
+        .unwrap();
+        assert!(load_live(&path).is_ok());
+        assert!(
+            std::fs::read_to_string(path)
+                .unwrap()
+                .contains("[future_preferences]")
+        );
+    }
+
+    #[test]
+    fn explicit_settings_reset_can_recover_a_newer_schema_after_backing_it_up() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = "schema_version = 999\n[future_table]\nkeep = true\n";
+        std::fs::write(&path, original).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        assert!(load_live(path).is_ok());
+        assert_eq!(std::fs::read(backup).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn reset_backup_restores_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        save(&path, &AppSettings::default()).unwrap();
+        let original = format!(
+            "# My hand-written configuration\n{}\n[my_future_table]\nfoo = 'bar'\n",
+            fs::read_to_string(&path).unwrap()
+        );
+        fs::write(&path, original.as_bytes()).unwrap();
+        let backup = reset_with_backup(&path, &AppSettings::default()).unwrap();
+        assert_eq!(fs::read(&backup).unwrap(), original.as_bytes());
+        restore_backup(&path, backup).unwrap();
+        assert_eq!(fs::read(path).unwrap(), original.as_bytes());
+    }
+
+    #[test]
+    fn documentation_lists_every_app_settings_key() {
+        let document = include_str!("../docs/configuration.md");
+        let mut settings = AppSettings::default();
+        settings.editor_font_family = Some("monospace".into());
+        settings.editor_font_size = Some(14.0);
+        settings.custom_terminal_theme = Some(crate::terminal::TerminalTheme::Dark.palette());
+        for key in toml::Value::try_from(settings)
+            .unwrap()
+            .as_table()
+            .unwrap()
+            .keys()
+        {
+            assert!(
+                document.contains(&format!("`{key}`")),
+                "Missing settings documentation: {key}"
+            );
+        }
+    }
+
     #[test]
     fn usage_preview_selection_round_trips_without_changing_legacy_defaults() {
         let mut previous_schema = toml::Value::try_from(AppSettings::default()).unwrap();
