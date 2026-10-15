@@ -287,18 +287,8 @@ impl HostedSession {
     /// A successor proof or different launch never identifies this process.
     pub(crate) fn same_process(&self, other: &Self) -> bool {
         match (self, other) {
-            (Self::Chat(a), Self::Chat(b)) => {
-                a.id == b.id
-                    && a.proof == b.proof
-                    && a.launch.provider == b.launch.provider
-                    && a.launch.recipe == b.launch.recipe
-            }
-            (Self::Terminal(a), Self::Terminal(b)) => {
-                a.id == b.id
-                    && a.launch == b.launch
-                    && a.continuity.live_proof().is_some()
-                    && a.continuity.live_proof() == b.continuity.live_proof()
-            }
+            (Self::Chat(a), Self::Chat(b)) => same_chat_process(a, b),
+            (Self::Terminal(a), Self::Terminal(b)) => same_terminal_process(a, b),
             _ => false,
         }
     }
@@ -309,6 +299,21 @@ impl HostedSession {
             Self::Terminal(session) => session.id,
         }
     }
+}
+
+/// Mutable thread and presentation metadata do not change runtime ownership.
+pub(crate) fn same_chat_process(a: &chat::Session, b: &chat::Session) -> bool {
+    a.id == b.id
+        && a.proof == b.proof
+        && a.launch.provider == b.launch.provider
+        && a.launch.recipe == b.launch.recipe
+}
+
+pub(crate) fn same_terminal_process(a: &TerminalSession, b: &TerminalSession) -> bool {
+    a.id == b.id
+        && a.launch == b.launch
+        && a.continuity.live_proof().is_some()
+        && a.continuity.live_proof() == b.continuity.live_proof()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
