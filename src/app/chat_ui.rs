@@ -6631,7 +6631,14 @@ impl Cagents {
                 let Some(result) = result else {
                     return Task::none();
                 };
+                // Revoke local plaintext before any early return can hand this
+                // attachment to retirement or asynchronous persistence. Keep
+                // the fence until final adoption because persistence may send
+                // the same Ready handle back through this handler.
+                let history_adoption_allowed=result.as_ref().ok().is_none_or(|handle|self.fence_account_history_ready(target,handle));
+                if result.is_err() {self.finish_account_history_ready(target);}
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
+                    self.finish_account_history_ready(target);
                     // The card was closed while this start was in flight.
                     // Whatever the start produced is given up now; a failed
                     // start is still checked against the inventory, because a
@@ -6642,6 +6649,7 @@ impl Cagents {
                     .chat_ui
                     .finish(target, |phase| matches!(phase, Phase::Starting(_)))
                 else {
+                    self.finish_account_history_ready(target);
                     return Task::none();
                 };
                 let recovery = attempt.recovery.take();
@@ -6671,6 +6679,7 @@ impl Cagents {
                             _ => false,
                         }
                 }) {
+                    self.finish_account_history_ready(target);
                     // The conversation started, but this card can no longer
                     // hold it. Leaving it alone left a daemon writer and its
                     // provider process running with nothing on screen able to
@@ -6810,13 +6819,20 @@ impl Cagents {
                         // All normal descriptor/rebind checks have completed.
                         // Unknown live account provenance may keep running, but
                         // cannot install a late local body after deletion intent.
-                        if !self.fence_account_history_ready(target,&handle) {
+                        self.finish_account_history_ready(target);
+                        if !history_adoption_allowed {
                             let mut session=handle.session();
                             session.proof=handle.proof();
-                            self.commit_chat_session(target.card,session);
+                            session.launch.session_id=handle.snapshot().session_id.clone().or(session.launch.session_id);
+                            self.commit_chat_session(target.card,session.clone());
                             let message="The conversation stayed running, but its account could not be verified after an account deletion request. Reconnect it before retrying deletion.".to_owned();
                             if let Some(CardRuntime::Chat(runtime))=self.cards.get_mut(&target.card) {
                                 runtime.unqueue();
+                                runtime.release_transcript_presentation();
+                                runtime.snapshot=Arc::new(Snapshot {session_id:session.launch.session_id.clone(),..Snapshot::default()});
+                                runtime.session=session;
+                                runtime.target=target;
+                                runtime.connection=Connection::Draft;
                                 runtime.error=Some(message.clone());
                                 runtime.disconnected=true;
                                 runtime.pending=None;
@@ -18253,7 +18269,8 @@ mod tests {
         let id=app.account_ui.add_managed_fixture(Provider::Codex,99202);
         let (card,target)=starting_chat(&mut app);
         let handle=account_privacy_handle(&app,card,None,false);
-        let admitted=handle.session();
+        let mut admitted=handle.session();
+        admitted.launch.session_id=Some(KNOWN_THREAD.into());
         app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
         complete_account_privacy_intent(&mut app,&id);
         answer_start(&mut app,target,Ok(handle.clone()));
@@ -18264,10 +18281,14 @@ mod tests {
         assert!(runtime.error.as_deref().unwrap().contains("account could not be verified"));
         assert_eq!(runtime.composer.text().trim(),"hello","the unsent first prompt stays editable");
         assert!(runtime.queued.is_none());
+        assert_eq!(runtime.session,admitted,"reconnect must use the admitted descriptor and confirmed native session");
         assert!(app.chat_ui.retiring.is_empty());
-        assert!(matches!(&app.card_state(card).unwrap().kind,CardKind::Chat(session) if session.id==admitted.id && session.launch==admitted.launch),
+        assert!(matches!(&app.card_state(card).unwrap().kind,CardKind::Chat(session) if session==&admitted),
             "retain the running actor's descriptor for an explicit reconnect");
         assert_eq!(handle.snapshot().items.len(),1,"refusing presentation does not mutate or stop unrelated provider state");
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        assert_eq!(app.chat_ui.attempt(card).unwrap().session,admitted);
+        assert_eq!(chat_runtime(&app,card).composer.text().trim(),"hello");
     }
 
     #[test]
@@ -18291,6 +18312,56 @@ mod tests {
         assert_eq!(parked.composer.text().trim(),"unsent composer survives");
         assert_eq!(b.snapshot().items.len(),1);
         assert!(app.chat_ui.retiring.is_empty());
+    }
+
+
+    #[test]
+    fn account_delete_intent_revokes_abandoned_ready_before_retirement_captures_handle() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let id=app.account_ui.add_managed_fixture(Provider::Codex,99204);
+        let (card,target)=starting_chat(&mut app);
+        let handle=account_privacy_handle(&app,card,Some(account_privacy_home(11)),false);
+        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
+        close_chat(&mut app,card);
+        complete_account_privacy_intent(&mut app,&id);
+        answer_start(&mut app,target,Ok(handle.clone()));
+        assert!(handle.snapshot().items.is_empty(),"retirement's pending task must not retain deleted-account plaintext");
+        assert!(!app.cards.contains_key(&card));
+        assert_eq!(app.chat_ui.retiring.len(),1,"the existing explicit close still retires its own actor");
+    }
+
+
+    #[test]
+    fn account_delete_intent_revokes_ready_before_account_persistence_holds_the_attachment() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let card=live_chat(&mut app,Some(KNOWN_THREAD));
+        let mut source=chat_runtime(&app,card).session.clone();
+        source.launch.recipe.environment.insert("CODEX_HOME".into(),"/removed-account".into());
+        app.install_chat_session(card,source.clone());
+        let directory=tempfile::tempdir().unwrap();
+        let (writer,_)=crate::session::SessionRuntime::open(directory.path().join("state.sqlite3"),crate::model::BootId::new("privacy-persist-fixture")).unwrap();
+        app.session=Some(writer);
+        app.persist();
+        app.session.as_ref().unwrap().flush(Duration::from_secs(10)).unwrap();
+        app.chat_forget(card);
+        app.cards.insert(card,CardRuntime::Loading);
+        drop(app.open_chat(card,source,chat::Intent::Restore));
+        let failed=chat_runtime_attempt(&app,card);
+        answer_start(&mut app,failed,Err(chat::StartFailure{message:"The saved account was removed".into(),recovery:chat::Recovery::Account}));
+        drop(app.update(Message::ChatUi(Action::RecoverAccount(card,Account::system(Provider::Codex).id()))));
+        let target=chat_runtime_attempt(&app,card);
+        let handle=account_privacy_handle(&app,card,Some(account_privacy_home(11)),false);
+        let id=app.account_ui.add_managed_fixture(Provider::Codex,99205);
+        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
+        complete_account_privacy_intent(&mut app,&id);
+        let task=app.update(Message::ChatUi(Action::Ready(target,Ready(Arc::new(Mutex::new(Some(Ok(handle.clone()))))))));
+        assert!(app.chat_start_pending(card),"account persistence still holds Ready before acknowledgment");
+        assert!(handle.snapshot().items.is_empty(),"pending persistence cannot retain deleted-account plaintext");
+        let reply=account_commit_reply(task);
+        assert!(matches!(&reply,Message::ChatUi(Action::AccountCommitted(_,_,Ok(())))));
+        drop(app.update(reply));
+        assert!(handle.snapshot().items.is_empty());
+        assert!(chat_runtime(&app,card).snapshot.items.is_empty());
     }
 
 }
