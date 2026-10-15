@@ -1474,7 +1474,9 @@ pub(super) struct Runtime {
     connection: Connection,
     /// The opaque picker identity retained for a fresh owning-daemon start.
     /// A recipe path is never sent as account authority.
+    draft_configured: bool,
     draft_account: Option<AccountId>,
+    draft_automatic: bool,
     /// An explicit window preference or composer choice. None keeps the
     /// owning provider's own default, rather than an inferred preview mode.
     draft_permission_choice: Option<String>,
@@ -1708,6 +1710,25 @@ fn submission(
 }
 
 impl Runtime {
+    fn configured_start(&self) -> Result<Option<chat::ConfiguredChatStart>, String> {
+        if !self.draft_configured { return Ok(None); }
+        if !self.session.is_unstarted() {
+            return Err("Configured choices apply only to a new conversation".into());
+        }
+        let start = chat::ConfiguredChatStart {
+            id: self.session.id,
+            provider: self.session.launch.provider,
+            working_directory: self.session.launch.recipe.working_directory.clone(),
+            account: self.draft_account.clone().ok_or("The saved draft choices do not match this conversation. Choose its account again or start a new draft.")?,
+            model: self.snapshot.selected_model.clone(),
+            effort: self.snapshot.reasoning.clone(),
+            permission_mode: self.draft_permission_choice.clone(),
+            automatic: self.draft_automatic,
+        };
+        start.validate()?;
+        Ok(Some(start))
+    }
+
     /// The word the caret is naming something with and the rows offered for
     /// it, or `None` while there is nothing to offer.
     fn completion(&self) -> Option<(completion::Token, Vec<completion::Candidate<'_>>)> {
@@ -2072,7 +2093,9 @@ impl Runtime {
             source_clock: None,
             finished_stamp: None,
             connection,
+            draft_configured: false,
             draft_account: None,
+            draft_automatic: false,
             draft_permission_choice: None,
             queued: None,
             followups: Vec::new(),
@@ -3689,11 +3712,14 @@ impl Cagents {
         runtime.completion.restart(true);
         if let Some(session) = &moved {
             runtime.session = session.clone();
+            runtime.draft_configured = true;
             runtime.draft_account = Some(account.id());
+            runtime.draft_automatic = automatic;
             runtime.draft_permission_choice = configuration.permission_mode.clone();
             runtime.error = None;
         }
         self.remember_chat_model(provider, model, reasoning);
+        if moved.is_none() { self.persist(); }
         let skills = if let Some(session) = moved {
             self.replace_chat_conversation(target.card, session);
             self.load_draft_skills(target)
@@ -3806,9 +3832,12 @@ impl Cagents {
             .recipe
             .environment
             .remove(account::routing::AUTOMATIC_MARKER);
+        runtime.draft_configured = true;
         runtime.draft_account = Some(account.id());
+        runtime.draft_automatic = false;
         runtime.draft_permission_choice = configuration.permission_mode.clone();
         if session == runtime.session {
+            self.persist();
             return Task::none();
         }
         runtime.session = session.clone();
@@ -4250,6 +4279,21 @@ impl Cagents {
             .filter(|card| card.existence.is_open() && !defaults.contains(&card.id))
             .map(|card| card.id)
             .collect::<std::collections::HashSet<_>>();
+        let eligible: HashSet<_> = self.durable.cards.iter().filter_map(|state| {
+            (open_cards.contains(&state.id) && matches!(&state.kind, CardKind::Chat(session) if session.is_unstarted())).then_some(state.id)
+        }).collect();
+        let mut configured_chat_drafts = self.durable.configured_chat_drafts.clone();
+        configured_chat_drafts.retain(|card, _| eligible.contains(card));
+        for (card, runtime) in self.chat_ui.parked.iter().map(|(card, runtime)| (card, runtime.as_ref()))
+            .chain(self.cards.iter().filter_map(|(card, runtime)| match runtime { CardRuntime::Chat(runtime) => Some((card, runtime.as_ref())), _ => None })) {
+            if eligible.contains(card) {
+                match runtime.configured_start() {
+                    Ok(Some(start)) => { configured_chat_drafts.insert(*card, start); }
+                    Ok(None) => { configured_chat_drafts.remove(card); }
+                    Err(_) => {} // Retain invalid typed metadata for refusal, never legacy fallback.
+                }
+            }
+        }
         let mut chat_drafts: HashMap<CardId, String> = self
             .chat_ui
             .drafts
@@ -4303,12 +4347,14 @@ impl Cagents {
         }
         if defaults.is_empty()
             && chat_drafts == self.durable.chat_drafts
+            && configured_chat_drafts == self.durable.configured_chat_drafts
             && repository_navigation == self.durable.repository_navigation
         {
             return Arc::clone(&self.durable);
         }
         let mut saved = (*self.durable).clone();
         saved.chat_drafts = chat_drafts;
+        saved.configured_chat_drafts = configured_chat_drafts;
         saved.repository_navigation = repository_navigation;
         if defaults.is_empty() {
             return Arc::new(saved);
@@ -4435,6 +4481,17 @@ impl Cagents {
                 return Task::none();
             }
         };
+        let snapshot = self.chat_draft_snapshot(provider);
+        let configured = chat::ConfiguredChatStart {
+            id: session.id, provider, working_directory: working_directory.clone(), account: account.id(),
+            model: snapshot.selected_model, effort: snapshot.reasoning,
+            permission_mode: self.settings.agents.get(settings::agents::provider_key(provider)).and_then(|configuration| configuration.permission_mode.clone()),
+            automatic,
+        };
+        if let Err(reason) = configured.validate() {
+            self.status = Some(TransientNotice::error(reason));
+            return Task::none();
+        }
         let scope = if self.durable.active_channel.is_none()
             && self.active_workspace.as_deref() != Some(working_directory.as_path())
         {
@@ -4442,12 +4499,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        let insert = self.insert_chat_card_with_lifetime(session, None, ephemeral, None);
-        if let Some(card) = self.workspace.focused()
-            && let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
-            runtime.draft_account = Some(account.id());
-            runtime.draft_permission_choice = self.settings.agents.get(settings::agents::provider_key(provider)).and_then(|configuration| configuration.permission_mode.clone());
-        }
+        let insert = self.insert_chat_card_with_lifetime(session, None, ephemeral, None, Some(configured));
         Task::batch([scope, insert])
     }
 
@@ -4461,7 +4513,7 @@ impl Cagents {
         beside: Option<CardId>,
         draft_from: Option<CardId>,
     ) -> Task<Message> {
-        self.insert_chat_card_with_lifetime(session, beside, false, draft_from)
+        self.insert_chat_card_with_lifetime(session, beside, false, draft_from, None)
     }
 
     fn insert_chat_card_with_lifetime(
@@ -4470,7 +4522,13 @@ impl Cagents {
         beside: Option<CardId>,
         ephemeral: bool,
         draft_from: Option<CardId>,
+        configured: Option<chat::ConfiguredChatStart>,
     ) -> Task<Message> {
+        if let Some(start) = &configured
+            && (!start.matches_draft(&session) || start.validate().is_err()) {
+            self.status = Some(TransientNotice::error("The new draft choices do not match its conversation"));
+            return Task::none();
+        }
         let beside = beside.and_then(|source| {
             let index = self.workspace.order().position(|id| id == source)?;
             let durable = self
@@ -4521,6 +4579,9 @@ impl Cagents {
         }
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
+        if let Some(start) = configured {
+            durable.configured_chat_drafts.insert(card_id, start);
+        }
         self.register_channel_card(card_id);
         let update = self
             .workspace
@@ -4602,8 +4663,22 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
-        runtime.draft_account = self.chat_account(runtime.session.launch.provider, &runtime.session.launch.recipe)
-            .or_else(|| (runtime.session.launch.provider == Provider::Omp).then(|| Account::system(Provider::Omp).id()));
+        if let Some(start) = self.durable.configured_chat_drafts.get(&card) {
+            runtime.draft_configured = true;
+            if start.matches_draft(&runtime.session) && start.validate().is_ok() {
+                runtime.draft_account = Some(start.account.clone());
+                runtime.draft_automatic = start.automatic;
+                runtime.draft_permission_choice = start.permission_mode.clone();
+                let snapshot = Arc::make_mut(&mut runtime.snapshot);
+                snapshot.selected_model = start.model.clone();
+                snapshot.reasoning = start.effort.clone();
+                if start.permission_mode.is_some() {
+                    snapshot.permission_mode = start.permission_mode.clone();
+                }
+            } else {
+                runtime.error = Some("The saved draft choices do not match this conversation. Choose its account again or start a new draft.".into());
+            }
+        }
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
         {
@@ -5231,6 +5306,20 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
     ) -> Task<Message> {
+        self.start_chat_with_configuration(card, session, intent, source, terminate_source, None)
+    }
+
+    fn start_chat_with_configuration(
+        &mut self, card: CardId, session: chat::Session, intent: chat::Intent,
+        source: Option<HostSessionProof>, terminate_source: bool,
+        configured: Option<chat::ConfiguredChatStart>,
+    ) -> Task<Message> {
+        if let Some(start) = &configured
+            && (!start.matches_draft(&session) || start.validate().is_err()
+                || intent != chat::Intent::Start || source.is_some() || terminate_source) {
+            self.status = Some(TransientNotice::error("Fresh draft choices cannot replace a saved conversation"));
+            return Task::none();
+        }
         let selection = None;
         let target = self.chat_ui.next_target(card);
         self.chat_ui.phases.insert(
@@ -5250,6 +5339,11 @@ impl Cagents {
                 // UI thread then only sees a join error and can still draw.
                 Self::started_chat(std::panic::catch_unwind(std::panic::AssertUnwindSafe(
                     || {
+                        if let Some(start) = configured {
+                            return ClientHandle::connect_configured(start, move |wake| {
+                                let _ = sender.try_send((target, wake));
+                            }).map(Arc::new);
+                        }
                         if intent == chat::Intent::Start && source.is_none() && session.is_unstarted() && session.terminal.is_none() {
                             validate_draft_program(&session)?;
                         }
@@ -5371,6 +5465,10 @@ impl Cagents {
         if !runtime.choosing() {
             return Task::none();
         }
+        let configured = match runtime.configured_start() {
+            Ok(configured) => configured,
+            Err(reason) => { runtime.error = Some(reason); return Task::none(); }
+        };
         let model = runtime
             .snapshot
             .selected_model
@@ -5378,6 +5476,7 @@ impl Cagents {
             .map(|model| (model, runtime.snapshot.reasoning.clone()));
         let mut session = runtime.session.clone();
         session.id = TerminalId::new();
+        let configured = configured.map(|mut start| { start.id = session.id; start });
         settings::AgentLaunchSettings::default().append_options(
             session.launch.provider,
             &mut session.launch.recipe.arguments,
@@ -5411,7 +5510,7 @@ impl Cagents {
         runtime.reasoning_picker = false;
         runtime.session = session.clone();
         self.replace_chat_conversation(target.card, session.clone());
-        self.start_chat(target.card, session, chat::Intent::Start, None, false)
+        self.start_chat_with_configuration(target.card, session, chat::Intent::Start, None, false, configured)
     }
 
     /// Takes the next step of sending a started draft's first message: its
@@ -7021,6 +7120,7 @@ impl Cagents {
                                 .recipe
                                 .environment
                                 .insert(account::routing::AUTOMATIC_MARKER.into(), "1".into());
+                            runtime.draft_automatic = true;
                             let session = runtime.session.clone();
                             self.replace_chat_conversation(target.card, session);
                         }
@@ -8068,6 +8168,7 @@ impl Cagents {
                     }
                     Arc::make_mut(&mut runtime.snapshot).reasoning = Some(reasoning.clone());
                     self.remember_chat_model(provider, Some(model), Some(reasoning));
+                    self.persist();
                     return Task::none();
                 }
                 let command = Command::SetModel {
@@ -13391,6 +13492,125 @@ mod tests {
         ] {
             assert!(!bypasses_approvals(&asking), "{asking:?}");
         }
+    }
+
+    #[test]
+    fn settings_configured_draft_restores_typed_choices_and_discards_them_on_issued_adoption() {
+        use crate::persistence::{SaveLane, StateStore};
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("configured-drafts.sqlite3");
+        let boot = crate::model::BootId::new("configured-draft-ui");
+        let store = StateStore::open(&database, boot.clone()).unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        app.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
+            model: Some("original-choice".into()), effort: Some("low".into()), permission_mode: Some("plan".into()),
+            executable: Some("/unavailable/window-only-wrapper".into()), ..Default::default()
+        });
+        drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("new draft") };
+        runtime.replace_draft(text_editor::Content::with_text("unsent private draft"));
+        runtime.draft_automatic = true;
+        let target = runtime.target;
+        drop(app.choose_draft_model(target, Provider::Claude, None));
+        drop(app.handle_chat_ui(Action::PermissionMode(target, "manual".into())));
+        let saved = app.persistent_workspace();
+        let expected = saved.configured_chat_drafts[&card].clone();
+        assert!(expected.model.is_none() && expected.effort.is_none(), "clear remains an explicit effective choice");
+        assert_eq!(expected.permission_mode.as_deref(), Some("manual"));
+        assert_eq!(expected.account, Account::system(Provider::Claude).id());
+        assert!(expected.automatic);
+        let mut lane = SaveLane::default();
+        lane.save(&store, &saved).unwrap();
+        let reopened = StateStore::open(&database, boot).unwrap();
+        let restored = reopened.load_workspace(saved.id, None).unwrap().unwrap();
+        assert_eq!(restored.configured_chat_drafts[&card], expected);
+        let CardKind::Chat(session) = restored.cards.iter().find(|state| state.id == card).unwrap().kind.clone() else { panic!("saved draft") };
+        let mut another_window = crate::app::tests::context_inspector_test_app(false);
+        another_window.settings_path = Some(directory.path().join("other-settings.toml"));
+        another_window.settings.agents.insert("claude".into(), settings::AgentLaunchSettings {
+            model: Some("different-window-default".into()), effort: Some("high".into()), permission_mode: Some("plan".into()), ..Default::default()
+        });
+        another_window.workspace = Cagents::rebuild_workspace(&restored);
+        another_window.chat_ui = State::with_drafts(restored.chat_drafts.clone());
+        another_window.durable = Arc::new(restored);
+        drop(another_window.open_chat_draft(card, session));
+        let Some(CardRuntime::Chat(runtime)) = another_window.cards.get(&card) else { panic!("restored draft") };
+        assert_eq!(runtime.composer.text(), "unsent private draft");
+        assert_eq!(runtime.configured_start().unwrap().unwrap(), expected);
+        let target = runtime.target;
+        // Build the actual first-send task but do not poll network/provider work.
+        drop(another_window.start_chat_draft(target));
+        let updated = another_window.persistent_workspace();
+        let pending = another_window.chat_ui.attempt(card).unwrap();
+        assert_ne!(pending.session.id, expected.id);
+        let mut actual = updated.configured_chat_drafts[&card].clone();
+        assert_eq!(actual.id, pending.session.id);
+        actual.id = expected.id;
+        assert_eq!(actual, expected);
+        let mut issued = pending.session.clone();
+        issued.launch.recipe.program = "/owning-device/real-wrapper".into();
+        issued.launch.recipe.environment.insert("DAEMON_POLICY".into(), "synthetic".into());
+        let handle = Arc::new(ClientHandle::fixture(issued, Snapshot::default()));
+        let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+        let ready = Message::ChatUi(Action::Ready(pending.target, ready));
+        drop(another_window.update(ready));
+        assert!(!another_window.durable.configured_chat_drafts.contains_key(&card));
+        assert!(!another_window.persistent_workspace().configured_chat_drafts.contains_key(&card));
+    }
+
+    #[test]
+    fn settings_cloned_configured_draft_keeps_choices_under_its_new_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
+        let original = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&original) else { panic!("draft") };
+        runtime.draft_permission_choice = Some("plan".into());
+        runtime.draft_automatic = true;
+        let expected = runtime.configured_start().unwrap().unwrap();
+        drop(app.clone_focused_pane());
+        let cloned = app.workspace.focused().unwrap();
+        assert_ne!(cloned, original);
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&cloned) else { panic!("cloned draft") };
+        let actual = runtime.configured_start().unwrap().unwrap();
+        assert_ne!(actual.id, expected.id);
+        assert_eq!(actual.account, expected.account);
+        assert_eq!(actual.permission_mode, expected.permission_mode);
+        assert_eq!(actual.automatic, expected.automatic);
+        assert_eq!(actual.model, expected.model);
+        assert_eq!(actual.effort, expected.effort);
+        assert!(app.chat_ui.attempt(cloned).is_none(), "cloning a draft does not start it");
+        assert_eq!(app.persistent_workspace().configured_chat_drafts[&cloned], actual);
+    }
+
+    #[test]
+    fn settings_invalid_typed_draft_refuses_before_mutation_and_absent_metadata_stays_legacy() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings_path = Some(directory.path().join("settings.toml"));
+        drop(app.new_native_chat(Provider::Claude, Some(directory.path().into())));
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Chat(session) = app.card_state(card).unwrap().kind.clone() else { panic!("draft") };
+        Arc::make_mut(&mut app.durable).configured_chat_drafts.get_mut(&card).unwrap().id = TerminalId::new();
+        drop(app.open_chat_draft(card, session.clone()));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("typed draft") };
+        runtime.replace_draft(text_editor::Content::with_text("keep this composer"));
+        let target = runtime.target;
+        drop(app.start_chat_draft(target));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("same draft") };
+        assert_eq!(runtime.composer.text(), "keep this composer");
+        assert_eq!(runtime.session, session);
+        assert!(runtime.error.as_deref().is_some_and(|reason| reason.contains("saved draft choices")));
+        assert!(app.chat_ui.attempt(card).is_none());
+        Arc::make_mut(&mut app.durable).configured_chat_drafts.remove(&card);
+        drop(app.open_chat_draft(card, session));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else { panic!("legacy draft") };
+        assert!(!runtime.draft_configured);
+        assert!(runtime.configured_start().unwrap().is_none());
+        assert!(!app.persistent_workspace().configured_chat_drafts.contains_key(&card));
     }
 
     #[test]

@@ -6261,6 +6261,16 @@ impl Cagents {
             return Self::open_external_url(session.current_url.clone());
         }
         let source_id = source.id;
+        let mut configured = if matches!(&source.kind, CardKind::Chat(session) if session.is_unstarted()) {
+            self.persistent_workspace().configured_chat_drafts.get(&source_id).cloned()
+        } else {
+            None
+        };
+        if let (Some(start), CardKind::Chat(session)) = (&configured, &source.kind)
+            && (!start.matches_draft(session) || start.validate().is_err()) {
+            self.status = Some(TransientNotice::error("The saved draft choices do not match this conversation. Choose its account again or start a new draft."));
+            return Task::none();
+        }
         let user_title = self.chrome_ui.user_titles.get(&source_id).cloned();
         let save_title = user_title.is_some();
         let mut card = source;
@@ -6309,6 +6319,9 @@ impl Cagents {
                 session.launch.session_id = None;
                 session.proof = None;
                 session.terminal = None;
+                if let Some(start) = &mut configured {
+                    start.id = session.id;
+                }
                 card.title = crate::app::chat_ui::chat_card_title(session.launch.provider).into();
             }
             CardKind::Browser(session) => {
@@ -6346,6 +6359,9 @@ impl Cagents {
         };
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card.clone());
+        if let Some(start) = configured {
+            durable.configured_chat_drafts.insert(id, start);
+        }
         durable.focused = Some(id);
         // The descriptor's directory can be a nested editor directory rather
         // than its containing workspace. Keep the filing across projection.
@@ -7426,6 +7442,9 @@ impl Cagents {
         let unchanged = self.card_state(card).is_some_and(
             |state| matches!(&state.kind, CardKind::Chat(current) if current == &session),
         );
+        let discarded_fresh_choices = !session.is_unstarted()
+            && self.durable.configured_chat_drafts.contains_key(&card)
+            && Arc::make_mut(&mut self.durable).configured_chat_drafts.remove(&card).is_some();
         // A successful attachment completes hydration even when the provider
         // has not enriched the already-saved descriptor yet.
         self.lifecycle.remove(card);
@@ -7433,7 +7452,7 @@ impl Cagents {
             state.residency = Residency::Hot;
         }
         if unchanged {
-            return None;
+            return discarded_fresh_choices.then_some(false);
         }
         let conversion = self
             .card_state(card)
