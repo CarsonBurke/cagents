@@ -1767,7 +1767,11 @@ pub struct LoadedRepository {
     github: GitHubAvailability,
     review_repository: Option<GitHubRepoKey>,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
+<<<<<<< HEAD
     status_order: git_ui::LoadedStatusOrder,
+=======
+    operations: HashMap<crate::model::WorktreeId, crate::repository::GitOperationObservation>,
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
 }
 
 type WorktreePrCacheKey = (GitHubRepoKey, GitHubRepoKey, String, String);
@@ -3940,6 +3944,7 @@ pub struct SourceControlRead {
     prepared: Option<Box<(RepositorySnapshot, SourceControlModel)>>,
     status: StatusSnapshot,
     head_repository: Option<GitHubRepoKey>,
+    operation: crate::repository::GitOperationObservation,
     read: u64,
 }
 
@@ -11146,6 +11151,8 @@ impl Cagents {
                     prepared: None,
                     status: status.clone(),
                     head_repository,
+                    operation: cache.row_operation().cloned().ok_or_else(||
+                        "successful source-control read did not expose operation metadata".to_owned())?,
                     read: status_read,
                 };
                 let Some(mut snapshot) = snapshot else {
@@ -13801,6 +13808,7 @@ impl Application for Cagents {
                                     SidebarWorktree::from_repository(record, status.as_ref());
                                 row.head_repository =
                                     loaded.head_repositories.get(&record.id).cloned();
+<<<<<<< HEAD
                                 row.apply_status_error(
                                     loaded
                                         .status_order
@@ -13808,6 +13816,11 @@ impl Application for Cagents {
                                         .get(&record.id)
                                         .map(String::as_str),
                                 );
+=======
+                                if let Some(operation) = loaded.operations.get(&record.id) {
+                                    row.apply_operation(operation);
+                                }
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
                                 row
                             })
                             .collect();
@@ -16529,6 +16542,7 @@ impl Application for Cagents {
                         &key,
                         &read.status,
                         read.head_repository.as_ref(),
+                        &read.operation,
                         read.read,
                     )
                 {
@@ -16547,6 +16561,7 @@ impl Application for Cagents {
                     {
                         worktree.apply_status(&read.status);
                         worktree.apply_status_head(&read.status.head);
+                        worktree.apply_operation(&read.operation);
                         if head_repository.is_none() || worktree.head_repository != head_repository
                         {
                             worktree.clear_pull_request();
@@ -17767,7 +17782,11 @@ fn load_project(
         github: GitHubAvailability::NotAssociated,
         review_repository: None,
         head_repositories: HashMap::new(),
+<<<<<<< HEAD
         status_order: Default::default(),
+=======
+        operations: HashMap::new(),
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
     })
 }
 
@@ -17828,6 +17847,12 @@ fn load_repository(
             Some((record.id, key))
         })
         .collect();
+    let operations = worktrees.iter().filter(|(record, _)| !record.bare).map(|(record, _)| {
+        let observation = service.operation_state(&record.path, &cancellation)
+            .map(|operation| operation.map(|operation| operation.kind))
+            .map_err(|error| error.to_string().chars().take(512).collect());
+        (record.id, observation)
+    }).collect();
     let review_repository = service
         .remotes(&repository.selected_path, &cancellation)
         .ok()
@@ -17855,7 +17880,11 @@ fn load_repository(
         github: github_availability,
         review_repository,
         head_repositories,
+<<<<<<< HEAD
         status_order,
+=======
+        operations,
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
     })
 }
 
@@ -23753,7 +23782,11 @@ mod tests {
             github: GitHubAvailability::NotAssociated,
             review_repository: None,
             head_repositories: HashMap::new(),
+<<<<<<< HEAD
             status_order: Default::default(),
+=======
+            operations: HashMap::new(),
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
         };
 
         // The failure lands last on purpose. A failure followed by a success
@@ -27859,6 +27892,7 @@ mod tests {
             prepared: None,
             status: crate::repository::StatusSnapshot::default(),
             head_repository: None,
+            operation: Ok(None),
             read: git_ui::next_status_read(),
         }
     }
@@ -27903,6 +27937,7 @@ mod tests {
                 status: snapshot.status.display_summary(),
                 prepared: Some(Box::new((snapshot, model))),
                 head_repository: None,
+                operation: Ok(None),
                 read: git_ui::next_status_read(),
             }),
         });

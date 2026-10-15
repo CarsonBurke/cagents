@@ -21,6 +21,7 @@ pub struct Snapshot {
     repository: RepositoryInfo,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     heads: HashMap<WorktreeId, GitHubRepoKey>,
+    operations: HashMap<WorktreeId, crate::repository::GitOperationObservation>,
 
     status_errors: HashMap<WorktreeId, String>,
     /// Only these rows were actually attempted by this read. Retained sibling
@@ -80,6 +81,11 @@ fn display_worktrees(
 }
 
 impl Snapshot {
+    fn failed_rows(&self) -> BTreeSet<WorktreeId> {
+        self.status_errors.keys().copied().chain(self.operations.iter()
+            .filter_map(|(id, operation)| operation.is_err().then_some(*id))).collect()
+    }
+
     /// Independent read streams order row authority by read start, rather than
     /// callback delivery. A delayed result cannot overwrite newer accepted facts.
     fn preserve_newer_status(&mut self, current: &Self) -> HashSet<WorktreeId> {
@@ -109,6 +115,9 @@ impl Snapshot {
             preserved.insert(id);
             self.status_updates.remove(&id);
             self.status_reads.insert(id, latest_at);
+            if let Some(operation) = current.operations.get(&id) {
+                self.operations.insert(id, operation.clone());
+            } else { self.operations.remove(&id); }
             if let Some(error) = current.status_errors.get(&id) {
                 self.status_errors.insert(id, error.clone());
             } else {
@@ -124,6 +133,7 @@ impl Snapshot {
                 true
             } else {
                 self.status_errors.remove(&id);
+                self.operations.remove(&id);
                 self.heads.remove(&id);
                 false
             }
@@ -149,6 +159,9 @@ impl Snapshot {
             preserved.insert(id);
             self.status_updates.remove(&id);
             self.status_reads.insert(id, latest);
+            if let Some(operation) = current.operations.get(&id) {
+                self.operations.insert(id, operation.clone());
+            } else { self.operations.remove(&id); }
             if let Some(error) = current.status_errors.get(&id) {
                 self.status_errors.insert(id, error.clone());
             } else {
@@ -433,6 +446,7 @@ impl State {
         key: &ActiveWorktreeKey,
         status: &StatusSnapshot,
         head_repository: Option<&GitHubRepoKey>,
+        operation: &crate::repository::GitOperationObservation,
         read: u64,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(&key.project_id) else {
@@ -488,7 +502,10 @@ impl State {
             entry.plan = Some(Arc::new(plan));
         }
         entry.snapshot.status_errors.remove(&key.worktree_id);
-        entry.failed_status_attempts.remove(&key.worktree_id);
+        entry.snapshot.operations.insert(key.worktree_id, operation.clone());
+        if operation.is_err() {
+            entry.failed_status_attempts.insert(key.worktree_id, Instant::now());
+        } else { entry.failed_status_attempts.remove(&key.worktree_id); }
         entry.snapshot.status_reads.insert(key.worktree_id, read);
         if reconfigure {
             self.configure();
@@ -567,6 +584,7 @@ impl State {
                 .worktrees
                 .retain(|(record, _)| record.id != worktree);
             entry.snapshot.status_errors.remove(&worktree);
+            entry.snapshot.operations.remove(&worktree);
             entry.failed_status_attempts.remove(&worktree);
             entry.snapshot.status_updates.remove(&worktree);
             entry
@@ -702,6 +720,7 @@ impl Cagents {
                     repository: repository.clone(),
                     worktrees: display_worktrees(&loaded.worktrees),
                     heads: loaded.head_repositories.clone(),
+                    operations: loaded.operations.clone(),
 
                     status_errors: loaded.status_order.errors.clone(),
                     status_updates: HashSet::new(),
@@ -803,9 +822,8 @@ impl Cagents {
                 }
                 let failed = entry
                     .snapshot
-                    .status_errors
-                    .keys()
-                    .copied()
+                    .failed_rows()
+                    .into_iter()
                     .filter(|id| {
                         entry
                             .failed_status_attempts
@@ -1005,13 +1023,14 @@ impl Cagents {
                         if entry.read_full_scan {
                             entry.read_failure = None;
                         }
+                        let failed_rows = snapshot.failed_rows();
                         entry
                             .failed_status_attempts
-                            .retain(|id, _| snapshot.status_errors.contains_key(id));
-                        for id in snapshot.status_errors.keys() {
+                            .retain(|id, _| failed_rows.contains(id));
+                        for id in failed_rows {
                             entry
                                 .failed_status_attempts
-                                .entry(*id)
+                                .entry(id)
                                 .or_insert_with(Instant::now);
                         }
                         let previous = std::mem::replace(&mut entry.snapshot, snapshot.clone());
@@ -1159,8 +1178,8 @@ impl Cagents {
             let change = std::mem::take(&mut entry.pending);
             for id in entry
                 .snapshot
-                .status_errors
-                .keys()
+                .failed_rows()
+                .iter()
                 .filter(|id| change.topology || change.worktrees.contains(*id))
             {
                 entry.failed_status_attempts.insert(*id, Instant::now());
@@ -1270,6 +1289,9 @@ fn read_local_with_plan(
             }
         };
         snapshot.status_errors.remove(&record.id);
+        snapshot.operations.insert(record.id, git.operation_state(&record.path, &cancellation)
+            .map(|operation| operation.map(|operation| operation.kind))
+            .map_err(|error| error.to_string().chars().take(512).collect()));
         apply_status_head(record, &current);
         let head_changed = status
             .as_ref()
@@ -1299,6 +1321,7 @@ fn read_local_with_plan(
         .status_reads
         .retain(|id, _| retained.contains(id) || removed.contains(id) || vanished.contains(id));
     snapshot.heads.retain(|id, _| retained.contains(id));
+    snapshot.operations.retain(|id, _| retained.contains(id));
     let upstreams = snapshot
         .worktrees
         .iter()
@@ -1416,6 +1439,9 @@ fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
             );
             if apply_status {
                 row.apply_status_error(error.map(String::as_str));
+                if error.is_none() && let Some(operation) = snapshot.operations.get(&record.id) {
+                    row.apply_operation(operation);
+                }
             }
             let head = snapshot.heads.get(&record.id).cloned();
             if row.head_repository != head {
@@ -1575,6 +1601,7 @@ mod tests {
             repository,
             worktrees,
             heads: HashMap::new(),
+            operations: HashMap::new(),
 
             status_errors: HashMap::new(),
             status_updates,
@@ -1635,6 +1662,7 @@ mod tests {
                 prepared: Some(Box::new((snapshot, model))),
                 status,
                 head_repository: None,
+                operation: Ok(None),
                 read,
             }),
         }
@@ -1885,6 +1913,7 @@ mod tests {
                 result: Ok(SourceControlRead {
                     status: prepared.status.display_summary(),
                     head_repository: None,
+                    operation: Ok(None),
                     read: status_read,
                     prepared: Some(Box::new((
                         prepared.clone(),
@@ -2218,6 +2247,7 @@ mod tests {
                 prepared: None,
                 status,
                 head_repository: None,
+                operation: Ok(None),
                 read: next_status_read(),
             }),
         }));
@@ -2235,6 +2265,7 @@ mod tests {
                 prepared: None,
                 status: stale_status,
                 head_repository: None,
+                operation: Ok(None),
                 read: read.saturating_sub(1),
             }),
         }));
@@ -2301,6 +2332,59 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         }
+    }
+
+    #[test]
+    fn operation_display_proof_recovers_without_events_and_rejects_delayed_watch_replay() {
+        const TEST: &str = "app::git_ui::tests::operation_display_proof_recovers_without_events_and_rejects_delayed_watch_replay";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        use crate::repository::GitOperationKind;
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("repo");
+        let baseline = fixture(&root);
+        let key = ActiveWorktreeKey { project_id: ProjectId::new(),
+            worktree_id: baseline.worktrees[0].0.id, canonical_path: root.clone() };
+        let mut app = app_with_status_snapshot(baseline, &key);
+        let admin = root.join(".git");
+        let oid = fs::read(admin.join("refs/heads/main")).unwrap();
+        fs::write(admin.join("MERGE_HEAD"), oid).unwrap();
+        fs::write(admin.join("MERGE_MSG"), "Merge fixture\n").unwrap();
+        let loaded = super::super::load_repository(&root, None, CancellationToken::default()).unwrap();
+        assert_eq!(loaded.operations.get(&key.worktree_id), Some(&Ok(Some(GitOperationKind::Merge))),
+            "initial worker publication includes operation metadata too");
+        let initial = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+        drop(app.update(initial));
+        assert_eq!(app.sidebar_model.projects[0].worktrees[0].operation, Some(GitOperationKind::Merge));
+        let delayed = app.refresh_ui.git.entries[&key.project_id].snapshot.clone();
+        fs::write(admin.join("MERGE_MSG"), [0xff]).unwrap();
+        let failed = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+        assert!(matches!(&failed, Message::SourceControlLoaded { result: Ok(read), .. }
+            if read.prepared.is_none() && read.operation.is_err()),
+            "unchanged full model still publishes the typed operation error");
+        drop(app.update(failed));
+        let row = &app.sidebar_model.projects[0].worktrees[0];
+        assert!(row.status_error.is_none());
+        assert!(row.operation_error.is_some());
+        assert!(row.status_tooltip_for_test().contains("Last known: Merge in progress"));
+        fs::write(admin.join("MERGE_MSG"), "Repaired fixture\n").unwrap();
+        app.refresh_ui.git.entries.get_mut(&key.project_id).unwrap().failed_status_attempts
+            .insert(key.worktree_id, Instant::now() - FALLBACK_INTERVAL - Duration::from_secs(1));
+        let retry = super::super::tests::task_app_message(app.git_fallback_tick());
+        assert!(matches!(&retry, Message::GitUi(Action::Read { result: Ok((snapshot, _)), .. })
+            if snapshot.status_updates == HashSet::from([key.worktree_id])));
+        drop(app.update(retry));
+        assert!(app.sidebar_model.projects[0].worktrees[0].operation_error.is_none());
+        fs::remove_file(admin.join("MERGE_HEAD")).unwrap();
+        let complete = super::super::tests::task_app_message(app.source_control_snapshot_task(key.clone()));
+        drop(app.update(complete));
+        assert!(app.sidebar_model.projects[0].worktrees[0].operation.is_none());
+        drop(app.update(Message::GitUi(Action::Read {
+            project: key.project_id, generation: 9, result: Ok((delayed, None)),
+        })));
+        let row = &app.sidebar_model.projects[0].worktrees[0];
+        assert!(row.operation.is_none() && row.operation_error.is_none(),
+            "a delayed watcher cannot reattach a completed operation");
+        assert!(row.status_tooltip_for_test().contains("No changes"));
     }
 
     #[test]
@@ -2557,6 +2641,7 @@ mod tests {
                 prepared: None,
                 status: status.clone(),
                 head_repository: None,
+                operation: Ok(None),
                 read,
             }),
         }));

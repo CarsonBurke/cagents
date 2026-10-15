@@ -143,6 +143,8 @@ impl DirtyState {
 /// Display-only observation of Git's in-progress operation markers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GitOperationKind { Merge, Rebase, CherryPick, Revert }
+/// Successful absence is distinct from unreadable operation metadata.
+pub type GitOperationObservation = Result<Option<GitOperationKind>, String>;
 impl GitOperationKind {
     pub fn label(self) -> &'static str {
         match self { Self::Merge => "Merge", Self::Rebase => "Rebase", Self::CherryPick => "Cherry-pick", Self::Revert => "Revert" }
@@ -702,7 +704,7 @@ pub struct SnapshotCache {
     publication_dependencies: Option<PublicationDependencies>,
     publication_system_root: Option<PublicationSystemRoot>,
     last_status: Option<StatusSnapshot>,
-    row_operation: Option<Result<Option<GitOperationKind>, String>>,
+    row_operation: Option<GitOperationObservation>,
     status_attempt_failed: bool,
     lines: BTreeMap<RepoPath, (FileIdentity, u64)>,
     observed: BTreeMap<RepoPath, Option<FileIdentity>>,
@@ -1011,7 +1013,7 @@ impl SnapshotCache {
 
     /// Display observation paired with this read. A marker error does not
     /// turn a successful Git status into a status-command failure.
-    pub fn row_operation(&self) -> Option<&Result<Option<GitOperationKind>, String>> {
+    pub fn row_operation(&self) -> Option<&GitOperationObservation> {
         self.row_operation.as_ref()
     }
 
@@ -4710,7 +4712,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         cache.row_operation = Some(match git_dir.as_deref() {
             Some(directory) => operation_metadata::read_operation_state(directory)
                 .map(|operation| operation.map(|operation| operation.kind))
-                .map_err(|error| error.to_string()),
+                .map_err(|error| error.to_string().chars().take(512).collect()),
             None => Ok(None),
         });
         use sha2::Digest;

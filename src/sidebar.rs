@@ -703,6 +703,8 @@ pub struct SidebarWorktree {
     pub listing_truncated: bool,
     untracked_complete: bool,
     pub status_error: Option<String>,
+    pub operation: Option<crate::repository::GitOperationKind>,
+    pub operation_error: Option<String>,
     pub ahead: Option<u64>,
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
@@ -774,6 +776,8 @@ impl SidebarWorktree {
             listing_truncated: false,
             untracked_complete,
             status_error: None,
+            operation: None,
+            operation_error: None,
             ahead,
             behind,
             created_at_unix_ms: None,
@@ -864,6 +868,18 @@ impl SidebarWorktree {
             self.branch = branch.map(str::to_owned);
             self.detached = detached;
             self.chrome.folded_branch = self.branch.as_deref().map(fold);
+            self.refresh_status_chrome();
+        }
+    }
+
+    pub fn apply_operation(&mut self, observation: &crate::repository::GitOperationObservation) {
+        let (operation, error) = match observation {
+            Ok(operation) => (*operation, None),
+            Err(error) => (self.operation, Some(error.chars().take(512).collect::<String>())),
+        };
+        if self.operation != operation || self.operation_error != error {
+            self.operation = operation;
+            self.operation_error = error;
             self.refresh_status_chrome();
         }
     }
@@ -978,6 +994,14 @@ impl SidebarWorktree {
                 format!("Git status unavailable: {error}")
             };
         }
+        if let Some(error) = &self.operation_error {
+            status.push_str(&format!(", Git operation unavailable: {error}"));
+            if let Some(operation) = self.operation {
+                status.push_str(&format!(". Last known: {} in progress", operation.label()));
+            }
+        } else if let Some(operation) = self.operation {
+            status.push_str(&format!(", {} in progress", operation.label()));
+        }
         status
     }
 
@@ -1019,6 +1043,9 @@ impl SidebarWorktree {
                 Some(badge) => format!("Last known: {badge}").into_boxed_str(),
                 None => "Git status unavailable".into(),
             });
+        }
+        if self.operation.is_some() || self.operation_error.is_some() {
+            self.chrome.dirty_badge = Some(self.status_description().into_boxed_str());
         }
         let mut status = self.status_description();
         if let Some(pr) = &self.chrome.pull_request {
@@ -6011,6 +6038,7 @@ pub fn worktree_indicators(worktree: &SidebarWorktree) -> WorktreeIndicators<'_>
 /// expanded row keeps checks as a durable badge of their own, after the
 /// reserved slot.
 fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
+<<<<<<< HEAD
     if worktree.status_error.is_some()
         || worktree
             .dirty
@@ -6020,10 +6048,24 @@ fn worktree_change_icon(worktree: &SidebarWorktree) -> Icon {
         Icon::Warning
     } else {
         Icon::Changes
+=======
+    if worktree.status_error.is_some() || worktree.operation_error.is_some()
+        || worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) {
+        return Icon::Warning;
+    }
+    use crate::repository::GitOperationKind;
+    match worktree.operation {
+        Some(GitOperationKind::Merge) => Icon::MergedPullRequest,
+        Some(GitOperationKind::Rebase) => Icon::Branch,
+        Some(GitOperationKind::CherryPick) => Icon::Commit,
+        Some(GitOperationKind::Revert) => Icon::RevertFile,
+        None => Icon::Changes,
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
     }
 }
 
 fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
+<<<<<<< HEAD
     if worktree.status_error.is_some() {
         BadgeTone::Warning
     } else if worktree
@@ -6035,6 +6077,12 @@ fn worktree_change_tone(worktree: &SidebarWorktree) -> BadgeTone {
     } else {
         BadgeTone::Warning
     }
+=======
+    if worktree.status_error.is_some() || worktree.operation_error.is_some() { BadgeTone::Warning }
+    else if worktree.dirty.as_ref().is_some_and(|dirty| dirty.conflicted > 0) { BadgeTone::Danger }
+    else if worktree.operation.is_some() { BadgeTone::Neutral }
+    else { BadgeTone::Warning }
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
 }
 
 fn worktree_change_count(worktree: &SidebarWorktree) -> String {
@@ -6042,6 +6090,7 @@ fn worktree_change_count(worktree: &SidebarWorktree) -> String {
         return "?".to_owned();
     }
     let count = worktree.dirty.as_ref().map_or(0, dirty_count);
+<<<<<<< HEAD
     if count > 999 {
         "999+".to_owned()
     } else if worktree.listing_truncated {
@@ -6049,6 +6098,12 @@ fn worktree_change_count(worktree: &SidebarWorktree) -> String {
     } else {
         count.to_string()
     }
+=======
+    let count = if count > 999 { "999+".to_owned() } else if worktree.listing_truncated {format!("{count}+")} else { count.to_string() };
+    if worktree.operation_error.is_some() { format!("{count} · ?") }
+    else if let Some(operation) = worktree.operation { format!("{} · {count}", operation.label()) }
+    else { count }
+>>>>>>> 14905b2b4 (feat(sidebar): carry ordered merge and rebase display state)
 }
 
 fn worktree_indicator(
@@ -16008,6 +16063,30 @@ pub(crate) mod tests {
         };
         assert_eq!(selection.len(), 501);
         assert_eq!(selection.last().unwrap().path, paths[500]);
+    }
+
+    #[test]
+    fn clean_index_keeps_operation_glyph_and_explicit_marker_error_provenance() {
+        use crate::repository::GitOperationKind;
+        let mut row = worktree(11, "feature/merge", false);
+        row.apply_operation(&Ok(Some(GitOperationKind::Merge)));
+        row.apply_status(&StatusSnapshot::default());
+        assert!(matches!(worktree_change_icon(&row), Icon::MergedPullRequest));
+        assert!(row.chrome.dirty_badge.as_deref().unwrap().contains("Merge in progress"));
+        assert!(row.status_description().contains("Merge in progress"));
+        assert_eq!(worktree_change_count(&row), "Merge · 0");
+        row.apply_operation(&Err("marker unreadable".into()));
+        assert!(row.status_error.is_none(), "operation metadata failure does not assert status failed");
+        assert!(matches!(worktree_change_icon(&row), Icon::Warning));
+        assert!(row.status_description().contains("Last known: Merge in progress"));
+        assert_eq!(worktree_change_count(&row), "0 · ?");
+        row.apply_operation(&Ok(Some(GitOperationKind::Rebase)));
+        assert!(row.operation_error.is_none());
+        assert!(matches!(worktree_change_icon(&row), Icon::Branch));
+        assert!(row.status_description().contains("Rebase in progress"));
+        row.apply_operation(&Ok(None));
+        assert!(row.chrome.dirty_badge.is_none());
+        assert!(row.status_description().contains("No changes"));
     }
 
     #[test]
