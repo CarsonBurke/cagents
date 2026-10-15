@@ -242,7 +242,7 @@ mod tests {
     #[test]
     fn contents_do_not_change_the_reading_column() {
         let renderer = crate::app::tests::headless_renderer();
-        for available in [280.0, 600.0, 956.0, 1440.0] {
+        for available in [280.0_f32, 600.0, 956.0, 1440.0] {
             let expected = available.min(design::READABLE_MEASURE + 2.0 * step::GAP_M);
             for footer_width in [0.0, 150.25, 900.0, 3000.0] {
                 let footer = widget::flex_row(vec![
