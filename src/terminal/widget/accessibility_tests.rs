@@ -924,3 +924,35 @@ fn actual_sidebar_text_focus_owns_ignored_control_keys_and_terminal_pairs_held_r
     dispatch(&mut root, &mut tree, control("t", keyboard::key::Code::KeyT, false));
     assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key { .. })));
 }
+
+
+#[test]
+fn key_released_during_review_pairs_after_exit_without_requiring_a_blur() {
+    let peer = Peer::new();
+    let renderer = renderer();
+    let mut widget = widget(&peer, "held-review-key", ReviewInputBarrier::default(), true, false);
+    widget.on_shortcut = None;
+    let mut tree = widget_tree(&widget);
+    dispatch(&mut widget, &mut tree, &renderer,
+        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, true));
+    assert_eq!(peer.fence().iter().filter(|request| matches!(request,
+        ClientRequest::Key { input, .. } if input.action == KeyAction::Press)).count(), 1);
+    let id = widget.id.clone().unwrap();
+    dispatch(&mut widget, &mut tree, &renderer, action(id, Action::Focus, None));
+    widget.review_active = true;
+    widget.suppress_focus_reports = true;
+    widget.review_revision = 1;
+    dispatch(&mut widget, &mut tree, &renderer,
+        key(keyboard::key::Named::Enter, keyboard::key::Code::Enter, false));
+    assert_no_pty_input(&peer.fence());
+    // This is the app's confirmed Review-off view; native keyboard focus stays
+    // on the terminal, so an ordinary blur alone cannot repair the release.
+    widget.review_active = false;
+    widget.suppress_focus_reports = false;
+    widget.review_revision = 2;
+    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::RedrawRequested(Instant::now())));
+    assert_eq!(peer.fence().iter().filter(|request| matches!(request,
+        ClientRequest::Key { input, .. } if input.action == KeyAction::Release)).count(), 1);
+    dispatch(&mut widget, &mut tree, &renderer, Event::Window(window::Event::RedrawRequested(Instant::now())));
+    assert!(!peer.fence().iter().any(|request| matches!(request, ClientRequest::Key { .. })));
+}
