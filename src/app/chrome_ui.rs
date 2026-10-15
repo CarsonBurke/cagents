@@ -78,6 +78,54 @@ mod tests {
     }
 
     #[test]
+    fn pane_menu_closes_when_equal_size_channel_destinations_change_or_reorder() {
+        use iced::{Event, Point, Rectangle, Size, Vector, mouse,
+            advanced::{Layout, Shell, clipboard, layout, widget::Tree}};
+        use crate::workspace_model::{ModelChannel, views::{Pane, View}};
+        let renderer = super::super::tests::headless_renderer();
+        let mut app = tab_fixture(1, 900.0);
+        let id = app.workspace.order().next().unwrap();
+        let card = app.card_state(id).unwrap();
+        let source = crate::model::ChannelId::new();
+        let destination = crate::model::ChannelId::new();
+        let other = crate::model::ChannelId::new();
+        let mut view = View::empty(source);
+        view.panes.push(Pane { id, title: card.title.clone(), user_title: None,
+            pending_terminal_start: false, width_fraction: 0.5, scope: None, kind: card.kind.clone() });
+        app.workspace_model.views = vec![view];
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.channels = [source, destination, other].into_iter().enumerate().map(|(index, id)| ModelChannel {
+            id, repository: PathBuf::from("/repo/.git"), title: format!("Channel {index}"), title_source: Default::default(), ordinal: index as u32,
+        }).collect();
+        assert_eq!(app.pane_move_destinations(id).len(), 2);
+        let window = Size::new(900.0, 600.0);
+        let viewport = Rectangle::with_size(window);
+        let probe = |app: &Cagents, tree: &mut Tree, open: bool| {
+            let mut header = app.column_header(id, true, 320.0);
+            header.as_widget_mut().diff(tree);
+            let node = header.as_widget_mut().layout(tree, &renderer, &layout::Limits::new(Size::ZERO, window));
+            if open {
+                header.as_widget_mut().update(tree, &Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)),
+                    Layout::new(&node), mouse::Cursor::Available(Point::new(80.0, 16.0)), &renderer,
+                    &mut clipboard::Null, &mut Shell::new(&mut Vec::new()), &viewport);
+            }
+            header.as_widget_mut().overlay(tree, Layout::new(&node), &renderer, &viewport, Vector::ZERO).is_some()
+        };
+        let header = app.column_header(id, true, 320.0);
+        let mut tree = Tree::new(header.as_widget());
+        drop(header);
+        assert!(probe(&app, &mut tree, true));
+        assert!(probe(&app, &mut tree, false), "unchanged destinations retain an open menu");
+        app.workspace_model.channels[1].id = crate::model::ChannelId::new();
+        app.workspace_model.sequence += 1;
+        assert!(!probe(&app, &mut tree, false), "equal-count replacement retires the original menu");
+        assert!(probe(&app, &mut tree, true));
+        app.workspace_model.channels[1].ordinal = 99;
+        app.workspace_model.sequence += 1;
+        assert!(!probe(&app, &mut tree, false), "same-width reordered destinations cannot replace open actions");
+    }
+
+    #[test]
     fn narrow_tabs_fit_four_and_wide_tabs_fit_real_twenty_character_titles() {
         let mut app = tab_fixture(30, 900.0);
         let (available, width) = app.tab_strip_geometry();
@@ -2349,7 +2397,11 @@ impl Cagents {
         let tab = iced::widget::mouse_area(tab)
             .on_enter(Message::ChromeUi(Action::HoverTab(Some(id))))
             .on_exit(Message::ChromeUi(Action::HoverTab(None)));
-        let menu_identity = (id, card.map(|card| card.generation), match self.cards.get(&id) {
+        // Destination metadata can change without changing this pane. The
+        // daemon's model epoch retires an open menu before its Move payloads
+        // could be replaced under the pointer, without cloning every channel.
+        let menu_identity = (self.workspace_model.identity, self.workspace_model.sequence,
+            id, card.map(|card| card.generation), match self.cards.get(&id) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
             _ => self.parked_chat_runtime(id).map(|runtime| runtime.target),
         });
