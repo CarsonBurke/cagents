@@ -11,7 +11,7 @@ use std::{
 };
 
 #[path = "editor_widget.rs"]
-mod text_editor;
+pub(crate) mod text_editor;
 
 mod diff_layout;
 mod preview;
@@ -346,6 +346,7 @@ pub enum EditorLspAction {
     Definition(Option<LspPosition>),
     References,
     Diagnostics,
+    Diagnostic(bool),
     Choose {
         index: usize,
         label: String,
@@ -366,6 +367,7 @@ struct EditorLanguageState {
     available_actions_at: Option<(u64, text_editor::Position)>,
     signature: Option<crate::lsp::LspSignatureHelp>,
     diagnostics: Vec<crate::lsp::LspDiagnostic>,
+    selected_diagnostic: Option<usize>,
     marks: Vec<text_editor::Diagnostic>,
     completions: Vec<LspCompletionItem>,
     selected: usize,
@@ -839,6 +841,8 @@ struct EditorDocument {
     source: PathBuf,
     content: text_editor::Content<cosmic::Renderer>,
     saved_text: String,
+    saved_history_revision: u64,
+    saved_snapshot: text_editor::TextSnapshot,
     disk_hash: blake3::Hash,
     markdown: bool,
     markdown_items: Vec<markdown::Item>,
@@ -900,6 +904,8 @@ struct SaveTicket {
     id: u64,
     identity: AsyncIdentity,
     revision: u64,
+    history_revision: u64,
+    snapshot_source: text_editor::TextSnapshot,
     snapshot: String,
 }
 
@@ -911,11 +917,15 @@ impl EditorDocument {
         disk_hash: blake3::Hash,
         markdown: bool,
     ) -> Self {
+        let content = text_editor::Content::with_text(&text);
+        let saved_snapshot = content.text_snapshot();
         Self {
             path,
             source,
-            content: text_editor::Content::with_text(&text),
+            content,
+            saved_snapshot,
             saved_text: text,
+            saved_history_revision: 0,
             disk_hash,
             markdown,
             // Source editing does not consume the preview AST. Parse only
@@ -1017,10 +1027,20 @@ impl EditorDocument {
     /// Brings the derived state up to date after the text changed.
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
-        self.dirty = !content_matches(&self.content, &self.saved_text);
+        self.refresh_dirty();
         self.markdown_stale = true;
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
+        }
+    }
+
+    fn refresh_dirty(&mut self) {
+        self.dirty = self.history.revision() != self.saved_history_revision;
+        if self.dirty && self.content.text_snapshot().same_text(&self.saved_snapshot) {
+            // Signature inequality is constant-time on ordinary edits. Only
+            // a possible return to the saved bytes pays for exact equality.
+            self.history.adopt_revision(self.saved_history_revision);
+            self.dirty = false;
         }
     }
 
@@ -1105,6 +1125,7 @@ impl EditorDocument {
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
         }
+        self.history.adopt_revision(self.saved_history_revision);
         self.dirty = false;
         debug_assert!(self.active_save.is_none());
         self.conflict = false;
@@ -1142,6 +1163,7 @@ impl EditorDocument {
             cancel.0.cancel();
         }
         self.dirty = text != self.saved_text;
+        if !self.dirty { self.history.adopt_revision(self.saved_history_revision); }
         self.revision = self.revision.wrapping_add(1).max(1);
     }
 
@@ -1171,7 +1193,6 @@ impl EditorDocument {
                 changes.push(change);
             }
         }
-        self.text_changed();
         Some(changes)
     }
 
@@ -1490,6 +1511,12 @@ fn caret_position(
     content: &text_editor::Content<cosmic::Renderer>,
     caret: text_editor::Position,
 ) -> Option<LspPosition> {
+    let snapshot = content.text_snapshot();
+    if snapshot.protocol_compatible_lines() {
+        let line = snapshot.line(caret.line)?;
+        let column = line.text[..char_boundary(&line.text, caret.column)].chars().count();
+        return Some(LspPosition::new(u32::try_from(caret.line).ok()?, u32::try_from(column).ok()?));
+    }
     let lines = content.line_count();
     if caret.line >= lines {
         return None;
@@ -1525,6 +1552,13 @@ fn caret_for_position(
     content: &text_editor::Content<cosmic::Renderer>,
     at: LspPosition,
 ) -> Option<text_editor::Position> {
+    let snapshot = content.text_snapshot();
+    if snapshot.protocol_compatible_lines() {
+        let line_index = usize::try_from(at.line).ok()?;
+        let line = snapshot.line(line_index)?;
+        let column = line.text.char_indices().nth(usize::try_from(at.character).ok()?).map_or(line.text.len(), |(byte,_)| byte);
+        return Some(text_editor::Position {line:line_index,column});
+    }
     let lines = content.line_count();
     let trailing_cr = trailing_carriage_return(content);
     let target = usize::try_from(at.character).unwrap_or(usize::MAX);
@@ -2680,6 +2714,8 @@ impl RepositoryRuntime {
             id: 1,
             identity: identity.clone(),
             revision: 1,
+            history_revision: if content_matches(&document.content, "B\n") { document.history.revision() } else { u64::MAX },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("B\n").text_snapshot(),
             snapshot: "B\n".into(),
         });
         runtime.document = DocumentState::Editable(document);
@@ -2837,7 +2873,9 @@ impl RepositoryRuntime {
     /// `text`, with the resulting intents still queued.
     #[cfg(test)]
     pub(crate) fn lsp_open_fixture(card: CardId, text: &str) -> (Self, AsyncIdentity) {
-        Self::open_fixture(card, "notes.txt", text)
+        let (mut runtime, identity) = Self::open_fixture(card, "notes.txt", text);
+        runtime.set_lsp_document(Some(LspDocumentId(0)));
+        (runtime, identity)
     }
 
     /// The same, under a chosen file name.
@@ -3411,6 +3449,29 @@ impl RepositoryRuntime {
         self.language.code_action_lines.sort_unstable();
         self.language.code_action_lines.dedup();
         self.language.diagnostics = diagnostics;
+        self.language.selected_diagnostic = None;
+    }
+
+    fn navigate_diagnostic(&mut self, forward: bool) {
+        let Some(at) = self.cursor_position() else { return; };
+        let mut order: Vec<_> = self.language.diagnostics.iter().enumerate().map(|(index,item)| (item.range.start,index)).collect();
+        order.sort_by_key(|entry| entry.0);
+        if order.is_empty() { return; }
+        let current = self.language.selected_diagnostic.and_then(|selected| order.iter().position(|(position,index)| *index == selected && *position == at));
+        let next = if let Some(current) = current {
+            if forward { (current + 1) % order.len() } else { (current + order.len() - 1) % order.len() }
+        } else if forward {
+            order.iter().position(|(position,_)| *position > at).unwrap_or(0)
+        } else {
+            order.iter().rposition(|(position,_)| *position < at).unwrap_or(order.len() - 1)
+        };
+        let (position,index) = order[next];
+        let message = self.language.diagnostics[index].message.clone();
+        if self.move_cursor_to(position) {
+            self.dismiss_editor_results();
+            self.set_editor_hover(Some(&message), Some(position));
+            self.language.selected_diagnostic = Some(index);
+        }
     }
 
     pub fn set_editor_rename(&mut self, draft: Option<String>) {
@@ -4019,6 +4080,7 @@ impl RepositoryRuntime {
                 document.content.cursor(),
                 Instant::now(),
             );
+            document.text_changed();
         }
         if let Some(version) = version {
             // Recorded highest-range-first, the order they were applied in:
@@ -4602,6 +4664,11 @@ impl RepositoryRuntime {
         let Some(version) = self.pending_lsp_change.take() else {
             return;
         };
+        if self.lsp_document.is_none() {
+            self.lsp_edits.clear();
+            self.lsp_edits_exact = true;
+            return;
+        }
         let DocumentState::Editable(document) = &self.document else {
             // The buffer stopped existing before anyone drained; the close
             // that replaced it is the only thing left worth saying.
@@ -5309,7 +5376,7 @@ impl RepositoryRuntime {
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
         if self.is_read_only_source() { return Task::none(); }
-        let (path, destination, text, disk_hash, revision) = match &self.document {
+        let (path, destination, text, disk_hash, revision, history_revision, snapshot_source) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
                     && document.active_save.is_none() && document.workspace_edit.is_none() =>
@@ -5320,6 +5387,8 @@ impl RepositoryRuntime {
                     document.content.text(),
                     document.disk_hash,
                     document.revision,
+                    document.history.revision(),
+                    document.content.text_snapshot(),
                 )
             }
             _ => return Task::none(),
@@ -5332,9 +5401,12 @@ impl RepositoryRuntime {
             id: self.next_save_ticket,
             identity: identity.clone(),
             revision,
+            history_revision,
+            snapshot_source,
             snapshot: text.clone(),
         };
         if let DocumentState::Editable(document) = &mut self.document {
+            document.history.seal();
             document.active_save = Some(ticket.clone());
             document.error = None;
         }
@@ -6081,7 +6153,8 @@ impl RepositoryRuntime {
                     Applied::Unchanged => Task::none(),
                 }
             }
-            RepositoryAction::Language { action, .. } => {
+            RepositoryAction::Language { card, action } => {
+                let diagnostic = matches!(action, EditorLspAction::Diagnostic(_));
                 match action {
                     EditorLspAction::CodeActionNext(forward) if !self.language.code_actions.is_empty() => {
                         let count = self.language.code_actions.len();
@@ -6098,10 +6171,11 @@ impl RepositoryRuntime {
                             (self.language.selected + count - 1) % count
                         };
                     }
+                    EditorLspAction::Diagnostic(forward) => self.navigate_diagnostic(forward),
                     EditorLspAction::Dismiss => self.dismiss_editor_results(),
                     _ => {}
                 }
-                Task::none()
+                if diagnostic { self.focus_editor(card) } else { Task::none() }
             }
             RepositoryAction::Save { card, overwrite } => self.request_save(card, overwrite),
             RepositoryAction::AutoSaveDue {
@@ -6152,7 +6226,7 @@ impl RepositoryRuntime {
                 }
                 let mut saved = false;
                 if let DocumentState::Editable(document) = &mut self.document {
-                    document.active_save = None;
+                    let ticket = document.active_save.take().expect("matched save ticket");
                     match result {
                         Ok(SaveOutcome::Saved {
                             content_hash,
@@ -6161,7 +6235,9 @@ impl RepositoryRuntime {
                             document.saved_text = saved_text;
                             document.disk_hash = content_hash;
                     document.external_version = None; document.external_deleted = false; document.recreate_missing = false; document.external_check_pending = false;
-                            document.dirty = document.content.text() != document.saved_text;
+                            document.saved_history_revision = ticket.history_revision;
+                            document.saved_snapshot = ticket.snapshot_source;
+                            document.refresh_dirty();
                             document.conflict = false;
                             document.error = None;
                             document.durability_warning = match durability {
@@ -9679,6 +9755,7 @@ fn editable_document_view<'a>(
                     }
                     Key::Named(Named::F2) if press.modifiers.is_empty() => Some(EditorLspAction::Rename),
                     Key::Character(character) if character.as_str() == "." && press.modifiers.command() => Some(EditorLspAction::CodeActions),
+                    Key::Named(Named::F8) if !press.modifiers.control() && !press.modifiers.alt() && !press.modifiers.logo() => Some(EditorLspAction::Diagnostic(!press.modifiers.shift())),
                     Key::Named(Named::F12) => Some(if press.modifiers.shift() {
                         EditorLspAction::References
                     } else {
@@ -14198,6 +14275,8 @@ mod tests {
             id: 7,
             identity: identity.clone(),
             revision: 1,
+            history_revision: if content_matches(&document.content, "submitted\n") { document.history.revision() } else { u64::MAX },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n").text_snapshot(),
             snapshot: "submitted\n".into(),
         });
         runtime.document = DocumentState::Editable(document);
@@ -14406,6 +14485,8 @@ mod tests {
             id: 8,
             identity: identity.clone(),
             revision: 3,
+            history_revision: if content_matches(&document.content, "newest\n") { document.history.revision() } else { u64::MAX },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("newest\n").text_snapshot(),
             snapshot: "newest\n".into(),
         });
         runtime.document = DocumentState::Editable(document);
@@ -14455,6 +14536,8 @@ mod tests {
                 generation: 1,
             },
             revision: 1,
+            history_revision: if content_matches(&document.content, "submitted\n") { document.history.revision() } else { u64::MAX },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n").text_snapshot(),
             snapshot: "submitted\n".into(),
         });
         document.dirty = false;
@@ -14510,6 +14593,8 @@ mod tests {
             id: 9,
             identity,
             revision: 1,
+            history_revision: if content_matches(&document.content, "submitted\n") { document.history.revision() } else { u64::MAX },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n").text_snapshot(),
             snapshot: "submitted\n".into(),
         });
         runtime.document = DocumentState::Editable(document);
@@ -14785,6 +14870,8 @@ mod tests {
             id: 2,
             identity: identity.clone(),
             revision: 1,
+            history_revision: if content_matches(&document.content, "after\n") { document.history.revision() } else { u64::MAX },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("after\n").text_snapshot(),
             snapshot: "after\n".into(),
         });
         runtime.document = DocumentState::Editable(document);
@@ -15108,7 +15195,9 @@ mod tests {
                 id: 1,
                 identity: identity.clone(),
                 revision: 1,
-                snapshot: "after\n".into(),
+                history_revision: if content_matches(&document.content, "after\n") { document.history.revision() } else { u64::MAX },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("after\n").text_snapshot(),
+            snapshot: "after\n".into(),
             });
             runtime.document = DocumentState::Editable(document);
 
@@ -17639,6 +17728,43 @@ mod tests {
             "the caret follows the text the user chose, past the edit inserted above it"
         );
         assert!(runtime.is_dirty());
+    }
+
+    #[test]
+    fn typing_without_an_attached_server_never_serializes_content() {
+        let card = CardId::new();
+        let source = "let value = 1;\n".repeat(50_000);
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "huge.rs", &source);
+        drop(runtime.take_lsp_intents());
+        text_editor::take_text_call_count();
+        for character in "changed".chars() {
+            drop(runtime.update(RepositoryAction::EditorAction { card,action:text_editor::Action::Edit(text_editor::Edit::Insert(character)) }));
+            assert!(runtime.take_lsp_intents().is_empty());
+        }
+        assert!(runtime.is_dirty());
+        drop(runtime.update(RepositoryAction::Undo {card}));
+        assert!(runtime.take_lsp_intents().is_empty());
+        assert_eq!(text_editor::take_text_call_count(), 0);
+    }
+
+    #[test]
+    fn diagnostic_navigation_wraps_and_displays_the_message() {
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "first\nsecond\nthird\n");
+        runtime.set_editor_diagnostics(vec![
+            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(2,0),LspPosition::new(2,3)),severity:crate::lsp::LspSeverity::Error,message:"third error".into(),source:None,code:None },
+            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,3)),severity:crate::lsp::LspSeverity::Warning,message:"second warning".into(),source:None,code:None },
+        ]);
+        runtime.move_cursor_to(LspPosition::new(0,0));
+        runtime.navigate_diagnostic(true);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1,0)));
+        assert!(!runtime.language.hover.is_empty());
+        runtime.navigate_diagnostic(true);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(2,0)));
+        runtime.navigate_diagnostic(true);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1,0)));
+        runtime.navigate_diagnostic(false);
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(2,0)));
     }
 
     #[test]
