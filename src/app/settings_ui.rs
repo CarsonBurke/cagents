@@ -1292,7 +1292,7 @@ fn shortcut_input<'a>(
     let mut children = vec![row.into()];
     if let Some(reason) = &error { children.push(design::caption(reason.clone()).class(cosmic::theme::Text::Custom(design::destructive_text)).into()); }
     let conflict = if error.is_some() { "conflicts unsaved" } else { "" };
-    setting_field(label, "", widget::column::with_children(children).spacing(2).into()).label_in_control().keywords(value).keywords(format!("keyboard_shortcuts {source} {conflict}"))
+    setting_field(label, "", widget::column::with_children(children).spacing(2).into()).label_in_control().keywords(value).keywords(settings::shortcut_search_keywords(value)).keywords(format!("keyboard_shortcuts {source} {conflict}"))
 }
 
 #[cfg(test)]
@@ -1309,5 +1309,8 @@ mod keyboard_table_tests {
         let matches = groups.into_iter().filter_map(|group| group.view("Keyboard", "Ctrl+Tab")).count();
         assert_eq!(matches, 3, "the pane action, chat action and fixed navigation row all match");
         assert_eq!(keyboard_groups(&draft, &invalid).into_iter().filter_map(|group| group.view("Keyboard", "Ctrl+=")).count(), 1);
+        draft.keyboard_shortcuts.rename_pane = "Control + F8".into();
+        draft.keyboard_shortcuts.chat_model = "F8 + Control".into();
+        assert_eq!(keyboard_groups(&draft, &invalid).into_iter().filter_map(|group| group.view("Keyboard", "Ctrl+F8")).count(), 2, "pressed keys find accepted aliases and modifier order");
     }
 }

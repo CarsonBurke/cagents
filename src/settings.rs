@@ -722,6 +722,28 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
     })
 }
 
+/// Canonical keys for searching bindings accepted with aliases, whitespace or
+/// reordered modifiers. Display text remains exactly as the user entered it.
+pub fn shortcut_search_keywords(value: &str) -> String {
+    parse_chords(value).iter().filter_map(|chord| parse_shortcut(chord).ok()).map(|binding| {
+        let mut parts = Vec::new();
+        if binding.control { parts.push("Ctrl".to_owned()); }
+        if binding.alt { parts.push("Alt".to_owned()); }
+        if binding.logo { parts.push("Super".to_owned()); }
+        if binding.shift { parts.push("Shift".to_owned()); }
+        parts.push(match binding.key {
+            ShortcutKey::Character(',') => "Comma".into(),
+            ShortcutKey::Character('+') => "Plus".into(),
+            ShortcutKey::Character(character) => character.to_ascii_uppercase().to_string(),
+            ShortcutKey::ArrowLeft => "Left".into(), ShortcutKey::ArrowRight => "Right".into(),
+            ShortcutKey::ArrowUp => "Up".into(), ShortcutKey::ArrowDown => "Down".into(),
+            ShortcutKey::Tab => "Tab".into(), ShortcutKey::PageUp => "PageUp".into(), ShortcutKey::PageDown => "PageDown".into(),
+            ShortcutKey::Function(number) => format!("F{number}"),
+        });
+        parts.join("+")
+    }).collect::<Vec<_>>().join(" ")
+}
+
 const fn default_terminal_scrollback_lines() -> usize {
     10_000
 }
