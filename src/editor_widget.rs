@@ -1200,58 +1200,38 @@ where
             // sides of the caret. Keep only nesting positions, never source text.
             let mut stack = Vec::new();
             let mut block = brackets::State::default();
-            let mut budget = 8 * 1024 * 1024usize;
+            // Matching is optional decoration in draw. Bound total lexer work,
+            // including prefix/lookahead scans, and stop at the first answer.
+            // A distant or unusually complex pair may remain unhighlighted.
+            let mut budget = 256 * 1024usize;
             let mut reached = false;
             for (line_index, line) in lines.iter().enumerate() {
-                if line.text().len() > budget {
-                    return None;
-                }
-                budget -= line.text().len();
-                let (tokens, end_block) = brackets::on_line(line.text(), block);
-                block = end_block;
-                for (column, token) in tokens {
-                    let position = Position {
-                        line: line_index,
-                        column,
-                    };
-                    if position == first {
-                        reached = true;
-                    }
-                    if forward && !reached {
-                        continue;
-                    }
+                budget = budget.checked_sub(1)?;
+                let result = brackets::scan_line(line.text(), block, &mut budget, |column, token| {
+                    use std::ops::ControlFlow;
+                    let position = Position { line: line_index, column };
+                    if position == first { reached = true; }
+                    if forward && !reached { return ControlFlow::Continue(()); }
                     if matches!(token, '(' | '[' | '{') {
-                        if stack.len() >= 4096 {
-                            return None;
-                        }
+                        if stack.len() >= 4096 { return ControlFlow::Break(None); }
                         stack.push((token, position));
                     } else {
-                        let expected = match token {
-                            ')' => '(',
-                            ']' => '[',
-                            '}' => '{',
-                            _ => continue,
-                        };
+                        let expected = match token { ')' => '(', ']' => '[', '}' => '{', _ => unreachable!() };
                         let Some((opening, opening_position)) = stack.pop() else {
-                            if position == first {
-                                return None;
-                            }
-                            continue;
+                            return if position == first { ControlFlow::Break(None) } else { ControlFlow::Continue(()) };
                         };
                         if opening != expected {
                             stack.clear();
-                            if reached {
-                                return None;
-                            }
-                            continue;
+                            return if reached { ControlFlow::Break(None) } else { ControlFlow::Continue(()) };
                         }
-                        if !forward && position == first {
-                            return Some((opening_position, first));
-                        }
-                        if forward && reached && stack.is_empty() {
-                            return Some((first, position));
-                        }
+                        if !forward && position == first { return ControlFlow::Break(Some((opening_position, first))); }
+                        if forward && reached && stack.is_empty() { return ControlFlow::Break(Some((first, position))); }
                     }
+                    ControlFlow::Continue(())
+                }).ok()?;
+                match result {
+                    std::ops::ControlFlow::Break(pair) => return pair,
+                    std::ops::ControlFlow::Continue(state) => block = state,
                 }
                 if line_index == first.line && !reached {
                     return None;
@@ -5720,6 +5700,14 @@ mod tests {
         assert_eq!(content.text(), "one\r\ntwo\n");
         assert!(content.replace(at, "e\r\ntw", "E", &[]));
         assert_eq!(content.text(), "onEo\n");
+    }
+
+    #[test]
+    fn bracket_matching_streams_large_lines_and_caps_distant_draw_work() {
+        let mut content: Content = Content::with_text(&"()".repeat(4 * 1024 * 1024));
+        assert_eq!(content.matching_brackets(), Some((Position { line: 0, column: 0 }, Position { line: 0, column: 1 })));
+        content.set_cursor(Cursor { position: Position { line: 0, column: 8 * 1024 * 1024 - 1 }, selection: None });
+        assert_eq!(content.matching_brackets(), None, "optional drawing must stop at its shared work bound");
     }
 
     #[test]

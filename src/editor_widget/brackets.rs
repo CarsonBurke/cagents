@@ -1,16 +1,26 @@
 //! Lightweight lexical filtering for the bracket matcher. Only bracket
-//! tokens are retained; source text is never copied.
-fn lifetime(text: &str, index: usize) -> bool {
+//! tokens are visited as they are read; source text is never copied.
+use std::ops::ControlFlow;
+
+fn charge(budget: &mut usize, work: usize) -> Result<(), ()> {
+    *budget = budget.checked_sub(work).ok_or(())?;
+    Ok(())
+}
+
+fn lifetime(text: &str, index: usize, budget: &mut usize) -> Result<bool, ()> {
+    charge(budget, index)?;
     let previous = text[..index].trim_end().as_bytes().last();
     if !previous.is_some_and(|byte| matches!(byte, b'<' | b'&' | b':' | b',' | b'+')) {
-        return false;
+        return Ok(false);
     }
     let tail = &text.as_bytes()[index + 1..];
-    let length = tail
-        .iter()
-        .take_while(|byte| byte.is_ascii_alphanumeric() || **byte == b'_')
-        .count();
-    length > 0 && tail.get(length) != Some(&b'\'')
+    let mut length = 0;
+    for byte in tail {
+        charge(budget, 1)?;
+        if !byte.is_ascii_alphanumeric() && *byte != b'_' { break; }
+        length += 1;
+    }
+    Ok(length > 0 && tail.get(length) != Some(&b'\''))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -20,11 +30,18 @@ pub(super) struct State {
     raw_hashes: Option<usize>,
 }
 
-pub(super) fn on_line(text: &str, mut state: State) -> (Vec<(usize, char)>, State) {
+/// The visitor may stop before the rest of a long line is scanned. Every scan
+/// and lookahead spends the same caller-owned work budget.
+pub(super) fn scan_line<B>(
+    text: &str,
+    mut state: State,
+    budget: &mut usize,
+    mut visit: impl FnMut(usize, char) -> ControlFlow<B>,
+) -> Result<ControlFlow<B, State>, ()> {
     let bytes = text.as_bytes();
-    let mut tokens = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
+        charge(budget, 1)?;
         if state.comment_depth > 0 {
             if bytes.get(index..index + 2) == Some(b"/*") {
                 state.comment_depth += 1;
@@ -38,6 +55,7 @@ pub(super) fn on_line(text: &str, mut state: State) -> (Vec<(usize, char)>, Stat
             continue;
         }
         if let Some(hashes) = state.raw_hashes {
+            charge(budget, hashes)?;
             if bytes[index] == b'"'
                 && bytes
                     .get(index + 1..index + 1 + hashes)
@@ -63,7 +81,10 @@ pub(super) fn on_line(text: &str, mut state: State) -> (Vec<(usize, char)>, Stat
         }
         match bytes[index] {
             b'/' if bytes.get(index + 1) == Some(&b'/') => break,
-            b'#' if text[..index].trim().is_empty()
+            b'#' if {
+                charge(budget, index)?;
+                text[..index].trim().is_empty()
+            }
                 && !bytes
                     .get(index + 1)
                     .is_some_and(|next| matches!(next, b'[' | b'!')) =>
@@ -74,41 +95,67 @@ pub(super) fn on_line(text: &str, mut state: State) -> (Vec<(usize, char)>, Stat
                 state.comment_depth = 1;
                 index += 2;
             }
-            b'r' if {
-                let hashes = bytes[index + 1..]
-                    .iter()
-                    .take_while(|byte| **byte == b'#')
-                    .count();
-                bytes.get(index + 1 + hashes) == Some(&b'"')
-            } =>
-            {
-                let hashes = bytes[index + 1..]
-                    .iter()
-                    .take_while(|byte| **byte == b'#')
-                    .count();
-                state.raw_hashes = Some(hashes);
-                index += hashes + 2;
+            b'r' => {
+                let mut hashes = 0;
+                while bytes.get(index + 1 + hashes) == Some(&b'#') {
+                    charge(budget, 1)?;
+                    hashes += 1;
+                }
+                if bytes.get(index + 1 + hashes) == Some(&b'"') {
+                    state.raw_hashes = Some(hashes);
+                    index += hashes + 2;
+                } else {
+                    index += 1;
+                }
             }
             quote @ (b'"' | b'\'')
                 if quote == b'"'
-                    || (!lifetime(text, index) && bytes[index + 1..].contains(&quote)) =>
+                    || (!lifetime(text, index, budget)? && {
+                        charge(budget, bytes.len() - index - 1)?;
+                        bytes[index + 1..].contains(&quote)
+                    }) =>
             {
                 state.quote = Some(quote);
                 index += 1;
             }
             bracket @ (b'(' | b')' | b'[' | b']' | b'{' | b'}') => {
-                tokens.push((index, bracket as char));
+                if let ControlFlow::Break(result) = visit(index, bracket as char) {
+                    return Ok(ControlFlow::Break(result));
+                }
                 index += 1;
             }
             _ => index += 1,
         }
     }
-    (tokens, state)
+    Ok(ControlFlow::Continue(state))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn on_line(text: &str, state: State) -> (Vec<(usize, char)>, State) {
+        let mut tokens = Vec::new();
+        let result = scan_line(text, state, &mut usize::MAX, |at, bracket| {
+            tokens.push((at, bracket));
+            ControlFlow::<()>::Continue(())
+        }).unwrap();
+        let ControlFlow::Continue(state) = result else { unreachable!() };
+        (tokens, state)
+    }
+
+    #[test]
+    fn streaming_stops_at_the_first_pair_and_bounds_prefix_and_lookahead_work() {
+        let text = "()".repeat(4 * 1024 * 1024);
+        let mut budget = 8;
+        let result = scan_line(&text, State::default(), &mut budget, |at, _| {
+            if at == 1 { ControlFlow::Break(at) } else { ControlFlow::Continue(()) }
+        });
+        assert_eq!(result, Ok(ControlFlow::Break(1)));
+        assert_eq!(budget, 6, "the rest of the 8MiB line must not be scanned");
+        for text in ["x".repeat(1024), format!("r{}\"()\"", "#".repeat(1024)), format!("'{}", "x".repeat(1024))] {
+            assert!(scan_line(&text, State::default(), &mut 16, |_, _| ControlFlow::<()>::Continue(())).is_err());
+        }
+    }
     #[test]
     fn comments_quotes_and_rust_lifetimes_do_not_hide_real_code_brackets() {
         assert_eq!(
