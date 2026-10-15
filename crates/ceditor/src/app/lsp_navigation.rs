@@ -275,6 +275,10 @@ impl Editor {
         if self.active != Some(card) || self.selection_epoch != *epoch || !self.lsp_navigation.history.is_current_target(target) {
             self.lsp_navigation.history_restores.remove(&card); return;
         }
+        // Deduplication can reuse a tab that still displays its previous
+        // buffer while a canonical open waits for Save. That loaded buffer is
+        // not a refusal of the exact pending source admitted above.
+        if self.tab(card).is_some_and(|tab| tab.pending_file.as_ref().and_then(|pending| pending.canonical.as_ref()) == Some(&target.location.source)) { return; }
         let Some(loaded) = self.capture_editor_location(card) else { return; };
         if loaded.source != target.location.source { self.lsp_navigation.history_restores.remove(&card); return; }
         let (from, target, _) = self.lsp_navigation.history_restores.remove(&card).unwrap();
@@ -569,6 +573,34 @@ mod tests {
         assert!(app.tab(a).unwrap().runtime.is_dirty());
         let forward = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: restored, forward: true })); run_tasks(&mut app, forward);
         assert_eq!(app.active, Some(b));
+    }
+
+    #[test]
+    fn history_anchor_waits_for_the_exact_pending_owner_to_save_its_previous_buffer() {
+        let root = tempfile::tempdir().unwrap();
+        for (path, text) in [("a.rs", "first\na😀éX\n"), ("b.rs", "destination\n"), ("c.rs", "keep C\n")] { std::fs::write(root.path().join(path), text).unwrap(); }
+        let mut app = editor(); let a = open_file(&mut app, root.path(), "a.rs");
+        assert!(app.tab_mut(a).unwrap().runtime.move_cursor_to(LspPosition::new(1, 3)));
+        let origin = app.capture_editor_location(a).unwrap();
+        let b = open_file(&mut app, root.path(), "b.rs"); let destination = app.capture_editor_location(b).unwrap();
+        app.lsp_navigation.history.record_jump(origin.clone(), destination);
+        let replace = app.request_file(a, "c.rs".into()); run_tasks(&mut app, replace);
+        app.tab_mut(a).unwrap().runtime.set_auto_save(false);
+        let pending = app.request_file(a, "a.rs".into());
+        let edited = app.update(Message::Repository(RepositoryAction::EditorAction { card: a, action: widget::text_editor::Action::Edit(widget::text_editor::Edit::Insert('!')) })); run_tasks(&mut app, edited);
+        run_tasks(&mut app, pending);
+        assert_eq!(app.tab(a).unwrap().pending_file.as_ref().and_then(|pending| pending.canonical.as_ref()), Some(&origin.source));
+        let retained = app.tab(a).unwrap().runtime.editor_text().unwrap();
+        app.active = Some(b); let count = app.tabs.len();
+        let back = app.update(Message::Repository(RepositoryAction::NavigateLocation { card: b, forward: false })); run_tasks(&mut app, back);
+        assert_eq!(app.active, Some(a)); assert_eq!(app.tabs.len(), count);
+        assert_eq!(app.tab(a).unwrap().runtime.editor_text().as_deref(), Some(retained.as_str()));
+        assert!(app.lsp_navigation.history_restores.contains_key(&a));
+        let save = app.update(Message::Repository(RepositoryAction::Save { card: a, overwrite: false })); run_tasks(&mut app, save);
+        assert_eq!(std::fs::read_to_string(root.path().join("c.rs")).unwrap(), retained);
+        assert_eq!(app.capture_editor_location(a).unwrap().source, origin.source);
+        assert_eq!(app.capture_editor_location(a).unwrap().anchor, origin.anchor);
+        assert!(!app.lsp_navigation.history_restores.contains_key(&a));
     }
 
     #[test]
