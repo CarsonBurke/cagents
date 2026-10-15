@@ -3171,19 +3171,19 @@ mod tests {
             });
             // This separate stream's wake is only a frame-order barrier. Its
             // epoch is deliberately unrelated to Snapshot/Activity generation.
-            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 100 });
+            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 0 });
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             respond(&mut codec, &mut server, None, ServerMessage::Response {
                 response: ServerResponse::ChatSnapshot { chat_id, snapshot: Some(initial.clone()) },
             });
-            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 101 });
+            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 0 });
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             let mut caught_up = initial;
             caught_up.generation = 8;
             respond(&mut codec, &mut server, None, ServerMessage::Response {
                 response: ServerResponse::ChatSnapshot { chat_id, snapshot: Some(caught_up) },
             });
-            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 102 });
+            respond(&mut codec, &mut server, None, ServerMessage::ChatObserved { chat_id, epoch: 0 });
             advance_rx.recv_timeout(Duration::from_secs(5)).unwrap();
             // Actual EOF is not a new generation or an explicit revocation.
         });
@@ -3201,6 +3201,7 @@ mod tests {
         advance_tx.send(()).unwrap();
         assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Observed),
             "same-state generation must not need an Activity or Changed wake");
+        assert!(handle.take_observed());
         assert_eq!(handle.snapshot().generation, 7);
         assert_eq!(handle.inner.activity.lock().unwrap().generation, 8);
         let invoked = std::cell::Cell::new(false);
@@ -3213,9 +3214,11 @@ mod tests {
         assert!(!current(), "draining activity must retain its generation floor");
         advance_tx.send(()).unwrap();
         assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Observed));
+        assert!(handle.take_observed());
         assert!(!current(), "a delayed older body must not heal the floor");
         advance_tx.send(()).unwrap();
         assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Observed));
+        assert!(handle.take_observed());
         assert!(current(), "a caught-up body with the exact tuple is readable");
         advance_tx.send(()).unwrap();
         assert!(matches!(wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(), Wake::Disconnected(_)));
