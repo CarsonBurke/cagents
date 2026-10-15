@@ -310,6 +310,63 @@ mod tests {
         let (done,finished)=std::sync::mpsc::channel();retire(Done(done));finished.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(weak.upgrade().is_none());
     }
+    fn runtime_fixture(text:&str)->(Runtime,RawSourcePart) {
+        let part=part(text);let session=fresh_chat_session(Provider::Claude,TerminalId::new(),"/project".into(),&Account::system(Provider::Claude),false).unwrap();
+        let item=Arc::new(chat::Item {id:part.item_id.clone(),role:chat::Role::Assistant,at:None,started_at:None,
+            content:ItemContent::Tool {name:"Write".into(),input:"bounded display input".into(),output:String::new(),status:chat::ToolStatus::Succeeded}});
+        let snapshot=Snapshot {ready:true,session_id:Some("native-session".into()),items:vec![item],raw_source_parts:vec![part.clone()],..Default::default()};
+        let handle=Arc::new(ClientHandle::fixture(session.clone(),snapshot));
+        (Runtime::new(Target {card:CardId::new(),generation:1},session,Connection::Live(handle),true,crate::settings::EditorSyntaxTheme::default()),part)
+    }
+    async fn reply(part:RawSourcePart,text:&str)->Reply {
+        let proof=part.clone();let text=text.to_owned();let pending=read(part,move |query|std::future::ready(Ok(page(query,&proof,&text)))).await.unwrap();
+        assert_eq!(chat::source_owners::admit_raw(&pending.text,&record(&pending.part),None),chat::source_owners::Admission::Ready);
+        Reply(Arc::new(ReplySlot(Mutex::new(Some(Ok(pending))))))
+    }
+    fn flush() {
+        struct Done(std::sync::mpsc::Sender<()>);impl Drop for Done {fn drop(&mut self) {let _=self.0.send(());}}
+        let (done,finished)=std::sync::mpsc::channel();retire(Done(done));finished.recv_timeout(Duration::from_secs(5)).unwrap();
+    }
+    #[tokio::test]
+    async fn app_actions_and_same_tree_keep_original_loading_copy_and_collapse_coherent() {
+        use iced::advanced::{Layout,layout,widget::Tree};
+        let text="{ \"exact\": \"original λ\" }";let(mut runtime,part)=runtime_fixture(text);let target=runtime.target;
+        let mut app=crate::app::tests::context_inspector_test_app(false);let renderer=crate::app::tests::headless_renderer();
+        let mut element=detail(&runtime,&part.item_id);let mut tree=Tree::new(&element);
+        let labels=|element:&mut Element<'static,Message>,tree:&mut Tree| {
+            tree.diff(element.as_widget_mut());let node=element.as_widget_mut().layout(tree,&renderer,&layout::Limits::new(iced::Size::ZERO,iced::Size::new(600.0,600.0)));
+            let nodes=element.as_widget().a11y_nodes(Layout::new(&node),tree,iced::mouse::Cursor::Unavailable);
+            nodes.root().iter().chain(nodes.children()).filter_map(|node|node.node().label().map(str::to_owned)).collect::<Vec<_>>()
+        };
+        assert!(!labels(&mut element,&mut tree).iter().any(|label|label=="Copy complete original"));
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::RawOriginalToggle(target,part.item_id.clone(),part.field)));
+        let (context,attempt)={let runtime=app.chat_runtime_mut(target).unwrap();let state=&runtime.raw_original;(state.context,state.entries[&Key::of(&part)].attempt.unwrap())};
+        let ready=reply(part.clone(),text).await;let weak={let slot=ready.0.0.lock().unwrap();let pending=slot.as_ref().unwrap().as_ref().unwrap();Arc::downgrade(&pending.text)};
+        drop(app.handle_chat_ui(Action::RawOriginalReady(target,part.source.clone(),part.field,context,attempt,ready)));
+        let runtime=app.chat_runtime_mut(target).unwrap();assert_eq!(runtime.raw_original.entries[&Key::of(&part)].loaded.as_ref().unwrap().view.text.as_ref(),text);
+        let mut element=detail(runtime,&part.item_id);assert!(labels(&mut element,&mut tree).iter().any(|label|label=="Copy complete original"));
+        drop(app.handle_chat_ui(Action::RawOriginalToggle(target,part.item_id.clone(),part.field)));
+        let runtime=app.chat_runtime_mut(target).unwrap();let mut element=detail(runtime,&part.item_id);
+        assert!(!labels(&mut element,&mut tree).iter().any(|label|label=="Copy complete original"));flush();assert!(weak.upgrade().is_none());
+    }
+    #[tokio::test]
+    async fn app_rejects_old_call_and_copy_after_scope_replacement_and_descriptor_removal() {
+        let text="{ \"secret\": \"old accepted call\" }";let(mut runtime,part)=runtime_fixture(text);let target=runtime.target;
+        toggle(&mut runtime,&part.item_id,part.field,false);let context=runtime.raw_original.context;let attempt=runtime.raw_original.entries[&Key::of(&part)].attempt.unwrap();
+        let ready=reply(part.clone(),text).await;
+        let session=runtime.session.clone();let snapshot=(*runtime.snapshot).clone();runtime.connection=Connection::Live(Arc::new(ClientHandle::fixture(session,snapshot)));
+        let mut app=crate::app::tests::context_inspector_test_app(false);app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(Action::RawOriginalReady(target,part.source.clone(),part.field,context,attempt,ready)));
+        let runtime=app.chat_runtime_mut(target).unwrap();assert!(runtime.raw_original.context!=context);assert_eq!(runtime.raw_original.retained_bytes(),0);
+        let semaphore=Arc::new(tokio::sync::Semaphore::new(1));let permit=semaphore.clone().try_acquire_owned().unwrap();
+        let copy=CopyReply(Arc::new(CopySlot(Mutex::new(Some(Ok(CopyOutput {text:text.into(),_reader:permit,_capacity:Default::default()}))))));
+        drop(app.handle_chat_ui(Action::RawOriginalCopied(target,context,record(&part),copy)));
+        assert!(app.chat_runtime_mut(target).unwrap().copied.is_none());flush();assert_eq!(semaphore.available_permits(),1);
+        let runtime=app.chat_runtime_mut(target).unwrap();let prose=runtime.snapshot.source_revision;
+        Arc::make_mut(&mut runtime.snapshot).raw_source_parts.clear();sync(runtime);
+        assert_eq!(runtime.snapshot.source_revision,prose);assert!(runtime.raw_original.entries.is_empty(),"Raw removal is authoritative independently of prose revision");
+    }
     #[test]
     fn source_reader_and_retirement_payloads_require_safe_send() {
         fn send<T:Send>() {}send::<Pending>();send::<Loaded>();send::<Entry>();send::<Reply>();
