@@ -66,10 +66,10 @@ impl Holding {
             }
         };
         let checked = (|| {
+            if let Some(error) = publication.publication_error() { return Err(error.to_owned()); }
             set_exact_directory_mode(publication.directory(), 0o700).map_err(|error|error.to_string())?;
             let metadata = publication.directory().metadata().map_err(|error|error.to_string())?;
             if metadata.uid() != unsafe { libc::geteuid() } { return Err("Undo holding ownership changed".into()); }
-            if let Some(error) = publication.publication_error() { return Err(error.to_owned()); }
             publication.directory().try_clone().map_err(|error|error.to_string())
         })();
         let root = match checked {

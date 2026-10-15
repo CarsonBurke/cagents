@@ -728,15 +728,29 @@ struct OwnedRecoveryDirectory {
     mode: u32,
     slot: Option<crate::recovery_authority::RecoverySlot>,
     mode_installed: bool,
+    temporary_installed: bool,
     sync_file: Option<fs::File>,
 }
 impl OwnedRecoveryDirectory {
+    fn install_temporary(&mut self) -> Result<(), String> {
+        if self.temporary_installed { return Ok(()); }
+        // The producer alone restores its temporary staging permissions. Do
+        // not overwrite that live witness with a consumer chmod first.
+        self.publication.retry_publication_steps().map_err(|error|error.to_string())?;
+        let actual = self.publication.directory().metadata().map_err(|error|error.to_string())?;
+        let initial = self.publication.initial_metadata();
+        if (actual.mode(), actual.uid(), actual.gid()) != (initial.mode(), initial.uid(), initial.gid()) {
+            return Err("The newly published directory metadata changed before recovery setup; it was preserved".into());
+        }
+        set_exact_directory_mode(self.publication.directory(), 0o700 | (self.mode & 0o2000)).map_err(|error|error.to_string())?;
+        self.temporary_installed = true;
+        Ok(())
+    }
     fn finish(&mut self) -> Result<(), String> {
         // Cleanup only the producer's private staging, never the restored
         // nonempty public directory. Its original inode stays pinned here.
-        if self.publication.publication_error().is_some() {
-            self.publication.resolve_recovery().map_err(|error|error.to_string())?;
-        }
+        self.install_temporary()?;
+        self.publication.retry_publication_steps().map_err(|error|error.to_string())?;
         let metadata = self.publication.directory().metadata().map_err(|error|error.to_string())?;
         let initial = self.publication.initial_metadata();
         let expected = if self.mode_installed { self.mode } else { 0o700 | (self.mode & 0o2000) };
@@ -885,9 +899,8 @@ fn recovery_parent(
                 }
                 // Retain BEFORE fallible chmod/clone so even partial setup keeps
                 // the exact created inode for final mode restoration.
-                created.owned.insert(key.clone(), OwnedRecoveryDirectory { publication, mode, slot: Some(slot), mode_installed: false, sync_file: None });
-                let publication = &created.owned[&key].publication;
-                set_exact_directory_mode(publication.directory(), temporary_mode).map_err(|error| error.to_string())?;
+                created.owned.insert(key.clone(), OwnedRecoveryDirectory { publication, mode, slot: Some(slot), mode_installed: false, temporary_installed: false, sync_file: None });
+                created.owned.get_mut(&key).unwrap().install_temporary()?;
                 created.held_parent(root, &key)?.ok_or("the created parent authority is unavailable")?
             }
         };
