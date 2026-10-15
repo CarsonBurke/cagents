@@ -475,6 +475,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original\n");
         assert!(git(root, &["log", "-1", "--format=%s"]).starts_with("Revert"));
         let other = open_real_git(&mut app, &destination, None); let target = bound(&app, other);
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: target.key.clone(), tab: sidebar::ChangesTab::History });
         sidebar_action(&mut app, SidebarAction::SearchHistory { key: target.key.clone(), query: picked.clone() });
         let row = app.tab(other).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
         assert_eq!(row.oid.as_str(), picked);
@@ -483,6 +484,30 @@ mod tests {
         assert_eq!(std::fs::read_to_string(destination.join("tracked.txt")).unwrap(), "picked contents\n");
         assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "original\n");
         assert_eq!(git(&destination, &["log", "-1", "--format=%s"]), "Change to replay");
+    }
+
+    #[test]
+    fn standalone_history_cherry_pick_conflict_refreshes_conflict_controls_and_git_output() {
+        let directory = git_fixture(); let root = directory.path(); let side = tempfile::tempdir().unwrap();
+        git(root, &["branch", "conflict-target"]);
+        std::fs::write(root.join("tracked.txt"), "incoming change\n").unwrap();
+        git(root, &["add", "tracked.txt"]); git(root, &["commit", "-m", "Incoming change"]);
+        let picked = git(root, &["rev-parse", "HEAD"]);
+        let destination = side.path().join("worktree");
+        git(root, &["worktree", "add", destination.to_str().unwrap(), "conflict-target"]);
+        std::fs::write(destination.join("tracked.txt"), "local conflicting change\n").unwrap();
+        git(&destination, &["add", "tracked.txt"]); git(&destination, &["commit", "-m", "Local conflicting change"]);
+        let mut app = editor(); let card = open_real_git(&mut app, &destination, None); let origin = bound(&app, card);
+        sidebar_action(&mut app, SidebarAction::SetChangesTab { key: origin.key.clone(), tab: sidebar::ChangesTab::History });
+        sidebar_action(&mut app, SidebarAction::SearchHistory { key: origin.key.clone(), query: picked });
+        let row = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap().history[0].clone();
+        sidebar_action(&mut app, SidebarAction::HistoryCommand { key: origin.key, oid: row.oid, mainline: row.mainline, message: row.message, command: sidebar::HistoryCommand::CherryPick });
+        let source = app.tab(card).unwrap().sidebar.source_control.as_ref().unwrap();
+        assert_eq!(source.operation.as_ref().unwrap().kind, cagents::repository::GitOperationKind::CherryPick);
+        assert!(!source.group(cagents::repository::ChangeArea::Conflict).unwrap().is_empty());
+        assert!(app.notice.as_deref().is_some_and(|notice| notice.contains("Git output:") && notice.contains("CONFLICT")), "{:?}", app.notice);
+        assert!(app.tab(card).unwrap().mutation.is_none());
+        assert_eq!(std::fs::read_to_string(root.join("tracked.txt")).unwrap(), "incoming change\n");
     }
 
     #[test]
