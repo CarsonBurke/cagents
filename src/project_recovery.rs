@@ -22,10 +22,20 @@ impl ProjectInstance {
     }
 }
 
+/// Backend process incarnation is distinct from the durable logical actor.
+/// Keep this shared DTO independent from host-only holder implementation types.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderIncarnation { pub pid: i32, pub start: u64 }
+impl ProviderIncarnation {
+    #[cfg(feature = "host")]
+    pub(crate) fn from_process(process: crate::daemon::holder_registry::Process) -> Self { Self { pid: process.pid, start: process.start } }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionClose {
     pub source: crate::agent_execution::HostedSession,
     pub execution_instance: Option<uuid::Uuid>,
+    pub provider: Option<ProviderIncarnation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

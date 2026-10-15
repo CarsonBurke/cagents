@@ -2,7 +2,7 @@
 //! bound teardown shares control admission with unrelated input and reads;
 //! short exclusive admission installs the reservation and commits the edit.
 use super::state::{ClientId, SharedHost};
-use crate::{agent_execution::HostedSession, project_recovery::{ProjectInstance, SessionClose}, terminal_ipc::{ClientRequest, ProtocolError, ProtocolErrorCode, ServerMessage, ServerResponse}, workspace_model::{ModelEdit, views::Scope}};
+use crate::{agent_execution::HostedSession, project_recovery::{ProjectInstance, ProviderIncarnation, SessionClose}, terminal_ipc::{ClientRequest, ProtocolError, ProtocolErrorCode, ServerMessage, ServerResponse}, workspace_model::{ModelEdit, views::Scope}};
 use std::{collections::HashSet, time::{Duration, Instant}};
 
 mod reservation;
@@ -16,15 +16,24 @@ enum Owner { Chat(crate::chat::runtime::Handle), Terminal(crate::terminal::Termi
 pub(super) fn inventory(host: &SharedHost, client: ClientId, project: &ProjectInstance) -> Result<Vec<SessionClose>, ProtocolError> {
     let registry = super::agent_execution::registry(host).map_err(error)?;
     registry.lock().unwrap_or_else(|p| p.into_inner()).require_project_instance(project).map_err(error)?;
-    let state = host.lock().unwrap_or_else(|p| p.into_inner());
-    if !state.chat_spawning.is_empty() { return Err(error("A native session is still starting; wait for it before removing the project")); }
-    let mut sessions = state.chats.values().filter(|record| record.handle.owns_work() || record.returning_terminal).map(|record| {
-        let mut session = record.session.clone();
-        session.launch.session_id = record.handle.session_id();
-        session.native_continuity = record.handle.native_continuity();
-        SessionClose { source: HostedSession::Chat(session), execution_instance: Some(record.execution_instance) }
-    }).collect::<Vec<_>>();
-    sessions.extend(state.list(client).into_iter().map(|terminal| SessionClose { source: HostedSession::Terminal(terminal.session), execution_instance: Some(terminal.execution_instance) }));
+    let (chats, mut sessions) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if !state.chat_spawning.is_empty() { return Err(error("A native session is still starting; wait for it before removing the project")); }
+        let chats = state.chats.values().filter(|record| record.handle.owns_work() || record.returning_terminal).map(|record| {
+            let mut session = record.session.clone();
+            session.launch.session_id = record.handle.session_id();
+            session.native_continuity = record.handle.native_continuity();
+            (session,record.execution_instance,record.handle.clone())
+        }).collect::<Vec<_>>();
+        let sessions = state.list(client).into_iter().map(|terminal| SessionClose { source: HostedSession::Terminal(terminal.session), execution_instance: Some(terminal.execution_instance), provider: None }).collect::<Vec<_>>();
+        (chats,sessions)
+    };
+    for (session,instance,actor) in chats {
+        // Authenticated retained state refresh may perform IPC. Never do it
+        // under HostState; final teardown refreshes/rechecks under its lifecycle gate.
+        actor.refresh_retained_state().map_err(error)?;
+        sessions.push(SessionClose { source: HostedSession::Chat(session), execution_instance: Some(instance), provider: actor.provider_process().map(ProviderIncarnation::from_process) });
+    }
     if sessions.len() > MAX_SESSIONS { return Err(error("Too many hosted sessions to inventory safely; close some panes and retry")); }
     Ok(sessions)
 }
@@ -68,6 +77,14 @@ pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstan
             }
         }).collect::<Result<Vec<_>,ProtocolError>>()?
     };
+    for (selected, (owner, _)) in sessions.iter().zip(&owners) {
+        if let Owner::Chat(actor) = owner {
+            actor.refresh_retained_state().map_err(error)?;
+            if selected.provider.is_none() || actor.provider_process().map(ProviderIncarnation::from_process) != selected.provider {
+                return Err(error("A selected provider process changed or cannot be proved; no project sessions were closed. Refresh Projects and retry."));
+            }
+        }
+    }
     for (selected, (_, current)) in sessions.iter().zip(&owners) {
         if matches!(selected.source, HostedSession::Chat(_)) && !registry.lock().unwrap_or_else(|p| p.into_inner()).authenticated_session_alias(&selected.source, current).map_err(error)? {
             return Err(error("A selected native thread or source changed; no project sessions were closed"));
@@ -87,7 +104,7 @@ pub(super) fn remove(host: &SharedHost, client: ClientId, project: ProjectInstan
                 let unchanged = state.chats.get(&id).is_some_and(|record| record.handle.same_actor(&owner));
                 if !unchanged { if owner.is_completed() && !state.chats.contains_key(&id) { continue; } return Err(error("A selected native actor changed; its replacement was preserved")); }
                 drop(state);
-                super::chat::close_project_session(host, client, &source, selected.execution_instance.ok_or_else(|| error("Missing native actor identity"))?, &owner, deadline.min(Instant::now() + Duration::from_secs(10)))?;
+                super::chat::close_project_session(host, client, &source, selected.execution_instance.ok_or_else(|| error("Missing native actor identity"))?, &owner, selected.provider.as_ref().ok_or_else(|| error("Missing provider process identity"))?, deadline.min(Instant::now() + Duration::from_secs(10)))?;
             },
             (HostedSession::Terminal(source), Owner::Terminal(owner)) => {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -134,7 +151,7 @@ mod tests {
             let handle = TerminalHandle::spawn(session.clone(), Default::default(), |_| {}).unwrap();
             let descriptor = { let mut state = self.host.lock().unwrap(); state.reserve_spawn(id).unwrap(); state.finish_spawn(1, session, handle.clone(), true).unwrap() };
             self.handles.push(handle);
-            SessionClose { source: HostedSession::Terminal(descriptor.session), execution_instance: Some(descriptor.execution_instance) }
+            SessionClose { source: HostedSession::Terminal(descriptor.session), execution_instance: Some(descriptor.execution_instance), provider: None }
         }
         fn request(&self, expected: ProjectInstance, sessions: Vec<SessionClose>) -> Result<(ServerResponse, Vec<ServerMessage>, bool),ProtocolError> {
             super::super::client::process_request(&self.host, 1, ClientRequest::CloseProjectGuarded { project: expected, sessions })
@@ -168,9 +185,10 @@ mod tests {
         };
         let actor = handle.clone(); let command = thread::spawn(move || actor.command(Command::Interrupt));
         pending.recv_timeout(Duration::from_secs(2)).unwrap();
+        let provider = handle.provider_process().map(ProviderIncarnation::from_process);
         let host = fixture.host.clone(); let expected = fixture.expected.clone();
         let (closed, closing) = crossbeam_channel::bounded(1);
-        let close = thread::spawn(move || { let result = super::super::client::process_request(&host,1,ClientRequest::CloseProjectGuarded { project: expected, sessions: vec![SessionClose { source: HostedSession::Chat(session), execution_instance: Some(instance) }] }); closed.send(result).unwrap(); });
+        let close = thread::spawn(move || { let result = super::super::client::process_request(&host,1,ClientRequest::CloseProjectGuarded { project: expected, sessions: vec![SessionClose { source: HostedSession::Chat(session), execution_instance: Some(instance), provider }] }); closed.send(result).unwrap(); });
         let deadline = Instant::now() + Duration::from_secs(2);
         while fixture.host.lock().unwrap().project_removals.lock().unwrap().is_empty() { assert!(Instant::now() < deadline,"scoped removal was not admitted"); thread::yield_now(); }
         assert!(closing.recv_timeout(Duration::from_millis(50)).is_err(),"provider remains blocked until explicitly released");
@@ -248,7 +266,13 @@ mod tests {
             let source = chat::Session { id, launch: chat::Launch { provider:Provider::Claude,recipe,session_id:None },proof:Some(state.proof().clone()),terminal:None,native_continuity:Default::default(),owned_codex_listener:None };
             state.chats.insert(id,super::super::chat::Record { execution_instance:instance, console_recipe:None, paired_terminal:None,session:source.clone(),handle:actor.clone(),source_process:None,subscribers:BTreeMap::new(),observations:BTreeMap::new(),completion_observed:true,returning_terminal:false }); source
         };
-        super::super::chat::close_project_session(&fixture.host,1,&source,instance,&actor,Instant::now()+Duration::from_secs(2)).unwrap();
+        let provider = ProviderIncarnation::from_process(actor.provider_process().expect("the completed actor retains its last provider incarnation"));
+        let missing = SessionClose { source: HostedSession::Chat(source.clone()), execution_instance: Some(instance), provider: None };
+        assert!(fixture.request(fixture.expected.clone(),vec![missing]).unwrap_err().message.contains("cannot be proved"),"None must never equal absent provider authority");
+        let mut stale = provider.clone(); stale.start = stale.start.wrapping_add(1);
+        assert!(super::super::chat::close_project_session(&fixture.host,1,&source,instance,&actor,&stale,Instant::now()+Duration::from_secs(2)).is_err());
+        assert!(fixture.host.lock().unwrap().chats.contains_key(&id),"a stale backend incarnation must preserve even a completed successor actor");
+        super::super::chat::close_project_session(&fixture.host,1,&source,instance,&actor,&provider,Instant::now()+Duration::from_secs(2)).unwrap();
         assert_eq!(std::fs::read_to_string(&counter).unwrap(),"started\n");
         assert!(!fixture.host.lock().unwrap().chats.contains_key(&id));
     }

@@ -130,11 +130,18 @@ impl Drop for OwnedSocket {
 }
 
 impl Handle {
+    /// Retain the latest actual provider identity after exit as well as while
+    /// live, so completed→restart→completed cannot match an older roster.
+    pub(crate) fn provider_process(&self) -> Option<crate::daemon::holder_registry::Process> { self.0.provider_process.lock().unwrap_or_else(|p| p.into_inner()).clone() }
+    /// Local actors publish their metadata directly. Retained-actor builds
+    /// replace this with the authenticated remote refresh before close fences.
+    pub(crate) fn refresh_retained_state(&self) -> Result<(), String> { Ok(()) }
     pub(crate) fn same_actor(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
 struct Inner {
+    provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -313,7 +320,9 @@ impl Handle {
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
         let pinned_directory = Arc::new(Mutex::new(spec.execution.as_ref().and_then(|context| context.directory_descriptor())));
+        let provider_process = Arc::new(Mutex::new(None));
         let inner = Arc::new(Inner {
+            provider_process: provider_process.clone(),
             pinned_directory: pinned_directory.clone(),
             commands,
             wake: Mutex::new(wake),
@@ -350,6 +359,7 @@ impl Handle {
             .spawn(move || {
                 let _owned_socket = owned_socket;
                 let mut actor = Actor {
+                    provider_process,
                     pinned_directory,
                     launch_context: spec.execution.clone(),
                     working_directory: spec.working_directory.clone(),
@@ -406,6 +416,9 @@ impl Handle {
                         } else {
                             spawn_provider(&spec, &actor.stop)
                         };
+                        if let Ok(Some(child)) = &child {
+                            *actor.provider_process.lock().unwrap_or_else(|p| p.into_inner()) = crate::daemon::holder_registry::Process::read(child.child.id() as i32).ok();
+                        }
                         let _ = started.send(child.as_ref().map(|_| ()).map_err(Clone::clone));
                         actor.child = child?;
                         match spec.transport {
@@ -1588,6 +1601,7 @@ fn nonblocking(fd: &impl AsRawFd) -> Result<(), String> {
     Ok(())
 }
 struct Actor {
+    provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     pinned_directory: Arc<Mutex<Option<Arc<std::fs::File>>>>,
     launch_context: Option<Arc<super::protocol::ExecutionContext>>,
     working_directory: std::path::PathBuf,
