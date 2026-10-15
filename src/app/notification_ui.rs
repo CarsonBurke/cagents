@@ -605,11 +605,18 @@ impl Cagents {
             .is_some_and(|channel| self.sidebar_model.project(channel.project_id).is_none())
         { return Task::none(); }
         let focus = self.focus_attention_card(id);
-        if self.workspace.focused() == Some(id) {
+        let parent = if self.workspace.focused() == Some(id) {
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
-        }
-        Task::batch([adopted, focus])
+            match self.cards.get(&id) {
+                Some(CardRuntime::Chat(runtime)) => Some(runtime.target),
+                _ => None,
+            }
+        } else { None };
+        // A Session notice names the parent's transcript. Retaining a selected
+        // child would focus the correct pane while hiding the actual response.
+        let transcript = parent.map_or_else(Task::none, |target| self.handle_chat_ui(chat_ui::Action::SelectSubagent(target, None)));
+        Task::batch([adopted, focus, transcript])
     }
 
     /// The model comes from the authenticated daemon watch. A session ID alone
