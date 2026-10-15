@@ -64,6 +64,11 @@ pub(super) struct Source {
 }
 
 impl Source {
+    pub(super) fn retained_capacity(&self) -> usize {
+        self.tail.capacity() + self.blocks.items.capacity() * std::mem::size_of::<usize>()
+    }
+
+
     /// Takes `body`, the answer so far, of which everything up to the bytes
     /// seen last time is unchanged. `open` is whether more may follow.
     pub(super) fn advance(&mut self, body: &str, open: bool) -> Step {
