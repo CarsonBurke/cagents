@@ -296,6 +296,7 @@ impl Cagents {
         project.unreachable = None;
         project.reloading = false;
         self.refresh_ui.finished(project_id, true);
+        self.reconcile_agent_attention_owners();
         self.refresh_sidebar_channels();
         self.reconcile_shared_views()
     }

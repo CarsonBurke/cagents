@@ -7259,6 +7259,29 @@ impl Cagents {
             .worktree_at(self.unchanneled_card_worktree(state)?)
     }
 
+    /// Reconcile only when repository roots change, not on runtime/frame wakes.
+    /// Existing scalar activity and restored unread must acquire late roots too.
+    fn reconcile_agent_attention_owners(&mut self) -> bool {
+        let roots: HashMap<_, _> = self.sidebar_model.projects.iter().flat_map(|project|
+            project.worktrees.iter().map(move |worktree| (worktree.path.as_path(), (project.id, worktree.id)))
+        ).collect();
+        let resolve = |directory: &Path| directory.ancestors().find_map(|ancestor| roots.get(ancestor).copied());
+        let owners: Vec<_> = self.durable.cards.iter()
+            .filter(|card| card.existence.is_open() && (self.sidebar_state.card_activity(card.id).is_some() || self.sidebar_state.has_card_update(card.id)))
+            .map(|card| {
+                let owner = if let Some(scope) = self.durable.card_scopes.get(&card.id) {
+                    resolve(scope)
+                } else {
+                    card_directory(card).and_then(resolve).or_else(|| self.worktree_owners.get(&card.id).and_then(|scope| resolve(scope)))
+                };
+                (card.id, owner)
+            }).collect();
+        let mut changed = false;
+        for (card, owner) in owners { changed |= self.sidebar_state.reattribute_card(card, owner); }
+        if changed { self.persist(); }
+        changed
+    }
+
     /// Whether `project` holds the scope the workspace shows: the active
     /// channel's project, or the one with a worktree at or above `active`,
     /// which is either a worktree root or a directory no known root owned.
@@ -13334,6 +13357,7 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        let reconcile_attention_roots = matches!(&message, Message::RepositoryLoaded { result: Ok(_), .. });
         self.reconcile_terminal_review_owner();
         if let Some(notice) = crate::diagnostics::take_notice() {
             self.notices.record(TransientNotice::warning(notice));
@@ -13772,6 +13796,7 @@ impl Application for Cagents {
                             };
                             // This return skips the derived-row tail below, and
                             // the new row may already hold the pane just opened.
+                            self.reconcile_agent_attention_owners();
                             self.refresh_sidebar_channels();
                             self.refresh_sidebar_worktree_panes();
                             if open_cards {
@@ -16672,6 +16697,7 @@ impl Application for Cagents {
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
+        if reconcile_attention_roots { self.reconcile_agent_attention_owners(); }
         let activation = self.retry_notification_activation();
         let task = Task::batch([task, self.flush_settings_on_blur(), activation]);
         self.sync_notification_presence();
@@ -25625,6 +25651,54 @@ mod tests {
         assert_eq!(app.durable.active_channel, Some(channels[0]));
         assert_eq!(app.workspace.focused(), Some(first));
         assert!(!app.sidebar_state.has_card_update(first));
+    }
+
+    #[test]
+    fn channel_attention_rolls_into_launch_worktree_and_bulk_reads_keep_other_worktrees_unread() {
+        use crate::agent::{Activity, ActivityState};
+        use crate::model::{ChannelId, ProjectChannel};
+        let mut app = context_inspector_test_app(false);
+        app.context_inspector_open = false;
+        let project = ProjectId::new();
+        let primary = WorktreeId::new();
+        let linked = WorktreeId::new();
+        let roots = [(primary, "/repo", "main"), (linked, "/repo/.worktrees/login", "feature/login")];
+        let mut cards = Vec::new();
+        for directory in ["/repo/.worktrees/login/src", "/repo/.worktrees/login/tests", "/repo/src"] {
+            let mut card = terminal_card_state();
+            let CardKind::Terminal(session) = &mut card.kind else { unreachable!() };
+            session.launch.working_directory = directory.into();
+            app.cards.insert(card.id, CardRuntime::Loading);
+            cards.push(card);
+        }
+        let ids: Vec<_> = cards.iter().map(|card| card.id).collect();
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend(cards);
+        durable.channels.push(ProjectChannel { title_source: Default::default(), id: channel, project_id: project, title: "Login".into(), ordinal: 0, shared: false, cards: ids[..2].to_vec(), focused: Some(ids[0]) });
+        app.observe_agent_activity_for_card(ids[0], Some(Activity { provider: Provider::Omp, state: ActivityState::Working }));
+        app.observe_agent_activity_for_card(ids[1], Some(Activity { provider: Provider::Omp, state: ActivityState::Waiting }));
+        assert!(app.agent_worktree(ids[0]).is_none());
+        app.sidebar_model.projects.push(SidebarProject::new(
+            project, RepositoryId::new(), "Repository".into(), "/repo".into(),
+            roots.into_iter().map(|(id, path, branch)| SidebarWorktree::new(id, path.into(), Some(branch.into()), false, false, None, None, None)).collect(), Vec::new(),
+        ));
+        app.known_worktree_roots = roots.into_iter().map(|(_, path, _)| PathBuf::from(path)).collect();
+        assert!(app.reconcile_agent_attention_owners());
+        app.refresh_sidebar_channels();
+        assert_eq!(app.sidebar_state.agent_activity(project, linked), Some(ActivityState::Waiting));
+        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
+        let row = &app.sidebar_model.projects[0].channels[0];
+        assert_eq!(row.worktree, Some((linked, "feature/login".into())));
+        assert!(row.tooltip.contains("feature/login"));
+        for id in &ids { app.observe_agent_update_for_card(*id); }
+        drop(app.update(Message::Sidebar(SidebarAction::MarkWorktreeRead(project, linked))));
+        assert!(!app.sidebar_state.has_card_update(ids[0]));
+        assert!(!app.sidebar_state.has_card_update(ids[1]));
+        assert!(app.sidebar_state.has_card_update(ids[2]));
+        drop(app.update(Message::Sidebar(SidebarAction::MarkAllRead)));
+        assert!(!app.sidebar_state.has_card_update(ids[2]));
+        assert_eq!(app.sidebar_state.worktree_attention(project, linked), Some(sidebar::AttentionState::Waiting));
     }
 
     #[test]

@@ -3282,6 +3282,21 @@ impl SidebarState {
         self.agent_outcomes.remove(&card);
     }
 
+    /// Roots may be learned after an actor's first scalar activity report.
+    /// Reattribute the cached state without inventing a new unread edge.
+    pub fn reattribute_card(&mut self, card: CardId, owner: Option<(ProjectId, WorktreeId)>) -> bool {
+        let mut changed = false;
+        if let Some(entry) = self.agent_activity.get_mut(&card) {
+            changed |= entry.owner != owner;
+            entry.owner = owner;
+        }
+        if let Some(previous) = self.agent_updates.get_mut(&card) {
+            changed |= *previous != owner;
+            *previous = owner;
+        }
+        changed
+    }
+
     pub fn set_card_activity(&mut self, card: CardId, activity: crate::agent::Activity) {
         self.agent_activity.insert(
             card,
