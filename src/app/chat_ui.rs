@@ -6371,7 +6371,6 @@ impl Cagents {
                 let Some(result) = result else {
                     return Task::none();
                 };
-                self.fence_account_history_ready(target,&result);
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
                     // The card was closed while this start was in flight.
                     // Whatever the start produced is given up now; a failed
@@ -6547,6 +6546,25 @@ impl Cagents {
                                     Message::ChatUi(Action::AccountCommitted(target, ready, result))
                                 });
                             }
+                        }
+                        // All normal descriptor/rebind checks have completed.
+                        // Unknown live account provenance may keep running, but
+                        // cannot install a late local body after deletion intent.
+                        if !self.fence_account_history_ready(target,&handle) {
+                            let mut session=handle.session();
+                            session.proof=handle.proof();
+                            self.commit_chat_session(target.card,session);
+                            let message="The conversation stayed running, but its account could not be verified after an account deletion request. Reconnect it before retrying deletion.".to_owned();
+                            if let Some(CardRuntime::Chat(runtime))=self.cards.get_mut(&target.card) {
+                                runtime.unqueue();
+                                runtime.error=Some(message.clone());
+                                runtime.disconnected=true;
+                                runtime.pending=None;
+                            } else { self.fail_runtime(target.card,message.clone()); }
+                            self.status=Some(TransientNotice::warning(message));
+                            // Dropping this UI attachment only detaches. Never
+                            // retire/stop the provider or replay its first prompt.
+                            return Task::none();
                         }
                         self.chat_ui.fresh_offers.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
@@ -17575,4 +17593,103 @@ mod tests {
             assert_eq!(chat_runtime(&app, card).failures, recorded);
         }
     }
+
+    fn account_privacy_handle(app: &Cagents, card: CardId, home: Option<account::HomeIdentity>, read_only: bool) -> Arc<ClientHandle> {
+        let session=fixture_handle(app,card,Some(KNOWN_THREAD)).session();
+        Arc::new(ClientHandle::fixture_account_home(session,Snapshot {
+            ready:true, session_id:Some(KNOWN_THREAD.into()),exited:read_only,
+            items:vec![Arc::new(chat::Item {id:"private-account-body".into(),role:chat::Role::Assistant,
+                content:text("private retained account text"),started_at:None,at:None})],
+            ..Snapshot::default()
+        },home))
+    }
+
+    fn account_privacy_home(inode:u64)->account::HomeIdentity {
+        // An attested remote path deliberately does not exist in the window's
+        // filesystem. Purge aliases may be absent on a pre-registration actor.
+        account::HomeIdentity {provider:Provider::Codex,canonical_home:format!("/remote-private-fixture/account-{inode}").into(),
+            device:731,inode,purge_ids:Vec::new()}
+    }
+
+    fn complete_account_privacy_intent(app:&mut Cagents,id:&AccountId) {
+        // Exercise the normal completion dispatch, including partial failure.
+        // Its UI revocation must not depend on successful physical deletion.
+        drop(app.update(Message::AccountUi(super::super::account_ui::Action::Removed {
+            id:id.clone(),delete_requested:true,registry:None,error:Some("fixture deletion refused by an active owner".into()),
+        })));
+    }
+
+    #[test]
+    fn account_delete_intent_removed_then_late_ready_revokes_only_matching_or_unknown_read_only_bodies() {
+        for (home,read_only,revoke) in [
+            (Some(account_privacy_home(11)),false,true),
+            (Some(account_privacy_home(12)),true,false),
+            (None,true,true),
+        ] {
+            let mut app=crate::app::tests::context_inspector_test_app(false);
+            let id=app.account_ui.add_managed_fixture(Provider::Codex,99201);
+            let (card,target)=starting_chat(&mut app);
+            let handle=account_privacy_handle(&app,card,home,read_only);
+            assert!(!handle.snapshot().items.is_empty());
+            app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
+            complete_account_privacy_intent(&mut app,&id);
+            answer_start(&mut app,target,Ok(handle.clone()));
+            assert!(app.chat_ui.retiring.is_empty(),"deletion privacy must not stop or retire provider work");
+            let runtime=chat_runtime(&app,card);
+            assert!(runtime.has_local_history_handle());
+            if revoke {
+                assert!(handle.snapshot().items.is_empty(),"late Ready cannot reinstall revoked local text");
+                assert!(runtime.snapshot.items.is_empty());
+            } else {
+                assert_eq!(handle.snapshot().items.len(),1,"known remote account B keeps its local text");
+            }
+        }
+    }
+
+    #[test]
+    fn account_delete_intent_gates_late_unknown_live_attachment_and_restores_unsent_composer() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let id=app.account_ui.add_managed_fixture(Provider::Codex,99202);
+        let (card,target)=starting_chat(&mut app);
+        let handle=account_privacy_handle(&app,card,None,false);
+        let admitted=handle.session();
+        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
+        complete_account_privacy_intent(&mut app,&id);
+        answer_start(&mut app,target,Ok(handle.clone()));
+        let runtime=chat_runtime(&app,card);
+        assert!(!runtime.has_local_history_handle(),"unknown live Ready must not install a local body");
+        assert!(runtime.snapshot.items.is_empty());
+        assert!(runtime.disconnected);
+        assert!(runtime.error.as_deref().unwrap().contains("account could not be verified"));
+        assert_eq!(runtime.composer.text().trim(),"hello","the unsent first prompt stays editable");
+        assert!(runtime.queued.is_none());
+        assert!(app.chat_ui.retiring.is_empty());
+        assert!(matches!(&app.card_state(card).unwrap().kind,CardKind::Chat(session) if session.id==admitted.id && session.launch==admitted.launch),
+            "retain the running actor's descriptor for an explicit reconnect");
+        assert_eq!(handle.snapshot().items.len(),1,"refusing presentation does not mutate or stop unrelated provider state");
+    }
+
+    #[test]
+    fn account_delete_intent_revokes_parked_known_a_but_preserves_known_b_and_unsent_text() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let id=app.account_ui.add_managed_fixture(Provider::Codex,99203);
+        let (card,target)=starting_chat(&mut app);
+        let a=account_privacy_handle(&app,card,Some(account_privacy_home(11)),true);
+        answer_start(&mut app,target,Ok(a.clone()));
+        write(&mut app,card,"unsent composer survives");
+        let (other,other_target)=starting_chat(&mut app);
+        let b=account_privacy_handle(&app,other,Some(account_privacy_home(12)),true);
+        answer_start(&mut app,other_target,Ok(b.clone()));
+        let Some(CardRuntime::Chat(runtime))=app.cards.remove(&card) else {panic!("chat runtime")};
+        app.chat_ui.parked.insert(card,runtime);
+        app.prepare_account_history_deletion(&id,Provider::Codex,&account::remote::RemovalHome::Present(account_privacy_home(11))).unwrap();
+        complete_account_privacy_intent(&mut app,&id);
+        let parked=app.chat_ui.parked.get(&card).unwrap();
+        assert!(a.snapshot().items.is_empty());
+        assert!(parked.snapshot.items.is_empty());
+        assert_eq!(parked.composer.text().trim(),"unsent composer survives");
+        assert_eq!(b.snapshot().items.len(),1);
+        assert!(app.chat_ui.retiring.is_empty());
+    }
+
 }

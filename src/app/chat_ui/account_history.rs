@@ -1,7 +1,6 @@
 //! Account-file deletion invalidates local presentation, never provider work.
 //! Association comes from the attached backend, not an issued launch recipe.
 use super::*;
-use std::os::unix::fs::MetadataExt;
 
 const MAX_PENDING_DELETIONS: usize = 64;
 
@@ -10,6 +9,7 @@ struct Deletion {
     id: AccountId,
     provider: Provider,
     physical: Option<(PathBuf, u64, u64)>,
+    missing_path: Option<PathBuf>,
 }
 
 #[derive(Default)]
@@ -24,12 +24,15 @@ pub(super) struct State {
 enum Decision { Keep, Revoke, UnverifiedLive }
 
 fn decide(target: &Deletion, provider: Provider, home: Option<&account::HomeIdentity>, read_only: bool, has_handle: bool) -> Decision {
+    if provider != target.provider || home.is_some_and(|home| home.provider != target.provider) { return Decision::Keep; }
     if let Some(home) = home {
         if home.purge_ids.contains(&target.id) || target.physical.as_ref().is_some_and(|(path, device, inode)| {
             home.canonical_home == *path && (home.device,home.inode) == (*device,*inode)
-        }) { Decision::Revoke } else { Decision::Keep }
-    } else if provider != target.provider { Decision::Keep }
-    else if read_only { Decision::Revoke }
+        }) { Decision::Revoke }
+        else if target.missing_path.as_ref()==Some(&home.canonical_home) && home.purge_ids.is_empty() {
+            if read_only {Decision::Revoke} else {Decision::UnverifiedLive}
+        } else { Decision::Keep }
+    } else if read_only { Decision::Revoke }
     else if has_handle { Decision::UnverifiedLive }
     else { Decision::Keep } // Unstarted draft/composer is not retained history.
 }
@@ -42,14 +45,13 @@ fn decision(target: &Deletion, runtime: &Runtime) -> Decision {
 impl Cagents {
     /// Called synchronously at explicit DeleteFiles intent, before its RPC.
     /// Archive and Move retain history and never enter this path.
-    pub(in crate::app) fn prepare_account_history_deletion(&mut self, id: &AccountId) -> Result<(),String> {
-        let state = self.account_ui.account(id).ok_or("The account changed; reload Accounts before deleting its files")?;
-        let physical = state.account.resolved_home().and_then(|home| {
-            let path = home.canonicalize().ok()?;
-            let metadata = std::fs::metadata(&path).ok()?;
-            metadata.is_dir().then(|| (path,metadata.dev(),metadata.ino()))
-        });
-        let deletion = Deletion { id:id.clone(), provider:state.account.provider, physical };
+    pub(in crate::app) fn prepare_account_history_deletion(&mut self, id: &AccountId, provider:Provider, home:&account::remote::RemovalHome) -> Result<(),String> {
+        let (physical,missing_path)=match home {
+            account::remote::RemovalHome::Present(home) if home.provider==provider => (Some((home.canonical_home.clone(),home.device,home.inode)),None),
+            account::remote::RemovalHome::Present(_)=>return Err("The account deletion preview identifies a different provider; reload Accounts before deleting files".into()),
+            account::remote::RemovalHome::Missing{path}=>(None,Some(path.clone())),
+        };
+        let deletion = Deletion { id:id.clone(), provider, physical, missing_path };
         if self.cards.values().filter_map(|runtime| match runtime { CardRuntime::Chat(runtime)=>Some(runtime.as_ref()),_=>None })
             .chain(self.chat_ui.parked.values().map(Box::as_ref))
             .any(|runtime| decision(&deletion,runtime)==Decision::UnverifiedLive) {
@@ -91,17 +93,19 @@ impl Cagents {
         }
     }
 
-    pub(super) fn fence_account_history_ready(&mut self, target: Target, result: &Result<Arc<ClientHandle>,chat::StartFailure>) {
-        let Some(deletions)=self.chat_ui.history_deletions.inflight.remove(&target) else {return;};
-        if let Ok(handle)=result {
-            for deletion in deletions {
-                if decide(&deletion,handle.session().launch.provider,handle.account_home(),handle.local_history_is_read_only(),true)==Decision::Revoke {
-                    handle.revoke_local_history();
-                    break;
-                }
+    pub(super) fn fence_account_history_ready(&mut self, target: Target, handle: &ClientHandle) -> bool {
+        let Some(deletions)=self.chat_ui.history_deletions.inflight.remove(&target) else {return true;};
+        let mut unverified=false;
+        for deletion in deletions {
+            match decide(&deletion,handle.session().launch.provider,handle.account_home(),handle.local_history_is_read_only(),true) {
+                Decision::Revoke => handle.revoke_local_history(),
+                Decision::UnverifiedLive => unverified=true,
+                Decision::Keep => {},
             }
         }
+        !unverified
     }
+
 }
 
 #[cfg(test)]
@@ -110,7 +114,7 @@ mod tests {
     #[test]
     fn deletion_association_preserves_other_accounts_and_gates_unknown_live_history() {
         let id:AccountId="claude/11111111-1111-4111-8111-111111111111".parse().unwrap();
-        let deletion=Deletion{id:id.clone(),provider:Provider::Claude,physical:Some(("/fixture/a".into(),1,2))};
+        let deletion=Deletion{id:id.clone(),provider:Provider::Claude,physical:Some(("/fixture/a".into(),1,2)),missing_path:None};
         let known=|path:&str,inode|account::HomeIdentity{provider:Provider::Claude,canonical_home:path.into(),device:1,inode,purge_ids:Vec::new()};
         let a=known("/fixture/a",2);let b=known("/fixture/b",3);
         assert_eq!(decide(&deletion,Provider::Claude,Some(&a),false,true),Decision::Revoke);
@@ -120,6 +124,8 @@ mod tests {
         assert_eq!(decide(&deletion,Provider::Claude,None,true,true),Decision::Revoke);
         assert_eq!(decide(&deletion,Provider::Claude,None,false,true),Decision::UnverifiedLive);
         assert_eq!(decide(&deletion,Provider::Codex,None,true,true),Decision::Keep);
+        let mut other_provider=a.clone();other_provider.provider=Provider::Codex;
+        assert_eq!(decide(&deletion,Provider::Codex,Some(&other_provider),true,true),Decision::Keep,"a shared physical path does not combine provider namespaces");
         assert_eq!(decide(&deletion,Provider::Claude,None,false,false),Decision::Keep,"drafts and unsent text survive");
         assert_eq!(decide(&deletion,Provider::Claude,Some(&known("/fixture/a",5)),true,true),Decision::Keep,"a replaced path alone never transfers physical association");
     }

@@ -54,6 +54,8 @@ pub(in crate::app) struct Table {
     pub(in crate::app) confirm_in_use: usize,
     pub(in crate::app) confirm_conversations: Option<Result<usize, String>>,
     pub(in crate::app) confirm_delete: String,
+    pub(in crate::app) removal_preview_generation: u64,
+    pub(in crate::app) confirm_home: Option<crate::account::remote::RemovalHome>,
     pub(in crate::app) add_menu: bool,
     pub(in crate::app) own_codex_config: bool,
     /// The row being renamed, and the name typed so far.

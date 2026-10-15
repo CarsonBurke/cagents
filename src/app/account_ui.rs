@@ -1056,7 +1056,7 @@ pub enum Action {
     RemoveConfirm(AccountId),
     MoveAndArchive(AccountId, AccountId),
     DeleteAccountFiles(AccountId),
-    RemovalCount(AccountId, Result<usize, String>),
+    RemovalCount(AccountId, u64, Result<account::remote::RemovalPreview, String>),
     RemovalDeleteInput(String),
     RemoveCancel,
     ArchiveDuplicate(AccountId),
@@ -3008,6 +3008,9 @@ impl Cagents {
                     self.account_ui.table.menu = Some(id.clone());
                     self.account_ui.table.confirm_remove = Some(id.clone());
                     self.account_ui.table.confirm_conversations = None;
+                    self.account_ui.table.confirm_home = None;
+                    self.account_ui.table.removal_preview_generation = self.account_ui.table.removal_preview_generation.wrapping_add(1);
+                    let generation = self.account_ui.table.removal_preview_generation;
                     self.account_ui.table.confirm_delete.clear();
                     return cosmic::task::future(async move {
                         let inspect = id.clone();
@@ -3019,14 +3022,17 @@ impl Cagents {
                         .await
                         .map_err(|error| error.to_string())
                         .and_then(|result| result);
-                        Message::AccountUi(Action::RemovalCount(id, result))
+                        Message::AccountUi(Action::RemovalCount(id, generation, result))
                     });
                 }
                 Task::none()
             }
-            Action::RemovalCount(id, result) => {
-                if self.account_ui.table.confirm_remove.as_ref() == Some(&id) {
-                    self.account_ui.table.confirm_conversations = Some(result);
+            Action::RemovalCount(id, generation, result) => {
+                if self.account_ui.table.confirm_remove.as_ref() == Some(&id) && self.account_ui.table.removal_preview_generation == generation {
+                    self.account_ui.table.confirm_conversations = Some(match result {
+                        Ok(preview)=>{self.account_ui.table.confirm_home=Some(preview.home);Ok(preview.conversations)},
+                        Err(error)=>{self.account_ui.table.confirm_home=None;Err(error)},
+                    });
                 }
                 Task::none()
             }
@@ -3039,12 +3045,14 @@ impl Cagents {
                 account::remote::Operation::MoveAndArchive { id, target },
             ),
             Action::DeleteAccountFiles(id) => {
+                if self.account_ui.table.confirm_remove.as_ref() != Some(&id) {return Task::none();}
                 if self.account_ui.account(&id).is_none_or(|account| {
                     self.account_ui.table.confirm_delete != self.account_ui.display_name(account)
                 }) {
                     return Task::none();
                 }
-                self.remove_account_with(id.clone(), account::remote::Operation::DeleteFiles { id })
+                let Some(home)=self.account_ui.table.confirm_home.clone() else {return Task::none();};
+                self.remove_account_with(id.clone(), account::remote::Operation::DeleteFiles { id, expected_home:Some(home) })
             }
             Action::RemoveCancel => {
                 self.account_ui.table.confirm_remove = None;
@@ -4270,10 +4278,16 @@ impl Cagents {
             return Task::none();
         }
         let delete_requested = matches!(&operation, account::remote::Operation::DeleteFiles { .. });
-        if delete_requested && let Err(error)=self.prepare_account_history_deletion(&id) {
-            self.account_ui.removing.remove(&id);
-            self.status=Some(TransientNotice::warning(error));
-            return Task::none();
+        if let account::remote::Operation::DeleteFiles {expected_home,..}=&operation {
+            let prepared=self.account_ui.account(&id).ok_or_else(||"The account changed; reload Accounts before deleting its files".to_owned())
+                .map(|state|state.account.provider)
+                .and_then(|provider|expected_home.as_ref().ok_or_else(||"Reload the account deletion preview before deleting files".to_owned())
+                    .and_then(|home|self.prepare_account_history_deletion(&id,provider,home)));
+            if let Err(error)=prepared {
+                self.account_ui.removing.remove(&id);
+                self.status=Some(TransientNotice::warning(error));
+                return Task::none();
+            }
         }
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
@@ -8977,4 +8991,20 @@ mod app_tests {
             "the final account reaches the visible viewport bottom"
         );
     }
+
+    #[test]
+    fn account_removal_preview_from_earlier_open_cannot_replace_current_daemon_identity() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);
+        let id=app.account_ui.add_managed_fixture(Provider::Codex,99210);
+        app.account_ui.table.confirm_remove=Some(id.clone());
+        app.account_ui.table.removal_preview_generation=2;
+        let preview=|inode|account::remote::RemovalPreview{conversations:inode as usize,
+            home:account::remote::RemovalHome::Present(account::HomeIdentity{
+                provider:Provider::Codex,canonical_home:"/remote/attested-only".into(),device:71,inode,purge_ids:Vec::new()})};
+        drop(app.update(Message::AccountUi(Action::RemovalCount(id.clone(),2,Ok(preview(2))))));
+        drop(app.update(Message::AccountUi(Action::RemovalCount(id,1,Ok(preview(1))))));
+        assert_eq!(app.account_ui.table.confirm_conversations,Some(Ok(2)));
+        assert!(matches!(&app.account_ui.table.confirm_home,Some(account::remote::RemovalHome::Present(home)) if home.inode==2));
+    }
+
 }

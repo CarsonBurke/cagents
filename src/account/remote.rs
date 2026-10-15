@@ -37,7 +37,57 @@ pub enum Operation {
     /// Explicit destructive action, confirmed separately in the interface.
     DeleteFiles {
         id: AccountId,
+        /// Optional for legacy direct callers; the UI supplies its exact
+        /// daemon preview so a replaced home cannot reuse old consent.
+        #[serde(default)]
+        expected_home: Option<RemovalHome>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RemovalHome {
+    Missing {
+        #[serde(with = "crate::selected_file_path::required")]
+        path: std::path::PathBuf,
+    },
+    Present(super::HomeIdentity),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RemovalPreview {
+    pub conversations: usize,
+    pub home: RemovalHome,
+}
+
+#[cfg(feature = "host")]
+impl RemovalHome {
+    fn capture(account: &super::Account) -> Result<Self,String> {
+        use std::os::unix::fs::MetadataExt;
+        let home=account.resolved_home().ok_or("The account has no credential directory")?;
+        crate::secure_file::reject_symlink_components(&home).map_err(|error|error.to_string())?;
+        match std::fs::metadata(&home) {
+            Ok(metadata) if metadata.is_dir() => Ok(Self::Present(super::HomeIdentity {
+                provider:account.provider,canonical_home:home.canonicalize().map_err(|error|error.to_string())?,
+                device:metadata.dev(),inode:metadata.ino(),purge_ids:vec![account.id()],
+            })),
+            Ok(_) => Err("The account home is not a directory".into()),
+            Err(error) if error.kind()==std::io::ErrorKind::NotFound => {
+                let mut parent=home.as_path();let mut suffix=Vec::new();
+                let path=loop {
+                    match parent.canonicalize() {
+                        Ok(mut path)=>{for name in suffix.into_iter().rev(){path.push(name);}break path;},
+                        Err(error) if error.kind()==std::io::ErrorKind::NotFound=>{
+                            suffix.push(parent.file_name().ok_or("The account home has no existing parent")?.to_owned());
+                            parent=parent.parent().ok_or("The account home has no existing parent")?;
+                        },
+                        Err(error)=>return Err(error.to_string()),
+                    }
+                };
+                Ok(Self::Missing{path})
+            },
+            Err(error)=>Err(error.to_string()),
+        }
+    }
 }
 
 #[cfg(feature = "host")]
@@ -72,7 +122,7 @@ pub(crate) fn affected_account(operation: &Operation) -> Result<Option<super::Ac
         }
         Operation::Remove { id }
         | Operation::MoveAndArchive { id, .. }
-        | Operation::DeleteFiles { id } => registry
+        | Operation::DeleteFiles { id, .. } => registry
             .all_accounts(Some(&homes))
             .into_iter()
             .find(|account| account.id() == *id)
@@ -320,7 +370,7 @@ pub(crate) fn execute(operation: Operation) -> Result<serde_json::Value, String>
                 .into_iter()
                 .find(|account| account.id() == id)
                 .ok_or("The account is no longer registered")?;
-            serde_json::to_value(super::handoff::conversation_count(&account)?)
+            serde_json::to_value(RemovalPreview { conversations:super::handoff::conversation_count(&account)?, home:RemovalHome::capture(&account)? })
                 .map_err(|error| error.to_string())
         }
         operation @ (Operation::Remove { .. }
@@ -346,10 +396,11 @@ fn remove_account(
     mut logout: impl FnMut(super::Account) -> Result<(), String>,
 ) -> Result<(super::registry::Registry, Option<String>), String> {
     use super::probe;
+    let expected_home=match &operation { Operation::DeleteFiles{expected_home,..}=>expected_home.clone(),_=>None };
     let (id, target, delete) = match operation {
         Operation::Remove { id } => (id, None, false),
         Operation::MoveAndArchive { id, target } => (id, Some(target), false),
-        Operation::DeleteFiles { id } => (id, None, true),
+        Operation::DeleteFiles { id, .. } => (id, None, true),
         _ => unreachable!(),
     };
     let registry = store.load().map_err(|error| error.to_string())?;
@@ -358,6 +409,11 @@ fn remove_account(
         .into_iter()
         .find(|account| account.id() == id)
         .ok_or("The account was already removed from this device")?;
+    if let Some(expected)=expected_home {
+        if RemovalHome::capture(&account)? != expected {
+            return Err("The account home changed after its deletion preview. Reload the dialog and review its files before deleting.".into());
+        }
+    }
     let key = account
         .registry_key()
         .ok_or("System accounts cannot be removed")?;
@@ -502,6 +558,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deletion_preview_refuses_replaced_and_newly_created_homes_before_logout_or_registry_changes() {
+        use crate::account::{Account,cache::Cache,home::Homes,registry::{Registered,Store}};
+        for initially_missing in [false,true] {
+            let directory=tempfile::tempdir().unwrap();
+            let homes=Homes::at(directory.path().join("homes"));
+            let store=Store::at(directory.path().join("config"));
+            let cache=Cache::at(directory.path().join("cache"));
+            let (key,home)=homes.create(Provider::Claude,None).unwrap();
+            let account=Account::managed(Provider::Claude,key,home.clone());
+            store.update(|registry|registry.register(Registered {key,provider:Provider::Claude,linked_home:None,label:None,
+                email:Some("preview@fixture.invalid".into()),organization:None,added_at:0},&[]).unwrap()).unwrap();
+            std::fs::write(home.join("original-private-file"),"preserved original").unwrap();
+            let original=directory.path().join("original-home");
+            if initially_missing {std::fs::rename(&home,&original).unwrap();}
+            let preview=RemovalHome::capture(&account).unwrap();
+            assert_eq!(matches!(preview,RemovalHome::Missing{..}),initially_missing);
+            if !initially_missing {std::fs::rename(&home,&original).unwrap();}
+            std::fs::create_dir(&home).unwrap();
+            std::fs::write(home.join("replacement-private-file"),"preserved replacement").unwrap();
+            let before=store.load().unwrap();
+            let error=remove_account(Operation::DeleteFiles{id:account.id(),expected_home:Some(preview)},&store,&homes,&cache,
+                |_|panic!("changed preview must refuse before provider logout")).unwrap_err();
+            assert!(error.contains("changed after its deletion preview"),"{error}");
+            assert_eq!(store.load().unwrap(),before);
+            assert_eq!(std::fs::read_to_string(original.join("original-private-file")).unwrap(),"preserved original");
+            assert_eq!(std::fs::read_to_string(home.join("replacement-private-file")).unwrap(),"preserved replacement");
+        }
+    }
+
+    #[test]
     fn account_lifecycle_refuses_probe_owners_without_changing_homes_or_registry() {
         use crate::account::{
             Account,
@@ -551,7 +637,7 @@ mod tests {
                     id: source.id(),
                     target: target.id(),
                 },
-                _ => Operation::DeleteFiles { id: source.id() },
+                _ => Operation::DeleteFiles { id: source.id(), expected_home: None },
             };
             let before = store.load().unwrap();
             let lock = cache.try_probe_lock(&source.lock_name()).unwrap().unwrap();
@@ -735,7 +821,7 @@ mod tests {
         let annotations = storage::Store::installation(&scope, "provider-confirmed-fixture").unwrap();
         assert_eq!(annotations.original(Some("confirmed-user"), 0, 4096).unwrap().text, "original request");
         drop(annotations);
-        let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+        let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id(), expected_home: None }, &store, &homes, &cache, |_| Ok(())).unwrap();
         assert!(warning.is_none(), "{warning:?}");
         assert!(!created.home.exists());
         assert!(!retained_image.exists());
@@ -757,7 +843,7 @@ mod tests {
                 Some(annotations.retain_attachment(&image).unwrap().path)
             } else { None };
             std::fs::remove_dir_all(&home).unwrap();
-            let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id() }, &store, &homes, &cache, |_| Ok(())).unwrap();
+            let (registry, warning) = remove_account(Operation::DeleteFiles { id: account.id(), expected_home: None }, &store, &homes, &cache, |_| Ok(())).unwrap();
             assert!(registry.find(key).is_none());
             if let Some(retained) = retained {
                 assert!(!retained.exists());

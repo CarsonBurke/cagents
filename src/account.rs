@@ -49,7 +49,8 @@ pub mod schedule;
 pub(crate) mod scope;
 
 /// Immutable, nonsecret association metadata for a local transcript cache.
-/// Supplied only by the exact attached backend actor's captured startup scope.
+/// Captured by the owning backend from an actor startup or registered-home
+/// deletion preview; displaying clients never resolve a remote home locally.
 /// This is not a capability and never authorizes provider or annotation reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HomeIdentity {
