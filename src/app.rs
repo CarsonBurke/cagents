@@ -4824,7 +4824,7 @@ pub struct Cagents {
     terminal_review_input: crate::terminal::ReviewInputBarrier,
     terminal_context: Option<terminal_ui::Context>,
     terminal_paste: Option<(CardId, String)>,
-    terminal_clipboard: Option<(CardId, crate::model::TerminalId, bool, String)>,
+    terminal_clipboard: Option<(CardId, terminal_ui::ClipboardTarget, bool, String)>,
     card_chrome: HashMap<CardId, CardChrome>,
     card_indices: HashMap<CardId, usize>,
     navigation_cache: sidebar::NavigationCache,
@@ -5062,7 +5062,7 @@ impl Cagents {
     }
 
     fn reconcile_terminal_review_owner(&mut self) {
-        if self.terminal_clipboard.as_ref().is_some_and(|(card, terminal, ..)| !matches!(self.cards.get(card), Some(CardRuntime::Terminal(handle)) if handle.terminal_id() == *terminal)) { self.terminal_clipboard = None; }
+        if self.terminal_clipboard.as_ref().is_some_and(|(card, terminal, ..)| !matches!(self.cards.get(card), Some(CardRuntime::Terminal(handle)) if !terminal.stale(handle))) { self.terminal_clipboard = None; }
 
         if let Some(owner) = self.terminal_review_card {
             let current_identity = match self.cards.get(&owner) {
@@ -15930,7 +15930,7 @@ impl Application for Cagents {
                     }
                     if let Some((card, terminal, ..)) = &self.terminal_clipboard {
                         return self.handle_terminal_find(terminal_ui::Action::ConfirmClipboard(
-                            *card, *terminal, false,
+                            *card, terminal.clone(), false,
                         ));
                     }
                     if let Some((card, _)) = &self.terminal_paste {
