@@ -3159,22 +3159,14 @@ impl RepositoryRuntime {
     /// Places a server location against the actual loaded target, including
     /// files that did not have a snapshot when the response was converted.
     /// A UTF-16 position inside a surrogate pair is refused rather than rounded.
-    pub fn move_cursor_to_coordinates(&mut self, mut at: LspPosition, coordinates: crate::lsp::LspCoordinates) -> bool {
-        if coordinates == crate::lsp::LspCoordinates::Utf16 {
-            let Some(text) = self.editor_text() else { return false; };
-            let Some(line) = text.split('\n').nth(at.line as usize) else { return false; };
-            let line = line.strip_suffix('\r').unwrap_or(line);
-            let mut units = 0u32;
-            let mut scalars = 0u32;
-            for character in line.chars() {
-                if units == at.character { break; }
-                units += character.len_utf16() as u32;
-                if units > at.character { return false; }
-                scalars += 1;
+    pub fn move_cursor_to_coordinates(&mut self, at: LspPosition, coordinates: crate::lsp::LspCoordinates) -> bool {
+        let at = match coordinates {
+            crate::lsp::LspCoordinates::Scalar => at,
+            crate::lsp::LspCoordinates::Utf16 => {
+                let Some(at) = self.scalar_position_for_utf16(at) else { return false; };
+                at
             }
-            if units != at.character { return false; }
-            at.character = scalars;
-        }
+        };
         self.move_cursor_to(at)
     }
 
