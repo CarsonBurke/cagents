@@ -1699,20 +1699,6 @@ mod tests {
                     closed: vec![],
                 })
                 .unwrap();
-            let mut ended = ended_console(&pane);
-            let crate::model::CardKind::Terminal(session) = &mut ended.kind else {
-                unreachable!()
-            };
-            session.resume_hint = Some("batched final provider session hint".into());
-            session.transcript_path = Some(directory.path().join("console.log"));
-            publish_console(&mut registry, &scope, &pane, &ended).unwrap();
-            let mut late = ended.clone();
-            let crate::model::CardKind::Terminal(session) = &mut late.kind else {
-                unreachable!()
-            };
-            session.resume_hint = Some("late final provider session hint".into());
-            late.title = "Completed console".into();
-            publish_console(&mut registry, &scope, &ended, &late).unwrap();
             let target = Scope::Worktree {
                 repository: directory.path().into(),
                 path: directory.path().into(),
@@ -1729,6 +1715,20 @@ mod tests {
                     },
                 })
                 .unwrap();
+            let mut ended = ended_console(&pane);
+            let crate::model::CardKind::Terminal(session) = &mut ended.kind else {
+                unreachable!()
+            };
+            session.resume_hint = Some("batched final provider session hint".into());
+            session.transcript_path = Some(directory.path().join("console.log"));
+            publish_console(&mut registry, &target, &pane, &ended).unwrap();
+            let mut late = ended.clone();
+            let crate::model::CardKind::Terminal(session) = &mut late.kind else {
+                unreachable!()
+            };
+            session.resume_hint = Some("late final provider session hint".into());
+            late.title = "Completed console".into();
+            publish_console(&mut registry, &target, &ended, &late).unwrap();
             let run = registry.agent_run(accepted.run.id).unwrap();
             drop(registry);
             let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
@@ -1829,7 +1829,7 @@ mod tests {
     }
 
     #[test]
-    fn ended_console_successor_proof_and_stale_claimed_before_never_authorize_old_close() {
+    fn ended_console_successors_survive_old_close_and_stale_updates_are_refused() {
         use crate::workspace_model::views::Scope;
         for stale_before in [false, true] {
             let (mut registry, _directory, accepted, pane) = console_pane_fixture();
@@ -1856,31 +1856,38 @@ mod tests {
             *host_incarnation = crate::model::HostIncarnation::new("successor-generation");
             publish_console(&mut registry, &scope, &ended, &successor).unwrap();
             let successor_end = ended_console(&successor);
-            publish_console(
+            let before = registry.model().unwrap();
+            let updated = publish_console(
                 &mut registry,
                 &scope,
                 if stale_before { &pane } else { &successor },
                 &successor_end,
-            )
-            .unwrap();
-            let before = registry.model().unwrap();
-            let result = registry.close_agent(&Origin::User, accepted.agent.id);
-            if stale_before {
+            );
+            let retained = if stale_before {
                 assert!(
-                    result
+                    updated
                         .unwrap_err()
-                        .contains("historical generation proof is unavailable")
+                        .contains(Registry::VIEW_SOURCE_CONFLICT)
                 );
                 assert_eq!(registry.model().unwrap(), before);
-                assert!(!registry.agent(accepted.agent.id).unwrap().closed);
+                successor
             } else {
-                assert!(result.unwrap().closed);
-            }
+                updated.unwrap();
+                successor_end
+            };
+            // The old agent can close, but neither a proved successor nor a
+            // refused stale update grants ownership of the successor's pane.
+            assert!(
+                registry
+                    .close_agent(&Origin::User, accepted.agent.id)
+                    .unwrap()
+                    .closed
+            );
             assert_eq!(
                 super::super::views::read(&registry.db, &scope)
                     .unwrap()
                     .panes,
-                vec![successor_end]
+                vec![retained]
             );
         }
     }
