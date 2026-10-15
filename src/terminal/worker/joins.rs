@@ -2,7 +2,7 @@
 //! finished packet may be visible while a TLS destructor is still blocked.
 use super::{PublishedState, WORKER_JOIN_TIMEOUT, close_processes};
 use std::{
-    sync::{Arc, Mutex, OnceLock, atomic::Ordering},
+    sync::{Arc, Mutex, OnceLock, atomic::{AtomicUsize, Ordering}},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -13,12 +13,39 @@ struct Job {
     published: Arc<PublishedState>,
 }
 const WORKERS: usize = 2;
-const QUEUED: usize = 64;
+// Match the host's existing 1024-terminal ceiling. Reservations also count
+// cleanup owners after their panes disappeared, so repeated failed cleanup
+// cannot create an unlimited retirement backlog.
+const CAPACITY: usize = 1024;
+static RESERVED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug)]
+pub(super) struct Reservation { _private: () }
+impl Drop for Reservation {
+    fn drop(&mut self) { RESERVED.fetch_sub(1, Ordering::AcqRel); }
+}
+fn capacity() -> usize {
+    #[cfg(test)]
+    {
+        static LIMIT: OnceLock<usize> = OnceLock::new();
+        return *LIMIT.get_or_init(|| std::env::var("CAGENTS_TERMINAL_JOIN_TEST_CAPACITY").ok().and_then(|value| value.parse().ok()).filter(|limit| (1..=CAPACITY).contains(limit)).unwrap_or(CAPACITY));
+    }
+    #[cfg(not(test))]
+    { CAPACITY }
+}
+pub(super) fn reserve() -> Result<Reservation, String> {
+    // Service startup failure is refused before any terminal worker or child
+    // exists. Every admitted worker keeps its reservation through actual join.
+    service()?;
+    RESERVED.fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| (count < capacity()).then_some(count + 1))
+        .map_err(|_| "Terminal cleanup capacity is full; wait for retained workers to finish before starting another terminal".to_owned())?;
+    Ok(Reservation { _private: () })
+}
 static SERVICE: OnceLock<Result<crossbeam_channel::Sender<Job>, String>> = OnceLock::new();
 
 fn service() -> Result<&'static crossbeam_channel::Sender<Job>, String> {
     SERVICE.get_or_init(|| {
-        let (sender, receiver) = crossbeam_channel::bounded::<Job>(QUEUED);
+        let (sender, receiver) = crossbeam_channel::bounded::<Job>(capacity());
         for index in 0..WORKERS {
             let receiver = receiver.clone();
             thread::Builder::new().name(format!("terminal-join-{index}")).spawn(move || {
