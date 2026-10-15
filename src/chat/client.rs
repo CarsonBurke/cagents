@@ -1845,7 +1845,14 @@ mod tests {
         let receipts = vec![a, b];
         let expected = receipts.clone();
         let (client, mut server) = UnixStream::pair().unwrap();
+        struct Completed(std::sync::mpsc::Sender<()>);
+        impl Drop for Completed { fn drop(&mut self) { let _ = self.0.send(()); } }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = thread::spawn(move || {
+            let _completed = Completed(done_tx);
+            let mut server = server;
+            server.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            server.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
             handoff_handshake(&mut server, &mut codec);
             for (index, expected) in expected.into_iter().enumerate() {
@@ -1858,7 +1865,9 @@ mod tests {
             }
         });
         let result = acknowledge_terminal_handoff_receipts_on(crate::control::ControlClient::from_stream(client), &receipts);
-        worker.join().unwrap();
+        let completed = done_rx.recv_timeout(Duration::from_secs(6));
+        drop(worker);
+        assert!(completed.is_ok(), "finite framed peer did not finish");
         assert!(result[0].as_ref().unwrap_err().contains("exact receipt refused"));
         assert!(result[1].is_ok());
         assert!(acknowledge_terminal_handoff_receipts_on(Err(crate::control::ControlError::ConnectionClosed), &receipts).iter().all(Result::is_err));

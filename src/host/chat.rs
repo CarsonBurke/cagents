@@ -2,6 +2,7 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 #[cfg(test)]
 mod account_isolation_tests;
 mod execution_directory;
+mod handoff_budget;
 pub(in crate::host) mod source_binding;
 mod native_cleanup;
 pub(in crate::host) mod presentation_close;
@@ -234,6 +235,7 @@ fn issue_terminal_handoff(
     let receipt = crate::terminal_ipc::TerminalHandoffReceipt {
         operation: uuid::Uuid::new_v4(), source, source_execution_instance, source_binding, retained_binding, terminal_native_epoch, terminal,
     };
+    handoff_budget::receipt(&receipt)?;
     state.remember_terminal_handoff(receipt.clone());
     Ok(receipt)
 }
@@ -1839,6 +1841,8 @@ fn codex_terminal_view_captured(
     };
     let continuation = source_binding::continuation(host, &source_binding)?;
     let original_intent = captured_intent.unwrap_or_else(|| source_binding.clone());
+    handoff_budget::bindings(&original_intent, &source_binding)?;
+    handoff_budget::recipe(&recipe)?;
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, chat_id)?;
@@ -1925,6 +1929,13 @@ fn codex_terminal_view_captured(
         };
     let mut recipe = recipe;
     recipe.working_directory = directory;
+    if let Err(error) = handoff_budget::recipe(&recipe) {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(record) = state.chats.get_mut(&chat_id).filter(|record| record.handle.same_actor(handle)) {
+            record.returning_terminal = false;
+        }
+        return Err(error);
+    }
     if let Some((source, terminal, proof)) = completed {
         let release = (|| {
             if terminal.holder_identity().is_some() {
@@ -3082,6 +3093,7 @@ fn process_inner(
             } else {
                 source_binding::require(host, client, &expected)?
             };
+            handoff_budget::bindings(&expected, &admitted_binding)?;
             restart::require_finished(host, chat_id)?;
             let (handle, mut session, issued_source, source_instance) = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3136,6 +3148,7 @@ fn process_inner(
                     .map_err(unavailable)?;
             let mut recipe = recipe;
             recipe.working_directory = directory.clone();
+            handoff_budget::recipe(&recipe)?;
             let terminal_id = crate::model::TerminalId::new();
             let mut terminal = crate::model::TerminalSession {
                 owned_codex_listener: None,
@@ -3192,6 +3205,9 @@ fn process_inner(
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
             recipe.working_directory = directory;
             terminal.launch = recipe.clone();
+            // Recheck an autonomous final permission-mode change before a new
+            // worker is spawned. Failure retains the completed exact source.
+            handoff_budget::recipe(&recipe)?;
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                 recipe,
                 last_exit: None,

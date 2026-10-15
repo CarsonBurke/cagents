@@ -653,4 +653,21 @@ mod tests {
         assert!(!owner.0.is_completed());
     }
 
+    #[test]
+    fn oversized_handoff_metadata_refuses_before_any_owned_provider_or_terminal_effect() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut source = source(directory.path());
+        source.launch.recipe.environment.insert("HANDOFF_METADATA_FIXTURE".into(), "x".repeat(70 * 1024));
+        let owner = actor(&source);
+        let fixture = BackendFixture::new(source.clone(), owner.0.clone(), uuid::Uuid::new_v4());
+        let binding = fixture.capture().unwrap();
+        let refusal = fixture.return_refuses(binding);
+        assert!(refusal.contains("acknowledgement budget"), "{refusal}");
+        assert!(!owner.0.is_completed(), "preflight must precede provider teardown");
+        let state = fixture.host.lock().unwrap();
+        assert!(!state.chats[&source.id].returning_terminal);
+        assert!(state.terminals.is_empty());
+        assert!(state.chat_handoffs.is_empty());
+    }
+
 }
