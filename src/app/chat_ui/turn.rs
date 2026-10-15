@@ -392,9 +392,10 @@ pub(super) fn same_structure(
     previous.len() == next.len() && previous.iter().zip(next).all(|(old, new)| {
         std::sync::Arc::ptr_eq(old, new) || (
             old.id == new.id && old.role == new.role && old.at == new.at && old.started_at == new.started_at
-            && matches!((&old.content, &new.content),
+            && (matches!((&old.content, &new.content),
                 (ItemContent::Text { thinking: a, phase: ap, .. }, ItemContent::Text { thinking: b, phase: bp, .. })
-                if a == b && ap == bp && renders(&old.content) == renders(&new.content)))
+                if a == b && ap == bp && renders(&old.content) == renders(&new.content))
+                || old.content == new.content)))
     })
 }
 
