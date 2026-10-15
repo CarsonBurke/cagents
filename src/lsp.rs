@@ -4863,6 +4863,7 @@ mod tests {
         method: String,
         id: Option<i64>,
         params: Value,
+        result: Option<Value>,
     }
 
     /// What the fake server's writer task puts on the wire.
@@ -5018,6 +5019,7 @@ mod tests {
                         .to_owned(),
                     id: message.get("id").and_then(Value::as_i64),
                     params: message.get("params").cloned().unwrap_or(Value::Null),
+                    result:message.get("result").cloned(),
                 };
                 reader_log.lock().expect("fake log").push(incoming.clone());
                 for reply in handler(&incoming) {
@@ -8964,4 +8966,22 @@ mod tests {
         let resource: lsp_types::WorkspaceEdit=serde_json::from_value(json!({"documentChanges":[{"kind":"create","uri":"file:///repo/new.rs"}]})).unwrap();assert!(matches!(features::convert_workspace_edit(&store,resource,None),Err(LspError::Unsupported(_))));
         assert_eq!(features::configuration(&json!({"rust-analyzer":{"check":{"command":"clippy"}}}),Some("rust-analyzer.check.command")),json!("clippy"));
     }
+
+    #[test]
+    fn server_workspace_edits_wait_for_application_ack_and_configuration_sections(){block_on(async{
+        let (_guard,worktree,file)=workspace();let uri=Url::from_file_path(&file).unwrap();let mut manager=rust_manager();
+        manager.servers[0].configuration=json!({"rust-analyzer":{"check":{"command":"clippy"}}});
+        let slot=install_fake(&mut manager,incremental_capabilities(), |_|vec![]);let events=manager.events();let doc=LspDocumentId(1);
+        manager.open_for_test(doc,&file,&worktree,rust_language(),1,"foo\n");let handle=handle_of(&slot).await;await_ready(&events,doc).await;
+        handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":600,"method":"workspace/applyEdit","params":{"label":"Quick fix","edit":{"changes":{uri.as_str():[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":3}},"newText":"bar"}]}}}}))).unwrap();
+        let id=next_matching(&events,|e|match e{LspEvent::ApplyWorkspaceEdit{id,edit,label,..}=>{assert_eq!(edit.documents.len(),1);assert_eq!(label.as_deref(),Some("Quick fix"));Some(*id)},_=>None}).await;
+        assert!(handle.entries("").iter().all(|e|e.id!=Some(600)),"server must wait for preview approval");
+        manager.respond_workspace_edit(id,true,None);
+        let deadline=tokio::time::Instant::now()+WAIT;
+        loop {if let Some(response)=handle.entries("").into_iter().find(|e|e.id==Some(600)){assert_eq!(response.result.unwrap()["applied"],json!(true));break;}assert!(tokio::time::Instant::now()<deadline);tokio::time::sleep(Duration::from_millis(2)).await;}
+        handle.push.send(Outgoing::Message(json!({"jsonrpc":"2.0","id":601,"method":"workspace/configuration","params":{"items":[{"section":"rust-analyzer.check"},{"section":"missing"}]}}))).unwrap();
+        let deadline=tokio::time::Instant::now()+WAIT;
+        loop {if let Some(response)=handle.entries("").into_iter().find(|e|e.id==Some(601)){assert_eq!(response.result.unwrap(),json!([{"command":"clippy"},null]));break;}assert!(tokio::time::Instant::now()<deadline);tokio::time::sleep(Duration::from_millis(2)).await;}
+        manager.begin_shutdown().await;
+    });}
 }
