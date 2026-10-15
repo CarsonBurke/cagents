@@ -159,6 +159,7 @@ impl Cagents {
                 return Task::none();
             }
         };
+        self.setup_ui.uncertain_receipts.remove(&worktree);
         if prepared.skipped {
             self.setup_ui.statuses.insert(worktree, WorktreeSetupStatus::Skipped);
             self.refresh_worktree_setup_rows();
