@@ -857,6 +857,26 @@ pub(super) fn process(
             Ok(Reply::Listed(summaries))
         }
         Operation::Close(id) => close(host, &authority, id).map(Reply::Closed),
+        Operation::InspectPresentationRepair(id) => {
+            let origin = origin(host, &authority)?;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            let target = registry.lock().unwrap_or_else(|p| p.into_inner())
+                .inspect_presentation_repair(&origin, id)?;
+            Ok(Reply::PresentationRepair(target))
+        }
+        Operation::ConfirmPresentationRepair { observed } => {
+            let origin = origin(host, &authority)?;
+            let id = observed.agent.id;
+            let gate = agent_gate(host, id);
+            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let registry = registry(host)?;
+            let removed = registry.lock().unwrap_or_else(|p| p.into_inner())
+                .confirm_presentation_repair(&origin, &observed)?;
+            if removed { announce(host, &registry); }
+            Ok(Reply::PresentationRemoved { agent: id, removed })
+        }
         Operation::Directory(scope) => {
             directory::read(host, &authority, scope).map(Reply::Directory)
         }

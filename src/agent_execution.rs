@@ -434,6 +434,26 @@ pub struct Accepted {
     pub created: bool,
 }
 
+/// A currently observed presentation, not proof of its historical execution
+/// generation. Confirming this target only removes the shown ended pane.
+/// Clients must display that distinction and obtain explicit owner consent.
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+pub struct PresentationRepairTarget {
+    pub registry: uuid::Uuid,
+    pub agent: Agent,
+    pub scope: Placement,
+    pub view_revision: u64,
+    pub pane: crate::workspace_model::views::Pane,
+}
+
+impl std::fmt::Debug for PresentationRepairTarget {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("PresentationRepairTarget")
+            .field("agent", &self.agent.id).field("pane", &self.pane.id)
+            .field("view_revision", &self.view_revision).finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum Operation {
     Submit(Submit),
@@ -464,6 +484,10 @@ pub enum Operation {
     PeekInbox(mailbox::Inbox),
     /// Settle exact received IDs in the authenticated recipient's mailbox.
     AcknowledgeInbox(mailbox::Receipt),
+    /// Observe an ended managed pane whose historical generation is unknown.
+    InspectPresentationRepair(AgentId),
+    /// Explicit presentation-only consent, fenced by the exact observation.
+    ConfirmPresentationRepair { observed: PresentationRepairTarget },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -528,6 +552,8 @@ pub enum Reply {
     Sent(mailbox::Sent),
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
+    PresentationRepair(Option<PresentationRepairTarget>),
+    PresentationRemoved { agent: AgentId, removed: bool },
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
