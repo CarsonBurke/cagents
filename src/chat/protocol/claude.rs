@@ -10235,7 +10235,8 @@ for line in sys.stdin:
         let spec = ProcessSpec::from(&recipe);
         let mut initial = Step {events:vec![Event::Ready(true),Event::Status {busy,detail:String::new()},
             Event::Capabilities(capabilities),Event::Models {models,selected:Some("launch-model".into()),reasoning:Some("low".into())},
-            Event::PermissionMode(Some("plan".into())),Event::FastMode(chat::FastMode::default())],..Default::default()};
+            Event::PermissionMode(Some("plan".into()))],..Default::default()};
+        if let Some(speed)=speed { initial.events.push(Event::FastMode(speed)); }
         let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
         let handle = chat::runtime::LocalHandle::start(spec,Box::new(adapter),initial,store,None,|_|{}).unwrap();
         (handle, log)
@@ -10266,12 +10267,14 @@ for line in sys.stdin:
         let directory=tempfile::tempdir().unwrap();
         let (missing, _)=start_with_speed(directory.path(),"missing-speed",policy(),false,None);
         assert!(!missing.snapshot(None).unwrap().capabilities.fast_mode);
+        assert!(missing.snapshot(None).unwrap().fast_mode.is_none());
         assert!(missing.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap_err().contains("not confirmed all"));
         assert!(!missing.is_completed()); missing.close().unwrap();
         let (disabled, _)=start_with_speed(directory.path(),"disabled-speed",policy(),false,Some(chat::FastMode {
             state:chat::FastModeState::Off,disabled_reason:Some("org_disabled".into()),
         }));
         assert!(!disabled.snapshot(None).unwrap().capabilities.fast_mode);
+        assert_eq!(disabled.snapshot(None).unwrap().fast_mode,Some(chat::FastMode {state:chat::FastModeState::Off,disabled_reason:Some("org_disabled".into())}));
         let captured=disabled.capture_continuation_options(Instant::now()+Duration::from_secs(5)).unwrap().unwrap();
         assert_eq!(captured.controls().fast_mode,Some(false));
         assert!(!disabled.is_completed()); disabled.close().unwrap();
