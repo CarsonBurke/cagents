@@ -26,6 +26,9 @@ struct VisualLine {
     height: f32,
 }
 
+#[derive(Debug)]
+struct SourceVisual { start: usize, end: usize, max_end: usize, visual: usize }
+
 /// Immutable prelaid glyphs, with the redundant shaping cache released.
 ///
 /// Created by [`Buffer::into_layout_snapshot`]. Width, fonts, attributes and
@@ -36,6 +39,7 @@ struct VisualLine {
 pub struct LayoutSnapshot {
     lines: Vec<SnapshotLine>,
     visual: Vec<VisualLine>,
+    source_visual: Vec<SourceVisual>,
     metrics: Metrics,
     width: Option<f32>,
     height: f32,
@@ -63,7 +67,15 @@ impl LayoutSnapshot {
             }
             source_start += line.text.len() + line.ending.as_str().len();
         }
-        Self { lines, visual, metrics, width, height: top }
+        let mut source_visual: Vec<_> = visual.iter().enumerate().filter_map(|(index, row)| {
+            let glyphs = &lines[row.physical].layout[row.layout].glyphs;
+            Some(SourceVisual { start: row.source_start + glyphs.iter().map(|glyph| glyph.start).min()?,
+                end: row.source_start + glyphs.iter().map(|glyph| glyph.end).max()?, max_end: 0, visual: index })
+        }).collect();
+        source_visual.sort_by_key(|row| row.start);
+        let mut max_end = 0;
+        for row in &mut source_visual { max_end = max_end.max(row.end); row.max_end = max_end; }
+        Self { lines, visual, source_visual, metrics, width, height: top }
     }
 
     pub fn height(&self) -> f32 { self.height }
@@ -73,6 +85,7 @@ impl LayoutSnapshot {
     /// allocator overhead. This is not a process RSS measurement.
     pub fn retained_bytes(&self) -> usize {
         self.visual.capacity() * core::mem::size_of::<VisualLine>()
+            + self.source_visual.capacity() * core::mem::size_of::<SourceVisual>()
             + self.lines.capacity() * core::mem::size_of::<SnapshotLine>()
             + self.lines.iter().map(|line| line.text.capacity()
                 + line.layout.capacity() * core::mem::size_of::<LayoutLine>()
@@ -119,6 +132,17 @@ impl LayoutSnapshot {
         Some(LayoutProjection { buffer, source_starts, visual: range, top })
     }
 
+    /// Visual rows whose source-cluster envelope contains a byte. Candidates
+    /// are found through an interval index; a caller must test actual clusters
+    /// because mixed-direction visual rows may have holes in their envelopes.
+    pub fn source_visual_lines(&self, byte: usize) -> impl Iterator<Item = usize> + '_ {
+        let upper = self.source_visual.partition_point(|row| row.start <= byte);
+        self.source_visual[..upper].iter().rev().take_while(move |row| row.max_end > byte)
+            .filter(move |row| row.end > byte).map(|row| row.visual)
+    }
+    pub fn line_top(&self, visual: usize) -> Option<f32> { self.visual.get(visual).map(|row| row.top) }
+    pub fn line_height(&self, visual: usize) -> Option<f32> { self.visual.get(visual).map(|row| row.height) }
+
     /// Logical source coordinate of each cluster, paired with its original
     /// glyph geometry. Useful to compare projections and to build source hits.
     pub fn glyphs(&self, visual: usize) -> Option<impl Iterator<Item = (usize, &LayoutGlyph)>> {
@@ -129,6 +153,7 @@ impl LayoutSnapshot {
 
 impl LayoutProjection {
     pub fn buffer(&self) -> &Buffer { &self.buffer }
+    pub fn source_starts(&self) -> &[usize] { &self.source_starts }
     /// Consume into the ordinary buffer type for an immutable Arc/Weak renderer.
     pub fn into_buffer(self) -> Buffer { self.buffer }
     pub fn top(&self) -> f32 { self.top }
