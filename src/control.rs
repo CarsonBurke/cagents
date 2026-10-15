@@ -327,7 +327,7 @@ pub enum ProjectCommand {
 pub enum ChannelCommand {
     /// Move a live pane, hosted session or agent into another channel.
     Move {
-        /// Pane ID, session ID, agent ID or unique agent name.
+        /// Full pane/session ID, agent ID or unique prefix, or unique agent name.
         target: String,
         /// Destination channel in the same project.
         #[arg(long)]

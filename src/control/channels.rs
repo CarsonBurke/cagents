@@ -16,30 +16,52 @@ fn find_pane<'a>(
     model: &'a WorkspaceModel,
     target: &str,
 ) -> Result<(&'a View, &'a Pane), AppError> {
-    let agents = model
+    let target = target.trim().to_ascii_lowercase();
+    if target.is_empty() {
+        return Err(AppError::new(
+            "not_found",
+            "A pane or agent handle is empty",
+        ));
+    }
+    let open = model
         .agents
         .iter()
-        .filter(|agent| {
-            !agent.closed
-                && (agent.id.to_string().eq_ignore_ascii_case(target)
-                    || agent
-                        .name
-                        .as_ref()
-                        .is_some_and(|name| name.eq_ignore_ascii_case(target)))
-        })
+        .filter(|agent| !agent.closed)
         .collect::<Vec<_>>();
+    // Match the existing agent commands: exact names, whole IDs, then unique
+    // ID prefixes. Never treat a name prefix or substring as a handle.
+    let named = open
+        .iter()
+        .copied()
+        .filter(|agent| agent.name.as_deref() == Some(target.as_str()))
+        .collect::<Vec<_>>();
+    let exact = open
+        .iter()
+        .copied()
+        .filter(|agent| agent.id.to_string() == target)
+        .collect::<Vec<_>>();
+    let agents = if !named.is_empty() {
+        named
+    } else if !exact.is_empty() {
+        exact
+    } else {
+        open.into_iter()
+            .filter(|agent| agent.id.to_string().starts_with(&target))
+            .collect()
+    };
     if agents.len() > 1 {
         return Err(AppError::new(
             "ambiguous",
-            "The agent name is ambiguous; use its full ID",
+            "The agent handle is ambiguous; use its full ID",
         ));
     }
+    let target = target.as_str();
     let mut matches = model.views.iter().flat_map(|view| {
         let agents = &agents;
         view.panes.iter().filter_map(move |pane| {
             let session = session_id(pane);
-            (pane.id.to_string().eq_ignore_ascii_case(target)
-                || session.is_some_and(|id| id.to_string().eq_ignore_ascii_case(target))
+            (pane.id.to_string() == target
+                || session.is_some_and(|id| id.to_string() == target)
                 || agents.iter().any(|agent| {
                     session.is_some_and(|id| {
                         agent
@@ -248,6 +270,7 @@ mod tests {
             pane.id.to_string().to_uppercase(),
             session_id(&pane).unwrap().to_string(),
             model.agents[0].id.to_string(),
+            model.agents[0].id.to_string()[..8].to_owned(),
             "WORKER".into(),
         ];
         for target in targets {
@@ -281,6 +304,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn agent_handles_require_unique_prefixes_and_prefer_exact_names() {
+        let (mut model, pane, _) = fixture();
+        model.agents[0].id = "1a2b3c4d-0000-4000-8000-000000000001".parse().unwrap();
+        assert_eq!(find_pane(&model, " 1A2B3C4D ").unwrap().1, &pane);
+        let mut other = model.agents[0].clone();
+        other.id = "1a2b9999-0000-4000-8000-000000000002".parse().unwrap();
+        other.name = None;
+        let mut other_pane = pane.clone();
+        other_pane.id = CardId::new();
+        let CardKind::Terminal(session) = &mut other_pane.kind else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        other.session = Some(HostedSession::Terminal(session.clone()));
+        model.views[0].panes.push(other_pane.clone());
+        model.agents.push(other);
+        assert_eq!(find_pane(&model, "1a2b").unwrap_err().kind, "ambiguous");
+        assert_eq!(find_pane(&model, "1a2b3c4d").unwrap().1, &pane);
+        assert_eq!(find_pane(&model, "1a2b9999").unwrap().1, &other_pane);
+        assert_eq!(
+            find_pane(&model, &model.agents[0].id.to_string())
+                .unwrap()
+                .1,
+            &pane
+        );
+        for missing in ["1a2bffff", "0000-4000-8000", "work", " "] {
+            assert_eq!(find_pane(&model, missing).unwrap_err().kind, "not_found");
+        }
+        model.agents[1].name = Some("1a2b".into());
+        assert_eq!(find_pane(&model, "1a2b").unwrap().1, &other_pane);
+        model.agents[1].closed = true;
+        assert_eq!(find_pane(&model, "1a2b").unwrap().1, &pane);
+    }
+
     fn envelope(request_id: u64, message: ServerMessage) -> ServerEnvelope {
         ServerEnvelope {
             version: PROTOCOL_VERSION,
@@ -309,7 +367,7 @@ mod tests {
     fn channel_move_rebases_a_revision_conflict_and_reports_confirmed_placement_without_respawn() {
         let (mut model, pane, to) = fixture();
         let original = pane.clone();
-        let target = model.agents[0].id.to_string();
+        let target = model.agents[0].id.to_string()[..8].to_owned();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         server_stream
             .set_read_timeout(Some(Duration::from_secs(5)))
