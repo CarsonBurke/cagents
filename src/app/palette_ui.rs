@@ -6,6 +6,7 @@ pub(super) struct State {
     recording: Option<SettingsField>,
     query: Option<String>,
     selected: usize,
+    move_pane: Option<CardId>,
 }
 impl State {
     pub(super) fn is_open(&self) -> bool {
@@ -16,6 +17,7 @@ impl State {
 pub enum Action {
     Record(SettingsField),
     Open,
+    MovePane(CardId),
     Close,
     Query(String),
     Run(MessageBox),
@@ -42,13 +44,23 @@ impl Cagents {
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
                 self.palette.selected = 0;
+                self.palette.move_pane = None;
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
                     .chain(self.reveal_palette_selection())
             }
+            Action::MovePane(card) => {
+                if self.workspace_inputs_blocked() || self.pane_move_destinations(card).is_empty() {
+                    return Task::none();
+                }
+                let task = self.update_palette(Action::Open);
+                self.palette.move_pane = Some(card);
+                task
+            }
             Action::Close => {
                 self.palette.recording = None;
                 self.palette.query = None;
+                self.palette.move_pane = None;
                 self.workspace.focused().map_or_else(Task::none, |card| {
                     iced::widget::operation::focus(self.card_keyboard_focus(card))
                         .map(cosmic::Action::App)
@@ -75,6 +87,7 @@ impl Cagents {
 
     fn run_palette_command(&mut self, message: Message) -> Task<Message> {
         self.palette.query = None;
+        self.palette.move_pane = None;
         let command = self.update(message);
         // A command can move focus to another pane synchronously. Restore
         // that current pane before running the command's explicit focus
@@ -200,6 +213,9 @@ impl Cagents {
     }
 
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
+        if let Some(card) = self.palette.move_pane {
+            return self.filter_palette_entries(self.pane_move_palette_entries(card));
+        }
         let mut entries: Vec<_> = workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
             .iter()
             .filter(|descriptor| descriptor.action != Command::CommandPalette)
@@ -229,6 +245,9 @@ impl Cagents {
                 ));
             }
         }
+        if let Some(card) = self.workspace.focused() {
+            entries.extend(self.pane_move_palette_entries(card));
+        }
         for project in &self.sidebar_model.projects {
             for channel in &project.channels {
                 entries.push((
@@ -251,6 +270,18 @@ impl Cagents {
                 ));
             }
         }
+        self.filter_palette_entries(entries)
+    }
+
+    fn pane_move_palette_entries(&self, card: CardId) -> Vec<(String, String, Message)> {
+        self.pane_move_destinations(card).into_iter().map(|channel| (
+            format!("Move pane to channel: {}", self.pane_move_destination_label(channel)),
+            String::new(),
+            Message::MovePaneToChannel { card, channel: channel.id },
+        )).collect()
+    }
+
+    fn filter_palette_entries(&self, mut entries: Vec<(String, String, Message)>) -> Vec<(String, String, Message)> {
         let query = self
             .palette
             .query
@@ -281,7 +312,9 @@ impl Cagents {
         }
         let query = self.palette.query.as_ref()?;
         let input =
-            crate::ui_controls::field::search("Search commands, panes and workspaces", query)
+            crate::ui_controls::field::search(if self.palette.move_pane.is_some() {
+                "Move pane to channel…"
+            } else { "Search commands, panes and workspaces" }, query)
                 .id(widget::Id::new("palette.query"))
                 .on_input(|query| Message::Palette(Action::Query(query)));
         let entries = self.palette_entries();
@@ -308,7 +341,9 @@ impl Cagents {
             })
             .collect();
         let rows = if rows.is_empty() {
-            widget::column::with_children(vec![design::caption("No matching commands").into()])
+            widget::column::with_children(vec![design::caption(if self.palette.move_pane.is_some() {
+                "No matching channels"
+            } else { "No matching commands" }).into()])
         } else {
             widget::column::with_children(rows)
         };

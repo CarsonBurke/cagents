@@ -55,6 +55,9 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   session keeps running; opening the destination channel shows the same pane.
   The pane stays in its source until the move succeeds. If the destination no
   longer exists, the source stays open and the app shows the refusal.
+  The tab's context menu also lists eligible channels; with many destinations,
+  **Move to channel…** opens a searchable picker. The command palette lists
+  the focused pane's channel destinations too.
 - Drag a project header to reorder projects; the order survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
