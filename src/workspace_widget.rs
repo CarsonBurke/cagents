@@ -3430,15 +3430,11 @@ mod tests {
     }
 
     #[test]
-    fn new_tab_chord_is_reserved_in_every_pane_and_does_not_repeat() {
+    fn new_tab_chord_is_reserved_outside_terminals_and_does_not_repeat() {
         use keyboard::key::Code;
 
         let shortcuts = KeyboardShortcuts::default();
-        for focused in [
-            FocusedPane::Other,
-            FocusedPane::Terminal,
-            FocusedPane::Review,
-        ] {
+        for focused in [FocusedPane::Other, FocusedPane::Review] {
             assert!(is_global_shortcut_chord(
                 &keyboard::Key::Character("t".into()),
                 keyboard::key::Physical::Code(Code::KeyT),

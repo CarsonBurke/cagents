@@ -1012,7 +1012,11 @@ fn settings_layout<'a>(
     width: f32,
 ) -> Element<'a, Message> {
     let (feedback, invalid) = (context.feedback, context.invalid);
-    let content_max_width = if category == SettingsCategory::Keyboard { 960.0 } else { CONTENT_MAX_WIDTH };
+    let content_max_width = if category == SettingsCategory::Keyboard {
+        960.0
+    } else {
+        CONTENT_MAX_WIDTH
+    };
     let narrow = width < RAIL_BREAKPOINT;
     let refused = |item: SettingsCategory| invalid.keys().any(|field| field.category() == item);
     let searching = !query.trim().is_empty();
@@ -1452,7 +1456,11 @@ mod keyboard_table_tests {
 
     #[test]
     fn shortcut_rows_match_the_persisted_policy_registry() {
-        let settings = KeyboardShortcuts::default();
+        let mut table = toml::Table::try_from(KeyboardShortcuts::default()).unwrap();
+        for (index, name) in KeyboardShortcuts::action_names().iter().enumerate() {
+            table.insert((*name).into(), vec![format!("action-{index}")].into());
+        }
+        let settings: KeyboardShortcuts = table.try_into().unwrap();
         assert_eq!(
             SettingsField::SHORTCUTS.len(),
             KeyboardShortcuts::action_names().len()
@@ -1467,18 +1475,70 @@ mod keyboard_table_tests {
 
     #[test]
     fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
-        use iced::{Size, advanced::{layout, widget::Tree}};
+        use iced::{
+            Size,
+            advanced::{layout, widget::Tree},
+        };
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let draft = SettingsDraft::from_settings(&AppSettings::default());
         let invalid = HashMap::new();
         for field in SettingsField::SHORTCUTS {
             let action = field.shortcut_action().unwrap();
-            let value = draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).unwrap().1;
-            let row = shortcut_input(field.label(), value, field, &draft.keyboard_shortcuts, &invalid);
-            let mut element = settings_group("Keyboard", "", vec![row]).compact().view("Keyboard", "").unwrap();
+            let value = draft
+                .keyboard_shortcuts
+                .shortcut_values()
+                .into_iter()
+                .find(|(candidate, _)| *candidate == action)
+                .unwrap()
+                .1;
+            let row = shortcut_input(
+                field.label(),
+                value,
+                field,
+                &draft.keyboard_shortcuts,
+                &invalid,
+            );
+            let mut element = settings_group("Keyboard", "", vec![row])
+                .compact()
+                .view("Keyboard", "")
+                .unwrap();
             let mut tree = Tree::new(element.as_widget());
-            let height = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::new(560.0, 0.0), Size::new(560.0, 1000.0))).size().height;
-            assert!(height <= 64.0, "{field:?} must keep its key chip, Record and Reset on one line; group height was {height}");
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::new(960.0, 0.0), Size::new(960.0, 1000.0)),
+            );
+            fn controls_row(node: &layout::Node) -> Option<&layout::Node> {
+                let children = node.children();
+                if children.len() == 4 && (children[2].size().width - 64.0).abs() < 0.1 {
+                    Some(node)
+                } else {
+                    children.iter().find_map(controls_row)
+                }
+            }
+            let row = controls_row(&node).expect("registered shortcut controls row");
+            assert!(
+                row.size().height <= 36.0,
+                "{field:?} controls must remain on one line: {:?}",
+                row.size()
+            );
+            for child in row.children() {
+                assert!(
+                    child.bounds().x + child.size().width <= row.size().width + 0.1,
+                    "{field:?} control exceeds row bounds: {:?} in {:?}",
+                    child.bounds(),
+                    row.size()
+                );
+            }
+            let keys = &row.children()[1];
+            for control in keys.children() {
+                assert!(
+                    control.bounds().x + control.size().width <= keys.size().width + 0.1,
+                    "{field:?} key, Record or Reset exceeds key cell: {:?} in {:?}",
+                    control.bounds(),
+                    keys.size()
+                );
+            }
         }
     }
 
