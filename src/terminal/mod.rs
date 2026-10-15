@@ -2,7 +2,10 @@
 pub(crate) mod holder;
 #[cfg(feature = "host")]
 pub(crate) mod reactor;
+mod daemon_start;
+#[cfg(any(feature = "ui", feature = "host"))]
 mod hosted;
+#[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod transport;
 pub mod ipc;
 mod search;
@@ -26,9 +29,9 @@ mod worker;
 pub(crate) const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 
-pub use hosted::{
-    HostedTerminalHandle, HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for,
-};
+pub use daemon_start::{HostedTerminalStartError, ensure_daemon_ready, ensure_daemon_ready_for};
+#[cfg(any(feature = "ui", feature = "host"))]
+pub use hosted::HostedTerminalHandle;
 pub use snapshot::{
     CellSnapshot, CellStyle, CellText, CursorShape, CursorSnapshot, HistoryPosition, RenderSnapshot, Rgb,
     RowSnapshot, ScrollSnapshot, Underline,
