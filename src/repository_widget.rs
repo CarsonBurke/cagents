@@ -17,11 +17,14 @@ mod diff_actions;
 pub use diff_actions::DiffPresentationCommand;
 mod diff_layout;
 mod diff_mutations;
-pub use diff_mutations::{Capture as DiffMutationCapture, Prepared as PreparedDiffMutation, Request as DiffMutationRequest};
+pub use diff_mutations::{
+    Capture as DiffMutationCapture, Prepared as PreparedDiffMutation,
+    Request as DiffMutationRequest,
+};
 mod preview;
 mod root_admission;
-pub use root_admission::{RootFilePreparation, RootFileAdmission};
 use diff_layout::{DiffLayout, DisplayRow, RowOffsets};
+pub use root_admission::{RootFileAdmission, RootFilePreparation};
 
 pub use text_editor::{Action as EditorAction, Edit as EditorEdit};
 
@@ -313,14 +316,28 @@ pub struct RepositoryCommandTarget {
 
 impl std::fmt::Debug for RepositoryCommandTarget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RepositoryCommandTarget").field("identity", &self.identity).field("editor_revision", &self.editor_revision).field("layout_revision", &self.layout_revision).finish_non_exhaustive()
+        f.debug_struct("RepositoryCommandTarget")
+            .field("identity", &self.identity)
+            .field("editor_revision", &self.editor_revision)
+            .field("layout_revision", &self.layout_revision)
+            .finish_non_exhaustive()
     }
 }
 impl PartialEq for RepositoryCommandTarget {
     fn eq(&self, other: &Self) -> bool {
-        self.identity == other.identity && self.editor_revision == other.editor_revision && self.cursor == other.cursor && self.surface == other.surface && self.basis == other.basis && self.mode == other.mode && self.layout_revision == other.layout_revision && self.selection == other.selection && match (&self.model, &other.model) {
-            (Some(left), Some(right)) => Arc::ptr_eq(left, right), (None, None) => true, _ => false,
-        }
+        self.identity == other.identity
+            && self.editor_revision == other.editor_revision
+            && self.cursor == other.cursor
+            && self.surface == other.surface
+            && self.basis == other.basis
+            && self.mode == other.mode
+            && self.layout_revision == other.layout_revision
+            && self.selection == other.selection
+            && match (&self.model, &other.model) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 impl Eq for RepositoryCommandTarget {}
@@ -333,15 +350,29 @@ impl Eq for RepositoryCommandTarget {}
 /// Deferred text for a protocol change. Ordinary edits retain only an
 /// immutable root; full serialization belongs to the session debounce.
 #[derive(Debug, Clone)]
-pub enum LspChangeText { Text(String), Snapshot(text_editor::TextSnapshot) }
-impl From<String> for LspChangeText { fn from(text:String)->Self {Self::Text(text)} }
-impl From<&str> for LspChangeText { fn from(text:&str)->Self {Self::Text(text.into())} }
+pub enum LspChangeText {
+    Text(String),
+    Snapshot(text_editor::TextSnapshot),
+}
+impl From<String> for LspChangeText {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+impl From<&str> for LspChangeText {
+    fn from(text: &str) -> Self {
+        Self::Text(text.into())
+    }
+}
 impl PartialEq for LspChangeText {
-    fn eq(&self, other:&Self)->bool {match (self,other) {
-        (Self::Text(left),Self::Text(right)) => left == right,
-        (Self::Snapshot(left),Self::Snapshot(right)) => left.same_text(right),
-        (Self::Snapshot(source),Self::Text(text)) | (Self::Text(text),Self::Snapshot(source)) => source.text().as_ref() == text,
-    }}
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(left), Self::Text(right)) => left == right,
+            (Self::Snapshot(left), Self::Snapshot(right)) => left.same_text(right),
+            (Self::Snapshot(source), Self::Text(text))
+            | (Self::Text(text), Self::Snapshot(source)) => source.text().as_ref() == text,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -367,11 +398,23 @@ pub enum LspIntent {
 
 /// File-surface commands share availability with their mounted toolbar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditorSurfaceCommand { Save, DiscardEdits, Edit, Preview, Diff }
+pub enum EditorSurfaceCommand {
+    Save,
+    DiscardEdits,
+    Edit,
+    Preview,
+    Diff,
+}
 
 /// Runtime-side feature availability; server capabilities stay with LspManager.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EditorLanguageFeature { Rename, FormatDocument, FormatSelection, CodeActions, Signature }
+pub enum EditorLanguageFeature {
+    Rename,
+    FormatDocument,
+    FormatSelection,
+    CodeActions,
+    Signature,
+}
 
 #[derive(Debug, Clone)]
 pub enum EditorLspAction {
@@ -379,7 +422,9 @@ pub enum EditorLspAction {
     RenameDraft(String),
     SubmitRename(String),
     CancelRename,
-    Format { selection: bool },
+    Format {
+        selection: bool,
+    },
     CodeActions,
     CodeActionsAt(Option<LspPosition>),
     CodeActionNext(bool),
@@ -404,7 +449,10 @@ pub enum EditorLspAction {
     Dismiss,
 }
 
-struct EditorCodeAction { title: String, disabled: Option<String> }
+struct EditorCodeAction {
+    title: String,
+    disabled: Option<String>,
+}
 
 #[derive(Default)]
 struct EditorLanguageState {
@@ -664,19 +712,65 @@ pub enum RepositoryAction {
         saved_text: String,
         result: Result<SaveOutcome, FileIoError>,
     },
-    OpenLocation { card: CardId, path: PathBuf, line: usize, column: usize },
-    OpenGoToLine { card: CardId },
-    GoToLineChanged { card: CardId, value: String },
-    SubmitGoToLine { card: CardId },
-    CloseGoToLine { card: CardId },
-    NavigateLocation { card: CardId, forward: bool },
-    DiskMetadata { identity: AsyncIdentity, ticket: u64, result: Result<Option<crate::editor_reload::Stamp>, String> },
-    ComparisonMetadata { identity: AsyncIdentity, ticket: u64, basis: DiffBasis, result: Result<crate::repository::RepositoryMetadataStamp, String> },
-    DiskLoaded { identity: AsyncIdentity, ticket: u64, stamp: crate::editor_reload::Stamp, baseline: blake3::Hash, result: Result<crate::editor_reload::Version, String> },
-    CompareDisk { card: CardId },
-    DiskComparisonLoaded { identity: AsyncIdentity, revision: u64, disk_hash: blake3::Hash, model: Option<DiffModel> },
-    KeepMine { card: CardId },
-    BranchBasisRefreshed { identity: AsyncIdentity, request: u64, previous: DiffBasis, result: Result<ResolvedBasis, String> },
+    OpenLocation {
+        card: CardId,
+        path: PathBuf,
+        line: usize,
+        column: usize,
+    },
+    OpenGoToLine {
+        card: CardId,
+    },
+    GoToLineChanged {
+        card: CardId,
+        value: String,
+    },
+    SubmitGoToLine {
+        card: CardId,
+    },
+    CloseGoToLine {
+        card: CardId,
+    },
+    NavigateLocation {
+        card: CardId,
+        forward: bool,
+    },
+    DiskMetadata {
+        identity: AsyncIdentity,
+        ticket: u64,
+        result: Result<Option<crate::editor_reload::Stamp>, String>,
+    },
+    ComparisonMetadata {
+        identity: AsyncIdentity,
+        ticket: u64,
+        basis: DiffBasis,
+        result: Result<crate::repository::RepositoryMetadataStamp, String>,
+    },
+    DiskLoaded {
+        identity: AsyncIdentity,
+        ticket: u64,
+        stamp: crate::editor_reload::Stamp,
+        baseline: blake3::Hash,
+        result: Result<crate::editor_reload::Version, String>,
+    },
+    CompareDisk {
+        card: CardId,
+    },
+    DiskComparisonLoaded {
+        identity: AsyncIdentity,
+        revision: u64,
+        disk_hash: blake3::Hash,
+        model: Option<DiffModel>,
+    },
+    KeepMine {
+        card: CardId,
+    },
+    BranchBasisRefreshed {
+        identity: AsyncIdentity,
+        request: u64,
+        previous: DiffBasis,
+        result: Result<ResolvedBasis, String>,
+    },
     Reload {
         card: CardId,
     },
@@ -713,10 +807,27 @@ pub enum RepositoryAction {
         request: u64,
         result: Result<crate::editor::BinaryPreview, FileIoError>,
     },
-    EditorFilePrepared { identity: AsyncIdentity, preparation: RootFilePreparation },
-    EditorFileAdmitted { identity: AsyncIdentity, admission: RootFileAdmission },
-    ConfiguredFileLoaded { identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides, root: Option<crate::editor::FileRootIdentity> },
-    EditorRootRebound { identity: AsyncIdentity, source: PathBuf, ticket: u64, previous: crate::editor::FileRootIdentity, result: Result<crate::editor::FileRootIdentity, String> },
+    EditorFilePrepared {
+        identity: AsyncIdentity,
+        preparation: RootFilePreparation,
+    },
+    EditorFileAdmitted {
+        identity: AsyncIdentity,
+        admission: RootFileAdmission,
+    },
+    ConfiguredFileLoaded {
+        identity: AsyncIdentity,
+        result: Result<LoadedFile, FileIoError>,
+        indentation: crate::editor_indent::Overrides,
+        root: Option<crate::editor::FileRootIdentity>,
+    },
+    EditorRootRebound {
+        identity: AsyncIdentity,
+        source: PathBuf,
+        ticket: u64,
+        previous: crate::editor::FileRootIdentity,
+        result: Result<crate::editor::FileRootIdentity, String>,
+    },
     OpenWorkingFileLocation {
         identity: AsyncIdentity,
         line: usize,
@@ -1223,11 +1334,18 @@ impl EditorDocument {
     /// re-parsed at a debounce boundary instead.
     fn apply(&mut self, action: text_editor::Action) -> Applied {
         match action {
-            text_editor::Action::Edit(edit @ (text_editor::Edit::Indent | text_editor::Edit::Unindent)) => {
+            text_editor::Action::Edit(
+                edit @ (text_editor::Edit::Indent | text_editor::Edit::Unindent),
+            ) => {
                 let before = self.content.cursor();
-                let changes = self.content.indent_recorded(matches!(edit, text_editor::Edit::Unindent));
-                if changes.is_empty() { return Applied::Unchanged; }
-                self.history.record_group(changes, before, self.content.cursor(), Instant::now());
+                let changes = self
+                    .content
+                    .indent_recorded(matches!(edit, text_editor::Edit::Unindent));
+                if changes.is_empty() {
+                    return Applied::Unchanged;
+                }
+                self.history
+                    .record_group(changes, before, self.content.cursor(), Instant::now());
                 self.text_changed();
                 Applied::Changed(None)
             }
@@ -1345,10 +1463,13 @@ impl EditorDocument {
     }
 
     fn refresh_dirty(&mut self) {
-        let presence_changed = self.present != self.saved_present
-            || self.presence_id != self.saved_presence_id;
+        let presence_changed =
+            self.present != self.saved_present || self.presence_id != self.saved_presence_id;
         self.dirty = presence_changed || self.history.revision() != self.saved_history_revision;
-        if !presence_changed && self.dirty && self.content.text_snapshot().same_text(&self.saved_snapshot) {
+        if !presence_changed
+            && self.dirty
+            && self.content.text_snapshot().same_text(&self.saved_snapshot)
+        {
             // Signature inequality is constant-time on ordinary edits. Only
             // a possible return to the saved bytes pays for exact equality.
             self.history.adopt_revision(self.saved_history_revision);
@@ -1511,11 +1632,15 @@ impl EditorDocument {
         if let Some(cancel) = &self.diagram_cancel {
             cancel.0.cancel();
         }
-        if !text.is_empty() { self.present = true; }
+        if !text.is_empty() {
+            self.present = true;
+        }
         self.dirty = self.present != self.saved_present
             || self.presence_id != self.saved_presence_id
             || text != self.saved_text;
-        if !self.dirty { self.history.adopt_revision(self.saved_history_revision); }
+        if !self.dirty {
+            self.history.adopt_revision(self.saved_history_revision);
+        }
         self.revision = self.revision.wrapping_add(1).max(1);
     }
 
@@ -1866,8 +1991,13 @@ fn caret_position(
     let snapshot = content.text_snapshot();
     if snapshot.protocol_compatible_lines() {
         let line = snapshot.line(caret.line)?;
-        let column = line.text[..char_boundary(&line.text, caret.column)].chars().count();
-        return Some(LspPosition::new(u32::try_from(caret.line).ok()?, u32::try_from(column).ok()?));
+        let column = line.text[..char_boundary(&line.text, caret.column)]
+            .chars()
+            .count();
+        return Some(LspPosition::new(
+            u32::try_from(caret.line).ok()?,
+            u32::try_from(column).ok()?,
+        ));
     }
     let lines = content.line_count();
     if caret.line >= lines {
@@ -1908,8 +2038,15 @@ fn caret_for_position(
     if snapshot.protocol_compatible_lines() {
         let line_index = usize::try_from(at.line).ok()?;
         let line = snapshot.line(line_index)?;
-        let column = line.text.char_indices().nth(usize::try_from(at.character).ok()?).map_or(line.text.len(), |(byte,_)| byte);
-        return Some(text_editor::Position {line:line_index,column});
+        let column = line
+            .text
+            .char_indices()
+            .nth(usize::try_from(at.character).ok()?)
+            .map_or(line.text.len(), |(byte, _)| byte);
+        return Some(text_editor::Position {
+            line: line_index,
+            column,
+        });
     }
     let lines = content.line_count();
     let trailing_cr = trailing_carriage_return(content);
@@ -2173,7 +2310,11 @@ struct WorkingDiffRefresh {
 }
 
 struct ComparisonMetadataRefresh {
-    stamp: Option<(PathBuf, DiffBasis, crate::repository::RepositoryMetadataStamp)>,
+    stamp: Option<(
+        PathBuf,
+        DiffBasis,
+        crate::repository::RepositoryMetadataStamp,
+    )>,
     probe: Option<u64>,
     next_probe: u64,
     retry_after: Option<Instant>,
@@ -2183,7 +2324,14 @@ struct ComparisonMetadataRefresh {
 
 impl Default for ComparisonMetadataRefresh {
     fn default() -> Self {
-        Self { stamp: None, probe: None, next_probe: 0, retry_after: None, retry_delay: Duration::from_secs(1), error: None }
+        Self {
+            stamp: None,
+            probe: None,
+            next_probe: 0,
+            retry_after: None,
+            retry_delay: Duration::from_secs(1),
+            error: None,
+        }
     }
 }
 
@@ -2191,7 +2339,12 @@ fn same_live_comparison(left: &DiffBasis, right: &DiffBasis) -> bool {
     match (left, right) {
         (DiffBasis::IndexToWorktree, DiffBasis::IndexToWorktree)
         | (DiffBasis::HeadToIndex, DiffBasis::HeadToIndex) => true,
-        (DiffBasis::MergeBaseToHead { base_ref: left, .. }, DiffBasis::MergeBaseToHead { base_ref: right, .. }) => left == right,
+        (
+            DiffBasis::MergeBaseToHead { base_ref: left, .. },
+            DiffBasis::MergeBaseToHead {
+                base_ref: right, ..
+            },
+        ) => left == right,
         _ => false,
     }
 }
@@ -2787,12 +2940,21 @@ impl RepositoryRuntime {
         self.descriptor.selected_file = None;
     }
 
-    pub fn is_read_only_source(&self) -> bool { self.external_source.is_some() }
-
-    pub fn source_tab_path(&self) -> Option<PathBuf> {
-        self.external_source.clone().or_else(|| self.workspace_edit_source()).or_else(|| self.descriptor.selected_file.as_ref().map(|path| self.descriptor.worktree.join(path)))
+    pub fn is_read_only_source(&self) -> bool {
+        self.external_source.is_some()
     }
 
+    pub fn source_tab_path(&self) -> Option<PathBuf> {
+        self.external_source
+            .clone()
+            .or_else(|| self.workspace_edit_source())
+            .or_else(|| {
+                self.descriptor
+                    .selected_file
+                    .as_ref()
+                    .map(|path| self.descriptor.worktree.join(path))
+            })
+    }
 
     /// Hides workbench launch controls in an independent editor window.
     pub fn set_standalone(&mut self, standalone: bool) {
@@ -2977,13 +3139,21 @@ impl RepositoryRuntime {
 
     pub fn set_editor_auto_close(&mut self, enabled: bool) {
         self.editor_auto_close = enabled;
-        if let DocumentState::Editable(document) = &mut self.document { document.content.set_auto_close(enabled); }
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.content.set_auto_close(enabled);
+        }
     }
 
     pub fn set_editor_tab_width(&mut self, width: u16) {
         self.editor_tab_width = width.clamp(1, 16);
         if let DocumentState::Editable(document) = &mut self.document {
-            document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, document.indentation));
+            document
+                .content
+                .configure_indentation(crate::editor_indent::Indentation::detect(
+                    &document.saved_text,
+                    self.editor_tab_width,
+                    document.indentation,
+                ));
         }
     }
 
@@ -3221,7 +3391,11 @@ impl RepositoryRuntime {
     /// that wants its own behaviour still has one: it can intercept
     /// [`RepositoryAction::Clipboard`] before forwarding it here.
     fn clipboard(&mut self, card: CardId, op: ClipboardOp) -> Task<RepositoryAction> {
-        if (self.is_read_only_source() || self.workspace_edit_pending()) && matches!(op, ClipboardOp::Cut | ClipboardOp::Paste) { return Task::none(); }
+        if (self.is_read_only_source() || self.workspace_edit_pending())
+            && matches!(op, ClipboardOp::Cut | ClipboardOp::Paste)
+        {
+            return Task::none();
+        }
         if self.source_surface == SourceSurface::Diff {
             return match op {
                 ClipboardOp::Copy => self.copy_diff(card, crate::diff_interaction::Command::Copy),
@@ -3348,8 +3522,13 @@ impl RepositoryRuntime {
             id: 1,
             identity: identity.clone(),
             revision: 1,
-            history_revision: if content_matches(&document.content, "B\n") { document.history.revision() } else { u64::MAX },
-            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("B\n").text_snapshot(),
+            history_revision: if content_matches(&document.content, "B\n") {
+                document.history.revision()
+            } else {
+                u64::MAX
+            },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("B\n")
+                .text_snapshot(),
             snapshot: "B\n".into(),
             present: true,
             presence_id: 0,
@@ -3439,8 +3618,14 @@ impl RepositoryRuntime {
     #[cfg(test)]
     pub(crate) fn dirty_fixture_at(card: CardId, path: PathBuf) -> Self {
         let mut runtime = Self::dirty_fixture(card);
-        runtime.selected.as_mut().expect("selected fixture file").path = path.clone();
-        let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+        runtime
+            .selected
+            .as_mut()
+            .expect("selected fixture file")
+            .path = path.clone();
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            unreachable!()
+        };
         document.source = path;
         runtime
     }
@@ -3558,7 +3743,8 @@ impl RepositoryRuntime {
                     markdown: false,
                 },
             }),
-        None));
+            None,
+        ));
         (runtime, identity)
     }
 
@@ -3588,8 +3774,11 @@ impl RepositoryRuntime {
     /// replace the recipe but cannot replace another window's local selection.
     pub(crate) fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {
         if let Some(path) = &navigation.external_source {
-            if navigation.project == self.descriptor.project && navigation.worktree == self.descriptor.worktree
-                && path.is_absolute() && self.descriptor.selected_file.is_none() {
+            if navigation.project == self.descriptor.project
+                && navigation.worktree == self.descriptor.worktree
+                && path.is_absolute()
+                && self.descriptor.selected_file.is_none()
+            {
                 self.set_external_source(path.clone());
                 self.restored_navigation = Some(navigation.clone());
             }
@@ -3653,21 +3842,36 @@ impl RepositoryRuntime {
     /// Capture the original authenticated local endpoint before initial load.
     /// This only configures future worker admission; it grants no filesystem
     /// effect or edited-root lease. Retargeting must keep the original endpoint.
-    pub fn set_recovery_endpoint(&mut self, endpoint: crate::recovery_domain::LocalRecoveryEndpoint) {
-        if self.recovery_endpoint.is_none() { self.recovery_endpoint = Some(endpoint); }
+    pub fn set_recovery_endpoint(
+        &mut self,
+        endpoint: crate::recovery_domain::LocalRecoveryEndpoint,
+    ) {
+        if self.recovery_endpoint.is_none() {
+            self.recovery_endpoint = Some(endpoint);
+        }
     }
     /// Share the actual window's bounded custody before initial load. Runtime
     /// clones this SAME ledger; it never creates a separate registration owner.
-    pub fn set_edited_root_admissions(&mut self, admissions: crate::edited_root_admission::SharedEditedRootAdmissions) {
-        if self.edited_root_admissions.is_none() { self.edited_root_admissions = Some(admissions); }
+    pub fn set_edited_root_admissions(
+        &mut self,
+        admissions: crate::edited_root_admission::SharedEditedRootAdmissions,
+    ) {
+        if self.edited_root_admissions.is_none() {
+            self.edited_root_admissions = Some(admissions);
+        }
     }
 
     /// Install the already enrolled ORIGINAL Source before initial load. It
     /// keeps directory-only tabs registered and lets file loads share its lease.
     /// This is not a Git-reader or filesystem-effect grant. Retargeting cannot
     /// overwrite it; a genuine replacement source needs a fresh runtime.
-    pub fn set_original_editor_root(&mut self, root: crate::editor::FileRootIdentity) -> Result<(), crate::editor::FileRootIdentity> {
-        if self.original_editor_root.is_some() || !root.has_active_admission() { return Err(root); }
+    pub fn set_original_editor_root(
+        &mut self,
+        root: crate::editor::FileRootIdentity,
+    ) -> Result<(), crate::editor::FileRootIdentity> {
+        if self.original_editor_root.is_some() || !root.has_active_admission() {
+            return Err(root);
+        }
         self.original_editor_root = Some(root);
         Ok(())
     }
@@ -3675,8 +3879,14 @@ impl RepositoryRuntime {
     pub fn initial_load(&mut self, card: CardId) -> Task<RepositoryAction> {
         if let Some(path) = self.external_source.clone() {
             self.files = FileListState::Ready(Vec::new());
-            let restored = self.restored_navigation.take().and_then(|navigation| navigation.editor);
-            self.selected = Some(RepositoryFile { path: path.clone(), ..RepositoryFile::default() });
+            let restored = self
+                .restored_navigation
+                .take()
+                .and_then(|navigation| navigation.editor);
+            self.selected = Some(RepositoryFile {
+                path: path.clone(),
+                ..RepositoryFile::default()
+            });
             self.document = DocumentState::Loading;
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
@@ -3684,8 +3894,12 @@ impl RepositoryRuntime {
             let identity = self.next_identity(card, path);
             return cosmic::task::future(async move {
                 let source = identity.path.clone();
-                let result = tokio::task::spawn_blocking(move || crate::editor::load_external_source(&source)).await
-                    .map_err(|error| FileIoError::Io(format!("external source worker failed: {error}"))).and_then(|result| result);
+                let result = tokio::task::spawn_blocking(move || {
+                    crate::editor::load_external_source(&source)
+                })
+                .await
+                .map_err(|error| FileIoError::Io(format!("external source worker failed: {error}")))
+                .and_then(|result| result);
                 RepositoryAction::FileLoaded { identity, result }
             });
         }
@@ -3758,7 +3972,10 @@ impl RepositoryRuntime {
             self.files = FileListState::Failed(error.to_string());
             return Task::none();
         }
-        if self.descriptor.worktree != view.worktree { self.undo_lru = crate::editor_navigation::UndoLru::default(); self.locations = crate::editor_navigation::Locations::default(); }
+        if self.descriptor.worktree != view.worktree {
+            self.undo_lru = crate::editor_navigation::UndoLru::default();
+            self.locations = crate::editor_navigation::Locations::default();
+        }
         self.descriptor = view;
         self.retained_viewports.clear();
         self.initial_load(card)
@@ -3767,7 +3984,9 @@ impl RepositoryRuntime {
     /// Poll only visible panes. Keep the mounted list, viewport, and document
     /// intact while discovering external changes, and never overlap a read.
     pub fn refresh_visible(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.is_read_only_source() { return Task::none(); }
+        if self.is_read_only_source() {
+            return Task::none();
+        }
         let diff = self.refresh_diff_visibility(card, true);
         if self.descriptor.selected_file.is_some() || self.file_list_read_outstanding() {
             return diff;
@@ -3780,28 +3999,46 @@ impl RepositoryRuntime {
     /// Called after an explicit relocation updates the descriptor/generation.
     /// Keep the same document and admitted save ticket, but stop outside reads
     /// until a worker proves the new path is the original physical directory.
-    pub(crate) fn rebind_editor_root_after_relocation(&mut self, card: CardId) -> Task<RepositoryAction> {
+    pub(crate) fn rebind_editor_root_after_relocation(
+        &mut self,
+        card: CardId,
+    ) -> Task<RepositoryAction> {
         self.undo_lru = crate::editor_navigation::UndoLru::default();
         self.locations = crate::editor_navigation::Locations::default();
-        self.pending_jump_origin = None; self.window_jump_origin = None;
-        self.disk_poll = None; self.disk_stamp = None; self.disk_comparison = None;
-        let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+        self.pending_jump_origin = None;
+        self.window_jump_origin = None;
+        self.disk_poll = None;
+        self.disk_stamp = None;
+        self.disk_comparison = None;
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
         document.root_unbound = true;
-        document.root_error = Some("Verifying the located checkout before observing or saving this buffer.".into());
+        document.root_error =
+            Some("Verifying the located checkout before observing or saving this buffer.".into());
         let Some(previous) = document.undo_root.clone() else {
             document.root_error = Some("The original editor root is unavailable. Your buffer was kept; reopen the located file before saving.".into());
             return Task::none();
         };
         document.root_rebind_ticket = document.root_rebind_ticket.wrapping_add(1).max(1);
         let ticket = document.root_rebind_ticket;
-        let source = document.source.clone(); let path = document.path.clone();
+        let source = document.source.clone();
+        let path = document.path.clone();
         let identity = self.current_identity(card, path);
-        let worktree = identity.worktree.clone(); let held = previous.clone();
+        let worktree = identity.worktree.clone();
+        let held = previous.clone();
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || held.rebind_same_directory(&worktree))
-                .await.map_err(|error| format!("Editor relocation worker failed: {error}"))
+                .await
+                .map_err(|error| format!("Editor relocation worker failed: {error}"))
                 .and_then(|result| result.map_err(|error| error.to_string()));
-            RepositoryAction::EditorRootRebound { identity, source, ticket, previous, result }
+            RepositoryAction::EditorRootRebound {
+                identity,
+                source,
+                ticket,
+                previous,
+                result,
+            }
         })
     }
 
@@ -3810,7 +4047,10 @@ impl RepositoryRuntime {
     /// capability: all current document/Locate/effect gates still apply.
     pub fn retained_filesystem_root(&self) -> Option<Arc<crate::fs_safety::Root>> {
         match &self.document {
-            DocumentState::Editable(document) => document.undo_root.as_ref().map(crate::editor::FileRootIdentity::retained_root),
+            DocumentState::Editable(document) => document
+                .undo_root
+                .as_ref()
+                .map(crate::editor::FileRootIdentity::retained_root),
             _ => None,
         }
     }
@@ -3823,8 +4063,15 @@ impl RepositoryRuntime {
             _ => None,
         };
         let mut roots = Vec::with_capacity(10);
-        for root in self.original_editor_root.iter().chain(current).chain(self.undo_lru.retained_root_identities()) {
-            if root.has_active_admission() && !roots.contains(root) { roots.push(root.clone()); }
+        for root in self
+            .original_editor_root
+            .iter()
+            .chain(current)
+            .chain(self.undo_lru.retained_root_identities())
+        {
+            if root.has_active_admission() && !roots.contains(root) {
+                roots.push(root.clone());
+            }
         }
         roots
     }
@@ -3833,46 +4080,85 @@ impl RepositoryRuntime {
     /// including cached roots while loading or read-only. Recovery/operation leases are
     /// additionally enrolled with the domain issuer until their own release.
     pub fn retained_filesystem_roots(&self) -> Vec<Arc<crate::fs_safety::Root>> {
-        let mut roots = self.retained_filesystem_root().into_iter().collect::<Vec<_>>();
+        let mut roots = self
+            .retained_filesystem_root()
+            .into_iter()
+            .collect::<Vec<_>>();
         if let Some(source) = &self.original_editor_root {
             let root = source.retained_root();
-            if !roots.iter().any(|previous| Arc::ptr_eq(previous, &root)) { roots.push(root); }
+            if !roots.iter().any(|previous| Arc::ptr_eq(previous, &root)) {
+                roots.push(root);
+            }
         }
         for root in self.undo_lru.retained_roots() {
-            if !roots.iter().any(|previous| Arc::ptr_eq(previous, &root)) { roots.push(root); }
+            if !roots.iter().any(|previous| Arc::ptr_eq(previous, &root)) {
+                roots.push(root);
+            }
         }
         roots
     }
 
-    fn editor_root_unbound(&self) -> bool { matches!(&self.document, DocumentState::Editable(document) if document.root_unbound) }
+    fn editor_root_unbound(&self) -> bool {
+        matches!(&self.document, DocumentState::Editable(document) if document.root_unbound)
+    }
 
     /// One descriptor metadata probe per second; unchanged files are never
     /// serialized or re-read. The source stamp includes inode/ctime so atomic
     /// replacement and no-op touches are distinguished by the later hash.
     pub fn refresh_open_document(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let DocumentState::Editable(document) = &self.document else { return Task::none(); };
-        if self.is_read_only_source() || document.root_unbound || document.workspace_edit.is_some() || document.active_save.is_some() || self.disk_poll.is_some() { return Task::none(); }
+        let DocumentState::Editable(document) = &self.document else {
+            return Task::none();
+        };
+        if self.is_read_only_source()
+            || document.root_unbound
+            || document.workspace_edit.is_some()
+            || document.active_save.is_some()
+            || self.disk_poll.is_some()
+        {
+            return Task::none();
+        }
         let source = document.source.clone();
         let identity = self.current_identity(card, document.path.clone());
-        let worktree = identity.worktree.clone(); let path = identity.path.clone();
+        let worktree = identity.worktree.clone();
+        let path = identity.path.clone();
         self.next_disk_poll = self.next_disk_poll.wrapping_add(1);
-        let ticket = self.next_disk_poll; self.disk_poll = Some((ticket, Instant::now()));
+        let ticket = self.next_disk_poll;
+        self.disk_poll = Some((ticket, Instant::now()));
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || crate::editor_reload::stamp(&worktree, &path, &source)).await.map_err(|error| error.to_string()).and_then(|result| result);
-            RepositoryAction::DiskMetadata { identity, ticket, result }
+            let result = tokio::task::spawn_blocking(move || {
+                crate::editor_reload::stamp(&worktree, &path, &source)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result);
+            RepositoryAction::DiskMetadata {
+                identity,
+                ticket,
+                result,
+            }
         })
     }
 
-    pub fn has_editable_document(&self) -> bool { matches!(&self.document, DocumentState::Editable(_)) }
+    pub fn has_editable_document(&self) -> bool {
+        matches!(&self.document, DocumentState::Editable(_))
+    }
 
     fn has_live_comparison(&self) -> bool {
-        !self.directory_only && !self.editor_root_unbound() && self.selected.is_some()
+        !self.directory_only
+            && !self.editor_root_unbound()
+            && self.selected.is_some()
             && (self.has_editable_document() || self.source_surface == SourceSurface::Diff)
-            && !matches!(self.diff_basis, DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. })
+            && !matches!(
+                self.diff_basis,
+                DiffBasis::CommitToParent { .. } | DiffBasis::PullRequest { .. }
+            )
     }
 
     pub fn observes_open_sources(&self) -> bool {
-        !self.is_read_only_source() && !self.editor_root_unbound() && !self.workspace_edit_pending() && (self.has_editable_document() || self.has_live_comparison())
+        !self.is_read_only_source()
+            && !self.editor_root_unbound()
+            && !self.workspace_edit_pending()
+            && (self.has_editable_document() || self.has_live_comparison())
     }
 
     /// Shared document and Git-metadata fallback for both editor frontends.
@@ -3884,44 +4170,100 @@ impl RepositoryRuntime {
     }
 
     fn refresh_comparison_metadata(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if !self.has_live_comparison() || self.comparison_metadata.probe.is_some() { return Task::none(); }
-        let Some(path) = self.selected_path().map(Path::to_path_buf) else { return Task::none(); };
+        if !self.has_live_comparison() || self.comparison_metadata.probe.is_some() {
+            return Task::none();
+        }
+        let Some(path) = self.selected_path().map(Path::to_path_buf) else {
+            return Task::none();
+        };
         let identity = self.current_identity(card, path);
         let basis = self.diff_basis.clone();
         let worktree = identity.worktree.clone();
-        self.comparison_metadata.next_probe = self.comparison_metadata.next_probe.wrapping_add(1).max(1);
+        self.comparison_metadata.next_probe =
+            self.comparison_metadata.next_probe.wrapping_add(1).max(1);
         let ticket = self.comparison_metadata.next_probe;
         self.comparison_metadata.probe = Some(ticket);
         cosmic::task::future(async move {
             let observed = basis.clone();
-            let result = tokio::task::spawn_blocking(move || crate::repository::repository_metadata_stamp(&worktree, &observed))
-                .await.map_err(|error| error.to_string()).and_then(|result| result.map_err(|error| error.to_string()));
-            RepositoryAction::ComparisonMetadata { identity, ticket, basis, result }
+            let result = tokio::task::spawn_blocking(move || {
+                crate::repository::repository_metadata_stamp(&worktree, &observed)
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            RepositoryAction::ComparisonMetadata {
+                identity,
+                ticket,
+                basis,
+                result,
+            }
         })
     }
 
-    fn comparison_metadata_loaded(&mut self, identity: AsyncIdentity, ticket: u64, basis: DiffBasis, result: Result<crate::repository::RepositoryMetadataStamp, String>) -> Task<RepositoryAction> {
-        if self.comparison_metadata.probe != Some(ticket) { return Task::none(); }
+    fn comparison_metadata_loaded(
+        &mut self,
+        identity: AsyncIdentity,
+        ticket: u64,
+        basis: DiffBasis,
+        result: Result<crate::repository::RepositoryMetadataStamp, String>,
+    ) -> Task<RepositoryAction> {
+        if self.comparison_metadata.probe != Some(ticket) {
+            return Task::none();
+        }
         self.comparison_metadata.probe = None;
-        if !self.accepts_selected(&identity) || self.diff_basis != basis || !self.has_live_comparison() { return Task::none(); }
+        if !self.accepts_selected(&identity)
+            || self.diff_basis != basis
+            || !self.has_live_comparison()
+        {
+            return Task::none();
+        }
         let stamp = match result {
-            Ok(stamp) => { self.comparison_metadata.error = None; stamp },
-            Err(error) => { self.comparison_metadata.error = Some(error); return Task::none(); }
+            Ok(stamp) => {
+                self.comparison_metadata.error = None;
+                stamp
+            }
+            Err(error) => {
+                self.comparison_metadata.error = Some(error);
+                return Task::none();
+            }
         };
         // Preserve a changed observation while an earlier reader owns the
         // slot. A later tick reconsiders it after that reader completes.
-        if self.comparison_refresh_pending() { return Task::none(); }
-        let unchanged = self.comparison_metadata.stamp.as_ref().is_some_and(|(old_path, old_basis, old)| old_path == &identity.path && same_live_comparison(old_basis, &basis) && old == &stamp);
+        if self.comparison_refresh_pending() {
+            return Task::none();
+        }
+        let unchanged =
+            self.comparison_metadata
+                .stamp
+                .as_ref()
+                .is_some_and(|(old_path, old_basis, old)| {
+                    old_path == &identity.path
+                        && same_live_comparison(old_basis, &basis)
+                        && old == &stamp
+                });
         if unchanged {
             if !self.comparison_refresh_failed() {
                 self.comparison_metadata.retry_after = None;
                 self.comparison_metadata.retry_delay = Duration::from_secs(1);
                 return Task::none();
             }
-            if self.comparison_metadata.retry_after.is_some_and(|deadline| Instant::now() < deadline) { return Task::none(); }
-        } else { self.comparison_metadata.retry_delay = Duration::from_secs(1); }
-        self.comparison_metadata.retry_after = Some(Instant::now() + self.comparison_metadata.retry_delay);
-        self.comparison_metadata.retry_delay = self.comparison_metadata.retry_delay.saturating_mul(2).min(Duration::from_secs(30));
+            if self
+                .comparison_metadata
+                .retry_after
+                .is_some_and(|deadline| Instant::now() < deadline)
+            {
+                return Task::none();
+            }
+        } else {
+            self.comparison_metadata.retry_delay = Duration::from_secs(1);
+        }
+        self.comparison_metadata.retry_after =
+            Some(Instant::now() + self.comparison_metadata.retry_delay);
+        self.comparison_metadata.retry_delay = self
+            .comparison_metadata
+            .retry_delay
+            .saturating_mul(2)
+            .min(Duration::from_secs(30));
         let card = identity.card;
         self.comparison_metadata.stamp = Some((identity.path, basis, stamp));
         self.refresh_open_comparison(card)
@@ -3931,25 +4273,38 @@ impl RepositoryRuntime {
     pub fn comparison_refresh_pending(&self) -> bool {
         self.branch_refresh.is_some()
             || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_)))
-            || self.diffs.iter().any(|(_, state)| matches!(state, DiffState::Loading { .. }))
+            || self
+                .diffs
+                .iter()
+                .any(|(_, state)| matches!(state, DiffState::Loading { .. }))
             || self.working_diff.active.is_some()
             || self.working_diff.timer.is_some()
     }
 
     pub fn comparison_refresh_failed(&self) -> bool {
         matches!(self.basis_resolution, Some(BasisResolution::Unavailable(_)))
-            || matches!(self.diff_state(&self.diff_basis), Some(DiffState::Ready(RenderedDiff::Error(_), _)))
+            || matches!(
+                self.diff_state(&self.diff_basis),
+                Some(DiffState::Ready(RenderedDiff::Error(_), _))
+            )
             || (self.editable_working_diff() && self.working_diff.error.is_some())
     }
 
     /// Called by the shared Git watcher after index/ref changes. Immutable
     /// history comparisons retain their object identities and mounted model.
     pub fn refresh_open_comparison(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.editor_root_unbound() { return Task::none(); }
-        if self.comparison_refresh_pending() { self.comparison_refresh_queued = true; return Task::none(); }
+        if self.editor_root_unbound() {
+            return Task::none();
+        }
+        if self.comparison_refresh_pending() {
+            self.comparison_refresh_queued = true;
+            return Task::none();
+        }
         self.comparison_refresh_queued = false;
         if let DiffBasis::MergeBaseToHead { base_ref, .. } = &self.diff_basis {
-            let Some(path) = self.selected_path().map(Path::to_path_buf) else { return Task::none(); };
+            let Some(path) = self.selected_path().map(Path::to_path_buf) else {
+                return Task::none();
+            };
             let identity = self.current_identity(card, path);
             let base_ref = base_ref.clone();
             let previous = self.diff_basis.clone();
@@ -3958,46 +4313,95 @@ impl RepositoryRuntime {
             self.branch_refresh = Some(request);
             return cosmic::task::future(async move {
                 let worktree = identity.worktree.clone();
-                let result = tokio::task::spawn_blocking(move || resolved_branch_basis(&worktree, base_ref)).await.map_err(|error| error.to_string()).and_then(|result| result);
-                RepositoryAction::BranchBasisRefreshed { identity, request, previous, result }
+                let result =
+                    tokio::task::spawn_blocking(move || resolved_branch_basis(&worktree, base_ref))
+                        .await
+                        .map_err(|error| error.to_string())
+                        .and_then(|result| result);
+                RepositoryAction::BranchBasisRefreshed {
+                    identity,
+                    request,
+                    previous,
+                    result,
+                }
             });
         }
-        if self.diff_basis.is_immutable() { return Task::none(); }
+        if self.diff_basis.is_immutable() {
+            return Task::none();
+        }
         self.diffs.retain(|(basis, _)| basis.is_immutable());
         self.working_diff.applied = None;
         self.ensure_current_diff(card)
     }
 
-    fn branch_basis_refreshed(&mut self, identity: AsyncIdentity, request: u64, previous: DiffBasis, result: Result<ResolvedBasis, String>) -> Task<RepositoryAction> {
-        if self.branch_refresh != Some(request) { return Task::none(); }
+    fn branch_basis_refreshed(
+        &mut self,
+        identity: AsyncIdentity,
+        request: u64,
+        previous: DiffBasis,
+        result: Result<ResolvedBasis, String>,
+    ) -> Task<RepositoryAction> {
+        if self.branch_refresh != Some(request) {
+            return Task::none();
+        }
         self.branch_refresh = None;
-        if !self.accepts_selected(&identity) || self.diff_basis != previous || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_))) {
+        if !self.accepts_selected(&identity)
+            || self.diff_basis != previous
+            || matches!(self.basis_resolution, Some(BasisResolution::Resolving(_)))
+        {
             Task::none()
         } else {
             match result {
                 Ok(ResolvedBasis::Ready(basis)) => {
                     self.basis_resolution = None;
-                    if basis == previous && !self.comparison_refresh_failed() { Task::none() } else {
+                    if basis == previous && !self.comparison_refresh_failed() {
+                        Task::none()
+                    } else {
                         self.capture_diff_viewport();
                         self.diffs.retain(|(cached, _)| *cached != previous);
-                        if let Some((selected, _)) = &mut self.committed_selection && *selected == previous { *selected = basis.clone(); }
+                        if let Some((selected, _)) = &mut self.committed_selection
+                            && *selected == previous
+                        {
+                            *selected = basis.clone();
+                        }
                         self.diff_basis = basis;
                         self.ensure_current_diff(identity.card)
                     }
                 }
-                Err(error) => { self.basis_resolution = Some(BasisResolution::Unavailable(error)); Task::none() }
+                Err(error) => {
+                    self.basis_resolution = Some(BasisResolution::Unavailable(error));
+                    Task::none()
+                }
                 _ => Task::none(),
             }
         }
     }
 
-    fn reload_disk_version(&mut self, card: CardId, version: crate::editor_reload::Version) -> Task<RepositoryAction> {
-        if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
-        let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
-        let cursor = document.content.cursor(); let scroll = document.content.scroll_position();
+    fn reload_disk_version(
+        &mut self,
+        card: CardId,
+        version: crate::editor_reload::Version,
+    ) -> Task<RepositoryAction> {
+        if self.is_read_only_source() || self.workspace_edit_pending() {
+            return Task::none();
+        }
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        let cursor = document.content.cursor();
+        let scroll = document.content.scroll_position();
         if !document.present || !document.saved_present {
-            let Some(restoration) = version.restoration else { document.error = Some("The reloaded file's Undo metadata is unavailable. Your buffer has been kept.".into()); return Task::none(); };
-            let Some(id) = document.next_presence_id.checked_add(1) else { document.error = Some("The editor's file identity counter is exhausted.".into()); return Task::none(); };
+            let Some(restoration) = version.restoration else {
+                document.error = Some(
+                    "The reloaded file's Undo metadata is unavailable. Your buffer has been kept."
+                        .into(),
+                );
+                return Task::none();
+            };
+            let Some(id) = document.next_presence_id.checked_add(1) else {
+                document.error = Some("The editor's file identity counter is exhausted.".into());
+                return Task::none();
+            };
             document.next_presence_id = id;
             document.saved_presence_id = id;
             document.deletion_mode = Some(restoration.git_mode());
@@ -4009,15 +4413,36 @@ impl RepositoryRuntime {
         document.saved_history_revision = document.history.reserve_revision();
         document.saved_text = version.text;
         document.disk_hash = version.content_hash;
-        document.source = version.source; document.markdown = version.markdown;
+        document.source = version.source;
+        document.markdown = version.markdown;
         let edits = document.discard_edits();
         document.saved_history_revision = document.history.revision();
         document.saved_snapshot = document.content.text_snapshot();
-        document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, document.indentation));
-        let map = |mut position: text_editor::Position| { position.line = version.mapping.map(position.line); position };
-        document.content.set_cursor(text_editor::Cursor { position: map(cursor.position), selection: cursor.selection.map(map) });
-        document.content.restore_scroll_position(text_editor::ScrollPosition { line: version.mapping.map(scroll.line), ..scroll });
-        document.external_version = None; document.external_deleted = false; document.external_check_pending = false; document.recreate_missing = false;
+        document
+            .content
+            .configure_indentation(crate::editor_indent::Indentation::detect(
+                &document.saved_text,
+                self.editor_tab_width,
+                document.indentation,
+            ));
+        let map = |mut position: text_editor::Position| {
+            position.line = version.mapping.map(position.line);
+            position
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: map(cursor.position),
+            selection: cursor.selection.map(map),
+        });
+        document
+            .content
+            .restore_scroll_position(text_editor::ScrollPosition {
+                line: version.mapping.map(scroll.line),
+                ..scroll
+            });
+        document.external_version = None;
+        document.external_deleted = false;
+        document.external_check_pending = false;
+        document.recreate_missing = false;
         self.disk_comparison = None;
         // The index baseline is unchanged by a file write. Keep it for the
         // revision-aware working-diff worker instead of discarding the gutter.
@@ -4027,16 +4452,43 @@ impl RepositoryRuntime {
     }
 
     fn compare_disk(&mut self, card: CardId) -> Task<RepositoryAction> {
-        let DocumentState::Editable(document) = &self.document else { return Task::none(); };
-        let Some(disk) = &document.external_version else { return Task::none(); };
-        let before: Arc<str> = Arc::from(disk.text.as_str()); let after = document.content.text();
-        let revision = document.revision; let disk_hash = disk.content_hash;
-        let identity = self.current_identity(card, document.path.clone()); let path = document.source.clone(); let theme = self.syntax_theme;
+        let DocumentState::Editable(document) = &self.document else {
+            return Task::none();
+        };
+        let Some(disk) = &document.external_version else {
+            return Task::none();
+        };
+        let before: Arc<str> = Arc::from(disk.text.as_str());
+        let after = document.content.text();
+        let revision = document.revision;
+        let disk_hash = disk.content_hash;
+        let identity = self.current_identity(card, document.path.clone());
+        let path = document.source.clone();
+        let theme = self.syntax_theme;
         self.source_surface = SourceSurface::Diff;
-        self.disk_comparison = Some(DiffState::Loading { request: 0, cancellation: CancellationToken::new() });
+        self.disk_comparison = Some(DiffState::Loading {
+            request: 0,
+            cancellation: CancellationToken::new(),
+        });
         cosmic::task::future(async move {
-            let model = tokio::task::spawn_blocking(move || crate::diff_view::build_document_diff(before, &after, &path, theme, &CancellationToken::new())).await.ok().flatten();
-            RepositoryAction::DiskComparisonLoaded { identity, revision, disk_hash, model }
+            let model = tokio::task::spawn_blocking(move || {
+                crate::diff_view::build_document_diff(
+                    before,
+                    &after,
+                    &path,
+                    theme,
+                    &CancellationToken::new(),
+                )
+            })
+            .await
+            .ok()
+            .flatten();
+            RepositoryAction::DiskComparisonLoaded {
+                identity,
+                revision,
+                disk_hash,
+                model,
+            }
         })
     }
 
@@ -4081,7 +4533,9 @@ impl RepositoryRuntime {
     /// Refreshes Git's status and mutable comparisons without replacing the
     /// open buffer or changing the identity of its loads and saves.
     pub fn refresh_after_mutation(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.is_read_only_source() { return Task::none(); }
+        if self.is_read_only_source() {
+            return Task::none();
+        }
         self.mutation_refresh_pending = true;
         if let Some(path) = self.selected.as_ref().map(|file| file.path.clone())
             && let Some(index) = self.diffs.iter().position(|(basis, state)| {
@@ -4194,15 +4648,19 @@ impl RepositoryRuntime {
         let mut units = 0u32;
         let mut scalars = 0u32;
         for character in text[span].chars() {
-            if units == at.character { return Some(LspPosition::new(at.line, scalars)); }
+            if units == at.character {
+                return Some(LspPosition::new(at.line, scalars));
+            }
             units += character.len_utf16() as u32;
             scalars += 1;
-            if units > at.character { return None; }
+            if units > at.character {
+                return None;
+            }
         }
         (units == at.character).then_some(LspPosition::new(at.line, scalars))
     }
 
-    pub fn diagnostic_navigation_available(&self)->bool {
+    pub fn diagnostic_navigation_available(&self) -> bool {
         self.editable_surface_visible() && !self.language.diagnostics.is_empty()
     }
 
@@ -4221,7 +4679,12 @@ impl RepositoryRuntime {
         } else {
             vec![]
         };
-        self.language.code_action_lines = self.language.marks.iter().map(|diagnostic| diagnostic.start.line).collect();
+        self.language.code_action_lines = self
+            .language
+            .marks
+            .iter()
+            .map(|diagnostic| diagnostic.start.line)
+            .collect();
         self.language.code_action_lines.sort_unstable();
         self.language.code_action_lines.dedup();
         self.language.diagnostics = diagnostics;
@@ -4229,19 +4692,43 @@ impl RepositoryRuntime {
     }
 
     fn navigate_diagnostic(&mut self, forward: bool) {
-        let Some(at) = self.cursor_position() else { return; };
-        let mut order: Vec<_> = self.language.diagnostics.iter().enumerate().map(|(index,item)| (item.range.start,index)).collect();
-        order.sort_by_key(|entry| entry.0);
-        if order.is_empty() { return; }
-        let current = self.language.selected_diagnostic.and_then(|selected| order.iter().position(|(position,index)| *index == selected && *position == at));
-        let next = if let Some(current) = current {
-            if forward { (current + 1) % order.len() } else { (current + order.len() - 1) % order.len() }
-        } else if forward {
-            order.iter().position(|(position,_)| *position > at).unwrap_or(0)
-        } else {
-            order.iter().rposition(|(position,_)| *position < at).unwrap_or(order.len() - 1)
+        let Some(at) = self.cursor_position() else {
+            return;
         };
-        let (position,index) = order[next];
+        let mut order: Vec<_> = self
+            .language
+            .diagnostics
+            .iter()
+            .enumerate()
+            .map(|(index, item)| (item.range.start, index))
+            .collect();
+        order.sort_by_key(|entry| entry.0);
+        if order.is_empty() {
+            return;
+        }
+        let current = self.language.selected_diagnostic.and_then(|selected| {
+            order
+                .iter()
+                .position(|(position, index)| *index == selected && *position == at)
+        });
+        let next = if let Some(current) = current {
+            if forward {
+                (current + 1) % order.len()
+            } else {
+                (current + order.len() - 1) % order.len()
+            }
+        } else if forward {
+            order
+                .iter()
+                .position(|(position, _)| *position > at)
+                .unwrap_or(0)
+        } else {
+            order
+                .iter()
+                .rposition(|(position, _)| *position < at)
+                .unwrap_or(order.len() - 1)
+        };
+        let (position, index) = order[next];
         let message = self.language.diagnostics[index].message.clone();
         if self.move_cursor_to(position) {
             self.dismiss_editor_results();
@@ -4251,27 +4738,62 @@ impl RepositoryRuntime {
     }
 
     pub fn set_editor_rename(&mut self, draft: Option<String>) {
-        if draft.is_some() { self.dismiss_editor_results(); }
+        if draft.is_some() {
+            self.dismiss_editor_results();
+        }
         self.language.rename = draft;
     }
-    pub fn editor_feature_ui_open(&self) -> bool { self.language.rename.is_some() || !self.language.code_actions.is_empty() }
+    pub fn editor_feature_ui_open(&self) -> bool {
+        self.language.rename.is_some() || !self.language.code_actions.is_empty()
+    }
     pub fn set_editor_code_actions(&mut self, items: &[crate::lsp::LspCodeAction]) {
-        self.language.available_actions_at = if items.is_empty() { None } else {
-            match &self.document { DocumentState::Editable(document) => Some((document.revision, document.content.cursor().position)), _ => None }
+        self.language.available_actions_at = if items.is_empty() {
+            None
+        } else {
+            match &self.document {
+                DocumentState::Editable(document) => {
+                    Some((document.revision, document.content.cursor().position))
+                }
+                _ => None,
+            }
         };
-        self.language.code_action_selected = items.iter().position(|item| item.is_preferred && item.disabled.is_none()).or_else(|| items.iter().position(|item| item.disabled.is_none())).unwrap_or(0);
-        self.language.code_actions = items.iter().map(|item| EditorCodeAction { title: item.title.clone(), disabled: item.disabled.clone() }).collect();
+        self.language.code_action_selected = items
+            .iter()
+            .position(|item| item.is_preferred && item.disabled.is_none())
+            .or_else(|| items.iter().position(|item| item.disabled.is_none()))
+            .unwrap_or(0);
+        self.language.code_actions = items
+            .iter()
+            .map(|item| EditorCodeAction {
+                title: item.title.clone(),
+                disabled: item.disabled.clone(),
+            })
+            .collect();
         self.language.completions.clear();
         self.language.hover.clear();
     }
-    pub fn set_editor_code_action_support(&mut self, supported: bool) { self.language.code_action_support = supported; }
-    pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) {
-        self.language.signature = signature.filter(|help| help.signatures.get(help.active_signature).is_some());
+    pub fn set_editor_code_action_support(&mut self, supported: bool) {
+        self.language.code_action_support = supported;
     }
-    pub fn editor_signature_visible(&self) -> bool { self.editor_signature_help().is_some() }
-    pub fn editor_signature_help(&self) -> Option<&crate::lsp::LspSignatureHelp> { self.language.signature.as_ref().filter(|help| help.signatures.get(help.active_signature).is_some()) }
-    pub fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] { &self.language.diagnostics }
-    pub fn rename_focus_id(card: CardId) -> widget::Id { widget::Id::new(format!("editor.rename.{card}")) }
+    pub fn set_editor_signature(&mut self, signature: Option<crate::lsp::LspSignatureHelp>) {
+        self.language.signature =
+            signature.filter(|help| help.signatures.get(help.active_signature).is_some());
+    }
+    pub fn editor_signature_visible(&self) -> bool {
+        self.editor_signature_help().is_some()
+    }
+    pub fn editor_signature_help(&self) -> Option<&crate::lsp::LspSignatureHelp> {
+        self.language
+            .signature
+            .as_ref()
+            .filter(|help| help.signatures.get(help.active_signature).is_some())
+    }
+    pub fn editor_diagnostics(&self) -> &[crate::lsp::LspDiagnostic] {
+        &self.language.diagnostics
+    }
+    pub fn rename_focus_id(card: CardId) -> widget::Id {
+        widget::Id::new(format!("editor.rename.{card}"))
+    }
 
     pub fn set_editor_completions(&mut self, items: Vec<LspCompletionItem>) {
         self.language.selected = items.iter().position(|item| item.preselect).unwrap_or(0);
@@ -4310,25 +4832,48 @@ impl RepositoryRuntime {
     pub fn move_cursor_to(&mut self, at: LspPosition) -> bool {
         let (position, path) = match &self.document {
             DocumentState::Editable(document) => {
-                let Some(position) = caret_for_position(&document.content, at) else { return false; };
+                let Some(position) = caret_for_position(&document.content, at) else {
+                    return false;
+                };
                 (position, document.path.clone())
             }
             _ => return false,
         };
-        self.record_location_jump(crate::editor_navigation::Location { path, cursor: text_editor::Cursor { position, selection: None }, scroll: text_editor::ScrollPosition { line: position.line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 } });
+        self.record_location_jump(crate::editor_navigation::Location {
+            path,
+            cursor: text_editor::Cursor {
+                position,
+                selection: None,
+            },
+            scroll: text_editor::ScrollPosition {
+                line: position.line.saturating_sub(10),
+                vertical: 0.0,
+                horizontal: 0.0,
+            },
+        });
         if let DocumentState::Editable(document) = &mut self.document {
-            document.history.seal(); document.content.set_cursor(text_editor::Cursor { position, selection: None });
+            document.history.seal();
+            document.content.set_cursor(text_editor::Cursor {
+                position,
+                selection: None,
+            });
         }
         true
     }
     /// Places a server location against the actual loaded target, including
     /// files that did not have a snapshot when the response was converted.
     /// A UTF-16 position inside a surrogate pair is refused rather than rounded.
-    pub fn move_cursor_to_coordinates(&mut self, at: LspPosition, coordinates: crate::lsp::LspCoordinates) -> bool {
+    pub fn move_cursor_to_coordinates(
+        &mut self,
+        at: LspPosition,
+        coordinates: crate::lsp::LspCoordinates,
+    ) -> bool {
         let at = match coordinates {
             crate::lsp::LspCoordinates::Scalar => at,
             crate::lsp::LspCoordinates::Utf16 => {
-                let Some(at) = self.scalar_position_for_utf16(at) else { return false; };
+                let Some(at) = self.scalar_position_for_utf16(at) else {
+                    return false;
+                };
                 at
             }
         };
@@ -4338,17 +4883,36 @@ impl RepositoryRuntime {
     /// Window-local navigation captures native byte positions and viewport
     /// without copying the document or touching its undo history.
     pub fn editor_navigation_anchor(&self) -> Option<crate::model::EditorNavigation> {
-        if !matches!(&self.document, DocumentState::Editable(_)) { return None; }
+        if !matches!(&self.document, DocumentState::Editable(_)) {
+            return None;
+        }
         self.navigation()?.editor
     }
 
-    pub fn restore_editor_navigation_anchor(&mut self, anchor: crate::model::EditorNavigation) -> bool {
-        if self.workspace_edit_pending() { return false; }
-        let DocumentState::Editable(document) = &mut self.document else { return false; };
+    pub fn restore_editor_navigation_anchor(
+        &mut self,
+        anchor: crate::model::EditorNavigation,
+    ) -> bool {
+        if self.workspace_edit_pending() {
+            return false;
+        }
+        let DocumentState::Editable(document) = &mut self.document else {
+            return false;
+        };
         document.history.seal();
-        let position = |position: crate::model::EditorPosition| text_editor::Position { line: position.line, column: position.column };
-        document.content.set_cursor(text_editor::Cursor { position: position(anchor.caret), selection: anchor.selection.map(position) });
-        let scroll = text_editor::ScrollPosition { line: anchor.scroll_line, vertical: anchor.scroll_vertical, horizontal: anchor.scroll_horizontal };
+        let position = |position: crate::model::EditorPosition| text_editor::Position {
+            line: position.line,
+            column: position.column,
+        };
+        document.content.set_cursor(text_editor::Cursor {
+            position: position(anchor.caret),
+            selection: anchor.selection.map(position),
+        });
+        let scroll = text_editor::ScrollPosition {
+            line: anchor.scroll_line,
+            vertical: anchor.scroll_vertical,
+            horizontal: anchor.scroll_horizontal,
+        };
         document.content.restore_scroll_position(scroll);
         self.viewports.editor = scroll;
         self.source_surface = SourceSurface::Editor;
@@ -4425,7 +4989,9 @@ impl RepositoryRuntime {
             position: end,
             selection: Some(start),
         });
-        if let Some(origin) = origin && let Some(target) = self.current_location() {
+        if let Some(origin) = origin
+            && let Some(target) = self.current_location()
+        {
             self.locations.jump(origin, target);
         }
         Some(total)
@@ -4489,7 +5055,9 @@ impl RepositoryRuntime {
             .map_or_else(Task::none, iced::widget::operation::focus)
     }
 
-    pub fn go_to_line_is_open(&self) -> bool { self.go_to_line.is_some() }
+    pub fn go_to_line_is_open(&self) -> bool {
+        self.go_to_line.is_some()
+    }
 
     /// Whether the find strip is mounted over the open buffer.
     ///
@@ -4851,8 +5419,12 @@ impl RepositoryRuntime {
     /// consequently nothing to refuse on that ground, and pretending to check
     /// would only suggest the field exists.
     pub fn apply_completion(&mut self, item: &LspCompletionItem) -> bool {
-        if self.is_read_only_source() { return false; }
-        if self.workspace_edit_pending() { return false; }
+        if self.is_read_only_source() {
+            return false;
+        }
+        if self.workspace_edit_pending() {
+            return false;
+        }
         if self.source_surface != SourceSurface::Editor {
             return false;
         }
@@ -5025,13 +5597,22 @@ impl RepositoryRuntime {
     }
 
     /// One-based scalar coordinates for callers which do not select a launcher.
-    pub fn editor_caret(&self) -> Option<(usize, usize)> { self.editor_caret_for("") }
+    pub fn editor_caret(&self) -> Option<(usize, usize)> {
+        self.editor_caret_for("")
+    }
 
     /// Converts the native UTF-8 caret into the selected editor's column units.
     pub fn editor_caret_for(&self, editor: &str) -> Option<(usize, usize)> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         let cursor = document.content.cursor().position;
-        let column = document.content.with_line(cursor.line, |line, _| crate::external_editor::column_for_prefix(editor, &line[..char_boundary(line, cursor.column)]))?;
+        let column = document.content.with_line(cursor.line, |line, _| {
+            crate::external_editor::column_for_prefix(
+                editor,
+                &line[..char_boundary(line, cursor.column)],
+            )
+        })?;
         Some((cursor.line + 1, column))
     }
 
@@ -5039,18 +5620,38 @@ impl RepositoryRuntime {
         let (editor_revision, cursor) = match &self.document {
             DocumentState::Editable(document) => {
                 let cursor = document.content.cursor();
-                (Some(document.revision), Some((cursor.position.line, cursor.position.column, cursor.selection.map(|position| (position.line, position.column)))))
+                (
+                    Some(document.revision),
+                    Some((
+                        cursor.position.line,
+                        cursor.position.column,
+                        cursor
+                            .selection
+                            .map(|position| (position.line, position.column)),
+                    )),
+                )
             }
             _ => (None, None),
         };
         RepositoryCommandTarget {
-            identity: self.current_identity(card, self.selected_path().unwrap_or(Path::new("")).to_owned()),
-            editor_revision, cursor, surface: self.source_surface, basis: self.diff_basis.clone(), mode: self.diff_mode,
-            layout_revision: self.diff_layout_revision, selection: self.diff_interaction.selection,
-            model: if self.shows_diff() { self.current_diff_model_snapshot() } else { None },
+            identity: self.current_identity(
+                card,
+                self.selected_path().unwrap_or(Path::new("")).to_owned(),
+            ),
+            editor_revision,
+            cursor,
+            surface: self.source_surface,
+            basis: self.diff_basis.clone(),
+            mode: self.diff_mode,
+            layout_revision: self.diff_layout_revision,
+            selection: self.diff_interaction.selection,
+            model: if self.shows_diff() {
+                self.current_diff_model_snapshot()
+            } else {
+                None
+            },
         }
     }
-
 
     /// The file the open buffer really is, when the selected path is a
     /// symbolic link to it; `None` for a buffer that is its own file.
@@ -5192,9 +5793,18 @@ impl RepositoryRuntime {
 
     /// The live buffer, or nothing while no editable document is open.
     pub fn editor_formatting_options(&self) -> (u32, bool) {
-        let DocumentState::Editable(document) = &self.document else { return (self.editor_tab_width as u32, true); };
+        let DocumentState::Editable(document) = &self.document else {
+            return (self.editor_tab_width as u32, true);
+        };
         let indentation = document.content.indentation();
-        (if indentation.tabs { indentation.tab_width as u32 } else { indentation.size as u32 }, !indentation.tabs)
+        (
+            if indentation.tabs {
+                indentation.tab_width as u32
+            } else {
+                indentation.size as u32
+            },
+            !indentation.tabs,
+        )
     }
     pub fn editor_text(&self) -> Option<String> {
         match &self.document {
@@ -5204,53 +5814,109 @@ impl RepositoryRuntime {
     }
 
     pub fn workspace_edit_source(&self) -> Option<PathBuf> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         Some(self.descriptor.worktree.join(&document.source))
     }
 
     /// Includes pending and read-only selected files so a workspace edit cannot
     /// classify a mounted file as unopened while its async read is completing.
     pub fn workspace_edit_candidate_source(&self) -> Option<PathBuf> {
-        self.workspace_edit_source().or_else(|| self.selected.as_ref().map(|file| self.descriptor.worktree.join(&file.path)))
+        self.workspace_edit_source().or_else(|| {
+            self.selected
+                .as_ref()
+                .map(|file| self.descriptor.worktree.join(&file.path))
+        })
     }
 
     pub fn workspace_edit_snapshot_size(&self) -> usize {
-        match &self.document { DocumentState::Editable(document) => document.content.text_len(), _ => 0 }
+        match &self.document {
+            DocumentState::Editable(document) => document.content.text_len(),
+            _ => 0,
+        }
     }
 
     /// Explicit operation snapshot, taken once for a server edit preview.
-    pub fn workspace_edit_snapshot(&self) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
-        Some((self.descriptor.worktree.join(&document.source), crate::editor_workspace_edit::OpenSnapshot {
-            text: document.content.text().into(), version: document.lsp_version, protocol_version: None,
-            writable: document.present && !document.root_unbound && !self.is_saving() && !self.is_read_only_source(),
-        }))
+    pub fn workspace_edit_snapshot(
+        &self,
+    ) -> Option<(PathBuf, crate::editor_workspace_edit::OpenSnapshot)> {
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        Some((
+            self.descriptor.worktree.join(&document.source),
+            crate::editor_workspace_edit::OpenSnapshot {
+                text: document.content.text().into(),
+                version: document.lsp_version,
+                protocol_version: None,
+                writable: document.present
+                    && !document.root_unbound
+                    && !self.is_saving()
+                    && !self.is_read_only_source(),
+            },
+        ))
     }
 
     /// Proves that the preview still addresses this exact buffer, then freezes
     /// mutations until the disk phase completes. No edit is made in this phase.
-    pub fn begin_workspace_edit(&mut self, ticket: u64, plan: &crate::editor_workspace_edit::DocumentPlan) -> Result<(), String> {
-        if self.is_read_only_source() { return Err("Dependency sources are read-only".into()); }
+    pub fn begin_workspace_edit(
+        &mut self,
+        ticket: u64,
+        plan: &crate::editor_workspace_edit::DocumentPlan,
+    ) -> Result<(), String> {
+        if self.is_read_only_source() {
+            return Err("Dependency sources are read-only".into());
+        }
         self.flush_lsp_change();
-        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
-        if !document.present || document.root_unbound || document.active_save.is_some() || document.workspace_edit.is_some()
-            || Some(document.lsp_version) != plan.version || !content_matches(&document.content, &plan.before) {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Err("An edited buffer was closed".into());
+        };
+        if !document.present
+            || document.root_unbound
+            || document.active_save.is_some()
+            || document.workspace_edit.is_some()
+            || Some(document.lsp_version) != plan.version
+            || !content_matches(&document.content, &plan.before)
+        {
             return Err("An edited buffer changed after the preview was prepared".into());
         }
-        let offsets = plan.edits.iter().flat_map(|edit| [edit.range.start, edit.range.end]).collect::<Vec<_>>();
-        let positions = document.content.positions_for_offsets(&offsets).ok_or("The server edit names an invalid native boundary")?;
+        let offsets = plan
+            .edits
+            .iter()
+            .flat_map(|edit| [edit.range.start, edit.range.end])
+            .collect::<Vec<_>>();
+        let positions = document
+            .content
+            .positions_for_offsets(&offsets)
+            .ok_or("The server edit names an invalid native boundary")?;
         let mut changes = Vec::new();
         for (index, edit) in plan.edits.iter().enumerate().rev() {
-            if plan.before.get(edit.range.clone()) == Some(edit.new_text.as_str()) { continue; }
+            if plan.before.get(edit.range.clone()) == Some(edit.new_text.as_str()) {
+                continue;
+            }
             let (start, end) = (positions[index * 2], positions[index * 2 + 1]);
-            let expected = plan.before.get(edit.range.clone()).ok_or("The server edit has an invalid range")?;
-            if document.content.range_end(start, expected) != Some(end) { return Err("The server edit does not address the native buffer".into()); }
-            let change = document.content.range_change(start, end, &edit.new_text).ok_or("The server edit does not address a native text range")?;
+            let expected = plan
+                .before
+                .get(edit.range.clone())
+                .ok_or("The server edit has an invalid range")?;
+            if document.content.range_end(start, expected) != Some(end) {
+                return Err("The server edit does not address the native buffer".into());
+            }
+            let change = document
+                .content
+                .range_change(start, end, &edit.new_text)
+                .ok_or("The server edit does not address a native text range")?;
             changes.push(change);
         }
         // Keep the explicit whole-transition helper usable for reload/tests.
         if plan.edits.is_empty() && plan.before != plan.after {
-            changes.push(document.content.replacement_to_text(&plan.after).ok_or("This buffer cannot represent the server edit safely")?);
+            changes.push(
+                document
+                    .content
+                    .replacement_to_text(&plan.after)
+                    .ok_or("This buffer cannot represent the server edit safely")?,
+            );
         }
         // A read admitted before the transaction must not replace or configure
         // the frozen buffer after publication. Its old callback has no slot.
@@ -5263,7 +5929,11 @@ impl RepositoryRuntime {
 
     pub fn cancel_workspace_edit(&mut self, ticket: u64) {
         if let DocumentState::Editable(document) = &mut self.document {
-            if document.workspace_edit.as_ref().is_some_and(|(current, _)| *current == ticket) {
+            if document
+                .workspace_edit
+                .as_ref()
+                .is_some_and(|(current, _)| *current == ticket)
+            {
                 document.workspace_edit = None;
             }
         }
@@ -5273,34 +5943,65 @@ impl RepositoryRuntime {
     /// step. The saved disk baseline is retained, so the resulting open buffer
     /// remains dirty until the user saves it.
     pub fn finish_workspace_edit(&mut self, ticket: u64) -> Result<(), String> {
-        let DocumentState::Editable(document) = &mut self.document else { return Err("An edited buffer was closed".into()); };
-        if !document.workspace_edit.as_ref().is_some_and(|(current, _)| *current == ticket) {
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Err("An edited buffer was closed".into());
+        };
+        if !document
+            .workspace_edit
+            .as_ref()
+            .is_some_and(|(current, _)| *current == ticket)
+        {
             return Err("The workspace-edit publication is stale".into());
         }
         let (_, changes) = document.workspace_edit.take().unwrap();
-        if changes.is_empty() { return Ok(()); }
+        if changes.is_empty() {
+            return Ok(());
+        }
         let cursor = document.content.cursor();
         let scroll = document.content.scroll_position();
-        let mut buffer = ProtocolTracked { content: &mut document.content, edits: Vec::new() };
+        let mut buffer = ProtocolTracked {
+            content: &mut document.content,
+            edits: Vec::new(),
+        };
         for (index, change) in changes.iter().enumerate() {
-            if !buffer.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks) {
+            if !buffer.replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks,
+            ) {
                 let mut restored = true;
                 for previous in changes[..index].iter().rev() {
-                    restored &= buffer.replace(previous.start, &previous.inserted, &previous.removed, &previous.removed_breaks);
+                    restored &= buffer.replace(
+                        previous.start,
+                        &previous.inserted,
+                        &previous.removed,
+                        &previous.removed_breaks,
+                    );
                 }
                 buffer.content.set_cursor(cursor);
                 buffer.content.restore_scroll_position(scroll);
-                return Err(if restored { "The prepared edit could not be applied; the buffer was preserved" } else { "The prepared edit failed and its buffer rollback could not complete" }.into());
+                return Err(if restored {
+                    "The prepared edit could not be applied; the buffer was preserved"
+                } else {
+                    "The prepared edit failed and its buffer rollback could not complete"
+                }
+                .into());
             }
         }
         document.content.set_cursor(cursor);
         document.content.restore_scroll_position(scroll);
-        document.history.record_group(changes, cursor, document.content.cursor(), Instant::now());
+        document
+            .history
+            .record_group(changes, cursor, document.content.cursor(), Instant::now());
         document.text_changed();
         if let Some(version) = document.bump_lsp_version() {
             self.lsp_edits.clear();
             self.lsp_edits_exact = false;
-            self.lsp_intents.push(LspIntent::Change { version, text: LspChangeText::Snapshot(document.content.text_snapshot()) });
+            self.lsp_intents.push(LspIntent::Change {
+                version,
+                text: LspChangeText::Snapshot(document.content.text_snapshot()),
+            });
         }
         self.refresh_find_matches();
         Ok(())
@@ -5315,26 +6016,41 @@ impl RepositoryRuntime {
 
     pub fn editor_text_in_range(&self, range: LspRange) -> Option<String> {
         let text = self.editor_text()?;
-        text.get(byte_offset(&text, range.start)?..byte_offset(&text, range.end)?).map(str::to_owned)
+        text.get(byte_offset(&text, range.start)?..byte_offset(&text, range.end)?)
+            .map(str::to_owned)
     }
 
     pub fn editor_selection_range(&self) -> Option<LspRange> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
         let (start, end) = document.content.selected_bounds()?;
-        Some(LspRange::new(caret_position(&document.content, start)?, caret_position(&document.content, end)?))
+        Some(LspRange::new(
+            caret_position(&document.content, start)?,
+            caret_position(&document.content, end)?,
+        ))
     }
 
     /// Installs a worker-built, virtualized comparison in a dedicated preview
     /// runtime. This runtime never owns an editable document or a Git baseline.
     pub fn set_workspace_preview(&mut self, path: PathBuf, model: DiffModel) {
         self.files = FileListState::Ready(Vec::new());
-        self.selected = Some(RepositoryFile { path, unstaged: true, ..RepositoryFile::default() });
+        self.selected = Some(RepositoryFile {
+            path,
+            unstaged: true,
+            ..RepositoryFile::default()
+        });
         self.document = DocumentState::None;
         self.source_surface = SourceSurface::Diff;
         self.diff_basis = DiffBasis::IndexToWorktree;
-        self.set_diff_state(self.diff_basis.clone(), DiffState::ready(RenderedDiff::Text {
-            model, old_label: "Before".into(), new_label: "After applying".into(),
-        }));
+        self.set_diff_state(
+            self.diff_basis.clone(),
+            DiffState::ready(RenderedDiff::Text {
+                model,
+                old_label: "Before".into(),
+                new_label: "After applying".into(),
+            }),
+        );
     }
 
     pub fn selected_staging_selection(
@@ -5540,7 +6256,10 @@ impl RepositoryRuntime {
     /// Undoes or redoes one step in the open buffer.
     fn step_history(&mut self, card: CardId, redo: bool) -> Task<RepositoryAction> {
         // Native history owns the live editor or working diff; source transactions remain immutable.
-        if self.workspace_edit_pending() || self.is_read_only_source() || !self.can_step_editor_history(redo) {
+        if self.workspace_edit_pending()
+            || self.is_read_only_source()
+            || !self.can_step_editor_history(redo)
+        {
             return Task::none();
         }
         self.dismiss_editor_results();
@@ -5631,7 +6350,9 @@ impl RepositoryRuntime {
     /// are still typing them. Without a loaded comparison there is no baseline
     /// to diff against, and loading one is the comparison surface's own job.
     fn editable_working_diff(&self) -> bool {
-        if self.disk_comparison.is_some() { return false; }
+        if self.disk_comparison.is_some() {
+            return false;
+        }
         self.diff_basis == DiffBasis::IndexToWorktree
             && self.basis_resolution.is_none()
             && matches!(self.document, DocumentState::Editable(_))
@@ -5712,7 +6433,9 @@ impl RepositoryRuntime {
     /// one timer or one immutable CPU snapshot exists, even under continuous
     /// typing or selection/basis churn. The timer observes the latest deadline.
     pub fn working_diff_task(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.is_read_only_source() { return Task::none(); }
+        if self.is_read_only_source() {
+            return Task::none();
+        }
         let wanted = self.wanted_working_diff();
         let revision_changed = !same_diff_revision(&wanted, &self.working_diff.desired);
         let rich = self.wants_rich_working_diff();
@@ -5798,7 +6521,10 @@ impl RepositoryRuntime {
         let syntax_theme = self.syntax_theme;
         let ignore_whitespace = self.diff_ignore_whitespace;
         let font = self.editor_font;
-        let present = [self.diff_model().is_none_or(|model| model.present[0]), document.present];
+        let present = [
+            self.diff_model().is_none_or(|model| model.present[0]),
+            document.present,
+        ];
         let source_head = self
             .diff_model()
             .and_then(|model| model.source_head.clone());
@@ -6000,12 +6726,24 @@ impl RepositoryRuntime {
 
     /// Builds a language-feature action only for the mounted source buffer.
     /// Applications also check the corresponding live server capability.
-    pub fn editor_language_feature_action(&self, card: CardId, feature: EditorLanguageFeature) -> Option<RepositoryAction> {
-        if self.standalone { return None; }
+    pub fn editor_language_feature_action(
+        &self,
+        card: CardId,
+        feature: EditorLanguageFeature,
+    ) -> Option<RepositoryAction> {
+        if self.standalone {
+            return None;
+        }
         self.editor_focus_target(card)?;
         self.lsp_document()?;
         self.cursor_position()?;
-        if self.editor_root_unbound() || self.is_saving() || (feature != EditorLanguageFeature::Signature && (self.is_read_only_source() || !self.desired_file_present())) { return None; }
+        if self.editor_root_unbound()
+            || self.is_saving()
+            || (feature != EditorLanguageFeature::Signature
+                && (self.is_read_only_source() || !self.desired_file_present()))
+        {
+            return None;
+        }
         let action = match feature {
             EditorLanguageFeature::Rename => EditorLspAction::Rename,
             EditorLanguageFeature::FormatDocument => EditorLspAction::Format { selection: false },
@@ -6055,25 +6793,53 @@ impl RepositoryRuntime {
 
     /// Returns the exact toolbar action when its current document can accept
     /// it. Palette and remapped shortcuts use this same activation-time guard.
-    pub fn editor_surface_command_action(&self, card: CardId, command: EditorSurfaceCommand) -> Option<RepositoryAction> {
+    pub fn editor_surface_command_action(
+        &self,
+        card: CardId,
+        command: EditorSurfaceCommand,
+    ) -> Option<RepositoryAction> {
         self.selected.as_ref()?;
         Some(match command {
-            EditorSurfaceCommand::Save if self.can_save() => RepositoryAction::Save { card, overwrite: false },
-            EditorSurfaceCommand::DiscardEdits if self.can_discard_edits() => RepositoryAction::DiscardEdits { card },
-            EditorSurfaceCommand::Edit if self.can_apply_markdown_mode(false) => RepositoryAction::ApplyMarkdownMode { card, preview: false },
-            EditorSurfaceCommand::Preview => {
-                let file_information = !matches!(&self.document, DocumentState::Editable(_) | DocumentState::Image { .. });
-                if file_information && !self.is_saving() { RepositoryAction::ApplySourceSurface { card, diff: false } }
-                else if !file_information && self.can_apply_markdown_mode(true) { RepositoryAction::ApplyMarkdownMode { card, preview: true } }
-                else { return None; }
+            EditorSurfaceCommand::Save if self.can_save() => RepositoryAction::Save {
+                card,
+                overwrite: false,
+            },
+            EditorSurfaceCommand::DiscardEdits if self.can_discard_edits() => {
+                RepositoryAction::DiscardEdits { card }
             }
-            EditorSurfaceCommand::Diff if self.can_show_diff() => RepositoryAction::ApplySourceSurface { card, diff: true },
+            EditorSurfaceCommand::Edit if self.can_apply_markdown_mode(false) => {
+                RepositoryAction::ApplyMarkdownMode {
+                    card,
+                    preview: false,
+                }
+            }
+            EditorSurfaceCommand::Preview => {
+                let file_information = !matches!(
+                    &self.document,
+                    DocumentState::Editable(_) | DocumentState::Image { .. }
+                );
+                if file_information && !self.is_saving() {
+                    RepositoryAction::ApplySourceSurface { card, diff: false }
+                } else if !file_information && self.can_apply_markdown_mode(true) {
+                    RepositoryAction::ApplyMarkdownMode {
+                        card,
+                        preview: true,
+                    }
+                } else {
+                    return None;
+                }
+            }
+            EditorSurfaceCommand::Diff if self.can_show_diff() => {
+                RepositoryAction::ApplySourceSurface { card, diff: true }
+            }
             _ => return None,
         })
     }
 
     pub fn can_save(&self) -> bool {
-        if self.is_read_only_source() { return false; }
+        if self.is_read_only_source() {
+            return false;
+        }
         matches!(&self.document, DocumentState::Editable(document) if !document.root_unbound && (document.dirty || document.durability_warning.is_some()) && document.active_save.is_none() && document.workspace_edit.is_none())
     }
 
@@ -6156,7 +6922,9 @@ impl RepositoryRuntime {
             DocumentState::Editable(document) if document.durability_warning.is_some() => {
                 "Durability warning"
             }
-            DocumentState::Editable(document) if document.root_unbound => "Located editor unavailable",
+            DocumentState::Editable(document) if document.root_unbound => {
+                "Located editor unavailable"
+            }
             DocumentState::Editable(document) if document.error.is_some() => "Save failed",
             DocumentState::Editable(_) if self.is_dirty() => "Unsaved changes",
             DocumentState::Editable(_) => "Editable",
@@ -6168,7 +6936,10 @@ impl RepositoryRuntime {
         };
         let (document_error, conflict) = match &self.document {
             DocumentState::Editable(document) => (
-                document.root_error.clone().or_else(|| document.error.clone())
+                document
+                    .root_error
+                    .clone()
+                    .or_else(|| document.error.clone())
                     .or_else(|| document.durability_warning.clone()),
                 document.conflict,
             ),
@@ -6330,7 +7101,10 @@ impl RepositoryRuntime {
 
     pub fn save_error(&self) -> Option<&str> {
         match &self.document {
-            DocumentState::Editable(document) => document.root_error.as_deref().or(document.error.as_deref())
+            DocumentState::Editable(document) => document
+                .root_error
+                .as_deref()
+                .or(document.error.as_deref())
                 .or(document.durability_warning.as_deref()),
             _ => None,
         }
@@ -6406,7 +7180,9 @@ impl RepositoryRuntime {
             DocumentState::Editable(document)
                 if self.auto_save
                     && document.dirty
-                    && document.active_save.is_none() && document.workspace_edit.is_none() && !document.root_unbound
+                    && document.active_save.is_none()
+                    && document.workspace_edit.is_none()
+                    && !document.root_unbound
                     && !document.conflict
                     && !document.external_check_pending
                     && document.error.is_none()
@@ -6446,9 +7222,19 @@ impl RepositoryRuntime {
         })
     }
 
-    pub fn take_auto_save_due(&mut self, identity: &AsyncIdentity, revision: u64, ticket: u64) -> bool {
-        if ticket != self.next_auto_save_ticket || !self.accepts_selected(identity)
-            || self.auto_save_pending != Some((identity.generation, revision)) || self.auto_save_revision() != Some(revision) { return false; }
+    pub fn take_auto_save_due(
+        &mut self,
+        identity: &AsyncIdentity,
+        revision: u64,
+        ticket: u64,
+    ) -> bool {
+        if ticket != self.next_auto_save_ticket
+            || !self.accepts_selected(identity)
+            || self.auto_save_pending != Some((identity.generation, revision))
+            || self.auto_save_revision() != Some(revision)
+        {
+            return false;
+        }
         self.auto_save_pending = None;
         true
     }
@@ -6464,7 +7250,9 @@ impl RepositoryRuntime {
     }
 
     pub fn request_save(&mut self, card: CardId, overwrite: bool) -> Task<RepositoryAction> {
-        if self.editor_root_unbound() { return Task::none(); }
+        if self.editor_root_unbound() {
+            return Task::none();
+        }
         // Explicit Save after a completed removal means create the open file
         // again. Debounced autosave never manufactures that user intent.
         if let DocumentState::Editable(document) = &mut self.document
@@ -6492,7 +7280,10 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
-        if self.is_read_only_source() || self.editor_root_unbound() || self.workspace_edit_pending() { return Task::none(); }
+        if self.is_read_only_source() || self.editor_root_unbound() || self.workspace_edit_pending()
+        {
+            return Task::none();
+        }
         if let DocumentState::Editable(document) = &mut self.document {
             document.prune_restorations();
             if document.active_save.is_none()
@@ -6518,10 +7309,21 @@ impl RepositoryRuntime {
                 return Task::none();
             }
         }
-        let (path, destination, text, disk_hash, revision, history_revision, snapshot_source, presence, model_root) = match &self.document {
+        let (
+            path,
+            destination,
+            text,
+            disk_hash,
+            revision,
+            history_revision,
+            snapshot_source,
+            presence,
+            model_root,
+        ) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
-                    && document.active_save.is_none() && document.workspace_edit.is_none() =>
+                    && document.active_save.is_none()
+                    && document.workspace_edit.is_none() =>
             {
                 (
                     document.path.clone(),
@@ -6579,11 +7381,26 @@ impl RepositoryRuntime {
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
                 if let Some(model_root) = model_root {
-                    let _protection = crate::worktree_cleanup::protect(&worktree).map_err(|error| FileIoError::Io(error.to_string()))?;
+                    let _protection = crate::worktree_cleanup::protect(&worktree)
+                        .map_err(|error| FileIoError::Io(error.to_string()))?;
                     let root = model_root.validate_named(&worktree)?;
-                    crate::editor::save_document_file_at(root, &destination, &text, disk_hash, overwrite, presence)
+                    crate::editor::save_document_file_at(
+                        root,
+                        &destination,
+                        &text,
+                        disk_hash,
+                        overwrite,
+                        presence,
+                    )
                 } else {
-                    save_document_file(&worktree, &destination, &text, disk_hash, overwrite, presence)
+                    save_document_file(
+                        &worktree,
+                        &destination,
+                        &text,
+                        disk_hash,
+                        overwrite,
+                        presence,
+                    )
                 }
             })
             .await
@@ -6599,14 +7416,25 @@ impl RepositoryRuntime {
         })
     }
 
-    fn install_loaded_file(&mut self, identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, root: Option<crate::editor::FileRootIdentity>) -> Task<RepositoryAction> {
+    fn install_loaded_file(
+        &mut self,
+        identity: AsyncIdentity,
+        result: Result<LoadedFile, FileIoError>,
+        root: Option<crate::editor::FileRootIdentity>,
+    ) -> Task<RepositoryAction> {
         if !self.accepts_selected(&identity) {
             return Task::none();
         }
         let restored_focus = self
             .restores_editor_navigation(&identity)
             .then(|| identity.clone());
-        if !matches!(&result, Ok(LoadedFile { content: FileContent::Editable { .. } | FileContent::SavedAbsence, .. })) {
+        if !matches!(
+            &result,
+            Ok(LoadedFile {
+                content: FileContent::Editable { .. } | FileContent::SavedAbsence,
+                ..
+            })
+        ) {
             self.undo_lru.remove(&identity.path);
         }
         self.document = match result {
@@ -6619,24 +7447,42 @@ impl RepositoryRuntime {
                         markdown,
                     },
             }) => {
-                let retained = self.undo_lru.take(&identity.path, &source, content_hash, true);
-                let mut document = EditorDocument::new(identity.path, source, text, content_hash, markdown);
+                let retained = self
+                    .undo_lru
+                    .take(&identity.path, &source, content_hash, true);
+                let mut document =
+                    EditorDocument::new(identity.path, source, text, content_hash, markdown);
                 if let Some(retained) = retained {
                     document.restore_undo(retained);
                 }
                 DocumentState::Editable(document)
-            },
-            Ok(LoadedFile { source, content: FileContent::SavedAbsence }) => {
-                match self.undo_lru.take(&identity.path, &source, blake3::hash(b""), false) {
+            }
+            Ok(LoadedFile {
+                source,
+                content: FileContent::SavedAbsence,
+            }) => {
+                match self
+                    .undo_lru
+                    .take(&identity.path, &source, blake3::hash(b""), false)
+                {
                     Some(retained) => {
                         let markdown = crate::editor::is_markdown_path(&source);
-                        let mut document = EditorDocument::new(identity.path, source, String::new(), blake3::hash(b""), markdown);
+                        let mut document = EditorDocument::new(
+                            identity.path,
+                            source,
+                            String::new(),
+                            blake3::hash(b""),
+                            markdown,
+                        );
                         document.restore_undo(retained);
                         DocumentState::Editable(document)
                     }
-                    None => DocumentState::Failed { path: identity.path, message: "The retained missing-file history is no longer available.".into() },
+                    None => DocumentState::Failed {
+                        path: identity.path,
+                        message: "The retained missing-file history is no longer available.".into(),
+                    },
                 }
-            },
+            }
             Ok(LoadedFile {
                 source,
                 content:
@@ -6707,8 +7553,16 @@ impl RepositoryRuntime {
             if let Some((path, source_line)) = self.pending_source_location.take()
                 && document.path == path
                 && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
-                && *pending_path == path {
-                let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+                && *pending_path == path
+            {
+                let line = document
+                    .content
+                    .source_line_ranges()
+                    .get(source_line)
+                    .map_or_else(
+                        || document.content.line_count().saturating_sub(1),
+                        |range| range.start,
+                    );
                 navigation.caret.line = line;
                 navigation.caret.column = 0;
                 navigation.scroll_line = line.saturating_sub(10);
@@ -6716,17 +7570,24 @@ impl RepositoryRuntime {
             if let Some((path, line, column)) = self.pending_scalar_location.take()
                 && document.path == path
                 && let Some((pending_path, navigation)) = &mut self.pending_editor_navigation
-                && *pending_path == path {
-                navigation.caret.column = document.content.with_line(line, |text, _| text.char_indices().nth(column).map_or(text.len(), |(byte, _)| byte)).unwrap_or(column);
+                && *pending_path == path
+            {
+                navigation.caret.column = document
+                    .content
+                    .with_line(line, |text, _| {
+                        text.char_indices()
+                            .nth(column)
+                            .map_or(text.len(), |(byte, _)| byte)
+                    })
+                    .unwrap_or(column);
             }
             if let Some((path, editor)) = self.pending_editor_navigation.take()
                 && self.selected.as_ref().is_some_and(|file| file.path == path)
             {
-                let position =
-                    |position: crate::model::EditorPosition| text_editor::Position {
-                        line: position.line,
-                        column: position.column,
-                    };
+                let position = |position: crate::model::EditorPosition| text_editor::Position {
+                    line: position.line,
+                    column: position.column,
+                };
                 document.content.set_cursor(text_editor::Cursor {
                     position: position(editor.caret),
                     selection: editor.selection.map(position),
@@ -6771,13 +7632,27 @@ impl RepositoryRuntime {
         Task::batch([retone, self.restore_visible_scroll(), reload, fragment])
     }
 
-    fn finish_configured_file(&mut self, identity: AsyncIdentity, result: Result<LoadedFile, FileIoError>, indentation: crate::editor_indent::Overrides, root: Option<crate::editor::FileRootIdentity>) -> Task<RepositoryAction> {
+    fn finish_configured_file(
+        &mut self,
+        identity: AsyncIdentity,
+        result: Result<LoadedFile, FileIoError>,
+        indentation: crate::editor_indent::Overrides,
+        root: Option<crate::editor::FileRootIdentity>,
+    ) -> Task<RepositoryAction> {
         let current = self.accepts_selected(&identity);
-        if current { self.undo_lru.validate_root(&identity.path, root.as_ref()); }
+        if current {
+            self.undo_lru.validate_root(&identity.path, root.as_ref());
+        }
         let task = self.install_loaded_file(identity, result, root);
         if current && let DocumentState::Editable(document) = &mut self.document {
             document.indentation = indentation;
-            document.content.configure_indentation(crate::editor_indent::Indentation::detect(&document.saved_text, self.editor_tab_width, indentation));
+            document
+                .content
+                .configure_indentation(crate::editor_indent::Indentation::detect(
+                    &document.saved_text,
+                    self.editor_tab_width,
+                    indentation,
+                ));
         }
         task
     }
@@ -6786,16 +7661,29 @@ impl RepositoryRuntime {
         let card = action.card();
         let task = self.update_inner(action);
         let find = self.find_task(card);
-        let refresh = if self.comparison_refresh_queued && !self.comparison_refresh_pending() { self.refresh_open_comparison(card) } else { Task::none() };
+        let refresh = if self.comparison_refresh_queued && !self.comparison_refresh_pending() {
+            self.refresh_open_comparison(card)
+        } else {
+            Task::none()
+        };
         Task::batch([task, find, refresh])
     }
 
     fn update_inner(&mut self, action: RepositoryAction) -> Task<RepositoryAction> {
-        if self.workspace_edit_pending() && matches!(&action,
-            RepositoryAction::FileLoaded { .. } | RepositoryAction::ConfiguredFileLoaded { .. }
-            | RepositoryAction::DiskMetadata { .. } | RepositoryAction::DiskLoaded { .. }
-            | RepositoryAction::DiskComparisonLoaded { .. } | RepositoryAction::KeepMine { .. }
-            | RepositoryAction::CompareDisk { .. }) { return Task::none(); }
+        if self.workspace_edit_pending()
+            && matches!(
+                &action,
+                RepositoryAction::FileLoaded { .. }
+                    | RepositoryAction::ConfiguredFileLoaded { .. }
+                    | RepositoryAction::DiskMetadata { .. }
+                    | RepositoryAction::DiskLoaded { .. }
+                    | RepositoryAction::DiskComparisonLoaded { .. }
+                    | RepositoryAction::KeepMine { .. }
+                    | RepositoryAction::CompareDisk { .. }
+            )
+        {
+            return Task::none();
+        }
         if matches!(
             &action,
             RepositoryAction::Save { .. }
@@ -6809,30 +7697,82 @@ impl RepositoryRuntime {
         ) {
             self.toolbar_overflow_open = false;
         }
-        if self.editor_root_unbound() && matches!(&action, RepositoryAction::DiskMetadata { .. } | RepositoryAction::DiskLoaded { .. } | RepositoryAction::DiskComparisonLoaded { .. } | RepositoryAction::KeepMine { .. } | RepositoryAction::Reload { .. }) { return Task::none(); }
+        if self.editor_root_unbound()
+            && matches!(
+                &action,
+                RepositoryAction::DiskMetadata { .. }
+                    | RepositoryAction::DiskLoaded { .. }
+                    | RepositoryAction::DiskComparisonLoaded { .. }
+                    | RepositoryAction::KeepMine { .. }
+                    | RepositoryAction::Reload { .. }
+            )
+        {
+            return Task::none();
+        }
         match action {
-            RepositoryAction::EditorRootRebound { identity, source, ticket, previous, result } => {
-                if !self.accepts_selected(&identity) { return Task::none(); }
-                let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
-                if document.source != source || document.root_rebind_ticket != ticket || document.undo_root.as_ref() != Some(&previous) { return Task::none(); }
+            RepositoryAction::EditorRootRebound {
+                identity,
+                source,
+                ticket,
+                previous,
+                result,
+            } => {
+                if !self.accepts_selected(&identity) {
+                    return Task::none();
+                }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if document.source != source
+                    || document.root_rebind_ticket != ticket
+                    || document.undo_root.as_ref() != Some(&previous)
+                {
+                    return Task::none();
+                }
                 match result {
-                    Ok(root) => { document.undo_root = Some(root); document.root_unbound = false; document.root_error = None; }
-                    Err(error) => { document.root_error = Some(error); }
+                    Ok(root) => {
+                        document.undo_root = Some(root);
+                        document.root_unbound = false;
+                        document.root_error = None;
+                    }
+                    Err(error) => {
+                        document.root_error = Some(error);
+                    }
                 }
                 Task::none()
             }
-            RepositoryAction::EditorFilePrepared { identity, preparation } => self.editor_file_prepared(identity, preparation),
-            RepositoryAction::EditorFileAdmitted { identity, admission } => self.editor_file_admitted(identity, admission),
-            RepositoryAction::ConfiguredFileLoaded { identity, result, indentation, root } => {
+            RepositoryAction::EditorFilePrepared {
+                identity,
+                preparation,
+            } => self.editor_file_prepared(identity, preparation),
+            RepositoryAction::EditorFileAdmitted {
+                identity,
+                admission,
+            } => self.editor_file_admitted(identity, admission),
+            RepositoryAction::ConfiguredFileLoaded {
+                identity,
+                result,
+                indentation,
+                root,
+            } => {
                 // Legacy/unscoped completions cannot mint a mutable document.
                 let result = if root_admission::is_mutable(&result) {
                     Err(FileIoError::Io("The original edited-root load receipt is required before this file can become editable.".into()))
-                } else { result };
+                } else {
+                    result
+                };
                 self.finish_configured_file(identity, result, indentation, root)
             }
             RepositoryAction::BinaryPage { card, offset } => {
-                let DocumentState::ReadOnly { path, reason: ReadOnlyReason::BinaryPreview(_) } = &self.document else { return Task::none(); };
-                let identity = self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
+                let DocumentState::ReadOnly {
+                    path,
+                    reason: ReadOnlyReason::BinaryPreview(_),
+                } = &self.document
+                else {
+                    return Task::none();
+                };
+                let identity =
+                    self.current_identity(card, self.selected_path().unwrap_or(path).to_path_buf());
                 let worktree = self.descriptor.worktree.clone();
                 let path = path.clone();
                 self.binary_page_request = self.binary_page_request.wrapping_add(1);
@@ -6860,101 +7800,237 @@ impl RepositoryRuntime {
                     && self.accepts_selected(&identity)
                     && let DocumentState::ReadOnly { reason, .. } = &mut self.document
                 {
-                    match result { Ok(preview) => *reason = ReadOnlyReason::BinaryPreview(preview), Err(error) => { if let ReadOnlyReason::BinaryPreview(preview) = reason { preview.error = Some(error.to_string()); } } }
+                    match result {
+                        Ok(preview) => *reason = ReadOnlyReason::BinaryPreview(preview),
+                        Err(error) => {
+                            if let ReadOnlyReason::BinaryPreview(preview) = reason {
+                                preview.error = Some(error.to_string());
+                            }
+                        }
+                    }
                 }
                 Task::none()
             }
-            RepositoryAction::ComparisonMetadata { identity, ticket, basis, result } => self.comparison_metadata_loaded(identity, ticket, basis, result),
-            RepositoryAction::BranchBasisRefreshed { identity, request, previous, result } => {
-                self.branch_basis_refreshed(identity, request, previous, result)
-            }
-            RepositoryAction::DiskMetadata { identity, ticket, result } => {
-                if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
-                let DocumentState::Editable(document) = &mut self.document else { self.disk_poll = None; return Task::none(); };
-                if document.active_save.is_some() { self.disk_poll = None; return Task::none(); }
+            RepositoryAction::ComparisonMetadata {
+                identity,
+                ticket,
+                basis,
+                result,
+            } => self.comparison_metadata_loaded(identity, ticket, basis, result),
+            RepositoryAction::BranchBasisRefreshed {
+                identity,
+                request,
+                previous,
+                result,
+            } => self.branch_basis_refreshed(identity, request, previous, result),
+            RepositoryAction::DiskMetadata {
+                identity,
+                ticket,
+                result,
+            } => {
+                if !self.accepts_selected(&identity)
+                    || self.disk_poll.is_none_or(|(active, _)| active != ticket)
+                {
+                    return Task::none();
+                }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    self.disk_poll = None;
+                    return Task::none();
+                };
+                if document.active_save.is_some() {
+                    self.disk_poll = None;
+                    return Task::none();
+                }
                 let stamp = match result {
                     Ok(stamp) => stamp,
-                    Err(error) => { self.disk_poll = None; document.conflict = true; document.error = Some(format!("Could not check the file on disk: {error}")); return Task::none(); }
+                    Err(error) => {
+                        self.disk_poll = None;
+                        document.conflict = true;
+                        document.error = Some(format!("Could not check the file on disk: {error}"));
+                        return Task::none();
+                    }
                 };
-                if self.disk_stamp == Some(stamp) { self.disk_poll = None; document.external_check_pending = false; return Task::none(); }
+                if self.disk_stamp == Some(stamp) {
+                    self.disk_poll = None;
+                    document.external_check_pending = false;
+                    return Task::none();
+                }
                 let Some(stamp) = stamp else {
-                    self.disk_poll = None; self.disk_stamp = Some(None);
+                    self.disk_poll = None;
+                    self.disk_stamp = Some(None);
                     if !document.saved_present {
                         document.external_check_pending = false;
                         if document.external_version.is_some() || document.external_deleted {
-                            document.external_version = None; document.external_deleted = false;
-                            document.conflict = false; document.error = None; self.disk_comparison = None;
+                            document.external_version = None;
+                            document.external_deleted = false;
+                            document.conflict = false;
+                            document.error = None;
+                            self.disk_comparison = None;
                         }
                         return Task::none();
                     }
-                    document.external_deleted = true; document.external_version = None; document.conflict = true;
-                    document.error = Some("File deleted or renamed on disk. Your buffer has been kept.".into());
+                    document.external_deleted = true;
+                    document.external_version = None;
+                    document.conflict = true;
+                    document.error =
+                        Some("File deleted or renamed on disk. Your buffer has been kept.".into());
                     return Task::none();
                 };
                 let capture = !document.present || !document.saved_present;
                 document.prune_restorations();
-                if capture && document.restorations.len() + usize::from(document.external_version.as_ref().is_some_and(|version| version.restoration.is_some())) >= 64 {
+                if capture
+                    && document.restorations.len()
+                        + usize::from(
+                            document
+                                .external_version
+                                .as_ref()
+                                .is_some_and(|version| version.restoration.is_some()),
+                        )
+                        >= 64
+                {
                     self.disk_poll = None;
                     document.conflict = true;
                     document.error = Some("The file has too many retained deletion snapshots to reload safely. Your buffer and Undo history have been kept.".into());
                     return Task::none();
                 }
                 document.external_check_pending = true;
-                let baseline = document.disk_hash; let before = document.saved_text.clone();
-                let worktree = identity.worktree.clone(); let path = identity.path.clone(); let tone = self.document_tone;
+                let baseline = document.disk_hash;
+                let before = document.saved_text.clone();
+                let worktree = identity.worktree.clone();
+                let path = identity.path.clone();
+                let tone = self.document_tone;
                 cosmic::task::future(async move {
-                    let result = tokio::task::spawn_blocking(move || crate::editor_reload::load_with_restoration(&worktree, &path, &before, tone, capture)).await.map_err(|error| error.to_string()).and_then(|result| result);
-                    RepositoryAction::DiskLoaded { identity, ticket, stamp, baseline, result }
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::editor_reload::load_with_restoration(
+                            &worktree, &path, &before, tone, capture,
+                        )
+                    })
+                    .await
+                    .map_err(|error| error.to_string())
+                    .and_then(|result| result);
+                    RepositoryAction::DiskLoaded {
+                        identity,
+                        ticket,
+                        stamp,
+                        baseline,
+                        result,
+                    }
                 })
             }
-            RepositoryAction::DiskLoaded { identity, ticket, stamp, baseline, result } => {
-                if !self.accepts_selected(&identity) || self.disk_poll.is_none_or(|(active, _)| active != ticket) { return Task::none(); }
+            RepositoryAction::DiskLoaded {
+                identity,
+                ticket,
+                stamp,
+                baseline,
+                result,
+            } => {
+                if !self.accepts_selected(&identity)
+                    || self.disk_poll.is_none_or(|(active, _)| active != ticket)
+                {
+                    return Task::none();
+                }
                 self.disk_poll = None;
-                let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
                 document.external_check_pending = false;
-                if document.disk_hash != baseline || document.active_save.is_some() { self.disk_stamp = None; return Task::none(); }
+                if document.disk_hash != baseline || document.active_save.is_some() {
+                    self.disk_stamp = None;
+                    return Task::none();
+                }
                 let version = match result {
                     Ok(version) => version,
-                    Err(error) => { document.conflict = true; document.error = Some(error); self.disk_stamp = Some(Some(stamp)); return Task::none(); }
+                    Err(error) => {
+                        document.conflict = true;
+                        document.error = Some(error);
+                        self.disk_stamp = Some(Some(stamp));
+                        return Task::none();
+                    }
                 };
                 self.disk_stamp = Some(Some(stamp));
-                let decision = if !document.saved_present { crate::editor_reload::Decision::Conflict }
-                    else { crate::editor_reload::decide(document.disk_hash, Some(version.content_hash), document.dirty) };
+                let decision = if !document.saved_present {
+                    crate::editor_reload::Decision::Conflict
+                } else {
+                    crate::editor_reload::decide(
+                        document.disk_hash,
+                        Some(version.content_hash),
+                        document.dirty,
+                    )
+                };
                 match decision {
                     crate::editor_reload::Decision::Unchanged => {
                         if document.external_version.is_some() || document.external_deleted {
-                            document.external_version = None; document.external_deleted = false; document.conflict = false; document.error = None; self.disk_comparison = None;
+                            document.external_version = None;
+                            document.external_deleted = false;
+                            document.conflict = false;
+                            document.error = None;
+                            self.disk_comparison = None;
                         }
                         Task::none()
-                    },
-                    crate::editor_reload::Decision::Reload => self.reload_disk_version(identity.card, version),
+                    }
+                    crate::editor_reload::Decision::Reload => {
+                        self.reload_disk_version(identity.card, version)
+                    }
                     crate::editor_reload::Decision::Conflict => {
-                        document.external_version = Some(version); document.external_deleted = false;
-                        document.conflict = true; document.error = Some("File changed on disk".into());
-                        if self.disk_comparison.is_some() { self.compare_disk(identity.card) } else { Task::none() }
+                        document.external_version = Some(version);
+                        document.external_deleted = false;
+                        document.conflict = true;
+                        document.error = Some("File changed on disk".into());
+                        if self.disk_comparison.is_some() {
+                            self.compare_disk(identity.card)
+                        } else {
+                            Task::none()
+                        }
                     }
                     crate::editor_reload::Decision::Deleted => unreachable!(),
                 }
             }
             RepositoryAction::CompareDisk { card } => self.compare_disk(card),
-            RepositoryAction::DiskComparisonLoaded { identity, revision, disk_hash, model } => {
-                if self.accepts_selected(&identity) && self.disk_comparison.is_some()
-                    && matches!(&self.document, DocumentState::Editable(document) if document.revision == revision && document.external_version.as_ref().is_some_and(|disk| disk.content_hash == disk_hash)) {
+            RepositoryAction::DiskComparisonLoaded {
+                identity,
+                revision,
+                disk_hash,
+                model,
+            } => {
+                if self.accepts_selected(&identity)
+                    && self.disk_comparison.is_some()
+                    && matches!(&self.document, DocumentState::Editable(document) if document.revision == revision && document.external_version.as_ref().is_some_and(|disk| disk.content_hash == disk_hash))
+                {
                     self.diff_layout_revision = self.diff_layout_revision.wrapping_add(1);
                     self.disk_comparison = Some(DiffState::ready(match model {
-                        Some(model) => RenderedDiff::Text { model, old_label: "Disk".into(), new_label: "Unsaved buffer".into() },
-                        None => RenderedDiff::Error("Could not compare the buffer and disk. Your edits have been kept.".into()),
+                        Some(model) => RenderedDiff::Text {
+                            model,
+                            old_label: "Disk".into(),
+                            new_label: "Unsaved buffer".into(),
+                        },
+                        None => RenderedDiff::Error(
+                            "Could not compare the buffer and disk. Your edits have been kept."
+                                .into(),
+                        ),
                     }));
                 }
                 Task::none()
             }
             RepositoryAction::KeepMine { card } => {
-                let DocumentState::Editable(document) = &mut self.document else { return Task::none(); };
-                if document.active_save.is_some() { return Task::none(); }
+                let DocumentState::Editable(document) = &mut self.document else {
+                    return Task::none();
+                };
+                if document.active_save.is_some() {
+                    return Task::none();
+                }
                 if let Some(version) = document.external_version.take() {
                     if !document.present || !document.saved_present {
-                        let Some(restoration) = version.restoration.clone() else { document.external_version = Some(version); document.error = Some("The external file's Undo metadata is unavailable. Your buffer has been kept.".into()); return Task::none(); };
-                        let Some(id) = document.next_presence_id.checked_add(1) else { document.external_version = Some(version); document.error = Some("The editor's file identity counter is exhausted.".into()); return Task::none(); };
+                        let Some(restoration) = version.restoration.clone() else {
+                            document.external_version = Some(version);
+                            document.error = Some("The external file's Undo metadata is unavailable. Your buffer has been kept.".into());
+                            return Task::none();
+                        };
+                        let Some(id) = document.next_presence_id.checked_add(1) else {
+                            document.external_version = Some(version);
+                            document.error =
+                                Some("The editor's file identity counter is exhausted.".into());
+                            return Task::none();
+                        };
                         document.next_presence_id = id;
                         document.saved_presence_id = id;
                         document.deletion_mode = Some(restoration.git_mode());
@@ -6965,20 +8041,27 @@ impl RepositoryRuntime {
                     document.recreate_missing = false;
                     document.history.seal();
                     document.saved_history_revision = document.history.reserve_revision();
-                    document.disk_hash = version.content_hash; document.saved_text = version.text;
-                    document.saved_snapshot = text_editor::Content::<cosmic::Renderer>::with_text(&document.saved_text).text_snapshot();
+                    document.disk_hash = version.content_hash;
+                    document.saved_text = version.text;
+                    document.saved_snapshot =
+                        text_editor::Content::<cosmic::Renderer>::with_text(&document.saved_text)
+                            .text_snapshot();
                     document.refresh_dirty();
                 } else if document.external_deleted {
                     document.history.seal();
                     document.saved_history_revision = document.history.reserve_revision();
                     document.saved_present = false;
-                    document.saved_text.clear(); document.disk_hash = blake3::hash(b"");
-                    document.saved_snapshot = text_editor::Content::<cosmic::Renderer>::with_text("").text_snapshot();
+                    document.saved_text.clear();
+                    document.disk_hash = blake3::hash(b"");
+                    document.saved_snapshot =
+                        text_editor::Content::<cosmic::Renderer>::with_text("").text_snapshot();
                     document.recreate_missing = true;
                     document.refresh_dirty();
+                } else {
+                    return self.request_save(card, true);
                 }
-                else { return self.request_save(card, true); }
-                document.conflict = false; document.error = None;
+                document.conflict = false;
+                document.error = None;
                 self.disk_comparison = None;
                 self.request_save(card, false)
             }
@@ -7148,7 +8231,9 @@ impl RepositoryRuntime {
                 // must use the two-phase ConfiguredFileLoaded admission path.
                 let result = if root_admission::is_mutable(&result) {
                     Err(FileIoError::Io("Original edited-root admission is required before opening an editable document.".into()))
-                } else { result };
+                } else {
+                    result
+                };
                 self.install_loaded_file(identity, result, None)
             }
             RepositoryAction::PdfTone { card, tone } => {
@@ -7378,7 +8463,11 @@ impl RepositoryRuntime {
                 index,
                 choice,
             } => {
-                if self.is_read_only_source() || self.workspace_edit_pending() || self.search_mode || self.source_surface != SourceSurface::Editor {
+                if self.is_read_only_source()
+                    || self.workspace_edit_pending()
+                    || self.search_mode
+                    || self.source_surface != SourceSurface::Editor
+                {
                     return Task::none();
                 }
                 let DocumentState::Editable(document) = &mut self.document else {
@@ -7426,8 +8515,14 @@ impl RepositoryRuntime {
                 self.markdown_task(card)
             }
             RepositoryAction::EditorAction { card, action } => {
-                if (self.workspace_edit_pending() || self.is_read_only_source()) && matches!(action, text_editor::Action::Edit(_)) { return Task::none(); }
-                if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) { return Task::none(); }
+                if (self.workspace_edit_pending() || self.is_read_only_source())
+                    && matches!(action, text_editor::Action::Edit(_))
+                {
+                    return Task::none();
+                }
+                if self.search_mode && !matches!(action, text_editor::Action::Scroll { .. }) {
+                    return Task::none();
+                }
                 // No buffer is mounted outside Edit, so an action arriving
                 // from any other surface is a stale message about a surface
                 // that has already been replaced.
@@ -7469,11 +8564,22 @@ impl RepositoryRuntime {
             RepositoryAction::Language { card, action } => {
                 let diagnostic = matches!(action, EditorLspAction::Diagnostic(_));
                 match action {
-                    EditorLspAction::CodeActionNext(forward) if !self.language.code_actions.is_empty() => {
+                    EditorLspAction::CodeActionNext(forward)
+                        if !self.language.code_actions.is_empty() =>
+                    {
                         let count = self.language.code_actions.len();
                         for _ in 0..count {
-                            self.language.code_action_selected = if forward { (self.language.code_action_selected + 1) % count } else { (self.language.code_action_selected + count - 1) % count };
-                            if self.language.code_actions[self.language.code_action_selected].disabled.is_none() { break; }
+                            self.language.code_action_selected = if forward {
+                                (self.language.code_action_selected + 1) % count
+                            } else {
+                                (self.language.code_action_selected + count - 1) % count
+                            };
+                            if self.language.code_actions[self.language.code_action_selected]
+                                .disabled
+                                .is_none()
+                            {
+                                break;
+                            }
                         }
                     }
                     EditorLspAction::Next(forward) if !self.language.completions.is_empty() => {
@@ -7488,7 +8594,11 @@ impl RepositoryRuntime {
                     EditorLspAction::Dismiss => self.dismiss_editor_results(),
                     _ => {}
                 }
-                if diagnostic { self.focus_editor(card) } else { Task::none() }
+                if diagnostic {
+                    self.focus_editor(card)
+                } else {
+                    Task::none()
+                }
             }
             RepositoryAction::Save { card, overwrite } => self.request_save(card, overwrite),
             RepositoryAction::AutoSaveDue {
@@ -7552,7 +8662,10 @@ impl RepositoryRuntime {
                             document.saved_present = active.present;
                             document.saved_presence_id = active.presence_id;
                             document.disk_hash = content_hash;
-                    document.external_version = None; document.external_deleted = false; document.recreate_missing = false; document.external_check_pending = false;
+                            document.external_version = None;
+                            document.external_deleted = false;
+                            document.recreate_missing = false;
+                            document.external_check_pending = false;
                             document.saved_history_revision = active.history_revision;
                             document.saved_snapshot = active.snapshot_source;
                             document.refresh_dirty();
@@ -7654,43 +8767,100 @@ impl RepositoryRuntime {
                     Task::none()
                 }
             }
-            RepositoryAction::OpenLocation { card, path, line, column } => {
-                let loaded = self.selected_path() == Some(path.as_path()) && matches!(self.document, DocumentState::Editable(_));
-                let byte = if loaded { match &self.document {
-                    DocumentState::Editable(document) => document.content.with_line(line, |text, _| text.char_indices().nth(column).map_or(text.len(), |(byte, _)| byte)).unwrap_or(column),
-                    _ => column,
-                } } else { column };
+            RepositoryAction::OpenLocation {
+                card,
+                path,
+                line,
+                column,
+            } => {
+                let loaded = self.selected_path() == Some(path.as_path())
+                    && matches!(self.document, DocumentState::Editable(_));
+                let byte = if loaded {
+                    match &self.document {
+                        DocumentState::Editable(document) => document
+                            .content
+                            .with_line(line, |text, _| {
+                                text.char_indices()
+                                    .nth(column)
+                                    .map_or(text.len(), |(byte, _)| byte)
+                            })
+                            .unwrap_or(column),
+                        _ => column,
+                    }
+                } else {
+                    column
+                };
                 let task = self.open_file_location(card, path.clone(), line, byte, 0);
-                if !loaded && self.selected_path() == Some(path.as_path()) && matches!(self.document, DocumentState::Loading) {
+                if !loaded
+                    && self.selected_path() == Some(path.as_path())
+                    && matches!(self.document, DocumentState::Loading)
+                {
                     self.pending_scalar_location = Some((path, line, column));
                 }
                 task
             }
             RepositoryAction::OpenGoToLine { card } => {
-                if !self.editable_surface_visible() { return Task::none(); }
-                let line = self.current_location().map_or(1, |location| location.cursor.position.line + 1);
+                if !self.editable_surface_visible() {
+                    return Task::none();
+                }
+                let line = self
+                    .current_location()
+                    .map_or(1, |location| location.cursor.position.line + 1);
                 self.go_to_line = Some(line.to_string());
-                iced::widget::operation::focus(widget::Id::new(format!("repository.{card}.go-to-line")))
+                iced::widget::operation::focus(widget::Id::new(format!(
+                    "repository.{card}.go-to-line"
+                )))
             }
-            RepositoryAction::GoToLineChanged { value, .. } => { self.go_to_line = Some(value); Task::none() }
+            RepositoryAction::GoToLineChanged { value, .. } => {
+                self.go_to_line = Some(value);
+                Task::none()
+            }
             RepositoryAction::SubmitGoToLine { card } => {
-                let Some((line, column)) = self.go_to_line.as_deref().and_then(crate::editor_navigation::parse_line_column) else { return Task::none(); };
-                let Some(path) = self.selected_path().map(Path::to_path_buf) else { return Task::none(); };
+                let Some((line, column)) = self
+                    .go_to_line
+                    .as_deref()
+                    .and_then(crate::editor_navigation::parse_line_column)
+                else {
+                    return Task::none();
+                };
+                let Some(path) = self.selected_path().map(Path::to_path_buf) else {
+                    return Task::none();
+                };
                 let byte_column = match &self.document {
-                    DocumentState::Editable(document) => document.content.with_line(line, |text, _| text.char_indices().nth(column).map_or(text.len(), |(byte, _)| byte)).unwrap_or(column),
+                    DocumentState::Editable(document) => document
+                        .content
+                        .with_line(line, |text, _| {
+                            text.char_indices()
+                                .nth(column)
+                                .map_or(text.len(), |(byte, _)| byte)
+                        })
+                        .unwrap_or(column),
                     _ => column,
                 };
                 self.go_to_line = None;
                 self.open_file_location(card, path, line, byte_column, 0)
             }
-            RepositoryAction::CloseGoToLine { card } => { self.go_to_line = None; self.focus_editor(card) }
-            RepositoryAction::NavigateLocation { card, forward } => self.navigate_location(card, forward),
+            RepositoryAction::CloseGoToLine { card } => {
+                self.go_to_line = None;
+                self.focus_editor(card)
+            }
+            RepositoryAction::NavigateLocation { card, forward } => {
+                self.navigate_location(card, forward)
+            }
             RepositoryAction::Reload { card } => {
-                if self.is_read_only_source() { return self.initial_load(card); }
-                if self.is_saving() { return Task::none(); }
+                if self.is_read_only_source() {
+                    return self.initial_load(card);
+                }
+                if self.is_saving() {
+                    return Task::none();
+                }
                 if let DocumentState::Editable(document) = &mut self.document
-                    && let Some(version) = document.external_version.take() { return self.reload_disk_version(card, version); }
-                if matches!(&self.document, DocumentState::Editable(document) if document.conflict && !document.external_deleted) {
+                    && let Some(version) = document.external_version.take()
+                {
+                    return self.reload_disk_version(card, version);
+                }
+                if matches!(&self.document, DocumentState::Editable(document) if document.conflict && !document.external_deleted)
+                {
                     // Retry a failed safe observation without replacing the
                     // retained buffer/history through an ordinary file open.
                     self.disk_stamp = None;
@@ -7742,7 +8912,10 @@ impl RepositoryRuntime {
             RepositoryAction::Undo { card } => self.step_history(card, false),
             RepositoryAction::Redo { card } => self.step_history(card, true),
             RepositoryAction::BackToFiles { card } => {
-                if self.is_read_only_source() || self.descriptor.selected_file.is_some() || self.blocks_navigation() {
+                if self.is_read_only_source()
+                    || self.descriptor.selected_file.is_some()
+                    || self.blocks_navigation()
+                {
                     return Task::none();
                 }
                 self.retain_viewports();
@@ -8243,7 +9416,9 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ToggleReplace { .. } => {
-                if self.is_read_only_source() { return Task::none(); }
+                if self.is_read_only_source() {
+                    return Task::none();
+                }
                 if self.shows_diff() {
                     return Task::none();
                 }
@@ -8251,7 +9426,9 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::ReplaceMatch { card, all } => {
-                if self.is_read_only_source() || self.workspace_edit_pending() { return Task::none(); }
+                if self.is_read_only_source() || self.workspace_edit_pending() {
+                    return Task::none();
+                }
                 if self.is_saving() || self.find_cache.as_ref() != self.wanted_find().as_ref() {
                     return Task::none();
                 }
@@ -8474,7 +9651,9 @@ impl RepositoryRuntime {
     /// cached, but navigating away cancels unfinished work rather than merely
     /// discarding its expensive result later.
     fn ensure_current_diff(&mut self, card: CardId) -> Task<RepositoryAction> {
-        if self.is_read_only_source() { return Task::none(); }
+        if self.is_read_only_source() {
+            return Task::none();
+        }
         let showing_diff = self.diff_surface_visible
             && self.source_surface == SourceSurface::Diff
             && self.basis_resolution.is_none();
@@ -8584,21 +9763,51 @@ impl RepositoryRuntime {
     }
 
     fn current_location(&self) -> Option<crate::editor_navigation::Location> {
-        let DocumentState::Editable(document) = &self.document else { return None; };
-        Some(crate::editor_navigation::Location { path: document.path.clone(), cursor: document.content.cursor(), scroll: document.content.scroll_position() })
+        let DocumentState::Editable(document) = &self.document else {
+            return None;
+        };
+        Some(crate::editor_navigation::Location {
+            path: document.path.clone(),
+            cursor: document.content.cursor(),
+            scroll: document.content.scroll_position(),
+        })
     }
 
-    pub fn remember_jump_origin(&mut self) { self.pending_jump_origin = self.current_location(); }
+    pub fn remember_jump_origin(&mut self) {
+        self.pending_jump_origin = self.current_location();
+    }
 
     fn record_location_jump(&mut self, target: crate::editor_navigation::Location) {
-        if self.navigating_history { return; }
-        if let Some(origin) = self.pending_jump_origin.take().or_else(|| self.current_location()) {
-            if self.window_jump_origin.is_none() && let Some(source) = self.source_tab_path() {
-                self.window_jump_origin = Some((source, crate::model::EditorNavigation {
-                    caret: crate::model::EditorPosition { line: origin.cursor.position.line, column: origin.cursor.position.column },
-                    selection: origin.cursor.selection.map(|at| crate::model::EditorPosition { line: at.line, column: at.column }),
-                    scroll_line: origin.scroll.line, scroll_vertical: origin.scroll.vertical, scroll_horizontal: origin.scroll.horizontal,
-                }));
+        if self.navigating_history {
+            return;
+        }
+        if let Some(origin) = self
+            .pending_jump_origin
+            .take()
+            .or_else(|| self.current_location())
+        {
+            if self.window_jump_origin.is_none()
+                && let Some(source) = self.source_tab_path()
+            {
+                self.window_jump_origin = Some((
+                    source,
+                    crate::model::EditorNavigation {
+                        caret: crate::model::EditorPosition {
+                            line: origin.cursor.position.line,
+                            column: origin.cursor.position.column,
+                        },
+                        selection: origin
+                            .cursor
+                            .selection
+                            .map(|at| crate::model::EditorPosition {
+                                line: at.line,
+                                column: at.column,
+                            }),
+                        scroll_line: origin.scroll.line,
+                        scroll_vertical: origin.scroll.vertical,
+                        scroll_horizontal: origin.scroll.horizontal,
+                    },
+                ));
             }
             self.locations.jump(origin, target);
         }
@@ -8606,26 +9815,63 @@ impl RepositoryRuntime {
 
     /// Frontends fold ordinary jumps into the same window history as language
     /// source tabs. The target is captured only after its actual buffer loads.
-    pub fn take_location_jump_origin(&mut self, card: CardId) -> Option<crate::editor_locations::Location> {
-        self.window_jump_origin.take().map(|(source, anchor)| crate::editor_locations::Location { card, source, anchor })
+    pub fn take_location_jump_origin(
+        &mut self,
+        card: CardId,
+    ) -> Option<crate::editor_locations::Location> {
+        self.window_jump_origin
+            .take()
+            .map(|(source, anchor)| crate::editor_locations::Location {
+                card,
+                source,
+                anchor,
+            })
     }
 
     fn navigate_location(&mut self, card: CardId, forward: bool) -> Task<RepositoryAction> {
-        let Some(target) = self.locations.peek(forward) else { return Task::none(); };
-        if self.blocks_navigation() && self.selected_path() != Some(target.path.as_path()) { return Task::none(); }
-        let Some(from) = self.current_location() else { return Task::none(); };
-        let Some(target) = self.locations.navigate(from, forward) else { return Task::none(); };
+        let Some(target) = self.locations.peek(forward) else {
+            return Task::none();
+        };
+        if self.blocks_navigation() && self.selected_path() != Some(target.path.as_path()) {
+            return Task::none();
+        }
+        let Some(from) = self.current_location() else {
+            return Task::none();
+        };
+        let Some(target) = self.locations.navigate(from, forward) else {
+            return Task::none();
+        };
         self.navigating_history = true;
-        let task = self.open_file_location(card, target.path.clone(), target.cursor.position.line, target.cursor.position.column, 0);
+        let task = self.open_file_location(
+            card,
+            target.path.clone(),
+            target.cursor.position.line,
+            target.cursor.position.column,
+            0,
+        );
         self.navigating_history = false;
         if let DocumentState::Editable(document) = &mut self.document {
-            document.content.set_cursor(target.cursor); document.content.restore_scroll_position(target.scroll);
+            document.content.set_cursor(target.cursor);
+            document.content.restore_scroll_position(target.scroll);
         } else {
-            self.pending_editor_navigation = Some((target.path, crate::model::EditorNavigation {
-                caret: crate::model::EditorPosition { line: target.cursor.position.line, column: target.cursor.position.column },
-                selection: target.cursor.selection.map(|position| crate::model::EditorPosition { line: position.line, column: position.column }),
-                scroll_line: target.scroll.line, scroll_vertical: target.scroll.vertical, scroll_horizontal: target.scroll.horizontal,
-            }));
+            self.pending_editor_navigation = Some((
+                target.path,
+                crate::model::EditorNavigation {
+                    caret: crate::model::EditorPosition {
+                        line: target.cursor.position.line,
+                        column: target.cursor.position.column,
+                    },
+                    selection: target.cursor.selection.map(|position| {
+                        crate::model::EditorPosition {
+                            line: position.line,
+                            column: position.column,
+                        }
+                    }),
+                    scroll_line: target.scroll.line,
+                    scroll_vertical: target.scroll.vertical,
+                    scroll_horizontal: target.scroll.horizontal,
+                },
+            ));
         }
         task
     }
@@ -8661,10 +9907,23 @@ impl RepositoryRuntime {
 
     /// Opens a Git/diff source line counted by LF separators. Native editor
     /// lines also split bare CR, so defer mapping until the actual file loads.
-    pub fn open_source_file_location(&mut self, card: CardId, path: PathBuf, source_line: usize) -> Task<RepositoryAction> {
+    pub fn open_source_file_location(
+        &mut self,
+        card: CardId,
+        path: PathBuf,
+        source_line: usize,
+    ) -> Task<RepositoryAction> {
         if self.selected_path() == Some(path.as_path())
-            && let DocumentState::Editable(document) = &self.document {
-            let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
+            && let DocumentState::Editable(document) = &self.document
+        {
+            let line = document
+                .content
+                .source_line_ranges()
+                .get(source_line)
+                .map_or_else(
+                    || document.content.line_count().saturating_sub(1),
+                    |range| range.start,
+                );
             return self.open_file_location(card, path, line, 0, 0);
         }
         let task = self.open_file_location(card, path.clone(), 0, 0, 0);
@@ -8672,11 +9931,27 @@ impl RepositoryRuntime {
             match &mut self.document {
                 DocumentState::Loading => self.pending_source_location = Some((path, source_line)),
                 DocumentState::Editable(document) => {
-                    let line = document.content.source_line_ranges().get(source_line).map_or_else(|| document.content.line_count().saturating_sub(1), |range| range.start);
-                    document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line, column: 0 }, selection: None });
-                    document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+                    let line = document
+                        .content
+                        .source_line_ranges()
+                        .get(source_line)
+                        .map_or_else(
+                            || document.content.line_count().saturating_sub(1),
+                            |range| range.start,
+                        );
+                    document.content.set_cursor(text_editor::Cursor {
+                        position: text_editor::Position { line, column: 0 },
+                        selection: None,
+                    });
+                    document
+                        .content
+                        .restore_scroll_position(text_editor::ScrollPosition {
+                            line: line.saturating_sub(10),
+                            vertical: 0.0,
+                            horizontal: 0.0,
+                        });
                 }
-                _ => {},
+                _ => {}
             }
         }
         task
@@ -8697,17 +9972,42 @@ impl RepositoryRuntime {
             return Task::none();
         }
         let caret = text_editor::Position { line, column };
-        if self.blocks_navigation() && self.selected_path() != Some(path.as_path()) { return Task::none(); }
+        if self.blocks_navigation() && self.selected_path() != Some(path.as_path()) {
+            return Task::none();
+        }
         self.pending_source_location = None;
         self.pending_scalar_location = None;
-        self.record_location_jump(crate::editor_navigation::Location { path: path.clone(), cursor: text_editor::Cursor { position: caret, selection: None }, scroll: text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 } });
-        let selection = (selection_bytes > 0).then_some(text_editor::Position { line, column: column.saturating_add(selection_bytes) });
+        self.record_location_jump(crate::editor_navigation::Location {
+            path: path.clone(),
+            cursor: text_editor::Cursor {
+                position: caret,
+                selection: None,
+            },
+            scroll: text_editor::ScrollPosition {
+                line: line.saturating_sub(10),
+                vertical: 0.0,
+                horizontal: 0.0,
+            },
+        });
+        let selection = (selection_bytes > 0).then_some(text_editor::Position {
+            line,
+            column: column.saturating_add(selection_bytes),
+        });
         if self.selected_path() == Some(path.as_path())
             && let DocumentState::Editable(document) = &mut self.document
         {
             document.history.seal();
-            document.content.set_cursor(text_editor::Cursor { position: caret, selection });
-            document.content.restore_scroll_position(text_editor::ScrollPosition { line: line.saturating_sub(10), vertical: 0.0, horizontal: 0.0 });
+            document.content.set_cursor(text_editor::Cursor {
+                position: caret,
+                selection,
+            });
+            document
+                .content
+                .restore_scroll_position(text_editor::ScrollPosition {
+                    line: line.saturating_sub(10),
+                    vertical: 0.0,
+                    horizontal: 0.0,
+                });
             self.source_surface = SourceSurface::Editor;
             self.markdown_mode = MarkdownMode::Edit;
             return self.focus_editor(card);
@@ -8769,7 +10069,9 @@ impl RepositoryRuntime {
     }
 
     fn open_file_entry(&mut self, card: CardId, file: RepositoryFile) -> Task<RepositoryAction> {
-        if self.is_read_only_source() { return Task::none(); }
+        if self.is_read_only_source() {
+            return Task::none();
+        }
         if let Err(error) = self.protect_editor_worktree(&self.descriptor.worktree.clone()) {
             self.files = FileListState::Failed(error.to_string());
             return Task::none();
@@ -8805,7 +10107,9 @@ impl RepositoryRuntime {
         self.committed_selection = None;
         self.selected = Some(file.clone());
         self.document = DocumentState::Loading;
-        self.disk_stamp = None; self.disk_poll = None; self.disk_comparison = None;
+        self.disk_stamp = None;
+        self.disk_poll = None;
+        self.disk_comparison = None;
         self.diffs.clear();
         self.basis_resolution = None;
         self.apply_diff_viewport(
@@ -9061,18 +10365,37 @@ impl RepositoryRuntime {
             return;
         }
         if let DocumentState::Editable(document) = &mut self.document
-            && !document.dirty && document.active_save.is_none() && document.durability_warning.is_none()
-            && document.workspace_edit.is_none() && !document.root_unbound && !document.conflict && !document.external_check_pending && document.error.is_none() && !document.external_deleted
-            && (document.undo_root.is_some() || (document.saved_present && document.history.retained_presence_ids().next().is_none())) {
-            self.undo_lru.insert(document.path.clone(), crate::editor_navigation::SavedUndo {
-                source: document.source.clone(), disk_hash: document.disk_hash,
-                history: std::mem::take(&mut document.history), cursor: document.content.cursor(), root: document.undo_root.clone(),
-                presence: crate::editor_navigation::SavedPresence {
-                    present: document.saved_present, id: document.saved_presence_id,
-                    next_id: document.next_presence_id, deletion_mode: document.deletion_mode,
-                    restorations: document.restorations.clone(), captured_ids: document.captured_presence_ids.clone(),
+            && !document.dirty
+            && document.active_save.is_none()
+            && document.durability_warning.is_none()
+            && document.workspace_edit.is_none()
+            && !document.root_unbound
+            && !document.conflict
+            && !document.external_check_pending
+            && document.error.is_none()
+            && !document.external_deleted
+            && (document.undo_root.is_some()
+                || (document.saved_present
+                    && document.history.retained_presence_ids().next().is_none()))
+        {
+            self.undo_lru.insert(
+                document.path.clone(),
+                crate::editor_navigation::SavedUndo {
+                    source: document.source.clone(),
+                    disk_hash: document.disk_hash,
+                    history: std::mem::take(&mut document.history),
+                    cursor: document.content.cursor(),
+                    root: document.undo_root.clone(),
+                    presence: crate::editor_navigation::SavedPresence {
+                        present: document.saved_present,
+                        id: document.saved_presence_id,
+                        next_id: document.next_presence_id,
+                        deletion_mode: document.deletion_mode,
+                        restorations: document.restorations.clone(),
+                        captured_ids: document.captured_presence_ids.clone(),
+                    },
                 },
-            });
+            );
         }
         self.capture_native_viewport();
         self.capture_diff_viewport();
@@ -9125,7 +10448,10 @@ impl RepositoryRuntime {
 
     fn next_identity(&mut self, card: CardId, path: PathBuf) -> AsyncIdentity {
         let next_probe = self.comparison_metadata.next_probe;
-        self.comparison_metadata = ComparisonMetadataRefresh { next_probe, ..Default::default() };
+        self.comparison_metadata = ComparisonMetadataRefresh {
+            next_probe,
+            ..Default::default()
+        };
         self.generation = self.generation.wrapping_add(1).max(1);
         AsyncIdentity {
             card,
@@ -9186,7 +10512,9 @@ impl RepositoryRuntime {
     }
 
     fn displayed_diff_state(&self) -> Option<&DiffState> {
-        if self.source_surface == SourceSurface::Diff && self.disk_comparison.is_some() { return self.disk_comparison.as_ref(); }
+        if self.source_surface == SourceSurface::Diff && self.disk_comparison.is_some() {
+            return self.disk_comparison.as_ref();
+        }
         let current = self.diff_state(&self.diff_basis);
         if matches!(current, Some(DiffState::Ready(..))) {
             return current;
@@ -9457,7 +10785,11 @@ fn page_edge(theme: &cosmic::Theme) -> cosmic::widget::container::Style {
 
 /// Legacy raw read used only by source/history fixtures; it grants no admission.
 #[cfg(test)]
-fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone, absent: Option<(PathBuf, crate::editor::FileRootIdentity)>) -> Task<RepositoryAction> {
+fn file_task(
+    identity: AsyncIdentity,
+    tone: crate::editor::PdfTone,
+    absent: Option<(PathBuf, crate::editor::FileRootIdentity)>,
+) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let path = identity.path.clone();
     cosmic::task::future(async move {
@@ -9466,19 +10798,30 @@ fn file_task(identity: AsyncIdentity, tone: crate::editor::PdfTone, absent: Opti
             let opened = crate::editor::worktree_root(&worktree).and_then(|root| {
                 let root = Arc::new(root);
                 let identity = crate::editor::FileRootIdentity::of(root.clone())?;
-                let absent = absent.as_ref().filter(|(_, expected)| *expected == identity).map(|(source, _)| source.as_path());
-                Ok((crate::editor::load_file_with_saved_absence(&root, &path, tone, absent), identity))
+                let absent = absent
+                    .as_ref()
+                    .filter(|(_, expected)| *expected == identity)
+                    .map(|(source, _)| source.as_path());
+                Ok((
+                    crate::editor::load_file_with_saved_absence(&root, &path, tone, absent),
+                    identity,
+                ))
             });
             match opened {
                 Ok((result, root)) => (result, indentation, Some(root)),
                 Err(error) => (Err(error), indentation, None),
             }
         })
-            .await
-            .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")))
-            ;
-        let (result, indentation, root) = loaded.unwrap_or_else(|error| (Err(error), crate::editor_indent::Overrides::default(), None));
-        RepositoryAction::ConfiguredFileLoaded { identity, result, indentation, root }
+        .await
+        .map_err(|error| FileIoError::Io(format!("file worker failed: {error}")));
+        let (result, indentation, root) = loaded
+            .unwrap_or_else(|error| (Err(error), crate::editor_indent::Overrides::default(), None));
+        RepositoryAction::ConfiguredFileLoaded {
+            identity,
+            result,
+            indentation,
+            root,
+        }
     })
 }
 
@@ -10500,7 +11843,9 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             edit.into(),
             icon_button(Icon::Diff, "View diff")
                 .selected(runtime.source_surface == SourceSurface::Diff && runtime.can_show_diff())
-                .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::Diff))
+                .on_press_maybe(
+                    runtime.editor_surface_command_action(card, EditorSurfaceCommand::Diff),
+                )
                 .into(),
         ])];
     // File actions stay mounted whether or not they can run: an inactive
@@ -10513,7 +11858,9 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
                 Icon::RevertFile,
                 "Discard unsaved edits (Ctrl+Z restores them)",
             )
-            .on_press_maybe(runtime.editor_surface_command_action(card, EditorSurfaceCommand::DiscardEdits))
+            .on_press_maybe(
+                runtime.editor_surface_command_action(card, EditorSurfaceCommand::DiscardEdits),
+            )
             .into(),
         );
         controls.push(
@@ -10744,7 +12091,10 @@ fn find_strip<'a>(
             },
         )
         .selected(runtime.replace_open && !runtime.shows_diff())
-        .on_press_maybe((!runtime.shows_diff() && !runtime.is_read_only_source()).then_some(RepositoryAction::ToggleReplace { card }))
+        .on_press_maybe(
+            (!runtime.shows_diff() && !runtime.is_read_only_source())
+                .then_some(RepositoryAction::ToggleReplace { card }),
+        )
         .into(),
         crate::ui_controls::field::search("Find in file", &runtime.find_query)
             .id(find_focus_id(card))
@@ -10895,33 +12245,82 @@ fn find_strip<'a>(
     )
 }
 
-fn selected_file_view<'a>(card: CardId, runtime: &'a RepositoryRuntime, review: Option<&'a crate::pull_request_review::State>) -> Element<'a, RepositoryAction> {
+fn selected_file_view<'a>(
+    card: CardId,
+    runtime: &'a RepositoryRuntime,
+    review: Option<&'a crate::pull_request_review::State>,
+) -> Element<'a, RepositoryAction> {
     let content = match runtime.source_surface {
         SourceSurface::Editor => editor_surface(card, runtime),
         SourceSurface::Diff => diff_surface(card, runtime, review),
     };
     let content = if let Some(error) = &runtime.comparison_metadata.error {
         widget::column::with_children(vec![
-            widget::container(crate::design::caption(format!("Could not check comparison changes: {error}. Retrying automatically."))).padding([space::XS, space::M]).into(),
+            widget::container(crate::design::caption(format!(
+                "Could not check comparison changes: {error}. Retrying automatically."
+            )))
+            .padding([space::XS, space::M])
+            .into(),
             content,
-        ]).height(Length::Fill).into()
-    } else { content };
-    let DocumentState::Editable(document) = &runtime.document else { return content; };
-    if document.external_version.is_none() && !document.external_deleted { return content; }
+        ])
+        .height(Length::Fill)
+        .into()
+    } else {
+        content
+    };
+    let DocumentState::Editable(document) = &runtime.document else {
+        return content;
+    };
+    if document.external_version.is_none() && !document.external_deleted {
+        return content;
+    }
     let actions: Vec<Element<'a, RepositoryAction>> = vec![
-        crate::ui_controls::button::secondary("Reload").on_press_maybe((!runtime.is_saving() && document.external_version.is_some()).then_some(RepositoryAction::Reload { card })).into(),
-        crate::ui_controls::button::secondary("Compare").on_press_maybe((!runtime.is_saving() && document.external_version.is_some()).then_some(RepositoryAction::CompareDisk { card })).into(),
-        crate::ui_controls::button::secondary(if document.external_deleted { "Save again" } else { "Keep mine" }).on_press_maybe((!runtime.is_saving()).then_some(RepositoryAction::KeepMine { card })).into(),
+        crate::ui_controls::button::secondary("Reload")
+            .on_press_maybe(
+                (!runtime.is_saving() && document.external_version.is_some())
+                    .then_some(RepositoryAction::Reload { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary("Compare")
+            .on_press_maybe(
+                (!runtime.is_saving() && document.external_version.is_some())
+                    .then_some(RepositoryAction::CompareDisk { card }),
+            )
+            .into(),
+        crate::ui_controls::button::secondary(if document.external_deleted {
+            "Save again"
+        } else {
+            "Keep mine"
+        })
+        .on_press_maybe((!runtime.is_saving()).then_some(RepositoryAction::KeepMine { card }))
+        .into(),
     ];
     let mut rows: Vec<Element<'a, RepositoryAction>> = vec![
-        crate::design::body(if document.external_deleted { "File deleted or renamed on disk. Your buffer has been kept." } else { "File changed on disk" }).width(Length::Fill).into(),
-        widget::row::with_children(actions).spacing(space::S).align_y(Alignment::Center).into(),
+        crate::design::body(if document.external_deleted {
+            "File deleted or renamed on disk. Your buffer has been kept."
+        } else {
+            "File changed on disk"
+        })
+        .width(Length::Fill)
+        .into(),
+        widget::row::with_children(actions)
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into(),
     ];
     if runtime.disk_comparison.is_some() {
-        rows.push(crate::ui_controls::button::secondary("Back to editor").on_press(RepositoryAction::ApplySourceSurface { card, diff: false }).into());
+        rows.push(
+            crate::ui_controls::button::secondary("Back to editor")
+                .on_press(RepositoryAction::ApplySourceSurface { card, diff: false })
+                .into(),
+        );
     }
-    let bar = widget::container(widget::column::with_children(rows).spacing(space::S)).class(cosmic::theme::Container::Secondary).padding(space::M);
-    widget::column::with_children([bar.into(), content]).height(Length::Fill).into()
+    let bar = widget::container(widget::column::with_children(rows).spacing(space::S))
+        .class(cosmic::theme::Container::Secondary)
+        .padding(space::M);
+    widget::column::with_children([bar.into(), content])
+        .height(Length::Fill)
+        .into()
 }
 
 fn editor_surface(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
@@ -11195,21 +12594,54 @@ fn editable_document_view<'a>(
 ) -> Element<'a, RepositoryAction> {
     let mut error_rows: Vec<Element<'a, RepositoryAction>> = Vec::new();
     let (line, column, selected) = document.content.cursor_metrics();
-    error_rows.push(widget::button::custom(crate::design::caption(if selected == 0 { format!("Ln {line}, Col {column}") } else { format!("Ln {line}, Col {column} ({selected} selected)") })).class(crate::ui_controls::control_style(false, None)).on_press(RepositoryAction::OpenGoToLine { card }).into());
+    error_rows.push(
+        widget::button::custom(crate::design::caption(if selected == 0 {
+            format!("Ln {line}, Col {column}")
+        } else {
+            format!("Ln {line}, Col {column} ({selected} selected)")
+        }))
+        .class(crate::ui_controls::control_style(false, None))
+        .on_press(RepositoryAction::OpenGoToLine { card })
+        .into(),
+    );
     if let Some(value) = &runtime.go_to_line {
         let valid = crate::editor_navigation::parse_line_column(value).is_some();
-        error_rows.push(widget::container(widget::column::with_children(vec![
-            crate::ui_controls::field::text("Line or line:column", value).id(widget::Id::new(format!("repository.{card}.go-to-line"))).on_input(move |value| RepositoryAction::GoToLineChanged { card, value }).on_submit(RepositoryAction::SubmitGoToLine { card }).into(),
-            widget::row::with_children(vec![
-                crate::ui_controls::button::secondary("Go").on_press_maybe(valid.then_some(RepositoryAction::SubmitGoToLine { card })).into(),
-                crate::ui_controls::button::secondary("Cancel").on_press(RepositoryAction::CloseGoToLine { card }).into(),
-                crate::design::caption(if valid { "One-based line and column" } else { "Enter a positive line or line:column" }).into(),
-            ]).spacing(space::S).into(),
-        ])).padding(space::M).into());
+        error_rows.push(
+            widget::container(widget::column::with_children(vec![
+                crate::ui_controls::field::text("Line or line:column", value)
+                    .id(widget::Id::new(format!("repository.{card}.go-to-line")))
+                    .on_input(move |value| RepositoryAction::GoToLineChanged { card, value })
+                    .on_submit(RepositoryAction::SubmitGoToLine { card })
+                    .into(),
+                widget::row::with_children(vec![
+                    crate::ui_controls::button::secondary("Go")
+                        .on_press_maybe(valid.then_some(RepositoryAction::SubmitGoToLine { card }))
+                        .into(),
+                    crate::ui_controls::button::secondary("Cancel")
+                        .on_press(RepositoryAction::CloseGoToLine { card })
+                        .into(),
+                    crate::design::caption(if valid {
+                        "One-based line and column"
+                    } else {
+                        "Enter a positive line or line:column"
+                    })
+                    .into(),
+                ])
+                .spacing(space::S)
+                .into(),
+            ]))
+            .padding(space::M)
+            .into(),
+        );
     }
 
-    if let Some(error) = document.root_error.as_ref().or(document.error.as_ref()
-        .filter(|_| document.external_version.is_none() && !document.external_deleted))
+    if let Some(error) = document
+        .root_error
+        .as_ref()
+        .or(document
+            .error
+            .as_ref()
+            .filter(|_| document.external_version.is_none() && !document.external_deleted))
         .or(document.durability_warning.as_ref())
     {
         let mut actions: Vec<Element<'a, RepositoryAction>> =
@@ -11479,7 +12911,14 @@ fn editable_document_view<'a>(
                 &[]
             })
             .diagnostics(&runtime.language.marks)
-            .code_action_lines(&runtime.language.code_action_lines, runtime.language.available_actions_at.filter(|(revision, _)| *revision == document.revision).map(|(_, at)| at))
+            .code_action_lines(
+                &runtime.language.code_action_lines,
+                runtime
+                    .language
+                    .available_actions_at
+                    .filter(|(revision, _)| *revision == document.revision)
+                    .map(|(_, at)| at),
+            )
             .popup(
                 popup,
                 if runtime.language.completions.is_empty() && runtime.language.hover.is_empty() {
@@ -11521,14 +12960,26 @@ fn editable_document_view<'a>(
             })
             .key_binding(move |press| {
                 use iced::keyboard::{Key, key::Named};
-                if !matches!(press.status, iced::widget::text_editor::Status::Focused { .. }) {
+                if !matches!(
+                    press.status,
+                    iced::widget::text_editor::Status::Focused { .. }
+                ) {
                     return text_editor::default_bindings(press);
                 }
                 // Read-only dependency sources retain normal focus traversal.
-                if runtime.is_read_only_source() && matches!(&press.key, Key::Named(Named::Tab)) { return None; }
-                if press.modifiers.command() && !press.modifiers.alt()
-                    && press.key.to_latin(press.physical_key).is_some_and(|key| key.eq_ignore_ascii_case(&'g')) {
-                    return Some(text_editor::Binding::Custom(RepositoryAction::OpenGoToLine { card }));
+                if runtime.is_read_only_source() && matches!(&press.key, Key::Named(Named::Tab)) {
+                    return None;
+                }
+                if press.modifiers.command()
+                    && !press.modifiers.alt()
+                    && press
+                        .key
+                        .to_latin(press.physical_key)
+                        .is_some_and(|key| key.eq_ignore_ascii_case(&'g'))
+                {
+                    return Some(text_editor::Binding::Custom(
+                        RepositoryAction::OpenGoToLine { card },
+                    ));
                 }
                 if let Some(delta) = crate::interaction::font_zoom_chord(
                     &press.key,
@@ -11543,16 +12994,42 @@ fn editable_document_view<'a>(
                 if let Some(binding) = registered_editor_binding(card, runtime, &press) {
                     return binding;
                 }
-                if press.modifiers.alt() && !press.modifiers.control() && !press.modifiers.shift() && !press.modifiers.logo() {
+                if press.modifiers.alt()
+                    && !press.modifiers.control()
+                    && !press.modifiers.shift()
+                    && !press.modifiers.logo()
+                {
                     match press.key {
-                        Key::Named(Named::ArrowLeft) => return Some(text_editor::Binding::Custom(RepositoryAction::NavigateLocation { card, forward: false })),
-                        Key::Named(Named::ArrowRight) => return Some(text_editor::Binding::Custom(RepositoryAction::NavigateLocation { card, forward: true })),
+                        Key::Named(Named::ArrowLeft) => {
+                            return Some(text_editor::Binding::Custom(
+                                RepositoryAction::NavigateLocation {
+                                    card,
+                                    forward: false,
+                                },
+                            ));
+                        }
+                        Key::Named(Named::ArrowRight) => {
+                            return Some(text_editor::Binding::Custom(
+                                RepositoryAction::NavigateLocation {
+                                    card,
+                                    forward: true,
+                                },
+                            ));
+                        }
                         _ => {}
                     }
                 }
                 let action = match &press.key {
-                    Key::Named(Named::F2) if !runtime.standalone && press.modifiers.is_empty() => Some(EditorLspAction::Rename),
-                    Key::Character(character) if !runtime.standalone && character.as_str() == "." && press.modifiers.command() => Some(EditorLspAction::CodeActions),
+                    Key::Named(Named::F2) if !runtime.standalone && press.modifiers.is_empty() => {
+                        Some(EditorLspAction::Rename)
+                    }
+                    Key::Character(character)
+                        if !runtime.standalone
+                            && character.as_str() == "."
+                            && press.modifiers.command() =>
+                    {
+                        Some(EditorLspAction::CodeActions)
+                    }
                     Key::Named(Named::Escape)
                         if !runtime.language.completions.is_empty()
                             || !runtime.language.hover.is_empty()
@@ -11561,9 +13038,15 @@ fn editable_document_view<'a>(
                     {
                         Some(EditorLspAction::Dismiss)
                     }
-                    Key::Named(Named::ArrowDown) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::CodeActionNext(true)),
-                    Key::Named(Named::ArrowUp) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::CodeActionNext(false)),
-                    Key::Named(Named::Enter) if !runtime.language.code_actions.is_empty() => Some(EditorLspAction::ChooseCodeAction(runtime.language.code_action_selected)),
+                    Key::Named(Named::ArrowDown) if !runtime.language.code_actions.is_empty() => {
+                        Some(EditorLspAction::CodeActionNext(true))
+                    }
+                    Key::Named(Named::ArrowUp) if !runtime.language.code_actions.is_empty() => {
+                        Some(EditorLspAction::CodeActionNext(false))
+                    }
+                    Key::Named(Named::Enter) if !runtime.language.code_actions.is_empty() => Some(
+                        EditorLspAction::ChooseCodeAction(runtime.language.code_action_selected),
+                    ),
                     Key::Named(Named::ArrowDown) if !runtime.language.completions.is_empty() => {
                         Some(EditorLspAction::Next(true))
                     }
@@ -11588,8 +13071,13 @@ fn editable_document_view<'a>(
                     .or_else(|| text_editor::default_bindings(press))
             });
         let editor = if runtime.language.code_action_support && !runtime.is_read_only_source() {
-            editor.on_code_action(move |at| RepositoryAction::Language { card, action: EditorLspAction::CodeActionsAt(caret_position(&document.content, at)) })
-        } else { editor };
+            editor.on_code_action(move |at| RepositoryAction::Language {
+                card,
+                action: EditorLspAction::CodeActionsAt(caret_position(&document.content, at)),
+            })
+        } else {
+            editor
+        };
         let editor =
             editor.on_action(move |action| RepositoryAction::EditorAction { card, action });
         crate::interaction::context_menu_keyed(
@@ -11599,51 +13087,174 @@ fn editable_document_view<'a>(
         )
     };
     if runtime.is_read_only_source() {
-        error_rows.push(crate::design::caption("Read-only dependency source · Go to definition remains available").into());
+        error_rows.push(
+            crate::design::caption(
+                "Read-only dependency source · Go to definition remains available",
+            )
+            .into(),
+        );
     }
     if let Some(draft) = &runtime.language.rename {
-        error_rows.push(widget::row::with_children(vec![
-            crate::ui_controls::field::text("New symbol name", draft)
-                .id(RepositoryRuntime::rename_focus_id(card))
-                .on_input(move |draft| RepositoryAction::Language { card, action: EditorLspAction::RenameDraft(draft) })
-                .on_submit(move |value| RepositoryAction::Language { card, action: EditorLspAction::SubmitRename(value) })
-                .width(Length::Fill).into(),
-            crate::ui_controls::button::primary("Preview rename").on_press(RepositoryAction::Language { card, action: EditorLspAction::SubmitRename(draft.clone()) }).into(),
-            crate::ui_controls::button::secondary("Cancel").on_press(RepositoryAction::Language { card, action: EditorLspAction::CancelRename }).into(),
-        ]).spacing(space::S).align_y(Alignment::Center).into());
+        error_rows.push(
+            widget::row::with_children(vec![
+                crate::ui_controls::field::text("New symbol name", draft)
+                    .id(RepositoryRuntime::rename_focus_id(card))
+                    .on_input(move |draft| RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::RenameDraft(draft),
+                    })
+                    .on_submit(move |value| RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::SubmitRename(value),
+                    })
+                    .width(Length::Fill)
+                    .into(),
+                crate::ui_controls::button::primary("Preview rename")
+                    .on_press(RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::SubmitRename(draft.clone()),
+                    })
+                    .into(),
+                crate::ui_controls::button::secondary("Cancel")
+                    .on_press(RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::CancelRename,
+                    })
+                    .into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into(),
+        );
     }
     if !runtime.language.code_actions.is_empty() {
         let first = runtime.language.code_action_selected / 8 * 8;
         let end = (first + 8).min(runtime.language.code_actions.len());
-        let rows = runtime.language.code_actions.iter().enumerate().skip(first).take(8).map(|(index, action)| {
-            let label = crate::design::body(action.disabled.as_ref().map_or_else(|| action.title.clone(), |reason| format!("{} — {reason}", action.title)))
-                .wrapping(iced::widget::text::Wrapping::None).ellipsize(iced::widget::text::Ellipsize::End(iced::advanced::text::EllipsizeHeightLimit::Lines(1)));
-            widget::button::custom(label).class(crate::ui_controls::control_style(index == runtime.language.code_action_selected, None))
-                .width(Length::Fill).on_press_maybe(action.disabled.is_none().then_some(RepositoryAction::Language { card, action: EditorLspAction::ChooseCodeAction(index) })).into()
-        }).collect::<Vec<_>>();
-        error_rows.push(widget::container(widget::scrollable(widget::column::with_children(rows).spacing(space::XS)).height(Length::Shrink)).max_height(240).into());
-        error_rows.push(widget::row::with_children(vec![
-            crate::design::caption(format!("Actions {}–{} of {} · ↑ ↓ choose · Enter apply · Escape close", first + 1, end, runtime.language.code_actions.len())).width(Length::Fill).into(),
-            crate::ui_controls::button::secondary("Previous").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActionNext(false) }).into(),
-            crate::ui_controls::button::secondary("Next").on_press(RepositoryAction::Language { card, action: EditorLspAction::CodeActionNext(true) }).into(),
-        ]).spacing(space::S).into());
+        let rows = runtime
+            .language
+            .code_actions
+            .iter()
+            .enumerate()
+            .skip(first)
+            .take(8)
+            .map(|(index, action)| {
+                let label = crate::design::body(action.disabled.as_ref().map_or_else(
+                    || action.title.clone(),
+                    |reason| format!("{} — {reason}", action.title),
+                ))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+                ));
+                widget::button::custom(label)
+                    .class(crate::ui_controls::control_style(
+                        index == runtime.language.code_action_selected,
+                        None,
+                    ))
+                    .width(Length::Fill)
+                    .on_press_maybe(action.disabled.is_none().then_some(
+                        RepositoryAction::Language {
+                            card,
+                            action: EditorLspAction::ChooseCodeAction(index),
+                        },
+                    ))
+                    .into()
+            })
+            .collect::<Vec<_>>();
+        error_rows.push(
+            widget::container(
+                widget::scrollable(widget::column::with_children(rows).spacing(space::XS))
+                    .height(Length::Shrink),
+            )
+            .max_height(240)
+            .into(),
+        );
+        error_rows.push(
+            widget::row::with_children(vec![
+                crate::design::caption(format!(
+                    "Actions {}–{} of {} · ↑ ↓ choose · Enter apply · Escape close",
+                    first + 1,
+                    end,
+                    runtime.language.code_actions.len()
+                ))
+                .width(Length::Fill)
+                .into(),
+                crate::ui_controls::button::secondary("Previous")
+                    .on_press(RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::CodeActionNext(false),
+                    })
+                    .into(),
+                crate::ui_controls::button::secondary("Next")
+                    .on_press(RepositoryAction::Language {
+                        card,
+                        action: EditorLspAction::CodeActionNext(true),
+                    })
+                    .into(),
+            ])
+            .spacing(space::S)
+            .into(),
+        );
     }
     if let Some(help) = &runtime.language.signature {
         if let Some(signature) = help.signatures.get(help.active_signature) {
-            let active = signature.active_parameter.or(help.active_parameter).and_then(|index| signature.parameters.get(index));
-            let active_range = active.and_then(|parameter| parameter.range.clone()).filter(|range| range.start <= range.end && signature.label.is_char_boundary(range.start) && signature.label.is_char_boundary(range.end) && range.end <= signature.label.len());
+            let active = signature
+                .active_parameter
+                .or(help.active_parameter)
+                .and_then(|index| signature.parameters.get(index));
+            let active_range =
+                active
+                    .and_then(|parameter| parameter.range.clone())
+                    .filter(|range| {
+                        range.start <= range.end
+                            && signature.label.is_char_boundary(range.start)
+                            && signature.label.is_char_boundary(range.end)
+                            && range.end <= signature.label.len()
+                    });
             let label: Element<'_, RepositoryAction> = if let Some(range) = active_range {
                 widget::row::with_children(vec![
-                    crate::design::body(&signature.label[..range.start]).font(Font::MONOSPACE).into(),
-                    crate::design::body(&signature.label[range.clone()]).font(Font { weight: iced::font::Weight::Bold, ..Font::MONOSPACE }).into(),
-                    crate::design::body(&signature.label[range.end..]).font(Font::MONOSPACE).into(),
-                ]).into()
-            } else { crate::design::body(signature.label.clone()).font(Font::MONOSPACE).into() };
+                    crate::design::body(&signature.label[..range.start])
+                        .font(Font::MONOSPACE)
+                        .into(),
+                    crate::design::body(&signature.label[range.clone()])
+                        .font(Font {
+                            weight: iced::font::Weight::Bold,
+                            ..Font::MONOSPACE
+                        })
+                        .into(),
+                    crate::design::body(&signature.label[range.end..])
+                        .font(Font::MONOSPACE)
+                        .into(),
+                ])
+                .into()
+            } else {
+                crate::design::body(signature.label.clone())
+                    .font(Font::MONOSPACE)
+                    .into()
+            };
             let mut rows = vec![label];
             if let Some(parameter) = active {
-                rows.push(crate::design::caption(format!("Parameter: {}{}", parameter.label, parameter.documentation.as_ref().map_or(String::new(), |doc| format!(" · {doc}")))).font(Font { weight: iced::font::Weight::Bold, ..Font::MONOSPACE }).into());
+                rows.push(
+                    crate::design::caption(format!(
+                        "Parameter: {}{}",
+                        parameter.label,
+                        parameter
+                            .documentation
+                            .as_ref()
+                            .map_or(String::new(), |doc| format!(" · {doc}"))
+                    ))
+                    .font(Font {
+                        weight: iced::font::Weight::Bold,
+                        ..Font::MONOSPACE
+                    })
+                    .into(),
+                );
             }
-            error_rows.push(widget::column::with_children(rows).spacing(space::XS).into());
+            error_rows.push(
+                widget::column::with_children(rows)
+                    .spacing(space::XS)
+                    .into(),
+            );
         }
     }
     // Keep the named editor in the same slot when save warnings appear.
@@ -11756,7 +13367,9 @@ fn labelled_diff_control<'a>(
 }
 
 fn diff_basis_controls(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
-    if runtime.disk_comparison.is_some() { return crate::design::caption("Disk → unsaved buffer").into(); }
+    if runtime.disk_comparison.is_some() {
+        return crate::design::caption("Disk → unsaved buffer").into();
+    }
     let selected = match &runtime.basis_resolution {
         Some(BasisResolution::Resolving(choice)) => Some(BasisChoice::Committed(*choice)),
         Some(BasisResolution::NeedsBase(_)) => {
@@ -12018,9 +13631,21 @@ fn diff_surface<'a>(
     if let Some(state) = &runtime.disk_comparison {
         return match state {
             DiffState::Loading { .. } => loading(),
-            DiffState::Ready(RenderedDiff::Text { model, old_label, new_label }, _) => diff_model_view(card, runtime, model, old_label, new_label, None),
-            DiffState::Ready(RenderedDiff::Error(error), _) => information_state("Could not compare buffer and disk", error),
-            _ => information_state("Comparison unavailable", "The disk file cannot be compared as text."),
+            DiffState::Ready(
+                RenderedDiff::Text {
+                    model,
+                    old_label,
+                    new_label,
+                },
+                _,
+            ) => diff_model_view(card, runtime, model, old_label, new_label, None),
+            DiffState::Ready(RenderedDiff::Error(error), _) => {
+                information_state("Could not compare buffer and disk", error)
+            }
+            _ => information_state(
+                "Comparison unavailable",
+                "The disk file cannot be compared as text.",
+            ),
         };
     }
     if runtime.mutation_refresh_pending
@@ -13969,41 +15594,76 @@ mod tests {
 
     #[tokio::test]
     async fn retained_root_census_includes_cached_original_during_and_after_new_root_load() {
-        let directory = tempfile::tempdir().unwrap(); let named = directory.path().join("root"); let moved = directory.path().join("original");
-        std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("source.rs"), "original").unwrap();
-        let card = CardId::new(); let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(card, "source.rs");
-        runtime.descriptor.worktree = named.clone(); identity.worktree = named.clone();
-        let task = file_task(identity, crate::editor::PdfTone::Original, None); finish_navigation_task(&mut runtime, task).await;
+        let directory = tempfile::tempdir().unwrap();
+        let named = directory.path().join("root");
+        let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("source.rs"), "original").unwrap();
+        let card = CardId::new();
+        let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(card, "source.rs");
+        runtime.descriptor.worktree = named.clone();
+        identity.worktree = named.clone();
+        let task = file_task(identity, crate::editor::PdfTone::Original, None);
+        finish_navigation_task(&mut runtime, task).await;
         let original = runtime.retained_filesystem_root().unwrap();
-        std::fs::rename(&named, &moved).unwrap(); std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("other.txt"), "replacement").unwrap();
+        std::fs::rename(&named, &moved).unwrap();
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("other.txt"), "replacement").unwrap();
         let task = runtime.open_file(card, "other.txt".into());
         assert!(runtime.retained_filesystem_root().is_none());
-        assert!(runtime.retained_filesystem_roots().iter().any(|root| Arc::ptr_eq(root, &original)), "cached original remains in exclusions while replacement loads");
+        assert!(
+            runtime
+                .retained_filesystem_roots()
+                .iter()
+                .any(|root| Arc::ptr_eq(root, &original)),
+            "cached original remains in exclusions while replacement loads"
+        );
         finish_navigation_task(&mut runtime, task).await;
-        let current = runtime.retained_filesystem_root().unwrap(); assert!(!Arc::ptr_eq(&current, &original));
+        let current = runtime.retained_filesystem_root().unwrap();
+        assert!(!Arc::ptr_eq(&current, &original));
         let roots = runtime.retained_filesystem_roots();
         assert!(roots.iter().any(|root| Arc::ptr_eq(root, &original)));
         assert!(roots.iter().any(|root| Arc::ptr_eq(root, &current)));
-        assert!(roots.len() <= 9, "one current document plus eight bounded cached histories");
+        assert!(
+            roots.len() <= 9,
+            "one current document plus eight bounded cached histories"
+        );
     }
 
     #[tokio::test]
     async fn retained_root_census_clones_the_actual_read_root_through_logical_relocation() {
-        let directory = tempfile::tempdir().unwrap(); let named = directory.path().join("root"); let moved = directory.path().join("original");
-        std::fs::create_dir(&named).unwrap(); std::fs::write(named.join("source.rs"), "original").unwrap();
-        let card = CardId::new(); let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(card, "source.rs");
-        runtime.descriptor.worktree = named.clone(); identity.worktree = named.clone();
-        assert!(runtime.retained_filesystem_root().is_none(), "pending native read has no invented Root");
+        let directory = tempfile::tempdir().unwrap();
+        let named = directory.path().join("root");
+        let moved = directory.path().join("original");
+        std::fs::create_dir(&named).unwrap();
+        std::fs::write(named.join("source.rs"), "original").unwrap();
+        let card = CardId::new();
+        let (mut runtime, mut identity) = RepositoryRuntime::selection_fixture(card, "source.rs");
+        runtime.descriptor.worktree = named.clone();
+        identity.worktree = named.clone();
+        assert!(
+            runtime.retained_filesystem_root().is_none(),
+            "pending native read has no invented Root"
+        );
         let task = file_task(identity, crate::editor::PdfTone::Original, None);
         finish_navigation_task(&mut runtime, task).await;
-        let original = runtime.retained_filesystem_root().expect("actual configured worker loaded its Root");
-        assert!(Arc::ptr_eq(&original, &runtime.retained_filesystem_root().unwrap()), "census does not duplicate FDs or reopen paths");
-        std::fs::rename(&named, &moved).unwrap(); std::fs::create_dir(&named).unwrap();
+        let original = runtime
+            .retained_filesystem_root()
+            .expect("actual configured worker loaded its Root");
+        assert!(
+            Arc::ptr_eq(&original, &runtime.retained_filesystem_root().unwrap()),
+            "census does not duplicate FDs or reopen paths"
+        );
+        std::fs::rename(&named, &moved).unwrap();
+        std::fs::create_dir(&named).unwrap();
         std::fs::write(named.join("foreign"), "keep").unwrap();
         // The explicit Locate reducer pauses effects before its worker result.
         drop(runtime.rebind_editor_root_after_relocation(card));
         assert!(runtime.editor_root_unbound());
-        assert!(Arc::ptr_eq(&original, &runtime.retained_filesystem_root().unwrap()));
+        assert!(Arc::ptr_eq(
+            &original,
+            &runtime.retained_filesystem_root().unwrap()
+        ));
         assert_eq!(runtime.editor_text().as_deref(), Some("original"));
         assert_eq!(std::fs::read(named.join("foreign")).unwrap(), b"keep");
     }
@@ -14011,134 +15671,285 @@ mod tests {
     #[tokio::test]
     async fn cross_presence_reload_keeps_both_metadata_lineages_through_undo_save_redo() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let directory = tempfile::tempdir().unwrap(); let root = directory.path(); let path = Path::new("source.rs");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = Path::new("source.rs");
         std::fs::write(root.join(path), "old").unwrap();
         std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let SaveOutcome::Absent { restoration, .. } = crate::editor::save_document_file(root, path, "", blake3::hash(b"old"), false, PresenceSave {
-            expected_present: true, desired_present: false, external_missing_recreate: false,
-            expected_mode: Some(0o100755), restoration: None,
-        }).unwrap() else { panic!("removed old lineage"); };
-        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "");
+        let SaveOutcome::Absent { restoration, .. } = crate::editor::save_document_file(
+            root,
+            path,
+            "",
+            blake3::hash(b"old"),
+            false,
+            PresenceSave {
+                expected_present: true,
+                desired_present: false,
+                external_missing_recreate: false,
+                expected_mode: Some(0o100755),
+                restoration: None,
+            },
+        )
+        .unwrap() else {
+            panic!("removed old lineage");
+        };
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "");
         runtime.descriptor.worktree = root.into();
         runtime.set_auto_save(false);
-        let DocumentState::Editable(document) = &mut runtime.document else { panic!() };
-        document.present = false; document.saved_present = false;
-        document.presence_id = 2; document.saved_presence_id = 2; document.next_presence_id = 2;
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!()
+        };
+        document.present = false;
+        document.saved_present = false;
+        document.presence_id = 2;
+        document.saved_presence_id = 2;
+        document.next_presence_id = 2;
         document.deletion_mode = Some(0o100755);
-        document.restorations.insert(2, restoration.clone()); document.captured_presence_ids.insert(2);
+        document.restorations.insert(2, restoration.clone());
+        document.captured_presence_ids.insert(2);
         let identity = runtime.current_identity(card, path.into());
         runtime.disk_poll = Some((1, Instant::now()));
-        drop(runtime.update(RepositoryAction::DiskMetadata { identity: identity.clone(), ticket: 1, result: Ok(None) }));
+        drop(runtime.update(RepositoryAction::DiskMetadata {
+            identity: identity.clone(),
+            ticket: 1,
+            result: Ok(None),
+        }));
         assert!(!runtime.is_dirty());
-        assert!(matches!(&runtime.document, DocumentState::Editable(document) if !document.external_deleted && document.error.is_none()));
+        assert!(
+            matches!(&runtime.document, DocumentState::Editable(document) if !document.external_deleted && document.error.is_none())
+        );
         std::fs::write(root.join(path), "external third\n").unwrap();
         std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o640)).unwrap();
         let stamp = crate::editor_reload::stamp(root, path, path).unwrap();
         runtime.disk_poll = Some((2, Instant::now()));
-        let task = runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 2, result: Ok(stamp) });
+        let task = runtime.update(RepositoryAction::DiskMetadata {
+            identity,
+            ticket: 2,
+            result: Ok(stamp),
+        });
         finish_navigation_task(&mut runtime, task).await;
-        assert!(matches!(&runtime.document, DocumentState::Editable(document) if document.conflict && document.external_version.as_ref().is_some_and(|version| version.restoration.is_some())));
+        assert!(
+            matches!(&runtime.document, DocumentState::Editable(document) if document.conflict && document.external_version.as_ref().is_some_and(|version| version.restoration.is_some()))
+        );
         drop(runtime.update(RepositoryAction::Reload { card }));
         assert_eq!(runtime.editor_text().as_deref(), Some("external third\n"));
         assert!(!runtime.is_dirty());
-        let DocumentState::Editable(document) = &runtime.document else { panic!() };
-        assert_eq!(document.presence_id, 3); assert_eq!(document.restorations.len(), 2);
-        assert!(Arc::ptr_eq(document.restorations.get(&2).unwrap(), &restoration));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        assert_eq!(document.presence_id, 3);
+        assert_eq!(document.restorations.len(), 2);
+        assert!(Arc::ptr_eq(
+            document.restorations.get(&2).unwrap(),
+            &restoration
+        ));
         // A later chmod must not replace the metadata that the Reload previewed.
         std::fs::set_permissions(root.join(path), std::fs::Permissions::from_mode(0o600)).unwrap();
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert!(!runtime.desired_file_present());
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
-        assert!(!root.join(path).exists()); assert!(!runtime.saved_file_present());
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(!root.join(path).exists());
+        assert!(!runtime.saved_file_present());
         drop(runtime.update(RepositoryAction::Redo { card }));
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
-        assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "external third\n");
-        assert_eq!(std::fs::metadata(root.join(path)).unwrap().mode() & 0o777, 0o640);
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            "external third\n"
+        );
+        assert_eq!(
+            std::fs::metadata(root.join(path)).unwrap().mode() & 0o777,
+            0o640
+        );
         assert!(!runtime.is_dirty());
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.undo_root = Some(crate::editor::FileRootIdentity::of(Arc::new(crate::editor::worktree_root(root).unwrap())).unwrap());
+            document.undo_root = Some(
+                crate::editor::FileRootIdentity::of(Arc::new(
+                    crate::editor::worktree_root(root).unwrap(),
+                ))
+                .unwrap(),
+            );
         }
         runtime.retain_viewports();
-        let retained = runtime.undo_lru.take(path, path, blake3::hash(b"external third\n"), true).expect("metadata lineage stays with history");
-        assert!(Arc::ptr_eq(retained.presence.restorations.get(&2).unwrap(), &restoration));
+        let retained = runtime
+            .undo_lru
+            .take(path, path, blake3::hash(b"external third\n"), true)
+            .expect("metadata lineage stays with history");
+        assert!(Arc::ptr_eq(
+            retained.presence.restorations.get(&2).unwrap(),
+            &restoration
+        ));
         assert_eq!(retained.presence.restorations.len(), 2);
     }
 
     #[tokio::test]
     async fn per_file_undo_retains_absence_metadata_and_refuses_recreation_and_root_replacement() {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let directory = tempfile::tempdir().unwrap(); let root = directory.path().join("project");
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("project");
         std::fs::create_dir(&root).unwrap();
         std::fs::write(root.join("a.rs"), "original\n").unwrap();
         std::fs::write(root.join("b.rs"), "other\n").unwrap();
-        std::fs::set_permissions(root.join("a.rs"), std::fs::Permissions::from_mode(0o640)).unwrap();
-        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "original\n");
-        runtime.descriptor.worktree = root.clone(); runtime.standalone = true; runtime.set_auto_save(false);
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &mut runtime.document else { panic!("loaded A"); };
+        std::fs::set_permissions(root.join("a.rs"), std::fs::Permissions::from_mode(0o640))
+            .unwrap();
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "original\n");
+        runtime.descriptor.worktree = root.clone();
+        runtime.standalone = true;
+        runtime.set_auto_save(false);
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &mut runtime.document else {
+            panic!("loaded A");
+        };
         let before = document.content.cursor();
         let change = document.content.replacement_to_text("").unwrap();
-        assert!(ProtocolTracked { content: &mut document.content, edits: Vec::new() }.replace(change.start, &change.removed, &change.inserted, &change.inserted_breaks));
-        document.next_presence_id = 1; document.presence_id = 1; document.present = false; document.deletion_mode = Some(0o100644);
-        document.history.record_group_with_presence_identities(vec![change], before, document.content.cursor(), Instant::now(), Some(((true, 1), (false, 1))));
+        assert!(
+            ProtocolTracked {
+                content: &mut document.content,
+                edits: Vec::new()
+            }
+            .replace(
+                change.start,
+                &change.removed,
+                &change.inserted,
+                &change.inserted_breaks
+            )
+        );
+        document.next_presence_id = 1;
+        document.presence_id = 1;
+        document.present = false;
+        document.deletion_mode = Some(0o100644);
+        document.history.record_group_with_presence_identities(
+            vec![change],
+            before,
+            document.content.cursor(),
+            Instant::now(),
+            Some(((true, 1), (false, 1))),
+        );
         document.text_changed();
-        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
-        assert!(!root.join("a.rs").exists()); assert!(!runtime.is_dirty());
-        let template = match &runtime.document { DocumentState::Editable(document) => document.restorations.get(&1).unwrap().clone(), _ => panic!() };
-        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
-        assert!(!runtime.saved_file_present()); assert!(!runtime.desired_file_present());
-        assert!(matches!(&runtime.document, DocumentState::Editable(document) if Arc::ptr_eq(document.restorations.get(&1).unwrap(), &template)));
+        let task = runtime.request_save_inner(card, false, false);
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(!root.join("a.rs").exists());
+        assert!(!runtime.is_dirty());
+        let template = match &runtime.document {
+            DocumentState::Editable(document) => document.restorations.get(&1).unwrap().clone(),
+            _ => panic!(),
+        };
+        let task = runtime.open_file(card, "b.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(!runtime.saved_file_present());
+        assert!(!runtime.desired_file_present());
+        assert!(
+            matches!(&runtime.document, DocumentState::Editable(document) if Arc::ptr_eq(document.restorations.get(&1).unwrap(), &template))
+        );
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.editor_text().as_deref(), Some("original\n"));
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
         assert_eq!(std::fs::read(root.join("a.rs")).unwrap(), b"original\n");
-        assert_eq!(std::fs::metadata(root.join("a.rs")).unwrap().mode() & 0o777, 0o640);
+        assert_eq!(
+            std::fs::metadata(root.join("a.rs")).unwrap().mode() & 0o777,
+            0o640
+        );
         assert!(!runtime.is_dirty());
         // Present metadata-bearing histories survive the same round trip.
-        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "b.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
         drop(runtime.update(RepositoryAction::Redo { card }));
-        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.request_save_inner(card, false, false);
+        finish_navigation_task(&mut runtime, task).await;
         assert!(!root.join("a.rs").exists());
-        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "b.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
         // A recreated empty file has the same empty hash but different presence.
         std::fs::write(root.join("a.rs"), "").unwrap();
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
-        assert!(runtime.saved_file_present()); assert!(!runtime.can_step_editor_history(false));
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
+        assert!(runtime.saved_file_present());
+        assert!(!runtime.can_step_editor_history(false));
         // Cache an ordinary edit, then replace the root with identical bytes.
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
-        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "b.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
         std::fs::rename(&root, directory.path().join("retired")).unwrap();
-        std::fs::create_dir(&root).unwrap(); std::fs::write(root.join("a.rs"), "x").unwrap();
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("a.rs"), "x").unwrap();
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
         assert_eq!(runtime.editor_text().as_deref(), Some("x"));
-        assert!(!runtime.can_step_editor_history(false), "same bytes in a different checkout cannot adopt old metadata/history");
+        assert!(
+            !runtime.can_step_editor_history(false),
+            "same bytes in a different checkout cannot adopt old metadata/history"
+        );
         // Park the actual absent-file completion before replacing its root.
         // The two captured read identities still match each other, so the
         // subsequent save must independently prove its retained model root.
         std::fs::write(root.join("b.rs"), "other\n").unwrap();
         let identity = runtime.current_identity(card, "a.rs".into());
-        let DocumentState::Editable(document) = &runtime.document else { panic!() };
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
         let revision = document.revision;
         let change = document.content.replacement_to_text("").unwrap();
-        runtime.apply_diff_buffer_revert_with_presence(&identity, revision, Some(Arc::new(change)), false, Some(0o100644)).unwrap();
-        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
-        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        runtime
+            .apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision,
+                Some(Arc::new(change)),
+                false,
+                Some(0o100644),
+            )
+            .unwrap();
+        let task = runtime.request_save_inner(card, false, false);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "b.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
         let task = runtime.open_file(card, "a.rs".into());
         use cosmic::iced::futures::StreamExt;
         let mut stream = iced::runtime::task::into_stream(task).unwrap();
-        let completion = loop { if let iced::runtime::Action::Output(action) = stream.next().await.expect("absent loader must produce completion") { break action; } };
-        assert!(matches!(&completion, RepositoryAction::ConfiguredFileLoaded { result: Ok(LoadedFile { content: FileContent::SavedAbsence, .. }), .. }));
+        let completion = loop {
+            if let iced::runtime::Action::Output(action) = stream
+                .next()
+                .await
+                .expect("absent loader must produce completion")
+            {
+                break action;
+            }
+        };
+        assert!(matches!(
+            &completion,
+            RepositoryAction::ConfiguredFileLoaded {
+                result: Ok(LoadedFile {
+                    content: FileContent::SavedAbsence,
+                    ..
+                }),
+                ..
+            }
+        ));
         std::fs::rename(&root, directory.path().join("second-retired")).unwrap();
         std::fs::create_dir(&root).unwrap();
         drop(runtime.update(completion));
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.editor_text().as_deref(), Some("x"));
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
         assert!(runtime.save_error().is_some());
-        assert!(!root.join("a.rs").exists(), "old Undo cannot recreate a file in the replacement checkout");
+        assert!(
+            !root.join("a.rs").exists(),
+            "old Undo cannot recreate a file in the replacement checkout"
+        );
         assert!(!directory.path().join("second-retired/a.rs").exists());
     }
 
@@ -14147,15 +15958,25 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::write(directory.path().join("a.rs"), "original").unwrap();
         std::fs::write(directory.path().join("b.rs"), "other").unwrap();
-        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "original");
-        runtime.descriptor.worktree = directory.path().to_path_buf(); runtime.standalone = true; runtime.set_auto_save(false);
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "original");
+        runtime.descriptor.worktree = directory.path().to_path_buf();
+        runtime.standalone = true;
+        runtime.set_auto_save(false);
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
         assert!(runtime.can_step_editor_history(false));
-        let task = runtime.open_file(card, "b.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "b.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
         std::fs::write(directory.path().join("a.rs"), "outside edit").unwrap();
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
         assert_eq!(runtime.editor_text().as_deref(), Some("outside edit"));
         assert!(!runtime.can_step_editor_history(false));
         drop(runtime.update(RepositoryAction::Undo { card }));
@@ -14165,45 +15986,100 @@ mod tests {
     #[tokio::test]
     async fn explicit_relocation_rebinds_the_same_root_without_losing_an_admitted_save() {
         use cosmic::iced::futures::StreamExt;
-        let directory = tempfile::tempdir().unwrap(); let old = directory.path().join("old"); let moved = directory.path().join("moved");
-        std::fs::create_dir(&old).unwrap(); std::fs::write(old.join("a.rs"), "before").unwrap();
-        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "before");
-        runtime.descriptor.worktree = old.clone(); runtime.standalone = true; runtime.set_auto_save(false);
-        let task = runtime.open_file(card, "a.rs".into()); finish_navigation_task(&mut runtime, task).await;
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
-        let saved = runtime.editor_text().unwrap(); let task = runtime.request_save(card, false);
+        let directory = tempfile::tempdir().unwrap();
+        let old = directory.path().join("old");
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("a.rs"), "before").unwrap();
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "a.rs", "before");
+        runtime.descriptor.worktree = old.clone();
+        runtime.standalone = true;
+        runtime.set_auto_save(false);
+        let task = runtime.open_file(card, "a.rs".into());
+        finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let saved = runtime.editor_text().unwrap();
+        let task = runtime.request_save(card, false);
         let mut stream = iced::runtime::task::into_stream(task).unwrap();
-        let completion = loop { if let iced::runtime::Action::Output(action) = stream.next().await.expect("save completion") { break action; } };
+        let completion = loop {
+            if let iced::runtime::Action::Output(action) =
+                stream.next().await.expect("save completion")
+            {
+                break action;
+            }
+        };
         assert!(runtime.is_saving());
-        std::fs::rename(&old, &moved).unwrap(); runtime.descriptor.worktree = moved.clone(); runtime.generation += 1;
+        std::fs::rename(&old, &moved).unwrap();
+        runtime.descriptor.worktree = moved.clone();
+        runtime.generation += 1;
         let rebind = runtime.rebind_editor_root_after_relocation(card);
         assert!(!runtime.observes_open_sources());
         drop(runtime.update(completion));
-        assert!(!runtime.is_saving(), "the exact admitted ticket settles despite descriptor generation changing");
+        assert!(
+            !runtime.is_saving(),
+            "the exact admitted ticket settles despite descriptor generation changing"
+        );
         assert_eq!(std::fs::read_to_string(moved.join("a.rs")).unwrap(), saved);
         finish_navigation_task(&mut runtime, rebind).await;
-        assert!(runtime.observes_open_sources()); assert!(runtime.save_error().is_none());
+        assert!(runtime.observes_open_sources());
+        assert!(runtime.save_error().is_none());
         assert!(runtime.can_step_editor_history(false));
         // Produce a real saved absence before checking the public Save path,
         // whose explicit recreation intent must also stay paused by relocation.
         let identity = runtime.current_identity(card, "a.rs".into());
-        let DocumentState::Editable(document) = &runtime.document else { panic!() };
-        let revision = document.revision; let change = document.content.replacement_to_text("").unwrap();
-        runtime.apply_diff_buffer_revert_with_presence(&identity, revision, Some(Arc::new(change)), false, Some(0o100644)).unwrap();
-        let task = runtime.request_save_inner(card, false, false); finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!()
+        };
+        let revision = document.revision;
+        let change = document.content.replacement_to_text("").unwrap();
+        runtime
+            .apply_diff_buffer_revert_with_presence(
+                &identity,
+                revision,
+                Some(Arc::new(change)),
+                false,
+                Some(0o100644),
+            )
+            .unwrap();
+        let task = runtime.request_save_inner(card, false, false);
+        finish_navigation_task(&mut runtime, task).await;
         assert!(!runtime.saved_file_present());
         // Locate may accept a replacement clone as a project. That does not
         // give its files authority over the already-mounted original buffer.
-        std::fs::create_dir(&old).unwrap(); std::fs::write(old.join("a.rs"), "clone").unwrap();
-        runtime.descriptor.worktree = old; runtime.generation += 1;
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("a.rs"), "clone").unwrap();
+        runtime.descriptor.worktree = old;
+        runtime.generation += 1;
         let rebind = runtime.rebind_editor_root_after_relocation(card);
         fn assert_save_paused(runtime: &mut RepositoryRuntime, card: CardId) {
-            let checkpoint = match &runtime.document { DocumentState::Editable(document) => (document.revision, document.history.revision(), document.presence_id), _ => panic!() };
+            let checkpoint = match &runtime.document {
+                DocumentState::Editable(document) => (
+                    document.revision,
+                    document.history.revision(),
+                    document.presence_id,
+                ),
+                _ => panic!(),
+            };
             for overwrite in [false, true] {
                 drop(runtime.update(RepositoryAction::Save { card, overwrite }));
-                let DocumentState::Editable(document) = &runtime.document else { panic!() };
-                assert_eq!((document.revision, document.history.revision(), document.presence_id), checkpoint);
-                assert!(!document.present && !document.saved_present && document.active_save.is_none());
+                let DocumentState::Editable(document) = &runtime.document else {
+                    panic!()
+                };
+                assert_eq!(
+                    (
+                        document.revision,
+                        document.history.revision(),
+                        document.presence_id
+                    ),
+                    checkpoint
+                );
+                assert!(
+                    !document.present && !document.saved_present && document.active_save.is_none()
+                );
                 assert!(document.content.is_empty());
             }
         }
@@ -14211,64 +16087,125 @@ mod tests {
         finish_navigation_task(&mut runtime, rebind).await;
         assert_save_paused(&mut runtime, card);
         assert_eq!(runtime.editor_text().as_deref(), Some(""));
-        assert!(!runtime.observes_open_sources()); assert!(runtime.save_error().is_some());
+        assert!(!runtime.observes_open_sources());
+        assert!(runtime.save_error().is_some());
         assert!(!runtime.workspace_edit_snapshot().unwrap().1.writable);
         assert!(!runtime.is_saving());
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert!(runtime.desired_file_present());
-        assert!(!runtime.workspace_edit_snapshot().unwrap().1.writable, "an otherwise editable present buffer remains unbound");
+        assert!(
+            !runtime.workspace_edit_snapshot().unwrap().1.writable,
+            "an otherwise editable present buffer remains unbound"
+        );
         // Explicit Verify can retry at the same logical pathname after the
         // original physical directory is restored there. Preserve the clone.
         let located = runtime.descriptor.worktree.clone();
         let clone = directory.path().join("retained-clone");
-        std::fs::rename(&located, &clone).unwrap(); std::fs::rename(&moved, &located).unwrap();
-        let retry = runtime.rebind_editor_root_after_relocation(card); finish_navigation_task(&mut runtime, retry).await;
-        assert!(runtime.observes_open_sources()); assert!(runtime.save_error().is_none());
-        let save = runtime.request_save(card, false); finish_navigation_task(&mut runtime, save).await;
-        assert_eq!(std::fs::read_to_string(located.join("a.rs")).unwrap(), saved);
-        assert_eq!(std::fs::read_to_string(clone.join("a.rs")).unwrap(), "clone");
+        std::fs::rename(&located, &clone).unwrap();
+        std::fs::rename(&moved, &located).unwrap();
+        let retry = runtime.rebind_editor_root_after_relocation(card);
+        finish_navigation_task(&mut runtime, retry).await;
+        assert!(runtime.observes_open_sources());
+        assert!(runtime.save_error().is_none());
+        let save = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, save).await;
+        assert_eq!(
+            std::fs::read_to_string(located.join("a.rs")).unwrap(),
+            saved
+        );
+        assert_eq!(
+            std::fs::read_to_string(clone.join("a.rs")).unwrap(),
+            "clone"
+        );
     }
 
     #[tokio::test]
     async fn external_deletion_save_again_is_create_only_and_keeps_later_edits_dirty() {
-        let directory = tempfile::tempdir().unwrap(); let root = directory.path(); let path = Path::new("source.rs");
-        let card = CardId::new(); let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "original");
-        runtime.descriptor.worktree = root.into(); runtime.set_auto_save(false);
-        let identity = runtime.current_identity(card, path.into()); runtime.disk_poll = Some((1, Instant::now()));
-        drop(runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 1, result: Ok(None) }));
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        let path = Path::new("source.rs");
+        let card = CardId::new();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "original");
+        runtime.descriptor.worktree = root.into();
+        runtime.set_auto_save(false);
+        let identity = runtime.current_identity(card, path.into());
+        runtime.disk_poll = Some((1, Instant::now()));
+        drop(runtime.update(RepositoryAction::DiskMetadata {
+            identity,
+            ticket: 1,
+            result: Ok(None),
+        }));
         let task = runtime.update(RepositoryAction::KeepMine { card });
-        assert!(matches!(&runtime.document, DocumentState::Editable(document) if !document.saved_present && document.active_save.is_some()));
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('!')) }));
+        assert!(
+            matches!(&runtime.document, DocumentState::Editable(document) if !document.saved_present && document.active_save.is_some())
+        );
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+        }));
         finish_navigation_task(&mut runtime, task).await;
-        assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "original");
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            "original"
+        );
         assert!(runtime.is_dirty());
         assert!(runtime.editor_text().unwrap().contains('!'));
         // A new missing observation admits another explicit Save Again, whose
         // no-replace writer must preserve a newer third-party recreation.
         std::fs::remove_file(root.join(path)).unwrap();
         runtime.disk_stamp = None;
-        let identity = runtime.current_identity(card, path.into()); runtime.disk_poll = Some((2, Instant::now()));
-        drop(runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 2, result: Ok(None) }));
+        let identity = runtime.current_identity(card, path.into());
+        runtime.disk_poll = Some((2, Instant::now()));
+        drop(runtime.update(RepositoryAction::DiskMetadata {
+            identity,
+            ticket: 2,
+            result: Ok(None),
+        }));
         let task = runtime.update(RepositoryAction::KeepMine { card });
         std::fs::write(root.join(path), "newer owner").unwrap();
         finish_navigation_task(&mut runtime, task).await;
-        assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), "newer owner");
+        assert_eq!(
+            std::fs::read_to_string(root.join(path)).unwrap(),
+            "newer owner"
+        );
         assert!(runtime.save_error().is_some());
     }
 
     #[test]
     fn server_target_coordinates_convert_utf16_after_loading_and_refuse_split_surrogates() {
         let card = CardId::new();
-        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "source.rs", "prior\rbare\r\na😀éX\n");
-        assert!(runtime.move_cursor_to_coordinates(LspPosition::new(1, 4), crate::lsp::LspCoordinates::Utf16));
+        let (mut runtime, _) =
+            RepositoryRuntime::open_fixture(card, "source.rs", "prior\rbare\r\na😀éX\n");
+        assert!(
+            runtime.move_cursor_to_coordinates(
+                LspPosition::new(1, 4),
+                crate::lsp::LspCoordinates::Utf16
+            )
+        );
         assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 3)));
         let before = runtime.cursor_position();
-        assert!(!runtime.move_cursor_to_coordinates(LspPosition::new(1, 2), crate::lsp::LspCoordinates::Utf16));
+        assert!(
+            !runtime.move_cursor_to_coordinates(
+                LspPosition::new(1, 2),
+                crate::lsp::LspCoordinates::Utf16
+            )
+        );
         assert_eq!(runtime.cursor_position(), before);
-        assert!(!runtime.move_cursor_to_coordinates(LspPosition::new(1, 99), crate::lsp::LspCoordinates::Utf16));
-        assert!(!runtime.move_cursor_to_coordinates(LspPosition::new(2, 1), crate::lsp::LspCoordinates::Utf16));
+        assert!(!runtime.move_cursor_to_coordinates(
+            LspPosition::new(1, 99),
+            crate::lsp::LspCoordinates::Utf16
+        ));
+        assert!(
+            !runtime.move_cursor_to_coordinates(
+                LspPosition::new(2, 1),
+                crate::lsp::LspCoordinates::Utf16
+            )
+        );
         assert_eq!(runtime.cursor_position(), before);
-        assert!(runtime.move_cursor_to_coordinates(LspPosition::new(1, 3), crate::lsp::LspCoordinates::Scalar));
+        assert!(runtime.move_cursor_to_coordinates(
+            LspPosition::new(1, 3),
+            crate::lsp::LspCoordinates::Scalar
+        ));
         assert_eq!(runtime.cursor_position(), before);
     }
 
@@ -14276,10 +16213,25 @@ mod tests {
     fn argument_typing_retains_signature_help_but_explicit_dismiss_closes_it() {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "call.rs", "call(");
-        runtime.set_editor_signature(Some(crate::lsp::LspSignatureHelp { signatures: vec![crate::lsp::LspSignature { label: "call(argument: i32)".into(), documentation: None, parameters: Vec::new(), active_parameter: Some(0) }], active_signature: 0, active_parameter: Some(0) }));
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('1')) }));
+        runtime.set_editor_signature(Some(crate::lsp::LspSignatureHelp {
+            signatures: vec![crate::lsp::LspSignature {
+                label: "call(argument: i32)".into(),
+                documentation: None,
+                parameters: Vec::new(),
+                active_parameter: Some(0),
+            }],
+            active_signature: 0,
+            active_parameter: Some(0),
+        }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('1')),
+        }));
         assert!(runtime.language.signature.is_some());
-        drop(runtime.update(RepositoryAction::Language { card, action: EditorLspAction::Dismiss }));
+        drop(runtime.update(RepositoryAction::Language {
+            card,
+            action: EditorLspAction::Dismiss,
+        }));
         assert!(runtime.language.signature.is_none());
     }
 
@@ -14290,7 +16242,12 @@ mod tests {
         std::fs::write(root.path().join("real.rs"), "source\n").unwrap();
         std::os::unix::fs::symlink("real.rs", root.path().join("alias.rs")).unwrap();
         let card = CardId::new();
-        let view = RepositoryView { project: crate::model::ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: Some("alias.rs".into()) };
+        let view = RepositoryView {
+            project: crate::model::ProjectId::new(),
+            repository: root.path().into(),
+            worktree: root.path().into(),
+            selected_file: Some("alias.rs".into()),
+        };
         let mut runtime = RepositoryRuntime::new_directory(view);
         let task = runtime.open_file_location(card, "alias.rs".into(), 0, 0, 0);
         finish_navigation_task(&mut runtime, task).await;
@@ -14306,7 +16263,12 @@ mod tests {
         let original = "pub fn source() {}\nsource();\n";
         std::fs::write(&path, original).unwrap();
         let card = CardId::new();
-        let view = RepositoryView { project: crate::model::ProjectId::new(), repository: worktree.path().into(), worktree: worktree.path().into(), selected_file: None };
+        let view = RepositoryView {
+            project: crate::model::ProjectId::new(),
+            repository: worktree.path().into(),
+            worktree: worktree.path().into(),
+            selected_file: None,
+        };
         let mut runtime = RepositoryRuntime::new(view.clone());
         runtime.set_external_source(path.clone());
         let load = runtime.initial_load(card);
@@ -14314,15 +16276,29 @@ mod tests {
         assert_eq!(runtime.editor_text().unwrap(), original);
         assert!(runtime.is_read_only_source());
         let intents = runtime.take_lsp_intents();
-        assert!(matches!(&intents[..], [LspIntent::Open { absolute_path, worktree: owner, .. }] if absolute_path == &path && owner == worktree.path()));
+        assert!(
+            matches!(&intents[..], [LspIntent::Open { absolute_path, worktree: owner, .. }] if absolute_path == &path && owner == worktree.path())
+        );
         assert!(runtime.move_cursor_to(LspPosition::new(1, 3)));
         for action in [
-            RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) },
-            RepositoryAction::Undo { card }, RepositoryAction::Redo { card },
-            RepositoryAction::Save { card, overwrite: true },
+            RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            },
+            RepositoryAction::Undo { card },
+            RepositoryAction::Redo { card },
+            RepositoryAction::Save {
+                card,
+                overwrite: true,
+            },
             RepositoryAction::ReplaceMatch { card, all: true },
-            RepositoryAction::Clipboard { card, op: ClipboardOp::Cut },
-        ] { drop(runtime.update(action)); }
+            RepositoryAction::Clipboard {
+                card,
+                op: ClipboardOp::Cut,
+            },
+        ] {
+            drop(runtime.update(action));
+        }
         assert_eq!(runtime.editor_text().unwrap(), original);
         assert!(!runtime.can_save());
         assert!(!runtime.is_dirty());
@@ -16084,41 +18060,91 @@ mod tests {
     #[tokio::test]
     async fn async_diff_source_locations_map_lf_lines_across_bare_cr_and_crlf() {
         let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("mixed.rs"), "first\rcontinued\nsecond\r\nthird\n").unwrap();
+        std::fs::write(
+            root.path().join("mixed.rs"),
+            "first\rcontinued\nsecond\r\nthird\n",
+        )
+        .unwrap();
         let card = CardId::new();
-        let mut runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: None });
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().into(),
+            worktree: root.path().into(),
+            selected_file: None,
+        });
         let task = runtime.open_source_file_location(card, "mixed.rs".into(), 1);
         assert!(matches!(&runtime.document, DocumentState::Loading));
         finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position, text_editor::Position { line: 2, column: 0 });
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position,
+            text_editor::Position { line: 2, column: 0 }
+        );
         let task = runtime.open_source_file_location(card, "mixed.rs".into(), 2);
         finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position, text_editor::Position { line: 3, column: 0 });
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position,
+            text_editor::Position { line: 3, column: 0 }
+        );
         let task = runtime.open_source_file_location(card, "mixed.rs".into(), usize::MAX);
         finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-        assert_eq!(document.content.cursor().position.line, document.content.line_count() - 1);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("source editor");
+        };
+        assert_eq!(
+            document.content.cursor().position.line,
+            document.content.line_count() - 1
+        );
     }
 
     #[tokio::test]
     async fn newer_source_or_native_location_supersedes_a_pending_scalar_column() {
         for source in [false, true] {
             let root = tempfile::tempdir().unwrap();
-            std::fs::write(root.path().join("mixed.rs"), "😀abcde\rcontinued\nsecond\nthird\n").unwrap();
+            std::fs::write(
+                root.path().join("mixed.rs"),
+                "😀abcde\rcontinued\nsecond\nthird\n",
+            )
+            .unwrap();
             let card = CardId::new();
             let path = PathBuf::from("mixed.rs");
-            let mut runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: None });
-            let first = runtime.update(RepositoryAction::OpenLocation { card, path: path.clone(), line: 0, column: 5 });
+            let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+                project: ProjectId::new(),
+                repository: root.path().into(),
+                worktree: root.path().into(),
+                selected_file: None,
+            });
+            let first = runtime.update(RepositoryAction::OpenLocation {
+                card,
+                path: path.clone(),
+                line: 0,
+                column: 5,
+            });
             assert!(runtime.pending_scalar_location.is_some());
-            let latest = if source { runtime.open_source_file_location(card, path, 2) }
-                else { runtime.open_file_location(card, path, 2, 1, 0) };
+            let latest = if source {
+                runtime.open_source_file_location(card, path, 2)
+            } else {
+                runtime.open_file_location(card, path, 2, 1, 0)
+            };
             assert!(runtime.pending_scalar_location.is_none());
             finish_navigation_task(&mut runtime, first).await;
             finish_navigation_task(&mut runtime, latest).await;
-            let DocumentState::Editable(document) = &runtime.document else { panic!("source editor"); };
-            assert_eq!(document.content.cursor().position, if source { text_editor::Position { line: 3, column: 0 } } else { text_editor::Position { line: 2, column: 1 } });
+            let DocumentState::Editable(document) = &runtime.document else {
+                panic!("source editor");
+            };
+            assert_eq!(
+                document.content.cursor().position,
+                if source {
+                    text_editor::Position { line: 3, column: 0 }
+                } else {
+                    text_editor::Position { line: 2, column: 1 }
+                }
+            );
         }
     }
 
@@ -16128,54 +18154,124 @@ mod tests {
         std::fs::write(root.path().join("a.rs"), "one").unwrap();
         std::fs::write(root.path().join("b.rs"), "two").unwrap();
         let card = CardId::new();
-        let mut runtime = RepositoryRuntime::new_directory(RepositoryView { project: ProjectId::new(), repository: root.path().to_path_buf(), worktree: root.path().to_path_buf(), selected_file: None });
-        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0); finish_navigation_task(&mut runtime, task).await;
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
-        let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0); finish_navigation_task(&mut runtime, task).await;
-        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0); finish_navigation_task(&mut runtime, task).await;
+        let mut runtime = RepositoryRuntime::new_directory(RepositoryView {
+            project: ProjectId::new(),
+            repository: root.path().to_path_buf(),
+            worktree: root.path().to_path_buf(),
+            selected_file: None,
+        });
+        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
         drop(runtime.update(RepositoryAction::Undo { card }));
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
         assert_eq!(document.content.text(), "one");
-        let task = runtime.request_save(card, false); finish_navigation_task(&mut runtime, task).await;
-        let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0); finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.request_save(card, false);
+        finish_navigation_task(&mut runtime, task).await;
+        let task = runtime.open_file_location(card, PathBuf::from("b.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
         std::fs::write(root.path().join("a.rs"), "outside").unwrap();
-        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0); finish_navigation_task(&mut runtime, task).await;
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
-        assert_eq!(document.content.text(), "outside"); assert!(!document.history.can_undo());
+        let task = runtime.open_file_location(card, PathBuf::from("a.rs"), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), "outside");
+        assert!(!document.history.can_undo());
     }
 
     #[test]
     fn go_to_line_and_location_history_work_for_large_source_files() {
-        let card = CardId::new(); let text = "abcdef\n".repeat(50_000);
+        let card = CardId::new();
+        let text = "abcdef\n".repeat(50_000);
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "huge.rs", &text);
         drop(runtime.update(RepositoryAction::OpenGoToLine { card }));
-        drop(runtime.update(RepositoryAction::GoToLineChanged { card, value: "30000:5".into() }));
+        drop(runtime.update(RepositoryAction::GoToLineChanged {
+            card,
+            value: "30000:5".into(),
+        }));
         drop(runtime.update(RepositoryAction::SubmitGoToLine { card }));
-        assert_eq!(runtime.cursor_position(), Some(LspPosition { line: 29999, character: 4 }));
-        drop(runtime.update(RepositoryAction::NavigateLocation { card, forward: false }));
-        assert_eq!(runtime.cursor_position(), Some(LspPosition { line: 0, character: 0 }));
-        drop(runtime.update(RepositoryAction::NavigateLocation { card, forward: true }));
-        assert_eq!(runtime.cursor_position(), Some(LspPosition { line: 29999, character: 4 }));
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(LspPosition {
+                line: 29999,
+                character: 4
+            })
+        );
+        drop(runtime.update(RepositoryAction::NavigateLocation {
+            card,
+            forward: false,
+        }));
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(LspPosition {
+                line: 0,
+                character: 0
+            })
+        );
+        drop(runtime.update(RepositoryAction::NavigateLocation {
+            card,
+            forward: true,
+        }));
+        assert_eq!(
+            runtime.cursor_position(),
+            Some(LspPosition {
+                line: 29999,
+                character: 4
+            })
+        );
     }
 
     fn disk_stamp_fixture() -> crate::editor_reload::Stamp {
         let root = tempfile::tempdir().unwrap();
         std::fs::write(root.path().join("file"), "data").unwrap();
-        crate::editor_reload::stamp(root.path(), Path::new("file"), Path::new("file")).unwrap().unwrap()
+        crate::editor_reload::stamp(root.path(), Path::new("file"), Path::new("file"))
+            .unwrap()
+            .unwrap()
     }
 
-    fn simulate_disk_version(runtime: &mut RepositoryRuntime, card: CardId, before: &str, after: &str) {
+    fn simulate_disk_version(
+        runtime: &mut RepositoryRuntime,
+        card: CardId,
+        before: &str,
+        after: &str,
+    ) {
         let path = runtime.selected_path().unwrap().to_path_buf();
         let identity = runtime.current_identity(card, path.clone());
         runtime.disk_poll = Some((1, Instant::now()));
-        drop(runtime.update(RepositoryAction::DiskLoaded { identity, ticket: 1, stamp: disk_stamp_fixture(), baseline: blake3::hash(before.as_bytes()), result: Ok(crate::editor_reload::Version {
-            text: after.into(), content_hash: blake3::hash(after.as_bytes()), source: path, markdown: false,
-            mapping: crate::editor_reload::LineMap::between(before, after), restoration: None,
-        }) }));
+        drop(runtime.update(RepositoryAction::DiskLoaded {
+            identity,
+            ticket: 1,
+            stamp: disk_stamp_fixture(),
+            baseline: blake3::hash(before.as_bytes()),
+            result: Ok(crate::editor_reload::Version {
+                text: after.into(),
+                content_hash: blake3::hash(after.as_bytes()),
+                source: path,
+                markdown: false,
+                mapping: crate::editor_reload::LineMap::between(before, after),
+                restoration: None,
+            }),
+        }));
     }
 
-    fn metadata_observer_fixture() -> (tempfile::TempDir, RepositoryRuntime, AsyncIdentity, crate::repository::RepositoryMetadataStamp) {
+    fn metadata_observer_fixture() -> (
+        tempfile::TempDir,
+        RepositoryRuntime,
+        AsyncIdentity,
+        crate::repository::RepositoryMetadataStamp,
+    ) {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git/refs/heads")).unwrap();
         std::fs::write(root.path().join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
@@ -16189,22 +18285,45 @@ mod tests {
         runtime.selected.as_mut().unwrap().staged = true;
         runtime.working_diff = WorkingDiffRefresh::default();
         runtime.diffs.clear();
-        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::ready(metadata_ready_diff()));
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::ready(metadata_ready_diff()),
+        );
         let identity = runtime.current_identity(card, "file.rs".into());
-        let stamp = crate::repository::repository_metadata_stamp(root.path(), &runtime.diff_basis).unwrap();
-        runtime.comparison_metadata.stamp = Some((identity.path.clone(), runtime.diff_basis.clone(), stamp.clone()));
+        let stamp =
+            crate::repository::repository_metadata_stamp(root.path(), &runtime.diff_basis).unwrap();
+        runtime.comparison_metadata.stamp = Some((
+            identity.path.clone(),
+            runtime.diff_basis.clone(),
+            stamp.clone(),
+        ));
         (root, runtime, identity, stamp)
     }
 
     fn metadata_ready_diff() -> RenderedDiff {
-        RenderedDiff::Text { model: two_change_model(), old_label: "Before".into(), new_label: "After".into() }
+        RenderedDiff::Text {
+            model: two_change_model(),
+            old_label: "Before".into(),
+            new_label: "After".into(),
+        }
     }
 
-    fn finish_metadata_diff(runtime: &mut RepositoryRuntime, identity: &AsyncIdentity, content: RenderedDiff) {
+    fn finish_metadata_diff(
+        runtime: &mut RepositoryRuntime,
+        identity: &AsyncIdentity,
+        content: RenderedDiff,
+    ) {
         let basis = runtime.diff_basis.clone();
-        let Some(DiffState::Loading { request, .. }) = runtime.diff_state(&basis) else { panic!("a comparison reader must own the slot"); };
+        let Some(DiffState::Loading { request, .. }) = runtime.diff_state(&basis) else {
+            panic!("a comparison reader must own the slot");
+        };
         let request = *request;
-        drop(runtime.update(RepositoryAction::DiffLoaded { identity: identity.clone(), basis, request, content }));
+        drop(runtime.update(RepositoryAction::DiffLoaded {
+            identity: identity.clone(),
+            basis,
+            request,
+            content,
+        }));
     }
 
     #[test]
@@ -16214,16 +18333,32 @@ mod tests {
         assert_eq!(runtime.comparison_metadata.probe, Some(1));
         drop(runtime.refresh_comparison_metadata(identity.card));
         assert_eq!(runtime.comparison_metadata.next_probe, 1);
-        drop(runtime.comparison_metadata_loaded(identity.clone(), 99, DiffBasis::HeadToIndex, Ok(stamp.clone())));
+        drop(runtime.comparison_metadata_loaded(
+            identity.clone(),
+            99,
+            DiffBasis::HeadToIndex,
+            Ok(stamp.clone()),
+        ));
         assert_eq!(runtime.comparison_metadata.probe, Some(1));
-        drop(runtime.comparison_metadata_loaded(identity.clone(), 1, DiffBasis::IndexToWorktree, Ok(stamp.clone())));
+        drop(runtime.comparison_metadata_loaded(
+            identity.clone(),
+            1,
+            DiffBasis::IndexToWorktree,
+            Ok(stamp.clone()),
+        ));
         assert!(runtime.comparison_metadata.probe.is_none());
         drop(runtime.refresh_comparison_metadata(identity.card));
-        drop(runtime.comparison_metadata_loaded(identity.clone(), 2, DiffBasis::HeadToIndex, Err("temporary metadata failure".into())));
+        drop(runtime.comparison_metadata_loaded(
+            identity.clone(),
+            2,
+            DiffBasis::HeadToIndex,
+            Err("temporary metadata failure".into()),
+        ));
         assert!(runtime.comparison_metadata.error.is_some());
         assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
         drop(runtime.refresh_comparison_metadata(identity.card));
-        let unchanged = runtime.comparison_metadata_loaded(identity, 3, DiffBasis::HeadToIndex, Ok(stamp));
+        let unchanged =
+            runtime.comparison_metadata_loaded(identity, 3, DiffBasis::HeadToIndex, Ok(stamp));
         assert!(iced::runtime::task::into_stream(unchanged).is_none());
         assert!(runtime.comparison_metadata.error.is_none());
         drop(first);
@@ -16232,52 +18367,125 @@ mod tests {
     #[test]
     fn shared_metadata_observer_retries_same_stamp_diff_errors_and_defers_busy_changes() {
         let (root, mut runtime, identity, stamp) = metadata_observer_fixture();
-        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::ready(RenderedDiff::Error("temporary diff failure".into())));
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::ready(RenderedDiff::Error("temporary diff failure".into())),
+        );
         runtime.comparison_metadata.probe = Some(1);
-        drop(runtime.comparison_metadata_loaded(identity.clone(), 1, DiffBasis::HeadToIndex, Ok(stamp.clone())));
+        drop(runtime.comparison_metadata_loaded(
+            identity.clone(),
+            1,
+            DiffBasis::HeadToIndex,
+            Ok(stamp.clone()),
+        ));
         assert!(runtime.comparison_refresh_pending());
-        finish_metadata_diff(&mut runtime, &identity, RenderedDiff::Error("failed once more".into()));
+        finish_metadata_diff(
+            &mut runtime,
+            &identity,
+            RenderedDiff::Error("failed once more".into()),
+        );
         runtime.comparison_metadata.retry_after = Some(Instant::now() + Duration::from_secs(30));
         runtime.comparison_metadata.probe = Some(2);
-        let backoff = runtime.comparison_metadata_loaded(identity.clone(), 2, DiffBasis::HeadToIndex, Ok(stamp.clone()));
+        let backoff = runtime.comparison_metadata_loaded(
+            identity.clone(),
+            2,
+            DiffBasis::HeadToIndex,
+            Ok(stamp.clone()),
+        );
         assert!(iced::runtime::task::into_stream(backoff).is_none());
         runtime.comparison_metadata.retry_after = None;
         runtime.comparison_metadata.probe = Some(3);
-        drop(runtime.comparison_metadata_loaded(identity.clone(), 3, DiffBasis::HeadToIndex, Ok(stamp.clone())));
+        drop(runtime.comparison_metadata_loaded(
+            identity.clone(),
+            3,
+            DiffBasis::HeadToIndex,
+            Ok(stamp.clone()),
+        ));
         finish_metadata_diff(&mut runtime, &identity, metadata_ready_diff());
         assert!(!runtime.comparison_refresh_failed());
         assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
         std::fs::write(root.path().join(".git/index"), "new index").unwrap();
-        let changed = crate::repository::repository_metadata_stamp(root.path(), &DiffBasis::HeadToIndex).unwrap();
+        let changed =
+            crate::repository::repository_metadata_stamp(root.path(), &DiffBasis::HeadToIndex)
+                .unwrap();
         assert_ne!(stamp, changed);
-        runtime.set_diff_state(DiffBasis::HeadToIndex, DiffState::Loading { request: 99, cancellation: CancellationToken::new() });
+        runtime.set_diff_state(
+            DiffBasis::HeadToIndex,
+            DiffState::Loading {
+                request: 99,
+                cancellation: CancellationToken::new(),
+            },
+        );
         runtime.comparison_metadata.probe = Some(4);
-        drop(runtime.comparison_metadata_loaded(identity.clone(), 4, DiffBasis::HeadToIndex, Ok(changed.clone())));
+        drop(runtime.comparison_metadata_loaded(
+            identity.clone(),
+            4,
+            DiffBasis::HeadToIndex,
+            Ok(changed.clone()),
+        ));
         assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
         finish_metadata_diff(&mut runtime, &identity, metadata_ready_diff());
         runtime.comparison_metadata.probe = Some(5);
-        drop(runtime.comparison_metadata_loaded(identity.clone(), 5, DiffBasis::HeadToIndex, Ok(changed.clone())));
-        assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, changed);
+        drop(runtime.comparison_metadata_loaded(
+            identity.clone(),
+            5,
+            DiffBasis::HeadToIndex,
+            Ok(changed.clone()),
+        ));
+        assert_eq!(
+            runtime.comparison_metadata.stamp.as_ref().unwrap().2,
+            changed
+        );
         assert!(runtime.comparison_refresh_pending());
     }
 
     #[test]
     fn shared_metadata_observer_recovers_branch_resolve_and_same_basis_diff_errors() {
         let (root, mut runtime, identity, _) = metadata_observer_fixture();
-        let basis = DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: fixture_oid(2), merge_base: fixture_oid(1) };
+        let basis = DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: fixture_oid(2),
+            merge_base: fixture_oid(1),
+        };
         runtime.diff_basis = basis.clone();
-        runtime.set_diff_state(basis.clone(), DiffState::ready(RenderedDiff::Error("temporary branch diff failure".into())));
+        runtime.set_diff_state(
+            basis.clone(),
+            DiffState::ready(RenderedDiff::Error("temporary branch diff failure".into())),
+        );
         let stamp = crate::repository::repository_metadata_stamp(root.path(), &basis).unwrap();
-        runtime.comparison_metadata.stamp = Some((identity.path.clone(), basis.clone(), stamp.clone()));
+        runtime.comparison_metadata.stamp =
+            Some((identity.path.clone(), basis.clone(), stamp.clone()));
         for ticket in 1..=3 {
             runtime.comparison_metadata.retry_after = None;
             runtime.comparison_metadata.probe = Some(ticket);
-            drop(runtime.comparison_metadata_loaded(identity.clone(), ticket, basis.clone(), Ok(stamp.clone())));
+            drop(runtime.comparison_metadata_loaded(
+                identity.clone(),
+                ticket,
+                basis.clone(),
+                Ok(stamp.clone()),
+            ));
             let request = runtime.branch_refresh.unwrap();
-            let result = if ticket == 1 { Err("temporary branch resolver failure".into()) } else { Ok(ResolvedBasis::Ready(basis.clone())) };
-            drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity: identity.clone(), request, previous: basis.clone(), result }));
-            if ticket == 2 { finish_metadata_diff(&mut runtime, &identity, RenderedDiff::Error("temporary branch diff failure".into())); }
-            if ticket == 3 { finish_metadata_diff(&mut runtime, &identity, metadata_ready_diff()); }
+            let result = if ticket == 1 {
+                Err("temporary branch resolver failure".into())
+            } else {
+                Ok(ResolvedBasis::Ready(basis.clone()))
+            };
+            drop(runtime.update(RepositoryAction::BranchBasisRefreshed {
+                identity: identity.clone(),
+                request,
+                previous: basis.clone(),
+                result,
+            }));
+            if ticket == 2 {
+                finish_metadata_diff(
+                    &mut runtime,
+                    &identity,
+                    RenderedDiff::Error("temporary branch diff failure".into()),
+                );
+            }
+            if ticket == 3 {
+                finish_metadata_diff(&mut runtime, &identity, metadata_ready_diff());
+            }
         }
         assert!(!runtime.comparison_refresh_failed());
         assert_eq!(runtime.comparison_metadata.stamp.as_ref().unwrap().2, stamp);
@@ -16299,7 +18507,11 @@ mod tests {
     fn branch_refresh_is_single_flight_and_coalesces_a_followup_after_completion() {
         let card = CardId::new();
         let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.rs", "body");
-        let basis = DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: fixture_oid(2), merge_base: fixture_oid(1) };
+        let basis = DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: fixture_oid(2),
+            merge_base: fixture_oid(1),
+        };
         runtime.diff_basis = basis.clone();
         let first = runtime.refresh_open_comparison(card);
         assert_eq!(runtime.branch_refresh, Some(1));
@@ -16307,7 +18519,12 @@ mod tests {
         drop(runtime.refresh_open_comparison(card));
         assert_eq!(runtime.next_branch_refresh, 1);
         assert!(runtime.comparison_refresh_queued);
-        drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity, request: 1, previous: basis, result: Err("temporary resolver failure".into()) }));
+        drop(runtime.update(RepositoryAction::BranchBasisRefreshed {
+            identity,
+            request: 1,
+            previous: basis,
+            result: Err("temporary resolver failure".into()),
+        }));
         assert_eq!(runtime.branch_refresh, Some(2));
         assert_eq!(runtime.next_branch_refresh, 2);
         assert!(!runtime.comparison_refresh_queued);
@@ -16318,15 +18535,32 @@ mod tests {
     fn branch_ref_refresh_keeps_the_newest_result_and_commit_history_stays_fixed() {
         let card = CardId::new();
         let (mut runtime, identity) = RepositoryRuntime::open_fixture(card, "file.rs", "body");
-        let basis = |seed| DiffBasis::MergeBaseToHead { base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(), head: fixture_oid(seed), merge_base: fixture_oid(1) };
+        let basis = |seed| DiffBasis::MergeBaseToHead {
+            base_ref: ValidatedRefName::parse("refs/heads/main").unwrap(),
+            head: fixture_oid(seed),
+            merge_base: fixture_oid(1),
+        };
         runtime.diff_basis = basis(2);
         runtime.next_branch_refresh = 2;
         runtime.branch_refresh = Some(2);
-        drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity: identity.clone(), request: 1, previous: basis(2), result: Ok(ResolvedBasis::Ready(basis(3))) }));
+        drop(runtime.update(RepositoryAction::BranchBasisRefreshed {
+            identity: identity.clone(),
+            request: 1,
+            previous: basis(2),
+            result: Ok(ResolvedBasis::Ready(basis(3))),
+        }));
         assert_eq!(runtime.diff_basis, basis(2));
-        drop(runtime.update(RepositoryAction::BranchBasisRefreshed { identity, request: 2, previous: basis(2), result: Ok(ResolvedBasis::Ready(basis(4))) }));
+        drop(runtime.update(RepositoryAction::BranchBasisRefreshed {
+            identity,
+            request: 2,
+            previous: basis(2),
+            result: Ok(ResolvedBasis::Ready(basis(4))),
+        }));
         assert_eq!(runtime.diff_basis, basis(4));
-        let commit = DiffBasis::CommitToParent { oid: fixture_oid(4), parent: Some(fixture_oid(3)) };
+        let commit = DiffBasis::CommitToParent {
+            oid: fixture_oid(4),
+            parent: Some(fixture_oid(3)),
+        };
         runtime.diff_basis = commit.clone();
         drop(runtime.refresh_open_comparison(card));
         assert_eq!(runtime.diff_basis, commit);
@@ -16336,53 +18570,95 @@ mod tests {
     #[test]
     fn clean_disk_reload_maps_the_caret_and_remains_one_undo_step() {
         let card = CardId::new();
-        let before = "one\ntwo\nthree\n"; let after = "new\none\ntwo\nthree\n";
+        let before = "one\ntwo\nthree\n";
+        let after = "new\none\ntwo\nthree\n";
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
         if let DocumentState::Editable(document) = &mut runtime.document {
-            document.content.set_cursor(text_editor::Cursor { position: text_editor::Position { line: 1, column: 2 }, selection: Some(text_editor::Position { line: 2, column: 1 }) });
+            document.content.set_cursor(text_editor::Cursor {
+                position: text_editor::Position { line: 1, column: 2 },
+                selection: Some(text_editor::Position { line: 2, column: 1 }),
+            });
         }
         simulate_disk_version(&mut runtime, card, before, after);
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
-        assert_eq!(document.content.text(), after); assert!(!document.dirty); assert!(!document.conflict);
-        assert_eq!(document.content.cursor().position.line, 2); assert_eq!(document.content.cursor().selection.unwrap().line, 3);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), after);
+        assert!(!document.dirty);
+        assert!(!document.conflict);
+        assert_eq!(document.content.cursor().position.line, 2);
+        assert_eq!(document.content.cursor().selection.unwrap().line, 3);
         drop(runtime.update(RepositoryAction::Undo { card }));
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
-        assert_eq!(document.content.text(), before); assert!(document.dirty);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), before);
+        assert!(document.dirty);
     }
 
     #[test]
     fn dirty_disk_reload_keeps_the_buffer_and_pauses_autosave_until_a_choice() {
-        let card = CardId::new(); let before = "one\ntwo\n"; let after = "disk\ntwo\n";
+        let card = CardId::new();
+        let before = "one\ntwo\n";
+        let after = "disk\ntwo\n";
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
         runtime.set_auto_save(true);
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
-        let edited = match &runtime.document { DocumentState::Editable(document) => document.content.text(), _ => unreachable!() };
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
+        let edited = match &runtime.document {
+            DocumentState::Editable(document) => document.content.text(),
+            _ => unreachable!(),
+        };
         simulate_disk_version(&mut runtime, card, before, after);
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
-        assert_eq!(document.content.text(), edited); assert!(document.conflict); assert!(document.external_version.is_some());
-        assert_eq!(document.error.as_deref(), Some("File changed on disk")); assert!(runtime.auto_save_revision().is_none());
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), edited);
+        assert!(document.conflict);
+        assert!(document.external_version.is_some());
+        assert_eq!(document.error.as_deref(), Some("File changed on disk"));
+        assert!(runtime.auto_save_revision().is_none());
         drop(runtime.update(RepositoryAction::Reload { card }));
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
-        assert_eq!(document.content.text(), after); assert!(!document.conflict); assert!(!document.dirty);
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert_eq!(document.content.text(), after);
+        assert!(!document.conflict);
+        assert!(!document.dirty);
         drop(runtime.update(RepositoryAction::Undo { card }));
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
         assert_eq!(document.content.text(), edited);
     }
 
     #[test]
     fn own_save_hashes_do_not_show_a_conflict_and_deleted_files_keep_the_buffer() {
-        let card = CardId::new(); let before = "one\n";
+        let card = CardId::new();
+        let before = "one\n";
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", before);
         simulate_disk_version(&mut runtime, card, before, before);
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
-        assert!(!document.conflict); assert!(document.error.is_none());
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert!(!document.conflict);
+        assert!(document.error.is_none());
         runtime.disk_poll = Some((2, Instant::now()));
         let identity = runtime.current_identity(card, PathBuf::from("file.rs"));
-        drop(runtime.update(RepositoryAction::DiskMetadata { identity, ticket: 2, result: Ok(None) }));
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editor"); };
-        assert!(document.external_deleted); assert!(document.conflict); assert_eq!(document.content.text(), before);
+        drop(runtime.update(RepositoryAction::DiskMetadata {
+            identity,
+            ticket: 2,
+            result: Ok(None),
+        }));
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editor");
+        };
+        assert!(document.external_deleted);
+        assert!(document.conflict);
+        assert_eq!(document.content.text(), before);
     }
-
 
     #[test]
     fn diff_scroll_range_matches_shaped_content_and_real_split_half_layout() {
@@ -17097,8 +19373,13 @@ mod tests {
             id: 7,
             identity: identity.clone(),
             revision: 1,
-            history_revision: if content_matches(&document.content, "submitted\n") { document.history.revision() } else { u64::MAX },
-            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n").text_snapshot(),
+            history_revision: if content_matches(&document.content, "submitted\n") {
+                document.history.revision()
+            } else {
+                u64::MAX
+            },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n")
+                .text_snapshot(),
             snapshot: "submitted\n".into(),
             present: true,
             presence_id: 0,
@@ -17309,8 +19590,13 @@ mod tests {
             id: 8,
             identity: identity.clone(),
             revision: 3,
-            history_revision: if content_matches(&document.content, "newest\n") { document.history.revision() } else { u64::MAX },
-            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("newest\n").text_snapshot(),
+            history_revision: if content_matches(&document.content, "newest\n") {
+                document.history.revision()
+            } else {
+                u64::MAX
+            },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("newest\n")
+                .text_snapshot(),
             snapshot: "newest\n".into(),
             present: true,
             presence_id: 0,
@@ -17362,8 +19648,13 @@ mod tests {
                 generation: 1,
             },
             revision: 1,
-            history_revision: if content_matches(&document.content, "submitted\n") { document.history.revision() } else { u64::MAX },
-            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n").text_snapshot(),
+            history_revision: if content_matches(&document.content, "submitted\n") {
+                document.history.revision()
+            } else {
+                u64::MAX
+            },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n")
+                .text_snapshot(),
             snapshot: "submitted\n".into(),
             present: true,
             presence_id: 0,
@@ -17421,8 +19712,13 @@ mod tests {
             id: 9,
             identity,
             revision: 1,
-            history_revision: if content_matches(&document.content, "submitted\n") { document.history.revision() } else { u64::MAX },
-            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n").text_snapshot(),
+            history_revision: if content_matches(&document.content, "submitted\n") {
+                document.history.revision()
+            } else {
+                u64::MAX
+            },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("submitted\n")
+                .text_snapshot(),
             snapshot: "submitted\n".into(),
             present: true,
             presence_id: 0,
@@ -17700,8 +19996,13 @@ mod tests {
             id: 2,
             identity: identity.clone(),
             revision: 1,
-            history_revision: if content_matches(&document.content, "after\n") { document.history.revision() } else { u64::MAX },
-            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("after\n").text_snapshot(),
+            history_revision: if content_matches(&document.content, "after\n") {
+                document.history.revision()
+            } else {
+                u64::MAX
+            },
+            snapshot_source: text_editor::Content::<cosmic::Renderer>::with_text("after\n")
+                .text_snapshot(),
             snapshot: "after\n".into(),
             present: true,
             presence_id: 0,
@@ -19493,7 +21794,7 @@ mod tests {
             message: "bad beta".into(),
             source: None,
             code: None,
-            protocol:None,
+            protocol: None,
         }]);
         assert_eq!(runtime.language.marks.len(), 1);
         assert_eq!(
@@ -20814,23 +23115,42 @@ mod tests {
         let before = "# Old title\n";
         let after = "# New title\n";
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "README.md", before);
-        if let DocumentState::Editable(document) = &mut runtime.document { document.markdown = true; }
-        drop(runtime.update(RepositoryAction::ApplyMarkdownMode { card, preview: true }));
+        if let DocumentState::Editable(document) = &mut runtime.document {
+            document.markdown = true;
+        }
+        drop(runtime.update(RepositoryAction::ApplyMarkdownMode {
+            card,
+            preview: true,
+        }));
         let plan = crate::editor_workspace_edit::DocumentPlan {
-            path: "/repo/README.md".into(), relative: "README.md".into(), before: before.into(), after: after.into(),
-            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: vec![], edits: vec![],
+            path: "/repo/README.md".into(),
+            relative: "README.md".into(),
+            before: before.into(),
+            after: after.into(),
+            before_hash: blake3::hash(before.as_bytes()),
+            version: Some(1),
+            protocol_version: Some(1),
+            open: true,
+            open_paths: vec![],
+            edits: vec![],
         };
         runtime.begin_workspace_edit(90, &plan).unwrap();
         runtime.finish_workspace_edit(90).unwrap();
         let task = runtime.programmatic_edit_task(card);
-        let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("fixture editor");
+        };
         assert_eq!(document.preview_text, before);
         assert!(document.markdown_stale);
         let mut stream = iced::runtime::task::into_stream(task).unwrap();
-        let Some(iced::runtime::Action::Output(action)) = stream.next().await else { panic!("preview debounce completion"); };
+        let Some(iced::runtime::Action::Output(action)) = stream.next().await else {
+            panic!("preview debounce completion");
+        };
         assert!(matches!(action, RepositoryAction::MarkdownDue { .. }));
         drop(runtime.update(action));
-        let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("fixture editor");
+        };
         assert_eq!(document.preview_text, after);
         assert!(!document.markdown_stale);
         assert_eq!(document.markdown_items.len(), 1);
@@ -20839,18 +23159,45 @@ mod tests {
     #[test]
     fn sparse_workspace_edits_retain_only_changed_fragments_in_one_undo_group() {
         let card = CardId::new();
-        let before = format!("old();\n{}old();\n", "unchanged source line\n".repeat(16_000));
+        let before = format!(
+            "old();\n{}old();\n",
+            "unchanged source line\n".repeat(16_000)
+        );
         let after = before.replace("old()", "new_name()");
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, &before);
         let last = before.rfind("old()").unwrap();
-        let plan = crate::editor_workspace_edit::DocumentPlan { path: "/repo/main.rs".into(), relative: "main.rs".into(),
-            before: before.clone().into(), after: after.clone().into(), before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: Vec::new(),
-            edits: [0, last].into_iter().map(|offset| crate::editor_workspace_edit::ResolvedEdit { range: offset..offset + 3, new_text: "new_name".into() }).collect() };
+        let plan = crate::editor_workspace_edit::DocumentPlan {
+            path: "/repo/main.rs".into(),
+            relative: "main.rs".into(),
+            before: before.clone().into(),
+            after: after.clone().into(),
+            before_hash: blake3::hash(before.as_bytes()),
+            version: Some(1),
+            protocol_version: Some(1),
+            open: true,
+            open_paths: Vec::new(),
+            edits: [0, last]
+                .into_iter()
+                .map(|offset| crate::editor_workspace_edit::ResolvedEdit {
+                    range: offset..offset + 3,
+                    new_text: "new_name".into(),
+                })
+                .collect(),
+        };
         runtime.begin_workspace_edit(51, &plan).unwrap();
-        let DocumentState::Editable(document) = &runtime.document else { panic!("fixture editor"); };
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("fixture editor");
+        };
         let changes = &document.workspace_edit.as_ref().unwrap().1;
         assert_eq!(changes.len(), 2);
-        assert!(changes.iter().map(|change| change.removed.len() + change.inserted.len()).sum::<usize>() < 32, "the unchanged middle must not be copied into history");
+        assert!(
+            changes
+                .iter()
+                .map(|change| change.removed.len() + change.inserted.len())
+                .sum::<usize>()
+                < 32,
+            "the unchanged middle must not be copied into history"
+        );
         runtime.finish_workspace_edit(51).unwrap();
         assert_eq!(runtime.editor_text().unwrap(), after);
         drop(runtime.update(RepositoryAction::Undo { card }));
@@ -20866,13 +23213,23 @@ mod tests {
         let before = runtime.editor_text().unwrap();
         let after = "fn renamed() {}\nrenamed();\n";
         let plan = crate::editor_workspace_edit::DocumentPlan {
-            path: "/repo/main.rs".into(), relative: "main.rs".into(),
-            before: before.clone().into(), after: after.into(),
-            before_hash: blake3::hash(before.as_bytes()), version: Some(1), protocol_version: Some(1), open: true, open_paths: vec![], edits: vec![],
+            path: "/repo/main.rs".into(),
+            relative: "main.rs".into(),
+            before: before.clone().into(),
+            after: after.into(),
+            before_hash: blake3::hash(before.as_bytes()),
+            version: Some(1),
+            protocol_version: Some(1),
+            open: true,
+            open_paths: vec![],
+            edits: vec![],
         };
         runtime.begin_workspace_edit(42, &plan).unwrap();
         assert!(runtime.is_saving());
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('x')) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        }));
         assert_eq!(runtime.editor_text().unwrap(), before);
         assert!(runtime.finish_workspace_edit(41).is_err());
         runtime.finish_workspace_edit(42).unwrap();
@@ -20930,13 +23287,21 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "A");
         runtime.set_auto_save(false);
-        drop(runtime.update(RepositoryAction::EditorAction { card, action: text_editor::Action::Edit(text_editor::Edit::Insert('B')) }));
+        drop(runtime.update(RepositoryAction::EditorAction {
+            card,
+            action: text_editor::Action::Edit(text_editor::Edit::Insert('B')),
+        }));
         simulate_disk_version(&mut runtime, card, "A", "C");
         drop(runtime.update(RepositoryAction::KeepMine { card }));
         drop(runtime.update(RepositoryAction::Undo { card }));
         assert_eq!(runtime.editor_text().as_deref(), Some("A"));
-        assert!(runtime.is_dirty(), "old native revision zero is not the new disk C baseline");
-        let DocumentState::Editable(document) = &runtime.document else { panic!("editable"); };
+        assert!(
+            runtime.is_dirty(),
+            "old native revision zero is not the new disk C baseline"
+        );
+        let DocumentState::Editable(document) = &runtime.document else {
+            panic!("editable");
+        };
         assert_eq!(document.saved_text, "C");
         assert_eq!(document.saved_snapshot.text().as_ref(), "C");
         assert_ne!(document.saved_history_revision, document.history.revision());
@@ -20944,13 +23309,27 @@ mod tests {
 
     #[test]
     fn whole_buffer_recovery_preserves_file_editing_preferences_and_snapshots() {
-        let mut document = EditorDocument::new("a.rs".into(), "a.rs".into(), "before".into(), blake3::hash(b"before"), false);
-        document.content.configure_indentation(crate::editor_indent::Indentation { tabs: true, size: 8, tab_width: 8 });
+        let mut document = EditorDocument::new(
+            "a.rs".into(),
+            "a.rs".into(),
+            "before".into(),
+            blake3::hash(b"before"),
+            false,
+        );
+        document
+            .content
+            .configure_indentation(crate::editor_indent::Indentation {
+                tabs: true,
+                size: 8,
+                tab_width: 8,
+            });
         document.content.set_auto_close(false);
         document.replace_text("after");
         assert_eq!(document.content.indentation().tab_width, 8);
         assert!(document.content.indentation().tabs);
-        document.content.perform(text_editor::Action::Edit(text_editor::Edit::Insert('(')));
+        document
+            .content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Insert('(')));
         assert_eq!(document.content.text(), "(after");
         assert_eq!(document.content.text_snapshot().text().as_ref(), "(after");
     }
@@ -20960,20 +23339,38 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "file.rs", "A");
         let (path, snapshot) = runtime.workspace_edit_snapshot().unwrap();
-        let plan = crate::editor_workspace_edit::DocumentPlan { path, relative: "file.rs".into(), before_hash: blake3::hash(snapshot.text.as_bytes()), before: snapshot.text.clone(), after: snapshot.text, version: Some(snapshot.version), protocol_version: None, open: true, open_paths: Vec::new(), edits: Vec::new() };
+        let plan = crate::editor_workspace_edit::DocumentPlan {
+            path,
+            relative: "file.rs".into(),
+            before_hash: blake3::hash(snapshot.text.as_bytes()),
+            before: snapshot.text.clone(),
+            after: snapshot.text,
+            version: Some(snapshot.version),
+            protocol_version: None,
+            open: true,
+            open_paths: Vec::new(),
+            edits: Vec::new(),
+        };
         runtime.disk_poll = Some((77, Instant::now()));
         runtime.begin_workspace_edit(1, &plan).unwrap();
         assert!(!runtime.observes_open_sources());
         assert!(runtime.disk_poll.is_none());
         let identity = runtime.current_identity(card, "file.rs".into());
-        drop(runtime.update(RepositoryAction::ConfiguredFileLoaded { identity, result: Err(FileIoError::Io("old read".into())), indentation: crate::editor_indent::Overrides::default(), root: None }));
+        drop(runtime.update(RepositoryAction::ConfiguredFileLoaded {
+            identity,
+            result: Err(FileIoError::Io("old read".into())),
+            indentation: crate::editor_indent::Overrides::default(),
+            root: None,
+        }));
         assert_eq!(runtime.editor_text().as_deref(), Some("A"));
         assert!(runtime.workspace_edit_pending());
         runtime.cancel_workspace_edit(1);
         assert!(runtime.observes_open_sources());
         runtime.set_external_source("/dependencies/std.rs".into());
         assert!(!runtime.observes_open_sources());
-        assert!(cosmic::iced::runtime::task::into_stream(runtime.refresh_open_sources(card)).is_none());
+        assert!(
+            cosmic::iced::runtime::task::into_stream(runtime.refresh_open_sources(card)).is_none()
+        );
     }
 
     #[test]
@@ -20984,11 +23381,14 @@ mod tests {
         drop(runtime.take_lsp_intents());
         text_editor::take_text_call_count();
         for character in "changed".chars() {
-            drop(runtime.update(RepositoryAction::EditorAction { card,action:text_editor::Action::Edit(text_editor::Edit::Insert(character)) }));
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert(character)),
+            }));
             assert!(runtime.take_lsp_intents().is_empty());
         }
         assert!(runtime.is_dirty());
-        drop(runtime.update(RepositoryAction::Undo {card}));
+        drop(runtime.update(RepositoryAction::Undo { card }));
         assert!(runtime.take_lsp_intents().is_empty());
         assert_eq!(text_editor::take_text_call_count(), 0);
     }
@@ -20998,19 +23398,33 @@ mod tests {
         let card = CardId::new();
         let (mut runtime, _) = RepositoryRuntime::lsp_open_fixture(card, "first\nsecond\nthird\n");
         runtime.set_editor_diagnostics(vec![
-            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(2,0),LspPosition::new(2,3)),severity:crate::lsp::LspSeverity::Error,message:"third error".into(),source:None,code:None,protocol:None },
-            crate::lsp::LspDiagnostic { range:LspRange::new(LspPosition::new(1,0),LspPosition::new(1,3)),severity:crate::lsp::LspSeverity::Warning,message:"second warning".into(),source:None,code:None,protocol:None },
+            crate::lsp::LspDiagnostic {
+                range: LspRange::new(LspPosition::new(2, 0), LspPosition::new(2, 3)),
+                severity: crate::lsp::LspSeverity::Error,
+                message: "third error".into(),
+                source: None,
+                code: None,
+                protocol: None,
+            },
+            crate::lsp::LspDiagnostic {
+                range: LspRange::new(LspPosition::new(1, 0), LspPosition::new(1, 3)),
+                severity: crate::lsp::LspSeverity::Warning,
+                message: "second warning".into(),
+                source: None,
+                code: None,
+                protocol: None,
+            },
         ]);
-        runtime.move_cursor_to(LspPosition::new(0,0));
+        runtime.move_cursor_to(LspPosition::new(0, 0));
         runtime.navigate_diagnostic(true);
-        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1,0)));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 0)));
         assert!(!runtime.language.hover.is_empty());
         runtime.navigate_diagnostic(true);
-        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(2,0)));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(2, 0)));
         runtime.navigate_diagnostic(true);
-        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1,0)));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(1, 0)));
         runtime.navigate_diagnostic(false);
-        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(2,0)));
+        assert_eq!(runtime.cursor_position(), Some(LspPosition::new(2, 0)));
     }
 
     #[test]
@@ -24031,10 +26445,12 @@ mod tests {
             matches!(registered_editor_binding(card, &runtime, &press("f", Code::KeyF, iced::keyboard::Modifiers::CTRL)), Some(Some(text_editor::Binding::Custom(RepositoryAction::Redo { card: id }))) if id == card)
         );
     }
-
 }
 
 /// The virtualized diff canvas used by a language-server workspace-edit preview.
-pub fn workspace_preview_view(card: CardId, runtime: &RepositoryRuntime) -> Element<'_, RepositoryAction> {
+pub fn workspace_preview_view(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+) -> Element<'_, RepositoryAction> {
     diff_surface(card, runtime, None)
 }
