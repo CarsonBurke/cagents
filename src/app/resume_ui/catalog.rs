@@ -853,15 +853,15 @@ mod tests {
             }
         };
         let cache = Cache::default();
-        write("First");
+        write("Review encryption");
         assert_eq!(
             cache.find(Provider::Claude, &candidate()).unwrap().title,
-            "First"
+            "Review encryption"
         );
-        write("Second, longer");
+        write("Review encryption throughput");
         assert_eq!(
             cache.find(Provider::Claude, &candidate()).unwrap().title,
-            "Second, longer"
+            "Review encryption throughput"
         );
     }
 }
