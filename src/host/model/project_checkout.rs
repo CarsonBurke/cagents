@@ -83,7 +83,7 @@ mod tests {
             repository: metadata.canonicalize().unwrap(), checkout: Some(linked.clone()),
             primary_checkout: Some(linked.clone()), name: "project".into(), kind: ProjectKind::Git,
         }.canonicalized();
-        assert!(invalid.is_err(), "a linked checkout cannot claim the primary row");
+        assert!(matches!(invalid.unwrap(), ModelEdit::ReopenProject { primary_checkout: None, .. }), "a linked checkout cannot claim the primary row");
         let before = registry.model().unwrap();
         assert_eq!(before.projects.len(), 1);
         assert_eq!(before.projects[0].checkout, Some(linked.canonicalize().unwrap()));
@@ -96,7 +96,7 @@ mod tests {
         let project = &restored.projects[0];
         let reply = crate::device_service::execute(crate::device_service::Operation::ProjectNavigation {
             repository: project.repository.clone(), kind: project.kind,
-            checkout: project.primary_checkout.clone().or_else(|| project.checkout.clone()),
+            checkout: project.checkout.clone(), primary_checkout: project.primary_checkout.clone(),
         }).unwrap();
         let crate::device_service::Reply::ProjectNavigation(navigation) = reply else { panic!("navigation response"); };
         let paths: Vec<_> = navigation.worktrees.into_iter().map(|row| row.path).collect();
@@ -104,6 +104,28 @@ mod tests {
         assert!(paths.contains(&linked.canonicalize().unwrap()));
         assert!(!paths.contains(&metadata.canonicalize().unwrap()));
         assert_eq!(navigation.repository, metadata.canonicalize().unwrap());
+
+        std::fs::remove_dir_all(&primary).unwrap();
+        let edit = ModelEdit::ReopenProject { repository: project.repository.clone(),
+            checkout: project.checkout.clone(), primary_checkout: project.primary_checkout.clone(),
+            name: "project".into(), kind: ProjectKind::Git }.canonicalized().unwrap();
+        assert!(matches!(edit, ModelEdit::ReopenProject { primary_checkout: None, .. }));
+        let read_root = crate::project_location::read_checkout(&project.repository,
+            project.checkout.as_deref(), project.primary_checkout.as_deref()).unwrap();
+        assert_eq!(read_root, linked.canonicalize().unwrap());
+        let service = crate::repository::RepositoryService::system("git");
+        let cancellation = crate::process::CancellationToken::new();
+        let info = service.discover(&read_root, &cancellation).unwrap();
+        let rows = service.list_worktrees_for_repository(&info, &cancellation).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path, linked.canonicalize().unwrap());
+        let reply = crate::device_service::execute(crate::device_service::Operation::ProjectNavigation {
+            repository: project.repository.clone(), kind: project.kind,
+            checkout: project.checkout.clone(), primary_checkout: project.primary_checkout.clone(),
+        }).unwrap();
+        let crate::device_service::Reply::ProjectNavigation(navigation) = reply else { panic!("navigation response"); };
+        assert_eq!(navigation.worktrees.len(), 1);
+        assert_eq!(navigation.worktrees[0].path, linked.canonicalize().unwrap());
     }
 
 }

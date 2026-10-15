@@ -409,14 +409,11 @@ pub enum ModelEdit {
 
 fn verified_primary_checkout(repository: &Path, primary: Option<PathBuf>, checkout: Option<&Path>) -> Result<Option<PathBuf>, String> {
     let repository = canonical_repository(repository)?;
-    if let Some(primary) = primary {
-        let primary = std::fs::canonicalize(primary).map_err(|error| error.to_string())?;
-        if crate::project_location::primary_checkout(&primary, &repository).as_ref() != Some(&primary) {
-            return Err(format!("{} is not the primary checkout of {}", primary.display(), repository.display()));
-        }
-        return Ok(Some(primary));
-    }
-    Ok(checkout.and_then(|checkout| crate::project_location::primary_checkout(checkout, &repository)))
+    // Retained discovery metadata may become stale after a checkout is removed,
+    // unmounted, or reused. An unavailable primary must not block a valid linked
+    // open; absent updates preserve the registry's prior discovery information.
+    Ok(primary.as_deref().and_then(|root| crate::project_location::primary_checkout(root, &repository))
+        .or_else(|| checkout.and_then(|root| crate::project_location::primary_checkout(root, &repository))))
 }
 
 impl ModelEdit {

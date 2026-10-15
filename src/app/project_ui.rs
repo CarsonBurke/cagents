@@ -252,7 +252,7 @@ impl Cagents {
     }
 
     pub(super) fn known_project_checkout(&self, repository: &Path, project_id: ProjectId) -> Option<(PathBuf, PathBuf)> {
-        if let Some(checkout) = self.project_ui.primary_checkout_roots.get(repository).or_else(|| self.project_ui.checkout_roots.get(repository)) {
+        if let Some(checkout) = self.project_ui.checkout_roots.get(repository).or_else(|| self.project_ui.primary_checkout_roots.get(repository)) {
             return Some((checkout.clone(), repository.to_owned()));
         }
         let project = self.sidebar_model.project(project_id)?;
