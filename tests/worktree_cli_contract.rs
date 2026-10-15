@@ -386,15 +386,18 @@ fn daemon_setup_review_selects_current_generation_with_a_stale_history_snapshot(
     let path=fixture.create("recreated-setup");
     let old:WorktreeSetupIntent=serde_json::from_value(fixture.setup_intent(&path)).unwrap();
     let admin=fixture.git(&path,&["rev-parse","--absolute-git-dir"]);
+    let journal=fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("worktree-operations.sqlite3");
+    let connection=rusqlite::Connection::open(journal).unwrap();
+    connection.execute("CREATE TEMP TABLE retained_fixture_history AS SELECT * FROM pending_operations WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?1",[path.to_str().unwrap()]).unwrap();
     fixture.cli(&["worktree","remove","recreated-setup"]);
+    assert_eq!(connection.query_row("SELECT count(*) FROM pending_operations WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?1",[path.to_str().unwrap()],|row|row.get::<_,i64>(0)).unwrap(),0,"normal removal must retire the old receipt");
     assert_eq!(fixture.create("recreated-setup"),path);
     assert_eq!(fixture.git(&path,&["rev-parse","--absolute-git-dir"]),admin);
     // Normal removal retires its receipt, preventing duplicate active leases.
     // Deliberately restore that old Applied history snapshot to exercise the
     // recovery reader against an imported/stale row without weakening writes.
-    let journal=fixture.root.path().join("data").join(cagents::instance::STORAGE_NAME).join("worktree-operations.sqlite3");
-    let connection=rusqlite::Connection::open(journal).unwrap();
-    assert_eq!(connection.execute("UPDATE pending_operations SET status='applied' WHERE action='create' AND json_extract(payload_json,'$.request.destination')=?1 AND json_extract(payload_json,'$.request.setup_intent.run_id')=?2",rusqlite::params![path.to_str().unwrap(),old.run_id.unwrap().to_string()]).unwrap(),1);
+    assert_eq!(connection.execute("INSERT INTO pending_operations SELECT * FROM retained_fixture_history",[]).unwrap(),1);
+    assert_eq!(connection.query_row("SELECT count(*) FROM pending_operations WHERE action='create' AND status='applied' AND json_extract(payload_json,'$.request.destination')=?1",[path.to_str().unwrap()],|row|row.get::<_,i64>(0)).unwrap(),2,"both independently settled generations must be present for this fixture");
     drop(connection);
     let socket=fixture.root.path().join("run").join(cagents::instance::RUNTIME_SUBDIRECTORY).join(cagents::terminal_ipc::SOCKET_FILE_NAME);
     let mut client=cagents::control::ControlClient::connect(&socket).unwrap();let repository=project.join(".git");
