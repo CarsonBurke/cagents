@@ -65,6 +65,10 @@ const PEER_PACKAGE_DIRECTORY: &str = "/usr/libexec/cagents";
 pub const UI_LAUNCH_HANDSHAKE_ENV: &str = "CAGENTS_UI_LAUNCH_HANDSHAKE";
 pub const UI_LAUNCH_READY: &str = "ready";
 pub const UI_LAUNCH_ERROR_PREFIX: &str = "error: ";
+/// A usable recovery window remains open while the updater reports failure.
+pub const UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX: &str = "recovery-incomplete: ";
+/// One bounded inventory announcement extends startup, without claiming ready.
+pub const UI_LAUNCH_RECOVERY_PROGRESS_PREFIX: &str = "recovering: ";
 
 pub const PRIMARY_WINDOW: &str = "primary";
 static WINDOW_SLOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
