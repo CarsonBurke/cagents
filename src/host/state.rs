@@ -295,6 +295,7 @@ pub(crate) struct HostState {
     pub(super) agent_activity_wake: Arc<super::activity::Wake>,
     /// Exclusive upgrade barrier; ordinary client operations remain concurrent.
     pub(super) control_gate: Arc<RwLock<()>>,
+    pub(super) account_lifecycle: super::account_lifecycle::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
@@ -324,6 +325,7 @@ impl HostState {
     pub(crate) fn new(proof: HostSessionProof) -> Self {
         Self {
             recover_holders: false,
+            account_lifecycle: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
             spawning: BTreeSet::new(),
@@ -600,23 +602,56 @@ impl HostState {
             scope,
             expected_revision,
             operation,
-            ..
+            change,
         } = &edit
         {
             let registry = self.registry()?;
-            if !registry
+            let seen = registry
                 .view_operation_seen(*operation)
-                .map_err(model_unavailable)?
-                && registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision
-            {
-                return Err(ProtocolError::new(
-                    ProtocolErrorCode::ViewConflict,
-                    "The workspace view changed; rebase this pane mutation on the current revision",
-                    true,
-                ));
+                .map_err(model_unavailable)?;
+            if !seen {
+                if let Some(reason) = registry
+                    .view_change_refusal(scope, change)
+                    .map_err(model_unavailable)?
+                {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        reason,
+                        false,
+                    ));
+                }
+                if registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        "The workspace view changed; rebase this pane mutation on the current revision",
+                        true,
+                    ));
+                }
             }
         }
-        let applied = self.registry()?.apply(&edit).map_err(model_unavailable)?;
+        let registry = self.registry()?;
+        let applied = registry.apply(&edit).map_err(|error| {
+            if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
+                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
+            }
+            // An execution writer can close a view after the preflight read.
+            // apply has rolled back; inspect authoritative membership again
+            // rather than making the client retry a permanently invalid edit.
+            if let ModelEdit::ChangeView { scope, change, .. } = &edit {
+                match registry.view_change_refusal(scope, change) {
+                    Ok(Some(reason)) => {
+                        return ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            reason,
+                            false,
+                        );
+                    }
+                    Err(storage) => return model_unavailable(storage),
+                    Ok(None) => {}
+                }
+            }
+            model_unavailable(error)
+        })?;
         if applied.changed {
             self.announce_model_edit(origin, applied.model.sequence, &edit);
         }
@@ -1394,6 +1429,16 @@ impl HostState {
         client: ClientId,
         windows: &[crate::instance::VerifiedWindow],
     ) -> Result<(), String> {
+        // Account probes/creation now retain a physical reservation instead
+        // of the global writer. They can still own operands inside this tree.
+        if !self
+            .account_lifecycle
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_empty()
+        {
+            return Err("An account operation is still using its credential directories".into());
+        }
         let verified = |id: &ClientId| {
             self.client_pids
                 .get(id)
@@ -3469,6 +3514,23 @@ fn start_terminal_view_owned(
     if let Some(environment) = &mut execution_environment {
         session.launch.remove_unset_environment(&mut environment.0);
     }
+    if adoption.is_some() {
+        super::account_lifecycle::ensure_terminal_adoption(
+            shared,
+            execution_environment.as_ref().map(|value| &value.0),
+            &crate::account::launch_credential_overrides(&session.launch),
+        )?;
+    }
+    super::account_lifecycle::ensure_launch(
+        shared,
+        &session.launch.working_directory,
+        execution_environment
+            .as_ref()
+            .map(|value| &value.0)
+            .unwrap_or(&session.launch.environment),
+        &crate::account::launch_credential_overrides(&session.launch),
+        execution_environment.is_none(),
+    )?;
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
