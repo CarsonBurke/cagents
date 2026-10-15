@@ -48,18 +48,18 @@ impl Store {
         let mut lengths=std::collections::HashMap::new();
         for batch in wanted.chunks(128){
             let placeholders=std::iter::repeat_n("(?,?)",batch.len()).collect::<Vec<_>>().join(",");
-            let sql=format!("SELECT agent,id,len,metadata FROM child_sources WHERE supported=1 AND (agent,id) IN (VALUES {placeholders})");
+            let sql=format!("SELECT agent,id,len,metadata,epoch FROM child_sources WHERE supported=1 AND (agent,id) IN (VALUES {placeholders})");
             let mut statement=self.db.prepare(&sql).map_err(|e|e.to_string())?;
             let parameters:Vec<&dyn rusqlite::ToSql>=batch.iter().flat_map(|key|[key.agent_id.as_ref().unwrap() as &dyn rusqlite::ToSql,&key.source_id as &dyn rusqlite::ToSql]).collect();
-            let rows=statement.query_map(parameters.as_slice(),|row|Ok((SourceKey{agent_id:Some(row.get(0)?),source_id:row.get(1)?},row.get::<_,usize>(2)?,row.get::<_,Vec<u8>>(3)?))).map_err(|e|e.to_string())?;
-            for row in rows {let (key,len,bytes)=row.map_err(|e|e.to_string())?;let metadata=postcard::from_bytes::<Option<SourceMetadata>>(&bytes).map_err(|e|e.to_string())?.ok_or("Missing original prose metadata")?;lengths.insert(key,(len,metadata));}
+            let rows=statement.query_map(parameters.as_slice(),|row|Ok((SourceKey{agent_id:Some(row.get(0)?),source_id:row.get(1)?},row.get::<_,usize>(2)?,row.get::<_,Vec<u8>>(3)?,row.get::<_,u64>(4)?))).map_err(|e|e.to_string())?;
+            for row in rows {let (key,len,bytes,epoch)=row.map_err(|e|e.to_string())?;let metadata=postcard::from_bytes::<Option<SourceMetadata>>(&bytes).map_err(|e|e.to_string())?.ok_or("Missing original prose metadata")?;lengths.insert(key,(len,metadata,epoch));}
         }
         let mut parts=Vec::with_capacity(visible.len());
         for (key,visible_len) in visible {
             if !changed && let Some(part)=cached.get(&key){parts.push((**part).clone());continue;}
-            let Some((source_len,metadata))=lengths.get(&key).cloned() else {continue;};
+            let Some((source_len,metadata,epoch))=lengths.get(&key).cloned() else {continue;};
             let replacement=source_len!=visible_len;
-            parts.push(SourcePart{item_id:key.source_id.clone(),source:key,start:0,end:if replacement{0}else{source_len},source_len,replacement,metadata});
+            parts.push(SourcePart{item_id:key.source_id.clone(),source:key,start:0,end:if replacement{0}else{source_len},source_len,replacement,epoch,metadata});
         }
         drop(cached);
         state.source_parts.retain(|part|part.source.agent_id.is_none());
