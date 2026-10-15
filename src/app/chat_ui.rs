@@ -13,6 +13,8 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
+const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
+
 mod auth_recovery;
 mod changes;
 mod clipboard_image;
@@ -27,6 +29,7 @@ mod markdown_source;
 mod monospace;
 mod permissions;
 mod prose;
+mod readiness;
 mod retained;
 mod scroll;
 mod selectable_prose;
@@ -4085,6 +4088,10 @@ impl Cagents {
     }
 
     fn preferred_chat_provider(&self) -> Provider {
+        if let Some(directory) = self.terminal_directory()
+            && let Some(provider) = self.usable_chat_provider_for_directory(&directory) {
+            return provider;
+        }
         self.workspace
             .focused()
             .and_then(|card| self.card_state(card))
@@ -4556,7 +4563,7 @@ impl Cagents {
         self.card_chrome.remove(&card);
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
-        self.load_draft_skills(target)
+        Task::batch([self.load_draft_skills(target), self.refresh_draft_accounts()])
     }
 
     pub(super) fn chat_subscription(&self) -> Subscription<Message> {
@@ -5971,10 +5978,14 @@ impl Cagents {
         }
         match action {
             Action::DraftModel(target, provider, model) => {
-                return self.choose_draft_model(target, provider, model);
+                self.chat_ui.default_chats.remove(&target.card);
+                let choice = self.choose_draft_model(target, provider, model);
+                return Task::batch([choice, self.refresh_draft_accounts()]);
             }
             Action::ChooseAccount(target, id) => {
-                return self.choose_chat_account(target, id);
+                self.chat_ui.default_chats.remove(&target.card);
+                let choice = self.choose_chat_account(target, id);
+                return Task::batch([choice, self.refresh_draft_accounts()]);
             }
             Action::RecoverAccount(card, id) => return self.recover_chat_account(card, id),
             Action::DraftSkills(target, launch, skills) => {
@@ -6217,7 +6228,7 @@ impl Cagents {
             }
             Action::Ready(target, ready) => {
                 let result = ready.0.lock().ok().and_then(|mut ready| ready.take());
-                let Some(result) = result else {
+                let Some(mut result) = result else {
                     return Task::none();
                 };
                 if let Some(session) = self.chat_ui.abandoned.remove(&target) {
@@ -6275,8 +6286,19 @@ impl Cagents {
                     }
                     return Task::none();
                 }
+                if let Err(failure) = &mut result
+                    && attempt.session.launch.provider == Provider::Codex
+                    && failure.message.starts_with("Cannot verify Codex account directory ")
+                    && failure.message.contains("os error 2")
+                {
+                    let raw = std::mem::replace(&mut failure.message,
+                        "Codex's account setup isn't available. Sign in or choose another account.".into());
+                    self.notices.record(TransientNotice::warning(failure.message.clone())
+                        .key(format!("chat-setup:{}", target.card)).details(raw).targets([target.card]));
+                }
                 match result {
                     Ok(handle) => {
+                        self.notices.resolve(&format!("chat-setup:{}", target.card));
                         if let Some((source, resolved)) = handle.upgrade_recovery() {
                             let replacement = handle.session();
                             if account_source.is_some()
@@ -7147,6 +7169,17 @@ impl Cagents {
                         generation,
                         Some((revision, mode)),
                     );
+                }
+                let setup = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) if runtime.target == target
+                        && !runtime.composer.text().trim_start().starts_with('/') => self.chat_draft_readiness(runtime),
+                    _ => None,
+                };
+                if matches!(setup, Some(account_ui::ProviderReadiness::MissingCli | account_ui::ProviderReadiness::MissingHome(_) | account_ui::ProviderReadiness::NeedsLogin(_) | account_ui::ProviderReadiness::LoginBusy(_))) {
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.error = Some(format!("{} setup is not ready. Sign in or choose another provider or account; your draft is retained.", runtime.session.launch.provider.label()));
+                    }
+                    return self.refresh_draft_accounts();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -12849,6 +12882,22 @@ mod tests {
         idle.busy = false;
         show_chat_snapshot_for_test(&mut app, card, idle);
         assert!(chat_runtime(&app, card).interrupt_armed.is_none());
+    }
+
+    #[test]
+    fn missing_codex_setup_keeps_the_draft_and_hides_raw_io_details_in_the_notice() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        let raw = "Cannot verify Codex account directory /fixture/home/.codex: No such file or directory (os error 2)";
+        answer_start(&mut app, target, Err(chat::StartFailure::retry(raw)));
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.is_draft());
+        assert!(runtime.error.as_deref().unwrap().contains("Sign in"));
+        assert!(!runtime.error.as_deref().unwrap().contains("os error"));
+        assert_eq!(runtime.composer.text().trim(), "hello");
+        let notice = app.notices.entries.iter().find(|entry| entry.notice.key.as_deref() == Some(&format!("chat-setup:{card}"))).unwrap();
+        assert_eq!(notice.notice.details.as_deref(), Some(raw));
+        assert_eq!(notice.notice.targets, vec![card]);
     }
 
     #[test]

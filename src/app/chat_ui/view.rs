@@ -899,6 +899,7 @@ impl Cagents {
                     Vec::new()
                 };
                 let view = runtime.view(
+                    self.chat_draft_readiness(runtime),
                     self.chat_auth_recovery(runtime),
                     self.chat_start_pending(card),
                     self.settings.chat_enter_sends,
@@ -909,6 +910,9 @@ impl Cagents {
                     accounts,
                     offers,
                 );
+                let view = if let Some(setup) = self.chat_draft_setup_view(runtime) {
+                    widget::column::with_children(vec![setup, view]).into()
+                } else { view };
                 if let Some(recovery) = self.account_recovery_controls(card) {
                     widget::column::with_children(vec![recovery, view]).into()
                 } else {
@@ -971,10 +975,6 @@ fn reasoning_finished(items: &[Arc<chat::Item>], busy: bool, id: &str) -> bool {
                         ))
             })
 }
-
-/// The providers a draft offers, in the order its picker lists them after
-/// its own.
-const MODEL_FAMILIES: [Provider; 3] = [Provider::Codex, Provider::Claude, Provider::Omp];
 
 /// One provider's models, as a draft's picker offers them.
 struct Offer<'a> {
@@ -1116,6 +1116,7 @@ impl Runtime {
 
     fn view<'a>(
         &'a self,
+        setup: Option<crate::app::account_ui::ProviderReadiness>,
         recovery: Option<auth_recovery::Recovery>,
         transitioning: bool,
         enter_sends: bool,
@@ -2147,7 +2148,10 @@ impl Runtime {
         // sessions, that something is being sent, that the agent has stopped
         // or failed, that it is waiting on them, that it is working.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let (glyph, state) = self.conversation_status(transitioning);
+        let (glyph, state) = match setup.as_ref().filter(|_| self.is_draft() && !transitioning && self.error.is_none() && snapshot.error.is_none()) {
+            Some(readiness) => (None, readiness.draft_status()),
+            None => self.conversation_status(transitioning),
+        };
         if let Some(glyph) = glyph {
             status.push(if glyph == Icon::AgentWorking {
                 crate::ui_controls::activity_spinner(
@@ -4771,6 +4775,7 @@ mod tests {
                 .summary
                 .clone();
             let mut element = runtime.view(
+                    None,
                 None,
                 false,
                 true,
@@ -4944,6 +4949,7 @@ mod tests {
         Arc::make_mut(&mut runtime.snapshot).subagents.push(child);
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         let mut element = runtime.view(
+                    None,
             None,
             false,
             true,
@@ -5686,6 +5692,7 @@ mod tests {
         let (runtime, _handle) = frame_cost::live_runtime(&items);
         let shortcuts = crate::settings::KeyboardShortcuts::default();
         let mut element = runtime.view(
+                    None,
             None,
             false,
             true,
@@ -5753,6 +5760,7 @@ mod tests {
                 let (mut runtime, _handle) = frame_cost::live_runtime(&items);
                 Arc::make_mut(&mut runtime.snapshot).title = title.clone();
                 let mut element = runtime.view(
+                    None,
                     None,
                     false,
                     true,
@@ -7344,6 +7352,7 @@ mod tests {
             drop(selected);
             let shortcuts = crate::settings::KeyboardShortcuts::default();
             let mut full = runtime.view(
+                    None,
                 None,
                 false,
                 true,
@@ -7573,6 +7582,7 @@ mod tests {
             let target = runtime.target;
             let shortcuts = crate::settings::KeyboardShortcuts::default();
             let mut element = runtime.view(
+                    None,
                 None,
                 false,
                 true,
@@ -7675,6 +7685,7 @@ mod tests {
             );
             for width in [360.0, 670.0] {
                 let mut element = runtime.view(
+                    None,
                     None,
                     false,
                     true,

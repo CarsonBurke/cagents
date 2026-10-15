@@ -16174,7 +16174,10 @@ impl Application for Cagents {
             Message::ChannelUi(action) => self.handle_channel_ui(action),
             Message::SidebarSelection(action) => self.update_sidebar_selection(action),
             Message::BranchUi(action) => self.update_branch_ui(action),
-            Message::AccountUi(action) => self.update_account_ui(action),
+            Message::AccountUi(action) => {
+                let update = self.update_account_ui(action);
+                Task::batch([update, self.reconcile_usable_default_chats()])
+            },
             Message::ResumeConversation(action) => self.update_resume(action),
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::GitUi(action) => self.update_git(action),
