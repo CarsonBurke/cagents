@@ -3803,6 +3803,12 @@ impl RepositoryRuntime {
     }
 
     /// The live buffer, or nothing while no editable document is open.
+    pub fn editor_formatting_options(&self) -> (u32, bool) {
+        let DocumentState::Editable(document) = &self.document else { return (self.editor_tab_width as u32, true); };
+        let indentation = document.content.indentation();
+        (if indentation.tabs { indentation.tab_width as u32 } else { indentation.size as u32 }, !indentation.tabs)
+    }
+
     pub fn editor_text(&self) -> Option<String> {
         match &self.document {
             DocumentState::Editable(document) => Some(document.content.text()),

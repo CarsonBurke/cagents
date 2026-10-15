@@ -1067,6 +1067,8 @@ where
         internal.editor.perform(action);
     }
 
+    pub fn indentation(&self) -> crate::editor_indent::Indentation { self.0.borrow().indentation }
+
     pub fn configure_indentation(&mut self, indentation: crate::editor_indent::Indentation) {
         let internal = self.0.get_mut();
         internal.indentation = indentation;
