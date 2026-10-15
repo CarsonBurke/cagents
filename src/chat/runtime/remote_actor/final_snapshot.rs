@@ -117,7 +117,7 @@ fn retirement_proved_inner(
         return Ok(false);
     }
     let file =
-        match crate::secure_file::open_existing_private_file(&retirement_path(record)?) {
+        match crate::secure_file::open_existing_private_file_readonly(&retirement_path(record)?) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.to_string()),
