@@ -484,7 +484,9 @@ fn recoverable_discard_executable_runs_while_original_cleanup_is_retained() {
         "execution must precede cleanup resolution"
     );
     assert!(
-        authority.retry().is_err(),
+        service
+            .resolve_discard_recovery(&discarded.recovery, &cancel)
+            .is_err(),
         "foreign entry still refuses cleanup"
     );
     let original = executor.original_holding.lock().unwrap();
