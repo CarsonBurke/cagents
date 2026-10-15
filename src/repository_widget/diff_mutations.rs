@@ -236,6 +236,11 @@ impl RepositoryRuntime {
                 );
             }
         }
+        let presence_id = if !present {
+            let id = document.next_presence_id.checked_add(1).ok_or("The file's Undo identity is exhausted. Reload before reverting.")?;
+            document.next_presence_id = id;
+            id
+        } else { document.presence_id };
         let cursor = document.content.cursor();
         let scroll = document.content.scroll_position();
         let mut buffer = ProtocolTracked {
@@ -255,14 +260,15 @@ impl RepositoryRuntime {
         let edits = buffer.edits;
         document.content.set_cursor(cursor);
         document.content.restore_scroll_position(scroll);
-        document.history.record_group_with_presence(
+        document.history.record_group_with_presence_identities(
             change.into_iter().map(Arc::unwrap_or_clone).collect(),
             cursor,
             document.content.cursor(),
             Instant::now(),
-            Some((document.present, present)),
+            Some(((document.present, presence_id), (present, presence_id))),
         );
         document.present = present;
+        document.presence_id = presence_id;
         if !present {
             document.deletion_mode = mode;
         }
@@ -503,6 +509,70 @@ mod tests {
         runtime.working_diff.desired_rich = true;
         let identity = runtime.current_identity(card, "new.sh".into());
         (runtime, identity)
+    }
+
+    fn revert_complete_added_buffer(runtime: &mut RepositoryRuntime, card: CardId, mode: u32) {
+        let text = runtime.editor_text().unwrap();
+        let mut model = crate::diff_view::build_diff("", &text);
+        model.present = [false, true];
+        model.modes = [None, Some(mode)];
+        runtime.set_diff_state(DiffBasis::IndexToWorktree, DiffState::ready(RenderedDiff::Text {
+            model: Arc::new(model), old_label: "Index".into(), new_label: "Working tree".into(),
+        }));
+        runtime.working_diff.applied = runtime.wanted_working_diff();
+        runtime.working_diff.desired = runtime.wanted_working_diff();
+        runtime.working_diff.applied_rich = true;
+        runtime.working_diff.desired_rich = true;
+        let model = runtime.current_diff_model_snapshot().unwrap();
+        let request = runtime.diff_mutation_request(card, 0..model.row_count(runtime.diff_mode)).unwrap();
+        let (identity, revision, mut patch) = runtime.capture_diff_mutation(card, git_patch::Kind::Revert, Some(&request)).unwrap().build().unwrap();
+        runtime.apply_diff_buffer_revert_with_presence(&identity, revision.unwrap(), patch.buffer_change.take(), patch.working_present.unwrap(), patch.working_mode).unwrap();
+    }
+
+    #[tokio::test]
+    async fn partial_change_multiple_presence_undos_restore_their_own_access_metadata() {
+        use std::os::unix::fs::PermissionsExt;
+        for save_between_undos in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().canonicalize().unwrap();
+            std::fs::write(root.join("new.sh"), "synthetic alpha\n").unwrap();
+            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o600)).unwrap();
+            let card = CardId::new();
+            let (mut runtime, _) = added_file_runtime(card, &root, "synthetic alpha\n");
+            revert_complete_added_buffer(&mut runtime, card, 0o100644);
+            let task = runtime.request_save_inner(card, false, false);
+            finish_presence_save(&mut runtime, task).await;
+            assert!(!root.join("new.sh").exists());
+            let DocumentState::Editable(document) = &mut runtime.document else { unreachable!() };
+            document.apply(text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("synthetic beta\n".into()))));
+            let task = runtime.request_save_inner(card, false, false);
+            finish_presence_save(&mut runtime, task).await;
+            std::fs::set_permissions(root.join("new.sh"), std::fs::Permissions::from_mode(0o644)).unwrap();
+            revert_complete_added_buffer(&mut runtime, card, 0o100644);
+            let task = runtime.request_save_inner(card, false, false);
+            finish_presence_save(&mut runtime, task).await;
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            let task = runtime.request_save_inner(card, false, false);
+            finish_presence_save(&mut runtime, task).await;
+            assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic beta\n");
+            assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o644);
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert!(!runtime.desired_file_present());
+            if save_between_undos {
+                let task = runtime.request_save_inner(card, false, false);
+                finish_presence_save(&mut runtime, task).await;
+                assert!(!root.join("new.sh").exists());
+            }
+            drop(runtime.update(RepositoryAction::Undo { card }));
+            assert_eq!(runtime.editor_text().unwrap(), "synthetic alpha\n");
+            let task = runtime.request_save_inner(card, false, false);
+            finish_presence_save(&mut runtime, task).await;
+            assert_eq!(std::fs::read_to_string(root.join("new.sh")).unwrap(), "synthetic alpha\n");
+            assert_eq!(std::fs::metadata(root.join("new.sh")).unwrap().permissions().mode() & 0o777, 0o600,
+                "older synthetic contents must not acquire the later broader permissions");
+            assert!(!runtime.is_dirty());
+        }
+        eprintln!("PRESENCE_LINEAGE_VERIFIED");
     }
 
     #[tokio::test]

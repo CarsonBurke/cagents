@@ -929,7 +929,11 @@ struct EditorDocument {
     present: bool,
     saved_present: bool,
     deletion_mode: Option<u32>,
-    restoration: Option<Arc<FileRestoration>>,
+    presence_id: u64,
+    saved_presence_id: u64,
+    next_presence_id: u64,
+    restorations: std::collections::BTreeMap<u64, Arc<FileRestoration>>,
+    captured_presence_ids: std::collections::BTreeSet<u64>,
     markdown: bool,
     markdown_items: Vec<markdown::Item>,
     /// Whether [`EditorDocument::markdown_items`] still describes the buffer.
@@ -987,6 +991,7 @@ struct SaveTicket {
     revision: u64,
     snapshot: String,
     present: bool,
+    presence_id: u64,
 }
 
 impl EditorDocument {
@@ -1015,7 +1020,11 @@ impl EditorDocument {
             present: true,
             saved_present: true,
             deletion_mode: None,
-            restoration: None,
+            presence_id: 0,
+            saved_presence_id: 0,
+            next_presence_id: 0,
+            restorations: std::collections::BTreeMap::new(),
+            captured_presence_ids: std::collections::BTreeSet::new(),
             markdown,
             // Source editing does not consume the preview AST. Parse only
             // when preview is first mounted, alongside its text snapshot.
@@ -1102,15 +1111,35 @@ impl EditorDocument {
         }
     }
 
+    fn prune_restorations(&mut self) {
+        let mut retained: std::collections::BTreeSet<_> = self.history.retained_presence_ids().collect();
+        retained.extend([self.presence_id, self.saved_presence_id]);
+        if let Some(active) = &self.active_save { retained.insert(active.presence_id); }
+        self.restorations.retain(|id, _| retained.contains(id));
+        self.captured_presence_ids.retain(|id| retained.contains(id));
+    }
+
+    fn present_lineage(&self, id: u64) -> u64 {
+        // An unsaved removal has not changed disk metadata. Cancelling it by
+        // Undo or typing may keep the still-present baseline; a submitted
+        // removal must retain its captured ticket's lineage until it lands.
+        if !self.captured_presence_ids.contains(&id) && self.saved_present
+            && !self.active_save.as_ref().is_some_and(|ticket| !ticket.present && ticket.presence_id == id) {
+            self.saved_presence_id
+        } else { id }
+    }
+
     /// Brings the derived state up to date after the text changed.
     fn text_changed(&mut self) {
         self.revision = self.revision.wrapping_add(1).max(1);
         if !self.present && !self.content.is_empty() {
+            let before = self.presence_id;
+            self.presence_id = self.present_lineage(before);
             self.present = true;
-            self.history.record_latest_presence(false, true);
+            self.history.record_latest_presence_identity((false, before), (true, self.presence_id));
         }
         self.dirty =
-            self.present != self.saved_present || !content_matches(&self.content, &self.saved_text);
+            self.present != self.saved_present || self.presence_id != self.saved_presence_id || !content_matches(&self.content, &self.saved_text);
         self.markdown_stale = true;
         if self.conflict_editing {
             let text = self.content.text();
@@ -1134,8 +1163,8 @@ impl EditorDocument {
     /// Each entry describes one replacement in the order it was applied; an
     /// entry is `None` where the replacement had no protocol range.
     fn step_history(&mut self, redo: bool) -> Option<Vec<Option<LspTextEdit>>> {
-        let presence = self.history.replay_presence(redo);
-        if presence.is_some_and(|(expected, _)| expected != self.present) {
+        let presence = self.history.replay_presence_identity(redo);
+        if presence.is_some_and(|(expected, _)| expected.0 != self.present || !expected.0 && expected.1 != self.presence_id) {
             self.history.clear();
             self.error = Some("The file existence changed outside this Undo transaction.".into());
             return None;
@@ -1153,8 +1182,9 @@ impl EditorDocument {
         match replay {
             Replay::Empty => return None,
             Replay::Applied => {
-                if let Some((_, present)) = presence {
+                if let Some((_, (present, id))) = presence {
                     self.present = present;
+                    self.presence_id = if present { self.present_lineage(id) } else { id };
                 }
             }
             Replay::Diverged => {
@@ -1198,12 +1228,12 @@ impl EditorDocument {
             if replaced && content_matches(&self.content, &self.saved_text) {
                 edits = replayed;
                 self.content.set_cursor(cursor);
-                self.history.record_group_with_presence(
+                self.history.record_group_with_presence_identities(
                     vec![change],
                     cursor,
                     self.content.cursor(),
                     Instant::now(),
-                    Some((self.present, self.saved_present)),
+                    Some(((self.present, self.presence_id), (self.saved_present, self.saved_presence_id))),
                 );
             } else {
                 tracing::warn!(
@@ -1214,16 +1244,17 @@ impl EditorDocument {
                 edits.push(None);
             }
         }
-        if edits.is_empty() && self.present != self.saved_present {
-            self.history.record_group_with_presence(
+        if edits.is_empty() && (self.present != self.saved_present || self.presence_id != self.saved_presence_id) {
+            self.history.record_group_with_presence_identities(
                 vec![],
                 cursor,
                 self.content.cursor(),
                 Instant::now(),
-                Some((self.present, self.saved_present)),
+                Some(((self.present, self.presence_id), (self.saved_present, self.saved_presence_id))),
             );
         }
         self.present = self.saved_present;
+        self.presence_id = self.saved_presence_id;
         self.content.restore_scroll_position(scroll);
         self.revision = self.revision.wrapping_add(1).max(1);
         self.markdown_stale = true;
@@ -1269,7 +1300,7 @@ impl EditorDocument {
         if !text.is_empty() {
             self.present = true;
         }
-        self.dirty = self.present != self.saved_present || text != self.saved_text;
+        self.dirty = self.present != self.saved_present || self.presence_id != self.saved_presence_id || text != self.saved_text;
         self.revision = self.revision.wrapping_add(1).max(1);
     }
 
@@ -2808,6 +2839,7 @@ impl RepositoryRuntime {
             revision: 1,
             snapshot: "B\n".into(),
             present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
         let completion = RepositoryAction::SaveFinished {
@@ -5188,12 +5220,12 @@ impl RepositoryRuntime {
             && document.active_save.is_none()
         {
             let cursor = document.content.cursor();
-            document.history.record_group_with_presence(
+            document.history.record_group_with_presence_identities(
                 vec![],
                 cursor,
                 cursor,
                 Instant::now(),
-                Some((false, true)),
+                Some(((false, document.presence_id), (true, document.presence_id))),
             );
             document.present = true;
             document.text_changed();
@@ -5207,6 +5239,19 @@ impl RepositoryRuntime {
         overwrite: bool,
         reveal_editor: bool,
     ) -> Task<RepositoryAction> {
+        if let DocumentState::Editable(document) = &mut self.document {
+            document.prune_restorations();
+            if document.active_save.is_none() && document.present && document.presence_id != document.saved_presence_id
+                && document.presence_id != 0 && !document.restorations.contains_key(&document.presence_id) {
+                document.error = Some("The Undo restoration metadata is unavailable. Reload before saving.".into());
+                return Task::none();
+            }
+            if !document.present && !document.restorations.contains_key(&document.presence_id)
+                && document.restorations.len() >= 64 {
+                document.error = Some("The file has too many retained deletion snapshots. Reload to release Undo metadata before saving.".into());
+                return Task::none();
+            }
+        }
         let (path, destination, text, disk_hash, revision, presence) = match &self.document {
             DocumentState::Editable(document)
                 if (document.dirty || document.durability_warning.is_some())
@@ -5222,7 +5267,8 @@ impl RepositoryRuntime {
                         expected_present: document.saved_present,
                         desired_present: document.present,
                         expected_mode: document.deletion_mode,
-                        restoration: document.restoration.clone(),
+                        restoration: (!document.saved_present || document.presence_id != document.saved_presence_id)
+                            .then(|| document.restorations.get(&document.presence_id).cloned()).flatten(),
                     },
                 )
             }
@@ -5238,6 +5284,7 @@ impl RepositoryRuntime {
             revision,
             snapshot: text.clone(),
             present: presence.desired_present,
+            presence_id: match &self.document { DocumentState::Editable(document) => document.presence_id, _ => unreachable!() },
         };
         if let DocumentState::Editable(document) = &mut self.document {
             document.active_save = Some(ticket.clone());
@@ -5929,8 +5976,10 @@ impl RepositoryRuntime {
                         }) => {
                             document.saved_text = saved_text;
                             document.saved_present = active.present;
+                            document.saved_presence_id = active.presence_id;
                             document.disk_hash = content_hash;
                             document.dirty = document.present != document.saved_present
+                                || document.presence_id != document.saved_presence_id
                                 || document.content.text() != document.saved_text;
                             document.conflict = false;
                             document.error = None;
@@ -5948,9 +5997,11 @@ impl RepositoryRuntime {
                         }) => {
                             document.saved_text = saved_text;
                             document.saved_present = false;
+                            document.saved_presence_id = active.presence_id;
                             document.disk_hash = blake3::hash(b"");
-                            document.restoration = Some(restoration);
-                            document.dirty = document.present || !document.content.is_empty();
+                            document.captured_presence_ids.insert(active.presence_id);
+                            document.restorations.entry(active.presence_id).or_insert(restoration);
+                            document.dirty = document.present || document.presence_id != document.saved_presence_id || !document.content.is_empty();
                             document.conflict = false;
                             document.error = None;
                             document.durability_warning = match durability {
@@ -14209,6 +14260,7 @@ mod tests {
             revision: 1,
             snapshot: "submitted\n".into(),
             present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -14418,6 +14470,7 @@ mod tests {
             revision: 3,
             snapshot: "newest\n".into(),
             present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -14468,6 +14521,7 @@ mod tests {
             revision: 1,
             snapshot: "submitted\n".into(),
             present: true,
+            presence_id: 0,
         });
         document.dirty = false;
         let view = RepositoryView {
@@ -14524,6 +14578,7 @@ mod tests {
             revision: 1,
             snapshot: "submitted\n".into(),
             present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -14800,6 +14855,7 @@ mod tests {
             revision: 1,
             snapshot: "after\n".into(),
             present: true,
+            presence_id: 0,
         });
         runtime.document = DocumentState::Editable(document);
 
@@ -15128,6 +15184,7 @@ mod tests {
                 revision: 1,
                 snapshot: "after\n".into(),
                 present: true,
+                presence_id: 0,
             });
             runtime.document = DocumentState::Editable(document);
 

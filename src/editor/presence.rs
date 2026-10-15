@@ -9,6 +9,24 @@ use std::{ffi::OsString, os::unix::fs::MetadataExt, sync::Arc};
 pub struct FileRestoration {
     source: File,
     permissions: Permissions,
+    _permit: RestorationPermit,
+}
+
+static RESTORATION_DESCRIPTORS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+const MAX_RESTORATION_DESCRIPTORS: usize = 256;
+
+#[derive(Debug)]
+struct RestorationPermit;
+impl RestorationPermit {
+    fn acquire() -> Result<Self, FileIoError> {
+        RESTORATION_DESCRIPTORS.fetch_update(std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |count| (count < MAX_RESTORATION_DESCRIPTORS).then_some(count + 1))
+            .map(|_| Self).map_err(|_| FileIoError::Io("Undo metadata capacity is exhausted. Close or reload older editors before removing this file.".into()))
+    }
+}
+impl Drop for RestorationPermit {
+    fn drop(&mut self) { RESTORATION_DESCRIPTORS.fetch_sub(1, std::sync::atomic::Ordering::AcqRel); }
 }
 
 impl PartialEq for FileRestoration {
@@ -36,13 +54,17 @@ pub(crate) fn save_document_file(
     overwrite: bool,
     presence: PresenceSave,
 ) -> Result<SaveOutcome, FileIoError> {
-    if presence.expected_present && presence.desired_present {
+    if presence.expected_present && presence.desired_present && presence.restoration.is_none() {
         return save_file(worktree, path, text, expected_hash, overwrite);
     }
     let _protection = crate::worktree_cleanup::protect(worktree).map_err(io_error)?;
     validate_repo_path(path)?;
     let root = worktree_root(worktree)?;
     let (parent, name) = fs_safety::open_parent_beneath(&root, path).map_err(resolve_error)?;
+    if presence.expected_present && presence.desired_present {
+        let restoration = presence.restoration.as_deref().ok_or_else(|| FileIoError::Io("The Undo metadata is unavailable.".into()))?;
+        return replace_or_remove_document_file(&parent, &name, expected_hash, None, || Ok(()), Some((restoration, text)));
+    }
     if !presence.desired_present {
         if !text.is_empty() {
             return Err(FileIoError::Io(
@@ -72,9 +94,13 @@ pub(crate) fn save_document_file(
             "The removed file's restoration metadata is unavailable. Reload before saving.".into(),
         )
     })?;
-    require_new_destination(&parent, Path::new(&name))?;
+    restore_document_file(&parent, &name, text, &restoration)
+}
+
+fn restore_document_file(parent: &Root, name: &std::ffi::OsStr, text: &str, restoration: &FileRestoration) -> Result<SaveOutcome, FileIoError> {
+    require_new_destination(parent, Path::new(name))?;
     let (mut temporary, temporary_name) =
-        fs_safety::create_temporary_in(&parent, 0o600).map_err(resolve_error)?;
+        fs_safety::create_temporary_in(parent, 0o600).map_err(resolve_error)?;
     let result = (|| {
         fs_safety::copy_ownership(&restoration.source, &temporary).map_err(io_error)?;
         fs_safety::copy_access_acl(&restoration.source, &temporary).map_err(io_error)?;
@@ -111,16 +137,16 @@ pub(crate) fn save_document_file(
             ));
         }
         temporary.sync_all().map_err(io_error)?;
-        fs_safety::rename_new_within(&parent, &temporary_name, &name).map_err(resolve_error)?;
+        fs_safety::rename_new_within(parent, &temporary_name, name).map_err(resolve_error)?;
         Ok(())
     })();
     if let Err(error) = result {
-        let _ = fs_safety::unlink_within(&parent, &temporary_name);
+        let _ = fs_safety::unlink_within(parent, &temporary_name);
         return Err(error);
     }
     Ok(SaveOutcome::Saved {
         content_hash: blake3::hash(text.as_bytes()),
-        durability: sync_durability(&parent),
+        durability: sync_durability(parent),
     })
 }
 
@@ -156,12 +182,21 @@ fn remove_document_file(
     expected_mode: Option<u32>,
     before_acquire: impl FnOnce() -> io::Result<()>,
 ) -> Result<SaveOutcome, FileIoError> {
+    replace_or_remove_document_file(parent, name, expected_hash, expected_mode, before_acquire, None)
+}
+
+fn replace_or_remove_document_file(
+    parent: &Root, name: &std::ffi::OsStr, expected_hash: blake3::Hash,
+    expected_mode: Option<u32>, before_acquire: impl FnOnce() -> io::Result<()>,
+    replacement: Option<(&FileRestoration, &str)>,
+) -> Result<SaveOutcome, FileIoError> {
+    let permit = if replacement.is_none() { Some(RestorationPermit::acquire()?) } else { None };
     let listed = fs_safety::metadata_beneath(parent, Path::new(name)).map_err(resolve_error)?;
     let mut source = fs_safety::open_beneath(parent, Path::new(name)).map_err(resolve_error)?;
     let original = source.metadata().map_err(io_error)?;
     if !same_inode(&listed, &original)
-        || !matches!(expected_mode, Some(0o100644 | 0o100755))
-        || (original.mode() & 0o100 != 0) != (expected_mode == Some(0o100755))
+        || replacement.is_none() && (!matches!(expected_mode, Some(0o100644 | 0o100755))
+            || (original.mode() & 0o100 != 0) != (expected_mode == Some(0o100755)))
     {
         return Err(FileIoError::Io(
             "The file identity or mode changed before Revert could remove it.".into(),
@@ -260,25 +295,33 @@ fn remove_document_file(
         // The descriptor, not a discoverable temporary name, owns the metadata.
         fs_safety::unlink_within(&holding, &template_name).map_err(resolve_error)?;
         capture?;
-        fs_safety::unlink_within(&holding, acquired_name).map_err(resolve_error)?;
         Ok(template)
     })();
-    let template = match verify {
-        Ok(template) => template,
-        Err(error) => {
-            let restored = fs_safety::rename_new_between(&holding, acquired_name, parent, name);
-            let location = if restored.is_ok() {
-                let _ = fs_safety::remove_directory_within(parent, &holding_name);
-                "The acquired file was put back without replacing newer work.".to_owned()
-            } else {
-                format!(
-                    "The acquired file is preserved at {}; newer destination contents were left intact.",
-                    holding.path().join(acquired_name).display()
-                )
-            };
-            return Err(FileIoError::Io(format!("{error} {location}")));
-        }
+    let put_back = |error: FileIoError| {
+        let restored = fs_safety::rename_new_between(&holding, acquired_name, parent, name);
+        let location = if restored.is_ok() {
+            let _ = fs_safety::remove_directory_within(parent, &holding_name);
+            "The acquired file was put back without replacing newer work.".to_owned()
+        } else {
+            format!("The acquired file is preserved at {}; newer destination contents were left intact.", holding.path().join(acquired_name).display())
+        };
+        FileIoError::Io(format!("{error} {location}"))
     };
+    let template = verify.map_err(&put_back)?;
+    if let Some((restoration, text)) = replacement {
+        // Keep the acquired original until the replacement is published. A
+        // racing new destination is refused and the original is put back or
+        // retained explicitly; no newer path is overwritten.
+        let outcome = restore_document_file(parent, name, text, restoration).map_err(&put_back)?;
+        let cleanup = fs_safety::unlink_within(&holding, acquired_name)
+            .and_then(|()| fs_safety::remove_directory_within(parent, &holding_name));
+        return match (outcome, cleanup) {
+            (SaveOutcome::Saved { content_hash, durability }, Ok(())) => Ok(SaveOutcome::Saved { content_hash, durability }),
+            (SaveOutcome::Saved { content_hash, .. }, Err(error)) => Ok(SaveOutcome::Saved { content_hash, durability: SaveDurability::Unconfirmed { error: format!("The older Undo metadata was published; the previous file remains at {}: {error}", holding.path().join(acquired_name).display()) } }),
+            _ => unreachable!("restoration publishes a present file"),
+        };
+    }
+    fs_safety::unlink_within(&holding, acquired_name).map_err(|error| put_back(resolve_error(error)))?;
     let cleanup = fs_safety::remove_directory_within(parent, &holding_name);
     let durability = match cleanup {
         Ok(()) => sync_durability(parent),
@@ -293,6 +336,7 @@ fn remove_document_file(
         restoration: Arc::new(FileRestoration {
             source: template,
             permissions: original.permissions(),
+            _permit: permit.expect("a removal reserved its bounded metadata descriptor"),
         }),
         durability,
     })
