@@ -2273,22 +2273,43 @@ impl Actor {
             // The disk-backed transcript store consumes text/tool items. Keep
             // their bounded live excerpt before that boundary, without ever
             // hydrating the page a window happens to be reading.
-            if matches!(&event, Event::Item(_) | Event::TextDelta { .. } | Event::TurnStarted | Event::Reset { .. }) {
+            if matches!(
+                &event,
+                Event::Item(_) | Event::TextDelta { .. } | Event::TurnStarted | Event::Reset { .. }
+            ) {
                 let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 Arc::make_mut(&mut state.notification_preview).observe(&event);
             }
             // Only clone semantic metadata, never transcript/tool bodies.
-            let authority = matches!(&event, Event::TurnStarted | Event::TurnSettled
-                | Event::TurnFinished { .. } | Event::Usage(_) | Event::Session { .. })
-                .then(|| event.clone());
-            let events = if frame_error.is_some() { None } else {
-                match self.store.lock().unwrap_or_else(|p| p.into_inner()).apply(event) {
+            let authority = matches!(
+                &event,
+                Event::TurnStarted
+                    | Event::TurnSettled
+                    | Event::TurnFinished { .. }
+                    | Event::Usage(_)
+                    | Event::Session { .. }
+            )
+            .then(|| event.clone());
+            let events = if frame_error.is_some() {
+                None
+            } else {
+                match self
+                    .store
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .apply(event)
+                {
                     Ok(events) => Some(events),
-                    Err(error) => { frame_error = Some(error); None }
+                    Err(error) => {
+                        frame_error = Some(error);
+                        None
+                    }
                 }
             };
             if let Some(events) = events {
-                if events.is_empty() { self.touch(); }
+                if events.is_empty() {
+                    self.touch();
+                }
                 for event in events {
                     let content = matches!(&event, Event::TurnFinished { .. })
                         .then(|| frame_contents.pop_front())
@@ -2297,14 +2318,15 @@ impl Actor {
                 }
             } else if let Some(event) = authority {
                 let content = matches!(&event, Event::TurnFinished { .. })
-                    .then(|| frame_contents.pop_front()).flatten();
+                    .then(|| frame_contents.pop_front())
+                    .flatten();
                 self.apply_with_attention(event, content);
             }
             if self.retained > STATE_LIMIT {
-                frame_error.get_or_insert_with(||
+                frame_error.get_or_insert_with(|| {
                     "Provider request/model metadata exceeds native IPC presentation capacity"
-                        .into(),
-                );
+                        .into()
+                });
             }
             if let Some(message) = fatal {
                 frame_error.get_or_insert(message);
@@ -2341,7 +2363,10 @@ impl Actor {
             }
         }
         self.publish_activity();
-        match frame_error { Some(error) => Err(error), None => Ok(()) }
+        match frame_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
     fn publish_current_attention(&self, evidence: crate::notifications::Evidence) {
         let content = self
@@ -3202,44 +3227,106 @@ pub(crate) fn notification_frames_for_test(
 mod tests {
     #[test]
     fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure() {
-        struct FinalFrame { run: Option<crate::model::RunId> }
+        struct FinalFrame {
+            run: Option<crate::model::RunId>,
+        }
         impl Adapter for FinalFrame {
-            fn initialize(&mut self) -> Result<Step, String> { Ok(Step { events: vec![Event::Ready(true)], ..Default::default() }) }
-            fn command(&mut self, _: Command) -> Result<Step, String> { Err("use a correlated run".into()) }
-            fn command_for_run(&mut self, run: crate::model::RunId, _: Command) -> Result<Step, String> {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("use a correlated run".into())
+            }
+            fn command_for_run(
+                &mut self,
+                run: crate::model::RunId,
+                _: Command,
+            ) -> Result<Step, String> {
                 self.run = Some(run);
-                Ok(Step { writes: vec![serde_json::json!({"final":true})], events: vec![
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Started { key: "confirmed-provider-turn".into() } },
-                    Event::TurnStarted,
-                ] })
+                Ok(Step {
+                    writes: vec![serde_json::json!({"final":true})],
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Started {
+                                key: "confirmed-provider-turn".into(),
+                            },
+                        },
+                        Event::TurnStarted,
+                    ],
+                })
             }
             fn receive(&mut self, frame: Value) -> Result<Step, String> {
                 assert_eq!(frame, serde_json::json!({"final":true}));
                 let run = self.run.take().unwrap();
-                Ok(Step { writes: Vec::new(), events: vec![
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Scope },
-                    Event::TextDelta { id: "answer".into(), role: Role::Assistant, thinking: false, delta: "Partial response".into() },
-                    // Store flushes the pending delta here and fails. The
-                    // remaining typed provider proof must still be processed.
-                    Event::TurnSettled,
-                    Event::Item(crate::chat::Item { id: "answer".into(), role: Role::Assistant, started_at: None, at: None,
-                        content: ItemContent::Text { text: "Exact final response".into(), thinking: false, phase: Phase::Final } }),
-                    Event::Usage(Default::default()),
-                    Event::TurnFinished { key: Some("confirmed-provider-turn".into()), outcome: crate::notifications::Kind::Succeeded },
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Settled },
-                    Event::Execution { run, event: crate::agent_execution::ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } },
-                ] })
+                Ok(Step {
+                    writes: Vec::new(),
+                    events: vec![
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Scope,
+                        },
+                        Event::TextDelta {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            thinking: false,
+                            delta: "Partial response".into(),
+                        },
+                        // Store flushes the pending delta here and fails. The
+                        // remaining typed provider proof must still be processed.
+                        Event::TurnSettled,
+                        Event::Item(crate::chat::Item {
+                            id: "answer".into(),
+                            role: Role::Assistant,
+                            started_at: None,
+                            at: None,
+                            content: ItemContent::Text {
+                                text: "Exact final response".into(),
+                                thinking: false,
+                                phase: Phase::Final,
+                            },
+                        }),
+                        Event::Usage(Default::default()),
+                        Event::TurnFinished {
+                            key: Some("confirmed-provider-turn".into()),
+                            outcome: crate::notifications::Kind::Succeeded,
+                        },
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Settled,
+                        },
+                        Event::Execution {
+                            run,
+                            event: crate::agent_execution::ProviderEvent::Finished {
+                                outcome: crate::notifications::Kind::Succeeded,
+                            },
+                        },
+                    ],
+                })
             }
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec = ProcessSpec { execution: None, messages: None, unset_environment: Default::default(),
-            transport: TransportSpec::JsonLines, program: "/bin/cat".into(), arguments: Vec::new(),
-            working_directory: directory.path().into(), environment: BTreeMap::new() };
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
         let mut adapter: Box<dyn Adapter> = Box::new(FinalFrame { run: None });
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let (updates, receiver) = crossbeam_channel::unbounded();
-        let handle = Handle::start(spec, adapter, initial, store, None, move |update| { let _ = updates.send(update); }).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = updates.send(update);
+        })
+        .unwrap();
         let ready_deadline = Instant::now() + Duration::from_secs(2);
         while !handle.0.state.lock().unwrap().ready && Instant::now() < ready_deadline {
             std::thread::sleep(Duration::from_millis(5));
@@ -3247,32 +3334,73 @@ mod tests {
         let ready = handle.0.state.lock().unwrap().ready;
         if !ready {
             let closed = handle.close();
-            assert!(ready, "actual actor initialization must complete; close: {closed:?}");
+            assert!(
+                ready,
+                "actual actor initialization must complete; close: {closed:?}"
+            );
         }
         handle.0.store.lock().unwrap().read_only_for_test().unwrap();
         let run = crate::model::RunId::new();
-        handle.command_for_run(run, Command::Prompt { text: "One accepted prompt".into(), attachments: Vec::new(), mode: crate::chat::PromptMode::Send }).unwrap();
+        handle
+            .command_for_run(
+                run,
+                Command::Prompt {
+                    text: "One accepted prompt".into(),
+                    attachments: Vec::new(),
+                    mode: crate::chat::PromptMode::Send,
+                },
+            )
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
         while !handle.is_completed() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(5));
         }
         let completed = handle.is_completed();
         let closed = handle.close();
-        assert!(completed, "the real actor must settle after reporting its cache failure");
+        assert!(
+            completed,
+            "the real actor must settle after reporting its cache failure"
+        );
         closed.unwrap();
         let updates = receiver.try_iter().collect::<Vec<_>>();
-        let finished = updates.iter().filter_map(|update| match update {
-            Update::Execution { run: actual, update: crate::agent_execution::Update::Finished { state, result } } if *actual == run => Some((state, result)),
-            _ => None,
-        }).collect::<Vec<_>>();
-        assert_eq!(finished.len(), 1, "the cache failure cannot synthesize a second terminal outcome: {updates:?}");
+        let finished = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::Execution {
+                    run: actual,
+                    update: crate::agent_execution::Update::Finished { state, result },
+                } if *actual == run => Some((state, result)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            finished.len(),
+            1,
+            "the cache failure cannot synthesize a second terminal outcome: {updates:?}"
+        );
         assert_eq!(*finished[0].0, crate::agent_execution::State::Succeeded);
         assert_eq!(finished[0].1.text, "Exact final response");
-        let evidence = updates.iter().filter_map(|update| match update { Update::AttentionContext { evidence, content } => Some((evidence, content)), _ => None }).collect::<Vec<_>>();
-        assert_eq!(evidence.len(), 1, "known success must not be replaced by a cache-error failure alert");
+        let evidence = updates
+            .iter()
+            .filter_map(|update| match update {
+                Update::AttentionContext { evidence, content } => Some((evidence, content)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            evidence.len(),
+            1,
+            "known success must not be replaced by a cache-error failure alert"
+        );
         assert_eq!(evidence[0].0.kind, crate::notifications::Kind::Succeeded);
-        assert_eq!(evidence[0].1.as_ref().unwrap().preview, "Exact final response");
-        assert!(handle.failure().is_some(), "the transcript I/O failure remains visible independently of provider success");
+        assert_eq!(
+            evidence[0].1.as_ref().unwrap().preview,
+            "Exact final response"
+        );
+        assert!(
+            handle.failure().is_some(),
+            "the transcript I/O failure remains visible independently of provider success"
+        );
     }
 
     #[test]

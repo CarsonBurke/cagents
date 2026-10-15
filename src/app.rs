@@ -4058,7 +4058,10 @@ pub enum Message {
     },
     Sidebar(SidebarAction),
     FocusCard(CardId),
-    AcknowledgeVisiblePane { card: CardId, epoch: u64 },
+    AcknowledgeVisiblePane {
+        card: CardId,
+        epoch: u64,
+    },
     TerminalReviewMode {
         card: CardId,
         terminal: crate::model::TerminalId,
@@ -7307,7 +7310,8 @@ impl Cagents {
     }
 
     fn focus_attention_card(&mut self, id: CardId) -> Task<Message> {
-        if self.exit.is_some() || self.workspace_inputs_blocked()
+        if self.exit.is_some()
+            || self.workspace_inputs_blocked()
             || self.focused_repository_is_saving()
             || self.update_prepared
         {
@@ -7353,16 +7357,21 @@ impl Cagents {
     }
 
     fn mark_cards_read(&mut self, cards: Vec<CardId>) -> Task<Message> {
-        let tasks: Vec<_> = cards.into_iter().map(|card| {
-            self.sidebar_state.acknowledge_agent_update(card);
-            self.acknowledge_card_notices(card);
-            if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
-                && let Err(error) = handle.acknowledge_updates()
-            {
-                self.status = Some(TransientNotice::error(format!("Could not acknowledge terminal output: {error}")));
-            }
-            self.acknowledge_chat_updates(card)
-        }).collect();
+        let tasks: Vec<_> = cards
+            .into_iter()
+            .map(|card| {
+                self.sidebar_state.acknowledge_agent_update(card);
+                self.acknowledge_card_notices(card);
+                if let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card)
+                    && let Err(error) = handle.acknowledge_updates()
+                {
+                    self.status = Some(TransientNotice::error(format!(
+                        "Could not acknowledge terminal output: {error}"
+                    )));
+                }
+                self.acknowledge_chat_updates(card)
+            })
+            .collect();
         self.refresh_sidebar_channels();
         Task::batch(tasks)
     }
@@ -7390,7 +7399,9 @@ impl Cagents {
                 "Could not acknowledge terminal output: {error}"
             )));
         }
-        if acknowledge_notices { self.acknowledge_card_notices(card); }
+        if acknowledge_notices {
+            self.acknowledge_card_notices(card);
+        }
         self.acknowledge_chat_updates(card)
     }
 
@@ -8157,7 +8168,9 @@ impl Cagents {
         }
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
-        if focus_changed { tasks.push(self.acknowledge_active_pane()); }
+        if focus_changed {
+            tasks.push(self.acknowledge_active_pane());
+        }
         if self.chrome_ui.tabs_focus != focused {
             self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
@@ -11344,8 +11357,11 @@ impl Cagents {
 
     fn sidebar_navigation_action(&self, row: sidebar::SelectionRow) -> Option<SidebarAction> {
         match row {
-            sidebar::SelectionRow::Project(id) => self.sidebar_model.project(id)
-                .and_then(|project| sidebar::project_primary_action(project, self.sidebar_state.filter())),
+            sidebar::SelectionRow::Project(id) => {
+                self.sidebar_model.project(id).and_then(|project| {
+                    sidebar::project_primary_action(project, self.sidebar_state.filter())
+                })
+            }
             sidebar::SelectionRow::Channel(channel_id) => {
                 Some(SidebarAction::OpenChannel { channel_id })
             }
@@ -13199,11 +13215,13 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
-        let attention_scope_changed = matches!(&message,
+        let attention_scope_changed = matches!(
+            &message,
             Message::RepositoryLoaded { result: Ok(_), .. }
-            | Message::DeviceProjectLoaded { result: Ok(_), .. }
-            | Message::AttachedWorktreePrsResolved { .. }
-            | Message::GitUi(_));
+                | Message::DeviceProjectLoaded { result: Ok(_), .. }
+                | Message::AttachedWorktreePrsResolved { .. }
+                | Message::GitUi(_)
+        );
         // Preserve the existing dispatch layout while every return converges
         // through the lightweight visibility/presence postlude below.
         #[rustfmt::skip]
@@ -16572,7 +16590,9 @@ impl Application for Cagents {
             terminal_probes,
         ])
             })();
-        if attention_scope_changed { self.notification_ui.scope_changed(); }
+        if attention_scope_changed {
+            self.notification_ui.scope_changed();
+        }
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();

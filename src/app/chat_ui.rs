@@ -7323,7 +7323,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7418,7 +7419,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -11151,14 +11153,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11177,7 +11184,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);
@@ -15497,32 +15507,50 @@ mod tests {
         let target = chat_runtime(&app, card).target;
         let source = chat_runtime(&app, card).session.clone();
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
-        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("chat fixture"); };
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("chat fixture");
+        };
         runtime.selected_subagent = Some("currently-viewed-child".into());
         let id = uuid::Uuid::new_v4();
-        drop(app.update(Message::NotificationUi(crate::app::notification_ui::Action::Snapshot(
-            crate::notifications::Snapshot {
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Snapshot(crate::notifications::Snapshot {
                 notices: vec![crate::notifications::Notice {
-                    id, event: crate::notifications::Event {
-                        content: None, target: crate::notifications::Target::Session(source.id),
-                        source_session: Some(source.id), provider: Some(source.launch.provider),
-                        directory: Some(source.launch.recipe.working_directory.clone()), destination: None,
-                        evidence: crate::notifications::Evidence { key: "parent-result-with-child-visible".into(), kind: crate::notifications::Kind::Succeeded },
-                    }, delivered: true, acknowledged: false, window: None,
-                }], diagnostic: None,
-            },
-        ))));
+                    id,
+                    event: crate::notifications::Event {
+                        content: None,
+                        target: crate::notifications::Target::Session(source.id),
+                        source_session: Some(source.id),
+                        provider: Some(source.launch.provider),
+                        directory: Some(source.launch.recipe.working_directory.clone()),
+                        destination: None,
+                        evidence: crate::notifications::Evidence {
+                            key: "parent-result-with-child-visible".into(),
+                            kind: crate::notifications::Kind::Succeeded,
+                        },
+                    },
+                    delivered: true,
+                    acknowledged: false,
+                    window: None,
+                }],
+                diagnostic: None,
+            }),
+        )));
         assert!(app.sidebar_state.has_card_update(card));
         assert!(!app.notification_ui.acknowledged_for_test(id));
-        drop(app.update(Message::NotificationUi(crate::app::notification_ui::Action::Activated(
-            crate::notifications::Target::Session(source.id),
-        ))));
+        drop(app.update(Message::NotificationUi(
+            crate::app::notification_ui::Action::Activated(crate::notifications::Target::Session(
+                source.id,
+            )),
+        )));
         assert!(chat_runtime(&app, card).parent_transcript_selected());
         assert!(!app.sidebar_state.has_card_update(card));
         assert!(app.notification_ui.acknowledged_for_test(id));
         assert_eq!(chat_runtime(&app, card).target, target);
         assert_eq!(chat_runtime(&app, card).session, source);
-        assert!(Arc::ptr_eq(chat_runtime(&app, card).handle().unwrap(), &handle));
+        assert!(Arc::ptr_eq(
+            chat_runtime(&app, card).handle().unwrap(),
+            &handle
+        ));
     }
 
     #[test]

@@ -8419,13 +8419,35 @@ mod tests {
 
     #[test]
     fn notification_label_survives_the_actual_send_step_event_order() {
-        let mut adapter = Claude { ready: true, ..Default::default() };
-        let mut step = adapter.send_prompt("Repair `config_file.rs`".into(), Vec::new(), PromptMode::Send).unwrap();
-        let user = step.events.iter().position(|event| matches!(event, Event::Item(item) if item.role == Role::User)).unwrap();
-        let started = step.events.iter().position(|event| matches!(event, Event::TurnStarted)).unwrap();
+        let mut adapter = Claude {
+            ready: true,
+            ..Default::default()
+        };
+        let mut step = adapter
+            .send_prompt(
+                "Repair `config_file.rs`".into(),
+                Vec::new(),
+                PromptMode::Send,
+            )
+            .unwrap();
+        let user = step
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::Item(item) if item.role == Role::User))
+            .unwrap();
+        let started = step
+            .events
+            .iter()
+            .position(|event| matches!(event, Event::TurnStarted))
+            .unwrap();
         assert!(user < started, "exercise the real command-step ordering");
-        step.events.push(Event::TurnFinished { key: Some("fixture-turn".into()), outcome: crate::notifications::Kind::Succeeded });
-        let contexts = crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default()).project(&step.events);
+        step.events.push(Event::TurnFinished {
+            key: Some("fixture-turn".into()),
+            outcome: crate::notifications::Kind::Succeeded,
+        });
+        let contexts =
+            crate::chat::notification::FrameContext::capture(&crate::chat::Snapshot::default())
+                .project(&step.events);
         assert_eq!(contexts.len(), 1);
         assert_eq!(contexts[0].conversation, "Repair config_file.rs");
     }
@@ -8433,27 +8455,41 @@ mod tests {
     #[test]
     fn notification_without_provider_title_uses_its_current_message_label() {
         let receipts = crate::chat::runtime::notification_frames_for_test(
-            Box::new(Claude { busy: true, ready: true, ..Default::default() }),
+            Box::new(Claude {
+                busy: true,
+                ready: true,
+                ..Default::default()
+            }),
             vec![
                 json!({"type":"user","uuid":"notification-topic-user","session_id":"44444444-4444-4444-8444-444444444444",
                     "message":{"role":"user","content":[{"type":"text","text":"Repair `config_file.rs`"}]}}),
                 json!({"type":"assistant","uuid":"notification-topic-answer","session_id":"44444444-4444-4444-8444-444444444444",
                     "message":{"role":"assistant","content":[{"type":"text","text":"The configuration is ready to review."}]}}),
                 json!({"type":"result","uuid":"notification-topic-result","session_id":"44444444-4444-4444-8444-444444444444","is_error":false}),
-            ], false,
+            ],
+            false,
         );
         let (evidence, content) = receipts.last().expect("real actor publishes completion");
         assert_eq!(evidence.kind, crate::notifications::Kind::Succeeded);
         assert_eq!(content.conversation, "Repair config_file.rs");
         assert_eq!(content.preview, "The configuration is ready to review.");
         let mut event = crate::notifications::Event::session(
-            crate::model::TerminalId::new(), crate::agent::Provider::Claude,
-            "/project".into(), evidence.clone(),
+            crate::model::TerminalId::new(),
+            crate::agent::Provider::Claude,
+            "/project".into(),
+            evidence.clone(),
         );
         event.content = Some(content.clone());
         event.validate().unwrap();
-        assert_eq!(crate::notifications::presentation::message(&event, true).title, "Repair config_file.rs");
-        assert!(!crate::notifications::presentation::message(&event, false).title.contains("config_file"));
+        assert_eq!(
+            crate::notifications::presentation::message(&event, true).title,
+            "Repair config_file.rs"
+        );
+        assert!(
+            !crate::notifications::presentation::message(&event, false)
+                .title
+                .contains("config_file")
+        );
     }
 
     #[test]

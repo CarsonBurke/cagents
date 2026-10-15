@@ -14,7 +14,10 @@ use std::{
 pub enum Action {
     Snapshot(Snapshot),
     Activated(Target),
-    SessionActivationExpired { session: TerminalId, generation: u64 },
+    SessionActivationExpired {
+        session: TerminalId,
+        generation: u64,
+    },
     InboxResolved {
         lineage: crate::agent_execution::Lineage,
         operation: uuid::Uuid,
@@ -31,7 +34,6 @@ struct ManagedActivation {
     display: crate::workspace_model::views::ManagedDisplay,
     session: crate::agent_execution::HostedSession,
 }
-
 
 #[derive(Default)]
 struct Pending {
@@ -463,7 +465,8 @@ impl Cagents {
         if matches!(&action, Action::Activated(_)) {
             self.notification_ui.session_activation = None;
             self.notification_ui.activation_attempt = None;
-            self.notification_ui.activation_generation = self.notification_ui.activation_generation.wrapping_add(1);
+            self.notification_ui.activation_generation =
+                self.notification_ui.activation_generation.wrapping_add(1);
         }
         match action {
             Action::Snapshot(snapshot) => {
@@ -680,7 +683,8 @@ impl Cagents {
         let Some(session) = self.notification_ui.session_activation else {
             return Task::none();
         };
-        let blocked = self.exit.is_some() || self.workspace_inputs_blocked()
+        let blocked = self.exit.is_some()
+            || self.workspace_inputs_blocked()
             || self.focused_repository_is_saving()
             || self.update_prepared;
         if self
@@ -983,37 +987,69 @@ mod tests {
         app.settings.notifications.message_previews = true;
         let first = app.durable.cards[0].clone();
         let second = crate::app::tests::terminal_card_state();
-        let sessions = [card_session(&first).unwrap(), card_session(&second).unwrap()];
+        let sessions = [
+            card_session(&first).unwrap(),
+            card_session(&second).unwrap(),
+        ];
         let project = ProjectId::new();
         let channel = ChannelId::new();
         app.sidebar_model.projects.push(SidebarProject::new(
-            project, RepositoryId::new(), "Fixture".into(), "/repo".into(),
-            Vec::new(), Vec::new(),
+            project,
+            RepositoryId::new(),
+            "Fixture".into(),
+            "/repo".into(),
+            Vec::new(),
+            Vec::new(),
         ));
         let durable = Arc::make_mut(&mut app.durable);
         durable.cards.push(second.clone());
         durable.channels.push(ProjectChannel {
-            title_source: Default::default(), id: channel, project_id: project,
-            title: "Shared channel".into(), ordinal: 0, shared: false,
-            cards: vec![first.id, second.id], focused: Some(first.id),
+            title_source: Default::default(),
+            id: channel,
+            project_id: project,
+            title: "Shared channel".into(),
+            ordinal: 0,
+            shared: false,
+            cards: vec![first.id, second.id],
+            focused: Some(first.id),
         });
-        let notices = sessions.into_iter().zip(["First unread result", "Second unread result"])
+        let notices = sessions
+            .into_iter()
+            .zip(["First unread result", "Second unread result"])
             .map(|(session, text)| {
                 let mut event = crate::notifications::Event::session(
-                    session, Provider::Codex, "/repo".into(),
-                    crate::notifications::Evidence { key: text.into(), kind: crate::notifications::Kind::Succeeded },
+                    session,
+                    Provider::Codex,
+                    "/repo".into(),
+                    crate::notifications::Evidence {
+                        key: text.into(),
+                        kind: crate::notifications::Kind::Succeeded,
+                    },
                 );
                 event.content = Some(crate::notifications::Content {
-                    conversation: "Fixture conversation".into(), preview: text.into(), request: None,
+                    conversation: "Fixture conversation".into(),
+                    preview: text.into(),
+                    request: None,
                 });
                 crate::notifications::Notice {
-                    id: uuid::Uuid::new_v4(), event, delivered: true,
-                    acknowledged: false, window: None,
+                    id: uuid::Uuid::new_v4(),
+                    event,
+                    delivered: true,
+                    acknowledged: false,
+                    window: None,
                 }
-            }).collect::<Vec<_>>();
-        let snapshot = Snapshot { notices, diagnostic: None };
+            })
+            .collect::<Vec<_>>();
+        let snapshot = Snapshot {
+            notices,
+            diagnostic: None,
+        };
         drop(app.update_notifications(Action::Snapshot(snapshot.clone())));
-        assert!(app.sidebar_model.projects[0].channels[0].tooltip_for_test().contains("First unread result"));
+        assert!(
+            app.sidebar_model.projects[0].channels[0]
+                .tooltip_for_test()
+                .contains("First unread result")
+        );
         drop(app.mark_cards_read(vec![first.id]));
         assert!(!app.sidebar_state.has_card_update(first.id));
         assert!(app.sidebar_state.has_card_update(second.id));
@@ -1318,11 +1354,26 @@ mod tests {
                 .acknowledged
                 .is_empty()
         );
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
-        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session));
-        assert!(!app.notification_ui.acknowledged_for_test(id), "return waits for qualified dwell");
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: app.attention_focus_epoch }));
-        assert_eq!(app.notification_ui.pending.lock().unwrap().acknowledged, BTreeSet::from([id]));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        assert_eq!(
+            app.notification_ui.focused_session_for_test(),
+            Some(session)
+        );
+        assert!(
+            !app.notification_ui.acknowledged_for_test(id),
+            "return waits for qualified dwell"
+        );
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
+        assert_eq!(
+            app.notification_ui.pending.lock().unwrap().acknowledged,
+            BTreeSet::from([id])
+        );
     }
 
     #[test]
@@ -1368,11 +1419,23 @@ mod tests {
             "notification snapshots must not withdraw an explicitly requested focused alert"
         );
 
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, false))));
-        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(window::Id::RESERVED, true))));
-        assert!(!app.notification_ui.acknowledged_for_test(id), "return waits for qualified dwell");
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            false,
+        ))));
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Focused(
+            window::Id::RESERVED,
+            true,
+        ))));
+        assert!(
+            !app.notification_ui.acknowledged_for_test(id),
+            "return waits for qualified dwell"
+        );
         let card = app.workspace.focused().unwrap();
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: app.attention_focus_epoch }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: app.attention_focus_epoch,
+        }));
         assert_eq!(
             app.notification_ui.pending.lock().unwrap().acknowledged,
             BTreeSet::from([id])
@@ -1406,7 +1469,7 @@ mod tests {
                 notices: vec![crate::notifications::Notice {
                     id,
                     event: crate::notifications::Event {
-                content: None,
+                        content: None,
                         target: Target::Session(session),
                         source_session: Some(session),
                         provider: Some(Provider::Claude),
@@ -1542,7 +1605,7 @@ mod tests {
             notices: vec![crate::notifications::Notice {
                 id,
                 event: crate::notifications::Event {
-                content: None,
+                    content: None,
                     target: crate::notifications::Target::Session(session),
                     source_session: Some(session),
                     provider: Some(Provider::Claude),
@@ -1612,27 +1675,45 @@ mod tests {
         app.core.set_main_window_id(Some(window));
         app.refresh_ui.focused = true;
         drop(app.update(Message::ExpireNotices(Instant::now())));
-        assert_eq!(app.notification_ui.focused_session_for_test(), Some(session.id));
+        assert_eq!(
+            app.notification_ui.focused_session_for_test(),
+            Some(session.id)
+        );
         drop(app.update(Message::WindowCloseRequested(window)));
-        assert!(app.exit.is_some(), "hold the real committed exit before reap completion");
+        assert!(
+            app.exit.is_some(),
+            "hold the real committed exit before reap completion"
+        );
         assert!(app.core.main_window_id().is_none());
-        assert!(app.refresh_ui.focused, "the stale native focus bit is the regression control");
+        assert!(
+            app.refresh_ui.focused,
+            "the stale native focus bit is the regression control"
+        );
         assert_eq!(app.notification_ui.focused_session_for_test(), None);
         let id = uuid::Uuid::new_v4();
-        drop(app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
-            notices: vec![crate::notifications::Notice {
-                id,
-                event: crate::notifications::Event {
-                    content: None, target: Target::Session(session.id),
-                    source_session: Some(session.id), provider: Some(Provider::Claude),
-                    directory: Some("/tmp".into()), destination: None,
-                    evidence: crate::notifications::Evidence {
-                        key: "waiting-during-exit-reap".into(),
-                        kind: crate::notifications::Kind::Waiting,
+        drop(
+            app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+                notices: vec![crate::notifications::Notice {
+                    id,
+                    event: crate::notifications::Event {
+                        content: None,
+                        target: Target::Session(session.id),
+                        source_session: Some(session.id),
+                        provider: Some(Provider::Claude),
+                        directory: Some("/tmp".into()),
+                        destination: None,
+                        evidence: crate::notifications::Evidence {
+                            key: "waiting-during-exit-reap".into(),
+                            kind: crate::notifications::Kind::Waiting,
+                        },
                     },
-                }, delivered: true, acknowledged: false, window: None,
-            }], diagnostic: None,
-        }))));
+                    delivered: true,
+                    acknowledged: false,
+                    window: None,
+                }],
+                diagnostic: None,
+            }))),
+        );
         assert_eq!(app.notification_ui.focused_session_for_test(), None);
         assert!(!app.notification_ui.acknowledged_for_test(id));
         assert!(app.sidebar_state.has_card_update(card));
@@ -1649,36 +1730,47 @@ mod tests {
         app.refresh_ui.focused = true;
         app.settings.notifications.while_focused = true;
         drop(app.update(Message::ExpireNotices(Instant::now())));
-        assert_eq!(app.notification_ui.focused_session_for_test(), Some(terminal.id));
+        assert_eq!(
+            app.notification_ui.focused_session_for_test(),
+            Some(terminal.id)
+        );
         let original_epoch = app.attention_focus_epoch;
         // This is a real close blocker retained outside the parent surface.
         app.automation_ui.update(crate::automation_ui::Action::New);
-        app.automation_ui.update(crate::automation_ui::Action::Field(
-            crate::automation_ui::Field::Name, "Keep this unsaved draft".into(),
-        ));
+        app.automation_ui
+            .update(crate::automation_ui::Action::Field(
+                crate::automation_ui::Field::Name,
+                "Keep this unsaved draft".into(),
+            ));
         drop(app.update(Message::WindowCloseRequested(window)));
         assert_eq!(app.transient_work_close, Some(window));
         assert!(app.modal_is_open());
         assert_eq!(app.notification_ui.focused_session_for_test(), None);
         assert_ne!(app.attention_focus_epoch, original_epoch);
         let id = uuid::Uuid::new_v4();
-        drop(app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
-            notices: vec![crate::notifications::Notice {
-                id,
-                event: crate::notifications::Event {
-                    content: None,
-                    target: Target::Session(terminal.id),
-                    source_session: Some(terminal.id),
-                    provider: Some(Provider::Claude),
-                    directory: Some("/tmp".into()), destination: None,
-                    evidence: crate::notifications::Evidence {
-                        key: "waiting-behind-actual-close-dialog".into(),
-                        kind: crate::notifications::Kind::Waiting,
+        drop(
+            app.update(Message::NotificationUi(Action::Snapshot(Snapshot {
+                notices: vec![crate::notifications::Notice {
+                    id,
+                    event: crate::notifications::Event {
+                        content: None,
+                        target: Target::Session(terminal.id),
+                        source_session: Some(terminal.id),
+                        provider: Some(Provider::Claude),
+                        directory: Some("/tmp".into()),
+                        destination: None,
+                        evidence: crate::notifications::Evidence {
+                            key: "waiting-behind-actual-close-dialog".into(),
+                            kind: crate::notifications::Kind::Waiting,
+                        },
                     },
-                },
-                delivered: true, acknowledged: false, window: None,
-            }], diagnostic: None,
-        }))));
+                    delivered: true,
+                    acknowledged: false,
+                    window: None,
+                }],
+                diagnostic: None,
+            }))),
+        );
         assert!(app.sidebar_state.has_card_update(card));
         assert!(!app.notification_ui.acknowledged_for_test(id));
         let escape = app.update(Message::KeyEvent {
@@ -1687,37 +1779,62 @@ mod tests {
                 modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
                 physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
-            }, captured: false,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured: false,
         });
         // Drive only the actual Escape dismissal message. A newly scheduled
         // dwell remains a separate fenced message, not blanket task draining.
         if app.transient_work_close.is_some() {
-            let cancellations = tokio::runtime::Builder::new_current_thread().enable_all()
-                .build().unwrap().block_on(async {
-                    let Some(mut stream) = cosmic::iced::runtime::task::into_stream(escape) else { return 0; };
+            let cancellations = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let Some(mut stream) = cosmic::iced::runtime::task::into_stream(escape) else {
+                        return 0;
+                    };
                     let mut cancellations = 0;
                     while let Some(action) = stream.next().await {
-                        if matches!(action, iced::runtime::Action::Output(cosmic::Action::App(Message::CancelTransientWorkClose))) {
+                        if matches!(
+                            action,
+                            iced::runtime::Action::Output(cosmic::Action::App(
+                                Message::CancelTransientWorkClose
+                            ))
+                        ) {
                             cancellations += 1;
                         }
                     }
                     cancellations
                 });
-            assert_eq!(cancellations, 1, "Escape must route the original close cancellation");
+            assert_eq!(
+                cancellations, 1,
+                "Escape must route the original close cancellation"
+            );
             drop(app.update(Message::CancelTransientWorkClose));
         } else {
             drop(escape);
         }
         assert!(app.transient_work_close.is_none());
         assert!(app.automation_ui.draft_dirty());
-        assert_eq!(app.notification_ui.focused_session_for_test(), Some(terminal.id));
+        assert_eq!(
+            app.notification_ui.focused_session_for_test(),
+            Some(terminal.id)
+        );
         let current_epoch = app.attention_focus_epoch;
         assert_ne!(current_epoch, original_epoch);
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: original_epoch }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: original_epoch,
+        }));
         assert!(app.sidebar_state.has_card_update(card));
         assert!(!app.notification_ui.acknowledged_for_test(id));
-        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: current_epoch }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: current_epoch,
+        }));
         assert!(!app.sidebar_state.has_card_update(card));
         assert!(app.notification_ui.acknowledged_for_test(id));
     }

@@ -797,7 +797,8 @@ impl Cagents {
         session: crate::agent_execution::HostedSession,
     ) -> Option<Task<Message>> {
         let placement = &display.scope;
-        if !session.has_complete_proof() || agent.closed
+        if !session.has_complete_proof()
+            || agent.closed
             || matches!(placement, crate::agent_execution::Placement::Channel(channel) if self.channel_ui.is_deleting(*channel) || self.channel_ui.was_deleted(*channel))
         {
             return None;
@@ -1929,7 +1930,9 @@ mod tests {
     fn attention_unpublished_managed_adoption_requires_complete_source_proof() {
         let (mut app, mut agent, _, _) = managed_display_fixture();
         app.workspace_model.views.clear();
-        let crate::agent_execution::HostedSession::Terminal(source) = agent.session.as_mut().unwrap() else {
+        let crate::agent_execution::HostedSession::Terminal(source) =
+            agent.session.as_mut().unwrap()
+        else {
             panic!("terminal fixture");
         };
         source.continuity = Default::default();
@@ -1940,7 +1943,10 @@ mod tests {
         assert!(app.adopt_execution_agent(&agent).is_none());
         assert!(Arc::ptr_eq(&original, &app.durable));
         assert_eq!(app.cards.len(), count);
-        assert!(app.card_state(CardId::from_uuid(agent.id.as_uuid())).is_none());
+        assert!(
+            app.card_state(CardId::from_uuid(agent.id.as_uuid()))
+                .is_none()
+        );
     }
 
     #[test]
