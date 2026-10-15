@@ -7429,7 +7429,23 @@ mod tests {
         app.settings.editor_tab_width = 8;
         let task = app.add(Opened { root: directory.path().into(), file: Some("empty.rs".into()), snapshot: None }, true);
         let card = app.active.unwrap();
+        let completion = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+            use cosmic::iced::futures::StreamExt;
+            let mut pending = vec![task];
+            while let Some(task) = pending.pop() {
+                if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+                    while let Some(action) = stream.next().await {
+                        if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                            if matches!(&message, Message::Repository(RepositoryAction::ConfiguredFileLoaded { .. })) { return message; }
+                            pending.push(app.update(message));
+                        }
+                    }
+                }
+            }
+            panic!("actual configured file worker completion");
+        });
         app.settings_open = true;
+        let task = app.update(completion);
         run_tasks(&mut app, task);
         assert_eq!(app.tab(card).unwrap().runtime.editor_text().as_deref(), Some(""));
         assert_eq!(app.tab(card).unwrap().runtime.editor_formatting_options(), (8, true));
