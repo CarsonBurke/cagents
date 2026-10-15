@@ -467,6 +467,35 @@ mod authority_tests {
     }
 
     #[test]
+    fn captured_authority_diff_keeps_original_filesystem_side_after_index_read() {
+        struct ReplaceAfterIndex { root: PathBuf, parked: PathBuf }
+        impl ProcessExecutor for ReplaceAfterIndex {
+            fn execute(&self, command: &CommandSpec, cancel: &CancellationToken) -> Result<ProcessOutput, ProcessFailure> {
+                let output = SystemProcessExecutor.execute(&isolated_spec(command.clone()), cancel)?;
+                if command.arguments.iter().any(|arg| arg == "ls-files") {
+                    std::fs::rename(&self.root, &self.parked).unwrap();
+                    std::fs::create_dir(&self.root).unwrap();
+                    actual_git(&self.root, &["init", "-b", "main"]);
+                    std::fs::write(self.root.join("file"), "foreign work\n").unwrap();
+                }
+                Ok(output)
+            }
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("worktree");
+        let parked = directory.path().join("original");
+        std::fs::create_dir(&root).unwrap();
+        actual_git(&root, &["init", "-b", "main"]);
+        std::fs::write(root.join("file"), "original work\n").unwrap();
+        let service = RepositoryService::new("git", Arc::new(ReplaceAfterIndex { root: root.clone(), parked: parked.clone() }))
+            .with_worktree_authority(WorktreeAuthority::capture(&root).unwrap()).unwrap();
+        let content = service.diff(&DiffRequest { worktree: root.clone(), path: RepoPath::parse("file").unwrap(), old_path: None, basis: DiffBasis::IndexToWorktree }, &CancellationToken::default()).unwrap();
+        assert!(matches!(content, DiffContent::Comparison { old: DiffSide::Absent, new: DiffSide::Text { ref text, .. }, .. } if text == "original work\n"));
+        assert_eq!(std::fs::read(root.join("file")).unwrap(), b"foreign work\n");
+        assert_eq!(std::fs::read(parked.join("file")).unwrap(), b"original work\n");
+    }
+
+    #[test]
     fn captured_authority_refuses_private_or_common_metadata_replacement_before_git() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("worktree");
