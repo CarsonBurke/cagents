@@ -22,6 +22,7 @@ use std::{
 };
 mod execution;
 mod native_reconcile;
+mod worker_join;
 mod store;
 mod websocket;
 use store::Store;
@@ -170,6 +171,8 @@ struct Inner {
     draining: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
+    worker_joining:AtomicBool,
+    worker_join_failed:AtomicBool,
     store: Arc<Mutex<Store>>,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
@@ -377,6 +380,8 @@ impl Handle {
             draining: draining.clone(),
             failure: failure.clone(),
             worker: Mutex::new(None),
+            worker_joining:AtomicBool::new(false),
+            worker_join_failed:AtomicBool::new(false),
             store: store.clone(),
             notify: notify.clone(),
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
@@ -1188,33 +1193,26 @@ impl Handle {
 
     fn join_worker_until(&self,deadline:Instant)->Result<(),String> {
         loop {
-            let joined=match self.0.worker.try_lock() {
-                Ok(mut worker)=>match worker.as_ref() {
-                    Some(current) if !current.is_finished()=>None,
-                    _=>Some(worker.take().map(|worker|worker.join())),
-                },
-                Err(std::sync::TryLockError::Poisoned(poisoned))=> {
-                    let mut worker=poisoned.into_inner();
-                    match worker.as_ref() {
-                        Some(current) if !current.is_finished()=>None,
-                        _=>Some(worker.take().map(|worker|worker.join())),
+            if !self.0.worker_joining.load(Ordering::Acquire) {
+                let ready=match self.0.worker.try_lock() {
+                    Ok(mut worker)=> {
+                        if self.0.worker_joining.load(Ordering::Acquire) {false}
+                        else if worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {worker_join::request(self,&mut worker)?;false}
+                        else {worker.is_none()}
                     }
-                }
-                Err(std::sync::TryLockError::WouldBlock)=>None,
-            };
-            match joined {
-                Some(Some(Err(_)))=> {
-                    let error="Native chat worker did not shut down cleanly; provider state is unconfirmed".to_owned();
-                    self.0.completed.store(false,Ordering::Release);
-                    match self.0.failure.try_lock() {
-                        Ok(mut failure)=>*failure=Some(error.clone()),
-                        Err(std::sync::TryLockError::Poisoned(poisoned))=>*poisoned.into_inner()=Some(error.clone()),
-                        Err(std::sync::TryLockError::WouldBlock)=> {},
+                    Err(std::sync::TryLockError::Poisoned(poisoned))=> {
+                        let mut worker=poisoned.into_inner();
+                        if self.0.worker_joining.load(Ordering::Acquire) {false}
+                        else if worker.as_ref().is_some_and(std::thread::JoinHandle::is_finished) {worker_join::request(self,&mut worker)?;false}
+                        else {worker.is_none()}
                     }
-                    return Err(error);
+                    Err(std::sync::TryLockError::WouldBlock)=>false,
+                };
+                if ready {
+                    return if self.0.worker_join_failed.load(Ordering::Acquire) {
+                        Err("Native chat worker did not shut down cleanly; provider state is unconfirmed".into())
+                    } else {Ok(())};
                 }
-                Some(_)=>return Ok(()),
-                None=> {}
             }
             let Some(remaining)=deadline.checked_duration_since(Instant::now()) else {
                 return Err("Native chat close is still pending; its exact provider cleanup owner is retained".into());
@@ -1233,8 +1231,8 @@ impl Handle {
             Err(std::sync::TryLockError::Poisoned(poisoned))=> {let _=poisoned.into_inner().write(&[1]);},
             Err(std::sync::TryLockError::WouldBlock)=> {},
         }
-        // Never hold a worker mutex while waiting for provider code. Only
-        // join after is_finished proves that its user cleanup has returned.
+        // is_finished may precede blocking TLS destruction. Actual joins run
+        // in a bounded owner service, never on this deadline-bearing caller.
         self.join_worker_until(deadline.unwrap_or_else(||Instant::now()+IO_TIMEOUT+super::TERMINATE_GRACE))?;
         if let Some(deadline)=deadline {return self.reconcile_native_until(deadline);}
         {
@@ -1420,11 +1418,10 @@ impl Drop for Inner {
             .unwrap_or_else(|p| p.into_inner())
             .take()
         {
-            if worker.is_finished() {
-                let _=worker.join();
-            } else {
-                tracing::warn!("Final chat handle dropped while its existing provider cleanup worker remains active; cleanup is unconfirmed");
-            }
+            // Dropping a JoinHandle detaches it. No last-handle destruction
+            // may join a TLS destructor, even if is_finished already says true.
+            drop(worker);
+            tracing::warn!("Final chat handle dropped without an OS-thread cleanup receipt; cleanup is unconfirmed");
         }
     }
 }
@@ -5824,20 +5821,55 @@ mod tests {
         assert!(!record.root.is_current(),"the later same close API must progress through exact native cleanup");
     }
 
+    fn worker_blocked_in_tls_destruction()->(JoinHandle<()>,crossbeam_channel::Sender<()>,crossbeam_channel::Receiver<()>) {
+        struct TlsCleanup {entered:crossbeam_channel::Sender<()>,release:crossbeam_channel::Receiver<()>,finished:crossbeam_channel::Sender<()>}
+        impl Drop for TlsCleanup {
+            fn drop(&mut self) {let _=self.entered.send(());let _=self.release.recv_timeout(Duration::from_secs(5));let _=self.finished.send(());}
+        }
+        thread_local! {static CLEANUP:std::cell::RefCell<Option<TlsCleanup>>=const {std::cell::RefCell::new(None)};}
+        let (entered,entered_cleanup)=crossbeam_channel::bounded(1);
+        let (release,released)=crossbeam_channel::bounded(1);
+        let (finished,finished_cleanup)=crossbeam_channel::bounded(1);
+        let worker=thread::spawn(move||CLEANUP.with(|cleanup|*cleanup.borrow_mut()=Some(TlsCleanup {entered,release:released,finished})));
+        entered_cleanup.recv_timeout(Duration::from_secs(1)).unwrap();
+        let deadline=Instant::now()+Duration::from_secs(1);
+        while !worker.is_finished() {assert!(Instant::now()<deadline,"fixture must reach the post-packet TLS destructor boundary");thread::yield_now();}
+        assert!(finished_cleanup.try_recv().is_err());
+        (worker,release,finished_cleanup)
+    }
+
     #[test]
-    fn final_handle_drop_does_not_wait_for_an_unfinished_cleanup_thread() {
+    fn bounded_close_does_not_join_a_latched_tls_destructor_on_its_caller() {
         let directory=tempfile::tempdir_in("/var/tmp").unwrap();
         let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
         let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
         let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
         handle.close().unwrap();
-        let (release,released)=crossbeam_channel::bounded(1);
-        let (finished,finished_worker)=crossbeam_channel::bounded(1);
-        *handle.0.worker.lock().unwrap()=Some(thread::spawn(move|| {let _=released.recv_timeout(Duration::from_secs(5));let _=finished.send(());}));
+        let (worker,release,finished)=worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap()=Some(worker);
+        let started=Instant::now();
+        assert!(handle.close_until(Instant::now()+Duration::from_millis(40)).is_err());
+        assert!(started.elapsed()<Duration::from_secs(1));
+        assert!(handle.0.worker_joining.load(Ordering::Acquire),"bounded owner service retains the actual unreturned OS thread");
+        assert!(finished.try_recv().is_err());
+        release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
+        handle.close_until(Instant::now()+Duration::from_secs(2)).unwrap();
+        assert!(!handle.0.worker_joining.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn final_handle_drop_does_not_join_even_after_finished_packet_precedes_tls_cleanup() {
+        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
+        let mut initial=Step::default();let store=preflight(&spec,&mut initial).unwrap();
+        let handle=Handle::start(spec,Box::new(Echo),initial,store,None,|_|{}).unwrap();
+        handle.close().unwrap();
+        let (worker,release,finished)=worker_blocked_in_tls_destruction();
+        *handle.0.worker.lock().unwrap()=Some(worker);
         let started=Instant::now();drop(handle);
-        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join arbitrary provider code");
-        assert!(finished_worker.try_recv().is_err(),"dropping a frontend handle is not proof that its cleanup thread finished");
-        release.send(()).unwrap();finished_worker.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(started.elapsed()<Duration::from_secs(1),"destruction must not join a TLS destructor even if is_finished returned true");
+        assert!(finished.try_recv().is_err(),"dropping the frontend is not proof that cleanup finished");
+        release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
