@@ -3360,6 +3360,14 @@ impl Runtime {
         documents: HashMap<String, Arc<find::External>>,
         complete: bool,
     ) {
+        // Sidecar completions may still serve expanded-file selection after
+        // Escape or an emptied query. They cannot reacquire independent Find
+        // body owners when there is no active search.
+        if self.find.as_ref().is_none_or(|query| query.is_empty()) {
+            self.find_external.clear();
+            self.find_external_complete = true;
+            return;
+        }
         let valid = documents
             .iter()
             .all(|(id, owner)| owner.item.as_ref() == id);
@@ -8309,7 +8317,11 @@ impl Cagents {
                     runtime.find_dirty = true;
                     runtime.find_debounce = true;
                     runtime.find_auto_reveal = true;
-                    runtime.update_find_paint();
+                    if runtime.find.as_ref().is_some_and(|query| query.is_empty()) {
+                        runtime.release_find_sources();
+                    } else {
+                        runtime.update_find_paint();
+                    }
                 }
             }
             Action::FindDebounced(target, generation) => {
@@ -12257,6 +12269,53 @@ mod tests {
             chat_runtime(&app, card).find_retained_source_bytes(),
             Some((0, 0))
         );
+        let late = Arc::new(find::External {
+            item: "patch-root".into(), revision: 99,
+            blocks: vec![find::Block {
+                identity: selection::logical_identity("patch-root", &[6, 5]),
+                text: Arc::from("needle from a late catalog completion"),
+            }].into(),
+        });
+        let late_body = Arc::downgrade(&late.blocks[0].text);
+        app.chat_runtime_mut(target).unwrap().set_find_external(
+            HashMap::from([("patch-root".into(), late)]), true);
+        assert!(chat_runtime(&app, card).find.is_none());
+        assert!(chat_runtime(&app, card).find_external.is_empty());
+        assert!(late_body.upgrade().is_none(), "closed search rejects late body ownership");
+
+        drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
+        let document = Arc::new(find::External {
+            item: "patch-root".into(), revision: 100,
+            blocks: vec![find::Block {
+                identity: selection::logical_identity("patch-root", &[6, 5]),
+                text: Arc::from("needle before clearing the query"),
+            }].into(),
+        });
+        let clear_body = Arc::downgrade(&document.blocks[0].text);
+        app.chat_runtime_mut(target).unwrap().set_find_external(
+            HashMap::from([("patch-root".into(), document)]), true);
+        complete_find_for_test(&mut app, target);
+        let origin = chat_runtime(&app, card).find_origin.unwrap().from_top();
+        assert!(chat_runtime(&app, card).find_retained_source_bytes().unwrap().0 > 0);
+        drop(app.handle_chat_ui(Action::Find(target, String::new())));
+        assert_eq!(chat_runtime(&app, card).find.as_deref(), Some(""));
+        assert_eq!(chat_runtime(&app, card).find_origin.unwrap().from_top(), origin);
+        assert!(clear_body.upgrade().is_none(), "empty query retires indexed body owners");
+        assert_eq!(chat_runtime(&app, card).find_retained_source_bytes(), Some((0, 0)));
+        let late = Arc::new(find::External {
+            item: "patch-root".into(), revision: 101,
+            blocks: vec![find::Block {
+                identity: selection::logical_identity("patch-root", &[6, 5]),
+                text: Arc::from("needle arriving after query was cleared"),
+            }].into(),
+        });
+        let late_body = Arc::downgrade(&late.blocks[0].text);
+        app.chat_runtime_mut(target).unwrap().set_find_external(
+            HashMap::from([("patch-root".into(), late)]), false);
+        assert!(late_body.upgrade().is_none(), "empty search rejects late body ownership");
+        assert!(!chat_runtime(&app, card).find_dirty);
+        assert_eq!(chat_runtime(&app, card).find_result_label(), "0 matches");
+
         drop(app.handle_chat_ui(Action::Find(target, "needle".into())));
         let document = Arc::new(find::External {
             item: "patch-root".into(),
