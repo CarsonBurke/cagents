@@ -1229,11 +1229,17 @@ mod tests {
         let _guard = diagnostic_test_guard();
         wait_capacity(0);
         let job = request(Duration::from_secs(1), false, true);
+        let metadata_only_permits = lane().bytes.available_permits();
+        assert_eq!(metadata_only_permits, CAPACITY_LIMIT / UNIT - 1);
         job.cancel();
         assert!(runtime().block_on(job.admit()).is_err());
         let worker = worker();
         assert!(allocate_bytes(provider_exit::MAX_OUTPUT_BYTES, &job, &worker).is_err());
         assert_eq!(lane().owned_capacity.load(Ordering::Acquire), 0);
+        assert_eq!(lane().bytes.available_permits(), metadata_only_permits);
+        drop(worker);
+        drop(job);
+        wait_capacity(0);
         assert_eq!(lane().bytes.available_permits(), CAPACITY_LIMIT / UNIT);
     }
     #[test]
