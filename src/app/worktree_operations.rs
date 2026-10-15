@@ -201,7 +201,7 @@ impl Cagents {
                 created_worktree: None,
                 state: None,
                 draft,
-                setup_intent: None,
+                setup_intent: request.setup_intent.clone(),
             },
         );
         self.sync_worktree_operation_rows();
@@ -221,10 +221,6 @@ impl Cagents {
             }
         })
     }
-    pub(super) fn set_worktree_setup_intent(&mut self, id: OperationId, intent: super::worktree_setup_ui::SetupIntent) {
-        if let Some(operation) = self.worktree_operations.get_mut(&id) { operation.setup_intent = Some(intent); }
-    }
-
     pub(super) fn worktree_progress(&mut self, event: WorktreeProgressEvent) -> Task<Message> {
         let Some(operation) = self.worktree_operations.get_mut(&event.operation_id) else {
             return Task::none();
@@ -260,6 +256,7 @@ impl Cagents {
     /// Its row waits for the checkout to list the worktree, which it never
     /// will again.
     pub(super) fn forget_worktree_creation(&mut self, path: &Path) {
+        self.forget_worktree_setup(path);
         self.worktree_operations.retain(|_, operation| {
             !(operation.finished
                 && operation
@@ -321,6 +318,7 @@ impl Cagents {
                 };
                 operation.state = Some(report.state);
                 operation.detail = report.detail;
+                if let Some(request) = report.request { operation.setup_intent = request.setup_intent.clone(); operation.request = Some(request); }
                 // Git may have created the checkout while ticket linking still
                 // needs reconciliation. Keep the actionable operation row and
                 // defer setup/agent startup until the complete contract settles.
@@ -332,7 +330,7 @@ impl Cagents {
                 None
             }
         };
-        let setup_intent = operation.setup_intent.take();
+        let setup_intent = outcome.as_ref().and_then(|_| operation.setup_intent.take());
         self.sync_worktree_operation_rows();
         if let (Some(repository), Some(outcome @ WorktreeCreationOutcome::Created { .. })) =
             (repository, outcome)
@@ -392,6 +390,10 @@ impl Cagents {
                         )));
                         continue;
                     };
+                    let setup_intent = report.request.as_ref().and_then(|request| request.setup_intent.clone());
+                    if report.state == WorktreeOperationState::Created
+                        && let (Some(intent), Some(WorktreeCreationOutcome::Created { worktree, .. })) = (setup_intent.clone(), &report.outcome)
+                    { self.recover_worktree_setup(report.operation_id, worktree.path.clone(), intent); }
                     self.worktree_operations.insert(
                         report.operation_id,
                         ActiveWorktreeOperation {
@@ -416,7 +418,7 @@ impl Cagents {
                             detail: report.detail,
                             state: Some(report.state),
                             draft: None,
-                            setup_intent: None,
+                            setup_intent,
                         },
                     );
                 }
@@ -499,7 +501,9 @@ mod tests {
             let id = OperationId::new();
             let project = ProjectId::new();
             let destination = PathBuf::from("/repo/worktrees/eng-123");
+            let intent = super::super::worktree_setup_ui::SetupIntent { skip: true, run_id: Some(id), ..Default::default() };
             let request = CreateWorktreeRequest {
+                setup_intent: Some(intent.clone()),
                 linear_issue: Some(crate::linear::context::LinkedIssue { issue_id: "ENG-123".into(), workspace: None }),
                 repository: "/repo".into(), managed_root: "/repo/worktrees".into(), destination: destination.clone(),
                 branch: crate::repository::ValidatedBranchName::parse("eng-123").unwrap(),
@@ -527,7 +531,38 @@ mod tests {
             assert_eq!(app.worktree_operations[&id].state, Some(state));
             if state == WorktreeOperationState::ReconcileRequired {
                 assert_eq!(app.worktree_operations[&id].row(&[]).unwrap().0, WorktreeOperationPhase::Failed);
+                assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
             }
+        }
+    }
+
+    #[test]
+    fn restored_creation_keeps_setup_intent_without_starting_effects() {
+        for state in [WorktreeOperationState::Created, WorktreeOperationState::ReconcileRequired] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let project = ProjectId::new();
+            let repository = PathBuf::from("/repo");
+            let path = repository.join("worktrees/recovered");
+            let id = OperationId::new();
+            app.sidebar_model.projects.push(SidebarProject::new(project, RepositoryId::new(), "repo".into(), repository.clone(), vec![], vec![]));
+            let intent = super::super::worktree_setup_ui::SetupIntent { primary: Some(repository.clone()), run_id: Some(id), ..Default::default() };
+            let request = CreateWorktreeRequest {
+                setup_intent: Some(intent.clone()), linear_issue: None, repository,
+                managed_root: "/repo/worktrees".into(), destination: path.clone(),
+                branch: crate::repository::ValidatedBranchName::parse("recovered").unwrap(),
+                base: crate::repository::BaseRevision::object_id("a".repeat(40)).unwrap(), track: false, operation_id: id,
+            };
+            let report = WorktreeOperationReport { operation_id: id, generation: 1, request: Some(request), state,
+                outcome: Some(WorktreeCreationOutcome::Created { worktree: crate::repository::WorktreeRecord {
+                    id: crate::model::WorktreeId::new(), path: path.clone(), creation_basis: None,
+                    created_at_unix_ms: Some(1), head_oid: Some("a".repeat(40)), branch: Some("refs/heads/recovered".into()),
+                    detached: false, bare: false, lock: Default::default(), prunable_reason: None,
+                }, warnings: vec![] }), detail: "recovered".into(), created_at_unix_ms: 1 };
+            let task = app.restore_worktree_operations(Ok(vec![report]));
+            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(app.worktree_operations[&id].setup_intent, Some(intent));
+            assert!(!app.setup_ui.active());
+            assert_eq!(app.durable.cards.len(), 0);
         }
     }
 

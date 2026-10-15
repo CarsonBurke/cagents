@@ -694,15 +694,16 @@ pub enum WorktreeSetupStatus {
     Running,
     Succeeded,
     Failed(String),
+    Interrupted(String),
     Skipped,
 }
 
 impl WorktreeSetupStatus {
     fn label(&self) -> &'static str {
-        match self { Self::Preparing | Self::Running => "Setting up", Self::Succeeded => "Setup complete", Self::Failed(_) => "Setup failed", Self::Skipped => "Setup skipped" }
+        match self { Self::Preparing | Self::Running => "Setting up", Self::Succeeded => "Setup complete", Self::Failed(_) => "Setup failed", Self::Interrupted(_) => "Review setup", Self::Skipped => "Setup skipped" }
     }
     fn detail(&self) -> &str {
-        match self { Self::Failed(detail) => detail, _ => self.label() }
+        match self { Self::Failed(detail) | Self::Interrupted(detail) => detail, _ => self.label() }
     }
 }
 
@@ -5953,6 +5954,10 @@ fn worktree_view<'a>(
         let indicator: Element<'static, SidebarAction> = if compact {
             widget::icon(Icon::Terminal.handle()).size(design::COMPACT_ICON_SIZE).into()
         } else { design::caption(status.label()).into() };
+        let indicator = if matches!(status, WorktreeSetupStatus::Interrupted(_) | WorktreeSetupStatus::Failed(_)) {
+            crate::ui_controls::button::secondary("Review setup")
+                .on_press_maybe((!modal_open).then_some(SidebarAction::ProjectCommand { project_id, worktree_id: Some(worktree.id), command: ProjectCommand::ReviewSetup })).into()
+        } else { indicator };
         content = content.push(crate::interaction::tooltip(indicator, status.detail().to_owned()));
     }
     // Durable attributes, after the reserved slot: each is a fact about the
@@ -6139,6 +6144,7 @@ pub enum ProjectCommand {
     CopyBranch,
     PullRequest,
     NewWorktreeFromBranch,
+    ReviewSetup,
     MoveUp,
     MoveDown,
     ResetSidebarOrder,

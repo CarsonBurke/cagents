@@ -555,6 +555,11 @@ impl Cagents {
             LinearLookup::Ready(issue) => Some(crate::linear::context::LinkedIssue { issue_id: issue.id.clone(), workspace: None }),
             _ => None,
         };
+        let setup_intent = (dialog.choices.setup_plan.is_some() || dialog.draft.skip_setup)
+            .then(|| super::worktree_setup_ui::SetupIntent {
+                primary: dialog.choices.primary.clone(), plan: dialog.choices.setup_plan.clone(),
+                skip: dialog.draft.skip_setup, run_id: Some(operation_id), copy_done: false,
+            });
         let selected_ref = dialog.draft.selected_branch_reference.clone();
         let prefix = dialog.prefix_dirty.then(|| dialog.choices.prefix.clone());
         let trust = (dialog.trust_setup && !dialog.draft.skip_setup && !dialog.choices.setup_trusted)
@@ -579,7 +584,7 @@ impl Cagents {
                 }
                 RepositoryService::system("git")
                     .resolve_worktree_request_selected(&input, selected_ref.as_deref(), &token)
-                    .map(|mut request| { request.linear_issue = linear_issue; request })
+                    .map(|mut request| { request.linear_issue = linear_issue; request.setup_intent = setup_intent; request })
                     .map_err(|error| WorktreeInputError::from_resolution(&error, &draft))
             })
             .await
@@ -615,18 +620,12 @@ impl Cagents {
         match result {
             Ok(request) => {
                 let draft = dialog.draft.clone();
-                let setup_intent = (dialog.choices.setup_plan.is_some() || dialog.draft.skip_setup)
-                    .then(|| super::worktree_setup_ui::SetupIntent {
-                        primary: dialog.choices.primary.clone(), plan: dialog.choices.setup_plan.clone(), skip: dialog.draft.skip_setup,
-                    });
                 let replaces = dialog.replaces;
                 self.worktree_dialog = None;
                 if let Some(replaced) = replaces {
                     let _ = self.dismiss_worktree_operation(replaced);
                 }
-                let id = request.operation_id;
                 let start = self.start_worktree_operation(project_id, request, Some(draft));
-                if let Some(intent) = setup_intent { self.set_worktree_setup_intent(id, intent); }
                 let focus = match self.nested_modal_focus_target() {
                     Some(target) => iced::widget::operation::focus(target).map(cosmic::Action::App),
                     None => self.focus_context_overlay_if_exposed(),

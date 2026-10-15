@@ -5449,6 +5449,7 @@ impl Cagents {
         let config = self.terminal_config(visible);
         let sender = self.terminal_wake_tx.clone();
         let terminal = session.id;
+        let setup_run = self.setup_ui.authorized_run(&session);
         let shared = self.shared_views.attached.contains(&card);
         let reserved = self
             .workspace_model
@@ -5469,7 +5470,12 @@ impl Cagents {
                     };
                     if reserved {
                         for _ in 0..100 {
-                            match client.complete_pending_terminal(card,session.id,crate::terminal_ipc::TerminalSpawnOptions::from(config.clone())) {
+                            let options = crate::terminal_ipc::TerminalSpawnOptions::from(config.clone());
+                            let started = match setup_run {
+                                Some(run) => client.start_worktree_setup(card, session.id, run, options),
+                                None => client.complete_pending_terminal(card, session.id, options),
+                            };
+                            match started {
                                 Ok(terminal) => { hosted=Some(terminal);created=true;break; }
                                 Err(crate::control::ControlError::Remote {code:crate::terminal_ipc::ProtocolErrorCode::TerminalAlreadyExists | crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,..}) => {
                                     hosted=client.list().map_err(|error|error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id);
