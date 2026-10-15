@@ -351,6 +351,8 @@ impl WorktreeDialog {
         if self.resolving.is_none() {
             self.choices.prefix = super::worktree_choices::sanitize_branch(&value);
             self.prefix_dirty = true;
+            self.submit_after_choices = false;
+            self.submit_after_linear = false;
             self.error = None;
         }
     }
@@ -1334,6 +1336,55 @@ mod tests {
         assert_eq!(dialog(&app).branch_input(), "feature/plain");
         let _ = app.finish_worktree_linear(id, Err("old failure".into()));
         assert!(matches!(dialog(&app).linear, LinearLookup::None));
+    }
+
+    #[test]
+    fn prefix_edits_cancel_deferred_submission_without_discarding_lookup_results() {
+        for linear in [false, true] {
+            let Fixture { mut app, .. } = fixture();
+            let id = OperationId::new();
+            drop(app.update(Message::WorktreeBranchChanged("feature/fresh".into())));
+            let pending = app.worktree_dialog.as_mut().unwrap();
+            if linear {
+                pending.linear = LinearLookup::Pending {
+                    id,
+                    token: CancellationToken::new(),
+                };
+            } else {
+                pending.choices_request = Some((id, CancellationToken::new()));
+            }
+            drop(app.update(Message::SubmitWorktree));
+            assert!(dialog(&app).submit_after_linear || dialog(&app).submit_after_choices);
+            drop(app.update(Message::WorktreePrefixChanged("team/".into())));
+            assert!(!dialog(&app).submit_after_linear);
+            assert!(!dialog(&app).submit_after_choices);
+            let expected = if linear {
+                drop(app.update(Message::WorktreeLinearResolved {
+                    id,
+                    result: Ok(crate::linear::IssuePreview {
+                        id: "2b498c52-7dc7-4c76-ad59-dfc488c40111".into(),
+                        identifier: "ENG-123".into(),
+                        title: "Fresh lookup".into(),
+                        branch_name: "eng-123-fresh".into(),
+                        url: "https://linear.app/team/issue/ENG-123".into(),
+                        state: "Todo".into(),
+                    }),
+                }));
+                assert!(matches!(dialog(&app).linear, LinearLookup::Ready(_)));
+                "team/eng-123-fresh"
+            } else {
+                let mut choices = super::super::worktree_choices::Choices::default();
+                choices.prefix = "previous/".into();
+                drop(app.update(Message::WorktreeChoicesResolved { id, result: Ok(choices) }));
+                assert!(dialog(&app).choices_request.is_none());
+                "team/feature/fresh"
+            };
+            assert_eq!(dialog(&app).effective_branch().unwrap(), expected);
+            assert!(dialog(&app).resolving.is_none(), "edited input requires a new submit");
+            assert!(app.worktree_operations.is_empty());
+            drop(app.update(Message::SubmitWorktree));
+            assert!(dialog(&app).resolving.is_some(), "the fresh lookup remains usable after explicit submit");
+        }
     }
 
     #[test]
