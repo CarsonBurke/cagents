@@ -5,9 +5,9 @@ mod close_processes;
 mod close_tests;
 #[cfg(test)]
 mod event_dispatch_tests;
+pub(crate) mod holder;
 #[cfg(test)]
 mod pty_reader_tests;
-pub(crate) mod holder;
 
 use close_processes::{FrozenFamily, RootIdentity};
 
@@ -1555,7 +1555,13 @@ impl Reader {
             .spawn(move || {
                 let _done = done_tx;
                 if started.recv().is_ok() {
-                    read_pty(&mut reader, &pty_tx, readiness, wake_rx, &reader_discard_pending);
+                    read_pty(
+                        &mut reader,
+                        &pty_tx,
+                        readiness,
+                        wake_rx,
+                        &reader_discard_pending,
+                    );
                 }
             })
             .map_err(|error| format!("start PTY reader: {error}"))?;
@@ -3530,7 +3536,12 @@ fn read_pty(
                 return;
             }
             Ok(read) => {
-                if !send_pty_message(sender, PtyMessage::Bytes(buffer[..read].to_vec()), &wake, discard_pending) {
+                if !send_pty_message(
+                    sender,
+                    PtyMessage::Bytes(buffer[..read].to_vec()),
+                    &wake,
+                    discard_pending,
+                ) {
                     return;
                 }
             }
@@ -3544,7 +3555,12 @@ fn read_pty(
                     std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
                 ) => {}
             Err(error) => {
-                send_pty_message(sender, PtyMessage::Error(error.to_string()), &wake, discard_pending);
+                send_pty_message(
+                    sender,
+                    PtyMessage::Error(error.to_string()),
+                    &wake,
+                    discard_pending,
+                );
                 return;
             }
         }
@@ -4042,7 +4058,13 @@ mod tests {
         let readiness = held.master.duplicate().unwrap();
         let (wake_rx, _wake_tx) = wake_pipe().unwrap();
         let (sender, messages) = crossbeam_channel::unbounded();
-        read_pty(&mut reader, &sender, readiness, wake_rx, &AtomicBool::new(false));
+        read_pty(
+            &mut reader,
+            &sender,
+            readiness,
+            wake_rx,
+            &AtomicBool::new(false),
+        );
 
         let messages: Vec<_> = messages.try_iter().collect();
         let output: Vec<u8> = messages
