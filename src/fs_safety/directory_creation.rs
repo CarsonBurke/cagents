@@ -346,6 +346,22 @@ fn create_with_preparation_hook(namespace:&DirectoryNamespace,root:&Root,relativ
         return create_unverified(&parent,&name,mode,
             "owned directory publication requires the exact protected destination parent; different-parent inheritance remains unverified".into());
     }
+    let Some(stage)=prepare_private_stage(namespace,mode,after_stage)? else {
+        return create_unverified(&parent,&name,mode,
+            "internal owner-access repair could not preserve destination gid/SGID; creation ownership is unverified".into());
+    };
+    after_capture(&parent,&name);
+    match stage.publish_to(parent,name.clone(),after_publish) {
+        Ok(publication)=>Ok(DirectoryCreation::Published(publication)),
+        Err((failure,true)) if failure.recovery.is_none()=>
+            resolve_directory(root,relative).map(DirectoryCreation::Existing).map_err(Into::into),
+        Err((failure,_))=>Err(failure),
+    }
+}
+
+fn prepare_private_stage(namespace:&DirectoryNamespace,mode:u32,
+    after_stage:impl FnOnce(&Root,&OsStr))->Result<Option<DirectoryStage>,DirectoryCreateError> {
+    let parent_metadata=namespace.directory.metadata().map_err(|e|ResolveError::io(&namespace.directory.path,&e))?;
     namespace_protected(&namespace.directory).map_err(|e|ResolveError::io(&namespace.directory.path,&e))?;
     // Retain the namespace before the first effect, including failures before
     // a payload/publication receipt exists.
@@ -387,26 +403,64 @@ fn create_with_preparation_hook(namespace:&DirectoryNamespace,root:&Root,relativ
         Err(error)=>return Err(preparation.fail(error)),
         Ok(false)=> {
             if let Err(error)=preparation.retry_cleanup() {return Err(preparation.fail(error));}
-            return create_unverified(&parent,&name,mode,
-                "internal owner-access repair could not preserve destination gid/SGID; creation ownership is unverified".into());
+            return Ok(None);
         }
         Ok(true)=>{},
     }
-    after_capture(&parent,&name);
+    Ok(Some(DirectoryStage { preparation, identity:identity.unwrap() }))
+}
+
+/// A private payload retained before its requested public name exists. The
+/// protected INTERNAL namespace assumption must hold for the entire staging
+/// interval. This API alone does not confine programs that canonicalize cwd;
+/// use a separately qualified fixed-mount command boundary for such programs.
+#[derive(Debug)]
+#[must_use = "retain the staged directory until publication or explicit cleanup"]
+pub struct DirectoryStage {
+    preparation:DirectoryPreparation,
+    identity:Metadata,
+}
+impl DirectoryStage {
+    pub fn directory(&self)->&Root { self.preparation.payload.as_ref().expect("prepared payload") }
+    pub fn initial_metadata(&self)->&Metadata { &self.identity }
+    pub fn identity(&self)->(u64,u64) { (self.identity.dev(),self.identity.ino()) }
+    /// A failed/canceled operation retains its nonempty payload for explicit
+    /// recovery; retry_cleanup removes only empty original internal entries.
+    pub fn into_preparation(self)->DirectoryPreparation { self.preparation }
+    /// Publishes into the same exact retained destination parent. No-clobber
+    /// failures return live staging authority when contents cannot be removed.
+    /// Ancestor spelling verification and directory fsync remain caller duties.
+    pub fn publish_new(self,root:&Root,relative:&Path)->Result<DirectoryPublication,DirectoryCreateError> {
+        let destination=(|| ->Result<_,ResolveError> {
+            let (parent,name)=open_parent_beneath(root,relative)?;
+            let expected=self.preparation.namespace.directory.metadata()
+                .map_err(|e|ResolveError::io(&self.preparation.namespace.directory.path,&e))?;
+            let actual=parent.metadata().map_err(|e|ResolveError::io(&parent.path,&e))?;
+            if (expected.dev(),expected.ino())!=(actual.dev(),actual.ino()) {
+                return Err(ResolveError::message(&parent.path,"staged directory publication requires the original exact parent; no cross-filesystem or inheritance fallback"));
+            }
+            namespace_protected(&self.preparation.namespace.directory)
+                .map_err(|e|ResolveError::io(&self.preparation.namespace.directory.path,&e))?;
+            Ok((parent,name))
+        })();
+        let (parent,name)=match destination {
+            Ok(destination)=>destination,
+            Err(error)=>return Err(self.preparation.fail(error)),
+        };
+        self.publish_to(parent,name,|_,_|{}).map_err(|(error,_)|error)
+    }
+    fn publish_to(self,parent:Root,name:OsString,after_publish:impl FnOnce(&Root,&OsStr))
+        ->Result<DirectoryPublication,(DirectoryCreateError,bool)> {
+        let DirectoryStage {mut preparation,identity}=self;
     let outer=preparation.outer.as_ref().unwrap();
     if let Err(error)=rename_exclusive(outer,OsStr::new("directory"),&parent,&name) {
         let exists=error.kind()==io::ErrorKind::AlreadyExists;
-        let failure=preparation.fail(ResolveError::io(&parent.path.join(&name),&error));
-        if exists && failure.recovery.is_none() {
-            return resolve_directory(&parent,Path::new(&name)).map(DirectoryCreation::Existing).map_err(Into::into);
-        }
-        return Err(failure);
+        return Err((preparation.fail(ResolveError::io(&parent.path.join(&name),&error)),exists));
     }
     // From here onward the published receipt must retain known identity even
     // when private outer cleanup fails.
     preparation.payload_created=false;
     let mut directory=preparation.payload.take().unwrap();
-    let identity=identity.unwrap();
     let outer=preparation.outer.take().unwrap();
     let stage=preparation.name;
     let retained_namespace=preparation.namespace;
@@ -414,16 +468,26 @@ fn create_with_preparation_hook(namespace:&DirectoryNamespace,root:&Root,relativ
     after_publish(&parent,&name);
     // Nothing after successful publication can erase the known identity from
     // the returned receipt. Cleanup failure retains the private staging root.
-    let cleanup=remove_directory_within(&namespace.directory,&stage);
+    let cleanup=remove_directory_within(&retained_namespace.directory,&stage);
     let (publication_error,private_staging)=match cleanup {
         Ok(())=>(None,None),
         Err(error)=>(Some(error.to_string()),Some((outer,stage))),
     };
-    Ok(DirectoryCreation::Published(DirectoryPublication {
+    Ok(DirectoryPublication {
         directory,parent,name,namespace:retained_namespace,identity,publication_error,private_staging,
         quarantined:None,removed:false,
-    }))
+    })
+    }
 }
+
+/// Prepare a payload using the exact parent's native mkdir inheritance. No
+/// requested public name is created. Unsupported ownership policy fails
+/// explicitly; there is no unverified staging fallback.
+pub fn stage_directory_in_namespace(namespace:&DirectoryNamespace,mode:u32)->Result<DirectoryStage,DirectoryCreateError> {
+    prepare_private_stage(namespace,mode,|_,_|{})?.ok_or_else(||
+        ResolveError::message(&namespace.directory.path,"private directory staging could not preserve actual parent gid/SGID").into())
+}
+
 fn existing_directory(root:&Root,relative:&Path)->Result<Option<Root>,ResolveError> {
     match resolve_directory(root,relative) {
         Ok(existing)=>Ok(Some(existing)),
@@ -871,6 +935,52 @@ mod tests {
             assert_eq!(fs::read(original.join("foreign")).unwrap(),b"preserve");
             assert!(retained.is_dir());
         }
+    }
+
+    #[test]
+    fn private_stage_is_populated_before_exclusive_publication() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let stage=stage_directory_in_namespace(&namespace,0o755).unwrap();
+        let original=stage.identity();
+        assert!(!dir.path().join("target").exists());
+        fs::write(stage.directory().path.join("owned"),b"completed private operation").unwrap();
+        let publication=stage.publish_new(&root,Path::new("target")).unwrap();
+        assert_eq!(publication.identity(),original);
+        assert_eq!(fs::read(dir.path().join("target/owned")).unwrap(),b"completed private operation");
+        assert!(publication.publication_error().is_none());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(),1);
+    }
+    #[test]
+    fn occupied_stage_destination_retains_nonempty_original_without_overwrite() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let stage=stage_directory_in_namespace(&namespace,0o755).unwrap();
+        fs::write(stage.directory().path.join("owned"),b"private data").unwrap();
+        fs::create_dir(dir.path().join("target")).unwrap();
+        fs::write(dir.path().join("target/foreign"),b"foreign data").unwrap();
+        let mut failure=stage.publish_new(&root,Path::new("target")).unwrap_err();
+        let mut preparation=failure.take_recovery().unwrap();
+        assert!(preparation.retry_cleanup().is_err(),"nonempty private data requires explicit recovery");
+        assert_eq!(fs::read(preparation.payload.as_ref().unwrap().path.join("owned")).unwrap(),b"private data");
+        assert_eq!(fs::read(dir.path().join("target/foreign")).unwrap(),b"foreign data");
+    }
+    #[test]
+    fn private_stage_refuses_changed_parent_and_retains_nonempty_data() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let namespace=DirectoryNamespace::acquire(&root).unwrap();
+        let stage=stage_directory_in_namespace(&namespace,0o755).unwrap();
+        fs::write(stage.directory().path.join("owned"),b"private data").unwrap();
+        fs::create_dir(dir.path().join("other")).unwrap();
+        let other=Root::open(&dir.path().join("other")).unwrap();
+        let mut error=stage.publish_new(&other,Path::new("target")).unwrap_err();
+        assert!(!dir.path().join("other/target").exists());
+        let preparation=error.take_recovery().unwrap();
+        assert!(!preparation.is_resolved());
+        assert_eq!(fs::read(preparation.payload.as_ref().unwrap().path.join("owned")).unwrap(),b"private data");
     }
 
 }
