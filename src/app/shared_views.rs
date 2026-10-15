@@ -36,6 +36,17 @@ pub(super) struct State {
 }
 
 impl State {
+    pub(super) fn is_requested_transfer(&self, operation: uuid::Uuid) -> bool {
+        self.requested_transfers.contains_key(&operation)
+    }
+
+    /// Retire exactly the refused intent; unrelated in-flight edits still
+    /// project over the authoritative view until their own acknowledgments.
+    pub(super) fn refused(&mut self, operation: uuid::Uuid) {
+        self.requested_transfers.remove(&operation);
+        self.pending.retain(|(id, _, _)| *id != operation);
+    }
+
     pub(super) fn prune_restoration_requests(&mut self, workspace: &WorkspaceState) {
         if self.restoration_requests.is_empty() {
             return;
@@ -449,7 +460,7 @@ impl Cagents {
     }
 
     pub(super) fn reject_pane_transfer(&mut self, operation: uuid::Uuid, error: String) {
-        self.shared_views.requested_transfers.remove(&operation);
+        self.shared_views.refused(operation);
         self.status = Some(TransientNotice::warning(format!("Could not move pane: {error}")));
     }
 
@@ -1436,6 +1447,11 @@ mod tests {
         assert!(matches!(change, Change::Transfer { id, destination: Scope::Channel(to), before: None }
             if id == pane.id && to == destination));
         assert!(!app.can_move_pane_to_channel(pane.id, destination), "duplicate pending move is disabled");
+        drop(app.begin_card_close(pane.id));
+        assert!(app.card_state(pane.id).unwrap().existence.is_open(),
+            "closing against the old scope must wait for the transfer acknowledgment");
+        assert!(app.status.as_ref().unwrap().message.contains("moving to a channel"));
+        assert!(rx.try_recv().is_err(), "a pending move must not publish a stale-scope removal");
         drop(app.reconcile_shared_views());
         assert!(app.durable.channels.iter().find(|c| c.id == source).unwrap().cards.contains(&pane.id));
         assert!(app.durable.channels.iter().find(|c| c.id == destination).unwrap().cards.is_empty());
@@ -1468,6 +1484,32 @@ mod tests {
         assert!(app.status.as_ref().unwrap().message.contains("destination no longer exists"));
         assert!(app.durable.channels.iter().find(|c| c.id == source).unwrap().cards.contains(&pane.id));
         assert!(app.can_move_pane_to_channel(pane.id, destination));
+    }
+
+    #[test]
+    fn refused_optimistic_transfer_restores_membership_without_erasing_other_intentions() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let refused = uuid::Uuid::new_v4();
+        let rename = uuid::Uuid::new_v4();
+        let mut renamed = pane.clone();
+        renamed.title = "Keep my pending rename".into();
+        app.shared_views.pending.push((refused, Scope::Channel(source), Change::Transfer {
+            id: pane.id, destination: Scope::Channel(destination), before: None,
+        }));
+        app.shared_views.pending.push((rename, Scope::Channel(source), Change::Update {
+            before: pane.clone(), pane: renamed,
+        }));
+        drop(app.reconcile_shared_views());
+        assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.contains(&pane.id));
+        drop(app.apply_workspace_model_update(super::super::workspace_model_sync::ModelUpdate::ViewRefused {
+            scope: Scope::Channel(source), operation: refused, error: "destination was removed".into(),
+        }));
+        assert_eq!(app.shared_views.pending.len(), 1);
+        assert_eq!(app.shared_views.pending[0].0, rename);
+        assert!(app.durable.channels.iter().find(|channel| channel.id == source).unwrap().cards.contains(&pane.id));
+        assert!(app.durable.channels.iter().find(|channel| channel.id == destination).unwrap().cards.is_empty());
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Keep my pending rename");
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
     }
 
     #[test]
