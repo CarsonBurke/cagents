@@ -115,9 +115,16 @@ fn shutdown_batch_continues_after_an_unfinished_worker() {
         };
         let stdout = fs::read_to_string(stdout).unwrap();
         let stderr = fs::read_to_string(stderr).unwrap();
+        let failure_root = if status.is_some_and(|status| status.success()) {
+            None
+        } else {
+            // A timed-out child may still have discoverable private holders;
+            // keep their evidence rather than unlinking their private runtime.
+            Some(directory.keep())
+        };
         assert!(
             status.is_some_and(|status| status.success()),
-            "isolated shutdown batch failed or exceeded 30s:\n{stdout}\n{stderr}"
+            "isolated shutdown batch failed or exceeded 30s; retained {failure_root:?}:\n{stdout}\n{stderr}"
         );
         assert!(stdout.contains("1 passed"));
         return;
