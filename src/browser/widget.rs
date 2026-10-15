@@ -283,7 +283,7 @@ impl<'a, Message> BrowserWidget<'a, Message> {
     }
 
     fn synchronize_focus(&self, state: &mut WidgetState) -> Result<(), BrowserError> {
-        if !self.model_focused {
+        if !self.native_owner(state) {
             state.input_focused = false;
         }
         let focused = self.owns_keyboard(state);
