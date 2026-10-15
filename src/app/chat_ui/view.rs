@@ -1903,6 +1903,9 @@ impl Runtime {
                     composer_editor_style,
                 )))
                 .on_action(move |event| action(Action::Composer(target, event)))
+                .on_history(&self.composer_history_owner, move |command| {
+                    action(Action::ComposerHistory(target, command))
+                })
                 .on_cursor(move |cursor| action(Action::ComposerCursor(target, cursor)))
                 .key_binding(move |press| {
                     // Native editors ask custom bindings on every mounted
@@ -6801,7 +6804,8 @@ mod tests {
                             Action::Composer(target, _)
                             | Action::ComposerCursor(target, _)
                             | Action::Submit(target, _)
-                            | Action::Latest(target),
+                            | Action::Latest(target)
+                            | Action::ComposerHistory(target, _),
                         ) => Some(*target) == expected,
                         _ => false,
                     }),

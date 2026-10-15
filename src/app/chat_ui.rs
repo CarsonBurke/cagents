@@ -1,3 +1,4 @@
+use crate::ui_controls::editable::{EditorHistoryCommand, EditorHistoryOwner};
 mod session_links;
 use super::*;
 use crate::account::{Account, AccountId};
@@ -178,6 +179,7 @@ pub enum Action {
     /// that cannot resume offers both and does neither on its own.
     StartFresh(CardId),
     Composer(Target, text_editor::Action),
+    ComposerHistory(Target, EditorHistoryCommand),
     ComposerCursor(Target, text_editor::Cursor),
     Paste(Target),
     PastedImage(Target, Option<clipboard_image::Image>),
@@ -358,6 +360,7 @@ impl Action {
     fn mutation_target(&self) -> Option<Target> {
         match self {
             Self::Composer(target, action) if action.is_edit() => Some(*target),
+            Self::ComposerHistory(target, command) if command.changes_text() => Some(*target),
             Self::DraftModel(target, _, _)
             | Self::ChooseAccount(target, _)
             | Self::AccountPicker(target, _)
@@ -1527,6 +1530,7 @@ pub(super) struct Runtime {
     opened: HashMap<String, bool>,
     pub(super) tool_groups_expanded: bool,
     composer: text_editor::Content<cosmic::Renderer>,
+    composer_history_owner: EditorHistoryOwner,
     revision: u64,
     attachments: Vec<Attachment>,
     thumbnails: thumbnails::Cache,
@@ -2042,6 +2046,7 @@ impl Runtime {
     /// was doing belonged to the old one.
     fn replace_draft(&mut self, composer: text_editor::Content<cosmic::Renderer>) {
         self.composer = composer;
+        self.composer_history_owner = EditorHistoryOwner::default();
         self.completion = completion::State::default();
         self.revision = self.revision.wrapping_add(1);
         self.resend = None;
@@ -2096,6 +2101,7 @@ impl Runtime {
             opened: HashMap::new(),
             tool_groups_expanded: false,
             composer: text_editor::Content::new(),
+            composer_history_owner: EditorHistoryOwner::default(),
             revision: 0,
             attachments: Vec::new(),
             thumbnails: thumbnails::Cache::default(),
@@ -6733,6 +6739,29 @@ impl Cagents {
                         return view::completion_scroll(target, 0.0);
                     }
                 }
+            }
+            Action::ComposerHistory(target, command) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                if !command.apply(&mut runtime.composer, &runtime.composer_history_owner) {
+                    return Task::none();
+                }
+                runtime.dismiss_suggestion();
+                runtime.revision = runtime.revision.wrapping_add(1);
+                runtime.history_cursor = None;
+                runtime.history_stash = None;
+                let rescroll = runtime.completion.restart(true);
+                let files = if runtime.files.is_none() && runtime.composer.text().contains('@') {
+                    runtime.files = Some(Arc::new(Vec::new()));
+                    Some(runtime.session.launch.recipe.working_directory.clone())
+                } else {
+                    None
+                };
+                return Task::batch([
+                    if rescroll { view::completion_scroll(target, 0.0) } else { Task::none() },
+                    files.map_or_else(Task::none, |directory| self.load_chat_files(target, directory)),
+                ]);
             }
             Action::Composer(target, action) => {
                 let mut files = None;

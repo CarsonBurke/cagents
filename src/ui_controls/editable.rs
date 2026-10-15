@@ -1,7 +1,9 @@
 //! Editable leaf semantics around the existing COSMIC input. Normal input,
 //! shaping, IME, clipboard and context menus remain owned by that widget.
 mod editor;
+mod history;
 pub use editor::TextEditor;
+pub use history::{EditorHistoryCommand, EditorHistoryOwner};
 
 use std::{borrow::Cow, cell::Cell, rc::Rc};
 
