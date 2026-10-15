@@ -568,6 +568,27 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
     }
 }
 
+/// A formerly hosted pane may never have observed its first provider identity.
+/// This narrow transition is usable only after authenticated upgrade resolution,
+/// exact attachment and snapshot confirmation, followed by a writer receipt.
+/// It does not authorize an ordinary snapshot to change saved ownership.
+pub fn is_upgrade_identity_learning(source: &Session, replacement: &Session) -> bool {
+    if source.launch.session_id.is_some()
+        || source.launch.recipe != replacement.launch.recipe
+        || !source.has_valid_native_continuity()
+        || source.owned_codex_listener.is_some() && !source.owns_codex_listener()
+        || !source.proof.as_ref().zip(replacement.proof.as_ref()).is_some_and(|(old, new)| old.boot_id == new.boot_id)
+        || source.terminal.as_ref().is_some_and(|terminal| terminal.continuity.live_proof().as_ref() != source.proof.as_ref())
+        || replacement.terminal.as_ref().is_some_and(|terminal| terminal.continuity.live_proof().as_ref() != replacement.proof.as_ref())
+    {
+        return false;
+    }
+    let Some(identity) = replacement.launch.session_id.as_ref().filter(|id| !id.is_empty() && id.len() <= 1024) else { return false; };
+    let mut confirmed = source.clone();
+    confirmed.launch.session_id = Some(identity.clone());
+    is_upgrade_recovery(&confirmed, replacement)
+}
+
 /// A retained Codex holder may have issued the same confirmed thread with an
 /// explicit resume prefix after its original fresh-thread descriptor. Only
 /// that prefix can change; the endpoint and all execution settings stay exact.

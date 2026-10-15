@@ -833,8 +833,12 @@ pub(crate) mod handoff {
     }
 
     #[cfg(any(feature = "host", test))]
-    fn validate_chat_source(source: &chat::Session, launch: &chat::Launch) -> Result<(), String> {
-        if !source.has_valid_native_continuity() {
+    /// Check the immutable descriptor against the separate effective restart.
+    /// Call while the old provider and windows are still usable, before handoff.
+    pub(crate) fn validate_chat_source(source: &chat::Session, launch: &chat::Launch) -> Result<(), String> {
+        if !source.has_valid_native_continuity()
+            || (source.owned_codex_listener.is_some() && !source.owns_codex_listener())
+        {
             return Err("Upgrade native continuity evidence is inconsistent".into());
         }
         let mut confirmed = source.launch.clone();
@@ -856,6 +860,26 @@ pub(crate) mod handoff {
             return Err("Upgrade native terminal ownership is inconsistent".into());
         }
         Ok(())
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn issued_chat_matches(saved: &chat::Session, source: &chat::Session) -> bool {
+        source.proof.is_some() && saved.proof == source.proof && saved.id == source.id
+            && saved.launch.provider == source.launch.provider
+            && saved.launch.recipe == source.launch.recipe
+            && saved.owned_codex_listener == source.owned_codex_listener
+            && saved.terminal.as_ref().map(|terminal| (&terminal.id, &terminal.launch, terminal.continuity.live_proof()))
+                == source.terminal.as_ref().map(|terminal| (&terminal.id, &terminal.launch, terminal.continuity.live_proof()))
+    }
+
+    /// Publish the descriptor windows were issued, with only its confirmed
+    /// presentation identity advanced. Resume argv belongs to `launch` alone.
+    #[cfg(feature = "host")]
+    pub(crate) fn restored_chat(source: &chat::Session, launch: &chat::Launch) -> Result<chat::Session, String> {
+        validate_chat_source(source, launch)?;
+        let mut restored = source.clone();
+        restored.launch.session_id = launch.session_id.clone();
+        Ok(restored)
     }
 
     /// The durable record of retained native conversations that an upgrade
