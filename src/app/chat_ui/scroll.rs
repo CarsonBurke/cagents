@@ -157,11 +157,32 @@ pub(super) fn locate_logical(target: Target, item: String, identity: u64, byte: 
         item: item_id(&item), identity, byte, content: None, viewport: None, found: None })
 }
 
+struct FindScrollMarker(bool);
+
+/// Find corrections position an existing result; they must not become user
+/// edge navigation that asks the provider to replace the history window.
+pub(super) fn find_scroll_to<T: Send + 'static>(target:Target,offset:f32) -> iced::Task<T> {
+    struct Scroll {id:Id,offset:f32}
+    impl<T:'static> Operation<T> for Scroll {
+        fn traverse(&mut self,visit:&mut dyn FnMut(&mut dyn Operation<T>)) {visit(self);}
+        fn custom(&mut self,id:Option<&Id>,_:Rectangle,state:&mut dyn std::any::Any) {
+            if id==Some(&self.id) && let Some(marker)=state.downcast_mut::<FindScrollMarker>() {marker.0=true;}
+        }
+        fn scrollable(&mut self,id:Option<&Id>,_:Rectangle,_:Rectangle,_:Vector,state:&mut dyn operation::Scrollable) {
+            if id==Some(&self.id) {state.scroll_to(operation::scrollable::AbsoluteOffset{x:None,y:Some(self.offset)});}
+        }
+    }
+    iced::advanced::widget::operate(Scroll{id:card_control_id(target.card,"chat-transcript"),offset})
+}
+
 /// Restore a source offset after the Find bar and temporary disclosures
 /// change the viewport height. Native chat offsets are bottom anchored.
 pub(super) fn restore_top<T: Send + 'static>(target: Target, top: f32) -> iced::Task<T> {
     struct Restore { scroll: Id, top: f32 }
     impl<T: 'static> Operation<T> for Restore {
+        fn custom(&mut self,id:Option<&Id>,_:Rectangle,state:&mut dyn std::any::Any) {
+            if id==Some(&self.scroll) && let Some(marker)=state.downcast_mut::<FindScrollMarker>() {marker.0=true;}
+        }
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation<T>)) { visit(self); }
         fn scrollable(&mut self, id: Option<&Id>, viewport: Rectangle, content: Rectangle,
             _: Vector, state: &mut dyn operation::Scrollable) {
@@ -731,6 +752,10 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         renderer: &cosmic::Renderer,
         operation: &mut dyn Operation,
     ) {
+        let mut find_scroll=FindScrollMarker(false);
+        if let Some(target)=self.target {
+            operation.custom(Some(&card_control_id(target.card,"chat-transcript")),layout.bounds(),&mut find_scroll);
+        }
         let mut before = ReadTop::default();
         if self.target.is_some() {
             self.content.as_widget_mut().operate(
@@ -753,7 +778,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             );
             let mut anchor = tree.state.downcast_ref::<ReaderState>().memory.0.borrow_mut();
             if let Some((top, geometry)) = after.0.zip(anchor.geometry()) {
-                anchor.pending_input |= navigation_input(
+                anchor.pending_input |= !find_scroll.0 && navigation_input(
                     before.0,
                     top,
                     Scroll::new(top, geometry.content.height, geometry.viewport.height),
@@ -1024,6 +1049,31 @@ mod tests {
         let mut actual = ReadTop::default();
         recreated.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut actual);
         assert_eq!(actual.0, Some(600.0), "revealing a hidden transcript does not jump to its end");
+    }
+
+    #[test]
+    fn find_scroll_corrections_do_not_arm_provider_history_navigation() {
+        use iced::futures::StreamExt;
+        let renderer=crate::app::tests::headless_renderer();
+        let target=Target{card:CardId::new(),generation:0};
+        let mut element=transcript(widget::Space::new().height(1600).width(Length::Fill),target,None,vec![],true,vec![]);
+        let mut tree=Tree::new(&element);
+        let node=element.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(Size::ZERO,Size::new(720.0,400.0)));
+        let mut actions=iced::runtime::task::into_stream(find_scroll_to::<()>(target,1200.0)).unwrap();
+        let executor=tokio::runtime::Builder::new_current_thread().build().unwrap();
+        while let Some(action)=executor.block_on(actions.next()) {
+            if let iced::runtime::Action::Widget(mut operation)=action {
+                loop {
+                    element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut operation);
+                    match operation.finish() {operation::Outcome::Chain(next)=>operation=next,_=>break}
+                }
+            }
+        }
+        assert!(!tree.state.downcast_ref::<ReaderState>().memory.0.borrow().pending_input,
+            "centering a search result must not request another history page");
+        element.as_widget_mut().operate(&mut tree,Layout::new(&node),&renderer,&mut SetBottom(0.0));
+        assert!(tree.state.downcast_ref::<ReaderState>().memory.0.borrow().pending_input,
+            "ordinary keyboard/edge operations retain their paging intent");
     }
 
     #[test]

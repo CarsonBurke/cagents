@@ -7379,8 +7379,7 @@ impl Cagents {
                 runtime.find_locating = location.filter(|location| !location.exact && attempt < 5)
                     .map(|_| (generation,navigation,attempt+1));
                 if let Some(location) = location {
-                    return iced::widget::scrollable::scroll_to(card_control_id(target.card,"chat-transcript"),
-                        iced::widget::scrollable::AbsoluteOffset {x:0.0,y:location.offset}).map(cosmic::Action::App);
+                    return scroll::find_scroll_to(target,location.offset).map(cosmic::Action::App);
                 }
             }
             Action::FindNavigationInput(target) => {
