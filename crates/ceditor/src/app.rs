@@ -114,6 +114,8 @@ struct Tab {
     next_open: u64,
     location_epoch: u64,
     files_loaded: bool,
+    /// Underlying project context also survives read-only external source tabs.
+    git_context: bool,
     git: bool,
     diagnostics: Vec<LspDiagnostic>,
     /// The manager version these diagnostics currently describe. Exact local
@@ -1546,7 +1548,8 @@ impl Editor {
         // Git provenance survives independently of mutation authority: on
         // supported read-only platforms an internal source still has Git panels.
         // External dependency tabs retain their separate read-only source policy.
-        let git = external.is_none() && git;
+        let git_context = git;
+        let git = external.is_none() && git_context;
         let needs_git_snapshot = git && opened.snapshot.is_none();
         let mut runtime = if git {
             RepositoryRuntime::new(descriptor)
@@ -1639,6 +1642,7 @@ impl Editor {
             next_open: 1,
             location_epoch: 0,
             files_loaded: external.is_some(),
+            git_context,
             git,
             diagnostics: Vec::new(),
             diagnostics_version: None,

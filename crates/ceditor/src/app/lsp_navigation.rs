@@ -164,7 +164,7 @@ impl Editor {
         let Some(tab) = self.tab(origin) else { return Task::none(); };
         let root = tab.runtime.descriptor.worktree.clone();
         let authority = tab.worktree_authority.clone();
-        let git = tab.git;
+        let git = tab.git_context;
         let origin_location = self.capture_editor_location(origin);
         let existing = self.tabs.iter().find(|tab| tab.runtime.source_tab_path().as_ref() == Some(&resolved.path)
             && tab.runtime.is_read_only_source() == resolved.external).map(|tab| tab.id);
@@ -239,7 +239,7 @@ impl Editor {
             let tab = self.tab(target.location.card)?;
             let root = tab.runtime.descriptor.worktree.clone();
             let authority = tab.worktree_authority.clone();
-            let git = tab.git;
+            let git = tab.git_context;
             let relative = target.location.source.strip_prefix(&root).ok().map(Path::to_path_buf);
             let external = relative.is_none().then(|| target.location.source.clone());
             let task = self.add_with_source_context(Opened { root, file: relative, snapshot: None, authority }, true, external, git);
@@ -351,6 +351,26 @@ mod tests {
         let target = app.active.unwrap(); assert_ne!(target, origin);
         assert!(app.tab(target).unwrap().git);
         assert!(app.tab(target).unwrap().worktree_authority.is_none());
+    }
+
+    #[test]
+    fn external_definition_tab_preserves_underlying_git_context_for_project_return() {
+        let directory = git_fixture(); let root = directory.path();
+        let dependency = tempfile::tempdir().unwrap(); let external = dependency.path().join("library.rs");
+        std::fs::write(&external, "fn library() {}\n").unwrap();
+        std::fs::write(root.join("target.rs"), "fn target() {}\n").unwrap();
+        let mut app = editor(); let origin = open_real_git(&mut app, root, Some("tracked.txt"));
+        let task = app.open_navigation_target(origin, Resolved { path: external, external: true,
+            at: LspPosition::new(0, 3), coordinates: LspCoordinates::Utf16 });
+        run_tasks(&mut app, task); let outside = app.active.unwrap();
+        assert!(!app.tab(outside).unwrap().git); assert!(app.tab(outside).unwrap().git_context);
+        assert!(app.tab(outside).unwrap().runtime.is_read_only_source());
+        let task = app.open_navigation_target(outside, Resolved { path: root.join("target.rs"), external: false,
+            at: LspPosition::new(0, 3), coordinates: LspCoordinates::Utf16 });
+        run_tasks(&mut app, task); let target = app.active.unwrap();
+        assert_ne!(target, outside); assert!(app.tab(target).unwrap().git);
+        assert!(!app.tab(target).unwrap().runtime.is_read_only_source());
+        assert!(app.tab(target).unwrap().worktree_authority.is_some());
     }
 
     #[test]
