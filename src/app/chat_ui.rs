@@ -453,6 +453,7 @@ pub(super) mod closing;
 pub(super) struct State {
     pub(super) close_dialog: Option<closing::Confirmation>,
     close_generation: u64,
+    end_requests: HashMap<Target, closing::EndRequest>,
     pub(super) image_viewer: Option<images::Gallery>,
     files: HashMap<PathBuf, Arc<Vec<String>>>,
     sender: async_channel::Sender<(Target, Wake)>,
@@ -497,6 +498,7 @@ impl Default for State {
             image_viewer: None,
             close_dialog: None,
             close_generation: 0,
+            end_requests: HashMap::new(),
             files: HashMap::new(),
             sender,
             receiver,
@@ -4698,6 +4700,7 @@ impl Cagents {
             }
         }
         self.chat_ui.phases.remove(&card);
+        self.chat_ui.end_requests.retain(|target, _| target.card != card);
         self.observe_agent_activity_for_card(card, None);
     }
     /// Forgets a chat runtime whose card is going away for good.
@@ -4877,7 +4880,7 @@ impl Cagents {
     /// The conversation a chat card would return from, as current as the card
     /// knows it: the runtime's session carries the identity the provider has
     /// confirmed since the card was saved.
-    fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
+    pub(super) fn chat_return_session(&self, card: CardId) -> Option<chat::Session> {
         if let Some(runtime) = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(&**runtime),
             _ => self.chat_ui.parked.get(&card).map(|runtime| &**runtime),
@@ -4928,18 +4931,28 @@ impl Cagents {
     /// behind its source terminal closes before that terminal's own close, so
     /// the terminal's close never races the actor that owns it.
     pub(super) fn begin_chat_close(&mut self, card: CardId) -> Task<Message> {
+        self.begin_chat_close_for(card, None)
+    }
+    pub(super) fn begin_chat_close_for(&mut self, card: CardId, batch: Option<uuid::Uuid>) -> Task<Message> {
+        if !self.pane_close_decision_current(card, batch) { return Task::none(); }
+        let Some(request) = closing::EndRequest::capture(self, card, batch) else { return Task::none(); };
         self.remember_conversation_draft(card);
-        if matches!(
-            self.chat_ui.phases.get(&card),
-            Some(Phase::Closing { restart: None, .. })
-        ) {
+        if let Some(Phase::Closing { target, restart: None }) = self.chat_ui.phases.get(&card) {
+            if self.chat_ui.end_requests.get(target).is_none_or(|pending| pending.batch != batch) {
+                self.stop_pane_close_batch(batch);
+            }
             return Task::none();
         }
-        if let Some(Phase::Returning {
-            close_requested, ..
-        }) = self.chat_ui.phases.get_mut(&card)
-        {
-            *close_requested = true;
+        if let Some(Phase::Returning { target, .. }) = self.chat_ui.phases.get(&card) {
+            let target = *target;
+            if self.chat_ui.end_requests.get(&target).is_some_and(|pending| pending.batch != batch) {
+                self.stop_pane_close_batch(batch);
+                return Task::none();
+            }
+            self.chat_ui.end_requests.entry(target).or_insert(request);
+            if let Some(Phase::Returning { close_requested, .. }) = self.chat_ui.phases.get_mut(&card) {
+                *close_requested = true;
+            }
             return Task::none();
         }
         // Only a live conversation is ever parked behind its terminal.
@@ -4957,6 +4970,7 @@ impl Cagents {
                     restart: None,
                 },
             );
+            self.chat_ui.end_requests.insert(target, request);
             return cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || handle.close())
                     .await
@@ -5001,6 +5015,7 @@ impl Cagents {
                     restart: None,
                 },
             );
+            self.chat_ui.end_requests.insert(target, request);
             return cosmic::task::future(async move {
                 let saved = session.clone();
                 let result =
@@ -5011,7 +5026,7 @@ impl Cagents {
                 Message::ChatUi(Action::RetainedCloseFinished(target, session, result))
             });
         }
-        let Some(remove) = self.remove_chat_card(card, None) else {
+        let Some(remove) = self.remove_chat_card_for(card, None, batch) else {
             return Task::none();
         };
         let retire = if pending {
@@ -5111,6 +5126,20 @@ impl Cagents {
         card: CardId,
         replacement: Option<LaunchRecipe>,
     ) -> Option<Task<Message>> {
+        self.remove_chat_card_for(card, replacement, None)
+    }
+    fn remove_chat_card_for(
+        &mut self,
+        card: CardId,
+        replacement: Option<LaunchRecipe>,
+        batch: Option<uuid::Uuid>,
+    ) -> Option<Task<Message>> {
+        // Hide leaves an open conversation outside the strip. End does not
+        // invent a temporary pane: after its exact cleanup has settled, retire
+        // that saved conversation through the normal shared-view checkpoint.
+        if replacement.is_none() && !self.workspace.order().any(|id| id == card) {
+            return self.remove_hidden_chat_card_for(card, batch);
+        }
         let replacement = match replacement {
             Some(launch) => {
                 // The return completed asynchronously. Deletion may have
@@ -5133,7 +5162,7 @@ impl Cagents {
             }
             None => None,
         };
-        self.reserve_chat_removal(card)?;
+        self.reserve_card_removal_for(card, batch)?;
         self.commit_card_removal(card, replacement)
     }
 
@@ -5152,19 +5181,6 @@ impl Cagents {
         self.insert_terminal_card(session, Some(slot))
     }
 
-    /// The workspace's reservation to remove `card`, taken now unless it is
-    /// already held; a refusal is reported.
-    fn reserve_chat_removal(&mut self, card: CardId) -> Option<crate::workspace::FocusHandoff> {
-        let handoff = match self.workspace.pending_close() {
-            Some(handoff) if handoff.unmounting == card => Ok(handoff),
-            _ => self.workspace.request_close(card),
-        };
-        handoff
-            .inspect_err(|error| {
-                self.status = Some(TransientNotice::error(error.to_string()));
-            })
-            .ok()
-    }
     /// A panic while connecting is a failed start, not an unwind of the UI thread.
     fn started_chat(
         caught: Result<
@@ -6525,7 +6541,16 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                let request = self.chat_ui.end_requests.remove(&target);
+                if close && request.as_ref().is_none_or(|request| !request.source_current(self, target.card)) {
+                    if let Some(request) = request { self.stop_pane_close_batch(request.batch); }
+                    return Task::none();
+                }
+                let batch = request.as_ref().and_then(|request| request.batch);
+                let close = close && request.as_ref().is_some_and(|request| request.current(self, target.card));
                 let card = target.card;
+                // The original Return remains authorized when its secondary
+                // selected End was revoked. Never attach a newer batch here.
                 // The chat stays whenever its conversation is still running
                 // somewhere a new terminal must not compete with: in the CLI
                 // the daemon keeps, or, for a resume, in an actor that may
@@ -6550,7 +6575,7 @@ impl Cagents {
                     self.status = Some(TransientNotice::error(error));
                     self.reread_chat_activity(target);
                     return if close {
-                        self.begin_chat_close(card)
+                        self.begin_chat_close_for(card, batch)
                     } else {
                         Task::none()
                     };
@@ -6566,7 +6591,7 @@ impl Cagents {
                 if close {
                     return Task::batch([
                         retry,
-                        self.remove_chat_card(card, None).unwrap_or_else(Task::none),
+                        self.remove_chat_card_for(card, None, batch).unwrap_or_else(Task::none),
                     ]);
                 }
                 // The terminal takes the chat's place in its strip, so it can
@@ -8244,6 +8269,13 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                let request = self.chat_ui.end_requests.remove(&target);
+                if close && request.as_ref().is_none_or(|request| !request.source_current(self, target.card)) {
+                    if let Some(request) = request { self.stop_pane_close_batch(request.batch); }
+                    return Task::none();
+                }
+                let batch = request.as_ref().and_then(|request| request.batch);
+                let close = close && request.as_ref().is_some_and(|request| request.current(self, target.card));
                 // A close asked for during the return runs on whatever the
                 // card turned out to be: the terminal it returned to, or the
                 // chat that is still there when the return failed.
@@ -8253,7 +8285,7 @@ impl Cagents {
                         self.status = Some(TransientNotice::error(error));
                         self.reread_chat_activity(target);
                         return if close {
-                            self.begin_chat_close(target.card)
+                            self.begin_chat_close_for(target.card, batch)
                         } else {
                             Task::none()
                         };
@@ -8295,9 +8327,9 @@ impl Cagents {
                     // A chat parked behind its CLI closes first, exactly as a
                     // close of that card does, and the CLI's close follows it.
                     let close = if self.chat_has_parked_runtime(target.card) {
-                        self.begin_chat_close(target.card)
+                        self.begin_chat_close_for(target.card, batch)
                     } else {
-                        self.begin_card_close(target.card)
+                        self.begin_card_close_for(target.card, batch)
                     };
                     Task::batch([task, close])
                 } else {
@@ -8314,15 +8346,22 @@ impl Cagents {
                 {
                     return Task::none();
                 }
-                if self.chat_return_session(target.card).as_ref() != Some(&session) {
+                let Some(request) = self.chat_ui.end_requests.remove(&target) else { return Task::none(); };
+                if !request.current(self, target.card) {
+                    self.stop_pane_close_batch(request.batch);
+                    return Task::none();
+                }
+                if self.chat_return_session(target.card).as_ref().is_none_or(|current| !terminal_close::same_chat_removal_source(&session, current)) {
+                    self.stop_pane_close_batch(request.batch);
                     return Task::none();
                 }
                 if let Err(error) = result {
+                    self.stop_pane_close_batch(request.batch);
                     self.status = Some(TransientNotice::error(error));
                     return Task::none();
                 }
                 return self
-                    .remove_chat_card(target.card, None)
+                    .remove_chat_card_for(target.card, None, request.batch)
                     .unwrap_or_else(Task::none);
             }
             Action::CloseFinished(target, result) => {
@@ -8344,7 +8383,13 @@ impl Cagents {
                 else {
                     return Task::none();
                 };
+                let request = self.chat_ui.end_requests.remove(&target);
                 if restart.is_none() {
+                    let Some(request) = request else { return Task::none(); };
+                    if !request.source_current(self, target.card) {
+                        self.stop_pane_close_batch(request.batch);
+                        return Task::none();
+                    }
                     // A chat parked behind its source terminal: the actor is
                     // closed or unreachable either way, and the card is that
                     // terminal now, so its own close takes over from here.
@@ -8355,7 +8400,12 @@ impl Cagents {
                             "The chat could not be confirmed stopped: {error}"
                         )));
                     }
-                    return self.begin_card_close(target.card);
+                    return if self.pane_close_decision_current(target.card, request.batch) {
+                        request.paired_terminal.map(|captured| self.resume_captured_card_close(captured)).unwrap_or_else(Task::none)
+                    } else {
+                        self.stop_pane_close_batch(request.batch);
+                        Task::none()
+                    };
                 }
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(error));
@@ -14701,6 +14751,30 @@ mod tests {
         assert!(app.terminal_close.is_none());
         assert!(!app.chat_has_parked_runtime(card));
         assert!(!app.chat_ui.transition_pending());
+    }
+
+    #[test]
+    fn a_direct_end_during_local_return_cannot_consume_an_unrelated_selected_delivery() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        drop(app.update(Message::ChatUi(Action::Switch(card))));
+        let target = local_return(&app).0;
+        drop(app.open_utility_card(CardKind::Settings));
+        let first = app.utility_card(&CardKind::Settings).unwrap();
+        drop(app.open_utility_card(CardKind::Accounts));
+        let second = app.utility_card(&CardKind::Accounts).unwrap();
+        let held = crate::app::tests::task_app_message(app.close_cards_in_order(vec![first, second]));
+        let batch = app.pane_close_batch_for(first);
+        request_end_chat(&mut app, card);
+        assert_eq!(app.chat_ui.end_requests[&target].batch, None);
+        drop(app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(())))));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(app.queued_card_closes.len(), 1);
+        assert!(app.pane_close_decision_current(first, batch));
+        assert!(app.pane_close_decision_current(second, batch));
+        drop(app.update(held));
+        assert_eq!(app.workspace.pending_close().unwrap().unmounting, first);
+        assert!(app.card_state(second).unwrap().existence.is_open());
     }
 
     /// A chat that switches to a shell leaves its channel only for the shell

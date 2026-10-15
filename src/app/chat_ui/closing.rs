@@ -7,7 +7,7 @@ pub enum Action {
     Cancel(DialogTarget),
     Confirm(DialogTarget),
     Hide(DialogTarget),
-    CommitHide(CardId),
+    CommitHide(terminal_close::RemovalTarget),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DialogTarget {
@@ -19,6 +19,7 @@ pub(in crate::app) struct Confirmation {
     pub tab: bool,
     generation: u64,
     source: CloseSource,
+    batch: Option<uuid::Uuid>,
 }
 
 /// The issued descriptor and live logical identity observed at consent time.
@@ -29,6 +30,47 @@ struct CloseSource {
     descriptor: chat::Session,
     session: chat::Session,
 }
+/// One End request follows only its captured logical source and selection.
+/// Cleanup results still settle their phase after this consent is revoked.
+#[derive(Clone)]
+pub(super) struct EndRequest {
+    pub(super) batch: Option<uuid::Uuid>,
+    kind: CardKind,
+    session: Option<chat::Session>,
+    pub(super) paired_terminal: Option<terminal_close::QueuedCardClose>,
+}
+impl EndRequest {
+    pub(super) fn capture(app: &mut Cagents, card: CardId, batch: Option<uuid::Uuid>) -> Option<Self> {
+        let kind = app.card_state(card).filter(|state| state.existence.is_open())?.kind.clone();
+        let session = app.chat_return_session(card);
+        let paired_terminal = if matches!(&kind, CardKind::Terminal(_)) {
+            Some(app.capture_card_close_for(card, batch)?)
+        } else { None };
+        Some(Self { batch, kind, session, paired_terminal })
+    }
+    pub(super) fn source_current(&self, app: &Cagents, card: CardId) -> bool {
+        let Some(state) = app.card_state(card).filter(|state| state.existence.is_open()) else { return false; };
+        let same_kind = match (&self.kind, &state.kind) {
+            (CardKind::Chat(expected), CardKind::Chat(current)) => terminal_close::same_chat_removal_source(expected, current),
+            (CardKind::Terminal(expected), CardKind::Terminal(current)) => {
+                let proof_matches = current.continuity.live_proof().is_none_or(|proof| expected.continuity.live_proof() == Some(proof));
+                let mut current = current.clone();
+                current.continuity = expected.continuity.clone();
+                current == *expected && proof_matches
+            }
+            _ => false,
+        };
+        same_kind && match (&self.session, app.chat_return_session(card)) {
+            (Some(expected), Some(current)) => terminal_close::same_chat_removal_source(expected, &current),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+    pub(super) fn current(&self, app: &Cagents, card: CardId) -> bool {
+        self.source_current(app, card) && app.pane_close_decision_current(card, self.batch)
+    }
+}
+
 impl Confirmation {
     pub(in crate::app) fn generation(&self) -> u64 {
         self.generation
@@ -67,6 +109,7 @@ impl Cagents {
             state.existence.is_open()
                 && matches!(&state.kind, CardKind::Chat(current) if current == &dialog.source.descriptor)
         }) && self.chat_return_session(dialog.card).as_ref() == Some(&dialog.source.session)
+            && self.pane_close_decision_current(dialog.card, dialog.batch)
     }
     pub(in crate::app) fn reconcile_chat_close_backing_state(&mut self) {
         if self
@@ -75,7 +118,9 @@ impl Cagents {
             .as_ref()
             .is_some_and(|dialog| !self.chat_close_source_matches(dialog))
         {
-            self.chat_ui.close_dialog = None;
+            if let Some(dialog) = self.chat_ui.close_dialog.take() {
+                self.stop_pane_close_batch(dialog.batch);
+            }
         }
     }
     pub(in crate::app) fn remember_conversation_draft(&mut self, card: CardId) {
@@ -152,16 +197,22 @@ impl Cagents {
                 .is_some_and(|draft| !draft.is_empty())
     }
     pub(in crate::app) fn request_chat_tab_close(&mut self, card: CardId) -> Task<Message> {
+        self.request_chat_tab_close_for(card, None)
+    }
+    pub(in crate::app) fn request_chat_tab_close_for(&mut self, card: CardId, batch: Option<uuid::Uuid>) -> Task<Message> {
+        if !self.pane_close_decision_current(card, batch) { return Task::none(); }
         if self.chat_is_unused(card) {
-            return self.begin_chat_close(card);
+            return self.begin_chat_close_for(card, batch);
         }
         if self.chat_close_needs_confirmation(card) {
-            return self.open_chat_close_confirmation(card, true);
+            return self.open_chat_close_confirmation(card, true, batch);
         }
-        self.hide_chat_tab(card)
+        self.hide_chat_tab_for(card, batch)
     }
-    fn open_chat_close_confirmation(&mut self, card: CardId, tab: bool) -> Task<Message> {
+    fn open_chat_close_confirmation(&mut self, card: CardId, tab: bool, batch: Option<uuid::Uuid>) -> Task<Message> {
+        if !self.pane_close_decision_current(card, batch) { return Task::none(); }
         if self.chat_ui.close_dialog.is_some() {
+            self.stop_pane_close_batch(batch);
             return Task::none();
         }
         let Some(source) = self.chat_close_source(card) else {
@@ -173,6 +224,7 @@ impl Cagents {
             tab,
             generation: self.chat_ui.close_generation,
             source,
+            batch,
         });
         self.modal_focus(widget::Id::new("chat-close.cancel"))
     }
@@ -210,7 +262,7 @@ impl Cagents {
                     return Task::none();
                 }
                 if self.chat_close_needs_confirmation(card) {
-                    self.open_chat_close_confirmation(card, false)
+                    self.open_chat_close_confirmation(card, false, None)
                 } else {
                     self.begin_chat_close(card)
                 }
@@ -219,6 +271,7 @@ impl Cagents {
                 let Some(dialog) = self.chat_ui.close_dialog.take() else {
                     return Task::none();
                 };
+                self.stop_pane_close_batch(dialog.batch);
                 let restore =
                     resolve_restore_card(Some(dialog.card), self.workspace.focused(), |card| {
                         self.workspace.order().any(|id| id == card)
@@ -232,47 +285,85 @@ impl Cagents {
                 let Some(dialog) = self.chat_ui.close_dialog.take() else {
                     return Task::none();
                 };
-                self.begin_chat_close(dialog.card)
+                self.begin_chat_close_for(dialog.card, dialog.batch)
             }
             Action::Hide(_) => {
                 let Some(dialog) = self.chat_ui.close_dialog.take() else {
                     return Task::none();
                 };
-                self.hide_chat_tab(dialog.card)
+                self.hide_chat_tab_for(dialog.card, dialog.batch)
             }
-            Action::CommitHide(card) => {
+            Action::CommitHide(target) => {
+                let card = target.card();
+                if self.pending_card_removal_target(card) != Some(target) { return Task::none(); }
+                if !self.card_removal_current(target) {
+                    if let Some(batch) = self.retire_card_removal(target) {
+                        let _ = self.workspace.cancel_close(card);
+                        self.stop_pane_close_batch(batch);
+                    }
+                    return Task::none();
+                }
                 let update = match self.workspace.commit_close(card) {
                     Ok(update) => update,
                     Err(error) => {
+                        if let Some(batch) = self.retire_card_removal(target) {
+                            let _ = self.workspace.cancel_close(card);
+                            self.stop_pane_close_batch(batch);
+                        }
                         self.status = Some(TransientNotice::warning(error.to_string()));
                         return Task::none();
                     }
                 };
+                let Some(batch) = self.retire_card_removal(target) else { return Task::none(); };
                 self.remember_conversation_draft(card);
                 if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
                     let _ = runtime.set_visible(false);
                 }
-                // Keep the descriptor, channel membership, runtime and provider.
-                // Selecting its sidebar row reconstructs the view from those.
-                self.apply_viewport(update, true, true)
+                // Hiding retires one presentation step, preserving the open
+                // conversation, its sidebar membership and provider ownership.
+                let viewport = self.apply_viewport(update, true, true);
+                let next = self.finish_selected_pane_close(card, batch);
+                Task::batch([viewport, next])
             }
         }
     }
-    fn hide_chat_tab(&mut self, card: CardId) -> Task<Message> {
-        let handoff = match self.workspace.request_close(card) {
-            Ok(handoff) => handoff,
-            Err(error) => {
-                self.status = Some(TransientNotice::warning(error.to_string()));
-                return Task::none();
-            }
-        };
+    fn hide_chat_tab_for(&mut self, card: CardId, batch: Option<uuid::Uuid>) -> Task<Message> {
+        let Some(handoff) = self.reserve_card_removal_for(card, batch) else { return Task::none(); };
+        let Some(target) = self.pending_card_removal_target(card) else { return Task::none(); };
         workspace_widget::focus_handoff_then(
             handoff,
             widget::Id::new(TOOLBAR_FOCUS_ID),
             |next| self.card_keyboard_focus(next),
-            Message::ChatClose(Action::CommitHide(card)),
+            Message::ChatClose(Action::CommitHide(target)),
         )
         .map(cosmic::Action::App)
+    }
+    /// End of an actually hidden chat has no focus handoff to reserve. The
+    /// caller validates its captured logical source after actor cleanup, and
+    /// this synchronous commit retains the usual expected-revision view edit.
+    pub(super) fn remove_hidden_chat_card_for(&mut self, card: CardId, batch: Option<uuid::Uuid>) -> Option<Task<Message>> {
+        if self.workspace.order().any(|id| id == card)
+            || self.pending_card_removal_target(card).is_some()
+            || !self.pane_close_decision_current(card, batch)
+        { return None; }
+        let saved = self.card_state(card).filter(|state| state.existence.is_open() && matches!(&state.kind, CardKind::Chat(_)))?.clone();
+        let destination = self.durable.channels.iter().find(|channel| channel.cards.contains(&card))
+            .map(|channel| WorkspaceDestination::Channel(channel.id))
+            .or_else(|| {
+                let path = self.durable.card_scopes.get(&card)?;
+                self.sidebar_model.projects.iter().find_map(|project| {
+                    project.worktrees.iter().find(|worktree| &worktree.path == path)
+                        .map(|worktree| WorkspaceDestination::Worktree(worktree.id))
+                        .or_else(|| (project.kind == ProjectKind::Folder && &project.repository == path).then_some(WorkspaceDestination::Folder(project.id)))
+                })
+            });
+        self.remember_conversation_draft(card);
+        self.recently_closed.push((saved, destination));
+        if self.recently_closed.len() > 32 { self.recently_closed.remove(0); }
+        self.chat_discard(card);
+        let retired = self.retire_offstrip_card(card);
+        let next = self.finish_selected_pane_close(card, batch);
+        Some(Task::batch([retired, next]))
     }
     pub(in crate::app) fn chat_close_dialog(&self) -> Option<Element<'_, Message>> {
         let dialog = self.chat_ui.close_dialog.as_ref()?;
@@ -297,6 +388,7 @@ impl Cagents {
         if dialog.tab {
             rows.push(
                 crate::ui_controls::button::secondary("Hide tab and keep conversation")
+                    .id(widget::Id::new("chat-close.hide"))
                     .on_press(Message::ChatClose(Action::Hide(target)))
                     .into(),
             );
@@ -394,12 +486,22 @@ mod tests {
         respond(&mut app, Action::Confirm);
         assert!(app.chat_ui.close_dialog.is_some());
         assert!(app.card_state(card).unwrap().existence.is_open());
+        app.update_prepared = false;
+        respond(&mut app, Action::Hide);
+        let target = app.pending_card_removal_target(card).expect("issued Hide reservation");
+        app.update_prepared = true;
         assert!(!super::super::super::user_message_blocked_during_update(
-            &Message::ChatClose(Action::CommitHide(card))
+            &Message::ChatClose(Action::CommitHide(target))
         ));
+        drop(app.update(Message::ChatClose(Action::CommitHide(target))));
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
     }
 
     fn emitted_confirm(app: &Cagents) -> Message {
+        emitted_control(app, "chat-close.confirm", |message| matches!(message, Message::ChatClose(Action::Confirm(_))))
+    }
+    fn emitted_control(app: &Cagents, id: &'static str, expected: fn(&Message) -> bool) -> Message {
         use iced::advanced::{
             Layout, Shell, clipboard, layout,
             widget::{Tree, operation},
@@ -417,7 +519,7 @@ mod tests {
             &mut tree,
             Layout::new(&node),
             &renderer,
-            &mut operation::focusable::focus::<()>(widget::Id::new("chat-close.confirm")),
+            &mut operation::focusable::focus::<()>(widget::Id::new(id)),
         );
         let mut messages = Vec::new();
         dialog.as_widget_mut().update(
@@ -439,8 +541,277 @@ mod tests {
             &bounds,
         );
         messages.into_iter().find(|message| matches!(message,
-            Message::ModalSurface { message, .. } if matches!(&**message, Message::ChatClose(Action::Confirm(_)))))
-            .expect("actual destructive button publishes its captured decision")
+            Message::ModalSurface { message, .. } if expected(message)))
+            .expect("actual dialog control publishes its captured decision")
+    }
+
+    fn output(task: Task<Message>, expected: fn(&Message) -> bool) -> Message {
+        use iced::futures::StreamExt;
+        let mut stream = iced::runtime::task::into_stream(task).expect("task has an output");
+        let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        executor.block_on(async move {
+            while let Some(action) = stream.next().await {
+                if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                    assert!(expected(&message), "unexpected application output: {message:?}");
+                    return message;
+                }
+                // These ownership tests do not execute native focus operations.
+            }
+            panic!("expected application output");
+        })
+    }
+    fn hide_decision(app: &Cagents) -> Message {
+        emitted_control(app, "chat-close.hide", |message| matches!(message, Message::ChatClose(Action::Hide(_))))
+    }
+    fn cancel_decision(app: &Cagents) -> Message {
+        emitted_control(app, "chat-close.cancel", |message| matches!(message, Message::ChatClose(Action::Cancel(_))))
+    }
+    fn hide_receipt(task: Task<Message>) -> Message {
+        output(task, |message| matches!(message, Message::ChatClose(Action::CommitHide(_))))
+    }
+    fn queued(task: Task<Message>) -> Message {
+        output(task, |message| matches!(message, Message::CloseQueuedCard(_)))
+    }
+    fn second_chat(app: &mut Cagents, directory: &Path, name: &str) -> CardId {
+        drop(app.new_native_chat(Provider::Codex, Some(directory.into())));
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("chat"); };
+        runtime.session.launch.session_id = Some(name.into());
+        let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else { panic!("descriptor"); };
+        session.launch.session_id = Some(name.into());
+        write(app, card, name, false);
+        card
+    }
+    fn retain_in_channel(app: &mut Cagents, directory: &Path, cards: Vec<CardId>) -> crate::model::ChannelId {
+        let project = ProjectId::new();
+        let channel = crate::model::ChannelId::new();
+        app.sidebar_model.projects.push(crate::sidebar::SidebarProject::new(project, crate::repository::RepositoryId::new(),
+            "Recorded project".into(), directory.into(), Vec::new(), Vec::new()));
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(crate::model::ProjectChannel { id: channel, project_id: project, title: "Retained conversation".into(),
+            title_source: Default::default(), ordinal: 0, shared: false, cards, focused: None });
+        durable.active_channel = Some(channel);
+        channel
+    }
+    fn attach_durable_owner(app: &mut Cagents, card: CardId) -> chat::Session {
+        let mut session = app.chat_return_session(card).unwrap();
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("modal-close-owner"),
+            boot_id: crate::model::BootId::new("modal-close-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("modal-close-incarnation"),
+        });
+        session.native_continuity = chat::NativeContinuity::Durable { provider_version: "fixture".into() };
+        app.card_state_mut(card).unwrap().kind = CardKind::Chat(session.clone());
+        let handle = Arc::new(ClientHandle::fixture(session.clone(), Snapshot {session_id: session.launch.session_id.clone(), ready: true, ..Snapshot::default()}));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else { panic!("runtime"); };
+        runtime.session = session.clone();
+        runtime.connection = Connection::Live(handle);
+        session
+    }
+    fn pending_end(app: &Cagents, card: CardId) -> Target {
+        match app.chat_ui.phases.get(&card) {
+            Some(Phase::Closing {target, restart: None}) => *target,
+            _ => panic!("exact End cleanup phase"),
+        }
+    }
+
+    #[test]
+    fn selected_chat_hide_retires_only_its_step_and_cancel_keeps_the_remaining_conversations() {
+        let (mut app, first, directory) = fixture();
+        write(&mut app, first, "first draft", false);
+        let second = second_chat(&mut app, directory.path(), "second conversation");
+        retain_in_channel(&mut app, directory.path(), vec![first, second]);
+        let first_delivery = queued(app.close_cards_in_order(vec![first, second]));
+        let batch = app.pane_close_batch_for(first);
+        assert!(batch.is_some());
+        drop(app.update(first_delivery));
+        assert_eq!(app.chat_ui.close_dialog.as_ref().unwrap().card, first);
+        let decision = hide_decision(&app);
+        let receipt = hide_receipt(app.update(decision));
+        let next = queued(app.update(receipt));
+        assert!(!app.workspace.order().any(|id| id == first));
+        assert!(app.card_state(first).unwrap().existence.is_open());
+        assert!(app.cards.contains_key(&first));
+        assert!(app.durable.channels[0].cards.contains(&first));
+        let first_key = draft_key(&app.chat_return_session(first).unwrap()).unwrap();
+        assert_eq!(app.durable.conversation_drafts[&first_key], "first draft");
+        assert!(!app.pane_close_decision_current(first, batch));
+        assert!(app.pane_close_decision_current(second, batch));
+        drop(app.update(next));
+        assert_eq!(app.chat_ui.close_dialog.as_ref().unwrap().card, second);
+        let cancel = cancel_decision(&app);
+        drop(app.update(cancel));
+        assert!(!app.project_recovery_ui.closing_panes);
+        assert!(app.queued_card_closes.is_empty());
+        assert!(app.card_state(first).unwrap().existence.is_open());
+        assert!(app.card_state(second).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn stale_hide_completion_cannot_consume_a_new_batch_or_reservation_of_the_same_chat() {
+        let (mut app, card, _directory) = fixture();
+        write(&mut app, card, "saved draft", false);
+        let first = queued(app.close_cards_in_order(vec![card]));
+        drop(app.update(first));
+        let decision = hide_decision(&app);
+        let old_receipt = hide_receipt(app.update(decision));
+        let old = app.pane_close_batch_for(card);
+        let newer = queued(app.close_cards_in_order(vec![card]));
+        let current = app.pane_close_batch_for(card);
+        assert_ne!(old, current);
+        drop(app.update(newer));
+        let generation = app.chat_ui.close_dialog.as_ref().unwrap().generation();
+        drop(app.update(old_receipt.clone()));
+        assert_eq!(app.chat_ui.close_dialog.as_ref().unwrap().generation(), generation);
+        assert!(app.pane_close_decision_current(card, current));
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(app.pending_card_removal_target(card).is_none());
+        let decision = hide_decision(&app);
+        let receipt = hide_receipt(app.update(decision));
+        let replacement = app.pending_card_removal_target(card).unwrap();
+        drop(app.update(old_receipt));
+        assert_eq!(app.pending_card_removal_target(card), Some(replacement));
+        assert!(app.card_removal_current(replacement));
+        drop(app.update(receipt));
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.project_recovery_ui.closing_panes);
+    }
+
+    #[test]
+    fn held_chat_decisions_from_a_revoked_selection_cannot_act_on_its_reopened_dialog() {
+        let (mut app, card, _directory) = fixture();
+        write(&mut app, card, "do not discard", false);
+        let old = queued(app.close_cards_in_order(vec![card]));
+        drop(app.update(old));
+        let held = [cancel_decision(&app), emitted_confirm(&app), hide_decision(&app)];
+        let newer = queued(app.close_cards_in_order(vec![card]));
+        drop(app.update(newer));
+        let generation = app.chat_ui.close_dialog.as_ref().unwrap().generation();
+        let current = app.pane_close_batch_for(card);
+        for message in held {
+            let result = app.update(message);
+            assert!(iced::runtime::task::into_stream(result).is_none());
+            assert_eq!(app.chat_ui.close_dialog.as_ref().unwrap().generation(), generation);
+            assert!(app.pane_close_decision_current(card, current));
+            assert!(app.workspace.order().any(|id| id == card));
+            assert!(app.card_state(card).unwrap().existence.is_open());
+            assert!(app.pending_card_removal_target(card).is_none());
+            assert!(app.chat_ui.phases.get(&card).is_none());
+        }
+        let current_cancel = cancel_decision(&app);
+        drop(app.update(current_cancel));
+        assert!(!app.project_recovery_ui.closing_panes);
+    }
+
+    #[test]
+    fn selected_end_of_a_hidden_durable_chat_advances_only_after_the_exact_cleanup_receipt() {
+        let (mut app, card, directory) = fixture();
+        let source = attach_durable_owner(&mut app, card);
+        write(&mut app, card, "hidden selected draft", false);
+        let other = second_chat(&mut app, directory.path(), "next selected conversation");
+        retain_in_channel(&mut app, directory.path(), vec![card, other]);
+        drop(app.update(Message::CloseCard(card)));
+        let decision = hide_decision(&app);
+        let receipt = hide_receipt(app.update(decision));
+        drop(app.update(receipt));
+        assert!(!app.workspace.order().any(|id| id == card));
+        let delivery = queued(app.close_cards_in_order(vec![card, other]));
+        drop(app.update(delivery));
+        let decision = emitted_confirm(&app);
+        drop(app.update(decision));
+        let target = pending_end(&app, card);
+        let batch = app.pane_close_batch_for(card);
+        assert_eq!(app.queued_card_closes.len(), 1);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        let next = queued(app.update(Message::ChatUi(super::super::Action::RetainedCloseFinished(target, source, Ok(())))));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(!app.pane_close_decision_current(card, batch));
+        assert!(app.pane_close_decision_current(other, batch));
+        drop(app.update(next));
+        assert_eq!(app.chat_ui.close_dialog.as_ref().unwrap().card, other);
+    }
+
+    #[test]
+    fn direct_chat_hide_cannot_dequeue_an_unrelated_selected_delivery() {
+        let (mut app, direct, directory) = fixture();
+        write(&mut app, direct, "independent draft", false);
+        let first = second_chat(&mut app, directory.path(), "first selected");
+        let second = second_chat(&mut app, directory.path(), "second selected");
+        let held = queued(app.close_cards_in_order(vec![first, second]));
+        let batch = app.pane_close_batch_for(first);
+        drop(app.update(Message::CloseCard(direct)));
+        let decision = hide_decision(&app);
+        let receipt = hide_receipt(app.update(decision));
+        drop(app.update(receipt));
+        assert_eq!(app.queued_card_closes.len(), 1);
+        assert!(app.pane_close_decision_current(first, batch));
+        assert!(app.pane_close_decision_current(second, batch));
+        assert!(!app.workspace.order().any(|id| id == direct));
+        drop(app.update(held));
+        assert_eq!(app.chat_ui.close_dialog.as_ref().unwrap().card, first);
+    }
+
+    #[test]
+    fn ending_a_genuinely_hidden_durable_chat_waits_for_cleanup_and_retires_its_saved_conversation() {
+        let (mut app, card, directory) = fixture();
+        let source = attach_durable_owner(&mut app, card);
+        let channel = retain_in_channel(&mut app, directory.path(), vec![card]);
+        write(&mut app, card, "provider-keyed hidden draft", false);
+        drop(app.update(Message::CloseCard(card)));
+        let decision = hide_decision(&app);
+        let receipt = hide_receipt(app.update(decision));
+        drop(app.update(receipt));
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        drop(app.update(Message::ChatClose(Action::End(card))));
+        let confirm = emitted_confirm(&app);
+        drop(app.update(confirm));
+        let target = pending_end(&app, card);
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.card_state(card).unwrap().existence.is_open(), "cleanup is still owed");
+        // A fixture result settles the actual phase; no live provider IO is polled.
+        drop(app.update(Message::ChatUi(super::super::Action::RetainedCloseFinished(target, source.clone(), Ok(())))));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(!app.workspace.order().any(|id| id == card));
+        assert!(!app.cards.contains_key(&card));
+        assert!(app.workspace.pending_close().is_none());
+        assert_eq!(app.durable.conversation_drafts[&draft_key(&source).unwrap()], "provider-keyed hidden draft");
+        assert!(app.recently_closed.iter().any(|(saved, destination)| saved.id == card && *destination == Some(WorkspaceDestination::Channel(channel))));
+        assert!(matches!(&app.card_state(card).unwrap().kind, CardKind::Chat(saved) if saved == &source));
+    }
+
+    #[test]
+    fn revoked_hidden_end_cleanup_cannot_close_a_reopened_chat_or_take_a_new_selection() {
+        let (mut app, card, directory) = fixture();
+        let source = attach_durable_owner(&mut app, card);
+        let channel = retain_in_channel(&mut app, directory.path(), vec![card]);
+        write(&mut app, card, "keep after reopened selection", false);
+        drop(app.update(Message::CloseCard(card)));
+        let decision = hide_decision(&app);
+        let receipt = hide_receipt(app.update(decision));
+        drop(app.update(receipt));
+        assert!(!app.workspace.order().any(|id| id == card));
+        let first = queued(app.close_cards_in_order(vec![card]));
+        drop(app.update(first));
+        let decision = emitted_confirm(&app);
+        drop(app.update(decision));
+        let target = pending_end(&app, card);
+        let old = app.pane_close_batch_for(card);
+        let _held = queued(app.close_cards_in_order(vec![card]));
+        let current = app.pane_close_batch_for(card);
+        assert_ne!(old, current);
+        drop(app.select_channel(channel));
+        assert!(app.workspace.order().any(|id| id == card));
+        drop(app.update(Message::ChatUi(super::super::Action::RetainedCloseFinished(target, source, Ok(())))));
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.workspace.order().any(|id| id == card));
+        assert!(app.pane_close_decision_current(card, current));
+        assert!(app.chat_ui.end_requests.is_empty());
+        assert!(app.workspace.pending_close().is_none());
+        assert!(app.recently_closed.is_empty());
     }
 
     #[test]
@@ -739,7 +1110,8 @@ mod tests {
         write(&mut app, card, "draft survives hide", false);
         drop(app.request_chat_tab_close(card));
         respond(&mut app, Action::Hide);
-        drop(app.update_chat_close(Action::CommitHide(card)));
+        let target = app.pending_card_removal_target(card).expect("issued Hide reservation");
+        drop(app.update_chat_close(Action::CommitHide(target)));
         assert!(!app.workspace.order().any(|id| id == card));
         assert!(app.card_state(card).unwrap().existence.is_open());
         assert!(app.cards.contains_key(&card));
