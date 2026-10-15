@@ -204,7 +204,7 @@ impl ClaudeProofs {
                 let key = frame["command_uuid"].as_str()?;
                 match frame["state"].as_str()? {
                     "started" | "completed" => self.joins.accepted(key, session, key),
-                    "cancelled" | "discarded" => {
+                    "cancelled" | "discarded" | "refused" => {
                         self.joins.retire(key);
                         None
                     }
@@ -512,6 +512,23 @@ mod tests {
         assert!(proofs.observe(&claude_user("replacement", "session"), &aliases, None).is_none());
         assert!(proofs.observe(&lifecycle("replacement", "started"), &[], None).is_none());
         assert!(proofs.observe(&claude_user("replacement", "session"), &[], None).is_some());
+    }
+
+    #[test]
+    fn claude_refused_commands_release_capacity_and_late_echo_cannot_accept() {
+        let mut proofs = ClaudeProofs::default();
+        for index in 0..MAX_PENDING {
+            proofs.submit(&format!("command-{index}"), &format!("uuid-{index}"), Some("session")).unwrap();
+        }
+        for index in 0..MAX_PENDING {
+            let id = format!("uuid-{index}");
+            assert!(proofs.observe(&lifecycle(&id, "refused"), &[], Some("session")).is_none());
+            assert!(proofs.observe(&lifecycle(&id, "started"), &[], Some("session")).is_none());
+            assert!(proofs.observe(&claude_user(&id, "session"), &[], None).is_none());
+        }
+        proofs.submit("new-command", "new-uuid", Some("session")).unwrap();
+        assert!(proofs.observe(&lifecycle("new-uuid", "started"), &[], Some("session")).is_none());
+        assert!(proofs.observe(&claude_user("new-uuid", "session"), &[], None).is_some());
     }
 
     #[test]
