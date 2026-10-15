@@ -3521,6 +3521,9 @@ struct SessionHandle {
 
 impl SessionHandle {
     fn status(&self) -> LspStatus {
+        if self.retired.load(Ordering::Acquire) {
+            return LspStatus::Disabled;
+        }
         self.status
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -9060,6 +9063,7 @@ mod tests {
             assert!(manager.live_servers().is_empty());
             assert!(old.methods().iter().any(|method| method == "shutdown"));
             assert!(old.methods().iter().any(|method| method == "exit"));
+            assert!(matches!(manager.status(doc), LspStatus::Disabled));
             assert!(wait_until_gone(pid).await, "the old server must be reaped before replacement admission");
 
             manager.open_for_test(LspDocumentId(2), &file, &worktree, rust_language(), 1, "fn replacement() {}\n");

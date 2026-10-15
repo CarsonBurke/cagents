@@ -10470,7 +10470,12 @@ impl Cagents {
         };
         match event {
             LspEvent::RootDiscovered { .. } => unreachable!("handled above"),
-            LspEvent::Resources { .. } => {}
+            LspEvent::Resources { .. } => {
+                // A root can retire while its editor remains open. Session
+                // retirement suppresses late protocol events, so refresh its
+                // status here instead of leaving a stale Ready indicator.
+                state.context.status = Some(self.lsp.status(doc));
+            }
             LspEvent::Diagnostics { version, items, .. } => {
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.set_editor_diagnostics(
