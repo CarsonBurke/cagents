@@ -801,6 +801,22 @@ impl Cagents {
                 .filter(|view| view.panes.iter().any(|candidate| candidate.id == card));
             let Some(owner) = owners.next() else { continue; };
             if owners.next().is_some() || owner.scope == *scope { continue; }
+            let repository_for = |scope: &Scope| match scope {
+                Scope::Channel(channel) => self.workspace_model.channel(*channel)
+                    .map(|channel| channel.repository.clone()),
+                Scope::Worktree { repository, .. } => Some(repository.clone()),
+            };
+            let source_verified = self.shared_views.source_bases.get(operation)
+                .is_some_and(|(identity, repository)| *identity == self.workspace_model.identity
+                    && repository_for(scope).as_deref() == Some(repository.as_path())
+                    && repository_for(&owner.scope).as_deref() == Some(repository.as_path()));
+            if !source_verified {
+                // Unknown origin stays unknown: do not mint a retry whose
+                // publication would capture unrelated current authority.
+                discarded.insert(*operation);
+                stale_actor = true;
+                continue;
+            }
             let current = owner.panes.iter().find(|pane| pane.id == card).unwrap();
             let source_changed = before.kind != pane.kind
                 || before.pending_terminal_start != pane.pending_terminal_start
@@ -1846,6 +1862,9 @@ mod tests {
         desired.title = "Preserved presentation edit".into();
         app.shared_views.pending.push((uuid::Uuid::new_v4(), Scope::Channel(source),
             Change::Update { before, pane: desired.clone() }));
+        let (operation, scope, change) = app.shared_views.pending.last().unwrap().clone();
+        app.publish_model_edit(ModelEdit::ChangeView { scope, expected_revision: 17, operation, change });
+        while rx.try_recv().is_ok() {}
         let mut model = app.workspace_model.clone();
         views::transfer(&mut model.views, &Scope::Channel(source), pane.id,
             &Scope::Channel(destination), None).unwrap();
@@ -1878,6 +1897,49 @@ mod tests {
         assert!(app.notices.recent().any(|entry|
             entry.notice.message.contains("incoming session update could not be verified")));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn transferred_updates_cannot_acquire_missing_or_foreign_source_authority() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for control in ["uncaptured", "foreign-watch-first", "foreign-registry"] {
+            let (mut app, source, destination, pane) = channel_move_fixture();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            drop(app.move_pane_to_channel(pane.id, destination));
+            let ModelEdit::ChangeView { operation: transfer, .. } = rx.try_recv().unwrap() else {
+                panic!("transfer");
+            };
+            let operation = uuid::Uuid::new_v4();
+            let mut desired = pane.clone();
+            desired.title = "Unverified earlier title".into();
+            let change = Change::Update { before: pane.clone(), pane: desired };
+            app.shared_views.pending.push((operation, Scope::Channel(source), change.clone()));
+            if control != "uncaptured" {
+                app.publish_model_edit(ModelEdit::ChangeView { scope: Scope::Channel(source),
+                    expected_revision: 17, operation, change });
+                while rx.try_recv().is_ok() {}
+            }
+            let mut model = app.workspace_model.clone();
+            views::transfer(&mut model.views, &Scope::Channel(source), pane.id,
+                &Scope::Channel(destination), None).unwrap();
+            if control == "foreign-watch-first" {
+                for channel in &mut model.channels { channel.repository = "/foreign/.git".into(); }
+            } else if control == "foreign-registry" {
+                app.shared_views.source_bases.get_mut(&operation).unwrap().0 = uuid::Uuid::new_v4();
+            }
+            model.sequence += 1;
+            app.workspace_model = model.clone();
+            drop(app.apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(source), operation: Some(transfer), model,
+            }));
+            assert!(rx.try_recv().is_err(), "an unknown source must not gain a fresh receipt: {control}");
+            assert!(!app.shared_views.pending.iter().any(|(id, _, _)| *id == operation));
+            assert!(!app.shared_views.source_bases.contains_key(&operation));
+            assert_eq!(app.card_state(pane.id).unwrap().title, pane.title);
+            assert!(app.notices.recent().any(|entry|
+                entry.notice.message.contains("incoming session update could not be verified")));
+        }
     }
 
     #[test]
