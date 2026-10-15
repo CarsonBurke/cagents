@@ -15,6 +15,7 @@ pub(crate) const RESIDENT_BYTES:usize=72*1024*1024;
 struct Owners {
     entries:Vec<(std::sync::Weak<Item>,usize)>,
     provenance:HashMap<usize,ResidentSource>,
+    last_emitted:Option<Usage>,
     /// Private offline readers reserve before allocating decoded source bodies.
     reserved:usize,
     /// One global replacement can temporarily overlap the old Item owners.
@@ -58,9 +59,19 @@ pub(crate) struct Usage {
     pub admitted_bytes:usize,
     pub reserved_bytes:usize,
 }
+fn emit(pool:&Arc<Mutex<Owners>>,state:&mut Owners) {
+    if !Arc::ptr_eq(pool,owners()) {return;}
+    let usage=Usage {admitted_bytes:state.bytes(),reserved_bytes:state.reserved};
+    if state.last_emitted==Some(usage) {return;}
+    state.last_emitted=Some(usage);
+    tracing::trace!(target:"cagents::memory",owner="chat_source_pool",pool_id=1u64,
+        accounting="logical_source_payload",admitted_bytes=usage.admitted_bytes,reserved_bytes=usage.reserved_bytes,
+        "logical source payload ownership changed");
+}
 pub(crate) fn usage()->Usage {
-    let mut owners=owners().lock().unwrap_or_else(|error|error.into_inner());owners.prune();
-    Usage {admitted_bytes:owners.bytes(),reserved_bytes:owners.reserved}
+    let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();
+    emit(pool,&mut state);
+    Usage {admitted_bytes:state.bytes(),reserved_bytes:state.reserved}
 }
 fn text_bytes(item:&Item)->Option<usize> {
     match &item.content {ItemContent::Text {text,..}=>Some(text.len()),_=>None}
@@ -69,12 +80,12 @@ pub(crate) fn admit(item:&Arc<Item>,source:&SourceKey,epoch:u64,replaced:Option<
     let Some(metadata)=SourceMetadata::from_item(item) else {return Admission::Capacity;};
     let Some(bytes)=text_bytes(item) else {return Admission::Capacity;};
     if item.id!=source.source_id {return Admission::Capacity;}
-    let mut owners=owners().lock().unwrap_or_else(|error|error.into_inner());
-    let result=owners.admit(item,bytes,replaced);
+    let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());
+    let result=state.admit(item,bytes,replaced);
     if result==Admission::Ready {
-        owners.provenance.insert(Arc::as_ptr(item) as usize,ResidentSource {source:source.clone(),bytes,epoch,metadata});
+        state.provenance.insert(Arc::as_ptr(item) as usize,ResidentSource {source:source.clone(),bytes,epoch,metadata});
     }
-    result
+    emit(pool,&mut state);result
 }
 
 /// Exact provenance recorded when a projected view is written to private cache.
@@ -87,8 +98,8 @@ pub(crate) struct ResidentSource {
     pub metadata:SourceMetadata,
 }
 pub(crate) fn resident_sources(snapshot:&Snapshot)->Vec<ResidentSource> {
-    let mut owners=owners().lock().unwrap_or_else(|error|error.into_inner());owners.prune();
-    resident_sources_in(&owners,snapshot)
+    let pool=owners();let mut state=pool.lock().unwrap_or_else(|error|error.into_inner());state.prune();
+    emit(pool,&mut state);resident_sources_in(&state,snapshot)
 }
 fn resident_sources_in(owners:&Owners,snapshot:&Snapshot)->Vec<ResidentSource> {
     std::iter::once((None,&snapshot.items))
@@ -114,9 +125,9 @@ pub(crate) fn reserve(bytes:usize,largest_source:usize)->Result<Reservation,Rese
 fn reserve_in(pool:Arc<Mutex<Owners>>,bytes:usize,largest:usize)->Result<Reservation,ReserveError> {
     if largest>SOURCE_BYTES || largest>bytes || (bytes>0 && largest==0) {return Err(ReserveError::InvalidPayload);}
     {
-        let mut owners=pool.lock().unwrap_or_else(|error|error.into_inner());owners.prune();
+        let mut owners=pool.lock().unwrap_or_else(|error|error.into_inner());owners.prune();emit(&pool,&mut owners);
         if owners.bytes().saturating_add(owners.reserved).saturating_add(bytes)>RESIDENT_BYTES {return Err(ReserveError::Capacity);}
-        owners.reserved+=bytes;
+        owners.reserved+=bytes;emit(&pool,&mut owners);
     }
     Ok(Reservation {pool,bytes})
 }
@@ -149,14 +160,14 @@ impl Reservation {
             }
             owners.provenance.insert(pointer as usize,record.clone());
         }
-        Ok(())
+        emit(&self.pool,&mut owners);Ok(())
     }
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
         if self.bytes>0 {
-            let mut owners=self.pool.lock().unwrap_or_else(|error|error.into_inner());
-            owners.reserved-=self.bytes;
+            let mut owners=self.pool.lock().unwrap_or_else(|error|error.into_inner());owners.prune();
+            owners.reserved-=self.bytes;emit(&self.pool,&mut owners);
         }
     }
 }
