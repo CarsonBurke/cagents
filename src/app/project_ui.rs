@@ -2408,16 +2408,18 @@ impl Cagents {
                 let crate::worktree_control::Reply::Inspected { snapshot, .. } = worktree_control_request(crate::worktree_control::Operation::Inspect { repository: request.repository.clone(), path: request.path.clone() })? else { return Err("Unexpected worktree safety response".into()); };
                 let current: WorktreeSafetySnapshot = serde_json::from_str(&snapshot).map_err(|error| error.to_string())?;
                 if current != confirmed { return Err("The worktree changed after confirmation; review its current files and commits".into()); }
-                let consented_agents = consented_agents.ok_or("Active agent consent must be checked again")?;
-                // The owning daemon compares execution instance/revision and
-                // closes conditionally at the actors. A separate census then
-                // unconditional close could interrupt an unconfirmed new turn.
-                let reply = worktree_control_request(crate::worktree_control::Operation::CloseSessions {
-                    repository: request.repository.clone(), path: request.path.clone(), agents: consented_agents.agents, census: consented_agents.census,
+                let observed = consented_agents.ok_or("Session stop consent must be checked again")?;
+                let consent = worktree_session_stop_consent(&observed)?;
+                // This is explicit consent to stop these exact actor lifetimes
+                // and ALL their ongoing work. The host fences new admission
+                // and refuses replacements/new actors before stopping them.
+                // The stronger conditional-close API remains live-refusing.
+                let reply = worktree_control_request(crate::worktree_control::Operation::StopSessions {
+                    repository: request.repository.clone(), path: request.path.clone(), consent,
                 })?;
                 match reply {
-                    crate::worktree_control::Reply::SessionsClosed { path } if path == request.path => Ok(()),
-                    _ => Err("Unexpected guarded worktree session close response".into()),
+                    crate::worktree_control::Reply::SessionsStopped { path } if path == request.path => Ok(()),
+                    _ => Err("Unexpected worktree session stop response".into()),
                 }
             }).await.map_err(|error| error.to_string()).and_then(|result| result);
             Message::ProjectUi(Action::DeletionSessionsClosed {
@@ -3683,6 +3685,23 @@ pub struct AgentCensus {
     census: Vec<BusyAgent>,
 }
 
+/// Derive only from the complete roster explicitly approved by the user.
+/// Revisions still fence the UI's fresh confirmation; whole-session stop
+/// intentionally authorizes all work within each retained actor lifetime.
+fn worktree_session_stop_consent(observed: &AgentCensus) -> Result<crate::worktree_control::SessionStopConsent, String> {
+    let mut sessions = observed.census.iter().map(|actor| crate::worktree_control::SessionIdentity {
+        session: actor.session,
+        instance: actor.session_instance,
+    }).collect::<Vec<_>>();
+    sessions.sort();
+    if sessions.iter().any(|session| session.instance.is_nil())
+        || sessions.windows(2).any(|pair| pair[0].session == pair[1].session)
+    {
+        return Err("The worktree session roster has unknown or ambiguous lifetime identities; review it again".into());
+    }
+    Ok(crate::worktree_control::SessionStopConsent {sessions})
+}
+
 fn busy_worktree_agents(repository: &Path, path: &Path) -> Result<AgentCensus, String> {
     let reply = worktree_control_request(crate::worktree_control::Operation::BusySessions {
         repository: repository.to_owned(),
@@ -4288,6 +4307,25 @@ mod tests {
                 .unwrap()
                 .contains("changed")
         );
+    }
+
+    #[test]
+    fn whole_session_consent_retains_lifetimes_instead_of_turn_revisions() {
+        let actor = BusyAgent {session: TerminalId::new(), instance: uuid::Uuid::new_v4(),
+            close_revision: Some(1), turn_generation: Some(1), session_instance: uuid::Uuid::new_v4()};
+        let original = AgentCensus {agents: vec![], census: vec![actor.clone()]};
+        let expected = worktree_session_stop_consent(&original).unwrap();
+        assert_eq!(expected.sessions.len(), 1, "idle sessions are included in explicit stop consent");
+        assert_eq!(expected.sessions[0].instance, actor.session_instance);
+        let mut next_turn = actor.clone();
+        next_turn.close_revision = Some(2); next_turn.turn_generation = Some(2);
+        assert_eq!(worktree_session_stop_consent(&AgentCensus {agents: vec![next_turn.clone()], census: vec![next_turn]}).unwrap(), expected,
+            "the explicit checkbox covers all ongoing work within the same actor lifetime");
+        let mut replaced = actor.clone(); replaced.session_instance = uuid::Uuid::new_v4();
+        assert_ne!(worktree_session_stop_consent(&AgentCensus {agents: vec![], census: vec![replaced.clone()]}).unwrap(), expected);
+        assert!(worktree_session_stop_consent(&AgentCensus {agents: vec![], census: vec![actor.clone(), replaced]}).is_err());
+        let mut unknown = actor; unknown.session_instance = uuid::Uuid::nil();
+        assert!(worktree_session_stop_consent(&AgentCensus {agents: vec![], census: vec![unknown]}).is_err());
     }
 
     #[test]
