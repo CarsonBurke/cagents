@@ -254,9 +254,9 @@ mod tests {
             assert!(!receipt_covers(&record, &source_digest(&forged).unwrap(), &[source_digest(&recovered.source).unwrap()]).unwrap());
         }
         let mut wrong = recovered.clone(); wrong.server_process.as_mut().unwrap().start += 1;
-        assert!(recognized_source(&record, &wrong, &published).is_err());
+        assert!(Publisher::new(&wrong).unwrap().retain(&record, &original, &recovered.source).is_err());
         let mut replacement = record.clone(); replacement.root.start += 1;
-        assert!(recognized_source(&replacement, &recovered, &published).is_err());
+        assert!(receipt_covers(&replacement, &hash, &[source_digest(&initial).unwrap()]).is_err());
         let mut full = load(&record).unwrap().unwrap();
         full.bindings = (0..MAX_BINDINGS).map(|index| { let mut hash = [0;32]; hash[..8].copy_from_slice(&(index as u64).to_le_bytes()); Binding { published: hash, wire: hash } }).collect();
         save(&full).unwrap();
