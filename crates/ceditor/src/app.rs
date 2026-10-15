@@ -4005,6 +4005,7 @@ impl Application for Editor {
                     Task::batch([task, report])
                 }
                 Message::RevealedInFiles { card, key, requested, result } => {
+                    let reveal_visible = self.active == Some(card) && self.sidebar_open && self.sidebar_panel == WorktreePanel::Files && !self.modal_open();
                     let Some(tab) = self.tab_mut(card) else { return Task::none(); };
                     if !tab.snapshot_loading { return Task::none(); }
                     tab.snapshot_loading = false;
@@ -4016,7 +4017,7 @@ impl Application for Editor {
                             source.revealed_path = target;
                             if let Some(previous) = tab.sidebar.source_control.as_ref() { previous.carry_mutation_into(&mut source); }
                             tab.navigation.reconcile_change_rows(&source);
-                            let focus = tab.navigation.finish_reveal_in_files(&source);
+                            let focus = tab.navigation.finish_reveal_in_files(&source).filter(|_| reveal_visible);
                             tab.sidebar.source_control = Some(source);
                             let root = tab.runtime.descriptor.worktree.clone();
                             let sourced = tab.review.set_source(review_source(&root, Some(&snapshot))).map(move |action| Message::PullRequestReview(card, action)).map(cosmic::Action::App);
