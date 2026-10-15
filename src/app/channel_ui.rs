@@ -844,9 +844,10 @@ impl Cagents {
     pub(super) fn name_channel_from_prompt(&mut self, card: CardId, prompt: &str) {
         // Later messages do not replace an established task. Restored snapshots
         // may repair a poor historical fallback using the first substantive prompt.
-        if self.durable.channels.iter().any(|channel| channel.title.is_empty()
-            && self.channel_primary_chat(channel) == Some(card))
-            && let Some(title) = channel_title_from_prompt(prompt) {
+        if self.durable.channels.iter().any(|channel| {
+            channel.title.is_empty() && self.channel_primary_chat(channel) == Some(card)
+        }) && let Some(title) = channel_title_from_prompt(prompt)
+        {
             self.suggest_channel_title(card, title, crate::model::ChannelTitleSource::Prompt);
         }
     }
@@ -865,13 +866,22 @@ impl Cagents {
             return false;
         };
         let id = self.durable.channels[index].id;
-        let Some(view) = self.workspace_model.views.iter().find(|view|
+        let Some(view) = self.workspace_model.views.iter().find(|view| {
             view.scope == crate::workspace_model::views::Scope::Channel(id)
-                && view.primary_chat() == Some(card)) else { return false; };
+                && view.primary_chat() == Some(card)
+        }) else {
+            return false;
+        };
         let expected_revision = view.revision;
         Arc::make_mut(&mut self.durable).channels[index].title = title.clone();
         Arc::make_mut(&mut self.durable).channels[index].title_source = source;
-        self.publish_model_edit(ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source });
+        self.publish_model_edit(ModelEdit::SuggestConversationTitle {
+            id,
+            card,
+            expected_revision,
+            title,
+            source,
+        });
         self.refresh_sidebar_channels();
         self.persist();
         true
@@ -1147,11 +1157,20 @@ mod tests {
             "New channel"
         );
 
-        app.workspace_model.views.push(crate::workspace_model::views::View {
-            scope: crate::workspace_model::views::Scope::Channel(id), revision: 1,
-            panes: vec![crate::workspace_model::views::Pane::from_card(&app.durable.cards[0], Some("/repo".into())).unwrap()],
-            retired: Vec::new(),
-        });
+        app.workspace_model
+            .views
+            .push(crate::workspace_model::views::View {
+                scope: crate::workspace_model::views::Scope::Channel(id),
+                revision: 1,
+                panes: vec![
+                    crate::workspace_model::views::Pane::from_card(
+                        &app.durable.cards[0],
+                        Some("/repo".into()),
+                    )
+                    .unwrap(),
+                ],
+                retired: Vec::new(),
+            });
         let prompt = format!("Explain the parser {}", "with detailed context ".repeat(12));
         let expected = channel_title_from_prompt(&prompt).expect("prompt has a title");
         app.name_channel_from_prompt(card, &prompt);

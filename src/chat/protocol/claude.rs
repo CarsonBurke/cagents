@@ -408,7 +408,10 @@ impl Claude {
             && let Some(titles) = &mut self.titles
             && let Some(title) = titles.update(&id)
         {
-            step.events.push(Event::Session { id, title: Some(title) });
+            step.events.push(Event::Session {
+                id,
+                title: Some(title),
+            });
         }
     }
 
@@ -2080,7 +2083,9 @@ impl Adapter for Claude {
                                     title: None,
                                 });
                             }
-                            if self.resumed { self.observe_title(&mut step); }
+                            if self.resumed {
+                                self.observe_title(&mut step);
+                            }
                             self.metadata(&response["response"], &mut step);
                             self.fast_mode_metadata(&response["response"], &mut step);
                             if let Some(mode) =
@@ -2225,7 +2230,9 @@ impl Adapter for Claude {
                 }
             }
             "result" => {
-                if frame["parent_tool_use_id"].is_null() { self.observe_title(&mut step); }
+                if frame["parent_tool_use_id"].is_null() {
+                    self.observe_title(&mut step);
+                }
                 let can_suggest = frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
@@ -5056,8 +5063,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let cwd = root.path().canonicalize().unwrap();
         let config = cwd.join("claude-config");
-        let project: String = cwd.to_str().unwrap().chars()
-            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
         let project = config.join("projects").join(project);
         std::fs::create_dir_all(&project).unwrap();
         let id = uuid::Uuid::new_v4().to_string();
@@ -5069,27 +5080,68 @@ mod tests {
             provider: Provider::Claude,
             session_id: Some(id.clone()),
             recipe: crate::model::LaunchRecipe {
-                program: "claude".into(), arguments: Vec::new(), working_directory: cwd.clone(),
-                environment: [("HOME".into(), cwd.to_string_lossy().into_owned()),
-                    ("CLAUDE_CONFIG_DIR".into(), config.to_string_lossy().into_owned())].into(),
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd.clone(),
+                environment: [
+                    ("HOME".into(), cwd.to_string_lossy().into_owned()),
+                    (
+                        "CLAUDE_CONFIG_DIR".into(),
+                        config.to_string_lossy().into_owned(),
+                    ),
+                ]
+                .into(),
                 unset_environment: Default::default(),
             },
         };
-        let mut adapter = Claude { session_id: Some(id.clone()),
-            titles: super::super::claude_titles::ClaudeTitles::new(&launch), ..Default::default() };
+        let mut adapter = Claude {
+            session_id: Some(id.clone()),
+            titles: super::super::claude_titles::ClaudeTitles::new(&launch),
+            ..Default::default()
+        };
         let foreign = uuid::Uuid::new_v4().to_string();
-        assert!(adapter.receive(json!({"type":"result","session_id":foreign})).is_err());
-        let result = adapter.receive(json!({"type":"result","session_id":id})).unwrap();
+        assert!(
+            adapter
+                .receive(json!({"type":"result","session_id":foreign}))
+                .is_err()
+        );
+        let result = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
         assert!(result.events.iter().any(|event| matches!(event,
             Event::Session { id: actual, title: Some(title) }
             if actual == &id && title == "Bundle encryption and throughput")));
-        let unchanged = adapter.receive(json!({"type":"result","session_id":id})).unwrap();
-        assert!(!unchanged.events.iter().any(|event| matches!(event, Event::Session { title: Some(_), .. })));
-        let mut file = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
-        writeln!(file, "{}", json!({"type":"custom-title","sessionId":id,"customTitle":"Encrypted bundle audit"})).unwrap();
-        let streaming = adapter.receive(json!({"type":"stream_event","session_id":id,"event":{}})).unwrap();
-        assert!(!streaming.events.iter().any(|event| matches!(event, Event::Session { title: Some(_), .. })));
-        let result = adapter.receive(json!({"type":"result","session_id":id})).unwrap();
+        let unchanged = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
+        assert!(
+            !unchanged
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+        );
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(
+            file,
+            "{}",
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Encrypted bundle audit"})
+        )
+        .unwrap();
+        let streaming = adapter
+            .receive(json!({"type":"stream_event","session_id":id,"event":{}}))
+            .unwrap();
+        assert!(
+            !streaming
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Session { title: Some(_), .. }))
+        );
+        let result = adapter
+            .receive(json!({"type":"result","session_id":id}))
+            .unwrap();
         assert!(result.events.iter().any(|event| matches!(event,
             Event::Session { title: Some(title), .. } if title == "Encrypted bundle audit")));
     }

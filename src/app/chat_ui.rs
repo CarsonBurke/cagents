@@ -1352,15 +1352,29 @@ struct ChannelNameObservation {
     pending: bool,
 }
 impl ChannelNameObservation {
-    fn observe(&mut self, snapshot: &Snapshot) -> Option<(String, crate::model::ChannelTitleSource)> {
+    fn observe(
+        &mut self,
+        snapshot: &Snapshot,
+    ) -> Option<(String, crate::model::ChannelTitleSource)> {
         if self.session != snapshot.session_id {
-            *self = Self { session: snapshot.session_id.clone(), ..Self::default() };
+            *self = Self {
+                session: snapshot.session_id.clone(),
+                ..Self::default()
+            };
         }
         let previous = self.title.clone();
-        if let Some(title) = snapshot.title.as_deref().and_then(crate::workspace_model::channel_title) {
+        if let Some(title) = snapshot
+            .title
+            .as_deref()
+            .and_then(crate::workspace_model::channel_title)
+        {
             self.title = Some((title, crate::model::ChannelTitleSource::Provider));
         } else if self.title.is_none() {
-            let stamp = (snapshot.turn_generation, snapshot.items.len(), snapshot.items.first().map(|item| item.id.clone()));
+            let stamp = (
+                snapshot.turn_generation,
+                snapshot.items.len(),
+                snapshot.items.first().map(|item| item.id.clone()),
+            );
             if self.scanned.as_ref() != Some(&stamp) {
                 self.scanned = Some(stamp);
                 self.title = snapshot_channel_name(snapshot);
@@ -5288,20 +5302,38 @@ impl Cagents {
             _ => None,
         }
     }
-    fn observe_channel_name(&mut self, target: Target, snapshot: &Snapshot)
-        -> Option<(String, crate::model::ChannelTitleSource)> {
+    fn observe_channel_name(
+        &mut self,
+        target: Target,
+        snapshot: &Snapshot,
+    ) -> Option<(String, crate::model::ChannelTitleSource)> {
         if !self.chat_ui.channel_names.contains_key(&target) {
-            self.chat_ui.channel_names.retain(|previous, _| previous.card != target.card);
+            self.chat_ui
+                .channel_names
+                .retain(|previous, _| previous.card != target.card);
         }
-        self.chat_ui.channel_names.entry(target).or_default().observe(snapshot)
+        self.chat_ui
+            .channel_names
+            .entry(target)
+            .or_default()
+            .observe(snapshot)
     }
 
-    fn publish_observed_channel_name(&mut self, target: Target, title: String, source: crate::model::ChannelTitleSource) {
-        let settled = self.durable.channels.iter().any(|channel| channel.cards.contains(&target.card)
-            && (channel.title_source == crate::model::ChannelTitleSource::Manual && !channel.title.is_empty()
-                || channel.title == title && channel.title_source == source));
+    fn publish_observed_channel_name(
+        &mut self,
+        target: Target,
+        title: String,
+        source: crate::model::ChannelTitleSource,
+    ) {
+        let settled = self.durable.channels.iter().any(|channel| {
+            channel.cards.contains(&target.card)
+                && (channel.title_source == crate::model::ChannelTitleSource::Manual
+                    && !channel.title.is_empty()
+                    || channel.title == title && channel.title_source == source)
+        });
         if (settled || self.suggest_channel_title(target.card, title, source))
-            && let Some(observation) = self.chat_ui.channel_names.get_mut(&target) {
+            && let Some(observation) = self.chat_ui.channel_names.get_mut(&target)
+        {
             observation.pending = false;
         }
     }
@@ -5309,13 +5341,29 @@ impl Cagents {
     /// A title may precede its pane's first shared-view acknowledgement. Retry
     /// the retained candidate after projection, with the newly accepted proof.
     pub(super) fn refresh_channel_title_suggestions(&mut self) {
-        for target in self.chat_ui.channel_names.keys().copied().collect::<Vec<_>>() {
+        for target in self
+            .chat_ui
+            .channel_names
+            .keys()
+            .copied()
+            .collect::<Vec<_>>()
+        {
             if self.chat_runtime_mut(target).is_none() {
                 self.chat_ui.channel_names.remove(&target);
             }
         }
-        let candidates = self.chat_ui.channel_names.iter().filter_map(|(target, observation)|
-            observation.pending.then(|| observation.title.clone()).flatten().map(|(title, source)| (*target, title, source))).collect::<Vec<_>>();
+        let candidates = self
+            .chat_ui
+            .channel_names
+            .iter()
+            .filter_map(|(target, observation)| {
+                observation
+                    .pending
+                    .then(|| observation.title.clone())
+                    .flatten()
+                    .map(|(title, source)| (*target, title, source))
+            })
+            .collect::<Vec<_>>();
         for (target, title, source) in candidates {
             if self.chat_runtime_mut(target).is_some() {
                 self.publish_observed_channel_name(target, title, source);
@@ -6607,14 +6655,18 @@ impl Cagents {
                     && runtime.target == target
                 {
                     let snapshot = match runtime.handle() {
-                        Some(handle) if needs_name && matches!(wake, Wake::Changed) => Some(handle.snapshot()),
+                        Some(handle) if needs_name && matches!(wake, Wake::Changed) => {
+                            Some(handle.snapshot())
+                        }
                         _ => None,
                     };
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
-                    if let Some((name, source)) = snapshot.and_then(|snapshot| self.observe_channel_name(target, &snapshot)) {
+                    if let Some((name, source)) =
+                        snapshot.and_then(|snapshot| self.observe_channel_name(target, &snapshot))
+                    {
                         self.publish_observed_channel_name(target, name, source);
                     }
                     return Task::none();
@@ -7387,7 +7439,8 @@ impl Cagents {
                 }
             }
             Action::ChangesPicker(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -7482,7 +7535,8 @@ impl Cagents {
                 }
             }
             Action::ComposerActions(target, open) => {
-                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target) {
+                if !matches!(self.cards.get(&target.card), Some(CardRuntime::Chat(runtime)) if runtime.target == target)
+                {
                     return Task::none();
                 }
                 if open {
@@ -9888,23 +9942,42 @@ mod tests {
     #[test]
     fn automatic_channel_names_observe_metadata_without_replaying_old_snapshots() {
         let mut observation = ChannelNameObservation::default();
-        let mut snapshot = Snapshot { session_id: Some("session-a".into()), ..Default::default() };
+        let mut snapshot = Snapshot {
+            session_id: Some("session-a".into()),
+            ..Default::default()
+        };
         assert!(observation.observe(&snapshot).is_none());
-        snapshot.items.push(Arc::new(chat::Item { id: "first-task".into(), role: chat::Role::User,
-            content: text("Review bundle encryption and performance"), started_at: None, at: None }));
-        assert_eq!(observation.observe(&snapshot).unwrap().0, "Review bundle encryption and performance");
+        snapshot.items.push(Arc::new(chat::Item {
+            id: "first-task".into(),
+            role: chat::Role::User,
+            content: text("Review bundle encryption and performance"),
+            started_at: None,
+            at: None,
+        }));
+        assert_eq!(
+            observation.observe(&snapshot).unwrap().0,
+            "Review bundle encryption and performance"
+        );
         observation.pending = false;
         // Streaming assistant changes and newer shared-model reads must not
         // re-publish an older name over a newer name from another window.
         snapshot.generation += 1;
         assert!(observation.observe(&snapshot).is_none());
         snapshot.title = Some("Bundle encryption audit".into());
-        assert_eq!(observation.observe(&snapshot).unwrap().1, crate::model::ChannelTitleSource::Provider);
+        assert_eq!(
+            observation.observe(&snapshot).unwrap().1,
+            crate::model::ChannelTitleSource::Provider
+        );
         observation.pending = false;
         assert!(observation.observe(&snapshot).is_none());
         snapshot.title = Some("Encryption and throughput".into());
-        assert_eq!(observation.observe(&snapshot).unwrap().0, "Encryption and throughput");
-        snapshot.session_id = Some("successor-session".into()); snapshot.title = None; snapshot.items.clear();
+        assert_eq!(
+            observation.observe(&snapshot).unwrap().0,
+            "Encryption and throughput"
+        );
+        snapshot.session_id = Some("successor-session".into());
+        snapshot.title = None;
+        snapshot.items.clear();
         assert!(observation.observe(&snapshot).is_none());
         assert!(observation.title.is_none());
     }
@@ -11239,14 +11312,19 @@ mod tests {
     fn pane_menu_actions_recheck_fork_availability_and_ignore_replaced_targets() {
         fn assert_no_effects(task: Task<Message>) {
             use cosmic::iced::futures::StreamExt;
-            let count = tokio::runtime::Builder::new_current_thread().build().unwrap()
+            let count = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
                 .block_on(async {
                     match cosmic::iced::runtime::task::into_stream(task) {
                         Some(stream) => stream.count().await,
                         None => 0,
                     }
                 });
-            assert_eq!(count, 0, "obsolete or unavailable menu action must not emit effects");
+            assert_eq!(
+                count, 0,
+                "obsolete or unavailable menu action must not emit effects"
+            );
         }
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat(&mut app);
@@ -11265,7 +11343,10 @@ mod tests {
         let task = app.handle_chat_ui(Action::BranchPicker(target, true));
         assert_no_effects(task);
         assert!(!chat_runtime(&app, card).branch_picker);
-        let replaced = Target { generation: target.generation + 1, ..target };
+        let replaced = Target {
+            generation: target.generation + 1,
+            ..target
+        };
         for open in [true, false] {
             let task = app.handle_chat_ui(Action::ChangesPicker(replaced, open));
             assert_no_effects(task);

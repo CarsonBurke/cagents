@@ -160,21 +160,20 @@ fn candidate(line: &str, quoted: bool) -> Option<(usize, String)> {
         )
     });
     if words.first().is_some_and(|word| {
-            matches!(
-                *word,
-                "cargo"
-                    | "git"
-                    | "npm"
-                    | "pnpm"
-                    | "yarn"
-                    | "python"
-                    | "python3"
-                    | "cd"
-                    | "curl"
-                    | "wget"
-            )
-        })
-    {
+        matches!(
+            *word,
+            "cargo"
+                | "git"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "python"
+                | "python3"
+                | "cd"
+                | "curl"
+                | "wget"
+        )
+    }) {
         return None;
     }
     let meaningful = words
@@ -261,7 +260,13 @@ mod tests {
 
     #[test]
     fn a_short_live_task_outranks_a_long_quoted_task() {
-        assert_eq!(channel_title_from_prompt("> Review the old implementation across all of the existing packages\nFix UI").as_deref(), Some("Fix UI"));
+        assert_eq!(
+            channel_title_from_prompt(
+                "> Review the old implementation across all of the existing packages\nFix UI"
+            )
+            .as_deref(),
+            Some("Fix UI")
+        );
     }
 
     #[test]

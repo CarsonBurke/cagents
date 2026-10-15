@@ -5,7 +5,11 @@
 //! This is presentation metadata, never execution or filesystem ownership proof.
 use crate::{agent::Provider, chat::Launch};
 use serde_json::Value;
-use std::{fs::File, io::{BufRead, BufReader, Read, Seek, SeekFrom}, path::{Path, PathBuf}};
+use std::{
+    fs::File,
+    io::{BufRead, BufReader, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+};
 
 const HEAD_BYTES: u64 = 256 * 1024;
 const TAIL_BYTES: u64 = 64 * 1024;
@@ -18,20 +22,34 @@ pub(super) struct ClaudeTitles {
 
 impl ClaudeTitles {
     pub(super) fn new(launch: &Launch) -> Option<Self> {
-        Some(Self { config: Provider::Claude.session_root(&launch.recipe)?,
-            cwd: launch.recipe.working_directory.clone(), previous: None })
+        Some(Self {
+            config: Provider::Claude.session_root(&launch.recipe)?,
+            cwd: launch.recipe.working_directory.clone(),
+            previous: None,
+        })
     }
 
     pub(super) fn update(&mut self, id: &str) -> Option<String> {
         let cwd = self.cwd.canonicalize().unwrap_or_else(|_| self.cwd.clone());
-        if !cwd.is_absolute() { return None; }
+        if !cwd.is_absolute() {
+            return None;
+        }
         let path = crate::agent::claude_transcript(&self.config, &cwd, id).ok()?;
         use std::os::unix::fs::OpenOptionsExt;
-        let mut file = File::options().read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path).ok()?;
-        if !file.metadata().ok()?.is_file() { return None; }
+        let mut file = File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(path)
+            .ok()?;
+        if !file.metadata().ok()?.is_file() {
+            return None;
+        }
         let title = named_title(&mut file, id, &cwd)?;
-        if self.previous.as_ref().is_some_and(|(session, previous)| session == id && previous == &title) {
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|(session, previous)| session == id && previous == &title)
+        {
             return None;
         }
         self.previous = Some((id.to_owned(), title.clone()));
@@ -40,22 +58,50 @@ impl ClaudeTitles {
 }
 
 #[derive(Default)]
-struct Names { matched: bool, custom: Option<String>, summary: Option<String> }
+struct Names {
+    matched: bool,
+    custom: Option<String>,
+    summary: Option<String>,
+}
 impl Names {
     fn note(&mut self, line: &[u8], id: &str, cwd: &Path) {
-        let Ok(row) = serde_json::from_slice::<Value>(line) else { return; };
+        let Ok(row) = serde_json::from_slice::<Value>(line) else {
+            return;
+        };
         if row["isSidechain"] == true
-            || row["cwd"].as_str().is_some_and(|path| Path::new(path) != cwd) { return; }
+            || row["cwd"]
+                .as_str()
+                .is_some_and(|path| Path::new(path) != cwd)
+        {
+            return;
+        }
         if let Some(session) = row["sessionId"].as_str() {
-            if session != id { return; }
-            if row["cwd"].as_str().is_some_and(|path| Path::new(path) == cwd) {
+            if session != id {
+                return;
+            }
+            if row["cwd"]
+                .as_str()
+                .is_some_and(|path| Path::new(path) == cwd)
+            {
                 self.matched = true;
             }
         }
-        let label = |key: &str| row[key].as_str().and_then(crate::workspace_model::channel_title);
+        let label = |key: &str| {
+            row[key]
+                .as_str()
+                .and_then(crate::workspace_model::channel_title)
+        };
         match row["type"].as_str() {
-            Some("custom-title") => if let Some(title) = label("customTitle") { self.custom = Some(title); },
-            Some("summary") => if let Some(title) = label("summary") { self.summary = Some(title); },
+            Some("custom-title") => {
+                if let Some(title) = label("customTitle") {
+                    self.custom = Some(title);
+                }
+            }
+            Some("summary") => {
+                if let Some(title) = label("summary") {
+                    self.summary = Some(title);
+                }
+            }
             _ => {}
         }
     }
@@ -72,21 +118,28 @@ fn named_title(file: &mut File, id: &str, cwd: &Path) -> Option<String> {
         line.clear();
     }
     drop(reader);
-    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES))).ok()?;
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
     let mut reader = BufReader::new(file.take(TAIL_BYTES));
-    if len > TAIL_BYTES { reader.read_until(b'\n', &mut line).ok()?; line.clear(); }
+    if len > TAIL_BYTES {
+        reader.read_until(b'\n', &mut line).ok()?;
+        line.clear();
+    }
     while reader.read_until(b'\n', &mut line).ok()? != 0 {
         names.note(&line, id, cwd);
         line.clear();
     }
-    names.matched.then(|| names.custom.or(names.summary)).flatten()
+    names
+        .matched
+        .then(|| names.custom.or(names.summary))
+        .flatten()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
     use serde_json::json;
+    use std::io::Write;
 
     fn append(file: &mut File, value: Value) {
         writeln!(file, "{value}").unwrap();
@@ -99,27 +152,59 @@ mod tests {
         let mut file = tempfile::tempfile().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
         let cwd = Path::new("/work");
-        append(&mut file, json!({"sessionId":id,"cwd":cwd,"type":"user","message":{}}));
+        append(
+            &mut file,
+            json!({"sessionId":id,"cwd":cwd,"type":"user","message":{}}),
+        );
         file.seek(SeekFrom::End(0)).unwrap();
-        append(&mut file, json!({"type":"summary","summary":"Bundle encryption review"}));
-        assert_eq!(named_title(&mut file, &id, cwd).as_deref(), Some("Bundle encryption review"));
+        append(
+            &mut file,
+            json!({"type":"summary","summary":"Bundle encryption review"}),
+        );
+        assert_eq!(
+            named_title(&mut file, &id, cwd).as_deref(),
+            Some("Bundle encryption review")
+        );
         file.seek(SeekFrom::End(0)).unwrap();
-        append(&mut file, json!({"type":"custom-title","sessionId":id,"customTitle":"Encryption and throughput"}));
-        assert_eq!(named_title(&mut file, &id, cwd).as_deref(), Some("Encryption and throughput"));
+        append(
+            &mut file,
+            json!({"type":"custom-title","sessionId":id,"customTitle":"Encryption and throughput"}),
+        );
+        assert_eq!(
+            named_title(&mut file, &id, cwd).as_deref(),
+            Some("Encryption and throughput")
+        );
     }
 
     #[test]
     fn wrong_session_directory_and_sidechain_cannot_name_parent() {
         let mut file = tempfile::tempfile().unwrap();
         let id = uuid::Uuid::new_v4().to_string();
-        append(&mut file, json!({"sessionId":id,"cwd":"/other","type":"user","message":{}}));
+        append(
+            &mut file,
+            json!({"sessionId":id,"cwd":"/other","type":"user","message":{}}),
+        );
         file.seek(SeekFrom::End(0)).unwrap();
-        append(&mut file, json!({"type":"summary","summary":"Foreign work"}));
+        append(
+            &mut file,
+            json!({"type":"summary","summary":"Foreign work"}),
+        );
         assert!(named_title(&mut file, &id, Path::new("/work")).is_none());
         file.rewind().unwrap();
-        assert!(named_title(&mut file, &uuid::Uuid::new_v4().to_string(), Path::new("/other")).is_none());
-        file.set_len(0).unwrap(); file.rewind().unwrap();
-        append(&mut file, json!({"sessionId":id,"cwd":"/work","isSidechain":true,"type":"summary","summary":"Child work"}));
+        assert!(
+            named_title(
+                &mut file,
+                &uuid::Uuid::new_v4().to_string(),
+                Path::new("/other")
+            )
+            .is_none()
+        );
+        file.set_len(0).unwrap();
+        file.rewind().unwrap();
+        append(
+            &mut file,
+            json!({"sessionId":id,"cwd":"/work","isSidechain":true,"type":"summary","summary":"Child work"}),
+        );
         assert!(named_title(&mut file, &id, Path::new("/work")).is_none());
     }
 }

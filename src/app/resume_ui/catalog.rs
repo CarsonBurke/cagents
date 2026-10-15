@@ -454,9 +454,15 @@ fn prompt_of(provider: Provider, value: &Value) -> Option<String> {
     };
     let content = &message["content"];
     let combined;
-    let text = if let Some(text) = content.as_str() { text } else {
-        combined = content.as_array()?.iter().take(32)
-            .filter_map(|part| part["text"].as_str()).fold(String::new(), |mut text, part| {
+    let text = if let Some(text) = content.as_str() {
+        text
+    } else {
+        combined = content
+            .as_array()?
+            .iter()
+            .take(32)
+            .filter_map(|part| part["text"].as_str())
+            .fold(String::new(), |mut text, part| {
                 let remaining = (32 * 1024usize).saturating_sub(text.len() + 1);
                 if remaining > 0 {
                     text.push('\n');

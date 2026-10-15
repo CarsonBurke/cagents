@@ -208,7 +208,8 @@ fn publish(
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
                     if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
-                        && let Ok(model) = client.read_workspace_model() {
+                        && let Ok(model) = client.read_workspace_model()
+                    {
                         // A refused suggestion is not replayed against a newer
                         // owner. Restore the authoritative name after optimism.
                         let _ = updates.send_blocking(ModelUpdate::Read(model));

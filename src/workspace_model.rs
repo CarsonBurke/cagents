@@ -260,12 +260,25 @@ impl WorkspaceModel {
                     channel.title_source = *source;
                 }
             }
-            ModelEdit::SuggestConversationTitle { id, card, expected_revision, title, source } => {
-                let current = self.views.iter().any(|view| view.scope == views::Scope::Channel(*id)
-                    && view.revision == *expected_revision && view.primary_chat() == Some(*card));
-                if current && !title.is_empty()
-                    && let Some(channel) = self.channels.iter_mut().find(|channel| channel.id == *id)
-                    && channel.title_source.accepts_refresh(&channel.title, *source)
+            ModelEdit::SuggestConversationTitle {
+                id,
+                card,
+                expected_revision,
+                title,
+                source,
+            } => {
+                let current = self.views.iter().any(|view| {
+                    view.scope == views::Scope::Channel(*id)
+                        && view.revision == *expected_revision
+                        && view.primary_chat() == Some(*card)
+                });
+                if current
+                    && !title.is_empty()
+                    && let Some(channel) =
+                        self.channels.iter_mut().find(|channel| channel.id == *id)
+                    && channel
+                        .title_source
+                        .accepts_refresh(&channel.title, *source)
                 {
                     channel.title = title.clone();
                     channel.title_source = *source;
@@ -502,12 +515,19 @@ mod tests {
 
     #[test]
     fn conversation_title_proof_roundtrips_without_changing_existing_edit_prefix() {
-        let old = ModelEdit::SuggestChannelTitle { id: ChannelId::new(), title: "old".into(),
-            source: ChannelTitleSource::Provider };
+        let old = ModelEdit::SuggestChannelTitle {
+            id: ChannelId::new(),
+            title: "old".into(),
+            source: ChannelTitleSource::Provider,
+        };
         assert_eq!(postcard::to_allocvec(&old).unwrap()[0], 7);
-        let edit = ModelEdit::SuggestConversationTitle { id: ChannelId::new(),
-            card: crate::model::CardId::new(), expected_revision: 23, title: "Bundle encryption".into(),
-            source: ChannelTitleSource::Provider };
+        let edit = ModelEdit::SuggestConversationTitle {
+            id: ChannelId::new(),
+            card: crate::model::CardId::new(),
+            expected_revision: 23,
+            title: "Bundle encryption".into(),
+            source: ChannelTitleSource::Provider,
+        };
         let bytes = postcard::to_allocvec(&edit).unwrap();
         assert_eq!(bytes[0], 12);
         assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
