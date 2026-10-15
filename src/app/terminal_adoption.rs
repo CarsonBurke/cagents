@@ -70,11 +70,7 @@ fn observe_inventory(
 /// hosting that process, and a later observation of it must not reopen the card
 /// the user shut.
 fn saved_terminal_claims_host(saved: &TerminalSession, hosted: &TerminalSession) -> bool {
-    saved.id == hosted.id
-        || (saved.continuity.live_proof().is_some()
-            && saved.continuity.live_proof() != hosted.continuity.live_proof()
-            && hosted.recovery_origin == Some(saved.recovery_origin.unwrap_or(saved.id))
-            && super::daemon_recovery::same_recovery_content(saved, hosted))
+    crate::persistence::ClosedTerminalClaim::of(saved).claims(hosted)
 }
 
 fn card_claims_terminal(card: &CardState, terminal: &TerminalSession) -> bool {
@@ -326,6 +322,7 @@ impl Cagents {
             // A terminal in the middle of a native-chat handoff is already this
             // window's, even before the card that will hold it is written.
             && !self.pending_terminal_handoffs.contains_key(&session.id)
+            && !self.session.as_ref().is_some_and(|runtime| runtime.terminal_was_closed(session))
             && !self
                 .durable
                 .cards
@@ -593,6 +590,40 @@ mod tests {
         let remaining = cards_for(&app, card_terminal(&app, card));
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].existence, closed);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("retirement.sqlite3");
+        let (runtime, _) =
+            crate::session::SessionRuntime::open(&path, BootId::new("closed-inventory")).unwrap();
+        app.session = Some(runtime);
+        app.persist();
+        app.session
+            .as_ref()
+            .unwrap()
+            .flush(Duration::from_secs(10))
+            .unwrap();
+        let committed = app
+            .session
+            .as_ref()
+            .unwrap()
+            .take_committed_closures(app.durable.id);
+        assert_eq!(
+            Arc::make_mut(&mut app.durable).retire_committed_cards(&committed),
+            1
+        );
+        let CardKind::Terminal(hosted) = &remaining[0].kind else {
+            unreachable!()
+        };
+        assert!(!app.adoptable(hosted));
+        let count = app.durable.cards.len();
+        drop(app.observe_hosted_terminals(vec![hosted.clone()]));
+        assert_eq!(app.durable.cards.len(), count);
+        app.session.as_mut().unwrap().shutdown();
+        let (reopened, _) =
+            crate::session::SessionRuntime::open(&path, BootId::new("closed-inventory")).unwrap();
+        app.session = Some(reopened);
+        assert!(!app.adoptable(hosted));
+        drop(app.observe_hosted_terminals(vec![hosted.clone()]));
+        assert_eq!(app.durable.cards.len(), count);
     }
 
     #[test]

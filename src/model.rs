@@ -1264,6 +1264,37 @@ impl Default for WorkspaceState {
 }
 
 impl WorkspaceState {
+    /// Release only fully closed cards confirmed by a storage receipt. A
+    /// pending close or a new open descriptor with the same ID stays owned.
+    pub fn retire_committed_cards(&mut self, committed: &BTreeSet<CardId>) -> usize {
+        let retired: BTreeSet<_> = self
+            .cards
+            .iter()
+            .filter(|card| {
+                committed.contains(&card.id) && matches!(card.existence, Existence::Closed { .. })
+            })
+            .map(|card| card.id)
+            .collect();
+        if retired.is_empty() {
+            return 0;
+        }
+        self.cards.retain(|card| !retired.contains(&card.id));
+        if self.cards.capacity() > self.cards.len().saturating_mul(4).saturating_add(32) {
+            self.cards.shrink_to_fit();
+        }
+        self.card_scopes.retain(|id, _| !retired.contains(id));
+        self.chat_drafts.retain(|id, _| !retired.contains(id));
+        self.repository_navigation
+            .retain(|id, _| !retired.contains(id));
+        self.local_only_cards.retain(|id| !retired.contains(id));
+        self.pending_terminal_creations
+            .retain(|id| !retired.contains(id));
+        self.worktree_focus.retain(|_, id| !retired.contains(id));
+        self.normalize_focus();
+        self.normalize_channels();
+        retired.len()
+    }
+
     pub fn normalize_channels(&mut self) {
         let open_cards = self
             .cards
@@ -1296,6 +1327,64 @@ impl WorkspaceState {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn retirement_requires_a_committed_closed_descriptor_and_releases_its_state() {
+        let closed = CardId::new();
+        let pending = CardId::new();
+        let open = CardId::new();
+        let card = |id, existence| CardState {
+            id,
+            generation: 1,
+            title: "pane".into(),
+            width_fraction: 1.0,
+            existence,
+            exposure: Exposure::Offscreen,
+            residency: Residency::Cold,
+            kind: CardKind::Settings,
+        };
+        let mut state = WorkspaceState {
+            cards: vec![
+                card(
+                    closed,
+                    Existence::Closed {
+                        tombstone: Tombstone {
+                            operation_id: None,
+                            closed_at_unix_ms: 1,
+                            reason: None,
+                        },
+                    },
+                ),
+                card(
+                    pending,
+                    Existence::Closing {
+                        operation_id: OperationId::new(),
+                    },
+                ),
+                card(open, Existence::Open),
+            ],
+            focused: Some(open),
+            ..WorkspaceState::default()
+        };
+        state
+            .chat_drafts
+            .insert(closed, "retained composer".repeat(1024));
+        state.chat_drafts.insert(open, "unsent".into());
+        state.card_scopes.insert(closed, PathBuf::from("/project"));
+        assert_eq!(state.retire_committed_cards(&BTreeSet::new()), 0);
+        assert_eq!(
+            state.retire_committed_cards(&[closed, pending, open].into()),
+            1
+        );
+        assert_eq!(
+            state.cards.iter().map(|card| card.id).collect::<Vec<_>>(),
+            vec![pending, open]
+        );
+        assert!(!state.chat_drafts.contains_key(&closed));
+        assert!(!state.card_scopes.contains_key(&closed));
+        assert_eq!(state.chat_drafts[&open], "unsent");
+        assert_eq!(state.focused, Some(open));
+    }
 
     #[test]
     fn legacy_repository_descriptor_remains_a_browser() {
