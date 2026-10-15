@@ -108,12 +108,12 @@ fn lock_at(root: &fs_safety::Root, relative: &Path) -> Result<GitFileLock, Strin
 
 #[cfg(test)]
 thread_local! {
-    pub(super) static CONFIG_SNAPSHOT_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) };
+    pub(super) static RECONCILIATION_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) };
 }
 
-fn snapshot_phase(_phase: &str) {
+fn test_phase(_phase: &str) {
     #[cfg(test)]
-    CONFIG_SNAPSHOT_TEST_HOOK.with_borrow_mut(|hook| {
+    RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| {
         if let Some(hook) = hook {
             hook(_phase);
         }
@@ -167,7 +167,7 @@ fn repair_tracking<E: ProcessExecutor>(
     if !original.is_file() || original.nlink() != 1 {
         return Err("The clone-local configuration is not a single regular file; reconcile its upstream explicitly".into());
     }
-    snapshot_phase("after_source_metadata");
+    test_phase("after_source_metadata");
     let bytes =
         fs_safety::read_bounded(&mut source, CONFIG_LIMIT).map_err(|error| error.to_string())?;
     if bytes.len() as u64 > CONFIG_LIMIT {
@@ -190,7 +190,7 @@ fn repair_tracking<E: ProcessExecutor>(
             uncopied[0]
         ));
     }
-    snapshot_phase("before_source_validation");
+    test_phase("before_source_validation");
     unchanged_source(&source, &original, &pinned.roots[2])?;
     metadata_snapshot
         .set_permissions(original.permissions())
@@ -514,6 +514,7 @@ pub(super) fn reconcile<E: ProcessExecutor>(
     }
     let private_ref = format!("refs/cagents/pr-checkout/{}/head", Uuid::new_v4());
     let mut changed = false;
+    let mut expected_final = plan.clone();
     let attempt = (|| -> Result<(), String> {
         // Effect-free capability proof: no repository policy or checkout runs.
         transaction(
@@ -674,12 +675,14 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             true,
             cancellation,
         )?;
+        expected_final = current;
         Ok(())
     })();
     let retained_directory = fs::read_link(pinned.path(2))
         .unwrap_or_else(|_| plan.common_dir.path.clone())
         .join(private_name);
     drop(lease);
+    test_phase("before_lease_observation");
     let observed_descendant = settle_descendants(&lease_observer);
     let descendant = if observed_descendant {
         Err("A policy or Git descendant outlived its command; it has now released the operation lease. Refresh and inspect the checkout before continuing".to_owned())
@@ -717,6 +720,19 @@ pub(super) fn reconcile<E: ProcessExecutor>(
             path: plan.path().to_owned(),
             retained_ref: Some(private_ref),
         });
+    }
+    // The prior native proof may precede the last owned policy child's
+    // effects. Re-read only after all inherited leases have truly retired,
+    // including children that exited before the first observer flock.
+    let final_state = service.prepare_existing_pr_checkout(&plan.request, &CancellationToken::default());
+    if !matches!(&final_state, Ok(current) if current == &expected_final) {
+        let detail = match final_state {
+            Ok(_) => "The checkout changed after its last policy hook; refresh it before opening".to_owned(),
+            Err(error) => format!("The checkout could not be verified after its last policy hook: {error}"),
+        };
+        let detail = format!("{detail}. Operation evidence: {}", retained_directory.display());
+        private.keep();
+        return Err(PrCheckoutFailure { kind: PrCheckoutFailureKind::PartialOrUnknown, detail, path: plan.path().to_owned(), retained_ref: Some(private_ref) });
     }
     if let Err(detail) = pinned.check(plan) {
         let detail = format!(

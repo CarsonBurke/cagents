@@ -614,7 +614,7 @@ fn concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new
     let changed_hook = changed.clone();
     let checked_hook = checked.clone();
     let config_hook = config.clone();
-    effect::CONFIG_SNAPSHOT_TEST_HOOK.with_borrow_mut(|hook| {
+    effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| {
         *hook = Some(Box::new(move |phase| {
             if phase == "after_source_metadata" {
                 fs::set_permissions(&config_hook, fs::Permissions::from_mode(0o600)).unwrap();
@@ -631,7 +631,7 @@ fn concurrent_private_config_snapshot_never_widens_the_named_lock_or_exposes_new
         }))
     });
     let result = fixture.apply(&plan);
-    effect::CONFIG_SNAPSHOT_TEST_HOOK.with_borrow_mut(|hook| *hook = None);
+    effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| *hook = None);
     let failure = result.unwrap_err();
     assert_eq!(failure.kind, PrCheckoutFailureKind::Refused);
     assert!(changed.load(std::sync::atomic::Ordering::SeqCst));
@@ -878,4 +878,55 @@ fn detached_policy_descendant_keeps_operation_running_and_protected_through_canc
         git_text(&fixture.root, &["rev-parse", "HEAD"]),
         new.as_str()
     );
+}
+
+#[test]
+fn policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_receipt() {
+    let fixture = Fixture::new(true);
+    let new = fixture.advance(|root| fs::write(root.join("file"), "new\n").unwrap());
+    let policy = fixture.root.join(".git/late-policy");
+    fs::create_dir(&policy).unwrap();
+    run_git(&fixture.root, &["config", "core.hooksPath", policy.to_str().unwrap()]);
+    let hook = policy.join("reference-transaction");
+    fs::write(&hook, r#"#!/bin/sh
+set -eu
+input=$(/bin/cat)
+if [ "$1" = committed ] && printf '%s' "$input" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then
+ /usr/bin/setsid /usr/bin/timeout 5 /bin/sh -c '
+  touch "$CAGENTS_PR_PRIVATE/late-child-started"
+  while [ ! -e "$CAGENTS_PR_PRIVATE/release-late-child" ]; do /bin/sleep 0.02; done
+  printf "\n[branch \"feature\"]\n merge = refs/heads/changed-by-child\n" >> "$CAGENTS_PR_COMMON_FD/config"
+  touch "$CAGENTS_PR_PRIVATE/late-child-retired"
+ ' </dev/null >/dev/null 2>&1 &
+fi
+"#).unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    let plan = fixture.prepare(&fixture.request(new.clone()));
+    let root = fixture.root.clone();
+    let synchronized = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let synchronized_hook = synchronized.clone();
+    effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| *hook = Some(Box::new(move |phase| {
+        if phase != "before_lease_observation" { return; }
+        let operation = fs::read_dir(root.join(".git")).unwrap().map(Result::unwrap)
+            .find(|entry| entry.file_name().to_string_lossy().starts_with("cagents-pr-checkout-")).unwrap().path();
+        fs::write(operation.join("release-late-child"), b"release").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let observer = fs::File::open(operation.join("lease")).unwrap();
+        loop {
+            // SAFETY: independent descriptor pins the original lease inode.
+            if unsafe { libc::flock(observer.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 { break; }
+            assert!(Instant::now() < deadline, "owned child must retire before first real observation");
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(operation.join("late-child-retired").exists());
+        synchronized_hook.store(true, std::sync::atomic::Ordering::SeqCst);
+    })));
+    let result = fixture.apply(&plan);
+    effect::RECONCILIATION_TEST_HOOK.with_borrow_mut(|hook| *hook = None);
+    let failure = result.unwrap_err();
+    assert_eq!(failure.kind, PrCheckoutFailureKind::PartialOrUnknown);
+    assert!(synchronized.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(failure.detail.contains("after its last policy hook"));
+    assert_eq!(git_text(&fixture.root, &["rev-parse", "HEAD"]), new.as_str());
+    assert!(String::from_utf8(fs::read(fixture.root.join(".git/config")).unwrap()).unwrap().contains("changed-by-child"));
 }
