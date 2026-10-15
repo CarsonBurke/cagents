@@ -268,6 +268,7 @@ mod tests {
         let socket = std::path::PathBuf::from(format!("/var/tmp/cagents-codex-{id}/control.sock"));
         Recovery {
             source: super::super::Session {
+                archive_report: None,
                 id,
                 launch: super::super::Launch {
                     provider: Provider::Codex,

@@ -6340,6 +6340,7 @@ mod tests {
         ];
         source.resume_hint = crate::model::agent_recovery::hint_from_launch(&source.launch);
         let chat = crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: source.id,
@@ -7059,6 +7060,7 @@ mod tests {
                     .insert("CLAUDE_CONFIG_DIR".into(), home.into());
             }
             crate::chat::Session {
+                archive_report: None,
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id,
@@ -7379,6 +7381,7 @@ mod tests {
             let source = paired.terminal.unwrap();
             let proof = source.continuity.live_proof().unwrap();
             let mut native = crate::chat::Session {
+                archive_report: None,
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id: TerminalId::new(),

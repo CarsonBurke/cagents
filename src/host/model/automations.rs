@@ -4804,6 +4804,133 @@ mod tests {
     }
 
     #[test]
+    fn private_report_response_frames_one_bounded_native_descriptor_without_duplicating_it() {
+        let (registry,_directory,_pane,scope,agent)=archived_membership_fixture();
+        let identity=registry.model().unwrap().identity;
+        let mut archive=registry.archived_automation_conversation(agent.id).unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(native))=&mut archive.agent.session else {unreachable!()};
+        native.launch.recipe.environment.insert("BOUNDED_PROVIDER_METADATA".into(),"x".repeat(5*1024*1024/2));
+        let mut issued=native.clone();
+        let proof=issued.proof.clone().unwrap();
+        let reference=crate::chat::ArchiveReportReference {format:1,registry:identity,agent:agent.id,source_operation:Uuid::new_v4()};
+        issued.archive_report=Some(reference.clone());
+        archive.snapshot.items.push(std::sync::Arc::new(crate::chat::Item {id:"bounded-report".into(),role:crate::chat::Role::Assistant,
+            content:crate::chat::ItemContent::Text {text:"r".repeat(15*1024*1024/4),thinking:false,phase:Default::default()},at:None,started_at:None}));
+        assert!(serde_json::to_vec(&archive.agent).unwrap().len()<3*1024*1024);
+        assert!(serde_json::to_vec(&archive.snapshot).unwrap().len()<4*1024*1024);
+        let report=crate::automations::ArchiveReport {reference,scope,source_revision:1,presentation_scope:None,
+            session_digest:crate::automations::ArchiveReport::session_digest(&issued).unwrap(),archive};
+        let expected=crate::terminal_ipc::ServerEnvelope {version:crate::terminal_ipc::PROTOCOL_VERSION,request_id:Some(1),proof,
+            message:crate::terminal_ipc::ServerMessage::Response {response:crate::terminal_ipc::ServerResponse::Automation(crate::automations::Response::ArchiveReport(Box::new(report)))}};
+        let mut frame=Vec::new();
+        crate::terminal_ipc::write_frame(&mut frame,&expected).unwrap();
+        assert!(frame.len()<crate::terminal_ipc::MAX_FRAME_BYTES);
+        assert!(frame.len()+postcard::to_stdvec(&issued).unwrap().len()>crate::terminal_ipc::MAX_FRAME_BYTES,
+            "duplicating the full requested Session would violate the actual frame budget");
+        let decoded:crate::terminal_ipc::ServerEnvelope=crate::terminal_ipc::read_frame(&mut std::io::Cursor::new(frame)).unwrap().unwrap();
+        assert_eq!(decoded,expected);
+    }
+
+    #[test]
+    fn ended_report_reopens_with_a_new_pane_and_exact_original_owner_without_resurrection() {
+        use crate::workspace_model::views::Change;
+        let (mut registry,_directory,original,scope,agent)=archived_membership_fixture();
+        let model=registry.model().unwrap();
+        let source_operation=Uuid::new_v4();
+        let revision=model.views.iter().find(|view|view.scope==scope).unwrap().revision;
+        let old_run=registry.latest_agent_run(agent.id).unwrap();
+        let old_snapshot=serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap()).unwrap();
+        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:source_operation,
+            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:original.clone()}}).unwrap();
+        let Some(crate::agent_execution::HostedSession::Chat(mut native))=agent.session.clone() else{unreachable!()};
+        native.terminal=agent.console.clone();
+        let report=registry.archive_report_source(model.identity,original.id,&native).unwrap().unwrap();
+        assert_eq!(report.reference.source_operation,source_operation);
+        assert_eq!(report.reference.agent,agent.id);
+        assert_eq!(report.source_revision,revision);
+        assert_eq!(report.scope,scope);
+        let mut presented=native.clone();presented.archive_report=Some(report.reference.clone());
+        assert!(crate::automations::archive::ArchivedPaneReadiness::qualify_report(&report,&presented).is_ok());
+        let new_id=crate::model::CardId::new();
+        assert_ne!(new_id,original.id);
+        let pane=crate::workspace_model::views::Pane {id:new_id,kind:crate::model::CardKind::Chat(presented.clone()),scope:report.presentation_scope.clone(),..original.clone()};
+        let current=registry.model().unwrap();
+        let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
+        let insert=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),change:Change::InsertArchiveReport {registry:model.identity,repository:agent.spec.target.repository.clone(),reference:report.reference.clone(),pane:pane.clone()}};
+        assert!(registry.apply(&insert).unwrap().changed);
+        assert!(!registry.apply(&insert).unwrap().changed);
+        let current=registry.model().unwrap();
+        let view=current.views.iter().find(|view|view.scope==scope).unwrap();
+        assert!(view.retired.contains(&original.id));
+        assert!(!view.panes.iter().any(|pane|pane.id==original.id));
+        assert_eq!(view.panes,vec![pane.clone()]);
+        assert_eq!(registry.agent(agent.id).unwrap(),agent);
+        assert_eq!(registry.latest_agent_run(agent.id).unwrap(),old_run);
+        assert_eq!(serde_json::to_value(registry.archived_automation_conversation(agent.id).unwrap()).unwrap(),old_snapshot);
+        assert_eq!(registry.archived_automation_pane_owner(&pane).unwrap().unwrap(),agent);
+        // A real StateStore roundtrip preserves the tiny NoStart reference,
+        // and the offline updater qualifies the new CardId through its exact
+        // original registry receipt without a daemon or provider.
+        let database=_directory.path().join("report-window.sqlite3");
+        let store=crate::persistence::StateStore::open(&database,native.proof.as_ref().unwrap().boot_id.clone()).unwrap();
+        let mut workspace=crate::model::WorkspaceState::default();
+        workspace.cards.push(crate::model::CardState {id:new_id,generation:0,title:pane.title.clone(),width_fraction:1.0,existence:crate::model::Existence::Open,exposure:crate::model::Exposure::Offscreen,residency:crate::model::Residency::Cold,kind:pane.kind.clone()});
+        workspace.focused=Some(new_id);workspace.automation_archives.insert(new_id,agent.id);
+        if let Some(scope)=&report.presentation_scope {workspace.card_scopes.insert(new_id,scope.clone());}
+        let generations=std::collections::BTreeMap::new();
+        store.save_workspace(&workspace,crate::persistence::SnapshotBase {workspace:0,cards:&generations}).unwrap();
+        let restored=store.load_workspace(workspace.id,native.proof.as_ref()).unwrap().unwrap();
+        assert_eq!(restored.cards[0].kind,pane.kind);
+        let readiness=crate::automations::archive::inspect_completed_automation_pane(&database,&_directory.path().join("model.sqlite3"),new_id,&pane.kind).unwrap().unwrap();
+        assert!(readiness.matches(agent.id,&presented));
+        let second_operation=Uuid::new_v4();
+        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:view.revision,operation:second_operation,
+            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:pane}}).unwrap();
+        let second=registry.archive_report_source(model.identity,new_id,&presented).unwrap().unwrap();
+        assert_eq!(second.reference.source_operation,second_operation,"a second End retains its actual new presentation receipt");
+        assert_eq!(second.reference.agent,agent.id);
+        let mut reread=presented;reread.archive_report=Some(second.reference.clone());
+        assert!(crate::automations::archive::ArchivedPaneReadiness::qualify_report(&second,&reread).is_ok());
+        let view=registry.model().unwrap().views.into_iter().find(|view|view.scope==scope).unwrap();
+        assert!(view.retired.contains(&original.id)&&view.retired.contains(&new_id));
+        assert!(view.panes.is_empty());
+    }
+
+    #[test]
+    fn archive_report_sources_refuse_spoofed_receipts_scope_revisions_and_expired_payloads() {
+        use crate::workspace_model::views::Change;
+        let (mut registry,_directory,original,scope,agent)=archived_membership_fixture();
+        let Some(crate::agent_execution::HostedSession::Chat(mut native))=agent.session.clone() else{unreachable!()};native.terminal=agent.console.clone();
+        let model=registry.model().unwrap();
+        assert!(registry.archive_report_source(model.identity,original.id,&native).is_err(),"an archive without committed membership removal cannot provider-resume");
+        let operation=Uuid::new_v4();
+        registry.apply(&ModelEdit::ChangeView {scope:scope.clone(),expected_revision:model.views[0].revision,operation,
+            change:Change::RemoveArchivedAutomationSource {registry:model.identity,repository:agent.spec.target.repository.clone(),before:original.clone()}}).unwrap();
+        let report=registry.archive_report_source(model.identity,original.id,&native).unwrap().unwrap();
+        let mut issued=native.clone();issued.archive_report=Some(report.reference.clone());
+        for variation in 0..5 {
+            let mut reference=report.reference.clone();let mut session=issued.clone();
+            match variation {0=>reference.registry=Uuid::new_v4(),1=>reference.agent=crate::model::AgentId::new(),2=>reference.source_operation=Uuid::new_v4(),3=>session.launch.recipe.arguments.push("--different".into()),_=>session.launch.session_id=Some("other-thread".into())};
+            assert!(registry.read_archive_report(&reference,&session).is_err());
+        }
+        let pane=crate::workspace_model::views::Pane {id:crate::model::CardId::new(),kind:crate::model::CardKind::Chat(issued.clone()),scope:report.presentation_scope.clone(),..original.clone()};
+        let current=registry.model().unwrap();let revision=current.views.iter().find(|view|view.scope==scope).unwrap().revision;
+        let mut edit=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision+1,operation:Uuid::new_v4(),change:Change::InsertArchiveReport {registry:model.identity,repository:agent.spec.target.repository.clone(),reference:report.reference.clone(),pane:pane.clone()}};
+        assert!(registry.apply(&edit).unwrap_err().contains("revision"));
+        if let ModelEdit::ChangeView {expected_revision,..}=&mut edit {*expected_revision=revision;}
+        let mut spoofed=edit.clone();if let ModelEdit::ChangeView {change:Change::InsertArchiveReport {registry,..},..}=&mut spoofed {*registry=Uuid::new_v4();}
+        assert!(registry.apply(&spoofed).is_err());
+        let mut old_card=edit.clone();if let ModelEdit::ChangeView {change:Change::InsertArchiveReport {pane,..},..}=&mut old_card {pane.id=original.id;}
+        assert!(registry.apply(&old_card).is_err(),"permanent old identity cannot be resurrected");
+        let plain=ModelEdit::ChangeView {scope:scope.clone(),expected_revision:revision,operation:Uuid::new_v4(),change:Change::Insert {pane,before:None}};
+        assert!(registry.apply(&plain).is_err(),"ordinary Insert cannot borrow a report reference");
+        registry.db.execute("DELETE FROM automation_snapshots WHERE agent=?1",[agent.id.to_string()]).unwrap();
+        assert!(registry.read_archive_report(&report.reference,&issued).is_err());
+        assert!(registry.archive_report_source(model.identity,original.id,&native).is_err(),"expiry never enables provider fallback");
+        assert!(registry.is_archived_automation_session(native.id).unwrap());
+    }
+
+    #[test]
     fn archived_membership_removal_preserves_report_runs_and_requires_original_registry_source() {
         use crate::workspace_model::views::Change;
         let (mut registry, _directory, pane, scope, agent) = archived_membership_fixture();
@@ -5577,7 +5704,7 @@ mod tests {
         // Simulate an older store lacking the new cleanup authority table.
         registry
             .db
-            .execute_batch("DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;")
+            .execute_batch("DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; PRAGMA user_version=12;")
             .unwrap();
         drop(registry);
         let mut registry = Registry::at(&directory.path().join("model.sqlite3")).unwrap();

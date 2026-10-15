@@ -308,6 +308,14 @@ pub enum Change {
     InsertIfEmpty {
         pane: Pane,
     },
+    /// A new pane presenting an existing closed report; no new native identity.
+    /// Requires a future matched protocol allocation, explicitly not protocol90.
+    InsertArchiveReport {
+        registry: uuid::Uuid,
+        repository: PathBuf,
+        reference: crate::chat::ArchiveReportReference,
+        pane: Pane,
+    },
     /// Membership-only consent for one exact closed automation archive.
     /// Requires a future matched protocol allocation, explicitly not protocol90.
     RemoveArchivedAutomationSource {
@@ -339,6 +347,17 @@ impl View {
                     self.panes.push(pane.clone());
                 }
             }
+            Change::InsertArchiveReport { pane, reference, .. } => {
+                if pane.pending_terminal_start
+                    || pane.id.as_uuid()==reference.agent.as_uuid()
+                    || !matches!(&pane.kind,CardKind::Chat(session) if session.archive_report.as_ref()==Some(reference)) {
+                    return Err("The saved report presentation descriptor is invalid".into());
+                }
+                pane.validate()?;
+                if !self.retired.contains(&pane.id) && !self.panes.iter().any(|current|current.id==pane.id) {
+                    self.panes.push(pane.clone());
+                }
+            }
             Change::Insert { pane, before } => {
                 pane.validate()?;
                 if !self.retired.contains(&pane.id)
@@ -349,6 +368,12 @@ impl View {
                 }
             }
             Change::Update { before, pane } => {
+                let report=|kind:&CardKind|matches!(kind,CardKind::Chat(session) if session.archive_report.is_some());
+                if report(&before.kind) || report(&pane.kind) {
+                    if !matches!((&before.kind,&pane.kind),(CardKind::Chat(a),CardKind::Chat(b)) if a==b) {
+                        return Err("The saved report presentation cannot become an executable descriptor".into());
+                    }
+                }
                 if before.id != pane.id {
                     return Err("pane identity cannot change".into());
                 }
@@ -735,6 +760,7 @@ mod managed_display_tests {
             },
         };
         let native = crate::chat::Session {
+            archive_report: None,
             id: console.id,
             launch: crate::chat::Launch {
                 provider: Provider::Claude,

@@ -1465,6 +1465,7 @@ mod tests {
             unreachable!()
         };
         card.kind = CardKind::Chat(crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: source.id,

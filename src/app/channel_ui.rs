@@ -1143,6 +1143,7 @@ mod tests {
 
     fn chat_session() -> crate::chat::Session {
         crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: crate::model::TerminalId::new(),

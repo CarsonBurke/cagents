@@ -4926,6 +4926,7 @@ mod tests {
             environment: BTreeMap::new(),
         };
         let session = |id| crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id,
@@ -5139,6 +5140,7 @@ mod tests {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let session = crate::chat::Session {
+            archive_report: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: crate::agent::Provider::Codex,

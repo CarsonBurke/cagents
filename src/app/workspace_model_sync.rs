@@ -1534,6 +1534,7 @@ mod tests {
             .push(local(target, project, "Execution", 1));
         durable.active_channel = Some(active);
         let session = crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             id: TerminalId::new(),
             proof: Some(crate::model::HostSessionProof {
@@ -1679,6 +1680,8 @@ mod tests {
                     timezone: "UTC".into(),
                 },
                 session_mode: SessionMode::Reuse,
+                visibility: Default::default(),
+                catch_up: Default::default(),
                 precheck: None,
             },
             firing: Firing {
@@ -1698,6 +1701,8 @@ mod tests {
                 agent: Some(automated.id),
                 run: None,
                 skip: None,
+                skipped_occurrences: None,
+                missed_interval: None,
                 diagnostic: None,
             },
             agent: Some(automated),
@@ -1744,6 +1749,7 @@ mod tests {
             .push(local(target, project, "Execution", 1));
         durable.active_channel = Some(active);
         let session = crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             id: TerminalId::new(),
             proof: Some(crate::model::HostSessionProof {

@@ -567,6 +567,7 @@ mod tests {
         let original = Scope::Channel(ChannelId::new());
         let moved = Scope::Channel(ChannelId::new());
         let session = crate::chat::Session {
+            archive_report: None,
             id: TerminalId::new(),
             launch: crate::chat::Launch {
                 provider: Provider::Codex,

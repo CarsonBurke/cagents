@@ -363,6 +363,7 @@ mod tests {
     /// A chat converted from a terminal keeps the terminal's ID.
     fn converted_chat(id: TerminalId, recovery_origin: Option<TerminalId>) -> HostedSession {
         HostedSession::Chat(crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             id,
             launch: crate::chat::Launch {

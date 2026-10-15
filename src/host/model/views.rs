@@ -129,7 +129,7 @@ pub(super) fn apply(
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
         _ => return Err("expected a workspace view edit".into()),
     };
-    if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { registry, repository, .. }, .. } = edit {
+    if let ModelEdit::ChangeView { change: Change::RemoveArchivedAutomationSource { registry, repository, .. } | Change::InsertArchiveReport {registry,repository,..}, .. } = edit {
         let identity: String = transaction.query_row("SELECT identity FROM metadata WHERE key=0", [], |row| row.get(0)).map_err(|error| error.to_string())?;
         let scope_repository: String = match scope {
             Scope::Channel(channel) => transaction.query_row("SELECT repository FROM channels WHERE id=?1", [channel.to_string()], |row| row.get(0)).map_err(|error| error.to_string())?,
@@ -161,6 +161,15 @@ pub(super) fn apply(
                     .map_err(|error| error.to_string())?;
             }
             for pane in panes {
+                // A restart cannot turn an uncommitted local report pointer
+                // into shared membership through ordinary migration seeding.
+                if matches!(&pane.kind,crate::model::CardKind::Chat(session) if session.archive_report.is_some()) {
+                    if owner(transaction,pane.id)?.as_ref()!=Some(scope)
+                        || !view.panes.iter().any(|current|current==pane) {
+                        return Err("The saved report presentation requires its original typed publication".into());
+                    }
+                    continue;
+                }
                 if view.panes.iter().any(|existing| {
                     existing.id != pane.id
                         && crate::workspace_model::views::same_resource(&existing.kind, &pane.kind)
@@ -223,6 +232,20 @@ pub(super) fn apply(
                         false
                     }
                 }
+                Change::InsertArchiveReport { reference, pane, .. } => {
+                    let crate::model::CardKind::Chat(session)=&pane.kind else { return Err("A saved report must have a native read-only presentation".into()); };
+                    let report=super::automation_reports::report_in(transaction,reference,session)?;
+                    if &report.scope!=scope || session.archive_report.as_ref()!=Some(reference)
+                        || owner(transaction,pane.id)?.is_some()
+                        || pane.scope!=super::automation_reports::presentation_scope_in(transaction,reference)? {
+                        return Err("The saved report presentation source or scope changed".into());
+                    }
+                    view.apply(change)?
+                }
+                Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
+                    if matches!(&pane.kind,crate::model::CardKind::Chat(session) if session.archive_report.is_some()) => {
+                    return Err("Publish saved reports with their typed presentation receipt".into());
+                }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane }
                     if resource_owner(transaction, pane)?.is_some() =>
                 {
@@ -236,6 +259,12 @@ pub(super) fn apply(
                     }
                     view.apply(change)?
                 }
+                Change::Update {before,pane} if (
+                    matches!(&before.kind,crate::model::CardKind::Chat(session) if session.archive_report.is_some())
+                    || matches!(&pane.kind,crate::model::CardKind::Chat(session) if session.archive_report.is_some()))
+                    && !matches!((&before.kind,&pane.kind),(crate::model::CardKind::Chat(a),crate::model::CardKind::Chat(b)) if a==b) => {
+                    return Err("The saved report presentation identity cannot change".into());
+                }
                 Change::Update { pane, .. } if resource_owner(transaction, pane)?.is_some() => {
                     false
                 }
@@ -245,6 +274,7 @@ pub(super) fn apply(
                         || super::automation_membership::archived_owner_in(transaction, before)?.is_none() {
                         return Err("workspace archived pane source conflict".into());
                     }
+                    super::automation_reports::capture_removal(transaction, *operation, scope, *expected_revision, before)?;
                     let changed = view.apply(change)?;
                     transaction.execute("DELETE FROM shared_view_panes WHERE id=?1 AND scope=?2", params![before.id.to_string(), key(scope)?]).map_err(|error| error.to_string())?;
                     changed

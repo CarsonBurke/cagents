@@ -107,6 +107,16 @@ pub enum Request {
     ArchivedConversation {
         agent: AgentId,
     },
+    /// Look up report provenance before any provider-resume identity reset.
+    ArchiveReportSource {
+        identity: Uuid,
+        card: crate::model::CardId,
+        session: crate::chat::Session,
+    },
+    ReadArchiveReport {
+        reference: crate::chat::ArchiveReportReference,
+        session: crate::chat::Session,
+    },
     ArchivedAgents {
         scope: agent_execution::Placement,
         identity: Uuid,
@@ -143,10 +153,32 @@ pub enum Response {
     Proposal(Box<Proposal>),
     Proposals(Vec<ProposalSummary>),
     ArchivedConversation(Box<ArchivedConversation>),
+    ArchiveReportSource(Option<Box<ArchiveReport>>),
+    ArchiveReport(Box<ArchiveReport>),
     ArchivedAgents(ArchiveAgentPage),
 }
 
-/// Destination discovery is paged independently of the bounded model push.
+/// Private bounded history plus the immutable registry-issued removal reference.
+/// This describes a read-only presentation, not a new provider conversation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveReport {
+    pub reference: crate::chat::ArchiveReportReference,
+    pub scope: crate::agent_execution::Placement,
+    pub source_revision: u64,
+    pub presentation_scope: Option<std::path::PathBuf>,
+    /// Binds the exact requested presentation without duplicating a potentially
+    /// large native recipe beside the original Agent in every response.
+    pub session_digest: [u8;32],
+    pub archive: ArchivedConversation,
+}
+impl ArchiveReport {
+    pub fn session_digest(session:&crate::chat::Session)->Result<[u8;32],String>{
+        use sha2::{Digest,Sha256};
+        let encoded=serde_json::to_vec(session).map_err(|error|error.to_string())?;
+        Ok(Sha256::digest(encoded).into())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArchiveAgentPage {
     pub scope: agent_execution::Placement,

@@ -782,7 +782,7 @@ mod tests {
         let definition = proposal.definition.clone();
         let original_clock = registry.automation_proposal_sequence().unwrap();
         assert_eq!(original_clock, 1);
-        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; PRAGMA user_version=12;").unwrap();
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE IF EXISTS automation_report_sources; PRAGMA user_version=12;").unwrap();
         drop(registry);
         let mut registry = Registry::at(&root.path().join("registry.sqlite3")).unwrap();
         assert_eq!(registry.automation_proposal_sequence().unwrap(), 0);
@@ -883,7 +883,7 @@ mod tests {
             .unwrap();
         // A malformed legacy definition fails after clock/table creation. The
         // entire new checkpoint must roll back, including its schema number.
-        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;").unwrap();
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; PRAGMA user_version=12;").unwrap();
         registry
             .db
             .execute(
@@ -951,7 +951,7 @@ mod tests {
     fn automation_checkpoint_refuses_a_future_schema_committed_after_the_outer_read() {
         let (root, registry, proposal) = fixture();
         let database = root.path().join("registry.sqlite3");
-        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;").unwrap();
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; PRAGMA user_version=12;").unwrap();
         // This is the opener's admitted version before its writer reservation.
         let observed: u32 = registry
             .db
@@ -1007,7 +1007,7 @@ mod tests {
     #[test]
     fn automation_checkpoint_accepts_an_already_committed_compatible_upgrade() {
         let (root, registry, proposal) = fixture();
-        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; PRAGMA user_version=12;").unwrap();
+        registry.db.execute_batch("ALTER TABLE metadata DROP COLUMN automation_proposal_sequence; DROP TABLE automation_precheck_retirements; DROP TABLE IF EXISTS automation_report_sources; PRAGMA user_version=12;").unwrap();
         let observed: u32 = registry
             .db
             .pragma_query_value(None, "user_version", |row| row.get(0))

@@ -1971,6 +1971,7 @@ mod tests {
             .environment
             .insert("API_KEY".into(), "private-secret".into());
         card.kind = CardKind::Chat(crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: source.id,

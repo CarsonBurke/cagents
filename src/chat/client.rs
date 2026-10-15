@@ -2052,6 +2052,7 @@ mod tests {
     /// persisted launch names its session directory and nothing else.
     fn omp_card(conversation: Option<&str>, proof: Option<HostSessionProof>) -> Session {
         Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),

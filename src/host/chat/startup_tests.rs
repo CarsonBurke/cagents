@@ -54,6 +54,7 @@ fn managed_codex_start_releases_bundle_lease_before_provider_spawn() {
     std::fs::write(&program, "#!/cagents-test-missing-interpreter\n").unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
     let session = Session {
+        archive_report: None,
         id: TerminalId::new(),
         native_continuity: Default::default(),
         owned_codex_listener: None,

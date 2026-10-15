@@ -334,6 +334,8 @@ fn response_output(name: &'static str, reply: Response) -> CommandOutput {
             json!({"archive":archive}),
             "Saved scheduled conversation".into(),
         ),
+        Response::ArchiveReportSource(report) => (json!({"report_source":report}), "Saved automation report source".into()),
+        Response::ArchiveReport(report) => (json!({"report":report}), "Read-only automation run report".into()),
         Response::ArchivedAgents(page) => (
             json!({"saved_agents":page}),
             "Saved scheduled agents".into(),

@@ -619,7 +619,7 @@ impl HostState {
                 ));
             }
         }
-        if let ModelEdit::ChangeView { operation, change: crate::workspace_model::views::Change::RemoveArchivedAutomationSource { before, .. }, .. } = &edit {
+        if let ModelEdit::ChangeView { operation, change: crate::workspace_model::views::Change::RemoveArchivedAutomationSource { before, .. } | crate::workspace_model::views::Change::InsertArchiveReport { pane:before, .. }, .. } = &edit {
             if !self.registry()?.view_operation_seen(*operation).map_err(model_unavailable)? {
                 let owner = self.registry()?.archived_automation_pane_owner(before).map_err(model_unavailable)?
                     .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::InvalidRequest, "The original closed automation archive is unavailable", false))?;
@@ -4740,6 +4740,7 @@ for line in sys.stdin:
         let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let start = |id: &str| {
             let session = Session {
+                archive_report: None,
                 native_continuity: Default::default(),
                 owned_codex_listener: None,
                 id: TerminalId::new(),
@@ -4895,6 +4896,7 @@ for line in sys.stdin:
         }
         let host = Arc::new(crate::host::state::HostLock::new(test_host()));
         let source = Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
@@ -5183,6 +5185,7 @@ for line in sys.stdin:
             environment: BTreeMap::new(),
         };
         let source = Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
@@ -5894,6 +5897,7 @@ for line in sys.stdin:
             state.chat_spawning.insert(
                 id,
                 crate::chat::Session {
+                    archive_report: None,
                     id,
                     launch: crate::chat::Launch {
                         provider: crate::agent::Provider::Claude,
@@ -6497,6 +6501,7 @@ for line in sys.stdin:
         );
         let mut state = test_host();
         let session = chat::Session {
+            archive_report: None,
             id: TerminalId::new(),
             native_continuity: Default::default(),
             owned_codex_listener: None,

@@ -5930,6 +5930,7 @@ mod tests {
                 generation: 0,
             },
             chat::Session {
+                archive_report: None,
                 id: crate::model::TerminalId::new(),
                 launch: chat::Launch {
                     provider: Provider::Claude,

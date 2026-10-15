@@ -7,6 +7,7 @@ mod delivery;
 pub(crate) mod descriptor_limit;
 mod lock;
 mod model;
+pub(crate) use model::inspect_archive_report_in;
 /// Upper bound accepted by read-only source archive qualification.
 pub(crate) const WORKSPACE_REGISTRY_SCHEMA_VERSION: u32 = model::SCHEMA_VERSION;
 mod notifications;

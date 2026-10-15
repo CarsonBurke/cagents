@@ -497,6 +497,7 @@ mod tests {
         let id = TerminalId::new();
         let socket = std::path::PathBuf::from(format!("/var/tmp/cagents-codex-{id}/control.sock"));
         let unnamed = Session {
+            archive_report: None,
             id,
             launch: Launch {
                 provider: crate::agent::Provider::Codex,

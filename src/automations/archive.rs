@@ -69,6 +69,19 @@ impl ArchivedPaneReadiness {
             terminal: None,
         })
     }
+    pub fn qualify_report(report: &crate::automations::ArchiveReport, session: &Session) -> Result<Self,String> {
+        if !report.reference.is_supported()
+            || session.archive_report.as_ref()!=Some(&report.reference)
+            || crate::automations::ArchiveReport::session_digest(session)?!=report.session_digest
+            || report.reference.agent!=report.archive.agent.id {
+            return Err("The saved report presentation has no exact private receipt".into());
+        }
+        let mut original=session.clone(); original.archive_report=None;
+        let mut receipt=Self::qualify(report.reference.agent,&original,&report.archive)?;
+        receipt.session=session.clone();
+        Ok(receipt)
+    }
+
     pub fn matches(&self, agent: AgentId, session: &Session) -> bool {
         self.agent == agent && &self.session == session
     }
@@ -213,7 +226,8 @@ pub(crate) fn native_descriptor_matches(
     else {
         return false;
     };
-    if agent.spec.provider != current.launch.provider
+    if saved.archive_report.is_some() || current.archive_report.is_some()
+        || agent.spec.provider != current.launch.provider
         || saved.id != current.id
         || saved.proof != current.proof
         || !current
@@ -339,7 +353,9 @@ pub fn inspect_completed_automation_pane(
             bindings.get(&card).copied()
         }
     };
-    let expected = AgentId::from_uuid(card.as_uuid());
+    let report=match kind {CardKind::Chat(session)=>session.archive_report.as_ref(),_=>None};
+    let expected = report.map_or_else(||AgentId::from_uuid(card.as_uuid()),|reference|reference.agent);
+    if report.is_some_and(|reference|!reference.is_supported()) {return Err("The saved report reference is unsupported".into());}
     if claim.is_some_and(|id| id != expected) {
         return Err("The source archive binding changed".into());
     }
@@ -355,7 +371,7 @@ pub fn inspect_completed_automation_pane(
         return Err("The source automation pane changed".into());
     }
     match std::fs::symlink_metadata(registry) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && claim.is_none() => {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && claim.is_none() && report.is_none() => {
             return Ok(None);
         }
         Err(_) => return Err("The claimed automation archive is unavailable".into()),
@@ -374,7 +390,7 @@ pub fn inspect_completed_automation_pane(
     }
     let schema:bool=model.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='automation_snapshots')",[],|row|row.get(0)).map_err(|_|"The source automation registry is unreadable")?;
     if !schema {
-        return if claim.is_some() {
+        return if claim.is_some() || report.is_some() {
             Err("The claimed automation archive schema is missing".into())
         } else {
             Ok(None)
@@ -382,6 +398,13 @@ pub fn inspect_completed_automation_pane(
     }
     if registry_version < ARCHIVE_REGISTRY_SCHEMA_FLOOR {
         return Err("The source automation archive has no supported versioned authority".into());
+    }
+    if let Some(reference)=report {
+        if registry_version<15 {return Err("The saved report has no supported versioned presentation authority".into());}
+        let CardKind::Chat(session)=kind else{unreachable!()};
+        let receipt=crate::host::inspect_archive_report_in(&model,reference,session)
+            .map_err(|_|"The saved report source or private history no longer qualifies")?;
+        return ArchivedPaneReadiness::qualify_report(&receipt,session).map(Some);
     }
     let owner:Option<String>=model.query_row("SELECT record FROM agents WHERE id=?1 AND closed=1 AND json_type(record,'$.origin.Automation')='object' AND length(CAST(record AS BLOB))<=4194304",[expected.to_string()],|row|row.get(0)).optional().map_err(|_|"The source automation owner is unreadable")?;
     let Some(owner) = owner else {

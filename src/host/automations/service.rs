@@ -35,6 +35,16 @@ pub(in crate::host) fn process_under_control(
             .ok_or_else(|| "The automation scheduler is unavailable".to_owned())
     };
     let response = match request {
+        Request::ArchiveReportSource { identity, card, session } => {
+            return registry.lock().unwrap_or_else(|p| p.into_inner())
+                .archive_report_source(identity, card, &session)
+                .map(|report| Response::ArchiveReportSource(report.map(Box::new)));
+        }
+        Request::ReadArchiveReport { reference, session } => {
+            return registry.lock().unwrap_or_else(|p| p.into_inner())
+                .read_archive_report(&reference, &session)
+                .map(|report| Response::ArchiveReport(Box::new(report)));
+        }
         Request::Propose { .. } => {
             return Err(
                 "Prepare automation approval requests from a live hosted conversation".into(),

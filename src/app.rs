@@ -23725,6 +23725,7 @@ mod tests {
                 let mut recipe = launch_recipe("/tmp");
                 recipe.program = "claude".into();
                 app.card_state_mut(source).unwrap().kind = CardKind::Chat(crate::chat::Session {
+                    archive_report: None,
                     native_continuity: Default::default(),
                     owned_codex_listener: None,
                     id: TerminalId::new(),
@@ -23825,6 +23826,7 @@ mod tests {
         let conversation = "a1b2c3d4-1111-4111-8111-123456789abc";
         recipe.arguments = vec!["--resume".into(), conversation.into(), "--bare".into()];
         let original = crate::chat::Session {
+            archive_report: None,
             native_continuity: Default::default(),
             owned_codex_listener: None,
             id: TerminalId::new(),
