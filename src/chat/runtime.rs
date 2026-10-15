@@ -554,6 +554,12 @@ impl Handle {
                         });
                     }
                     if state.outcome.is_some() && state.finished_at.is_none() { state.finished_at = observed_at(); }
+                    let terminal=match &state.outcome {Some(crate::agent::ActivityOutcome::Failed{..})=>Some(ToolStatus::Failed),Some(crate::agent::ActivityOutcome::Cancelled|crate::agent::ActivityOutcome::Interrupted{..})=>Some(ToolStatus::Stopped),_=>None};
+                    if let Some(status)=terminal {
+                        finish_snapshot_work(&mut state,status,direct_closed&&native_closed);
+                        drop(state);
+                        if let Err(error)=actor.store.lock().unwrap_or_else(|p|p.into_inner()).finish_running(status) {tracing::warn!(%error,"Cannot settle ended provider tool metadata");}
+                    }
                 }
                 actor.apply(Event::Exited { code });
                 let usage = actor
@@ -2818,6 +2824,11 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         }
         Event::TurnFinished { outcome, .. } => {
             use crate::{agent::ActivityOutcome, notifications::Kind};
+            match outcome {
+                Kind::Cancelled=> {let all=state.capabilities.interrupt_stops_background;finish_snapshot_work(state,ToolStatus::Stopped,all);}
+                Kind::Failed=>finish_snapshot_work(state,ToolStatus::Failed,false),
+                _=>{}
+            }
             state.outcome = match outcome {
                 Kind::Succeeded => Some(ActivityOutcome::Succeeded),
                 Kind::Cancelled => Some(ActivityOutcome::Cancelled),
@@ -3267,6 +3278,21 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
     }
 }
 
+fn finish_snapshot_work(state:&mut Snapshot,status:ToolStatus,include_background:bool) {
+    fn finish_items(items:&mut [Arc<Item>],status:ToolStatus) {
+        for item in items {
+            if item.content.status()!=Some(ToolStatus::Running) {continue;}
+            match &mut Arc::make_mut(item).content {ItemContent::Tool {status:current,..}|ItemContent::Command {status:current,..}|ItemContent::Changes {status:current,..}=>*current=status,_=>{}}
+        }
+    }
+    finish_items(&mut state.items,status);
+    for child in &mut state.subagents {
+        if child.status==ToolStatus::Running && (!child.background || include_background) {
+            child.status=status;child.waiting=false;child.detail.clear();finish_items(&mut child.items,status);
+        }
+    }
+}
+
 /// Running task identities authorize interruption and idle waits. Retiring
 /// presentation history must never retire that ownership evidence. Keep only
 /// the newest 32 rich child transcripts, with older active entries remaining
@@ -3549,6 +3575,22 @@ mod tests {
         assert!(!diagnostic.summary.contains('\x1b'));
         assert!(!diagnostic.output.contains('\x1b'));
         assert!(diagnostic.output.len() > diagnostic.summary.len());
+    }
+
+    #[test]
+    fn cancelled_work_does_not_become_running_again_when_the_next_turn_starts() {
+        let tool=Arc::new(Item {id:"old-tool".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"Bash".into(),input:"work".into(),output:String::new(),status:ToolStatus::Running}});
+        let mut state=Snapshot {items:vec![tool],..Default::default()};
+        subagent(&mut state,"foreground");subagent(&mut state,"background").background=true;
+        let mut indices=BTreeMap::new();
+        apply_event(&mut state,&mut indices,Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Cancelled});
+        assert_eq!(state.items[0].content.status(),Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[0].status,ToolStatus::Stopped);
+        assert_eq!(state.subagents[1].status,ToolStatus::Running,"a background child outside interruption ownership remains live");
+        apply_event(&mut state,&mut indices,Event::TurnStarted);
+        assert!(state.outcome.is_none());assert_eq!(state.items[0].content.status(),Some(ToolStatus::Stopped));assert_eq!(state.subagents[0].status,ToolStatus::Stopped);
+        finish_snapshot_work(&mut state,ToolStatus::Failed,true);
+        assert_eq!(state.subagents[1].status,ToolStatus::Failed,"confirmed provider teardown settles all owned children");
     }
 
     #[test]
