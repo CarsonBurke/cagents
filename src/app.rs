@@ -35,6 +35,8 @@ mod palette_ui;
 mod project_ui;
 mod project_creation;
 mod project_source_admission;
+mod project_source_ui;
+mod root_admission_ui;
 use project_source_admission::{PreparedProjectRepository, ProjectPreparationFailure};
 mod recovery_placement;
 mod pull_request_ui;
@@ -1855,6 +1857,7 @@ fn proven_pull_request_base(changes: &sidebar::BranchChanges, remotes: &[String]
 #[derive(Debug, Clone)]
 pub struct LoadedRepository {
     creation_source: Option<worktree_dialog::WorktreeCreationSource>,
+    registered_creation: Option<project_source_admission::RegisteredProjectSource>,
     project: ProjectState,
     repository: Option<RepositoryInfo>,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
@@ -2830,7 +2833,8 @@ fn completion_navigates(message: &Message) -> bool {
     }
     matches!(
         message,
-        Message::RepositoryLoaded {
+        Message::RepositoryAdmitted { open_cards: true, result: Ok(_), .. }
+        | Message::RepositoryLoaded {
             open_cards: true,
             result: Ok(_),
             ..
@@ -6919,6 +6923,14 @@ pub enum Message {
         generation: u64,
         result: Result<Box<PreparedProjectRepository>, ProjectPreparationFailure>,
     },
+    RootAdmissions(root_admission_ui::Action),
+    RepositoryAdmitted {
+        open_cards: bool,
+        project_id: ProjectId,
+        generation: u64,
+        ticket: crate::edited_root_admission::AdmissionTicket,
+        result: Result<Box<LoadedRepository>, ProjectPreparationFailure>,
+    },
     RepositoryLoaded {
         open_cards: bool,
         project_id: ProjectId,
@@ -7971,6 +7983,7 @@ pub struct Cagents {
     notices: NoticeLog,
     sidebar_model: SidebarModel,
     project_ui: project_ui::State,
+    edited_root_admissions: crate::edited_root_admission::SharedEditedRootAdmissions,
     worktree_protections: crate::worktree_cleanup::WindowProtections,
     channel_ui: channel_ui::State,
     sidebar_selection_ui: sidebar_selection_ui::State,
@@ -17359,6 +17372,7 @@ impl Application for Cagents {
             attention_navigation: Vec::new(),
             attention_focus_epoch: 0,
             project_ui: project_ui::State::default(),
+            edited_root_admissions: Default::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
@@ -17923,12 +17937,21 @@ impl Application for Cagents {
                 generation,
                 result,
             } => self.device_project_loaded(project_id, generation, result),
+            Message::RootAdmissions(action) => self.update_root_admissions(action),
+            Message::RepositoryPrepared { open_cards, project_id, generation, result } =>
+                self.finish_repository_preparation(project_id, generation, open_cards, result),
+            Message::RepositoryAdmitted { open_cards, project_id, generation, ticket, result } =>
+                self.finish_repository_admission(project_id, generation, open_cards, ticket, result),
             Message::RepositoryLoaded {
                 open_cards,
                 project_id,
                 generation,
                 result,
             } => {
+                let result = self.checked_repository_publication(result).and_then(|loaded| {
+                    (loaded.project.id == project_id).then_some(loaded)
+                        .ok_or_else(|| "The repository completion does not name its original project read.".to_owned())
+                });
                 if self.repository_generations.get(&project_id) != Some(&generation) {
                     return Task::none();
                 }
@@ -18050,7 +18073,6 @@ impl Application for Cagents {
                             // row's complete metadata. Publish no new authority
                             // into that older row: explicitly read its own actor.
                             let canonical_refresh = if !superseded {
-                                self.retire_project_creation_source(existing_id);
                                 self.repository_load_task(existing_repository, Some(existing_id), false)
                             } else { Task::none() };
                             self.repository_generations.remove(&project_id);
@@ -18180,8 +18202,8 @@ impl Application for Cagents {
                         } else {
                             self.sidebar_model.projects.push(sidebar_project);
                         }
-                        self.publish_project_creation_source(loaded.project.id, generation,
-                            loaded.creation_source.clone(),
+                        self.publish_registered_project_source(loaded.project.id, generation,
+                            loaded.registered_creation.clone(),
                             loaded.repository.as_ref().is_some_and(|repository| repository.is_bare));
                         self.sidebar_model
                             .apply_project_order(&self.durable.project_order);
@@ -22030,6 +22052,7 @@ impl Application for Cagents {
     fn subscription(&self) -> Subscription<Message> {
         let operation_subscriptions = self.worktree_progress_subscriptions();
         let mut subscriptions = vec![
+            self.root_admission_subscription(),
             if self
                 .notices
                 .entries
@@ -23107,6 +23130,7 @@ fn load_project_with_source(
     std::fs::read_dir(&directory)
         .map_err(|error| format!("could not read folder {}: {error}", directory.display()))?;
     Ok(LoadedRepository {
+        registered_creation: None,
         creation_source: None,
         project: ProjectState {
             id: project_id.unwrap_or_default(),
@@ -23221,6 +23245,7 @@ fn read_loaded_repository<E: crate::repository::ProcessExecutor>(
     // wrote last.
     let name = crate::workspace_model::repository_display_name(&repository.common_dir);
     Ok(LoadedRepository {
+        registered_creation: None,
         creation_source,
         project: ProjectState {
             kind: Default::default(),
@@ -30101,6 +30126,7 @@ mod tests {
         app.repository_generations.insert(broken, 1);
         app.repository_generations.insert(healthy, 1);
         let loaded = LoadedRepository {
+            registered_creation: None,
             creation_source: None,
             project: ProjectState {
                 kind: Default::default(),
@@ -32313,6 +32339,7 @@ mod tests {
             attention_navigation: Vec::new(),
             attention_focus_epoch: 0,
             project_ui: project_ui::State::default(),
+            edited_root_admissions: Default::default(),
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),

@@ -8,6 +8,7 @@ pub(super) struct PublishedSource {
     logical_generation: u64,
     repository: PathBuf,
     source: WorktreeCreationSource,
+    editor_root: Option<crate::editor::FileRootIdentity>,
 }
 
 impl Cagents {
@@ -17,7 +18,29 @@ impl Cagents {
         let row = self.sidebar_model.project(project)?;
         let published = self.project_ui.creation_sources.get(&project)?;
         (row.repository == published.repository && row.creation_binding == Some(published.source.id())
-            && published.source.is_available()).then(|| published.source.clone())
+            && published.source.is_available()
+            && published.editor_root.as_ref().is_some_and(crate::editor::FileRootIdentity::has_active_admission))
+            .then(|| published.source.clone())
+    }
+
+    pub(super) fn retained_registered_project_source(&self, project: ProjectId)
+        -> Option<project_source_admission::RegisteredProjectSource> {
+        let source = self.retained_project_creation_source(project)?;
+        let editor_root = self.project_ui.creation_sources.get(&project)?.editor_root.clone()?;
+        let registered = project_source_admission::RegisteredProjectSource { source, editor_root };
+        Self::registered_project_source_is_current(&registered).then_some(registered)
+    }
+
+    pub(super) fn publish_registered_project_source(&mut self, project: ProjectId, generation: u64,
+        registered: Option<project_source_admission::RegisteredProjectSource>, bare: bool) {
+        if self.repository_generations.get(&project) != Some(&generation) { return; }
+        if registered.as_ref().is_some_and(|registered| !Self::registered_project_source_is_current(registered)) { return; }
+        self.publish_project_creation_source(project, generation, registered.as_ref().map(|registered| registered.source.clone()), bare);
+        if let Some(registered) = registered
+            && let Some(published) = self.project_ui.creation_sources.get_mut(&project)
+            && published.read_generation == generation && published.source.id() == registered.source.id() {
+            published.editor_root = Some(registered.editor_root);
+        }
     }
 
     /// New user intents additionally require a completed, current project read.
@@ -46,6 +69,7 @@ impl Cagents {
     pub(super) fn retire_project_creation_source(&mut self, project: ProjectId) {
         self.invalidate_project_worktree_creations(project);
         if let Some(published) = self.project_ui.creation_sources.remove(&project) {
+            if let Ok(admitted) = published.source.edited_root_admission() { admitted.ticket().request_retirement(); }
             published.source.invalidate();
         }
         if let Some(row) = self.sidebar_model.projects.iter_mut().find(|row| row.id == project) {
@@ -87,7 +111,7 @@ impl Cagents {
             row.creation_unavailable_reason = None;
             self.project_ui.creation_sources.insert(project, PublishedSource {
                 read_generation: generation, logical_generation: generation,
-                repository: row.repository.clone(), source,
+                repository: row.repository.clone(), source, editor_root: None,
             });
         }
     }
