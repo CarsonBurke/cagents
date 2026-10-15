@@ -4357,7 +4357,7 @@ impl RepositoryRuntime {
                         self.set_diff_state(
                             DiffBasis::IndexToWorktree,
                             DiffState::ready(RenderedDiff::Text {
-                                model,
+                                model: Arc::new(model),
                                 old_label: "Index".into(),
                                 new_label: "Working buffer".into(),
                             }),
@@ -6288,6 +6288,7 @@ impl RepositoryRuntime {
         self.request_diff(identity, basis, old_path)
     }
 
+
     fn open_file(&mut self, card: CardId, path: PathBuf) -> Task<RepositoryAction> {
         let file = match self.file(&path).cloned() {
             Some(file) => file,
@@ -6678,6 +6679,16 @@ impl RepositoryRuntime {
                 .selected
                 .as_ref()
                 .is_some_and(|file| file.path == identity.path)
+    }
+
+    /// Capture the model currently ready for this basis in constant time.
+    /// A stale display fallback is intentionally excluded. Mutation callers
+    /// must also fence the live buffer revision before applying a patch.
+    pub fn current_diff_model_snapshot(&self) -> Option<Arc<DiffModel>> {
+        match self.diff_state(&self.diff_basis) {
+            Some(DiffState::Ready(RenderedDiff::Text { model,.. },_)) => Some(Arc::clone(model)),
+            _ => None,
+        }
     }
 
     fn diff_model(&self) -> Option<&DiffModel> {
@@ -17616,7 +17627,7 @@ mod tests {
     /// A ready text diff carrying the labels the staged basis produces.
     fn staged_text_diff(model: DiffModel) -> RenderedDiff {
         RenderedDiff::Text {
-            model,
+            model: Arc::new(model),
             old_label: "HEAD".into(),
             new_label: "Index".into(),
         }
