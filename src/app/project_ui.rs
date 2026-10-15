@@ -366,15 +366,19 @@ impl Cagents {
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
         cosmic::task::future(async move {
             let removed = tokio::task::spawn_blocking(move || {
-                let retirements = store.and_then(|store| {
-                    if crate::device::selected().is_some() { return None; }
+                let retirements = store.map(|store| {
+                    if crate::device::selected().is_some() {
+                        return Err("Remote worktree creation metadata was retained; its original local association is unavailable".to_owned());
+                    }
                     RepositoryService::system("git").creation_retirements_before_removal(
-                        store, &request.repository, &request.path, &CancellationToken::new()).ok()
+                        store, &request.repository, &request.path, &CancellationToken::new())
                 });
                 let reply = crate::device_service::request(crate::device_service::Operation::RemoveMergedWorktree { request }).ok()?;
                 let crate::device_service::Reply::MergedWorktreeRemoved(Ok(removed)) = reply else { return None; };
-                if let Some(retirements) = retirements
-                    && let Err(errors) = retirements.finish(&removed) {
+                if let Some(Err(errors)) = retirements.map(|captured| captured
+                    .map_err(|error| vec![error])
+                    .and_then(|capture| capture.finish(&removed)
+                        .map_err(|errors| errors.into_iter().map(|error| error.to_string()).collect()))) {
                     for error in errors { tracing::warn!(%error, "could not release removed worktree creation receipt"); }
                 }
                 Some(removed)
@@ -1507,15 +1511,19 @@ impl Cagents {
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let retirements = store.and_then(|store| {
-                    if crate::device::selected().is_some() { return None; }
+                let retirements = store.map(|store| {
+                    if crate::device::selected().is_some() {
+                        return Err("Remote worktree creation metadata was retained; its original local association is unavailable".to_owned());
+                    }
                     RepositoryService::system("git").creation_retirements_before_removal(
-                        store, &request.repository, &request.path, &CancellationToken::new()).ok()
+                        store, &request.repository, &request.path, &CancellationToken::new())
                 });
                 let removed = delete_worktree(&request)?;
-                if let Some(retirements) = retirements
-                    && let Some(removed) = removed
-                    && let Err(errors) = retirements.finish(&removed)
+                if let Some(removed) = removed
+                    && let Some(Err(errors)) = retirements.map(|captured| captured
+                        .map_err(|error| vec![error])
+                        .and_then(|capture| capture.finish(&removed)
+                            .map_err(|errors| errors.into_iter().map(|error| error.to_string()).collect())))
                 {
                     // The worktree is gone either way; what stays held is
                     // only the chance to create the same one again.

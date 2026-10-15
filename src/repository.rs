@@ -10611,8 +10611,7 @@ pub fn capture_worktree_creation_retirements(
     planned: &RemovedWorktree,
 ) -> Result<WorktreeCreationRetirements, StoreError> {
     let candidates = store.worktree_creation_retirement_candidates()?.into_iter()
-        .filter(|operation| operation.status == PendingOperationStatus::Applied)
-        .filter(|operation| serde_json::from_value::<WorktreeJournal>(operation.payload.clone())
+        .filter(|operation| worktree_setup_intent::settled_setup_journal(operation)
             .is_ok_and(|journal| journal.created(planned))).collect();
     Ok(WorktreeCreationRetirements { store, planned: planned.clone(), candidates })
 }
@@ -12048,6 +12047,38 @@ mod worktree_journal_tests {
         let retained = fixture.store.journaled_worktree_operation(row.id).unwrap().unwrap();
         assert_eq!(retained.payload, updated);
         assert_eq!(retained.status, PendingOperationStatus::Applied);
+    }
+
+    #[test]
+    fn unsupported_or_mismatched_creation_evidence_stays_retained_after_removal() {
+        for mutation in ["version", "state", "operation", "outcome"] {
+            let mut fixture = Fixture::new();
+            fixture.resolve(fixture.input("foo"));
+            let original = fixture.run(&CancellationToken::new());
+            assert_eq!(original.state, WorktreeOperationState::Created, "{original:?}");
+            let destination = fixture.request.destination.clone();
+            let removed = fixture.removal(&destination);
+            let row = fixture.store.journaled_worktree_operation(original.operation_id).unwrap().unwrap();
+            let mut updated = row.payload.clone();
+            match mutation {
+                "version" => updated["version"] = serde_json::json!(99),
+                "state" => updated["state"] = serde_json::to_value(WorktreeOperationState::OutcomeUnknown).unwrap(),
+                "operation" => updated["request"]["operation_id"] = serde_json::to_value(OperationId::new()).unwrap(),
+                "outcome" => updated["outcome"] = serde_json::Value::Null,
+                _ => unreachable!(),
+            }
+            assert!(serde_json::from_value::<WorktreeJournal>(updated.clone()).is_ok());
+            fixture.store.update_operation(row.id, &row.payload, &updated, PendingOperationStatus::Applied).unwrap();
+            let captured = fixture.store.journaled_worktree_operation(row.id).unwrap().unwrap();
+            assert!(worktree_setup_intent::settled_setup_journal(&captured).is_err());
+            let retirements = capture_worktree_creation_retirements(fixture.store.clone(), &removed).unwrap();
+            fixture.git(&["worktree", "remove", destination.to_str().unwrap()]);
+
+            retirements.finish(&removed).unwrap();
+            assert!(!destination.exists());
+            let retained = fixture.store.journaled_worktree_operation(row.id).unwrap().unwrap();
+            assert_eq!(retained.payload, updated, "{mutation} must not grant journal retirement");
+        }
     }
 
     /// A creation journaled before administrative directories were recorded
