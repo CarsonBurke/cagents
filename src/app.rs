@@ -2915,12 +2915,15 @@ pub enum SettingsField {
     ShortcutRenameFile,
     ShortcutDuplicateFile,
     ShortcutCopyRelativePath,
+    ShortcutStageSelectedChanges,
+    ShortcutUnstageSelectedChanges,
+    ShortcutDiscardSelectedChanges,
 
 }
 
 impl SettingsField {
     /// The shortcut table in `KeyboardShortcuts::actions` order.
-    const SHORTCUTS: [Self; 112] = [
+    const SHORTCUTS: [Self; 115] = [
         Self::ShortcutNewTerminal,
         Self::ShortcutNewChannel,
         Self::ShortcutClonePane,
@@ -3037,6 +3040,9 @@ impl SettingsField {
         Self::ShortcutRenameFile,
         Self::ShortcutDuplicateFile,
         Self::ShortcutCopyRelativePath,
+        Self::ShortcutStageSelectedChanges,
+        Self::ShortcutUnstageSelectedChanges,
+        Self::ShortcutDiscardSelectedChanges,
 
     ];
 
@@ -3157,6 +3163,9 @@ impl SettingsField {
             Self::ShortcutRenameFile => "Rename file…",
             Self::ShortcutDuplicateFile => "Duplicate file…",
             Self::ShortcutCopyRelativePath => "Copy relative path",
+            Self::ShortcutStageSelectedChanges => "Stage selected changes",
+            Self::ShortcutUnstageSelectedChanges => "Unstage selected changes",
+            Self::ShortcutDiscardSelectedChanges => "Discard selected changes…",
 
 
             Self::ShortcutCommandPalette => "Command palette",
@@ -3332,6 +3341,9 @@ impl SettingsField {
             | Self::ShortcutRenameFile
             | Self::ShortcutDuplicateFile
             | Self::ShortcutCopyRelativePath
+            | Self::ShortcutStageSelectedChanges
+            | Self::ShortcutUnstageSelectedChanges
+            | Self::ShortcutDiscardSelectedChanges
             | Self::ShortcutRenamePane
             | Self::ShortcutCommandPalette
             | Self::ShortcutNewThread
@@ -3470,6 +3482,9 @@ struct ShortcutDraft {
     rename_file: String,
     duplicate_file: String,
     copy_relative_path: String,
+    stage_selected_changes: String,
+    unstage_selected_changes: String,
+    discard_selected_changes: String,
 
 
     command_palette: String,
@@ -3596,6 +3611,9 @@ impl ShortcutDraft {
             rename_file: settings::format_chords(&shortcuts.rename_file),
             duplicate_file: settings::format_chords(&shortcuts.duplicate_file),
             copy_relative_path: settings::format_chords(&shortcuts.copy_relative_path),
+            stage_selected_changes: settings::format_chords(&shortcuts.stage_selected_changes),
+            unstage_selected_changes: settings::format_chords(&shortcuts.unstage_selected_changes),
+            discard_selected_changes: settings::format_chords(&shortcuts.discard_selected_changes),
 
 
             command_palette: settings::format_chords(&shortcuts.command_palette),
@@ -3934,6 +3952,9 @@ impl SettingsDraft {
             SettingsField::ShortcutRenameFile => self.keyboard_shortcuts.rename_file = value,
             SettingsField::ShortcutDuplicateFile => self.keyboard_shortcuts.duplicate_file = value,
             SettingsField::ShortcutCopyRelativePath => self.keyboard_shortcuts.copy_relative_path = value,
+            SettingsField::ShortcutStageSelectedChanges => self.keyboard_shortcuts.stage_selected_changes = value,
+            SettingsField::ShortcutUnstageSelectedChanges => self.keyboard_shortcuts.unstage_selected_changes = value,
+            SettingsField::ShortcutDiscardSelectedChanges => self.keyboard_shortcuts.discard_selected_changes = value,
 
 
             SettingsField::ShortcutCommandPalette => {
@@ -4265,6 +4286,9 @@ fn settings_update(
         SettingsField::ShortcutRenameFile => { next.keyboard_shortcuts.rename_file = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutDuplicateFile => { next.keyboard_shortcuts.duplicate_file = settings::parse_chords(value); Ok(()) }
         SettingsField::ShortcutCopyRelativePath => { next.keyboard_shortcuts.copy_relative_path = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutStageSelectedChanges => { next.keyboard_shortcuts.stage_selected_changes = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutUnstageSelectedChanges => { next.keyboard_shortcuts.unstage_selected_changes = settings::parse_chords(value); Ok(()) }
+        SettingsField::ShortcutDiscardSelectedChanges => { next.keyboard_shortcuts.discard_selected_changes = settings::parse_chords(value); Ok(()) }
 
         SettingsField::ShortcutToggleProjects => {
             next.keyboard_shortcuts.toggle_projects = settings::parse_chords(value);
@@ -15574,6 +15598,10 @@ impl Application for Cagents {
                 Task::batch(tasks)
             }
             Message::Sidebar(action) => {
+                if let SidebarAction::RunChangeCommand { command, key, row, selection_revision } = action {
+                    return self.run_captured_change_command(command, key, row, selection_revision);
+                }
+
                 if let SidebarAction::RunCommand { command, action } = action {
                     return self.run_sidebar_registered_command(command, *action);
                 }
@@ -15704,7 +15732,7 @@ impl Application for Cagents {
                         } else { Task::none() }
                     }
                     SidebarAction::DeleteRow(row) => self.delete_sidebar_row(row),
-                    SidebarAction::RunCommand { .. } => unreachable!("registered commands are validated before dispatch"),
+                    SidebarAction::RunCommand { .. } | SidebarAction::RunChangeCommand { .. } => unreachable!("registered commands are validated before dispatch"),
                     SidebarAction::DeleteRows(rows) => {
                         if rows.len() == 1 {
                             self.delete_sidebar_row(rows[0])
@@ -17286,6 +17314,7 @@ impl Application for Cagents {
                                 | workspace_widget::FocusedPane::OutsideWorkspace
                                 | workspace_widget::FocusedPane::SidebarRows
                                 | workspace_widget::FocusedPane::SidebarFiles
+                                | workspace_widget::FocusedPane::SidebarChanges
                         )
                         && workspace_widget::global_shortcut(
                             &event,
@@ -17638,6 +17667,7 @@ impl Application for Cagents {
                                 | workspace_widget::FocusedPane::OutsideWorkspace
                                 | workspace_widget::FocusedPane::SidebarRows
                                 | workspace_widget::FocusedPane::SidebarFiles
+                                | workspace_widget::FocusedPane::SidebarChanges
                         )
                         && let Some(card) = self.workspace.focused()
                         && matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
@@ -18947,6 +18977,7 @@ impl Application for Cagents {
             focus_regions.push((sidebar::selection_row_focus_id(row), workspace_widget::FocusedPane::SidebarRows.into()));
         }
         focus_regions.push((sidebar::file_panel_focus_id(), workspace_widget::FocusedPane::SidebarFiles.into()));
+        focus_regions.push((sidebar::change_panel_focus_id(), workspace_widget::FocusedPane::SidebarChanges.into()));
         let projection = self.workspace.projection(self.workspace.viewport_width());
         for mounted in &projection.mounted {
             let card = mounted.id;

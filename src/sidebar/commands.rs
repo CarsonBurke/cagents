@@ -8,6 +8,7 @@ pub enum CommandTarget {
     Unavailable,
     Rows(Vec<SelectionRow>),
     File { key: ActiveWorktreeKey, path: RepoPath },
+    Changes { key: ActiveWorktreeKey, row: ChangeSelectionRow, selection_revision: u64 },
 }
 
 /// Menu parameters remain in their ordinary self-contained sidebar action.
@@ -108,7 +109,7 @@ impl CommandTarget {
 
     pub fn resolve(&self, model: &SidebarModel, command: Command) -> Option<SidebarAction> {
         match self {
-            Self::Unavailable => None,
+            Self::Unavailable | Self::Changes { .. } => None,
             Self::File { key, path } => {
                 let source = model.source_control.as_ref()?;
                 if source.key != *key || !model.contains_worktree(key) || source.reloading || source.busy() { return None; }
@@ -170,6 +171,25 @@ impl CommandTarget {
                 Some(project_action(project.id, worktree.map(|row| row.id), project_command))
             }
         }
+    }
+
+    /// Changes retain a selection generation as well as the worktree and
+    /// focused path. Rebinding, clearing or replacing selection cannot retarget
+    /// a palette entry that was captured before its search field took focus.
+    pub fn resolve_in(&self, model: &SidebarModel, state: &SidebarState, command: Command) -> Option<SidebarAction> {
+        let Self::Changes { key, row, selection_revision } = self else { return self.resolve(model, command); };
+        let source = model.source_control.as_ref()?;
+        if &source.key != key || !model.contains_worktree(key) || source.reloading || source.busy()
+            || state.change_selection_revision() != *selection_revision { return None; }
+        let operation = match command {
+            Command::StageSelectedChanges => ChangeGroupCommand::Stage,
+            Command::UnstageSelectedChanges => ChangeGroupCommand::Unstage,
+            Command::DiscardSelectedChanges => ChangeGroupCommand::Discard,
+            _ => return None,
+        };
+        change_command_available_for(source, state, row, operation).then(|| SidebarAction::InvokeChangeRows {
+            key: key.clone(), row: row.clone(), command: operation,
+        })
     }
 
     pub fn capabilities(&self, model: &SidebarModel) -> u64 {
@@ -247,5 +267,35 @@ mod tests {
         for command in [FileCommand::Rename, FileCommand::CopyFile, FileCommand::CopyPath, FileCommand::CopyRelativePath, FileCommand::RevealInFileManager] {
             assert!(command_id(&SidebarAction::FileCommand { key: key.clone(), path: RepoPath::parse("file.rs").unwrap(), command }).is_some());
         }
+    }
+}
+
+
+#[cfg(test)]
+mod change_target_tests {
+    use super::*;
+    #[test]
+    fn captured_change_selection_rejects_replacement_and_rebound_worktree() {
+        let mut model = super::super::tests::panel_model();
+        let mut state = super::super::tests::panel_state(&model);
+        let source = model.source_control.as_ref().unwrap();
+        let rows = change_selection_order(source, &state);
+        assert!(rows.len() > 1);
+        let row = rows[0].clone();
+        let command = if row.area == ChangeArea::Staged { Command::UnstageSelectedChanges } else { Command::StageSelectedChanges };
+        state.select_change_rows(row.clone(), SelectionIntent::Toggle, &rows);
+        let target = CommandTarget::Changes { key: source.key.clone(), row,
+            selection_revision: state.change_selection_revision() };
+        assert!(matches!(target.resolve_in(&model, &state, command), Some(SidebarAction::InvokeChangeRows { .. })));
+        state.select_change_rows(rows[0].clone(), SelectionIntent::Toggle, &rows);
+        state.select_change_rows(rows[1].clone(), SelectionIntent::Toggle, &rows);
+        assert_eq!(state.selected_change_count(), 1);
+        assert!(target.resolve_in(&model, &state, command).is_none(), "equal-count replacement cannot retarget a captured command");
+        let current = CommandTarget::Changes { key: source.key.clone(), row: rows[1].clone(),
+            selection_revision: state.change_selection_revision() };
+        model.source_control.as_mut().unwrap().reloading = true;
+        assert!(current.resolve_in(&model, &state, Command::StageSelectedChanges).is_none());
+        model.source_control = None;
+        assert!(current.resolve_in(&model, &state, Command::StageSelectedChanges).is_none());
     }
 }

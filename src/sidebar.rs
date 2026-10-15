@@ -3783,6 +3783,7 @@ impl SidebarState {
             | SidebarAction::DeleteRow(_)
             | SidebarAction::DeleteSelectedRows
             | SidebarAction::RunCommand { .. }
+            | SidebarAction::RunChangeCommand { .. }
             | SidebarAction::DeleteRows(_)
             | SidebarAction::ClearRowSelection => {}
         }
@@ -3814,6 +3815,8 @@ pub enum ChangeGroupCommand {
 /// Not `Eq`: the resize request carries a width, and widths are measurements.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SidebarAction {
+    RunChangeCommand { command: crate::workspace_widget::GlobalShortcut, key: ActiveWorktreeKey,
+        row: ChangeSelectionRow, selection_revision: u64 },
     RunCommand { command: crate::workspace_widget::GlobalShortcut, action: Box<SidebarAction> },
     /// Original selection captured before a palette or context menu took focus.
     DeleteRows(Vec<SelectionRow>),

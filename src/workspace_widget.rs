@@ -124,6 +124,9 @@ pub enum GlobalShortcut {
     RenameFile,
     DuplicateFile,
     CopyRelativePath,
+    StageSelectedChanges,
+    UnstageSelectedChanges,
+    DiscardSelectedChanges,
 
 
     CommandPalette,
@@ -196,6 +199,9 @@ impl GlobalShortcut {
             Self::RenameFile => Some(1 << 21),
             Self::DuplicateFile => Some(1 << 22),
             Self::CopyRelativePath => Some(1 << 23),
+            Self::StageSelectedChanges => Some(1 << 24),
+            Self::UnstageSelectedChanges => Some(1 << 25),
+            Self::DiscardSelectedChanges => Some(1 << 26),
             _ => None,
         }
     }
@@ -279,6 +285,9 @@ impl GlobalShortcut {
             Self::RenameFile => "rename_file",
             Self::DuplicateFile => "duplicate_file",
             Self::CopyRelativePath => "copy_relative_path",
+            Self::StageSelectedChanges => "stage_selected_changes",
+            Self::UnstageSelectedChanges => "unstage_selected_changes",
+            Self::DiscardSelectedChanges => "discard_selected_changes",
 
             Self::NextAttention => "next_attention",
             Self::PreviousAttention => "previous_attention",
@@ -358,7 +367,7 @@ impl ShortcutScope {
             Self::Workspace => true,
             Self::OutsideTerminal => focused != FocusedPane::Terminal,
             Self::OutsideTextInput => !focused.is_text_editing(),
-            Self::Sidebar => matches!(focused, FocusedPane::SidebarRows | FocusedPane::SidebarFiles),
+            Self::Sidebar => matches!(focused, FocusedPane::SidebarRows | FocusedPane::SidebarFiles | FocusedPane::SidebarChanges),
             Self::Review => focused == FocusedPane::Review,
             Self::Chat => matches!(focused, FocusedPane::Chat | FocusedPane::ChatPane),
             Self::Editor => focused == FocusedPane::Editor,
@@ -371,6 +380,7 @@ impl ShortcutScope {
 pub enum FocusedPane {
     SidebarRows,
     SidebarFiles,
+    SidebarChanges,
     /// A terminal, which forwards the keys it is given to its process.
     Terminal,
     /// A pull request review pane.
@@ -1158,6 +1168,9 @@ pub const GLOBAL_SHORTCUT_DESCRIPTORS: &[ShortcutDescriptor] = &[
     ShortcutDescriptor { action: GlobalShortcut::RenameFile, label: "Rename file…", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::DuplicateFile, label: "Duplicate file…", repeatable: false, scope: ShortcutScope::Sidebar },
     ShortcutDescriptor { action: GlobalShortcut::CopyRelativePath, label: "Copy relative path", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::StageSelectedChanges, label: "Stage selected changes", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::UnstageSelectedChanges, label: "Unstage selected changes", repeatable: false, scope: ShortcutScope::Sidebar },
+    ShortcutDescriptor { action: GlobalShortcut::DiscardSelectedChanges, label: "Discard selected changes…", repeatable: false, scope: ShortcutScope::Sidebar },
 
 ];
 
@@ -1254,6 +1267,9 @@ pub fn shortcut_keys(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> &
         GlobalShortcut::RenameFile => &shortcuts.rename_file,
         GlobalShortcut::DuplicateFile => &shortcuts.duplicate_file,
         GlobalShortcut::CopyRelativePath => &shortcuts.copy_relative_path,
+        GlobalShortcut::StageSelectedChanges => &shortcuts.stage_selected_changes,
+        GlobalShortcut::UnstageSelectedChanges => &shortcuts.unstage_selected_changes,
+        GlobalShortcut::DiscardSelectedChanges => &shortcuts.discard_selected_changes,
 
 
         GlobalShortcut::CommandPalette => &shortcuts.command_palette,

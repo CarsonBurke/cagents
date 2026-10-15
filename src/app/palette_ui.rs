@@ -983,7 +983,7 @@ impl Cagents {
     fn capture_sidebar_command_target(&self) -> Option<sidebar::commands::CommandTarget> {
         let pane = self.input_trace.keyboard_focus()?;
         let Some(widget) = self.input_trace.keyboard_widget_id() else {
-            return matches!(pane, workspace_widget::FocusedPane::SidebarRows | workspace_widget::FocusedPane::SidebarFiles).then_some(sidebar::commands::CommandTarget::Unavailable);
+            return matches!(pane, workspace_widget::FocusedPane::SidebarRows | workspace_widget::FocusedPane::SidebarFiles | workspace_widget::FocusedPane::SidebarChanges).then_some(sidebar::commands::CommandTarget::Unavailable);
         };
         match pane {
             workspace_widget::FocusedPane::SidebarRows => {
@@ -991,6 +991,12 @@ impl Cagents {
                 let Some(row) = visible.iter().copied().find(|row| sidebar::selection_row_focus_id(*row) == widget) else { return Some(sidebar::commands::CommandTarget::Unavailable); };
                 let selected = self.sidebar_state.selected_rows(&visible);
                 Some(sidebar::commands::CommandTarget::Rows(if selected.contains(&row) { selected } else { vec![row] }))
+            }
+            workspace_widget::FocusedPane::SidebarChanges => {
+                let Some(source) = self.sidebar_model.source_control.as_ref() else { return Some(sidebar::commands::CommandTarget::Unavailable); };
+                let Some(row) = sidebar::change_row_from_focus_id(source, &source.key, &widget) else { return Some(sidebar::commands::CommandTarget::Unavailable); };
+                Some(sidebar::commands::CommandTarget::Changes { key: source.key.clone(), row,
+                    selection_revision: self.sidebar_state.change_selection_revision() })
             }
             workspace_widget::FocusedPane::SidebarFiles => {
                 let Some(source) = self.sidebar_model.source_control.as_ref() else { return Some(sidebar::commands::CommandTarget::Unavailable); };
@@ -1008,9 +1014,18 @@ impl Cagents {
     fn sidebar_command_mask(&self, target: &sidebar::commands::CommandTarget) -> u64 {
         workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS.iter().filter_map(|descriptor| {
             let bit = descriptor.action.sidebar_command_bit()?;
-            let action = target.resolve(&self.sidebar_model, descriptor.action)?;
+            let action = target.resolve_in(&self.sidebar_model, &self.sidebar_state, descriptor.action)?;
             (!crate::device::is_remote() || device_ui::supports_sidebar_action(&action)).then_some(bit)
         }).fold(0, |mask, bit| mask | bit)
+    }
+
+    pub(super) fn run_captured_change_command(&mut self, command: Command, key: sidebar::ActiveWorktreeKey,
+        row: sidebar::ChangeSelectionRow, selection_revision: u64) -> Task<Message> {
+        let target = sidebar::commands::CommandTarget::Changes { key, row, selection_revision };
+        match target.resolve_in(&self.sidebar_model, &self.sidebar_state, command) {
+            Some(action) if !crate::device::is_remote() || device_ui::supports_sidebar_action(&action) => self.update(Message::Sidebar(action)),
+            _ => { self.status = Some(TransientNotice::warning("The original change selection is no longer available")); Task::none() }
+        }
     }
 
     pub(super) fn run_sidebar_registered_command(&mut self, command: Command, action: SidebarAction) -> Task<Message> {
@@ -1145,7 +1160,13 @@ impl Cagents {
         if command.sidebar_command_bit().is_some()
             && let Some(target) = self.sidebar_command_target()
         {
-            return match target.resolve(&self.sidebar_model, command) {
+            return match target.resolve_in(&self.sidebar_model, &self.sidebar_state, command) {
+                // Check and invoke in the same update: no queued message may
+                // reinterpret a selection after its captured revision passed.
+                Some(action @ SidebarAction::InvokeChangeRows { .. }) => {
+                    if crate::device::is_remote() && !device_ui::supports_sidebar_action(&action) { return Task::none(); }
+                    self.update(Message::Sidebar(action))
+                }
                 Some(action) => self.run_sidebar_registered_command(command, action),
                 None => {
                     self.status = Some(TransientNotice::warning("The original sidebar target is no longer available"));
@@ -1337,6 +1358,9 @@ impl Cagents {
             | Command::RenameFile
             | Command::DuplicateFile
             | Command::CopyRelativePath
+            | Command::StageSelectedChanges
+            | Command::UnstageSelectedChanges
+            | Command::DiscardSelectedChanges
             => self.run_registered_command(command),
             Command::ChatAccount | Command::ChatModel | Command::ChatPermissions => {
                 self.open_chat_control(command)
@@ -1583,6 +1607,9 @@ impl SettingsField {
             Self::ShortcutRenameFile => Some(Command::RenameFile),
             Self::ShortcutDuplicateFile => Some(Command::DuplicateFile),
             Self::ShortcutCopyRelativePath => Some(Command::CopyRelativePath),
+            Self::ShortcutStageSelectedChanges => Some(Command::StageSelectedChanges),
+            Self::ShortcutUnstageSelectedChanges => Some(Command::UnstageSelectedChanges),
+            Self::ShortcutDiscardSelectedChanges => Some(Command::DiscardSelectedChanges),
 
 
             Self::ShortcutNewTerminal => Some(Command::NewTerminal),
@@ -1733,6 +1760,9 @@ impl ShortcutDraft {
             (Command::RenameFile, self.rename_file.as_str()),
             (Command::DuplicateFile, self.duplicate_file.as_str()),
             (Command::CopyRelativePath, self.copy_relative_path.as_str()),
+            (Command::StageSelectedChanges, self.stage_selected_changes.as_str()),
+            (Command::UnstageSelectedChanges, self.unstage_selected_changes.as_str()),
+            (Command::DiscardSelectedChanges, self.discard_selected_changes.as_str()),
 
             (Command::NewTerminal, self.new_terminal.as_str()),
             (Command::NewChannel, self.new_channel.as_str()),
