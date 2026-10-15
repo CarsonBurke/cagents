@@ -466,18 +466,35 @@ mod settings_typography_tests {
                 .height
         };
         let before = height();
+        let initial_font = interface_font();
         let revision = typography_revision();
-        configure_typography("DejaVu Sans Mono", 18.0, "DejaVu Serif", 21.0);
+        // Private XDG profiles may intentionally exclude the user's fonts.
+        // Exercise two families that this renderer actually discovered instead
+        // of assuming a particular host-installed family exists.
+        let families = installed_font_families(false);
+        assert!(
+            families.len() >= 2,
+            "the typography fixture requires two installed font families"
+        );
+        let interface_family = families
+            .iter()
+            .find(|family| Font::with_name(family.as_str()).family != initial_font.family)
+            .expect("at least one installed family differs from the initial interface font");
+        let chat_family = families
+            .iter()
+            .find(|family| family.as_str() != interface_family.as_str())
+            .expect("a second distinct installed family is available");
+        configure_typography(interface_family, 18.0, chat_family, 21.0);
         assert!(height() > before);
         assert_eq!(
             interface_font().family,
-            cosmic::iced::font::Family::Name("DejaVu Sans Mono")
+            cosmic::iced::font::Family::Name(interface_family.as_str())
         );
         let markdown = markdown_settings(&Theme::dark(), TEXT_PROSE);
         assert_eq!(markdown.text_size.0, 21.0);
         assert_eq!(
             markdown.style.font.family,
-            cosmic::iced::font::Family::Name("DejaVu Serif")
+            cosmic::iced::font::Family::Name(chat_family.as_str())
         );
         assert!(
             typography_revision() > revision,
