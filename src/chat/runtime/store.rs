@@ -1610,6 +1610,7 @@ mod tests {
                 },
             }))
             .unwrap();
+        store.db.execute_batch("CREATE TEMP TRIGGER reject_stream_body_delete BEFORE DELETE ON chunks BEGIN SELECT RAISE(ABORT,'streaming input must append body chunks'); END;").unwrap();
         for (index, chunk) in input.as_bytes().chunks(50).enumerate() {
             store
                 .apply(Event::InputDelta {
@@ -1640,6 +1641,10 @@ mod tests {
         assert!(hydrated.items.iter().all(
             |item| matches!(&item.content, ItemContent::Tool { input, .. } if !input.is_empty())
         ));
+        let reference_directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut reference=Store::at(reference_directory.path().into()).unwrap();
+        reference.apply(Event::Item(Item {id:"large-input".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"Write".into(),input,output:String::new(),status:crate::chat::ToolStatus::Running}})).unwrap();
+        assert_eq!(hydrated.items,reference.window().unwrap().items,"append hydration must equal a single authoritative full item");
     }
 
     #[test]
