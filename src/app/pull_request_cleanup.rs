@@ -25,8 +25,8 @@ impl Cagents {
         if pane.review.selection_generation()!=generation || pane.project(&self.sidebar_model)!=Some(project) || pane.review.target().is_none_or(|target|target.pull_request.state.0!="MERGED"||target.pull_request.head_ref_oid!=head.head.as_str()||target.pull_request.head_ref_name!=head.branch||target.pull_request.head_repository_key().is_none_or(|source|!source.same_repository(&head.repository))){return Task::none();}
         match result{
             Ok(Some(record))=>{
-                let Some(row)=self.sidebar_model.projects.iter_mut().find(|row|row.id==project).and_then(|row|row.worktrees.iter_mut().find(|row|row.id==record.id&&row.path==record.path))else{return Task::none();};
-                row.pull_request_state=Some(sidebar::WorktreePullRequestState::Merged);
+                let Some(row)=self.sidebar_model.project(project).and_then(|row|row.worktrees.iter().find(|row|row.id==record.id&&row.path==record.path))else{return Task::none();};
+                if row.detached || row.branch.as_deref()!=Some(head.branch.as_str()) || row.head_oid.as_deref()!=Some(head.head.as_str()) || row.head_repository.as_ref().is_none_or(|source|!source.same_repository(&head.repository)) { return Task::none(); }
                 self.handle_project_action(project_ui::Action::Command{project_id:project,worktree_id:Some(record.id),command:sidebar::ProjectCommand::Delete})
             }
             Ok(None)=>{self.status=Some(TransientNotice::warning("No managed worktree matches this PR's exact head. Keep local commits and branches until you have reviewed their state."));Task::none()}

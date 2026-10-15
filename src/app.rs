@@ -27430,6 +27430,43 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_pull_request_cleanup_cannot_target_a_new_checkout_at_the_same_path() {
+        for changed in ["branch", "head", "repository", "unknown"] {
+            let (mut app, project) = pull_request_test_app(&[]);
+            let (card, _) = app.add_pull_requests_card("/repo".into());
+            let mut target = crate::pull_request_review::tests::target(1);
+            let pr = Arc::make_mut(&mut target.pull_request);
+            pr.state.0 = "MERGED".into();
+            pr.head_repository = Some(crate::github::GitHubHeadRepository { name: "r".into() });
+            pr.head_repository_owner = Some(crate::github::GitHubActor { login: "o".into(), name: None, is_bot: false });
+            let head = crate::pull_request_review::CleanupHead {
+                repository: target.repository.clone(), branch: pr.head_ref_name.clone(), head: Oid::parse(pr.head_ref_oid.clone()).unwrap(),
+            };
+            let record = crate::repository::WorktreeRecord {
+                id: WorktreeId::new(), path: "/repo/worktrees/feature".into(), created_at_unix_ms: None,
+                head_oid: Some(head.head.as_str().into()), branch: Some(format!("refs/heads/{}", head.branch)),
+                detached: false, bare: false, lock: Default::default(), prunable_reason: None,
+            };
+            let mut row = SidebarWorktree::from_repository(&record, None);
+            row.head_repository = Some(head.repository.clone());
+            match changed {
+                "branch" => row.branch = Some("other".into()),
+                "head" => row.head_oid = Some("b".repeat(40)),
+                "repository" => row.head_repository = Some(GitHubRepoKey::new("github.com", None, "other", "r").unwrap()),
+                _ => row.head_oid = None,
+            }
+            app.sidebar_model.projects.iter_mut().find(|row| row.id == project).unwrap().worktrees.push(row);
+            let Some(CardRuntime::PullRequests(pane)) = app.cards.get_mut(&card) else { panic!("PR pane"); };
+            drop(pane.review.update(crate::pull_request_review::Action::Open(target)));
+            let generation = pane.review.selection_generation();
+            drop(app.merged_pull_request_cleanup_ready(card, project, generation, head, Ok(Some(record.clone()))));
+            assert!(!app.project_ui.modal_open(), "stale {changed} must not open deletion");
+            let row = app.sidebar_model.project(project).unwrap().worktrees.iter().find(|row| row.id == record.id).unwrap();
+            assert_eq!(row.pull_request_state, None, "stale {changed} must not manufacture a merged badge");
+        }
+    }
+
+    #[test]
     fn a_visible_pull_request_browser_refreshes_beside_the_focused_chat() {
         let (mut app, _) = pull_request_test_app(&[]);
         app.active_workspace = Some("/repo".into());

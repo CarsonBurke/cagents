@@ -694,6 +694,9 @@ pub struct SidebarWorktree {
     pub id: WorktreeId,
     pub path: PathBuf,
     pub branch: Option<String>,
+    /// The commit from the latest authoritative Git read. A durable path alone
+    /// cannot identify the checkout that an asynchronous action inspected.
+    pub head_oid: Option<String>,
     pub head_repository: Option<crate::github::GitHubRepoKey>,
     pub detached: bool,
     pub locked: bool,
@@ -754,6 +757,7 @@ impl SidebarWorktree {
             id,
             path,
             branch,
+            head_oid: None,
             detached,
             locked,
             dirty,
@@ -804,6 +808,8 @@ impl SidebarWorktree {
         row.untracked_omitted = status.is_some_and(|status| status.untracked_omitted);
         row.refresh_status_chrome();
         row.created_at_unix_ms = record.created_at_unix_ms;
+        row.head_oid = record.head_oid.clone();
+        if let Some(status) = status { row.apply_status(status); }
         row
     }
 
@@ -822,6 +828,7 @@ impl SidebarWorktree {
             self.chrome.folded_branch = self.branch.as_deref().map(fold);
         }
         self.locked = record.lock.locked;
+        self.head_oid = record.head_oid.clone();
         self.created_at_unix_ms = record.created_at_unix_ms;
         if let Some(status) = status {
             self.apply_status(status);
@@ -831,6 +838,10 @@ impl SidebarWorktree {
 
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
+        self.head_oid = match &status.head {
+            HeadState::Branch { oid, .. } | HeadState::Detached { oid } => Some(oid.clone()),
+            HeadState::Unborn { .. } | HeadState::Unknown => None,
+        };
         let (ahead, behind) = match &status.tracking {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
@@ -11332,6 +11343,21 @@ pub(crate) mod tests {
         }
         pr.state = Some(WorktreePullRequestState::Closed);
         assert_eq!(pull_request_tone(&pr), PullRequestTone::Danger);
+    }
+
+    #[test]
+    fn authoritative_sidebar_reads_replace_checkout_identity_without_dirty_changes() {
+        let mut row = SidebarWorktree::from_durable(WorktreeId::new(), "/repo/feature".into(), Some("feature".into()));
+        let mut status = StatusSnapshot::default();
+        status.head = HeadState::Branch { name: "feature".into(), oid: "a".repeat(40) };
+        row.apply_status(&status);
+        assert_eq!(row.head_oid.as_deref(), Some("a".repeat(40).as_str()));
+        status.head = HeadState::Branch { name: "feature".into(), oid: "b".repeat(40) };
+        row.apply_status(&status);
+        assert_eq!(row.head_oid.as_deref(), Some("b".repeat(40).as_str()));
+        status.head = HeadState::Unknown;
+        row.apply_status(&status);
+        assert!(row.head_oid.is_none(), "an unreadable checkout cannot retain old action authority");
     }
 
     fn worktree(id: u128, branch: &str, dirty: bool) -> SidebarWorktree {
