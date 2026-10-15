@@ -12688,6 +12688,10 @@ mod tests {
         drop(app.update(Message::ChatUi(Action::SelectSubagent(target, None))));
         assert_eq!(app.notification_ui.focused_session_for_test(), Some(parent));
         let current_epoch = app.attention_focus_epoch;
+        assert_eq!(app.durable.focused, app.workspace.focused());
+        let resize = app.workspace.resize_viewport(1200.0);
+        drop(app.apply_viewport(resize, true, false));
+        assert!(app.sidebar_state.has_card_update(card), "an unrelated viewport update cannot bypass visible dwell");
         drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: stale_epoch }));
         assert!(app.sidebar_state.has_card_update(card));
         drop(app.update(Message::AcknowledgeVisiblePane { card, epoch: current_epoch }));

@@ -8351,7 +8351,11 @@ impl Cagents {
         }
         let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
-        tasks.push(self.acknowledge_active_pane());
+        // Layout/camera updates cannot shorten a newly qualified visibility
+        // dwell. An actual pane focus change remains an explicit read action.
+        if focus_changed {
+            tasks.push(self.acknowledge_active_pane());
+        }
         if self.chrome_ui.tabs_focus != focused {
             self.chrome_ui.tabs_focus = focused;
             tasks.push(self.reveal_active_tab());
