@@ -389,6 +389,7 @@ struct PublishedState {
     worker_join: AtomicU8,
     join_reservation: OnceLock<joins::Reservation>,
     join_escalation_at: OnceLock<std::time::Instant>,
+    join_signal_error: OnceLock<()>,
     shutdown_requested: AtomicBool,
     interrupt_requested: AtomicBool,
     input_order: Mutex<InputOrder>,
@@ -440,6 +441,7 @@ impl PublishedState {
             worker_join: AtomicU8::new(0),
             join_reservation: OnceLock::new(),
             join_escalation_at: OnceLock::new(),
+            join_signal_error: OnceLock::new(),
             shutdown_requested: AtomicBool::new(false),
             interrupt_requested: AtomicBool::new(false),
             input_order: Mutex::new(InputOrder::default()),
@@ -1372,14 +1374,21 @@ impl TerminalHandle {
     /// holder. Serialize with completion, then transfer any final retained
     /// screen; a live parser that cannot serialize is honestly screen-lost.
     pub(crate) fn preserve_for_restart(&self) -> Result<(), String> {
-        let (reply, result) = crossbeam_channel::bounded(1);
-        if self
-            .send_command(Command::PreserveForRestart(reply))
-            .is_ok()
-            && let Ok(result) = result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
         {
-            result?;
+            let mut order=self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner());
+            if order.handoff {return Err("Terminal ownership transition already owns admission".into());}
+            order.handoff=true;
         }
+        let (reply, result) = crossbeam_channel::bounded(1);
+        if let Err(error)=self.send_command(Command::PreserveForRestart(reply)) {
+            // No command was accepted, so original ownership is known. Wake
+            // any deadline parked behind this provisional handoff fence.
+            self.inner.published.input_order.lock().unwrap_or_else(|p|p.into_inner()).handoff=false;
+            joins::ownership_changed();
+            return Err(error.to_string());
+        }
+        result.recv_timeout(WORKER_JOIN_TIMEOUT * 2)
+            .map_err(|_|"Terminal preservation outcome is unknown; ownership remains fenced".to_string())??;
         let deadline = std::time::Instant::now() + WORKER_JOIN_TIMEOUT;
         if !self.join_worker_until(deadline, false) {
             return Err("terminal preservation join is pending or exceeded its deadline".into());
