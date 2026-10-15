@@ -1692,11 +1692,20 @@ mod tests {
                 }
             }
             store.flush_input().unwrap();
-            let io_written = written_bytes()-io_before;
+            let stream_io_written = written_bytes()-io_before;
+            let stream_duration=started.elapsed();
             let (bytes,chunks):(usize,usize) = store.db.query_row("SELECT SUM(length(data)),COUNT(*) FROM chunks WHERE id='bench' AND field=0",[],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
             assert_eq!(bytes,source.len());
-            println!("append={append} duration_ms={} body_bytes_submitted={submitted_bytes} syscall_write_bytes={io_written} final_body_bytes={bytes} final_chunks={chunks}",started.elapsed().as_millis());
-            if append { assert!(io_written <= 5 * 1024 * 1024,"append writes should stay within a small constant factor of input size"); }
+            // Include the authoritative block-stop classification in the
+            // complete measurement; it is one full final item, not a delta.
+            for event in adapter.receive(stream(serde_json::json!({"type":"content_block_stop","index":0}))).unwrap().events {store.apply(event).unwrap();}
+            store.flush_input().unwrap();
+            let total_io_written=written_bytes()-io_before;
+            println!("append={append} stream_duration_ms={} total_duration_ms={} delta_body_bytes_submitted={submitted_bytes} stream_syscall_write_bytes={stream_io_written} total_syscall_write_bytes={total_io_written} streamed_body_bytes={bytes} streamed_chunks={chunks}",stream_duration.as_millis(),started.elapsed().as_millis());
+            if append {
+                assert!(stream_io_written <= 5 * 1024 * 1024,"append writes should stay within a small constant factor of input size");
+                assert!(total_io_written <= 16 * 1024 * 1024,"the final authoritative classification must remain linear too");
+            }
         }
     }
 
