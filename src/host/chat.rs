@@ -1551,6 +1551,19 @@ fn codex_terminal_view(
             .returning_terminal = true;
         completed
     };
+    let (directory, execution) = match super::session_locations::verified_chat_directory(host, &session, handle) {
+        Ok(verified) => verified,
+        Err(message) => {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(record) = state.chats.get_mut(&chat_id)
+                .filter(|record| record.handle.same_actor(handle)) {
+                record.returning_terminal = false;
+            }
+            return Err(unavailable(message));
+        }
+    };
+    let mut recipe = recipe;
+    recipe.working_directory = directory;
     if let Some((source, terminal, proof)) = completed {
         let release = (|| {
             if terminal.holder_identity().is_some() {
@@ -1618,7 +1631,7 @@ fn codex_terminal_view(
         resume_hint: None,
         transcript_path: None,
     };
-    let spawned = super::state::spawn_terminal_view_owned(
+    let spawned = super::state::spawn_terminal_view_owned_at_directory(
         host,
         client,
         terminal,
@@ -1628,6 +1641,7 @@ fn codex_terminal_view(
         },
         Some(handle.execution_environment()),
         true,
+        execution,
     );
     let (descriptor, paired_terminal) = match spawned {
         Ok(pair) => pair,
@@ -2412,6 +2426,13 @@ fn process_inner(
                     "A shared Codex source must be reattached, not replaced",
                 ));
             }
+            // Capture positive owned-process/approved directory evidence
+            // before stopping the native writer. A reused old pathname is
+            // never authority for the replacement's working directory.
+            let (directory, execution) = super::session_locations::verified_chat_directory(host, &session, &handle)
+                .map_err(unavailable)?;
+            let mut recipe = recipe;
+            recipe.working_directory = directory.clone();
             let terminal_id = crate::model::TerminalId::new();
             let mut terminal = crate::model::TerminalSession {
                 owned_codex_listener: None,
@@ -2437,7 +2458,8 @@ fn process_inner(
                 // Another client can close this chat while the lock is released.
                 // Report that instead of panicking the per-client thread, which
                 // would take down every hosted PTY with it.
-                let Some(record) = state.chats.get_mut(&chat_id) else {
+                let Some(record) = state.chats.get_mut(&chat_id)
+                    .filter(|record| record.handle.same_actor(&handle)) else {
                     return Err(unavailable(
                         "The chat was closed while returning to terminal; no replacement terminal was started",
                     ));
@@ -2457,10 +2479,11 @@ fn process_inner(
             }
             // Autonomous policy changes can arrive while the native writer
             // shuts down. The final confirmed snapshot wins over launch flags.
-            let recipe = session
+            let mut recipe = session
                 .launch
                 .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
+            recipe.working_directory = directory;
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                 recipe,
@@ -2487,7 +2510,7 @@ fn process_inner(
                     )
                     .map_err(unavailable)?;
             }
-            let descriptor = super::state::spawn_terminal_with_environment(
+            let (descriptor, _) = super::state::spawn_terminal_view_owned_at_directory(
                 host,
                 client,
                 terminal,
@@ -2496,6 +2519,8 @@ fn process_inner(
                     ..Default::default()
                 },
                 Some(handle.execution_environment()),
+                false,
+                execution,
             )?;
             let retired = {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -2506,7 +2531,7 @@ fn process_inner(
                 let retained = state
                     .chats
                     .get(&chat_id)
-                    .is_some_and(|record| record.returning_terminal);
+                    .is_some_and(|record| record.returning_terminal && record.handle.same_actor(&handle));
                 if !retained {
                     // The replacement has no receipt to commit and no source to be
                     // retried from, so retire it rather than leaving a PTY in the
