@@ -43,16 +43,40 @@ fn same_issued_launch(a: &HostedSession, b: &HostedSession) -> bool {
         _ => false,
     }
 }
+fn compatible_chat_metadata(cached: &HostedSession, current: &HostedSession) -> bool {
+    match (cached,current) {
+        (HostedSession::Chat(cached), HostedSession::Chat(current)) => {
+            cached.launch.session_id.as_ref().is_none_or(|id| current.launch.session_id.as_ref() == Some(id))
+                && cached.owned_codex_listener.as_ref().is_none_or(|listener| current.owned_codex_listener.as_ref() == Some(listener))
+                && cached.terminal.as_ref().is_none_or(|terminal| current.terminal.as_ref().is_some_and(|current| current.id == terminal.id && current.launch == terminal.launch))
+        },
+        (HostedSession::Terminal(_), HostedSession::Terminal(_)) => true,
+        _ => false,
+    }
+}
+fn same_source(cached: &HostedSession, current: &HostedSession) -> bool {
+    cached.same_process(current) && compatible_chat_metadata(cached,current)
+        && match (cached,current) {
+            (HostedSession::Chat(cached), HostedSession::Chat(current)) => cached.terminal.as_ref().is_none_or(|terminal| current.terminal.as_ref().is_some_and(|current| terminal == current || HostedSession::Terminal(terminal.clone()).same_process(&HostedSession::Terminal(current.clone())))),
+            _ => true,
+        }
+}
 fn source_key(source: &HostedSession) -> Result<Option<[u8; 32]>, String> {
+    // Thread enrichment is compared against the current authenticated actor
+    // separately. The private old source can predate its first confirmed ID.
     let value = match source {
-        HostedSession::Chat(session) if session.proof.is_some() => serde_json::to_vec(&("chat", session.id, &session.proof, session.launch.provider, &session.launch.recipe)),
+        HostedSession::Chat(session) if session.proof.is_some() => serde_json::to_vec(&("chat", session.id, &session.proof, session.launch.provider, &session.launch.recipe, &session.owned_codex_listener, session.terminal.as_ref().map(|terminal| (terminal.id, &terminal.launch, terminal.continuity.live_proof())))),
         HostedSession::Terminal(session) if session.continuity.live_proof().is_some() => serde_json::to_vec(&("terminal", session.id, session.continuity.live_proof(), &session.launch)),
         _ => return Ok(None),
     }.map_err(|error| error.to_string())?;
     Ok(Some(*blake3::hash(&value).as_bytes()))
 }
 fn retain_source(location: &mut Location) -> Result<(), String> {
-    if let Some(key) = source_key(&location.source)? {
+    let source = location.source.clone();
+    retain_alias(location, &source)
+}
+fn retain_alias(location: &mut Location, source: &HostedSession) -> Result<(), String> {
+    if let Some(key) = source_key(source)? {
         location.previous_sources.retain(|known| *known != key);
         location.previous_sources.push(key);
         if location.previous_sources.len() > 64 { location.previous_sources.remove(0); }
@@ -125,6 +149,10 @@ pub(super) fn apply(db: &Connection, moves: &[SessionMove]) -> Result<(), String
                     return Err("The approved session directory changed during Locate; no relocation was committed".into());
                 }
                 location.directory = movement.candidate.clone();
+                if !compatible_chat_metadata(&location.source, &movement.source) {
+                    return Err("The confirmed provider conversation changed during Locate; no relocation was committed".into());
+                }
+                location.source = movement.source.clone();
                 location.approved = Some(*identity);
                 location.process = Some(process.clone());
                 location.blocked_directory = None;
@@ -159,10 +187,11 @@ pub(super) fn pin_owned_agents(db: &Connection, moves: &[SessionMove]) -> Result
 
 impl Registry {
     pub(crate) fn authenticated_session_alias(&self, cached: &HostedSession, current: &HostedSession) -> Result<bool, String> {
-        if cached.same_process(current) { return Ok(true); }
+        if !compatible_chat_metadata(cached,current) { return Ok(false); }
+        if same_source(cached,current) { return Ok(true); }
         if cached.id() != current.id() { return Ok(false); }
         let Some(location) = read(&self.db, current.id())? else { return Ok(false); };
-        Ok(location.source.same_process(current) && source_key(cached)?.is_some_and(|key| location.previous_sources.contains(&key)))
+        Ok(same_source(&location.source, current) && source_key(cached)?.is_some_and(|key| location.previous_sources.contains(&key)))
     }
     pub(crate) fn refuse_session_location(&mut self, source: &HostedSession, candidate: &Path, reason: &str) -> Result<(), String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
@@ -181,12 +210,15 @@ impl Registry {
         let Some(first) = retained.first() else { return Ok(()); };
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         let Some(mut location) = read(&tx, first.id())? else { return Ok(()); };
-        if !same_issued_launch(&location.source, successor) || successor.id() != first.id() || retained.iter().any(|source| source.id() != first.id())
-            || !retained.iter().any(|source| location.source.same_process(source))
+        if !same_issued_launch(&location.source, successor) || !compatible_chat_metadata(&location.source, successor) || successor.id() != first.id() || retained.iter().any(|source| source.id() != first.id())
+            || !retained.iter().any(|source| same_source(&location.source, source))
         { return Err("Authenticated holder sources do not prove this session directory successor".into()); }
         // A process proof can change during authenticated adoption, while the
         // original approved inode, refusal and operational spelling cannot.
         retain_source(&mut location)?;
+        for source in retained {
+            if same_issued_launch(&location.source, source) { retain_alias(&mut location, source)?; }
+        }
         location.source = successor.clone();
         write(&tx, &location)?;
         tx.commit().map_err(|error| error.to_string())
@@ -194,7 +226,7 @@ impl Registry {
 
     pub(crate) fn session_location(&self, source: &HostedSession) -> Result<Option<Location>, String> {
         let location = read(&self.db, source.id())?;
-        if location.as_ref().is_some_and(|location| !location.source.same_process(source)) {
+        if location.as_ref().is_some_and(|location| !location.source.same_process(source) || !compatible_chat_metadata(&location.source, source)) {
             return Err("The saved operational directory belongs to another session incarnation".into());
         }
         Ok(location)
@@ -203,7 +235,7 @@ impl Registry {
     pub(crate) fn bind_session_location(&mut self, source: &HostedSession, previous: Option<&HostedSession>, directory: &Path, approved: DirectoryIdentity) -> Result<(), String> {
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         let old = read(&tx, source.id())?;
-        if old.as_ref().is_some_and(|location| !same_issued_launch(&location.source, source)) {
+        if old.as_ref().is_some_and(|location| !same_issued_launch(&location.source, source) || !compatible_chat_metadata(&location.source, source)) {
             return Err("A session directory binding cannot change its original issued launch".into());
         }
         if old.as_ref().is_some_and(|location| !location.source.same_process(source)
@@ -232,7 +264,7 @@ impl Registry {
         let Some(first) = retained.first() else { return Ok(None); };
         let Some(location) = read(&self.db, first.id())? else { return Ok(None); };
         if retained.iter().any(|source| source.id() != first.id())
-            || !retained.iter().any(|source| location.source.same_process(source)) {
+            || !retained.iter().any(|source| same_source(&location.source, source)) {
             return Err("Retained provider sources do not authenticate the saved directory binding".into());
         }
         if let Some(reason) = &location.refusal { return Err(reason.clone()); }
@@ -296,6 +328,31 @@ mod tests {
         assert!(registry.session_location(&source).is_err());
         let mut replaced = identity; replaced.inode = replaced.inode.wrapping_add(1);
         assert!(registry.bind_session_location(&successor, None, fixture.path(), replaced).unwrap_err().contains("replaced"));
+    }
+
+    #[test]
+    fn aliases_never_replace_a_known_provider_thread() {
+        let fixture = tempfile::tempdir().unwrap();
+        let mut registry = Registry::at(&fixture.path().join("workspace.sqlite3")).unwrap();
+        let mut source = source(fixture.path());
+        let HostedSession::Chat(session) = &mut source else { unreachable!() };
+        session.launch.session_id = Some("22222222-0000-4000-8000-000000000001".into());
+        let identity = DirectoryIdentity::from_metadata(&std::fs::metadata(fixture.path()).unwrap());
+        registry.bind_session_location(&source, None, fixture.path(), identity).unwrap();
+        let mut successor = source.clone();
+        let HostedSession::Chat(session) = &mut successor else { unreachable!() };
+        session.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("successor");
+        registry.adopt_session_location(&[source.clone()], &successor).unwrap();
+        assert!(registry.authenticated_session_alias(&source, &successor).unwrap());
+        let mut different_thread = source.clone();
+        let HostedSession::Chat(session) = &mut different_thread else { unreachable!() };
+        session.launch.session_id = Some("33333333-0000-4000-8000-000000000002".into());
+        assert!(!registry.authenticated_session_alias(&different_thread, &successor).unwrap());
+        assert!(registry.adopt_session_location(&[successor.clone()], &different_thread).is_err());
+        let mut current_wrong_thread = successor.clone();
+        let HostedSession::Chat(session) = &mut current_wrong_thread else { unreachable!() };
+        session.launch.session_id = Some("44444444-0000-4000-8000-000000000003".into());
+        assert!(!registry.authenticated_session_alias(&source, &current_wrong_thread).unwrap());
     }
 
     #[test]
