@@ -14,7 +14,6 @@ const KEYS: usize = 8192;
 const CHUNKS: usize = 65536;
 const KEY_BYTES: usize = 4096;
 const OPEN_KEYS: usize = 512;
-const OPEN: i64 = 0;
 const SEALED: i64 = 1;
 
 const SCHEMA:&str="CREATE TABLE raw_source_schema(singleton INTEGER PRIMARY KEY CHECK(singleton=1),version INTEGER NOT NULL,nonce TEXT NOT NULL,next_revision INTEGER NOT NULL,bytes INTEGER NOT NULL,keys INTEGER NOT NULL,chunks INTEGER NOT NULL,disabled TEXT);
