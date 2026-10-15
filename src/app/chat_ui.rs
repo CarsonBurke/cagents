@@ -2664,6 +2664,9 @@ impl Runtime {
     pub(super) fn logical_source_metrics(&self)->(usize,usize,usize) {
         (self.logical_sources.retained_bytes(),hydration::live_source_bytes(),self.logical_sources.alias_count())
     }
+    pub(super) fn logical_source_reader_capacity(&self)->usize {
+        hydration::reader_source_capacity()
+    }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
         if !visible {hydration::release(self);}

@@ -206,6 +206,22 @@ enum Admission {Ready,Turnover,Capacity}
 pub(super) fn live_source_bytes()->usize {
     let mut owners=owners().lock().unwrap_or_else(|error|error.into_inner());owners.prune();owners.bytes()
 }
+static READER_CAPACITY: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Allocated String capacity in the two readers, including a completed body
+/// awaiting admission. Shared `known` items remain counted only by Owners.
+#[derive(Default)]
+struct ReaderCapacity(std::sync::atomic::AtomicUsize);
+impl ReaderCapacity {
+    fn set(&self, bytes: usize) {
+        let old = self.0.swap(bytes, Ordering::Relaxed);
+        if bytes >= old { READER_CAPACITY.fetch_add(bytes-old, Ordering::Relaxed); }
+        else { READER_CAPACITY.fetch_sub(old-bytes, Ordering::Relaxed); }
+    }
+}
+impl Drop for ReaderCapacity {
+    fn drop(&mut self) { self.set(0); }
+}
+pub(super) fn reader_source_capacity()->usize { READER_CAPACITY.load(Ordering::Relaxed) }
 fn admit(item:&Arc<chat::Item>,bytes:usize,replaced:Option<&Arc<chat::Item>>)->Admission {
     owners().lock().unwrap_or_else(|error|error.into_inner()).admit(item,bytes,replaced)
 }
@@ -239,9 +255,10 @@ async fn load(source:&Source)->Result<Loaded,String> {
     static WORKERS:std::sync::OnceLock<tokio::sync::Semaphore>=std::sync::OnceLock::new();
     let _permit=WORKERS.get_or_init(||tokio::sync::Semaphore::new(2)).acquire().await
         .map_err(|_|"Message loading stopped".to_owned())?;
-    let loaded=read(&source.key,source.known.as_ref(),|query| {
+    let reader_capacity=ReaderCapacity::default();
+    let loaded=read_counted(&source.key,source.known.as_ref(),|query| {
         let handle=source.handle.clone();async move {handle.source_page(query).await}
-    }).await?;
+    }, &reader_capacity).await?;
     if source.known.as_ref().is_some_and(|known|Arc::ptr_eq(&known.item,&loaded.item)) {return Ok(loaded);}
     let item=&loaded.item;
     let bytes=match &item.content {ItemContent::Text {text,..}=>text.len(),_=>return Err("The source is not prose.".into())};
@@ -260,7 +277,14 @@ async fn load(source:&Source)->Result<Loaded,String> {
     Ok(loaded)
 }
 
+#[cfg(test)]
 async fn read<F,Fut>(key:&Key,known:Option<&Loaded>,mut fetch:F)->Result<Loaded,String>
+where F:FnMut(chat::cache::SourceQuery)->Fut,
+      Fut:std::future::Future<Output=Result<chat::cache::SourcePage,chat::cache::SourceError>> {
+    read_counted(key,known,&mut fetch,&ReaderCapacity::default()).await
+}
+
+async fn read_counted<F,Fut>(key:&Key,known:Option<&Loaded>,mut fetch:F,capacity:&ReaderCapacity)->Result<Loaded,String>
 where F:FnMut(chat::cache::SourceQuery)->Fut,
       Fut:std::future::Future<Output=Result<chat::cache::SourcePage,chat::cache::SourceError>> {
     let mut text=String::new();let mut epoch=None;let mut until=None;let mut offset=0;let mut metadata=None;
@@ -293,12 +317,14 @@ where F:FnMut(chat::cache::SourceQuery)->Fut,
                     // the newly appended suffix, preserving complete parser
                     // context without repeatedly reading the old prefix.
                     text=previous.clone();text.reserve_exact(boundary-previous.len());
+                    capacity.set(text.capacity());
                     epoch=Some(page.epoch);offset=previous.len();
                     if offset==boundary {break;}
                     continue;
                 }
             }
             text.reserve_exact(boundary);
+            capacity.set(text.capacity());
         }
         epoch=Some(page.epoch);offset=page.next_offset;text.push_str(&page.text);
         if page.complete {break;}
@@ -548,16 +574,20 @@ mod tests {
         let original=chat::Item {id:"original".into(),role:chat::Role::Assistant,started_at:Some(100),at:Some(900),
             content:ItemContent::Text {text:"prefix 🦀 appended tail".into(),thinking:true,phase:chat::Phase::Commentary}};
         let metadata=chat::cache::SourceMetadata::from_item(&original).unwrap();let mut queries=Vec::new();
-        let loaded=read(&key,Some(&known),|query| {
+        let capacity=ReaderCapacity::default();
+        let loaded=read_counted(&key,Some(&known),|query| {
             queries.push(query.clone());std::future::ready(page(query,body(&original),7,metadata.clone()))
-        }).await.unwrap();
+        },&capacity).await.unwrap();
+        assert!(capacity.0.load(Ordering::Relaxed)>=body(&original).len());
         assert_eq!(*loaded.item,original);assert_eq!(queries.len(),2);
         assert_eq!(queries[0].offset,0);assert_eq!(queries[0].limit,4);
         assert_eq!(queries[1].offset,body(&previous).len());assert_eq!(queries[1].until,Some(body(&original).len()));
         assert_eq!(queries[1].expected_epoch,Some(7));
         let mut probes=0;
-        let retained=read(&key,Some(&loaded),|query| {probes+=1;std::future::ready(page(query,body(&original),7,metadata.clone()))}).await.unwrap();
+        let reused_capacity=ReaderCapacity::default();
+        let retained=read_counted(&key,Some(&loaded),|query| {probes+=1;std::future::ready(page(query,body(&original),7,metadata.clone()))},&reused_capacity).await.unwrap();
         assert_eq!(probes,1);assert!(Arc::ptr_eq(&retained.item,&loaded.item));
+        assert_eq!(reused_capacity.0.load(Ordering::Relaxed),0,"known shared Item adds no new reader allocation");
     }
     #[tokio::test]
     async fn a_rewrite_epoch_reloads_the_prefix_and_rejects_mid_read_rewrites() {
