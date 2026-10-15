@@ -36,7 +36,7 @@ impl Store {
     /// Publish only identities/ranges for the bounded resident window. Child
     /// metadata is reused on status-only publications; changed keys are fetched
     /// in bounded indexed batches, never by scanning older child transcripts.
-    pub(super) fn publish_source_parts(&mut self,state:&mut crate::chat::Snapshot)->Result<(),String>{
+    pub(in crate::chat::runtime) fn publish_source_parts(&mut self,state:&mut crate::chat::Snapshot)->Result<(),String>{
         use crate::chat::cache::{SourceKey,SourcePart};
         let cached:std::collections::HashMap<_,_>=state.source_parts.iter().filter(|part|part.source.agent_id.is_some()).map(|part|(part.source.clone(),part)).collect();
         let visible:Vec<_>=state.subagents.iter().flat_map(|agent|agent.items.iter().filter_map(move |item|{
