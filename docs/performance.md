@@ -3,6 +3,7 @@
 - [Redraw scheduling](#redraw-scheduling)
 - [Pane open](#pane-open)
 - [Terminal pipeline](#terminal-pipeline)
+- [Terminal resource accounting](#terminal-resource-accounting)
 - [Terminal search](#terminal-search)
 - [Reference results](#reference-results)
 
@@ -125,6 +126,37 @@ unmeasured.
 `terminal-workload --emit visual-input` runs only the output generator, for use
 inside the native UI: it accepts `r`, `g`, and `b` to repaint with distinct RGB
 colors, and `q` exits.
+
+## Terminal resource accounting
+
+Measure terminal holders with **PSS** as well as RSS. Every holder maps the
+same executable and shared libraries; summing RSS counts those shared pages
+once for every holder. `/proc/<pid>/smaps_rollup` reports `Pss` in KiB and
+apportions a shared page among its mappings. Sum PSS across the daemon, its
+verified holder processes and the UI to estimate their resident physical cost.
+Keep the per-process RSS figures too, and report both rather than treating the
+sum of holder RSS as private terminal memory. Do not include unrelated daemons
+or terminals merely because their executable names match.
+
+Use an isolated development runtime and record the exact executable revisions,
+profiles, daemon identity, process start ticks and fixture settings. Sample
+`Threads` from each process's `/proc/<pid>/status` and RSS/PSS from its
+`smaps_rollup`. Verify process identity again after sampling. Record separate
+phases: warmed idle, eight fixture chats, thirty CLI terminals, and the same
+terminals attached to one native UI window. Include holder processes in the
+memory accounting, while keeping daemon/UI thread counts separate. Warm the
+fixed transport and cleanup services before the idle sample so lazy service
+startup is visible in the baseline. A census with fake socket peers is a useful
+contract test; it does not substitute for the native workload.
+
+For input-latency comparisons, use the same `scripts/benchmark-terminal input`
+workload, build profiles, socket/direct mode, acknowledgement cadence and
+terminal settings before and after the change. Preserve each raw JSON result
+and its p99. Report individual runs or the median of per-run p99 values;
+averaging percentiles does not produce a pooled p99. Direct PTY and hosted
+socket results are separate measurements, and neither measures compositor
+presentation. Record machine load and memory pressure alongside each run, then
+clean up only the fixture-owned sessions and verify their exit.
 
 ## Terminal search
 

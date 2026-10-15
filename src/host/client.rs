@@ -187,6 +187,7 @@ fn request_class(request: &ClientRequest) -> crate::terminal::transport::WorkCla
         | ClientRequest::BuildInfo => WorkClass::Input,
         ClientRequest::Connect { .. }
         | ClientRequest::Attach { .. }
+        | ClientRequest::AttachTerminalSource { .. }
         | ClientRequest::Snapshot { .. } => WorkClass::Snapshot,
         _ => WorkClass::Domain,
     }
@@ -1056,6 +1057,19 @@ pub(super) fn process_admitted(
                 event_sequence: terminal.event_sequence,
             });
             Ok((ServerResponse::Spawned { terminal }, extras, false))
+        }
+        ClientRequest::AttachTerminalSource { source, execution_instance, after_generation, after_event_sequence } => {
+            let terminal_id = source.id;
+            let (terminal, events) = {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                let terminal = state.attach_source(client_id, &source, execution_instance)?;
+                state.resume_presentation(client_id, terminal_id, after_generation);
+                let events = state.replay_events(terminal_id, after_event_sequence)?;
+                (terminal, events)
+            };
+            let snapshot = super::state::client_snapshot(host, client_id, terminal_id, after_generation)?;
+            let extras = replay_messages(terminal_id, events, snapshot, terminal.generation, terminal.event_sequence);
+            Ok((ServerResponse::Attached { terminal }, extras, false))
         }
         ClientRequest::Attach {
             terminal_id,

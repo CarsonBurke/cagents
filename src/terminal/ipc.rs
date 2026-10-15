@@ -511,6 +511,14 @@ pub enum ClientRequest {
     ChatCommitTerminalReceipt {
         receipt: TerminalHandoffReceipt,
     },
+    /// Attach only the exact worker already authenticated by a prior operation.
+    /// Appended future wire contract; final owner allocation is required.
+    AttachTerminalSource {
+        source: TerminalSession,
+        execution_instance: uuid::Uuid,
+        after_generation: u64,
+        after_event_sequence: u64,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
