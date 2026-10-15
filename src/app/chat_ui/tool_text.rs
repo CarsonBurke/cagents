@@ -741,11 +741,7 @@ mod tests {
                 node.size()
             );
         }
-        let preview = Preview::update(
-            None,
-            &tool("ok"),
-            crate::settings::EditorSyntaxTheme::Auto,
-        );
+        let preview = Preview::update(None, &tool("ok"), crate::settings::EditorSyntaxTheme::Auto);
         let mut element = preview.view();
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -765,15 +761,23 @@ mod tests {
         use iced::advanced::{layout, widget::Tree};
         let renderer = crate::app::tests::headless_renderer();
         let text = ToolText::update(None, "first line\nsecond line", Language::Plain);
-        let target = Target { card: CardId::new(), generation: 0 };
+        let target = Target {
+            card: CardId::new(),
+            generation: 0,
+        };
         let height = || {
-            let mut element = text.view(crate::settings::EditorSyntaxTheme::Auto, None, target, None);
+            let mut element =
+                text.view(crate::settings::EditorSyntaxTheme::Auto, None, target, None);
             let mut tree = Tree::new(element.as_widget());
-            element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 1000.0)),
-            ).size().height
+            element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(800.0, 1000.0)),
+                )
+                .size()
+                .height
         };
         design::configure_typography("", 13.0, "", 14.0);
         let small = height();

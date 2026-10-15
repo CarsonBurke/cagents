@@ -225,9 +225,7 @@ pub fn title_font() -> Font {
 pub fn display<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::body(text)
         .size(scaled_interface_size(TEXT_DISPLAY))
-        .line_height(LineHeight::Absolute(
-            scaled_interface_size(26.0).into(),
-        ))
+        .line_height(LineHeight::Absolute(scaled_interface_size(26.0).into()))
         .font(weighted(Weight::Bold))
 }
 
@@ -282,21 +280,24 @@ mod settings_typography_tests {
         let viewport = Rectangle::with_size(Size::new(900.0, 700.0));
         let text_height = |mut element: cosmic::Element<'_, ()>| {
             let mut tree = Tree::new(element.as_widget());
-            element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            ).size().height
+            element
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                )
+                .size()
+                .height
         };
         let menu_height = || {
             let items = widget::menu::items(
                 &std::collections::HashMap::new(),
                 vec![widget::menu::Item::Button("Rename pane", None, Action)],
             );
-            let mut element: cosmic::Element<'_, ()> = widget::context_menu(
-                widget::Space::new().width(300.0).height(100.0),
-                Some(items),
-            ).into();
+            let mut element: cosmic::Element<'_, ()> =
+                widget::context_menu(widget::Space::new().width(300.0).height(100.0), Some(items))
+                    .into();
             let mut tree = Tree::new(element.as_widget());
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -317,13 +318,16 @@ mod settings_typography_tests {
                 &mut shell,
                 &viewport,
             );
-            let mut overlay = element.as_widget_mut().overlay(
-                &mut tree,
-                Layout::new(&node),
-                &renderer,
-                &viewport,
-                Vector::ZERO,
-            ).expect("right click mounts the actual toolkit context menu");
+            let mut overlay = element
+                .as_widget_mut()
+                .overlay(
+                    &mut tree,
+                    Layout::new(&node),
+                    &renderer,
+                    &viewport,
+                    Vector::ZERO,
+                )
+                .expect("right click mounts the actual toolkit context menu");
             let surface = layout::Node::new(viewport.size());
             overlay.as_overlay_mut().update(
                 &Event::Mouse(mouse::Event::CursorMoved { position: pointer }),
@@ -334,31 +338,54 @@ mod settings_typography_tests {
                 &mut shell,
             );
             let menu = overlay.as_overlay_mut().layout(&renderer, viewport.size());
-            menu.children().first().expect("context menu row laid out").size().height
+            menu.children()
+                .first()
+                .expect("context menu row laid out")
+                .size()
+                .height
         };
 
         configure_typography("", 13.0, "", 14.0);
         let small_label = text_height(widget::text("Rename pane").into());
         let small_menu = menu_height();
         let small_root = text_height(widget::menu::root::<(), Renderer>("Pane").into());
-        let small_checkbox = text_height(crate::ui_controls::field::checkbox(false).label("Choice").into());
-        let small_toggle = text_height(crate::ui_controls::field::toggle(false).label("Choice").into());
+        let small_checkbox = text_height(
+            crate::ui_controls::field::checkbox(false)
+                .label("Choice")
+                .into(),
+        );
+        let small_toggle = text_height(
+            crate::ui_controls::field::toggle(false)
+                .label("Choice")
+                .into(),
+        );
         let small_button = text_height(crate::ui_controls::button::secondary("Action").into());
         let small_caption = text_height(caption("Caption").into());
         let toolkit_label_height = || {
             use cosmic::iced::advanced::widget::Operation;
             struct Label(Option<f32>);
             impl Operation for Label {
-                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+                fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                    visit(self);
+                }
                 fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
-                    if text == "Toolkit action" { self.0 = Some(bounds.height); }
+                    if text == "Toolkit action" {
+                        self.0 = Some(bounds.height);
+                    }
                 }
             }
-            let mut element: cosmic::Element<'_, ()> = widget::button::text("Toolkit action").into();
+            let mut element: cosmic::Element<'_, ()> =
+                widget::button::text("Toolkit action").into();
             let mut tree = Tree::new(element.as_widget());
-            let node = element.as_widget_mut().layout(&mut tree, &renderer, &layout::Limits::new(Size::ZERO, viewport.size()));
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
             let mut label = Label(None);
-            element.as_widget_mut().operate(&mut tree, Layout::new(&node), &renderer, &mut label);
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut label);
             label.0.expect("actual toolkit button label mounted")
         };
         let small_toolkit_label = toolkit_label_height();
@@ -367,19 +394,52 @@ mod settings_typography_tests {
         let large_label = text_height(widget::text("Rename pane").into());
         let large_menu = menu_height();
         let large_root = text_height(widget::menu::root::<(), Renderer>("Pane").into());
-        assert!(large_label > small_label * 1.5, "unsized toolkit labels inherit interface size");
-        assert!(large_root > small_root, "actual menu roots inherit interface size");
-        assert!(large_menu > small_menu, "context-menu rows grow with their labels");
-        assert!(large_menu >= large_label + 8.0, "menu padding must not clip the line box");
-        assert!(text_height(crate::ui_controls::field::checkbox(false).label("Choice").into()) > small_checkbox);
-        assert!(text_height(crate::ui_controls::field::toggle(false).label("Choice").into()) > small_toggle);
+        assert!(
+            large_label > small_label * 1.5,
+            "unsized toolkit labels inherit interface size"
+        );
+        assert!(
+            large_root > small_root,
+            "actual menu roots inherit interface size"
+        );
+        assert!(
+            large_menu > small_menu,
+            "context-menu rows grow with their labels"
+        );
+        assert!(
+            large_menu >= large_label + 8.0,
+            "menu padding must not clip the line box"
+        );
+        assert!(
+            text_height(
+                crate::ui_controls::field::checkbox(false)
+                    .label("Choice")
+                    .into()
+            ) > small_checkbox
+        );
+        assert!(
+            text_height(
+                crate::ui_controls::field::toggle(false)
+                    .label("Choice")
+                    .into()
+            ) > small_toggle
+        );
         let large_button = text_height(crate::ui_controls::button::secondary("Action").into());
         assert!(large_button > small_button && large_button >= interface_size() + 5.0);
-        assert!(toolkit_label_height() > small_toolkit_label * 1.5, "toolkit buttons inherit interface size");
+        assert!(
+            toolkit_label_height() > small_toolkit_label * 1.5,
+            "toolkit buttons inherit interface size"
+        );
         let large_caption = text_height(caption("Caption").into());
         assert!(large_caption > small_caption);
-        assert!((large_caption - scaled_interface_size(17.0)).abs() < 0.01, "caption line box follows its type size");
-        assert_eq!(text_height(widget::text("Fixed caption").size(12.0).into()), explicit);
+        assert!(
+            (large_caption - scaled_interface_size(17.0)).abs() < 0.01,
+            "caption line box follows its type size"
+        );
+        assert_eq!(
+            text_height(widget::text("Fixed caption").size(12.0).into()),
+            explicit
+        );
         configure_typography("", 13.0, "", 14.0);
     }
 

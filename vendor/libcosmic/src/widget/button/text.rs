@@ -63,7 +63,9 @@ impl<Message> Button<'_, Message> {
     pub fn new(text: Text) -> Self {
         let guard = crate::theme::THEME.lock().unwrap();
         let theme = guard.cosmic();
-        let font_size = crate::widget::text::default_size().ceil().clamp(1.0, u16::MAX as f32) as u16;
+        let font_size = crate::widget::text::default_size()
+            .ceil()
+            .clamp(1.0, u16::MAX as f32) as u16;
         let line_height = font_size.saturating_add(6);
         Self {
             id: Id::unique(),

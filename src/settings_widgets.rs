@@ -342,13 +342,18 @@ mod tests {
         use iced::advanced::{layout, widget::Tree};
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let height = |query| {
-            let mut label: Element<'_, ()> = highlighted("Interface font".into(), query, design::heading_font());
+            let mut label: Element<'_, ()> =
+                highlighted("Interface font".into(), query, design::heading_font());
             let mut tree = Tree::new(label.as_widget());
-            label.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(300.0, 100.0)),
-            ).size().height
+            label
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(iced::Size::ZERO, iced::Size::new(300.0, 100.0)),
+                )
+                .size()
+                .height
         };
         design::configure_typography("", 13.0, "", 14.0);
         let small = [height(""), height("font")];
