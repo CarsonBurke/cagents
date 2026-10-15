@@ -6286,7 +6286,7 @@ fn channel_context_controls<'a>(
             None,
             ChannelContextCommand(
                 channel_id,
-                selection_rows.clone().filter(|rows| rows.len() > 1),
+                selection_rows.as_deref().filter(|rows| rows.len() > 1),
                 ChannelMenuCommand::Delete,
             ),
         )];
@@ -6315,8 +6315,8 @@ fn channel_context_controls<'a>(
     crate::interaction::context_menu(content, menu)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ChannelContextCommand(ChannelId, Option<Arc<[SelectionRow]>>, ChannelMenuCommand);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ChannelContextCommand<'a>(ChannelId, Option<&'a [SelectionRow]>, ChannelMenuCommand);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChannelMenuCommand {
@@ -6325,7 +6325,7 @@ enum ChannelMenuCommand {
     MarkRead,
 }
 
-impl widget::menu::Action for ChannelContextCommand {
+impl widget::menu::Action for ChannelContextCommand<'_> {
     type Message = SidebarAction;
 
     fn message(&self) -> SidebarAction {
@@ -6706,8 +6706,8 @@ pub enum ProjectCommand {
     Remove,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ContextCommand<'a>(ProjectId, Option<WorktreeId>, &'a ProjectCommand, Option<Arc<[SelectionRow]>>);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContextCommand<'a>(ProjectId, Option<WorktreeId>, &'a ProjectCommand, Option<&'a [SelectionRow]>);
 
 impl widget::menu::Action for ContextCommand<'_> {
     type Message = SidebarAction;
@@ -6851,7 +6851,7 @@ fn context_controls<'a>(
                         project_id,
                         worktree_id,
                         command,
-                        selection_rows.clone().filter(|rows| rows.len() > 1
+                        selection_rows.as_deref().filter(|rows| rows.len() > 1
                             && matches!(command, ProjectCommand::Delete | ProjectCommand::Remove)),
                     ),
                 )
