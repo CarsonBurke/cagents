@@ -219,6 +219,8 @@ pub enum Action {
 
 impl Cagents {
     pub(super) fn activate_project(&mut self, repository: PathBuf) -> Task<Message> {
+        self.cancel_workspace_preview();
+        self.chrome_ui.close();
         let project = self
             .sidebar_model
             .projects
