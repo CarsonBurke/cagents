@@ -51,6 +51,7 @@ pub use daemon_stop::run_daemon_stop_confirmation;
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
 };
+use worktree_ui::card_directory;
 
 use std::{
     borrow::Cow,
