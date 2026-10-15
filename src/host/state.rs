@@ -3479,6 +3479,16 @@ fn start_terminal_view_owned(
                 return Err(not_found(terminal_id));
             }
         }
+        // A saved setup recipe is evidence, never automatic replay permission.
+        // Existing actor attachment above and authenticated holder adoption
+        // below keep their original ownership paths; neither spawns a recipe.
+        if crate::upgrade::is_worktree_setup_recipe(&session.launch) && adoption.is_none() {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Worktree setup was interrupted; review and explicitly resume it instead of replaying its saved recipe",
+                false,
+            ));
+        }
         state.reserve_spawn_for_view(terminal_id, paired.then_some(&session))?;
         if crate::account::login::is_codex_browser(&session.launch) {
             let reserved = state.reserve_browser_login(terminal_id).and_then(|()| {

@@ -47,6 +47,79 @@ mod tests {
     use crate::{model::{BootId, CardId, CardKind, HostIncarnation, HostSessionId, LaunchRecipe},
         upgrade::handoff::{Carried, Checkpoint, Phase, Store, Terminal},
         workspace_model::views::{Pane, Scope}};
+    use std::path::Path;
+
+    fn isolated_fixture(name: &str) -> bool {
+        use crate::process::ProcessExecutor;
+        const MARKER: &str = "CAGENTS_SETUP_RESTORE_FIXTURE";
+        if std::env::var_os(MARKER).as_deref() == Some(std::ffi::OsStr::new(name)) { return false; }
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        for directory in ["home", "run", "config", "data", "cache"] {
+            crate::secure_file::prepare_private_directory(&root.path().join(directory)).unwrap();
+        }
+        let mut command = crate::process::CommandSpec::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"]);
+        for (key, _) in std::env::vars_os() { command = command.env_remove(key); }
+        command = command.env(MARKER, name).env("PATH", "/usr/bin:/bin")
+            .env("SHELL", "/bin/sh").env("HOME", root.path().join("home"))
+            .env("XDG_RUNTIME_DIR", root.path().join("run"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"));
+        command.timeout = Some(Duration::from_secs(45));
+        let output = crate::process::SystemProcessExecutor.execute(
+            &command, &crate::repository::CancellationToken::new()).unwrap();
+        assert!(output.success, "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed; 0 failed"),
+            "the isolated contract must actually execute: {}", String::from_utf8_lossy(&output.stdout));
+        println!("{}", String::from_utf8_lossy(&output.stdout));
+        true
+    }
+
+    struct CloseFixtureTerminals(SharedHost);
+    impl Drop for CloseFixtureTerminals {
+        fn drop(&mut self) {
+            let handles = self.0.lock().unwrap_or_else(|p| p.into_inner()).terminals.values()
+                .map(|record| record.handle.clone()).collect::<Vec<_>>();
+            for handle in handles { let _ = handle.shutdown(); }
+        }
+    }
+
+    struct CloseFixtureHandle(TerminalHandle);
+    impl Drop for CloseFixtureHandle {
+        fn drop(&mut self) { let _ = self.0.shutdown(); }
+    }
+
+    // Only exact processes created by this private fixture enter this guard.
+    // Keep kernel handles before detaching so assertion cleanup never signals
+    // a PID re-created from a stale registry or leaves its original status.
+    #[derive(Default)]
+    struct FixtureProcesses(Vec<std::os::fd::OwnedFd>);
+    impl FixtureProcesses {
+        fn retain(&mut self, process: &crate::daemon::holder_registry::Process) {
+            use std::os::fd::FromRawFd;
+            assert!(process.is_current());
+            let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) as i32 };
+            assert!(descriptor >= 0, "fixture pidfd capture: {}", std::io::Error::last_os_error());
+            self.0.push(unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor) });
+        }
+    }
+    impl Drop for FixtureProcesses {
+        fn drop(&mut self) {
+            use std::os::fd::AsRawFd;
+            for descriptor in &self.0 {
+                unsafe {
+                    libc::syscall(libc::SYS_pidfd_send_signal, descriptor.as_raw_fd(), libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(), 0);
+                    let mut ready = libc::pollfd { fd: descriptor.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+                    libc::poll(&mut ready, 1, 2000);
+                    let mut status: libc::siginfo_t = std::mem::zeroed();
+                    libc::waitid(libc::P_PIDFD, descriptor.as_raw_fd() as libc::id_t, &mut status,
+                        libc::WEXITED | libc::WNOHANG);
+                }
+            }
+        }
+    }
 
     fn proof(incarnation: &str) -> HostSessionProof {
         HostSessionProof { host_session_id: HostSessionId::new("setup-restore"),
@@ -61,6 +134,7 @@ mod tests {
 
     #[test]
     fn mixed_setup_and_shell_restore_preserves_setup_without_replay_and_keeps_shell_usable() {
+        if isolated_fixture(concat!(module_path!(), "::mixed_setup_and_shell_restore_preserves_setup_without_replay_and_keeps_shell_usable")) { return; }
         for (carried, has_pane) in [(false, true), (true, true), (false, false)] {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let root = directory.path();
@@ -104,9 +178,11 @@ mod tests {
                 state.install_model(registry);
             }
             let host = Arc::new(HostLock::new(state));
+            let _cleanup = CloseFixtureTerminals(host.clone());
             let proc_root = root.join("proc");
             fs::create_dir(&proc_root).unwrap();
-            restore_upgrade_from(&host, store, &proc_root, None).unwrap();
+            let missing_holders = root.join("missing-holders");
+            restore_upgrade_from(&host, store, &proc_root, carried.then_some(missing_holders.as_path())).unwrap();
             let handle = {
                 let state = host.lock().unwrap();
                 assert!(!state.terminals.contains_key(&setup.id));
@@ -138,5 +214,99 @@ mod tests {
             restore_upgrade_from(&host, store, &proc_root, None).unwrap();
             assert!(!root.join("setup-replayed").exists());
         }
+    }
+
+    #[test]
+    fn marked_setup_generic_spawns_refuse_before_pending_reservation_or_command_execution() {
+        if isolated_fixture(concat!(module_path!(), "::marked_setup_generic_spawns_refuse_before_pending_reservation_or_command_execution")) { return; }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        let mut recipe = LaunchRecipe::shell(root.to_owned()).unwrap();
+        recipe.program = "/bin/sh".into();
+        recipe.arguments = vec!["-c".into(), "printf replayed >> forbidden-replay".into()];
+        recipe.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+        let source = session(recipe, &proof("old"));
+        let mut registry = super::super::super::model::Registry::at(&root.join("model.sqlite3")).unwrap();
+        registry.apply(&ModelEdit::OpenProject { repository: root.to_owned(), name: "setup".into(), kind: Default::default() }).unwrap();
+        let pane = Pane { id: CardId::new(), title: "setup".into(), user_title: None, pending_terminal_start: true,
+            width_fraction: 1.0, scope: Some(root.to_owned()), kind: CardKind::Terminal(source.clone()) };
+        registry.apply(&ModelEdit::SeedView { scope: Scope::Worktree { repository: root.to_owned(), path: root.to_owned() },
+            panes: vec![pane.clone()], closed: Vec::new() }).unwrap();
+        let mut state = HostState::new(proof("current"));
+        state.install_model(registry);
+        state.register_client(1);
+        let host = Arc::new(HostLock::new(state));
+        let _cleanup = CloseFixtureTerminals(host.clone());
+        for error in [spawn_terminal(&host, 1, source.clone(), Default::default()).unwrap_err(),
+            spawn_pending_terminal(&host, 1, pane.id, source.id, Default::default()).unwrap_err()] {
+            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert!(error.message.contains("review and explicitly resume"));
+        }
+        let state = host.lock().unwrap();
+        assert!(state.terminals.is_empty());
+        let saved = state.read_model().unwrap().views.remove(0).panes.remove(0);
+        assert!(saved.pending_terminal_start, "a refused generic request cannot consume the pending pane");
+        assert_eq!(saved.kind, pane.kind);
+        assert!(!root.join("forbidden-replay").exists());
+        println!("SETUP_GENERIC_REPLAY_REFUSED");
+    }
+
+    #[test]
+    fn authenticated_carried_setup_reattaches_the_original_holder_without_replaying_its_recipe() {
+        if isolated_fixture(concat!(module_path!(), "::authenticated_carried_setup_reattaches_the_original_holder_without_replaying_its_recipe")) { return; }
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let mut old = proof("old");
+        old.boot_id = crate::daemon::read_boot_id().unwrap();
+        let mut lease = Some(crate::daemon::HostLease::acquire(&paths, &old).unwrap());
+        let mut recipe = LaunchRecipe::shell(root.to_owned()).unwrap();
+        recipe.program = "/bin/sh".into();
+        recipe.arguments = vec!["-c".into(), "printf once >> setup-count; exec /bin/cat".into()];
+        recipe.environment.insert("CAGENTS_WORKTREE_SETUP".into(), "1".into());
+        let source = session(recipe, &old);
+        // The fixture itself explicitly starts the initial trusted command;
+        // the host restore path below may only adopt this already-running owner.
+        let original = crate::terminal::TerminalHandle::spawn(source.clone(), crate::terminal::TerminalConfig {
+            holder_recovery: Some(crate::terminal::holder::Recovery { source: source.clone(),
+                previous_sources: Vec::new(), relaunches: Vec::new(), options: Default::default(), execution_environment: None }),
+            ..Default::default()
+        }, |_| {}).unwrap();
+        let _original_cleanup = CloseFixtureHandle(original.clone());
+        let owner = original.holder_identity().unwrap().clone();
+        let mut processes = FixtureProcesses::default();
+        processes.retain(&owner.root);
+        processes.retain(&owner.holder);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read(root.join("setup-count")).is_ok_and(|bytes| bytes == b"once") {
+            assert!(Instant::now() < deadline, "the initial reviewed fixture command did not run");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let holders = crate::terminal::holder::directory().unwrap();
+        original.carry(crate::terminal::holder::socket(&holders, source.id)).unwrap();
+        let mut checkpoint = Checkpoint::new(old.clone(), Vec::new(), Vec::new(), Vec::new());
+        checkpoint.carried.push(Carried { source: source.clone(), previous_sources: Vec::new(),
+            relaunches: Vec::new(), options: Default::default() });
+        checkpoint.preserve_carried = true;
+        checkpoint.phase = Phase::Ready;
+        let store = Store::open(&root.join("checkpoint")).unwrap();
+        store.save(&checkpoint).unwrap();
+        drop(lease.take());
+        let mut current = old;
+        current.host_incarnation = HostIncarnation::new("replacement");
+        let _lease = crate::daemon::HostLease::acquire(&paths, &current).unwrap();
+        let mut state = HostState::new(current);
+        state.enable_holder_recovery();
+        let host = Arc::new(HostLock::new(state));
+        let _cleanup = CloseFixtureTerminals(host.clone());
+        restore_upgrade_from(&host, store, Path::new("/proc"), Some(&holders)).unwrap();
+        let adopted = host.lock().unwrap().terminals[&source.id].handle.clone();
+        assert_eq!(adopted.holder_identity(), Some(&owner));
+        assert!(!adopted.is_completed());
+        assert_eq!(fs::read_to_string(root.join("setup-count")).unwrap(), "once");
+        assert_eq!(adopted.close_checked(true), crate::terminal_ipc::TerminalCloseResult::Closed);
+        assert_eq!(fs::read_to_string(root.join("setup-count")).unwrap(), "once");
+        assert!(Store::open(&root.join("checkpoint")).unwrap().load().unwrap().is_none());
+        println!("SETUP_CARRIED_HOLDER_REATTACHED_ONCE");
     }
 }
