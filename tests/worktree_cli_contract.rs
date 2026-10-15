@@ -21,7 +21,7 @@ impl Fixture {
     }
     fn new()->Self {
         let root=tempfile::tempdir().unwrap();
-        for path in ["home","run","data","config","cache","tmp","bin","project"] {fs::create_dir(root.path().join(path)).unwrap();}
+        for path in ["home","home/.claude","run","data","config","cache","tmp","bin","project"] {fs::create_dir(root.path().join(path)).unwrap();}
         fs::set_permissions(root.path().join("run"),fs::Permissions::from_mode(0o700)).unwrap();
         let git=|args:&[&str]| {let output=Self::command(root.path(),Path::new("/usr/bin/git")).args(args).output().unwrap();assert!(output.status.success(),"{args:?}: {output:?}");};
         git(&["init","-q","-b","main"]);
@@ -184,7 +184,7 @@ fn optional_agent_uses_new_worktree_and_waits_for_setup() {
     fs::write(project.join(".cagents/worktree.toml"),"setup = \"sleep 0.05; printf ready > setup-ready\"\n").unwrap();
     let plan=cagents::worktree_setup::load(&project).unwrap().unwrap();
     cagents::worktree_setup::trust(&project,&plan,&cagents::repository::CancellationToken::new()).unwrap();
-    fs::create_dir(fixture.root.path().join("home/.claude")).unwrap();
+    fs::create_dir_all(fixture.root.path().join("home/.claude")).unwrap();
     let provider=fixture.root.path().join("bin/claude");
     fs::write(&provider,format!("#!/bin/sh\nset -eu\n[ -f setup-ready ] || exit 18\nprintf '%s' \"$PWD\" > \"$HOME/../spawn-directory\"\n{}",include_str!("fixtures/automation-claude.sh"))).unwrap();
     fs::set_permissions(provider,fs::Permissions::from_mode(0o700)).unwrap();
