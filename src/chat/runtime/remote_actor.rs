@@ -1268,9 +1268,10 @@ impl Drop for Remote {
             .get_mut()
             .unwrap_or_else(|p| p.into_inner())
             .take()
-            && worker.is_finished()
         {
-            let _ = worker.join();
+            // is_finished can precede OS thread/TLS destruction. This worker
+            // only observes retained metadata; detach never proves cleanup.
+            drop(worker);
         }
         // A committed proxy disappearing is a detach, including daemon death.
         // Startup EOF, held until commit, owns uninstalled launch rollback.
@@ -2667,6 +2668,17 @@ done"#;
             "the next real state RPC must fetch the raced Ready transition"
         );
     }
+    #[test]
+    fn final_proxy_drop_never_joins_finished_packet_with_blocked_tls_cleanup() {
+        let actor=RemoteActor::fixture();
+        let (worker,release,finished)=super::super::tests::worker_blocked_in_tls_destruction();
+        *actor.0.worker.lock().unwrap()=Some(worker);
+        let started=Instant::now();drop(actor);
+        assert!(started.elapsed()<Duration::from_secs(1));
+        assert!(finished.try_recv().is_err(),"frontend detach is not OS-thread or retained-provider cleanup proof");
+        release.send(()).unwrap();finished.recv_timeout(Duration::from_secs(1)).unwrap();
+    }
+
     #[test]
     fn bounded_remote_close_keeps_one_pending_rpc_and_its_exact_owner() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
