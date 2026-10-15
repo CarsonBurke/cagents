@@ -7835,13 +7835,13 @@ impl Cagents {
                 if let Some(runtime)=self.chat_runtime_mut(target) {changes_sources::patch_ready(runtime,&key,index,attempt,result);return changes_sources::copy_task(runtime,None);}
             }
             Action::ToggleChangeFile(target,item,index)=>{
-                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.toggle_file(&item,index);changes_find::sync(runtime);}
+                if let Some(runtime)=self.chat_runtime_mut(target) {let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());runtime.logical_changes.toggle_file(&item,index,find);runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);}
             }
             Action::LoadChangePage(target,item,offset)=>{
-                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.page(&item,offset);changes_find::sync(runtime);}
+                if let Some(runtime)=self.chat_runtime_mut(target) {let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());runtime.logical_changes.page(&item,offset,find);runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);}
             }
             Action::RetryChangeSource(target,item,index)=>{
-                if let Some(runtime)=self.chat_runtime_mut(target) {runtime.logical_changes.retry(&item,index);changes_find::sync(runtime);}
+                if let Some(runtime)=self.chat_runtime_mut(target) {let find=runtime.find.as_ref().is_some_and(|query|!query.is_empty());runtime.logical_changes.retry(&item,index,find);runtime.logical_changes.reconcile_demand(&runtime.expanded,find);changes_find::sync(runtime);}
             }
             Action::CopyChangePatch(target,item,index)=>{
                 if let Some(runtime)=self.chat_runtime_mut(target) {return changes_sources::copy_task(runtime,Some((item,index)));}

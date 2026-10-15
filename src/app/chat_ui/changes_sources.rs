@@ -297,22 +297,22 @@ impl State {
         }
         let projected=Arc::new(projected);self.projected=Some(projected.clone());projected
     }
-    pub(super) fn toggle_file(&mut self,item:&str,index:usize) {
+    pub(super) fn toggle_file(&mut self,item:&str,index:usize,find:bool) {
         let Some(key)=self.aliases.get(item) else {return;};let Some(entry)=self.entries.get_mut(key) else {return;};
-        if !entry.opened.remove(&index) {entry.opened.insert(index);} else {
+        if !entry.opened.remove(&index) {entry.opened.insert(index);} else if !find {
             entry.patches.remove(&index);entry.restored.remove(&index);entry.patch_requests.remove(&index);entry.patch_errors.remove(&index);
         }
-        entry.demand(true,false);entry.revision=attempt();self.revision=self.revision.wrapping_add(1);
+        entry.demand(true,find);entry.revision=attempt();self.revision=self.revision.wrapping_add(1);
     }
-    pub(super) fn page(&mut self,item:&str,offset:usize) {
+    pub(super) fn page(&mut self,item:&str,offset:usize,find:bool) {
         let Some(key)=self.aliases.get(item) else {return;};let Some(entry)=self.entries.get_mut(key) else {return;};
         if offset!=0 && !entry.pages.values().any(|page|page.next_offset==Some(offset)) {return;}
-        entry.manual_pages.insert(offset);entry.wanted_pages.insert(offset);entry.page_errors.remove(&offset);entry.demand(true,false);
+        entry.manual_pages.insert(offset);entry.wanted_pages.insert(offset);entry.page_errors.remove(&offset);entry.demand(true,find);entry.revision=attempt();self.revision=self.revision.wrapping_add(1);
     }
-    pub(super) fn retry(&mut self,item:&str,index:Option<usize>) {
+    pub(super) fn retry(&mut self,item:&str,index:Option<usize>,find:bool) {
         let Some(key)=self.aliases.get(item) else {return;};let Some(entry)=self.entries.get_mut(key) else {return;};
         match index {Some(index)=>{entry.patch_errors.remove(&index);entry.opened.insert(index);},None=>entry.page_errors.clear()}
-        entry.demand(true,false);entry.revision=attempt();self.revision=self.revision.wrapping_add(1);
+        entry.demand(true,find);entry.revision=attempt();self.revision=self.revision.wrapping_add(1);
     }
     fn complete_manifest(&mut self,key:&chat::cache::SourceKey,offset:usize,request:u64,result:Result<Arc<Manifest>,String>)->bool {
         let Some(entry)=self.entries.get_mut(key).filter(|entry|entry.requested.get(&offset)==Some(&request)) else {return false;};
@@ -728,7 +728,7 @@ mod tests {
         let sources=state.find_sources();assert_eq!(sources.len(),1);assert!(sources[0].complete);assert_eq!(sources[0].epoch,page.epoch);
         assert_eq!(sources[0].manifests[0].files[0].path,page.files[0].path);assert_eq!(sources[0].patches[0].0,0);
         assert!(Arc::ptr_eq(&sources[0].patches[0].1,&loaded));drop(sources);drop(loaded);
-        state.toggle_file(&page.source.source_id,0);state.project(raw,None,&expanded,false);
+        state.toggle_file(&page.source.source_id,0,false);state.project(raw,None,&expanded,false);
         assert!(state.copy_patch(&page.source.source_id,0).is_none());assert!(weak.upgrade().is_none());
     }
     #[tokio::test]
@@ -801,7 +801,7 @@ mod tests {
         };
         let mut element=detail(&runtime,&page.source.source_id).unwrap();let mut tree=Tree::new(&element);
         assert!(labels(&mut element,&mut tree).iter().any(|label|label=="Copy patch"));
-        runtime.logical_changes.toggle_file(&page.source.source_id,0);
+        runtime.logical_changes.toggle_file(&page.source.source_id,0,false);
         let mut element=detail(&runtime,&page.source.source_id).unwrap();
         assert!(!labels(&mut element,&mut tree).iter().any(|label|label=="Copy patch"));
         let mut changed=(*page).clone();changed.epoch.incarnation=uuid::Uuid::from_u128(44);
@@ -847,6 +847,21 @@ mod tests {
         state.reconcile_demand(&HashSet::new(),false);
         let entry=&state.entries[&page.source];assert!(entry.patch_requests.is_empty());assert!(entry.requested.is_empty());
         assert!(entry.wanted_pages.is_empty());assert_eq!(state.retained_bytes(),0);assert!(weak.upgrade().is_none());
+    }
+
+    #[tokio::test]
+    async fn manual_file_toggle_page_and_retry_preserve_other_active_find_sources() {
+        let text="@@ -1 +1 @@\n-before\n+after\n";let mut page=(*fixture(text)).clone();
+        page.metadata.total_files=2;page.metadata.total_bytes*=2;let mut second=page.files[0].clone();second.file_index=1;second.path="src/second.rs".into();page.files.push(second);
+        let page=Arc::new(page);let(mut state,raw,expanded)=open(&page,"part");state.project(raw,None,&expanded,true);
+        let first=state.entries[&page.source].patch_requests[&0];let pending=state.entries[&page.source].patch_requests[&1];
+        assert!(state.complete_patch(&page.source,0,first,Ok(ready(&page,text).await)));
+        let weak=Arc::downgrade(&state.entries[&page.source].current(0).unwrap().text);
+        state.toggle_file(&page.source.source_id,0,true);state.toggle_file(&page.source.source_id,0,true);
+        state.page(&page.source.source_id,0,true);state.retry(&page.source.source_id,Some(1),true);
+        let entry=&state.entries[&page.source];assert!(entry.current(0).is_some());assert!(weak.upgrade().is_some());
+        assert_eq!(entry.patch_requests[&1],pending,"unrelated pending file remains scheduled during active Find");
+        assert_eq!(state.find_patches().len(),1);assert!(!state.complete_for_find());
     }
 
 }
