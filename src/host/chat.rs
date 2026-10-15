@@ -2503,7 +2503,23 @@ pub(super) fn process(
     request: ClientRequest,
 ) -> Result<ServerResponse, ProtocolError> {
     super::agent_execution::interactive(host, client, request, |request| {
-        process_inner(host, client, request)
+        process_inner(host, client, request, None)
+    })
+}
+
+/// A failed private Agent bind may race a supported same-ID restart. Retain
+/// its original actor if either lifetime changed; a saved descriptor alone is
+/// insufficient because a successor may have identical launch metadata.
+pub(super) fn close_captured(
+    host: &SharedHost,
+    client: ClientId,
+    source: &Session,
+    handle: &Handle,
+    execution_instance: uuid::Uuid,
+) -> Result<ServerResponse, ProtocolError> {
+    let request = ClientRequest::ChatClose { chat_id: source.id };
+    super::agent_execution::interactive(host, client, request, |request| {
+        process_inner(host, client, request, Some((source, handle, execution_instance)))
     })
 }
 
@@ -2552,6 +2568,7 @@ fn process_inner(
     host: &SharedHost,
     client: ClientId,
     request: ClientRequest,
+    captured_close: Option<(&Session, &Handle, uuid::Uuid)>,
 ) -> Result<ServerResponse, ProtocolError> {
     // Keep explicit close/return and a restart's full pair publication mutually
     // exclusive. Weak entries retain only currently executing transitions.
@@ -2574,6 +2591,24 @@ fn process_inner(
         }
         None => None,
     };
+    // The transition claim covers both this exact identity check and every
+    // close effect below. Neither inherited subscriptions nor same recipes
+    // authorize cleanup of a newer actor installed while binding was failing.
+    if let Some((source, handle, instance)) = captured_close {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        validate_proof(source.proof.as_ref(), state.proof())?;
+        if instance.is_nil() || !matches!(&request,
+            ClientRequest::ChatClose { chat_id } if *chat_id == source.id)
+            || !state.chats.get(&source.id).is_some_and(|record|
+                record.execution_instance == instance && record.handle.same_actor(handle)
+                    && crate::agent_execution::HostedSession::Chat(record.session.clone())
+                        .same_process(&crate::agent_execution::HostedSession::Chat(source.clone())))
+        {
+            return Err(unavailable(
+                "The provider changed after its Agent binding failed; no replacement was stopped",
+            ));
+        }
+    }
     // Normalize while the transition claim remains held: subscription never
     // runs ChatAttach, whose completed-actor contract intentionally restarts.
     let request = match request {
@@ -4739,6 +4774,77 @@ for line in sys.stdin:
                 .handle
                 .same_actor(&replacement)
         );
+        replacement.close().unwrap();
+    }
+
+    #[test]
+    fn failed_agent_bind_cleanup_does_not_close_a_same_id_restarted_actor() {
+        use crate::agent_execution::{Destination, HostedSession, Origin, Spec, Submit, Surface, Target};
+        let (directory, host, saved) = upgrade_fixture();
+        restore_upgrade(&host, &saved).unwrap();
+        let (source, previous, instance) = {
+            let mut state = host.lock().unwrap();
+            state.register_client(1);
+            state.register_client(0);
+            let record = state.chats.get_mut(&saved.source.id).unwrap();
+            record.subscribers.insert(0, false);
+            (record.session.clone(), record.handle.clone(), record.execution_instance)
+        };
+        // Fail a real binding write after the captured ChatAttached descriptor.
+        // The barrier leaves the exact production cleanup helper suspended
+        // while a supported completed-actor restart installs its successor.
+        let mut registry = super::super::model::Registry::at(&directory.path().join("binding.sqlite3")).unwrap();
+        registry.apply(&crate::workspace_model::ModelEdit::OpenProject {
+            repository: directory.path().to_owned(), name: "Binding fixture".into(),
+            kind: crate::model::ProjectKind::Folder,
+        }).unwrap();
+        let accepted = registry.submit_agent(&Origin::User, &Submit {
+            name: None,
+            destination: Destination::New(Spec {
+                provider: source.launch.provider, account: None,
+                target: Target { repository: directory.path().to_owned(), directory: directory.path().to_owned(), placement: None },
+                surface: Surface::Chat, model: None, permission_mode: None, reasoning_effort: None,
+            }),
+            prompt: "Never submitted".into(), idempotency_key: "failed-bind".into(),
+        }, 1).unwrap();
+        registry.reserve_agent_launch(accepted.agent.id, &HostedSession::Chat(source.clone())).unwrap();
+        rusqlite::Connection::open(directory.path().join("binding.sqlite3")).unwrap().execute_batch("CREATE TRIGGER reject_fixture_binding BEFORE UPDATE ON agents BEGIN SELECT RAISE(ABORT, 'fixture binding write refused'); END;").unwrap();
+        let (failed_tx, failed_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let closing_host = host.clone();
+        let captured_source = source.clone();
+        let captured_actor = previous.clone();
+        let cleanup = thread::spawn(move || {
+            let binding = registry.bind_agent(accepted.agent.id, None, HostedSession::Chat(captured_source.clone()));
+            assert!(binding.unwrap_err().contains("fixture binding write refused"));
+            failed_tx.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            close_captured(&closing_host, 0, &captured_source, &captured_actor, instance)
+        });
+        failed_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        previous.close().unwrap();
+        assert!(previous.is_completed());
+        let ServerResponse::ChatAttached { session: restarted, .. } = process(
+            &host, 1, ClientRequest::ChatAttach { session: source.clone() },
+        ).unwrap() else { panic!("supported same-ID restart did not attach"); };
+        let replacement = {
+            let state = host.lock().unwrap();
+            let record = &state.chats[&source.id];
+            assert!(record.subscribers.contains_key(&0), "inherited attachment must not authorize a replacement close");
+            assert_ne!(record.execution_instance, instance);
+            record.handle.clone()
+        };
+        assert_eq!(restarted.id, source.id);
+        assert!(!replacement.same_actor(&previous));
+        resume_tx.send(()).unwrap();
+        let refusal = cleanup.join().unwrap().unwrap_err();
+        assert!(refusal.message.contains("no replacement was stopped"), "{refusal:?}");
+        assert!(!replacement.is_completed());
+        assert!(host.lock().unwrap().chats[&source.id].handle.same_actor(&replacement));
+        // Even an identical descriptor and current actor reference cannot
+        // reuse the previous installation's private execution instance.
+        assert!(close_captured(&host, 0, &restarted, &replacement, instance).is_err());
+        assert!(!replacement.is_completed());
         replacement.close().unwrap();
     }
 

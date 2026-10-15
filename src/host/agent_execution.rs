@@ -472,12 +472,12 @@ fn dispatch(
             // Teardown is synchronous and uses the same exact actor retirement
             // path as UI close. A failed teardown retains the private launch
             // identity and interrupted capacity instead of losing ownership.
-            match super::chat::process(
+            match super::chat::close_captured(
                 host,
                 EXECUTION_CLIENT,
-                ClientRequest::ChatClose {
-                    chat_id: session.id,
-                },
+                &session,
+                &handle,
+                execution_instance,
             ) {
                 Ok(_) => {
                     return Err(before(format!(
