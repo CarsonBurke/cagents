@@ -69,7 +69,24 @@ impl PresenceHolding {
         // parents refuse before creating or acquiring any presence artifacts.
         let namespace = fs_safety::DirectoryNamespace::acquire(&parent).map_err(io_error)?;
         let leaf = OsString::from(format!(".cagents-editor-{}", uuid::Uuid::new_v4()));
-        let publication = match fs_safety::create_directory_in_namespace(&namespace, &parent, Path::new(&leaf), 0o700).map_err(resolve_error)? {
+        let creation = match fs_safety::create_directory_in_namespace(&namespace, &parent, Path::new(&leaf), 0o700) {
+            Ok(creation) => creation,
+            Err(mut error) => {
+                let message = error.to_string();
+                if let Some(mut preparation) = error.take_recovery() {
+                    // Preparation owns at most3 roots, plus this exact parent.
+                    // Capture the whole typed object before converting cause
+                    // text; a failed private bootstrap is still an owner.
+                    let authority = slot.retain(message.clone(), move || {
+                        preparation.retry_cleanup().map_err(|error| error.to_string())?;
+                        fs_safety::sync_directory(&parent).map_err(|error| error.to_string())
+                    });
+                    return Err(FileIoError::Recovery { message, authority });
+                }
+                return Err(FileIoError::Io(message));
+            }
+        };
+        let publication = match creation {
             fs_safety::DirectoryCreation::Published(receipt) => receipt,
             fs_safety::DirectoryCreation::Existing(_) => return Err(FileIoError::Io("The editor staging name already exists and was preserved.".into())),
             fs_safety::DirectoryCreation::Unverified { reason, .. } => return Err(FileIoError::Io(format!("Editor staging ownership could not be verified; the entry was preserved: {reason}"))),
