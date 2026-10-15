@@ -161,9 +161,13 @@ impl KeyAuthority {
         let host = surface.host_proof().filter(|host| host.is_complete())?;
         Some(Self { terminal: surface.terminal_id(), worker, host })
     }
-    fn receipt(surface: &super::TerminalSurface, binding: &crate::terminal::HostedTerminalBinding) -> Option<Self> {
-        let actual = Self::capture(surface)?;
-        (actual.terminal == binding.source.id && actual.worker == binding.execution_instance).then_some(actual)
+    fn receipt(surface: &super::TerminalSurface, binding: &crate::terminal::HostedTerminalBinding, host: crate::model::HostSessionProof) -> Option<Self> {
+        // This proof was captured by the transport at matched Accepted, before
+        // publishing the immutable result. A live getter can be None after a
+        // subsequent disconnect and cannot erase the admitted press.
+        if binding.source.id != surface.terminal_id() || binding.execution_instance.is_nil() || !host.is_complete() { return None; }
+        if surface.execution_instance().filter(|worker| !worker.is_nil()).is_some_and(|worker| worker != binding.execution_instance) { return None; }
+        Some(Self { terminal: binding.source.id, worker: binding.execution_instance, host })
     }
 }
 impl ConsumedInputs {
@@ -186,7 +190,7 @@ impl ConsumedInputs {
             Err(_) => true,
             Ok(Err(reason)) => { failures.push(reason); false }
             Ok(Ok(binding)) => {
-                let authority = KeyAuthority::receipt(&key.surface, &binding);
+                let authority = key.press.admission_host_proof().and_then(|host| KeyAuthority::receipt(&key.surface, &binding, host));
                 if authority.is_none() || key.authority.as_ref().is_some_and(|expected| Some(expected) != authority.as_ref()) {
                     failures.push("terminal key admission returned a different or unknown worker authority".into());
                     return false;
