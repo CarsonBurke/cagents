@@ -1024,7 +1024,7 @@ impl Cagents {
                 .is_some_and(|id| self.chat_switch_available(id) && self.chat_switch_ready(id)),
             can_review: card.and_then(|id| self.chat_changes_target(id)).is_some(),
             is_pull_request: card.is_some_and(|id| matches!(self.cards.get(&id), Some(CardRuntime::PullRequests(_)))) ,
-            can_find: card.is_some_and(|id| match self.cards.get(&id) {
+            can_find: !self.sidebar_model.projects.is_empty() || card.is_some_and(|id| match self.cards.get(&id) {
                 Some(CardRuntime::Repository(runtime)) => runtime.editor_focus_target(id).is_some(),
                 Some(CardRuntime::Chat(_) | CardRuntime::Settings | CardRuntime::Terminal(_)) => {
                     true
@@ -1033,6 +1033,8 @@ impl Cagents {
             }),
             daemon_can_restart: !crate::device::is_remote(),
             can_search_project: self.sidebar_state.active_worktree().is_some(),
+            has_attention: !self.sidebar_state.attention_cards().is_empty(),
+            can_cycle_workspace: sidebar::workspace_cycle(&self.sidebar_model, &self.sidebar_state).len() > 1,
             has_unread: self.durable.cards.iter().any(|card| card.existence.is_open() && self.sidebar_state.has_card_update(card.id)),
             can_reopen: self
                 .recently_closed
@@ -1253,7 +1255,11 @@ impl Cagents {
                         {
                             return self.handle_terminal_find(terminal_ui::Action::Open(card));
                         }
-                        self.update(Message::FocusProjectSearch)
+                        if self.sidebar_state.active_worktree().is_some() {
+                            self.update(Message::SelectContextTab(ContextTab::Search))
+                        } else {
+                            self.update(Message::FocusProjectSearch)
+                        }
                     }
                 }
             }

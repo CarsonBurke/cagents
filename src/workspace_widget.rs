@@ -313,6 +313,8 @@ pub struct CommandContext {
     pub can_reopen: bool,
     pub has_unread: bool,
     pub can_search_project: bool,
+    pub has_attention: bool,
+    pub can_cycle_workspace: bool,
 }
 
 impl ShortcutDescriptor {
@@ -376,6 +378,8 @@ impl ShortcutDescriptor {
         match self.action {
             GlobalShortcut::NewWorktree => context.active_git_project,
             GlobalShortcut::MarkAllRead => context.has_unread,
+            GlobalShortcut::NextAttention | GlobalShortcut::PreviousAttention => context.has_attention,
+            GlobalShortcut::CycleWorkspace(_) => context.can_cycle_workspace,
             GlobalShortcut::SearchInProject => context.can_search_project,
             GlobalShortcut::ReviewToggleViewed | GlobalShortcut::ReviewNextUnviewed => context.is_pull_request,
             GlobalShortcut::ChatAccount => context.chat_account,
