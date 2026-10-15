@@ -973,6 +973,40 @@ mod tests {
     }
 
     #[test]
+    fn save_acquisition_live_recovery_retains_actual_cleanup_lease_after_root_rename() {
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let named = directory.path().join("root");
+        let moved = directory.path().join("moved");
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join("file"), b"base").unwrap();
+        let root = Root::open(&named).unwrap();
+        let protection = crate::worktree_cleanup::fixture_protection(runtime.path(), &named, false).unwrap();
+        assert!(protection.retained_descriptor_count() >= 3);
+        let context = recovery_context_at(&root, Arc::new(Some(protection))).unwrap();
+        let source = fs_safety::open_beneath(&root, Path::new("file")).unwrap();
+        let holding = Holding::create(&root, &source, &context).unwrap();
+        let private = holding.root.try_clone().unwrap();
+        fs::write(private.path().join("unresolved"), b"preserve").unwrap();
+        let authority = holding.retain();
+        drop(context);
+        fs::rename(&named, &moved).unwrap();
+        fs::create_dir(&named).unwrap();
+        fs::write(named.join("foreign"), b"new actor").unwrap();
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err(), "the original inode lease must survive the old caller/context drop");
+        assert!(authority.retry().is_err());
+        assert!(crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).is_err());
+        fs_safety::unlink_within(&private, OsStr::new("unresolved")).unwrap();
+        authority.retry().unwrap();
+        assert!(authority.is_resolved());
+        let exclusive = crate::worktree_cleanup::fixture_protection(runtime.path(), &moved, true).unwrap();
+        drop(exclusive);
+        assert_eq!(fs::read(moved.join("file")).unwrap(), b"base");
+        assert_eq!(fs::read(named.join("foreign")).unwrap(), b"new actor");
+    }
+
+    #[test]
     fn save_acquisition_recovery_keeps_authenticated_file_descriptors_until_actual_resolution() {
         use std::os::fd::AsRawFd;
         let (dir, root) = fixture();
