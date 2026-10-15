@@ -1127,7 +1127,10 @@ mod tests {
 
         assert!(!app.card_state(card).unwrap().existence.is_open());
         assert!(!app.workspace.order().any(|id| id == card));
-        assert_eq!(app.durable.automation_archives.get(&card), Some(&owner));
+        // The closed canonical pane is not reused as a report tombstone.
+        // Pruning its local projection index does not remove the private report.
+        assert!(!app.durable.automation_archives.contains_key(&card));
+        assert_eq!(report.agent.id, owner);
         assert_eq!(serde_json::to_value(&*report).unwrap(), original_report);
         assert_eq!(serde_json::to_value(&app.workspace_model.archived_automation_agents).unwrap(), original_owner);
         assert!(app.chat_ui.phases.is_empty());
