@@ -115,29 +115,41 @@ impl Stack {
         fallback: widget::Id,
         instance: impl Fn(Modal) -> Option<Instance>,
     ) -> Option<(Modal, u64, bool)> {
-        let previous = self.frames.last().map(|f| f.kind);
+        let previous = self.frames.last().map(|frame| (frame.kind, frame.generation));
         // A removed lower dialog cannot remain the restore target of the
         // next surviving frame. Carry its parent link through any gap.
         let mut inherited_restore = None;
         for frame in &mut self.frames {
-            if active.contains(&frame.kind) && frame.instance == instance(frame.kind) {
+            if active.contains(&frame.kind) {
                 if let Some(restore) = inherited_restore.take() {
                     frame.restore = restore;
+                }
+                let current = instance(frame.kind);
+                if frame.instance != current {
+                    // Refresh retained lower payloads in place. They cannot
+                    // displace an unchanged dialog above them, and their old
+                    // field state cannot become the new request's focus.
+                    self.generation = self.generation.wrapping_add(1);
+                    frame.instance = current;
+                    frame.generation = self.generation;
+                    frame.focus = Default::default();
                 }
             } else if inherited_restore.is_none() {
                 inherited_restore = Some(frame.restore.clone());
             }
         }
-        self.frames
-            .retain(|f| active.contains(&f.kind) && f.instance == instance(f.kind));
+        self.frames.retain(|frame| active.contains(&frame.kind));
         let mut pushed = false;
         for &kind in active {
-            if !self.frames.iter().any(|f| f.kind == kind) {
+            if !self.frames.iter().any(|frame| frame.kind == kind) {
                 self.generation = self.generation.wrapping_add(1);
                 let restore = self
                     .frames
                     .last()
                     .and_then(|frame| frame.focus.get())
+                    .or_else(|| {
+                        if self.frames.is_empty() { inherited_restore.take() } else { None }
+                    })
                     .or_else(|| self.workspace_focus.get())
                     .unwrap_or_else(|| fallback.clone());
                 self.frames.push(Frame {
@@ -150,14 +162,14 @@ impl Stack {
                 pushed = true;
             }
         }
-        if pushed || previous != self.frames.last().map(|frame| frame.kind) {
-            self.focus_revision
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let current = self.frames.last().map(|frame| (frame.kind, frame.generation));
+        if previous != current {
+            self.focus_revision.fetch_add(1, Ordering::AcqRel);
         }
-        self.frames
-            .last()
-            .filter(|f| pushed || previous != Some(f.kind))
-            .map(|f| (f.kind, f.generation, pushed))
+        self.frames.last().filter(|_| previous != current).map(|frame| {
+            let replaced_top = previous.is_some_and(|(kind, _)| kind == frame.kind);
+            (frame.kind, frame.generation, pushed || replaced_top)
+        })
     }
     pub(super) fn focus_snapshot(&self, kind: Modal) -> crate::interaction::FocusSnapshot {
         self.frames
@@ -864,6 +876,69 @@ mod tests {
             drop(app.update(cancel));
             assert!(app.dirty_repository_close.is_none(), "current Cancel still works");
         }
+    }
+
+    #[test]
+    fn advancing_a_lower_dirty_step_preserves_the_visible_dialog_and_full_unwind() {
+        let mut app = app();
+        let root = widget::Id::new("fixture.before-dirty-step");
+        let root_snapshot = app.modal_stack.workspace_focus.clone();
+        focus_input(root_snapshot.clone(), root.clone());
+        let first = app.workspace.focused().unwrap();
+        let second = CardId::new();
+        let mut state = app.card_state(first).unwrap().clone();
+        state.id = second;
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        for card in [first, second] {
+            app.cards.insert(card, CardRuntime::Repository(Box::new(
+                RepositoryRuntime::dirty_fixture(card))));
+        }
+        drop(app.begin_dirty_close(DirtyCloseIntent::Application(window::Id::unique()),
+            VecDeque::from([first, second])));
+        drop(app.finish_modal_update(Task::none()));
+        let previous_lower = app.modal_surface_target(Modal::DirtyClose);
+        focus_input(app.modal_stack.focus_snapshot(Modal::DirtyClose),
+            dirty_close_control_id(first, DirtyCloseControl::Discard));
+        app.settings_reset_confirm = true;
+        let upper_focus = app.finish_modal_update(Task::none());
+        let upper = app.modal_surface_target(Modal::SettingsReset);
+        let held_upper = emitted_reset_cancel(&app);
+        let Some(CardRuntime::Repository(runtime)) = app.cards.get_mut(&first) else { panic!() };
+        assert!(runtime.abandon_unsaved_changes());
+        drop(app.advance_dirty_close());
+        drop(app.finish_modal_update(Task::none()));
+        assert_eq!(app.top_modal(), Some(Modal::SettingsReset));
+        assert_eq!(app.modal_surface_target(Modal::SettingsReset), upper,
+            "a lower request replacement cannot revoke the upper gesture");
+        assert_ne!(app.modal_surface_target(Modal::DirtyClose).instance, previous_lower.instance);
+        let upper_cancel = widget::Id::new("dialog.reset-settings.cancel");
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), upper_focus),
+            Some(upper_cancel), "queued upper focus remains current");
+        let pop = app.update(held_upper);
+        assert!(!app.settings_reset_confirm);
+        assert_eq!(app.top_modal(), Some(Modal::DirtyClose));
+        let cancel = dirty_close_control_id(second, DirtyCloseControl::Cancel);
+        assert_eq!(super::super::tests::focused_element(app.dialog().unwrap(), pop),
+            Some(cancel.clone()), "the replacement has safe initial focus, not its predecessor's field");
+        let decision = emitted_dialog_decision(&app, cancel,
+            |message| matches!(message, Message::CancelRepositoryClose));
+        let restore = app.update(decision);
+        assert!(app.dirty_repository_close.is_none());
+        assert_eq!(super::super::tests::focused_element(observed_input(root_snapshot, root.clone()), restore),
+            Some(root), "full unwind retains the original workspace target");
+    }
+
+    #[test]
+    fn replacing_all_modal_kinds_carries_the_original_root_restore_link() {
+        let mut stack = Stack::default();
+        let root = widget::Id::new("fixture.original-before-atomic-kind-change");
+        focus_input(stack.workspace_focus.clone(), root.clone());
+        stack.reconcile(&[Modal::Resume], widget::Id::new("fallback"));
+        // Sampling another workspace field must not rewrite an existing
+        // modal chain's original restore link during an atomic replacement.
+        focus_input(stack.workspace_focus.clone(), widget::Id::new("fixture.later-workspace-focus"));
+        stack.reconcile(&[Modal::SettingsReset], widget::Id::new("fallback"));
+        assert_eq!(stack.frames[0].restore, root);
     }
 
     #[test]
