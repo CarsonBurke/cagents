@@ -50,7 +50,17 @@ impl<'a, Message: Clone + 'a> Setting<'a, Message> {
     fn view(self, query: &str) -> Element<'a, Message> {
         let mut children = Vec::new();
         if !self.label_in_control {
-            children.push(highlighted(self.label.to_owned(), query, design::heading_font()).into());
+            children.push(if query.trim().is_empty() {
+                design::heading(self.label).into()
+            } else {
+                highlighted(
+                    self.label.to_owned(),
+                    query,
+                    design::heading_font(),
+                    design::interface_size(),
+                    design::interface_size() + 5.0,
+                )
+            });
         }
         children.push(self.control);
         if let Some(error) = self.error {
@@ -82,6 +92,8 @@ fn highlighted<'a, Message: 'a>(
     text: String,
     query: &str,
     font: iced::Font,
+    size: f32,
+    line_height: f32,
 ) -> Element<'a, Message> {
     let words: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
     let mut spans = Vec::new();
@@ -114,11 +126,9 @@ fn highlighted<'a, Message: 'a>(
         });
     }
     iced::widget::rich_text(spans)
-        .size(design::interface_size())
+        .size(size)
         .font(font)
-        .line_height(iced::widget::text::LineHeight::Absolute(
-            (design::interface_size() + 5.0).into(),
-        ))
+        .line_height(iced::widget::text::LineHeight::Absolute(line_height.into()))
         .width(Length::Fill)
         .into()
 }
@@ -190,7 +200,13 @@ impl<'a, Message: Clone + 'a> Group<'a, Message> {
         let mut heading: Vec<Element<'a, Message>> = vec![if query.trim().is_empty() {
             design::title(self.title).into()
         } else {
-            highlighted(breadcrumb, query, design::heading_font()).into()
+            highlighted(
+                breadcrumb,
+                query,
+                design::title_font(),
+                design::scaled_interface_size(design::TEXT_TITLE),
+                design::scaled_interface_size(design::LINE_TITLE),
+            )
         }];
         if !self.detail.is_empty() {
             heading.push(
@@ -299,10 +315,12 @@ mod tests {
     #[test]
     fn labels_and_search_highlights_follow_interface_type_size() {
         use iced::advanced::{layout, widget::Tree};
+        let _restore = design::typography_test_guard();
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let height = |query| {
             let mut label: Element<'_, ()> =
-                highlighted("Interface font".into(), query, design::heading_font());
+                highlighted("Interface font".into(), query, design::heading_font(),
+                    design::interface_size(), design::interface_size() + 5.0);
             let mut tree = Tree::new(label.as_widget());
             label
                 .as_widget_mut()
@@ -322,6 +340,41 @@ mod tests {
             assert_eq!(large, 29.0);
         }
         design::configure_typography("", 13.0, "", 14.0);
+    }
+
+    #[test]
+    fn settings_search_keeps_dynamic_heading_and_title_roles() {
+        use iced::advanced::{layout, widget::Tree};
+        let _restore = design::typography_test_guard();
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let limits = layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 600.0));
+        let measure = |mut element: Element<'_, ()>| {
+            let mut tree = Tree::new(element.as_widget());
+            element.as_widget_mut().layout(&mut tree, &renderer, &limits).size().height
+        };
+        for size in [13.0, 24.0] {
+            design::configure_typography("", size, "", 14.0);
+            // Compare actual stock role widgets rather than duplicating their
+            // scale formulas in the expected geometry.
+            let heading_height = measure(design::heading("Font").into());
+            let title_height = measure(design::title("Editor > Font").into());
+            assert!(title_height > heading_height);
+            for query in ["", "Font"] {
+                let mut setting = field::<()>("Font", "",
+                    widget::Space::new().width(1).height(1).into()).view(query);
+                let mut tree = Tree::new(setting.as_widget());
+                let node = setting.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(node.children()[0].size().height, heading_height,
+                    "field label keeps its heading role at {size}px/query={query}");
+                let mut element = group("Font", "", vec![field::<()>("Font", "",
+                    widget::Space::new().width(1).height(1).into())])
+                    .view("Editor", query).unwrap();
+                let mut tree = Tree::new(element.as_widget());
+                let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+                assert_eq!(node.children()[0].children()[0].size().height, title_height,
+                    "group breadcrumb keeps its title role at {size}px/query={query}");
+            }
+        }
     }
 
     #[test]
