@@ -27,6 +27,40 @@ impl Store {
         }
         Ok(false)
     }
+    /// Publish only identities/ranges for the bounded resident window. Child
+    /// metadata is reused on status-only publications; changed keys are fetched
+    /// in bounded indexed batches, never by scanning older child transcripts.
+    pub(super) fn publish_source_parts(&mut self,state:&mut crate::chat::Snapshot)->Result<(),String>{
+        use crate::chat::cache::{SourceKey,SourcePart};
+        let cached:std::collections::HashMap<_,_>=state.source_parts.iter().filter(|part|part.source.agent_id.is_some()).map(|part|(part.source.clone(),part)).collect();
+        let visible:Vec<_>=state.subagents.iter().flat_map(|agent|agent.items.iter().filter_map(move |item|{
+            if let ItemContent::Text{text,..}=&item.content {Some((SourceKey{agent_id:Some(agent.id.clone()),source_id:item.id.clone()},text.len()))} else {None}
+        })).collect();
+        let changed=self.source_revision!=state.source_revision;
+        let wanted:Vec<_>=visible.iter().filter(|(key,_)|changed || !cached.contains_key(key)).map(|(key,_)|key).collect();
+        if !wanted.is_empty(){self.flush_child_source()?;}
+        let mut lengths=std::collections::HashMap::new();
+        for batch in wanted.chunks(128){
+            let placeholders=std::iter::repeat_n("(?,?)",batch.len()).collect::<Vec<_>>().join(",");
+            let sql=format!("SELECT agent,id,len FROM child_sources WHERE supported=1 AND (agent,id) IN (VALUES {placeholders})");
+            let mut statement=self.db.prepare(&sql).map_err(|e|e.to_string())?;
+            let parameters:Vec<&dyn rusqlite::ToSql>=batch.iter().flat_map(|key|[key.agent_id.as_ref().unwrap() as &dyn rusqlite::ToSql,&key.source_id as &dyn rusqlite::ToSql]).collect();
+            let rows=statement.query_map(parameters.as_slice(),|row|Ok((SourceKey{agent_id:Some(row.get(0)?),source_id:row.get(1)?},row.get::<_,usize>(2)?))).map_err(|e|e.to_string())?;
+            for row in rows {let (key,len)=row.map_err(|e|e.to_string())?;lengths.insert(key,len);}
+        }
+        let mut parts=Vec::with_capacity(visible.len());
+        for (key,visible_len) in visible {
+            if !changed && let Some(part)=cached.get(&key){parts.push((**part).clone());continue;}
+            let Some(source_len)=lengths.get(&key).copied() else {continue;};
+            let replacement=source_len!=visible_len;
+            parts.push(SourcePart{item_id:key.source_id.clone(),source:key,start:0,end:if replacement{0}else{source_len},source_len,replacement});
+        }
+        drop(cached);
+        state.source_parts.retain(|part|part.source.agent_id.is_none());
+        state.source_parts.extend(parts);
+        state.source_revision=self.source_revision;
+        Ok(())
+    }
     pub(crate) fn source_page(&mut self, query: SourceQuery) -> Result<SourcePage, SourceError> {
         if !(4..=PAGE_BYTES).contains(&query.limit) || query.source.source_id.len()>METADATA_LIMIT || query.source.agent_id.as_ref().is_some_and(|id|id.len()>METADATA_LIMIT)
             || (query.offset>0 && (query.until.is_none() || query.expected_epoch.is_none())) || (query.until.is_some() && query.expected_epoch.is_none()) {
@@ -164,6 +198,46 @@ mod tests {
         assert_eq!(before,(store.end,store.first,store.forward,store.paging,store.dirty));
         assert_eq!(store.source_page(query(None,"root")),Err(SourceError::NotFound));
     }
+    #[test]
+    fn explicit_source_parts_preserve_opaque_ids_and_avoid_real_root_collisions() {
+        let mut store=Store::new().unwrap();
+        let text="a".repeat(2*PART_BYTES);
+        let colliding=format!("a:native-part:1:text:{PART_BYTES}-{}:0-0",2*PART_BYTES);
+        store.apply(Event::Item(item("a",&text))).unwrap();
+        store.apply(Event::Item(item(&colliding,"opaque root"))).unwrap();
+        let window=store.window().unwrap();
+        let ids:std::collections::HashSet<_>=window.items.iter().map(|item|&item.id).collect();
+        assert_eq!(ids.len(),window.items.len());
+        let opaque=window.source_parts.iter().find(|part|part.item_id==colliding).unwrap();
+        assert_eq!(opaque.source.source_id,colliding);
+        assert_eq!((opaque.start,opaque.end,opaque.source_len),(0,11,11));
+        let aliases:Vec<_>=window.source_parts.iter().filter(|part|part.source.source_id=="a").collect();
+        assert_eq!(aliases.len(),2);
+        assert!(aliases.iter().all(|part|part.source_len==text.len() && !part.replacement));
+        let escaped=aliases.iter().find(|part|part.start>0).unwrap();
+        assert_ne!(escaped.item_id,colliding);
+        assert!(escaped.item_id.contains(":native-alias:"));
+        assert_eq!(store.source_page(query(None,&opaque.source.source_id)).unwrap().text,"opaque root");
+        assert_eq!(store.window().unwrap().source_parts,window.source_parts);
+    }
+
+    #[test]
+    fn child_placeholder_metadata_names_original_text_without_fake_byte_ranges() {
+        let mut store=Store::new().unwrap();
+        let text="original".repeat(20_000);
+        store.apply(Event::SubagentItem{id:"child".into(),item:item("opaque:native-part:1:text:0-3:0-0",&text)}).unwrap();
+        let mut state=crate::chat::Snapshot::default();
+        state.subagents.push(crate::chat::Subagent{id:"child".into(),items:vec![std::sync::Arc::new(item("opaque:native-part:1:text:0-3:0-0","[placeholder]"))],kind:String::new(),description:String::new(),status:crate::chat::ToolStatus::Running,background:false,model:None,waiting:false,detail:String::new()});
+        store.publish_source_parts(&mut state).unwrap();
+        assert_eq!(state.source_parts.len(),1);
+        let part=&state.source_parts[0];assert!(part.replacement);
+        assert_eq!((part.start,part.end,part.source_len),(0,0,text.len()));
+        assert_eq!(part.source.agent_id.as_deref(),Some("child"));
+        assert_eq!(part.source.source_id,"opaque:native-part:1:text:0-3:0-0");
+        let before=state.source_parts.clone();
+        store.publish_source_parts(&mut state).unwrap();assert_eq!(state.source_parts,before);
+    }
+
     #[test]
     fn append_keeps_frozen_prefix_and_rewrite_invalidates_it() {
         let mut store=Store::new().unwrap();

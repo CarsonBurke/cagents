@@ -952,6 +952,8 @@ pub struct Snapshot {
     /// Original prose mutation boundary, independent of status/presentation updates.
     #[serde(default)]
     pub source_revision: u64,
+    #[serde(default)]
+    pub source_parts: Vec<cache::SourcePart>,
 }
 
 /// When a provider takes a message it is holding.
