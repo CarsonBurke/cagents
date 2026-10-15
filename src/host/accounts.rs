@@ -47,10 +47,22 @@ async fn cancellable_probe<F: std::future::Future>(
     }
 }
 
-type Reports = BTreeMap<
-    (crate::agent::Provider, std::path::PathBuf, u64, u64),
-    VecDeque<(crate::account::LiveReport, u64)>,
->;
+type HomeKey = (crate::agent::Provider, std::path::PathBuf, u64, u64);
+#[derive(Clone, Default)]
+struct HomeReports {
+    events: VecDeque<(crate::account::LiveReport, u64)>,
+    lost_login: bool,
+}
+#[derive(Clone, Default)]
+struct Reports {
+    homes: BTreeMap<HomeKey, HomeReports>,
+    /// Whole-home eviction loses precise attribution. Remember at most the
+    /// three providers so overflow still requires identity verification.
+    lost_login_providers: std::collections::BTreeSet<crate::agent::Provider>,
+}
+impl Reports {
+    fn is_empty(&self) -> bool { self.homes.is_empty() && self.lost_login_providers.is_empty() }
+}
 /// Bounded resident metadata only; provider callbacks never access disk or wait
 /// for probes. Coalescing by account keeps a busy transcript from growing work.
 pub(super) struct Signal {
@@ -62,7 +74,7 @@ impl Signal {
     fn new(stopped: Arc<(Mutex<bool>, Condvar)>) -> Self {
         Self {
             stopped,
-            pending: Mutex::new(BTreeMap::new()),
+            pending: Mutex::new(Reports::default()),
             ready: AtomicBool::new(false),
         }
     }
@@ -81,14 +93,19 @@ impl Signal {
         }
         let mut pending = self.pending.lock().unwrap_or_else(|p| p.into_inner());
         let key = (scope.provider, scope.canonical_home.clone(), scope.device, scope.inode);
-        if pending.len() >= 256 && !pending.contains_key(&key) {
-            pending.pop_first();
+        if pending.homes.len() >= 256 && !pending.homes.contains_key(&key) {
+            if let Some(((provider, ..), dropped)) = pending.homes.pop_first()
+                && (dropped.lost_login || dropped.events.iter().any(|(report, _)| matches!(report, crate::account::LiveReport::CodexLogin(_)))) {
+                pending.lost_login_providers.insert(provider);
+            }
         }
-        let reports = pending.entry(key).or_default();
-        if reports.len() >= 32 {
-            reports.pop_front();
+        let reports = pending.homes.entry(key).or_default();
+        if reports.events.len() >= 32 {
+            if reports.events.pop_front().is_some_and(|(report, _)| matches!(report, crate::account::LiveReport::CodexLogin(_))) {
+                reports.lost_login = true;
+            }
         }
-        reports.push_back((report, observed_at));
+        reports.events.push_back((report, observed_at));
         self.ready.store(true, Ordering::Release);
         self.stopped.1.notify_all();
         drop(stopped);
@@ -130,9 +147,10 @@ fn apply_reports(
         let Ok(canonical) = home.canonicalize() else { continue; };
         let Ok(metadata) = std::fs::metadata(&canonical) else { continue; };
         if !metadata.is_dir() { continue; }
-        let Some(reports) = reports.get(&(account.provider, canonical, metadata.dev(), metadata.ino())) else {
-            continue;
-        };
+        let home_reports = reports.homes.get(&(account.provider, canonical, metadata.dev(), metadata.ino()));
+        let lost_login = reports.lost_login_providers.contains(&account.provider)
+            || home_reports.is_some_and(|reports| reports.lost_login);
+        if home_reports.is_none() && !lost_login { continue; }
         let Some(key) = account.cache_key() else {
             continue;
         };
@@ -144,9 +162,16 @@ fn apply_reports(
                 0,
             ),
         });
+        if lost_login {
+            entry.snapshot = UsageSnapshot::state(UsageStatus::NeedsLogin,
+                "Account updates exceeded the pending queue; verifying the current sign-in", now);
+            let _ = cache.store(&key, entry.clone());
+            changed_logins.push(account);
+            continue;
+        }
         let mut updated = false;
         let mut login_changed = false;
-        for (report, observed_at) in reports {
+        for (report, observed_at) in home_reports.into_iter().flat_map(|reports| &reports.events) {
             if entry.snapshot.observed_at > *observed_at
                 && entry.snapshot.observed_at
                     <= now.saturating_add(crate::account::schedule::CLOCK_SLACK)
@@ -437,7 +462,7 @@ mod tests {
         assert!(signal.ready.load(Ordering::Acquire));
         let pending = signal.drain();
         assert!(
-            pending.contains_key(&(provider, scope.canonical_home.clone(), scope.device, scope.inode)),
+            pending.homes.contains_key(&(provider, scope.canonical_home.clone(), scope.device, scope.inode)),
             "a managed launch must not be reinterpreted as the system home"
         );
         let (entries, exhausted, logins) =
@@ -473,6 +498,55 @@ mod tests {
         assert!(logins.is_empty());
         assert_eq!(entries[&account.cache_key().unwrap()].snapshot.status, UsageStatus::Ok,
             "the old actor's report must not exhaust a replacement home at the same path");
+    }
+
+    #[test]
+    fn bounded_usage_overflow_cannot_discard_a_login_verification_barrier() {
+        use crate::{agent::Provider, account::{LiveReport, Identity, UsageSnapshot, UsageStatus,
+            cache::Entry, registry::{Registered, Registry}, scope::LaunchAccountScope}};
+        for whole_home_eviction in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let homes = Homes::at(root.path().join("accounts"));
+            let (key, home) = homes.create(Provider::Codex, None).unwrap();
+            let account = Account::managed(Provider::Codex, key, home.clone());
+            let mut registry = Registry::default();
+            registry.register(Registered { key, provider: Provider::Codex, linked_home: None,
+                label: None, email: Some("old@fixture.invalid".into()), organization: None, added_at: 0 }, &[]).unwrap();
+            let cache = Cache::at(root.path().join("cache"));
+            let mut snapshot = UsageSnapshot::state(UsageStatus::Ok, "verified old login", 1);
+            snapshot.plan = Some("pro".into());
+            cache.store(&account.cache_key().unwrap(), Entry {
+                identity: Some(Identity { email: Some("old@fixture.invalid".into()), plan: Some("pro".into()), ..Default::default() }), snapshot,
+            }).unwrap();
+            let scope = LaunchAccountScope::resolve(Provider::Codex, root.path(),
+                |name| (name == "CODEX_HOME").then(|| home.as_os_str().to_owned())).unwrap();
+            let signal = Signal::new(Arc::new((Mutex::new(false), Condvar::new())));
+            signal.record(&scope, LiveReport::CodexLogin(crate::account::codex::LoginUpdate {
+                chatgpt: false, plan: None,
+            }), 10);
+            let limits = LiveReport::CodexLimits(crate::account::codex::LimitsUpdate {
+                windows: Vec::new(), credits: None, plan: Some("pro".into()), limited: false,
+            });
+            if whole_home_eviction {
+                for index in 0..257 {
+                    let path = root.path().join(format!("zz-extra-home-{index:03}"));
+                    std::fs::create_dir(&path).unwrap();
+                    let scope = LaunchAccountScope::resolve(Provider::Codex, root.path(),
+                        |name| (name == "CODEX_HOME").then(|| path.as_os_str().to_owned())).unwrap();
+                    signal.record(&scope, limits.clone(), 11 + index);
+                }
+            } else {
+                for index in 0..33 { signal.record(&scope, limits.clone(), 11 + index); }
+            }
+            let pending = signal.drain();
+            assert!(pending.homes.len() <= 256);
+            assert!(pending.homes.values().all(|home| home.events.len() <= 32));
+            let (entries, exhausted, logins) = apply_reports(&registry, Some(&homes), &cache, pending, 1000);
+            assert!(exhausted.is_empty());
+            assert!(logins.contains(&account));
+            assert_eq!(entries[&account.cache_key().unwrap()].snapshot.status, UsageStatus::NeedsLogin,
+                "overflow must require a fresh identity probe before later limits become allowance");
+        }
     }
 
     #[test]
