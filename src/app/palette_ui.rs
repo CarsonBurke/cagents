@@ -943,7 +943,15 @@ mod tests {
         let mut tree = Tree::new(focus_fixture_view(&app).as_widget());
         let open = app.update_palette(Action::Open);
         let _ = app.update_palette(Action::Query("open settings".into()));
-        assert_eq!(app.palette_entries().len(), 1);
+        // File-opening commands share these words. Choose the destination by
+        // its command identity so this remains a pane-focus contract.
+        app.palette.selected = app
+            .palette_entries()
+            .iter()
+            .position(|(_, _, message)| {
+                matches!(message, Message::RunCommand(Command::OpenSettings))
+            })
+            .expect("the settings-pane command is listed");
         let _ = focus_fixture_step(&app, &mut tree, &renderer, open, false);
         let submit = app.update_palette(Action::Submit);
         let destination = app.workspace.focused().unwrap();
