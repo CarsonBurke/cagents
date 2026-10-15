@@ -394,6 +394,8 @@ impl Text {
 
     /// Logical text without constructing styled presentation spans. Shared by
     /// the active transcript's selection/find index and bounded visible rows.
+    #[cfg(test)]
+    pub(super) fn plain_ready(&self) -> bool { self.plain.get().is_some() }
     pub fn plain(&self) -> Arc<str> {
         self.plain.get_or_init(|| {
             #[cfg(test)]
