@@ -227,8 +227,8 @@ impl CreationSession {
         destination.validate()?;
         // Retain the SAME duplicate whose number enters argv. Parent-PID FD
         // paths must not escape into a child that can outlive this service.
-        let directory = Arc::new(destination.root.retained_directory().map_err(filesystem)?);
-        command.arguments[position] = format!("/proc/self/fd/{}/.", directory.as_raw_fd()).into();
+        let (operand, directory) = authority::inherited_directory_scope(&destination.root)?;
+        command.arguments[position] = operand.into_os_string();
         command.inherit_file(directory).map_err(filesystem)
     }
 
@@ -475,7 +475,7 @@ impl OwnedDestination {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
