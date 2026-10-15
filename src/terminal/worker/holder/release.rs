@@ -45,6 +45,8 @@ fn service() -> Result<&'static crossbeam_channel::Sender<Task>, String> {
     }).as_ref().map_err(Clone::clone)
 }
 
+pub(super) fn initialize() -> Result<(),String> {service().map(|_|())}
+
 pub(crate) fn completed(handle: &super::super::TerminalHandle) -> Result<std::sync::mpsc::Receiver<Result<(), String>>, String> {
     if !handle.is_completed() {
         return Err("Terminal is still running; completed cleanup cannot retire it".into());

@@ -768,9 +768,12 @@ impl std::fmt::Debug for TerminalHandle {
 }
 
 impl TerminalHandle {
-    /// Warm fixed join resources before measuring the host's idle baseline.
+    /// Warm fixed retirement resources before the daemon reports readiness.
+    /// The idle baseline includes actual joins, exact-child reaping and holder
+    /// cleanup; adding terminals then contributes only each emulator worker.
     pub(crate) fn initialize_worker_joins() -> Result<(), String> {
-        joins::initialize()
+        joins::initialize()?;
+        holder::initialize_cleanup()
     }
 
     /// Captured from the authenticated original holder before worker startup;
@@ -7434,6 +7437,7 @@ mod tests {
             return;
         }
         crate::terminal::reactor::initialize().unwrap();
+        TerminalHandle::initialize_worker_joins().unwrap();
         let count = || std::fs::read_dir("/proc/self/task").unwrap().count();
         let idle = count();
         let mut handles = Vec::new();
