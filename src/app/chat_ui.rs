@@ -203,6 +203,14 @@ pub enum Action {
     Toggle(Target, String),
     ToggleProviderExit(Target),
     CopyProviderExit(Target),
+    CopyProviderExitRecent(Target),
+    LoadProviderExit(Target),
+    ProviderExitPage(Target, bool),
+    ProviderExitLoaded(
+        Target,
+        provider_exit::Request,
+        Result<chat::client::ProviderExitOutput, String>,
+    ),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
     ToggleTurn(Target, String),
@@ -314,6 +322,7 @@ impl Action {
         matches!(
             self,
             Self::Ready(..)
+                | Self::ProviderExitLoaded(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
                 | Self::Wake(..)
@@ -1540,6 +1549,7 @@ pub(super) struct Runtime {
     attachment_chooser_pending: bool,
     expanded: HashSet<String>,
     provider_exit_expanded: bool,
+    provider_exit_output: provider_exit::State,
     /// Coordination card parts shown in full, as `{item id}#{part}`.
     unfolded: HashSet<String>,
     answers: view::Answers,
@@ -2109,6 +2119,7 @@ impl Runtime {
             attachment_chooser_pending: false,
             expanded: HashSet::new(),
             provider_exit_expanded: false,
+            provider_exit_output: provider_exit::State::default(),
             unfolded: HashSet::new(),
             answers: HashMap::new(),
             pending: None,
@@ -2545,6 +2556,7 @@ impl Runtime {
         {
             self.provider_exit_expanded = false;
         }
+        self.provider_exit_output.reconcile(&snapshot);
         self.snapshot = snapshot;
         images::sync(self);
         self.refresh_find();
@@ -2609,6 +2621,9 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
+        if !visible {
+            self.provider_exit_output.hide();
+        }
         images::sync(self);
         self.present()
     }
@@ -6614,6 +6629,7 @@ impl Cagents {
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
                             self.resume_history_navigation(target),
+                            self.reload_provider_exit(target),
                             fork.map_or_else(Task::none, |session| {
                                 let scope = if let Some(channel) = self
                                     .durable
@@ -7547,21 +7563,18 @@ impl Cagents {
                     self.resume_history_navigation(target),
                 ]);
             }
-            Action::ToggleProviderExit(target) => {
-                if let Some(runtime) = self.chat_runtime_mut(target)
-                    && runtime.snapshot.provider_exit.is_some()
-                {
-                    runtime.provider_exit_expanded = !runtime.provider_exit_expanded;
-                }
+            Action::ToggleProviderExit(target) => return self.toggle_provider_exit(target),
+            Action::CopyProviderExit(target) => return self.load_provider_exit(target, true),
+            Action::CopyProviderExitRecent(target) => {
+                return self.copy_recent_provider_exit(target);
             }
-            Action::CopyProviderExit(target) => {
-                if let Some(diagnostic) = self
-                    .chat_runtime_mut(target)
-                    .and_then(|runtime| runtime.snapshot.provider_exit.as_ref())
-                {
-                    let text = provider_exit::copy_text(diagnostic);
-                    self.status = Some(TransientNotice::success("Copied provider output"));
-                    return iced::clipboard::write(text).map(cosmic::Action::App);
+            Action::LoadProviderExit(target) => return self.load_provider_exit(target, false),
+            Action::ProviderExitLoaded(target, request, result) => {
+                return self.provider_exit_loaded(target, request, result);
+            }
+            Action::ProviderExitPage(target, forward) => {
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.provider_exit_page(forward);
                 }
             }
             Action::Toggle(target, id) => {
@@ -9993,6 +10006,7 @@ mod tests {
                 name: "fixture".into(),
                 input: "{}".into(),
                 output: String::new(),
+                log: None,
                 status: chat::ToolStatus::Running,
             },
             started_at: None,
@@ -11180,6 +11194,7 @@ mod tests {
         let diagnostic = chat::ProviderExitDiagnostic {
             summary: "Provider exited with status 3".into(),
             output: "start\nlast meaningful failure".into(),
+            log: None,
         };
         Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).provider_exit =
             Some(diagnostic.clone());
@@ -11197,13 +11212,16 @@ mod tests {
             (Some("previous-turn".into()), diagnostic.summary.clone()),
             (None, diagnostic.summary.clone()),
         ];
-        assert_eq!(chat_runtime(&app, card).provider_exit_failure_index(), Some(1));
+        assert_eq!(
+            chat_runtime(&app, card).provider_exit_failure_index(),
+            Some(1)
+        );
         drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
         assert!(!chat_runtime(&app, card).provider_exit_expanded);
     }
 
     #[test]
-    fn provider_output_is_absent_until_expanded_and_keeps_the_complete_retained_tail() {
+    fn provider_output_shapes_only_the_selected_page_after_expansion() {
         use iced::advanced::{
             Layout, layout,
             widget::{Operation, Tree},
@@ -11253,10 +11271,27 @@ mod tests {
             Some(chat::ProviderExitDiagnostic {
                 summary: "Provider exited with status 3".into(),
                 output: output.clone(),
+                log: None,
             });
         assert!(!rendered_text(chat_runtime(&app, card)).contains(&output));
         drop(app.handle_chat_ui(Action::ToggleProviderExit(target)));
-        assert!(rendered_text(chat_runtime(&app, card)).contains(&output));
+        let mut restored = String::new();
+        for page in 0..output.len().div_ceil(16 * 1024) {
+            let start = page * 16 * 1024;
+            let end = (start + 16 * 1024).min(output.len());
+            assert!(
+                rendered_text(chat_runtime(&app, card)).contains(&output[start..end].to_owned())
+            );
+            restored.push_str(&output[start..end]);
+            drop(app.handle_chat_ui(Action::ProviderExitPage(target, true)));
+        }
+        assert_eq!(restored, output);
+        // Stale queued Next actions cannot leave an inaccessible page index.
+        for _ in 0..10 {
+            drop(app.handle_chat_ui(Action::ProviderExitPage(target, true)));
+        }
+        drop(app.handle_chat_ui(Action::ProviderExitPage(target, false)));
+        assert!(rendered_text(chat_runtime(&app, card)).contains(&output[..16 * 1024].to_owned()));
     }
 
     #[test]
