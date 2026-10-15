@@ -5518,16 +5518,19 @@ new_thread = "Alt+Shift+G"
         desired.keyboard_shortcuts.search_projects = vec!["Ctrl+Shift+F".into(), "Alt+S".into()];
         save_merged(&path, &loaded, &desired).unwrap();
         let file = saved(&path);
-        let bindings: Vec<ShortcutBinding> = file["keyboard_shortcuts"]
+        let bindings: Vec<(&str, ShortcutBinding)> = file["keyboard_shortcuts"]
             .as_table()
             .unwrap()
             .iter()
             .filter(|(name, _)| name.as_str() != "terminal_passthrough_actions")
-            .flat_map(|(_, chords)| chords.as_array().unwrap())
-            .map(|chord| parse_shortcut(chord.as_str().unwrap()).unwrap())
+            .flat_map(|(name, chords)| chords.as_array().unwrap().iter().map(move |chord| {
+                (name.as_str(), parse_shortcut(chord.as_str().unwrap()).unwrap())
+            }))
             .collect();
-        for (index, binding) in bindings.iter().enumerate() {
-            assert!(!bindings[..index].contains(binding), "{file:#?}");
+        for (index, (action, binding)) in bindings.iter().enumerate() {
+            assert!(!bindings[..index].iter().any(|(previous, other)| {
+                other == binding && shortcut_binding_conflicts(action, previous, *binding)
+            }), "{file:#?}");
         }
         assert_eq!(load(&path).unwrap(), desired);
     }
