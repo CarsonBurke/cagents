@@ -1924,7 +1924,8 @@ impl PendingWrites {
                     };
                     if result.is_ok() {
                         let mut sources=self.chat_rebindings.get(&recovery.card)
-                            .filter(|(_,replacement)|replacement==&recovery.source)
+                            .filter(|(sources, replacement)| replacement == &recovery.source
+                                || (replacement == &recovery.replacement && sources.contains(&recovery.source)))
                             .map(|(sources,_)|sources.clone()).unwrap_or_default();
                         if !sources.contains(&recovery.source) {sources.push(recovery.source);}
                         // Older offers beyond the bounded history are refused
@@ -4383,6 +4384,68 @@ mod tests {
         assert_eq!(saved.kind, CardKind::Chat(replacement));
         assert_eq!(saved.title, "Saved during recovery");
         assert!(writes.is_settled());
+    }
+
+    #[test]
+    fn ordered_upgrade_and_repeated_restart_keep_the_original_queued_snapshot_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("ordered-restart.db");
+        let boot = BootId::new("ordered-restart-boot");
+        let (mut writer, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+        let proof = |name| crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(name),
+            boot_id: boot.clone(),
+            host_incarnation: crate::model::HostIncarnation::new(name),
+        };
+        let source = crate::chat::Session {
+            archive_report: None, id: TerminalId::new(), proof: Some(proof("original")),
+            terminal: None, native_continuity: Default::default(), owned_codex_listener: None,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some("11111111-1111-4111-8111-111111111111".into()),
+                recipe: LaunchRecipe {program:"claude".into(), arguments:Vec::new(),
+                    working_directory:"/project".into(), environment:Default::default(),
+                    unset_environment:Default::default()},
+            },
+        };
+        let mut snapshot = workspace();
+        let card = snapshot.cards[0].id;
+        snapshot.cards[0].kind = CardKind::Chat(source.clone());
+        writer.snapshot(Arc::new(snapshot.clone()));
+        writer.flush(Duration::from_secs(10)).unwrap();
+        let mut resolved = source.clone();
+        resolved.proof = Some(proof("replacement-daemon"));
+        writer.rebind_chat_upgrade(card, source, resolved.clone()).unwrap()
+            .recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        let mut replacement = resolved.clone();
+        let recipe = LaunchRecipe {
+            program:"/matched/cagents".into(),
+            arguments:vec!["agent".into(),"console".into(),crate::model::AgentId::new().to_string()],
+            working_directory:resolved.launch.recipe.working_directory.clone(),
+            environment:Default::default(), unset_environment:Default::default(),
+        };
+        let mut terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(resolved.id, recipe, None).session;
+        let current = resolved.proof.as_ref().unwrap();
+        terminal.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id:current.host_session_id.clone(), boot_id:current.boot_id.clone(),
+            host_incarnation:current.host_incarnation.clone(),
+        };
+        replacement.terminal = Some(terminal);
+        let receipt = crate::chat::RestartReceipt::confirm(resolved, replacement.clone()).unwrap();
+        for _ in 0..2 {
+            writer.rebind_chat_restart(card, receipt.clone()).unwrap()
+                .recv_timeout(Duration::from_secs(10)).unwrap().unwrap();
+        }
+        // This actual ordered writer offer still has the original pre-upgrade
+        // descriptor, and carries a new user edit after the duplicate receipt.
+        snapshot.cards[0].title = "Edited after exact restart replay".into();
+        writer.snapshot(Arc::new(snapshot));
+        writer.flush(Duration::from_secs(10)).unwrap();
+        writer.shutdown();
+        let reopened = StateStore::open(&path, boot).unwrap();
+        let saved = reopened.load_card(card, None).unwrap().unwrap();
+        assert_eq!(saved.kind, CardKind::Chat(replacement));
+        assert_eq!(saved.title, "Edited after exact restart replay");
     }
 
     #[test]
