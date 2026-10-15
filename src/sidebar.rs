@@ -3925,7 +3925,12 @@ fn view_inner<'a>(
                 && !matches!(model.data_state, SidebarDataState::Error(_))
             {
                 cosmic::iced::widget::lazy(
-                    (cache.generation(model, state), compact, modal_open),
+                    (
+                        cache.generation(model, state),
+                        compact,
+                        modal_open,
+                        crate::design::typography_revision(),
+                    ),
                     move |_| project_list(model, state, compact, modal_open),
                 )
                 .into()
@@ -4700,8 +4705,13 @@ fn project_identity_row<'a>(
         .on_press_maybe(
             project_primary_action(
                 project,
-                if review_mode { SidebarFilter::PullRequests } else { SidebarFilter::All },
-            ).and_then(|action| gated(action, modal_open)),
+                if review_mode {
+                    SidebarFilter::PullRequests
+                } else {
+                    SidebarFilter::All
+                },
+            )
+            .and_then(|action| gated(action, modal_open)),
         );
     let tip: Cow<'static, str> = if review_mode && project.github_ready {
         Cow::Owned(format!("Browse pull requests in {}", project.name))
@@ -4725,16 +4735,20 @@ pub(crate) fn project_primary_action(
             repository: project.repository.clone(),
         });
     }
-    Some(if filter == SidebarFilter::PullRequests && project.github_ready {
-        SidebarAction::BrowsePullRequests { project_id: project.id }
-    } else if project.kind == ProjectKind::Folder {
-        SidebarAction::OpenRepository {
-            project_id: project.id,
-            repository: project.repository.clone(),
-        }
-    } else {
-        SidebarAction::ToggleProject(project.id)
-    })
+    Some(
+        if filter == SidebarFilter::PullRequests && project.github_ready {
+            SidebarAction::BrowsePullRequests {
+                project_id: project.id,
+            }
+        } else if project.kind == ProjectKind::Folder {
+            SidebarAction::OpenRepository {
+                project_id: project.id,
+                repository: project.repository.clone(),
+            }
+        } else {
+            SidebarAction::ToggleProject(project.id)
+        },
+    )
 }
 
 /// The project's name, on one line, ellipsized rather than wrapped so a long
@@ -4949,8 +4963,8 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload = project_primary_action(project, state.filter)
-        .and_then(|action| gated(action, modal_open));
+    let reload =
+        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -7284,14 +7298,39 @@ fn files_section<'a>(
             query,
         });
     }
-    let folded = fold(state.files_query().trim());
+    if !modal_open
+        && let Some((path, _, _)) =
+            crate::editor_navigation::parse_location(state.files_query().trim())
+    {
+        let candidate = PathBuf::from(path);
+        let relative = if candidate.is_absolute() {
+            candidate
+                .strip_prefix(&key.canonical_path)
+                .ok()
+                .map(Path::to_path_buf)
+        } else {
+            Some(candidate)
+        };
+        if let Some(path) = relative.and_then(|path| RepoPath::parse(path).ok()) {
+            let key = key.clone();
+            filter = filter.on_submit(move |_| SidebarAction::OpenFile {
+                key: key.clone(),
+                path: path.clone(),
+            });
+        }
+    }
+    let folded = fold(&crate::editor_navigation::file_query(
+        state.files_query().trim(),
+    ));
     // File browsing is always a tree: the flat list exists only for
     // diff/change review. A text filter still flattens to matching files.
     let flat = !folded.is_empty();
     let (visible, hidden, notice): (Vec<&FileRow>, usize, Option<&str>) = match &source.file_search
     {
         FileSearch::Pending { query }
-            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+                == folded.as_ref()
+                && !folded.is_empty() =>
         {
             let (visible, hidden) = file_row_page(
                 &source.files,
@@ -7308,12 +7347,17 @@ fn files_section<'a>(
             query,
             files,
             hidden,
-        } if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() => {
+        } if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+            == folded.as_ref()
+            && !folded.is_empty() =>
+        {
             let notice = files.is_empty().then_some("No files match this filter.");
             (files.iter().collect(), *hidden, notice)
         }
         FileSearch::Failed { query, message }
-            if fold(query.trim()).as_ref() == folded.as_ref() && !folded.is_empty() =>
+            if fold(&crate::editor_navigation::file_query(query.trim())).as_ref()
+                == folded.as_ref()
+                && !folded.is_empty() =>
         {
             (Vec::new(), 0, Some(message.as_str()))
         }
@@ -8437,10 +8481,10 @@ fn changes_footer<'a>(
         crate::ui_controls::field::editor("Commit subject", &state.commit_draft.subject_composer.0)
             .placeholder("Commit subject")
             .id(chrome.commit_input_id.clone())
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .height(Length::Fixed(design::TEXT_BODY * 1.3 + 16.0))
-            .size(design::TEXT_BODY)
+            .height(Length::Fixed(design::interface_size() * 1.3 + 16.0))
+            .size(design::interface_size())
             .padding([space::S, 10.0])
             .style(commit_description_style)
             .key_binding(move |press| {
@@ -8489,13 +8533,13 @@ fn changes_footer<'a>(
             .id(chrome.commit_description_id.clone())
             .height(Length::Fixed(
                 (state.commit_draft.composer.0.line_count().clamp(2, 4) as f32)
-                    * design::TEXT_BODY
+                    * design::interface_size()
                     * 1.3
                     + 16.0,
             ))
-            .font(cosmic::iced::Font::DEFAULT)
+            .font(design::interface_font())
             .style(commit_description_style)
-            .size(design::TEXT_BODY)
+            .size(design::interface_size())
             .padding([space::XS, space::S])
             .key_binding(move |press| {
                 if !matches!(
@@ -9841,13 +9885,15 @@ fn search_label(
     heading: bool,
 ) -> Element<'static, SidebarAction> {
     use cosmic::iced::widget::text::Span;
+    let size = design::scaled_interface_size(size);
+    let line_height = cosmic::iced::widget::text::LineHeight::Absolute((size + 5.0).into());
     let font = cosmic::font::Font {
         weight: if heading {
             cosmic::iced::font::Weight::Medium
         } else {
             cosmic::iced::font::Weight::Normal
         },
-        ..cosmic::font::default()
+        ..design::interface_font()
     };
     let emphasis = cosmic::font::Font {
         weight: cosmic::iced::font::Weight::Bold,
@@ -9857,6 +9903,7 @@ fn search_label(
     if highlights.is_empty() {
         return widget::text::body(label.to_owned())
             .size(size)
+            .line_height(line_height)
             .font(font)
             .class(class)
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -9884,6 +9931,7 @@ fn search_label(
     }
     let label = cosmic::iced::widget::rich_text(spans)
         .size(size)
+        .line_height(line_height)
         .font(font)
         .class(class)
         .wrapping(cosmic::iced::widget::text::Wrapping::None)
@@ -10469,7 +10517,9 @@ mod row_interaction {
             if matches!(self.kind, Kind::Search { enabled: true })
                 && state.focused
                 && let Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key), modifiers, ..
+                    key: keyboard::Key::Named(key),
+                    modifiers,
+                    ..
                 }) = event
                 && modifiers.is_empty()
             {
@@ -11065,6 +11115,48 @@ mod row_interaction {
 #[cfg(test)]
 pub(crate) mod tests {
     #[test]
+    fn settings_interface_typography_reaches_plain_and_highlighted_sidebar_identity_labels() {
+        use super::*;
+        use cosmic::iced::advanced::{layout, widget::Tree};
+        let renderer = headless_renderer();
+        let height = |query| {
+            let mut label = search_label(
+                "Project fixture",
+                query,
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            );
+            let mut tree = Tree::new(label.as_widget());
+            label
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(300.0, 100.0)),
+                )
+                .size()
+                .height
+        };
+        design::configure_typography("", 13.0, "", 14.0);
+        let small = [height(""), height("fixture")];
+        design::configure_typography("", 24.0, "", 14.0);
+        let large = [height(""), height("fixture")];
+        for (small, large) in small.into_iter().zip(large) {
+            assert!(large > small, "sidebar identity must follow interface size");
+            assert!(
+                large <= WORKTREE_ROW_HEIGHT,
+                "largest line box must fit its row"
+            );
+            assert_eq!(
+                large, 29.0,
+                "plain and highlighted labels use the same absolute line box"
+            );
+        }
+        design::configure_typography("", 13.0, "", 14.0);
+    }
+
+    #[test]
     fn required_review_policy_does_not_claim_the_viewer_was_requested() {
         let mut pull_request = crate::pull_request_review::tests::pull_request(51);
         for decision in ["REVIEW_REQUIRED", "CHANGES_REQUESTED"] {
@@ -11258,58 +11350,61 @@ pub(crate) mod tests {
             advanced::{Shell, clipboard, widget::operation},
             keyboard, mouse,
         };
-        for key in [keyboard::key::Named::ArrowDown, keyboard::key::Named::Escape] {
-        for (focused, modal) in [(false, false), (true, false), (true, true)] {
-            let state = SidebarState::default();
-            let renderer = headless_renderer();
-            let mut element = search(&state, modal);
-            let mut tree = Tree::new(&element);
-            let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
-            let node = element.as_widget_mut().layout(
-                &mut tree,
-                &renderer,
-                &layout::Limits::new(Size::ZERO, viewport.size()),
-            );
-            if focused {
-                element.as_widget_mut().operate(
+        for key in [
+            keyboard::key::Named::ArrowDown,
+            keyboard::key::Named::Escape,
+        ] {
+            for (focused, modal) in [(false, false), (true, false), (true, true)] {
+                let state = SidebarState::default();
+                let renderer = headless_renderer();
+                let mut element = search(&state, modal);
+                let mut tree = Tree::new(&element);
+                let viewport = Rectangle::with_size(Size::new(240.0, 48.0));
+                let node = element.as_widget_mut().layout(
                     &mut tree,
-                    Layout::new(&node),
                     &renderer,
-                    &mut operation::focusable::focus::<()>(search_focus_id()),
+                    &layout::Limits::new(Size::ZERO, viewport.size()),
+                );
+                if focused {
+                    element.as_widget_mut().operate(
+                        &mut tree,
+                        Layout::new(&node),
+                        &renderer,
+                        &mut operation::focusable::focus::<()>(search_focus_id()),
+                    );
+                }
+                let mut messages = Vec::new();
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &Event::Keyboard(keyboard::Event::KeyPressed {
+                        key: keyboard::Key::Named(key),
+                        modified_key: keyboard::Key::Named(key),
+                        physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
+                        location: keyboard::Location::Standard,
+                        modifiers: keyboard::Modifiers::empty(),
+                        text: None,
+                        repeat: false,
+                    }),
+                    Layout::new(&node),
+                    mouse::Cursor::Unavailable,
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
+                assert_eq!(
+                    messages,
+                    if focused && !modal {
+                        vec![if key == keyboard::key::Named::Escape {
+                            SidebarAction::ToggleControls
+                        } else {
+                            SidebarAction::FocusFirstSearchResult
+                        }]
+                    } else {
+                        vec![]
+                    }
                 );
             }
-            let mut messages = Vec::new();
-            element.as_widget_mut().update(
-                &mut tree,
-                &Event::Keyboard(keyboard::Event::KeyPressed {
-                    key: keyboard::Key::Named(key),
-                    modified_key: keyboard::Key::Named(key),
-                    physical_key: keyboard::key::Physical::Code(keyboard::key::Code::ArrowDown),
-                    location: keyboard::Location::Standard,
-                    modifiers: keyboard::Modifiers::empty(),
-                    text: None,
-                    repeat: false,
-                }),
-                Layout::new(&node),
-                mouse::Cursor::Unavailable,
-                &renderer,
-                &mut clipboard::Null,
-                &mut Shell::new(&mut messages),
-                &viewport,
-            );
-            assert_eq!(
-                messages,
-                if focused && !modal {
-                    vec![if key == keyboard::key::Named::Escape {
-                        SidebarAction::ToggleControls
-                    } else {
-                        SidebarAction::FocusFirstSearchResult
-                    }]
-                } else {
-                    vec![]
-                }
-            );
-        }
         }
     }
 

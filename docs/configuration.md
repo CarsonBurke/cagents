@@ -43,7 +43,7 @@ palette.
 
 The file uses schema version 3. `schema_version` identifies the format; all
 other missing keys take their defaults. Unknown keys are
-ignored and preserved on save. Values this build cannot read use their default
+ignored and preserved on save. At startup, values this build cannot read use their default
 with a warning and remain in the file until that setting is changed.
 Unsupported schema versions and malformed TOML are
 errors. A file that fails to load is reported when the
@@ -51,11 +51,22 @@ app starts. That session then runs on defaults and does not write the file, so
 your file is not overwritten. To replace a broken file from the app, use
 **Reset all settings**.
 
-Each window reads the file when it opens. A save re-reads the file and writes
-only the fields that window changed since its last save, so several windows can
-share the file and edits you make by hand while the app runs are kept. Running
-windows do not pick up hand edits; windows opened afterwards do. If a hand edit
-leaves the file invalid, saves from running windows fail until it is fixed.
+Use **Open settings.toml** or **Reveal settings.toml** in the command palette
+or **Settings > General**. Opening creates a file with the current values if
+one does not exist, including commented defaults for reference. Missing values
+always use the documented defaults.
+
+Every window watches the settings directory, including atomic file replacements.
+After a short quiet interval, valid hand edits and saves from other windows apply
+without restarting. Invalid TOML or invalid known values leave the last working
+settings active and show a persistent notice with **Open file** and error details.
+Unknown keys remain preserved. A save re-reads the file and merges only the fields
+that window changed, preserving other windows' preferences.
+
+**Reset all settings** and **Reset category** first write a private, timestamped
+`settings.toml.bak-<timestamp>-<suffix>` alongside the file. **Undo reset** restores
+the original bytes, including comments and hand-written tables. Backups remain on
+disk for recovery after closing the window. Conversations and panes are preserved.
 
 ### Example
 
@@ -70,6 +81,10 @@ hibernation_delay_ms = 30000
 focus_follows_mouse = false
 app_theme = "system"
 ui_scale = 1.0
+interface_font_family = ""
+interface_font_size = 13.0
+chat_font_family = ""
+chat_font_size = 14.0
 terminal_line_height = 1.286
 terminal_scroll_speed = 1.0
 terminal_padding = 8.0
@@ -88,6 +103,8 @@ pull_request_open_target = "review"
 managed_worktree_directory = "worktrees/"
 worktree_sort = "newest"
 editor_auto_save = true
+editor_auto_close = true
+editor_tab_width = 4
 editor_wrap_lines = false
 editor_syntax_theme = "auto"
 confirm_terminal_close = true
@@ -95,7 +112,7 @@ chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
 check_for_updates = true
-shortcut_defaults_revision = 4
+shortcut_defaults_revision = 5
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -106,7 +123,8 @@ chat_permissions = ["Ctrl+Shift+O"]
 new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
 close_focused_column = ["Ctrl+W"]
-search_projects = ["Ctrl+F"]
+search_projects = ["Ctrl+Shift+F"]
+find_in_pane = ["Ctrl+F"]
 previous_column = ["Ctrl+PageUp"]
 next_column = ["Ctrl+PageDown"]
 cycle_pane_width = ["Alt+R"]
@@ -144,6 +162,10 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `focus_follows_mouse` | boolean | `false` | Activates a pane after the pointer crosses into it and stays for 300 ms. Typing cancels the pending activation |
 | `app_theme` | string | `"system"` | `"system"`, `"dark"`, `"light"`, `"catppuccin_mocha"`, `"catppuccin_latte"`, `"dracula"`, `"nord"`, `"tokyo_night"`, `"gruvbox_dark"`, or `"solarized_light"`. Colors the application; terminal and syntax colors are set separately |
 | `ui_scale` | float | `1.0` | `0.8` through `1.5`. Multiplies display scaling |
+| `interface_font_family` | string | `""` | Empty follows the desktop interface family; otherwise a family name up to 128 bytes. Settings lists installed families and warns when a saved family is unavailable |
+| `interface_font_size` | float | `13.0` | `10.0` through `24.0` logical pixels for workbench labels and controls |
+| `chat_font_family` | string | `""` | Empty follows the interface family; otherwise a family name up to 128 bytes. Applies to transcript prose and Markdown; code stays monospace |
+| `chat_font_size` | float | `14.0` | `8.0` through `40.0` logical pixels. Applies to existing transcript messages and the composer |
 | `terminal_line_height` | float | `1.286` | `1.0` through `2.0`, relative to the font size |
 | `terminal_scroll_speed` | float | `1.0` | `0.25` through `4.0`. Multiplies wheel and trackpad scrolling. Mouse wheel events sent to applications that track the mouse are not scaled |
 | `terminal_padding` | float | `8.0` | `0.0` through `24.0` logical pixels |
@@ -166,6 +188,8 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `managed_worktree_directory` | string | `"worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
+| `editor_auto_close` | boolean | `true` | Pairs brackets and quotes, wraps selected text, and types over an existing closer. Turn it off to insert characters literally |
+| `editor_tab_width` | integer | `4` | `1` through `16` columns. Changes native tab stops without rewriting tabs. Also supplies the space indentation fallback when neither file content nor `.editorconfig` sets it |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
 | `editor_syntax_theme` | string | `"auto"` | Syntax colors for editors and diffs: `"auto"` (follows the app theme), `"solarized_dark"`, `"mocha"`, `"ocean"`, `"eighties"`, or `"inspired_github"` (`"inspired_git_hub"`, written by earlier versions, is also read) |
 | `confirm_terminal_close` | boolean | `true` | Asks before closing a terminal that has a foreground program or background jobs. An idle shell closes without asking |
@@ -173,8 +197,10 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
+| `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
+| `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `4` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `shortcut_defaults_revision` | integer | `5` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -182,6 +208,18 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `notifications.waiting` | boolean | `true` | Alerts when a supported provider needs attention |
 | `notifications.while_focused` | boolean | `false` | Also alerts for the focused pane in a focused window |
 | `notifications.review_requests` | boolean | `true` | Alerts for incoming GitHub review requests |
+| `custom_terminal_theme` | table | unset | Custom terminal color palette, selectable live as Custom. |
+| `auto_delete_merged_worktrees` | boolean | `false` | Clean up clean, inactive merged worktrees automatically; never discard changes or stop running work. |
+| `default_worktree_pane` | string | `"native_chat"` | `"native_chat"` or `"terminal"`; the first pane in an empty worktree. |
+| `default_channel_pane` | string | `"native_chat"` | `"native_chat"` or `"terminal"`; the first pane in an empty channel. |
+| `diff_hide_unchanged` | boolean | `true` | Hide unchanged lines in diff views. |
+| `chat_expand_tool_groups` | boolean | `false` | Start chat tool groups expanded. |
+| `chat_content_fraction` | float | `0.5` | Legacy preference retained for compatibility; chat uses an automatic centered reading column. |
+| `default_native_pane_fraction` | float | `0.5` | Initial width fraction of native chat and utility panes. |
+| `usage_preview_rows` | table | `{}` | Provider keys map to usage rows; an empty list hides that provider’s preview rows. |
+| `show_worktree_changes_icons` | boolean | `true` | Show dirty-worktree badges in Projects. |
+| `keyboard_shortcuts` | table | built-in chords | Action keys map to chord arrays. See Keyboard shortcuts. |
+| `notifications` | table | enabled | Notification event preferences. See the example above. |
 
 ## Keyboard shortcuts
 
@@ -202,9 +240,9 @@ modifiers, joined by `+`. Names are case-insensitive.
   with a letter or arrow, can be bound but then no longer reach a terminal.
   The defaults bind **Ctrl+W** to close the focused pane, **Alt+R** to cycle
   pane width, and **Ctrl+T** to create a native thread tab.
-- The `search_projects` chords reach terminal programs, except **Ctrl+F**,
-  which opens terminal scrollback find. The same key finds in the focused
-  editor or chat transcript, and otherwise searches projects.
+- `search_projects` defaults to **Ctrl+Shift+F**. `find_in_pane` defaults to
+  **Ctrl+F**, opening find in the focused terminal, editor, or chat transcript.
+  In a pane without find, Ctrl+F searches projects.
   File and hunk navigation also works in local diff panes. Viewed-file commands
   act only in a pull request pane. The chords reach terminals outside that scope.
 - `chat_account`, `chat_model`, and `chat_permissions` apply only to the
@@ -231,7 +269,7 @@ There are 25 dark and light terminal presets. The values are `"dark"`,
 To make your own palette:
 
 1. Add a `[custom_terminal_theme]` table after the top-level keys.
-2. Restart the app.
+2. Save the file. Every open window reloads the palette automatically.
 3. Choose **Custom** in the terminal color theme dropdown.
 
 cagents keeps this table when you switch to a preset. On load, this table
@@ -261,7 +299,41 @@ ansi = [
 ]
 ```
 
+The settings pane presents width fractions as percentages and hibernation delays
+in seconds. The file keeps the documented fractional widths and millisecond
+duration so existing configuration continues to round-trip unchanged. Font
+selectors accept a typed family as well as an installed choice. An unavailable
+family remains saved, with a visible fallback warning.
+
+## Editor navigation
+
+Ctrl+G accepts a one-based line or `line:column`. The Ln/Col indicator opens the
+same field and shows the selected character count. File filtering also accepts
+compiler locations such as `src/main.rs:120:8`.
+
+Alt+Left and Alt+Right, or the mouse back and forward buttons over the focused
+editor, revisit explicit jumps such as definitions, search results and go-to-line.
+Switching between saved files retains undo history for up to eight files and
+32 MiB of edit data per card. Reopening a file whose disk content changed drops
+its retained history. Unsaved edits still require saving or discarding before
+switching files.
+
+Tab and Shift+Tab indent or outdent multiline selections as one undo step. Enter keeps
+leading whitespace and adds a level after an opening bracket. The editor detects
+the file's indentation and applies matching `.editorconfig` settings from within
+the repository; the tab-width preference supplies the fallback.
 ## Language servers
+
+Language servers are shared by workspace root. Rust selects the outermost Cargo
+workspace (or nearest Cargo package); JavaScript and TypeScript recognize npm
+workspaces, `pnpm-workspace.yaml`, and TypeScript project references. Discovery
+runs off the UI thread. The inspector lists live servers and their cached process
+RSS, refreshed in the background; RSS describes the server process, excluding its
+children. Closing the last document arms the idle timeout. Worktree removal
+retires its servers immediately; removals outside the app are detected within
+five seconds. When all slots have active documents, opening a new server reports
+the limit instead of evicting a server in use. Set the two scalar options before
+any TOML table headers.
 
 `language_servers` lists external Language Server Protocol (LSP) servers for
 the native editor. If the key is missing, cagents uses this built-in list. If
@@ -343,6 +415,8 @@ them back as version 3 the next time it saves.
   | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
   | `cycle_pane_width` | `Ctrl+Shift+R` (revisions 2–3) | `Alt+R` |
   | `new_native_thread` | `Ctrl+Shift+N` | `Ctrl+T`, `Ctrl+Shift+N` |
+  | `search_projects` | `Ctrl+F` (revisions 1–4) | `Ctrl+Shift+F` |
+  | `find_in_pane` | absent before revision 5 | `Ctrl+F` |
 
   An action the table leaves out counts as on its old default. A version-2
   file that spells `previous_column` as `"Alt+Q"` or `next_column` as
@@ -350,7 +424,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 4`, after which an old default you choose
+  `shortcut_defaults_revision = 5`, after which an old default you choose
   again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
@@ -403,3 +477,62 @@ that is an absolute path to an executable file:
 This lookup applies only when cagents creates a new default terminal.
 Explicit CLI commands and launch recipes restored from saved sessions run
 unchanged.
+
+### Language-server editor options
+
+Each `[[language_servers]]` entry accepts `format_on_save` (default `false`),
+`formatting_timeout_ms` (default `1000`, range `50..=10000`),
+`initialization_options`, and `configuration`. Initialization options are sent
+unchanged in `initialize`; configuration is sent after initialization and used
+for `workspace/configuration` section requests. Dotted sections such as
+`rust-analyzer.check` select nested configuration objects. Each JSON value is
+limited to 1 MiB. For example, these fields belong to the rust-analyzer server:
+
+```toml
+format_on_save = true
+formatting_timeout_ms = 1000
+initialization_options = { check = { command = "clippy" } }
+configuration = { rust-analyzer = { check = { command = "clippy" } } }
+```
+
+Formatting timeouts report a terminal request failure and cancel the server
+request, allowing the application to continue saving. Workspace-edit file
+creation, file deletion, and file renaming are rejected before applying any
+text edits; ordinary multi-file text edits retain server versions and preview
+annotations for the application to validate and confirm.
+
+### Language-server editor commands
+
+With the text editor focused, `F2` prepares a symbol rename and opens an inline
+name field. Submit the field to inspect the proposed changes in a per-file diff
+preview, then apply or cancel. `Ctrl+.` requests code actions at the caret or
+selection. Disabled actions retain the server's explanation. The command palette
+also exposes Rename symbol, Format document, Format selection, Code actions, and
+Show signature help when the current server supports them. Signature help follows
+the server's trigger characters, emphasizes the active parameter, and closes on
+`)` or Escape.
+
+Rename and multi-file text edits require preview confirmation. Each participating
+open buffer retains one independent Undo step and remains unsaved. Unopened files
+use atomic, conflict-aware writes; if a later file refuses its write, earlier
+writes are restored only while their written contents still match. A concurrent
+outside edit is preserved and reported. Changed buffers, changed tab identities,
+overlapping ranges, unsupported file operations, and paths outside the worktree
+refuse the operation before application. Previews support up to 512 files and a
+64 MiB combined before/after text budget; ordinary editable-file limits still
+apply. Server confirmation labels and descriptions appear above the comparison.
+
+With `format_on_save = true`, explicit saves and autosaves request formatting
+first. A timeout or refusal reports the failure and continues the ordinary safe
+save; formatting never bypasses disk conflict checks. Formatting edits also
+retain Undo.
+
+Definitions outside the project open a highlighted, read-only source tab. Such
+tabs retain their original project's language-server workspace, so definition
+navigation continues to work inside dependency sources. Their source path and
+caret restore locally with the window; they do not become shared workspace
+recipes. Typing, clipboard cuts/pastes, formatting, refactoring, history replay,
+and saving cannot modify these dependency sources.
+
+Server errors remain dismissible notices. Informational server messages expire
+automatically, and server log messages go to the diagnostic log.

@@ -543,7 +543,8 @@ impl Cagents {
         if let Some(error) = dialog.error.as_ref().filter(|error| error.field.is_none()) {
             rows.push(
                 widget::selectable_text(error.message.as_str())
-                    .size(design::TEXT_BODY)
+                    .font(design::interface_font())
+                    .size(design::interface_size())
                     .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                     .width(Length::Fill)
                     .class(cosmic::theme::Text::Custom(design::warning_text))
@@ -605,7 +606,10 @@ fn field<'a>(
 
 fn error_note(message: &str) -> Element<'_, Message> {
     widget::text::caption(message)
-        .size(design::TEXT_CAPTION)
+        .size(design::scaled_interface_size(design::TEXT_CAPTION))
+        .line_height(iced::widget::text::LineHeight::Absolute(
+            design::scaled_interface_size(17.0).into(),
+        ))
         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
         .class(cosmic::theme::Text::Custom(design::warning_text))
         .into()
