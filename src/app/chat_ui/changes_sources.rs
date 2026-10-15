@@ -92,6 +92,8 @@ pub(super) struct State {
     raw:Option<Arc<Snapshot>>,
     projected:Option<Arc<Snapshot>>,
     selected:Option<String>,
+    session:Option<String>,
+    incarnation:Option<uuid::Uuid>,
     revision:u64,
     context:u64,
 }
@@ -108,6 +110,8 @@ struct Entry {
     wanted_pages:HashSet<usize>,
     manual_pages:HashSet<usize>,
     opened:HashSet<usize>,
+    suspended:HashSet<usize>,
+    suspended_paths:HashMap<usize,bool>,
     patches:HashMap<usize,LoadedPatch>,
     restored:HashMap<usize,(Arc<str>,chat::source_owners::ResidentPatch)>,
     patch_requests:HashMap<usize,u64>,
@@ -131,6 +135,13 @@ pub(super) struct LoadedPatch {
     pub view:tool_text::ToolText,
     pub prefixes:Arc<Vec<[u8;32]>>,
 }
+impl Drop for LoadedPatch {
+    fn drop(&mut self) {
+        // The canonical view owns UI-only Rc handles. Keep its pure body/index
+        // alive through field destruction, then release them off the event thread.
+        retire_copy((self.text.clone(),self.record.clone(),self.prefixes.clone()));
+    }
+}
 /// Action clones share a single completion owner; a stale result is taken and
 /// released once, including its reader permit and allocated-capacity guard.
 #[derive(Clone)]
@@ -140,7 +151,7 @@ fn attempt()->u64 {NEXT.fetch_add(1,Ordering::Relaxed)}
 impl Entry {
     fn new(part:chat::cache::changes::Part)->Self {
         Self {revision:attempt(),render_revision:0,copy_all:false,copy_intent:None,copy_error:None,part,pages:Default::default(),requested:Default::default(),page_errors:Default::default(),
-            wanted_pages:Default::default(),manual_pages:Default::default(),opened:Default::default(),patches:Default::default(),restored:Default::default(),
+            wanted_pages:Default::default(),manual_pages:Default::default(),opened:Default::default(),suspended:Default::default(),suspended_paths:Default::default(),patches:Default::default(),restored:Default::default(),
             patch_requests:Default::default(),patch_errors:Default::default()}
     }
     fn file(&self,index:usize)->Option<(&Arc<Manifest>,&File)> {
@@ -186,8 +197,46 @@ impl Entry {
 }
 impl State {
     pub(super) fn clear(&mut self) {
-        self.entries.clear();self.aliases.clear();self.raw=None;self.projected=None;
+        self.evict(false);self.entries.clear();self.aliases.clear();self.selected=None;self.session=None;self.incarnation=None;
         self.revision=self.revision.wrapping_add(1);self.context=self.context.wrapping_add(1);
+    }
+    /// Keep only exact-source file/page disclosure intent on ordinary hide.
+    /// Manifests, bodies, requests and copy demand are released; source reset,
+    /// Ready and account revocation still clear the intent entirely.
+    pub(super) fn evict(&mut self,find:bool) {
+        for entry in self.entries.values_mut() {
+            for (offset,page) in &entry.pages {
+                for file in &page.files {
+                    entry.suspended_paths.insert(file.file_index,matches!(file.kind,chat::ChangeKind::Renamed {..}));
+                    if entry.opened.contains(&file.file_index) {entry.manual_pages.insert(*offset);}
+                }
+            }
+            for index in entry.patches.keys() {
+                if entry.opened.contains(index) || find {entry.suspended.insert(*index);}
+            }
+            entry.patches.clear();retire_copy(std::mem::take(&mut entry.restored));
+            retire_copy(std::mem::take(&mut entry.pages));
+            entry.requested.clear();entry.patch_requests.clear();entry.wanted_pages.clear();
+            entry.copy_all=false;entry.copy_intent=None;entry.copy_error=None;
+            entry.revision=attempt();
+        }
+        if let Some(raw)=self.raw.take() {retire_copy(raw);}
+        if let Some(projected)=self.projected.take() {retire_copy(projected);}
+        self.context=self.context.wrapping_add(1);self.revision=self.revision.wrapping_add(1);
+    }
+    /// Previously rendered leaf identities only; no synthetic selection bytes.
+    pub(super) fn pending_paths(&self,item:&str)->Vec<Vec<u32>> {
+        let Some(entry)=self.aliases.get(item).and_then(|key|self.entries.get(key)) else {return Vec::new();};
+        let mut paths=Vec::new();
+        for (index,renamed) in &entry.suspended_paths {
+            if entry.file(*index).is_none() && let Ok(index)=u32::try_from(*index) {
+                paths.push(vec![7,index,0]);if *renamed {paths.push(vec![7,index,1]);}
+            }
+        }
+        for index in &entry.suspended {
+            if entry.current(*index).is_none() && let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}
+        }
+        paths.sort();paths
     }
     pub(super) fn reconcile_demand(&mut self,expanded:&HashSet<String>,find:bool) {
         let mut changed=false;
@@ -262,9 +311,10 @@ impl State {
         self.revision=self.revision.wrapping_add(1);Ok(())
     }
     pub(super) fn project(&mut self,raw:Arc<Snapshot>,selected:Option<&str>,expanded:&HashSet<String>,find:bool)->Arc<Snapshot> {
-        if self.raw.as_ref().is_some_and(|old|old.session_id!=raw.session_id || old.source_incarnation!=raw.source_incarnation) || self.selected.as_deref()!=selected {
+        if self.session!=raw.session_id || self.incarnation!=raw.source_incarnation || self.selected.as_deref()!=selected {
             self.clear();self.selected=selected.map(str::to_owned);
         }
+        self.session=raw.session_id.clone();self.incarnation=raw.source_incarnation;
         let active=match selected {Some(id)=>raw.subagents.iter().find(|agent|agent.id==id).map(|agent|&agent.items),None=>Some(&raw.items)};
         let parts:HashMap<_,_>=raw.changes_parts.iter().filter(|part|part.source.agent_id.as_deref()==selected
             && raw.source_incarnation.is_none_or(|incarnation|part.epoch.incarnation==incarnation))
@@ -322,7 +372,7 @@ impl State {
     pub(super) fn toggle_file(&mut self,item:&str,index:usize,find:bool) {
         let Some(key)=self.aliases.get(item) else {return;};let Some(entry)=self.entries.get_mut(key) else {return;};
         if !entry.opened.remove(&index) {entry.opened.insert(index);} else if !find {
-            entry.patches.remove(&index);entry.restored.remove(&index);entry.patch_requests.remove(&index);entry.patch_errors.remove(&index);
+            entry.suspended.remove(&index);entry.patches.remove(&index);entry.restored.remove(&index);entry.patch_requests.remove(&index);entry.patch_errors.remove(&index);
         }
         entry.demand(true,find);entry.revision=attempt();self.revision=self.revision.wrapping_add(1);
     }

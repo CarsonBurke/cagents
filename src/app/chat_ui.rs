@@ -2698,7 +2698,7 @@ impl Runtime {
     }
     pub(super) fn set_visible(&mut self, visible: bool) -> Result<(), String> {
         self.visible.store(visible, Ordering::Relaxed);
-        if !visible {self.logical_changes.clear();self.changes_find.clear();self.set_find_external(HashMap::new(),false);hydration::release(self);}
+        if !visible {self.logical_changes.evict(self.find.as_ref().is_some_and(|query|!query.is_empty()));self.changes_find.clear();self.set_find_external(HashMap::new(),false);hydration::release(self);}
         images::sync(self);
         self.present()
     }
