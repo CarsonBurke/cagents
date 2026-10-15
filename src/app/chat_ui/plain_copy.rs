@@ -16,11 +16,13 @@ struct Proof {
     session: Option<String>,
     selected: Option<String>,
     account_epoch: u64,
+    source_incarnation: Option<uuid::Uuid>,
     intent: Intent,
 }
 impl Proof {
     fn current(&self, runtime: &Runtime, account_epoch: u64) -> bool {
         self.intent.current() && self.account_epoch == account_epoch
+            && self.source_incarnation == runtime.snapshot.source_incarnation
             && self.session == runtime.snapshot.session_id
             && self.selected == runtime.selected_subagent
             && (match (&self.actor, runtime.handle()) {
@@ -103,7 +105,7 @@ pub(super) fn begin(runtime: &mut Runtime, item: &str, account_epoch: u64, inten
     runtime.recovery.plain_copy.clear();
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     let proof = Proof { source: Arc::downgrade(&source), actor: runtime.handle().map(Arc::downgrade),
-        session: runtime.snapshot.session_id.clone(), selected: runtime.selected_subagent.clone(), account_epoch, intent:intent.clone() };
+        session: runtime.snapshot.session_id.clone(), selected: runtime.selected_subagent.clone(), account_epoch, source_incarnation:runtime.snapshot.source_incarnation, intent:intent.clone() };
     let cancelled = Arc::new(AtomicBool::new(false));
     let input = Arc::new(InputSlot {source:Mutex::new(Some(source)),cancelled:cancelled.clone()});
     intent.register(&input);
@@ -177,7 +179,7 @@ mod tests {
     }
     #[tokio::test]
     async fn actual_selected_message_copy_uses_worker_and_rejects_stale_contexts() {
-        for change in 0..7 {
+        for change in 0..8 {
             let mut app=crate::app::tests::context_inspector_test_app(false);
             let mut runtime=runtime();let target=runtime.target;
             let parent=item(chat::Role::Assistant,"**PARENT**");
@@ -202,6 +204,7 @@ mod tests {
                 4=>{app.invalidate_originals_for_account(&Account::system(Provider::Claude).id());}
                 5=>{let runtime=app.chat_runtime_mut(target).unwrap();runtime.visible.store(false,Ordering::Relaxed);runtime.recovery.plain_copy.clear();}
                 6=>{let runtime=app.chat_runtime_mut(target).unwrap();let handle=Arc::new(ClientHandle::fixture(runtime.session.clone(),(*runtime.snapshot).clone()));runtime.connection=Connection::Live(handle);}
+                7=>{Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).source_incarnation=Some(uuid::Uuid::new_v4());}
                 _=>{Arc::make_mut(&mut app.chat_runtime_mut(target).unwrap().snapshot).generation+=1;}
             }
             drop(app.handle_chat_ui(Action::PlainCopyReady(target,id,reply)));

@@ -885,6 +885,9 @@ impl PromptSuggestion {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    /// Exact source cache lifetime, including Reset followed by the same session.
+    #[serde(default)]
+    pub source_incarnation: Option<uuid::Uuid>,
     /// Daemon wall-clock milliseconds sampled for this publication. Clients
     /// advance this with their monotonic clock instead of comparing timestamps
     /// from two machines. Absent only in older data and synthetic snapshots.

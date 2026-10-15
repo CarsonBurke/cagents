@@ -12,6 +12,7 @@ struct Context {
     session: String,
     turn: u64,
     original_revision: u64,
+    source_incarnation: Option<uuid::Uuid>,
     latest_visible_user: Option<String>,
 }
 impl Context {
@@ -22,6 +23,7 @@ impl Context {
             session: runtime.snapshot.session_id.clone()?,
             turn: runtime.snapshot.turn_generation,
             original_revision:runtime.snapshot.original_revision,
+            source_incarnation:runtime.snapshot.source_incarnation,
             latest_visible_user: turn_actions::latest_user(&runtime.snapshot).map(|item|item.id.clone()),
         })
     }
@@ -350,6 +352,22 @@ mod tests {
         }
         Arc::make_mut(&mut runtime.snapshot).original_retry_pending=false;
         runtime.sync_original();assert!(runtime.recovery.originals.query.is_some());
+    }
+
+    #[test]
+    fn same_session_source_reset_rejects_old_original_reply_and_preserves_typed_draft() {
+        let mut app=crate::app::tests::context_inspector_test_app(false);let mut runtime=runtime();let target=runtime.target;
+        Arc::make_mut(&mut runtime.snapshot).source_incarnation=Some(uuid::Uuid::from_u128(1));
+        runtime.replace_draft(text_editor::Content::with_text("typed independent intent"));
+        runtime.sync_original();let context=Context::current(&runtime).unwrap();let id=runtime.recovery.originals.query_id_for_test();
+        let old=page(&context,"old-user","old accepted input");
+        let mut next=(*runtime.snapshot).clone();next.generation+=1;next.source_incarnation=Some(uuid::Uuid::from_u128(2));
+        runtime.handle().unwrap().publish_snapshot_for_test(next);runtime.refresh();
+        app.cards.insert(target.card,CardRuntime::Chat(Box::new(runtime)));
+        drop(app.original_ready(target,id,None,0,Reply::fixture(Ok(Value::Metadata(old)))));
+        let runtime=app.chat_runtime_mut(target).unwrap();
+        assert!(runtime.recovery.originals.metadata.is_none());assert!(runtime.original_retry_user().is_none());
+        assert_eq!(runtime.composer.text(),"typed independent intent");
     }
 
     #[test]

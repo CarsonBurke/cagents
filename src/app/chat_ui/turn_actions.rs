@@ -49,6 +49,7 @@ impl Settings {
 #[derive(Default)]
 pub(super) struct State {
     pub submitted: Option<Prompt>,
+    source_incarnation: Option<uuid::Uuid>,
     pub originals: originals::State,
     pub plain_copy: plain_copy::State,
     pub attachment_labels: HashMap<PathBuf,PathBuf>,
@@ -92,6 +93,16 @@ impl State {
     }
 
     pub fn observe(&mut self, snapshot: &Snapshot) {
+        // A known source lifetime changing inside one connection proves that
+        // old read/replay eligibility ended, even if Session was coalesced.
+        // First attachment (None→Some) alone is not evidence of a reset.
+        if self.source_incarnation.is_some() && self.source_incarnation!=snapshot.source_incarnation {
+            self.originals.clear();self.plain_copy.clear();self.submitted=None;
+            self.commands.clear();self.inflight=None;self.replay_settings=None;self.retried=None;self.notice=None;
+            if self.branch_draft.as_ref().is_some_and(|prompt|prompt.origin_backend) {self.branch_draft=None;}
+            if self.prepared_prompt.as_ref().is_some_and(|prompt|prompt.origin_backend) {self.prepared_prompt=None;}
+        }
+        self.source_incarnation=snapshot.source_incarnation;
         self.last_user=None;self.last_assistant=None;self.assistant_user=None;self.recoverable_users.clear();
         let mut prompt=None;
         for item in &snapshot.items {
@@ -488,6 +499,21 @@ pub(super) fn plain_text(source: &str) -> String {
 #[cfg(test)]
 mod presentation_tests {
     use super::*;
+    #[test]
+    fn source_reset_retires_history_eligibility_but_first_attachment_preserves_new_branch_intent() {
+        let mut state=State::default();let mut snapshot=Snapshot::default();
+        state.submitting(&snapshot,&Command::Prompt {text:"captured original".into(),attachments:vec![],mode:PromptMode::Send});
+        snapshot.source_incarnation=Some(uuid::Uuid::from_u128(1));state.observe(&snapshot);
+        assert!(state.submitted.is_some(),"first observed source identity alone is not a reset");
+        let mut origin=state.submitted.clone().unwrap();origin.origin_backend=true;
+        state.prepared_prompt=Some(Arc::new(origin.clone()));state.branch_draft=Some(origin.clone());
+        snapshot.source_incarnation=Some(uuid::Uuid::from_u128(2));state.observe(&snapshot);
+        assert!(state.submitted.is_none() && state.prepared_prompt.is_none() && state.branch_draft.is_none());
+        state.prepared_prompt=Some(Arc::new(origin));state.connection_replaced();
+        snapshot.source_incarnation=Some(uuid::Uuid::from_u128(3));state.observe(&snapshot);
+        assert!(state.prepared_prompt.is_some(),"an explicitly prepared branch is new intent across its new actor's first attachment");
+    }
+
     #[test]
     fn plain_copy_preserves_content_and_code_without_markdown_styling() {
         let copied=plain_text("# Title\n\n**Bold** and [label](https://example.com)\n\n```rust\nlet x = 1;\n```\n\n- one\n- two");
