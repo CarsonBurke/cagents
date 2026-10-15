@@ -949,7 +949,7 @@ enum StagedClass {
     Status(LspDocumentId),
     Progress(LspDocumentId),
     Resources(LspDocumentId),
-    ServerMessage(LspDocumentId),
+    ServerMessage(LspDocumentId, LspMessageLevel),
 }
 
 #[derive(Debug, Default)]
@@ -981,7 +981,7 @@ impl PendingInner {
             LspEvent::Status { doc, .. } => StagedClass::Status(*doc),
             LspEvent::Progress { doc, .. } => StagedClass::Progress(*doc),
             LspEvent::Resources { doc } => StagedClass::Resources(*doc),
-            LspEvent::ServerMessage { doc,.. } => StagedClass::ServerMessage(*doc),
+            LspEvent::ServerMessage { doc,level,.. } => StagedClass::ServerMessage(*doc,*level),
             _ => {
                 // Terminal: dropping one would leave the application waiting
                 // for an answer that never comes, so the oldest is only
@@ -1022,7 +1022,10 @@ impl PendingInner {
             StagedClass::Status(doc),
             StagedClass::Progress(doc),
             StagedClass::Resources(doc),
-            StagedClass::ServerMessage(doc),
+            StagedClass::ServerMessage(doc,LspMessageLevel::Error),
+            StagedClass::ServerMessage(doc,LspMessageLevel::Warning),
+            StagedClass::ServerMessage(doc,LspMessageLevel::Info),
+            StagedClass::ServerMessage(doc,LspMessageLevel::Log),
         ] {
             self.replaceable.remove(&class);
         }
@@ -1031,7 +1034,7 @@ impl PendingInner {
             | StagedClass::Status(at)
             | StagedClass::Progress(at)
             | StagedClass::Resources(at)
-            | StagedClass::ServerMessage(at) => *at != doc,
+            | StagedClass::ServerMessage(at,_) => *at != doc,
         });
         self.diagnostic_versions.remove(&doc);
         self.terminal.retain(|event| event_doc(event) != Some(doc));

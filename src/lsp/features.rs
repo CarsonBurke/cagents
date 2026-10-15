@@ -87,7 +87,7 @@ pub struct LspParameter {
     pub documentation: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LspMessageLevel { Error, Warning, Info, Log }
 
 #[derive(Debug, Clone, Default)]
