@@ -1027,7 +1027,9 @@ impl Cagents {
                 };
                 dialog.loading = false;
                 match result {
-                    Ok(directories) => dialog.directories = directories.join(", "),
+                    Ok(directories) => {
+                        dialog.directories = format_disposable_directories(&directories)
+                    }
                     Err(error) => {
                         dialog.error =
                             Some(format!("Could not read project cleanup policy: {error}"))
@@ -1983,7 +1985,7 @@ impl Cagents {
                 ),
                 input.into(),
                 super::notice_detail(
-                    "Use exact directory names, not paths or patterns. Leave empty to preserve all ignored files. This policy is stored in this clone's local Git configuration and shared by its worktrees.",
+                    "Use exact directory names, not paths or patterns. Quote names containing commas or surrounding spaces. Leave empty to preserve all ignored files. This policy is stored in this clone's local Git configuration and shared by its worktrees.",
                 ),
             ];
             if let Some(error) = &dialog.error {
@@ -2690,27 +2692,79 @@ fn safety_read_task(target: Target, request: u64, confirming: bool) -> Task<Mess
     })
 }
 
+fn format_disposable_directories(names: &[String]) -> String {
+    names
+        .iter()
+        .map(|name| {
+            if name.contains([',', '"']) || name.trim() != name {
+                format!("\"{}\"", name.replace('"', "\"\""))
+            } else {
+                name.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn parse_disposable_directories(value: &str) -> Result<Vec<String>, String> {
     let mut directories = Vec::new();
-    for name in value
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-    {
-        if name == "."
+    let mut remaining = value.trim_start();
+    while !remaining.is_empty() {
+        let quoted = remaining.starts_with('"');
+        let name = if quoted {
+            let mut chars = remaining[1..].char_indices().peekable();
+            let mut name = String::new();
+            let mut closed = None;
+            while let Some((index, ch)) = chars.next() {
+                if ch == '"' {
+                    if chars.peek().is_some_and(|(_, next)| *next == '"') {
+                        chars.next();
+                        name.push('"');
+                    } else {
+                        closed = Some(index + 2);
+                        break;
+                    }
+                } else {
+                    name.push(ch);
+                }
+            }
+            let end = closed.ok_or("Close the quoted directory name with a double quote.")?;
+            remaining = remaining[end..].trim_start();
+            if !remaining.is_empty() && !remaining.starts_with(',') {
+                return Err("Separate directory names with commas after a closing quote.".into());
+            }
+            name
+        } else {
+            let end = remaining.find(',').unwrap_or(remaining.len());
+            let name = remaining[..end].trim().to_owned();
+            remaining = &remaining[end..];
+            if name.contains('"') {
+                return Err(
+                    "Quote the whole directory name and double any quotes inside it.".into(),
+                );
+            }
+            name
+        };
+        remaining = remaining
+            .strip_prefix(',')
+            .unwrap_or(remaining)
+            .trim_start();
+        if name.is_empty() && !quoted {
+            continue;
+        }
+        if name.is_empty()
+            || name == "."
             || name == ".."
             || name.contains(['/', '\\'])
             || name.chars().any(char::is_control)
         {
             return Err(
-                "Enter directory names separated by commas, without paths or wildcards.".into(),
+                "Enter directory names separated by commas, without paths or control characters."
+                    .into(),
             );
         }
-        if name.contains(['*', '?', '[', ']']) {
-            return Err("Use exact directory names; wildcard patterns are not supported.".into());
-        }
-        if !directories.iter().any(|entry| entry == name) {
-            directories.push(name.to_owned());
+        if !directories.iter().any(|entry| entry == &name) {
+            directories.push(name);
         }
     }
     Ok(directories)
@@ -3975,17 +4029,37 @@ mod tests {
             vec!["target", "node_modules"]
         );
         assert!(parse_disposable_directories("").unwrap().is_empty());
-        for invalid in [
-            "../data",
-            "target/build",
-            "..",
-            "*",
-            "foo\\bar",
-            "target\n.env",
-        ] {
+        for invalid in ["../data", "target/build", "..", "foo\\bar", "target\n.env"] {
             assert!(
                 parse_disposable_directories(invalid).is_err(),
                 "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_policy_round_trips_names_without_expanding_the_allowlist() {
+        let names: Vec<String> = [
+            "target",
+            "build,data",
+            " cache ",
+            "quote\"name",
+            "缓存",
+            "[literal]*",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let displayed = format_disposable_directories(&names);
+        assert_eq!(parse_disposable_directories(&displayed).unwrap(), names);
+        assert_eq!(
+            parse_disposable_directories("\"build,data\"").unwrap(),
+            vec!["build,data"]
+        );
+        for malformed in ["\"unfinished", "\"target\"data", "bad\"quote", "\"\""] {
+            assert!(
+                parse_disposable_directories(malformed).is_err(),
+                "{malformed}"
             );
         }
     }
