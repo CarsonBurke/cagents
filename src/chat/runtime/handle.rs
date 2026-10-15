@@ -94,6 +94,7 @@ impl Handle {
     pub(crate) fn title(&self)->Option<String> {match &self.0 {Owner::Local(local)=>local.title(),Owner::Remote(remote)=>remote.state().title.clone()}}
     #[cfg(test)]
     pub(crate) fn resource_lifetime(&self)->Box<dyn Fn()->bool> {match &self.0 {Owner::Local(local)=>Box::new(local.resource_lifetime()),Owner::Remote(remote)=>remote.resource_lifetime()}}
+    pub(crate) fn finish_retained_close(&self)->Result<(),String> {match &self.0 {Owner::Local(_)=>Ok(()),Owner::Remote(remote)=>remote.finish_close()}}
     pub(crate) fn commit_native_installation(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>{local.commit_native_installation();Ok(())},Owner::Remote(remote)=>remote.commit_installation()}}
     pub(crate) fn native_continuity(&self)->chat::NativeContinuity {match &self.0 {Owner::Local(local)=>local.native_continuity(),Owner::Remote(remote)=>remote.state().native_continuity.clone()}}
     pub(crate) fn preserve_for_restart(&self)->Result<(),String> {match &self.0 {Owner::Local(local)=>local.preserve_for_restart(),Owner::Remote(remote)=>remote.preserve()}}

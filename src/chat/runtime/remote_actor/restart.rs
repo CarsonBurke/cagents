@@ -27,6 +27,7 @@ impl Server {
     pub(super) fn restart(&mut self,request:Request)->Result<RestartReceipt,String> {
         let hash=*blake3::hash(&serde_json::to_vec(&request).map_err(|error|error.to_string())?).as_bytes();
         if let Some(state)=self.journal.lock().unwrap_or_else(|p|p.into_inner()).restart(request.id,&hash)? {return Ok(RestartReceipt {id:request.id,state});}
+        if self.closed_snapshot.is_some() {return Err("This actor was explicitly closed; acknowledge final outcomes and retire it before creating a new session".into());}
         if !self.installed || !self.actor.is_completed() {return Err("The existing provider still owns work; explicit restart requires its completed teardown".into());}
         let mut expected=published_source(&self.source,self.actor.confirmed_session_id().as_deref(),&self.resident()?.native_continuity);
         expected.proof=Some(self.proof.clone());

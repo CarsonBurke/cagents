@@ -70,6 +70,8 @@ pub(crate) struct ActorInspection {
     pub recovery_environment:BTreeMap<String,String>,
 }
 #[derive(Serialize,Deserialize)]
+struct ClosePublication {snapshot:Snapshot,resident:Resident}
+#[derive(Serialize,Deserialize)]
 struct DirectoryEvidence {process:Process,identity:crate::agent_execution::DirectoryIdentity,path:PathBuf}
 #[derive(Serialize,Deserialize)]
 struct Startup {
@@ -415,20 +417,29 @@ impl RemoteActor {
     }
     pub fn preserve(&self)->Result<(),String> {self.call::<()>("preserve",Value::Null)?;self.0.preserved.store(true,Ordering::Release);self.0.stop.store(true,Ordering::Release);Ok(())}
     pub fn close_method(&self,method:&str,args:Value)->Result<(),String> {
-        let snapshot=match self.call::<Snapshot>(method,args) {
-            Ok(snapshot)=>snapshot,
+        let snapshot=match self.call::<ClosePublication>(method,args) {
+            Ok(publication)=>{
+                // Keep the final semantic cursors visible to the broker even
+                // though this proxy's provider is now closed.
+                {let mut state=self.0.state.lock().unwrap_or_else(|p|p.into_inner());*state=Arc::new(publication.resident);}
+                publication.snapshot
+            },
             Err(error)=>{
                 if !chat::native_holder::actor_close_proved(&self.0.identity.record,&self.0.proof)? {return Err(error);}
                 final_snapshot::read(&self.0.identity,&self.0.proof).map_err(|detail|format!("Provider cleanup is proved, but the exact final publication is unavailable: {detail}"))?
             }
         };
         self.publish_closed(snapshot);
+        (self.0.notify)(Update::RetainedOutcomes);
         Ok(())
+    }
+    pub fn finish_close(&self)->Result<(),String> {
+        match self.call::<()>("retire",Value::Null) {Ok(())=>Ok(()),Err(error)=>if chat::native_holder::actor_close_proved(&self.0.identity.record,&self.0.proof)? {Ok(())}else {Err(error)}}
     }
     pub fn close(&self)->Result<(),String> {self.close_method("close",Value::Null)}
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
-    fn cleanup(&self)->Result<chat::protocol::LaunchOutcome,String> {self.close()?;Ok(chat::protocol::LaunchOutcome::TeardownProved)}
+    fn cleanup(&self)->Result<chat::protocol::LaunchOutcome,String> {self.close()?;self.finish_close()?;Ok(chat::protocol::LaunchOutcome::TeardownProved)}
 }
 impl Drop for Remote {
     fn drop(&mut self) {
@@ -475,6 +486,7 @@ struct Server {
     socket_identity:(u64,u64),
     _directory:Option<Arc<File>>,
     mailbox_seal:Option<Arc<crate::agent_execution::mailbox::Seal>>,
+    closed_snapshot:Option<Arc<Snapshot>>,
 }
 impl Server {
     fn start(startup:Startup,control:&UnixStream)->Result<Self,String> {
@@ -522,7 +534,7 @@ impl Server {
         let mut build=registry::BuildIdentity::current(Kind::Native);build.capabilities.push(CAPABILITY.into());
         let identity=ActorIdentity {instance:actor.close_observation().actor_id,record:Record {version:4,build:Some(build),kind:Kind::Native,application:crate::instance::APPLICATION_ID.into(),boot,terminal:startup.source.id,holder:Process::read(std::process::id() as i32).map_err(|error|error.to_string())?,root:provider}};
         identity.record.create(&directory_path).map_err(|error|error.to_string())?;
-        Ok(Self {actor,identity,source:startup.source,lineage:Vec::new(),execution_console:None,paired_holder:None,proof,epoch:uuid::Uuid::new_v4(),installed:false,journal,changed,pending:Vec::new(),account_reports,environment,recovery_environment:startup.recovery_environment,listener,socket,socket_identity,_directory:directory,mailbox_seal})
+        Ok(Self {actor,identity,source:startup.source,lineage:Vec::new(),execution_console:None,paired_holder:None,proof,epoch:uuid::Uuid::new_v4(),installed:false,journal,changed,pending:Vec::new(),account_reports,environment,recovery_environment:startup.recovery_environment,listener,socket,socket_identity,_directory:directory,mailbox_seal,closed_snapshot:None})
     }
     fn notifier(&self)->impl Fn(Update)+Send+Sync+'static {
         let outcomes=self.journal.clone();let changed=self.changed.clone();let reports=self.account_reports.clone();
@@ -597,6 +609,7 @@ impl Server {
             let (source,):(chat::Session,)=serde_json::from_value(request.args).map_err(|error|error.to_string())?;
             if source!=self.source && !self.published_sources().contains(&source) {return Err("Retained actor source/account identity does not match this chat".into());}
             self.epoch=uuid::Uuid::new_v4();self.proof=request.proof;
+            if self.closed_snapshot.is_some() {self.publish_close()?;}
             return serde_json::to_value(self.attached()?).map_err(|error|error.to_string());
         }
         if request.epoch!=Some(self.epoch) || request.proof!=self.proof {return Err("Retained actor attachment was superseded; stale input and ACKs are refused".into());}
@@ -663,18 +676,31 @@ impl Server {
                 self.lineage=lineage;self.source=source;self.execution_console=console;self.paired_holder=pair;
                 Ok(Value::Null)
             },
-            "close_if_revision"=>{let (revision,)=decode!((u64,));self.actor.close_if_revision(revision)?;reap_orphans()?;value!(self.publish_close()?)},
-            "close_if_idle"=>{let (generation,)=decode!((u64,));self.actor.close_if_idle(generation)?;reap_orphans()?;value!(self.publish_close()?)},
-            "close"=>{self.actor.close()?;reap_orphans()?;value!(self.publish_close()?)},
+            "close_if_revision"=>{let (revision,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_revision(revision)?;reap_orphans()?;}value!(self.publish_close()?)},
+            "close_if_idle"=>{let (generation,)=decode!((u64,));if self.closed_snapshot.is_none() {self.actor.close_if_idle(generation)?;reap_orphans()?;}value!(self.publish_close()?)},
+            "close"=>{if self.closed_snapshot.is_none() {self.actor.close()?;reap_orphans()?;}value!(self.publish_close()?)},
+            "retire"=>{
+                if self.closed_snapshot.is_none() {return Err("Stop the exact retained provider before retiring its helper".into());}
+                let journal=self.journal.lock().unwrap_or_else(|p|p.into_inner());
+                if self.installed && (journal.latest()?!=journal.acknowledged()? || journal.continuity_loss()?.as_ref().is_some_and(|loss|!loss.acknowledged)) {return Err("Final retained outcomes must be durably acknowledged before helper retirement".into());}
+                Ok(Value::Null)
+            },
             _=>Err("Unknown retained actor method/version".into()),
         }
     }
-    fn publish_close(&self)->Result<Snapshot,String> {
-        let mut snapshot=self.actor.snapshot(None).ok_or("The actor has no final publication")?;
-        if let Some(loss)=self.journal.lock().unwrap_or_else(|p|p.into_inner()).continuity_loss()? {snapshot.error=Some(loss.reason.clone());snapshot.outcome=Some(crate::agent::ActivityOutcome::Interrupted {reason:loss.reason});}
+    fn publish_close(&mut self)->Result<ClosePublication,String> {
+        let snapshot=if let Some(snapshot)=&self.closed_snapshot {snapshot.as_ref().clone()}else {
+            let mut snapshot=self.actor.snapshot(None).ok_or("The actor has no final publication")?;
+            if let Some(loss)=self.journal.lock().unwrap_or_else(|p|p.into_inner()).continuity_loss()? {snapshot.error=Some(loss.reason.clone());snapshot.outcome=Some(crate::agent::ActivityOutcome::Interrupted {reason:loss.reason});}
+            snapshot
+        };
+        // A closing actor may be adopted by a new authenticated daemon before
+        // its last semantic ACK. Refresh receipt authority without changing
+        // the exact immutable final publication.
         final_snapshot::save(&self.identity,&self.proof,&snapshot)?;
         chat::native_holder::publish_actor_close(&self.identity.record,&self.proof,&self.source,&self.published_sources(),self.paired_holder.as_ref())?;
-        Ok(snapshot)
+        self.closed_snapshot=Some(Arc::new(snapshot.clone()));
+        Ok(ClosePublication {snapshot,resident:self.resident()?})
     }
     fn serve(mut self,startup:UnixStream)->Result<(),String> {
         send(&startup,&Ok::<_,String>(self.attached()?),Duration::from_secs(30))?;
@@ -687,14 +713,14 @@ impl Server {
                     let response=(|| {
                         let request:Invocation=receive(&control,TIMEOUT)?;
                         authorize(&control,&request.proof)?;
-                        let close=matches!(request.method.as_str(),"close"|"close_if_idle"|"close_if_revision");
+                        let close=request.method=="retire";
                         let result=self.invoke(request);
                         finished=close&&result.is_ok();
                         result
                     })();
-                    // Send authentication failures through the same named
-                    // result boundary. Closing succeeds independently of ACK
-                    // delivery because exact cleanup proof is already durable.
+                    // Authentication failures use the same result boundary. Only an
+                    // explicit retirement after durable semantic ACK exits the
+                    // helper; a lost provider-close reply retains its journal.
                     let _=send(&control,&response,TIMEOUT);
                     if finished {break;}
 
@@ -810,7 +836,7 @@ mod tests {
         identity.instance=actor.close_observation().actor_id;
         let journal_directory=root.path().join("journal");std::fs::create_dir(&journal_directory).unwrap();
         let socket=root.path().join("fixture.sock");let listener=UnixListener::bind(&socket).unwrap();let metadata=std::fs::symlink_metadata(&socket).unwrap();
-        Fixture {server:Server {actor,identity,source,lineage:Vec::new(),execution_console:None,paired_holder:None,proof,epoch:uuid::Uuid::new_v4(),installed:true,journal:Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),changed:Arc::new(std::sync::atomic::AtomicU64::new(1)),pending:Vec::new(),account_reports:Arc::new(Mutex::new(Vec::new())),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:BTreeMap::new(),listener,socket,socket_identity:(metadata.dev(),metadata.ino()),_directory:None,mailbox_seal:None},_root:root}
+        Fixture {server:Server {actor,identity,source,lineage:Vec::new(),execution_console:None,paired_holder:None,proof,epoch:uuid::Uuid::new_v4(),installed:true,journal:Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),changed:Arc::new(std::sync::atomic::AtomicU64::new(1)),pending:Vec::new(),account_reports:Arc::new(Mutex::new(Vec::new())),environment:crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),recovery_environment:BTreeMap::new(),listener,socket,socket_identity:(metadata.dev(),metadata.ino()),_directory:None,mailbox_seal:None,closed_snapshot:None},_root:root}
     }
     #[test]
     fn explicit_restart_reuses_the_store_and_never_repeats_a_deduplicated_launch() {
@@ -845,6 +871,20 @@ done"#;
         assert!(!fixture._root.path().join("prompts").exists(),"restart never replays an accepted prompt");
         let mut changed=payload;changed["arguments"]=json!(["-c","exit 0"]);
         assert!(server.restart(serde_json::from_value(changed).unwrap()).is_err(),"same restart UUID cannot select a different launch");
+    }
+    #[test]
+    fn stopped_provider_keeps_its_semantic_journal_until_outcome_and_loss_ack() {
+        let mut fixture=resident_fixture();let server=&mut fixture.server;
+        server.actor.close().unwrap();server.closed_snapshot=Some(Arc::new(server.actor.snapshot(None).unwrap()));
+        server.journal.lock().unwrap().append(&Update::Attention(crate::notifications::Evidence {key:"final-turn".into(),kind:crate::notifications::Kind::Succeeded})).unwrap();
+        let retire=||Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"retire".into(),args:Value::Null};
+        let request=retire();assert!(server.invoke(request).is_err());
+        assert_eq!(server.journal.lock().unwrap().page(0).unwrap().len(),1,"provider teardown must not discard the uncommitted final outcome");
+        server.journal.lock().unwrap().ack(1).unwrap();
+        server.journal.lock().unwrap().record_loss("fixture loss").unwrap();
+        let request=Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"retire".into(),args:Value::Null};assert!(server.invoke(request).is_err());
+        let id=server.journal.lock().unwrap().continuity_loss().unwrap().unwrap().id;server.journal.lock().unwrap().ack_loss(id).unwrap();
+        let request=Invocation {proof:server.proof.clone(),epoch:Some(server.epoch),method:"retire".into(),args:Value::Null};assert!(server.invoke(request).is_ok());
     }
     #[test]
     fn input_refusal_and_storage_failure_publish_new_resident_revisions() {
