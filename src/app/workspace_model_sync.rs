@@ -207,7 +207,8 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if let ModelEdit::ReopenProject { repository, .. } = request {
+                    if let ModelEdit::ReopenProject { repository, .. }
+                        | ModelEdit::VisitProject { repository, reopen: true, .. } = request {
                         let _ = updates.send_blocking(ModelUpdate::ReopenFailed {
                             repository,
                             error: error.to_string(),
@@ -234,7 +235,8 @@ fn send(
         _ => None,
     };
     let reopened = match &edit {
-        ModelEdit::ReopenProject { repository, .. } => Some(repository.clone()),
+        ModelEdit::ReopenProject { repository, .. }
+        | ModelEdit::VisitProject { repository, reopen: true, .. } => Some(repository.clone()),
         _ => None,
     };
     let view_edit = match &edit {
@@ -932,6 +934,10 @@ impl Cagents {
                 != Some(checkout)
         });
         if let Some(project_id) = self.project_for_repository(&shared.repository) {
+            if let Some(project) = self.sidebar_model.projects.iter_mut()
+                .find(|project| project.id == project_id) {
+                project.name.clone_from(&shared.name);
+            }
             let needs_checkout_read = primary_changed
                 || (checkout_changed
                     && self
@@ -1126,7 +1132,8 @@ impl Cagents {
         // The project first: a channel in a repository no project owns is
         // reachable from no sidebar. Both edits go through one queue, so the
         // registry sees them in this order.
-        self.publish_model_edit(ModelEdit::OpenProject {
+        self.publish_model_edit(ModelEdit::VisitProject {
+            reopen: false,
             checkout: checkout.clone(),
             primary_checkout: primary_checkout.clone(),
             kind,
@@ -1174,7 +1181,8 @@ impl Cagents {
             .primary_checkout_roots
             .get(&repository)
             .cloned();
-        self.publish_model_edit(ModelEdit::OpenProject {
+        self.publish_model_edit(ModelEdit::VisitProject {
+            reopen: false,
             checkout: checkout.clone(),
             primary_checkout: primary_checkout.clone(),
             kind,
@@ -1217,22 +1225,15 @@ impl Cagents {
             .primary_checkout_roots
             .get(&repository)
             .cloned();
-        let edit = if self.project_ui.is_reopening(&repository) {
-            ModelEdit::ReopenProject {
-                checkout: checkout.clone(),
-                primary_checkout: primary_checkout.clone(),
-                repository,
-                name,
-                kind,
-            }
-        } else {
-            ModelEdit::OpenProject {
-                checkout: checkout.clone(),
-                primary_checkout: primary_checkout.clone(),
-                repository,
-                name,
-                kind,
-            }
+        // A delayed filesystem load or channel sync must not overwrite a
+        // rename committed after this window's last model observation.
+        let edit = ModelEdit::VisitProject {
+            reopen: self.project_ui.is_reopening(&repository),
+            checkout,
+            primary_checkout,
+            repository,
+            name,
+            kind,
         };
         self.publish_model_edit(edit);
     }
@@ -2030,6 +2031,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shared_checkout_reload_keeps_the_latest_name_and_publishes_a_visit() {
+        let Some(checkout) = git_checkout() else { return; };
+        let root = checkout.path().canonicalize().unwrap();
+        let repository = canonical_repository(&root.join(".git")).unwrap();
+        let (mut app, project, _) = app_with_project();
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project, RepositoryId::new(), "Old local label".into(),
+            repository.clone(), Vec::new(), Vec::new(),
+        )];
+        app.sidebar_model.projects[0].unreachable = Some("Previous read failed".into());
+        let shared = ModelProject {
+            repository: repository.clone(), checkout: Some(root),
+            primary_checkout: None, name: "Custom shared label".into(),
+            kind: ProjectKind::Git, ordinal: 1,
+        };
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.projects.push(shared.clone());
+        let publishes = intercept_publishes(&mut app);
+        let Adoption::Opening(task) = app.adopt_shared_project(&shared) else {
+            panic!("new checkout metadata on an unreachable row must reload it");
+        };
+        assert_eq!(app.sidebar_model.projects[0].name, "Custom shared label");
+        let message = first_message(task).expect("actual repository read completion");
+        let Message::RepositoryLoaded { result: Ok(loaded), .. } = &message else {
+            panic!("expected a successful actual Git read");
+        };
+        assert_ne!(loaded.project.name, "Custom shared label");
+        // The read only knows the filesystem-derived name. A newer observed
+        // rename must win when its old completion reaches the UI.
+        app.workspace_model.projects[0].name = "Newest shared label".into();
+        drop(app.update(message));
+        assert_eq!(app.sidebar_model.project(project).unwrap().name, "Newest shared label");
+        let edits = drain(&publishes);
+        assert!(edits.iter().any(|edit| matches!(edit,
+            ModelEdit::VisitProject { repository: key, name, reopen: false, .. }
+                if key == &repository && name == "Newest shared label")));
+        assert!(!edits.iter().any(|edit| matches!(edit,
+            ModelEdit::OpenProject { .. } | ModelEdit::ReopenProject { .. })),
+            "read completion may publish discovery, never a rename");
+        // Even a rename not yet observed by this window must survive its
+        // queued publication: the visit remains only an insert-time hint.
+        app.sidebar_model.projects[0].name = "Older local label".into();
+        app.project_ui.reopening.insert(project, repository.clone());
+        app.publish_project_opened(project);
+        assert!(matches!(publishes.try_recv().unwrap(), ModelEdit::VisitProject {
+            repository: key, reopen: true, ..
+        } if key == repository));
+        drop(app.apply_workspace_model_update(ModelUpdate::Reopened {
+            repository: repository.clone(), model: app.workspace_model.clone(),
+        }));
+        assert!(!app.project_ui.is_reopening(&repository));
+    }
+
     /// A channel another window created arrives as a scope, not as a
     /// conversation: N windows adopting one channel must not start N chats in
     /// it, and the cards inside a channel are each window's own business.
@@ -2219,7 +2274,8 @@ mod tests {
                 .filter(|edit| !matches!(edit, ModelEdit::SeedView { .. }))
                 .collect::<Vec<_>>(),
             vec![
-                ModelEdit::OpenProject {
+                ModelEdit::VisitProject {
+                    reopen: false,
                     checkout: None,
                     primary_checkout: None,
                     kind: Default::default(),
