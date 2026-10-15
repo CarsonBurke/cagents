@@ -24073,6 +24073,23 @@ mod tests {
     }
 
     #[test]
+    fn an_existing_loaded_readonly_target_places_utf16_without_a_language_server() {
+        let (mut app, card) = editing_repository_app();
+        let (mut runtime, _) = RepositoryRuntime::open_fixture(card, "std.rs", "a😀éX\n");
+        let path = PathBuf::from("/dependencies/std.rs");
+        runtime.set_external_source(path.clone());
+        let view = runtime.descriptor.clone();
+        app.cards.insert(card, CardRuntime::Repository(Box::new(runtime)));
+        app.lsp_contexts.remove(&card);
+        let count = app.cards.len();
+        drop(app.open_lsp_source_tab(view, path, LspPosition::new(0, 4), LspCoordinates::Utf16, true, None));
+        assert_eq!(app.cards.len(), count);
+        assert_eq!(app.workspace.focused(), Some(card));
+        assert!(!app.lsp_pending_jumps.contains_key(&card));
+        assert!(matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime)) if runtime.cursor_position() == Some(LspPosition::new(0, 3)) && runtime.is_read_only_source()));
+    }
+
+    #[test]
     fn editor_language_results_reveal_details_from_the_files_tab() {
         let mut app = lsp_test_app();
         let card = repository_card(&mut app, "/repo");

@@ -320,6 +320,10 @@ pub enum LspIntent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EditorSurfaceCommand { Save, DiscardEdits, Edit, Preview, Diff }
 
+/// Runtime-side feature availability; server capabilities stay with LspManager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorLanguageFeature { Rename, FormatDocument, FormatSelection, CodeActions, Signature }
+
 #[derive(Debug, Clone)]
 pub enum EditorLspAction {
     Rename,
@@ -4595,6 +4599,26 @@ impl RepositoryRuntime {
 
     pub fn is_dirty(&self) -> bool {
         matches!(&self.document, DocumentState::Editable(document) if document.dirty)
+    }
+
+    /// Builds a language-feature action only for the mounted source buffer.
+    /// Applications also check the corresponding live server capability.
+    pub fn editor_language_feature_action(&self, card: CardId, feature: EditorLanguageFeature) -> Option<RepositoryAction> {
+        self.editor_focus_target(card)?;
+        self.lsp_document()?;
+        self.cursor_position()?;
+        if self.is_saving() || (feature != EditorLanguageFeature::Signature && self.is_read_only_source()) { return None; }
+        let action = match feature {
+            EditorLanguageFeature::Rename => EditorLspAction::Rename,
+            EditorLanguageFeature::FormatDocument => EditorLspAction::Format { selection: false },
+            EditorLanguageFeature::FormatSelection => {
+                self.editor_selection_range()?;
+                EditorLspAction::Format { selection: true }
+            }
+            EditorLanguageFeature::CodeActions => EditorLspAction::CodeActions,
+            EditorLanguageFeature::Signature => EditorLspAction::Signature,
+        };
+        Some(RepositoryAction::Language { card, action })
     }
 
     /// Returns the exact toolbar action when its current document can accept
@@ -10924,6 +10948,21 @@ mod tests {
         assert!(runtime.language.signature.is_some());
         drop(runtime.update(RepositoryAction::Language { card, action: EditorLspAction::Dismiss }));
         assert!(runtime.language.signature.is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_loaded_alias_reports_the_actual_source_identity_for_tab_reuse() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("real.rs"), "source\n").unwrap();
+        std::os::unix::fs::symlink("real.rs", root.path().join("alias.rs")).unwrap();
+        let card = CardId::new();
+        let view = RepositoryView { project: crate::model::ProjectId::new(), repository: root.path().into(), worktree: root.path().into(), selected_file: Some("alias.rs".into()) };
+        let mut runtime = RepositoryRuntime::new_directory(view);
+        let task = runtime.open_file_location(card, "alias.rs".into(), 0, 0, 0);
+        finish_navigation_task(&mut runtime, task).await;
+        assert_eq!(runtime.editor_text().as_deref(), Some("source\n"));
+        assert_eq!(runtime.source_tab_path(), Some(root.path().join("real.rs")));
     }
 
     #[tokio::test]
