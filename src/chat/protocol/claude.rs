@@ -2129,7 +2129,11 @@ impl Adapter for Claude {
                         });
                     }
                 } else if string(response, "subtype") != "success" {
-                    return Err("Unsupported Claude control response subtype".into());
+                    self.warn_unknown("control response", string(response,"subtype"));
+                    acknowledged=Err("Claude returned an unrecognized control response; the requested change is unconfirmed".into());
+                    if string(&request,"subtype")=="initialize" {
+                        step.events.push(Event::Error {message:"Claude could not confirm initialization; restart the session after updating the provider".into(),fatal:true});
+                    }
                 } else {
                     match string(&request, "subtype") {
                         "initialize" => {
@@ -5201,6 +5205,16 @@ mod tests {
             assert!(step.events.iter().any(|event| matches!(event,Event::TurnFinished { outcome:crate::notifications::Kind::Failed,.. })));
             assert!(!step.events.iter().any(|event| matches!(event,Event::TurnFinished { outcome:crate::notifications::Kind::Succeeded,.. })));
         }
+    }
+
+    #[test]
+    fn unfamiliar_control_acknowledgements_refuse_only_the_command() {
+        let mut adapter=Claude::default();
+        let request=adapter.control(json!({"subtype":"set_permission_mode","mode":"manual"})).unwrap();
+        let id=request.writes[0]["request_id"].as_str().unwrap();
+        let step=adapter.receive(json!({"type":"control_response","response":{"subtype":"future_ack","request_id":id}})).unwrap();
+        assert!(step.events.is_empty());
+        let replies=adapter.control_replies();assert_eq!(replies.len(),1);assert_eq!(replies[0].0,id);assert!(replies[0].1.is_err());
     }
 
     #[test]
