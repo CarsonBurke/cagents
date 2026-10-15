@@ -65,6 +65,10 @@ pub fn read(worktree: &Path) -> io::Result<Option<CreationBasis>> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
+    read_admin(&admin)
+}
+
+pub(crate) fn read_admin(admin: &Path) -> io::Result<Option<CreationBasis>> {
     let bytes = match bounded_read(&admin.join(FILE_NAME)) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),

@@ -10530,6 +10530,9 @@ struct WorktreeJournal {
     effects_started: bool,
     checkout_completed: bool,
     base_oid: Option<String>,
+    /// Older creations keep the documented default-branch fallback.
+    #[serde(default)]
+    basis_recording_expected: bool,
     #[serde(default)]
     existing_branch_oid: Option<String>,
     /// The administrative directory Git keeps for the created worktree,
@@ -11212,21 +11215,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     error.to_string(),
                 );
             }
-            if let (Some(admin), Some(oid)) = (&journal.admin_dir, &journal.base_oid) {
-                let receipt = crate::worktree_basis::CreationBasis::new(journal.request.base.revision_argument(), oid.clone())
-                    .and_then(|basis| crate::worktree_basis::record(admin, &basis).map(|()| basis));
-                match receipt {
-                    Ok(basis) => {
-                        if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome {
-                            worktree.creation_basis = Some(basis);
-                        }
-                    }
-                    Err(error) => {
-                        journal.detail = format!("{}; creation basis could not be recorded: {error}", journal.detail);
-                        journal.warnings.push(repository_warning(&self.git, RepositoryError::Validation(ValidationError::Io(error.to_string()))));
-                    }
-                }
-            }
+            self.record_created_worktree_basis(&mut journal);
             self.unlock_created_worktree(&mut journal);
         }
         finish_worktree_journal(store, &journal, &payload, created_at, &emit)
@@ -11272,6 +11261,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             effects_started: false,
             checkout_completed: false,
             base_oid: None,
+            basis_recording_expected: true,
             existing_branch_oid,
             admin_dir: None,
             outcome: None,
@@ -11476,6 +11466,47 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         clean.then_some(git_dir)
     }
 
+    /// Publish creation metadata after Git success is durable. Recovery never
+    /// replays Git or unlocks. A missing receipt is repaired only while the
+    /// original lock, branch/head/admin identity and exclusive process lease
+    /// still prove ownership of this exact completed creation.
+    fn record_created_worktree_basis(&self, journal: &mut WorktreeJournal) {
+        if journal.state != WorktreeOperationState::Created || !journal.basis_recording_expected { return; }
+        let (Some(admin), Some(oid)) = (&journal.admin_dir, &journal.base_oid) else { return; };
+        let basis = crate::worktree_basis::CreationBasis::new(journal.request.base.revision_argument(), oid.clone());
+        if let Ok(basis) = &basis && matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.creation_basis.as_ref() == Some(basis)) { return; }
+        let receipt = (|| -> Result<crate::worktree_basis::CreationBasis, String> {
+            let basis = basis.map_err(|error| error.to_string())?;
+            match crate::worktree_basis::read_admin(admin).map_err(|error| error.to_string())? {
+                Some(existing) if existing == basis => return Ok(basis),
+                Some(_) => return Err("The existing creation basis has a different identity".into()),
+                None => {}
+            }
+            let lease = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE).map_err(|error| error.to_string())?;
+            if lease_file_identity(&lease).ok() != journal.lease_identity { return Err("Creation process lease identity changed".into()); }
+            let token = CancellationToken::new();
+            let records = self.list_worktrees(&journal.request.repository, &token).map_err(|error| error.to_string())?;
+            let label = format!("cagents:{}", journal.request.operation_id);
+            let owned = records.iter().any(|record| record.branch.as_deref() == Some(journal.request.branch.full_ref().as_str())
+                && record.head_oid.as_ref() == Some(oid) && record.lock.reason.as_deref() == Some(label.as_str())
+                && self.git_dir(&record.path, &token).ok().as_ref() == Some(admin));
+            if !owned { return Err("The original creation no longer proves ownership of the missing basis receipt".into()); }
+            crate::worktree_basis::record(admin, &basis).map_err(|error| error.to_string())?;
+            Ok(basis)
+        })();
+        match receipt {
+            Ok(basis) => if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome { worktree.creation_basis = Some(basis); },
+            Err(error) => {
+                let detail = format!("creation basis could not be recorded: {error}");
+                if !journal.detail.contains(&detail) {
+                    journal.detail = format!("{}; {detail}", journal.detail);
+                    journal.warnings.push(repository_warning(&self.git, RepositoryError::Validation(ValidationError::Io(error))));
+                }
+            }
+        }
+        if let Some(WorktreeCreationOutcome::Created { warnings, .. }) = &mut journal.outcome { warnings.clone_from(&journal.warnings); }
+    }
+
     /// Only the original live request may clean up its own Git lock. Startup
     /// reconciliation deliberately never calls this mutating helper.
     fn unlock_created_worktree(&self, journal: &mut WorktreeJournal) {
@@ -11626,6 +11657,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 // user to reconcile by hand. The grace is the same bound the
                 // in-process path accepts, and costs nothing uncontended.
                 self.settle_worktree_journal(&mut journal, CLEANUP_GRACE);
+                self.record_created_worktree_basis(&mut journal);
                 reports.push(finish_worktree_journal(
                     store,
                     &journal,
@@ -11633,6 +11665,10 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     operation.created_at_unix_ms,
                     &|_| {},
                 ));
+            } else if journal.state == WorktreeOperationState::Created && journal.basis_recording_expected
+                && matches!(&journal.outcome, Some(WorktreeCreationOutcome::Created { worktree, .. }) if worktree.creation_basis.is_none()) {
+                self.record_created_worktree_basis(&mut journal);
+                reports.push(finish_worktree_journal(store, &journal, &operation.payload, operation.created_at_unix_ms, &|_| {}));
             } else {
                 reports.push(journal.report(operation.created_at_unix_ms));
             }
@@ -11987,6 +12023,29 @@ mod worktree_journal_tests {
         let remote = fixture.service.resolve_worktree_request_selected(&input, Some("refs/remotes/origin/topic"), &token).unwrap();
         assert_eq!(remote.branch.as_str(), "topic"); assert!(remote.track);
         assert!(fixture.service.resolve_worktree_request_selected(&input, Some("refs/heads/disappeared"), &token).is_err());
+    }
+
+    #[test]
+    fn restart_repairs_a_durable_created_checkout_before_basis_publication() {
+        let mut fixture = Fixture::new(); let token = CancellationToken::new();
+        fixture.git(&["branch", "release/1.2"]);
+        fixture.request.base = BaseRevision::LocalBranch(ValidatedBranchName::parse("release/1.2").unwrap());
+        assert_eq!(fixture.run(&token).state, WorktreeOperationState::Created);
+        let operation = fixture.store.journaled_worktree_operations().unwrap().into_iter().find(|operation| operation.id == fixture.request.operation_id).unwrap();
+        let mut journal: WorktreeJournal = serde_json::from_value(operation.payload.clone()).unwrap();
+        fs::remove_file(journal.admin_dir.as_ref().unwrap().join("cagents-created-from.json")).unwrap();
+        if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome { worktree.creation_basis = None; }
+        fixture.git(&["worktree", "lock", "--reason", &format!("cagents:{}", operation.id), fixture.request.destination.to_str().unwrap()]);
+        fixture.store.update_operation(operation.id, &operation.payload, &serde_json::to_value(&journal).unwrap(), PendingOperationStatus::Applied).unwrap();
+        let reports = RepositoryService::system("git").rehydrate_worktree_operations(&fixture.store).unwrap();
+        let report = reports.into_iter().find(|report| report.operation_id == operation.id).unwrap();
+        assert_eq!(report.state, WorktreeOperationState::Created);
+        let basis = crate::worktree_basis::read(&fixture.request.destination).unwrap().unwrap();
+        assert_eq!(basis.reference, "refs/heads/release/1.2");
+        assert_eq!(Some(basis.oid), journal.base_oid);
+        let record = fixture.service.list_worktrees(&fixture.request.repository, &token).unwrap().into_iter().find(|record| record.path == fixture.request.destination).unwrap();
+        assert!(record.lock.locked, "recovery only repairs metadata; it must not unlock or replay Git");
+        assert!(record.creation_basis.is_some());
     }
 
     /// Deleting a created worktree in the app frees its identity, so the same
