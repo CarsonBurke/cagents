@@ -15234,15 +15234,21 @@ mod tests {
 
     #[test]
     fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
-        for (stale_reply, codex_resume, legacy_paired, learns_identity) in [
-            (false, false, false, false),
-            (true, false, false, false),
-            (false, true, false, false),
-            (true, true, false, false),
-            (false, false, true, false),
-            (true, false, true, false),
-            (false, false, true, true),
-            (true, false, true, true),
+        for (stale_reply, codex_resume, legacy_paired, learns_identity, paired_recipe, writer_refused) in [
+            (false, false, false, false, 0, false),
+            (true, false, false, false, 0, false),
+            (false, true, false, false, 0, false),
+            (true, true, false, false, 0, false),
+            (false, false, true, false, 0, false),
+            (true, false, true, false, 0, false),
+            (false, false, true, true, 0, false),
+            (true, false, true, true, 0, false),
+            (false, false, true, false, 1, false),
+            (true, false, true, false, 1, false),
+            (false, false, true, false, 2, false),
+            (true, false, true, false, 2, false),
+            (false, false, true, false, 1, true),
+            (false, false, true, false, 2, true),
         ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let card = live_chat(&mut app, Some(KNOWN_THREAD));
@@ -15282,6 +15288,24 @@ mod tests {
                 if learns_identity {
                     source.launch.session_id = None;
                 }
+                if paired_recipe != 0 {
+                    // An old converted chat keeps its fresh issued recipe,
+                    // while its terminal can have been a fresh CLI or shell.
+                    // The daemon owns no private listener for this pairing.
+                    source.reset_owned_codex_listener();
+                    source.launch.recipe.arguments = vec![
+                        "--remote".into(), "unix:///run/test-paired-codex.sock".into(),
+                    ];
+                    source.launch.recipe.environment.insert("CODEX_HOME".into(), "/private/test-codex-home".into());
+                    let mut issued = source.launch.recipe.clone();
+                    if paired_recipe == 2 {
+                        issued.program = "/bin/bash".into();
+                        issued.arguments = vec!["--login".into()];
+                    }
+                    let terminal = source.terminal.as_mut().unwrap();
+                    terminal.launch = issued;
+                    terminal.transcript_path = Some("/private/test-paired-transcript".into());
+                }
                 app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             }
             let directory = tempfile::tempdir().unwrap();
@@ -15297,6 +15321,9 @@ mod tests {
                 .unwrap()
                 .flush(Duration::from_secs(10))
                 .unwrap();
+            if writer_refused {
+                app.session.as_ref().unwrap().operation_store().shutdown().unwrap();
+            }
             let mut replacement = source.clone();
             if learns_identity {
                 replacement.launch.session_id = Some(KNOWN_THREAD.into());
@@ -15316,9 +15343,17 @@ mod tests {
                     host_incarnation: proof.host_incarnation,
                 };
             }
+            let history = vec![Arc::new(chat::Item {
+                id: "paired-upgrade-existing-answer".into(),
+                role: chat::Role::Assistant,
+                content: text("Existing paired answer survives upgrade"),
+                started_at: None,
+                at: None,
+            })];
             let snapshot = Snapshot {
                 session_id: replacement.launch.session_id.clone(),
                 ready: true,
+                items: history.clone(),
                 ..Snapshot::default()
             };
             let handle = Arc::new(if legacy_paired {
@@ -15353,6 +15388,23 @@ mod tests {
             );
             assert!(!app.cards.contains_key(&card));
             let receipt = account_commit_reply(task);
+            if writer_refused {
+                assert!(matches!(&receipt,
+                    Message::ChatUi(Action::UpgradeCommitted(_, _, Err(reason)))
+                        if reason == &crate::persistence::StoreError::Closed.to_string()));
+                let _ = app.update(receipt);
+                assert!(!app.chat_start_pending(card));
+                assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source.clone()));
+                assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
+                let database = rusqlite::Connection::open_with_flags(
+                    directory.path().join("state.sqlite3"), rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+                ).unwrap();
+                let stored: String = database.query_row(
+                    "SELECT content_json FROM cards WHERE card_id=?1", [card.to_string()], |row| row.get(0),
+                ).unwrap();
+                assert_eq!(serde_json::from_str::<chat::Session>(&stored).unwrap(), source);
+                continue;
+            }
             assert!(matches!(
                 receipt,
                 Message::ChatUi(Action::UpgradeCommitted(_, _, Ok(())))
@@ -15381,6 +15433,7 @@ mod tests {
                     CardKind::Chat(replacement.clone())
                 );
                 assert_eq!(chat_runtime(&app, card).session, replacement.clone());
+                assert_eq!(chat_runtime(&app, card).snapshot.items, history);
                 app.persist();
                 let writer = app.session.as_ref().unwrap();
                 writer.flush(Duration::from_secs(10)).unwrap();
