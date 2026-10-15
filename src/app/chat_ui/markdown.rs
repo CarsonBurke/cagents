@@ -74,10 +74,10 @@ impl Content {
         content
     }
 
-    /// Pushes more Markdown into the [`Content`]; parsing incrementally!
-    ///
-    /// This is specially useful when you have long streams of Markdown; like
-    /// big files or potentially long replies.
+    /// Append source while retaining completed parsed blocks. The unfinished
+    /// block may be reparsed; syntax-free paragraphs and open top-level fences
+    /// have specialized append paths. This does not promise linear work for
+    /// every growing CommonMark document.
     pub fn push_str(&mut self, markdown: &str) {
         if markdown.is_empty() {
             return;

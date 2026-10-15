@@ -1,7 +1,7 @@
 //! An answer's Markdown as the parser has to be handed it.
 //!
-//! iced's Markdown parser is written for documents, and three of the choices
-//! it makes for a document lose text from an agent's answer:
+//! The local Markdown parser preserves the pinned document semantics, and
+//! three document-oriented choices would lose text from an agent's answer:
 //!
 //! - a `---` or `+++` line with text straight after it opens a front-matter
 //!   block, and everything up to the next such line is discarded - which is
@@ -11,9 +11,8 @@
 //! - an indented code block comes out as an empty box, with its lines run into
 //!   the paragraph that follows.
 //!
-//! The parser's item types cannot be built from outside it, so it cannot be
-//! replaced for these three cases without carrying a copy of the whole widget
-//! crate. What reaches it is rewritten instead: a separator is given a fourth
+//! Source normalization keeps these product choices separate from CommonMark
+//! parsing: a separator is given a fourth
 //! dash, which is still a separator and no longer front matter; a `<` that is
 //! neither an autolink nor a line break is escaped, which is how Markdown
 //! spells a literal one; and an indented block is fenced. Text inside a fence
