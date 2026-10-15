@@ -939,6 +939,12 @@ done"#;
         assert!(!fixture._root.path().join("prompts").exists(),"restart never replays an accepted prompt");
         let mut changed=payload;changed["arguments"]=json!(["-c","exit 0"]);
         assert!(server.restart(serde_json::from_value(changed).unwrap()).is_err(),"same restart UUID cannot select a different launch");
+        let close=server.actor.close_observation();
+        let expected=crate::agent_execution::DirectoryIdentity::from_metadata(&std::fs::metadata(fixture._root.path()).unwrap());
+        assert_eq!(close.directory_identity,Some(expected),"prepared restart retains physical close scope");
+        assert_eq!(close.working_directory,fixture._root.path());
+        server.actor.close_if_revision(close.close_revision).unwrap();
+        server.actor.close_until(Instant::now()+Duration::from_secs(5)).unwrap();
     }
     #[test]
     fn stopped_provider_keeps_its_semantic_journal_until_outcome_and_loss_ack() {

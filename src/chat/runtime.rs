@@ -1983,10 +1983,13 @@ impl Actor {
     fn record_execution_directory(&mut self,directory:&std::path::Path) {
         let _state=self.state.lock().unwrap_or_else(|p|p.into_inner());
         let mut close=self.close_state.lock().unwrap_or_else(|p|p.into_inner());
-        let pinned=self.launch_context.as_ref().and_then(|context|context.directory_descriptor());
+        let pinned=self.launch_context.as_ref()
+            .filter(|context|context.provider_directory_observed(directory).unwrap_or(false))
+            .and_then(|context|context.directory_descriptor());
         let identity=pinned.as_ref().and_then(|pinned|pinned.metadata().ok()).map(|metadata|crate::agent_execution::DirectoryIdentity::from_metadata(&metadata));
-        if close.working_directory!=directory || close.directory_identity!=identity {
-            close.working_directory=directory.into();
+        let observed_directory=if identity.is_some() {directory.to_path_buf()} else {Default::default()};
+        if close.working_directory!=observed_directory || close.directory_identity!=identity {
+            close.working_directory=observed_directory;
             close.directory_identity=identity;
             close._directory=pinned;
             close.revision=close.revision.saturating_add(1);
@@ -2381,6 +2384,9 @@ impl Actor {
                             let _ = self.adapter.relocate_directory(&self.working_directory);
                             return Err(error);
                         }
+                        // Only a previously verified provider scope transfers
+                        // through this adapter-accepted same-inode move.
+                        context.relocate_observed_provider_directory(&self.working_directory,&directory)?;
                         self.record_execution_directory(&directory);
                         self.working_directory = directory;
                         self.dirty=true;
