@@ -3594,6 +3594,15 @@ impl Application for Editor {
                     // Sidebar menus share command identities with the ADE,
                     // while this host owns its file mutations and preferences.
                     let action = match action {
+                        SidebarAction::RunChangeCommand { command, key, row, selection_revision } => {
+                            let target = sidebar::commands::CommandTarget::Changes { key, row, selection_revision };
+                            let resolved = self.current().and_then(|tab| target.resolve_in(&tab.sidebar, &tab.navigation, command));
+                            let Some(action) = resolved else {
+                                self.notice = Some("The original change selection is no longer available.".into());
+                                return Task::none();
+                            };
+                            action
+                        }
                         SidebarAction::RunCommand { command, action } => {
                             let valid = cagents::sidebar::commands::command_id(&action) == Some(command)
                                 && self.current().is_some_and(|tab| {
@@ -3603,7 +3612,7 @@ impl Application for Editor {
                                     tab.navigation.active_worktree() == Some(key)
                                         && tab.sidebar.source_control.as_ref().is_some_and(|source| {
                                             source.key == *key
-                                                && !source.reloading
+                                                && !source.is_reloading()
                                                 && !source.busy()
                                                 && cagents::sidebar::commands::file_rows(source)
                                                     .any(|row| row.path == *path)
@@ -3617,6 +3626,22 @@ impl Application for Editor {
                         }
                         action => action,
                     };
+                    // Both the captured menu and inline row controls resolve
+                    // selection synchronously, then retain this host's existing
+                    // save, mutation and discard-confirmation checks.
+                    let action = if let SidebarAction::InvokeChangeRows { key, row, command } = action {
+                        let resolved = self.current().and_then(|tab| {
+                            (tab.navigation.active_worktree() == Some(&key)).then_some(())?;
+                            let source = tab.sidebar.source_control.as_ref()?;
+                            if source.is_reloading() || source.busy() { return None; }
+                            sidebar::resolve_change_command(source, &tab.navigation, &key, &row, command)
+                        });
+                        let Some(action) = resolved else {
+                            self.notice = Some("The original change selection is no longer available.".into());
+                            return Task::none();
+                        };
+                        action
+                    } else { action };
                     if matches!(action, SidebarAction::OpenSettings) {
                         return self.update(Message::Settings);
                     }
@@ -3639,6 +3664,35 @@ impl Application for Editor {
                                     tab.navigation.apply(&action);
                                 }
                                 return self.open_working_change(id, path, *area);
+                            }
+                            SidebarAction::SelectChangeRows { key, row, intent }
+                                if self.tab(id).is_some_and(|tab| tab.navigation.active_worktree() == Some(key)) =>
+                            {
+                                let tab = self.tab_mut(id).unwrap();
+                                let Some(source) = tab.sidebar.source_control.as_ref() else { return Task::none(); };
+                                let order = sidebar::change_selection_order(source, &tab.navigation);
+                                tab.navigation.select_change_rows(row.clone(), *intent, &order);
+                                return iced::widget::operation::focus(sidebar::change_row_focus_id(key, row)).map(cosmic::Action::App);
+                            }
+                            SidebarAction::NavigateChangeRow { key, row, direction, extend }
+                                if self.tab(id).is_some_and(|tab| tab.navigation.active_worktree() == Some(key)) =>
+                            {
+                                let tab = self.tab_mut(id).unwrap();
+                                let Some(source) = tab.sidebar.source_control.as_ref() else { return Task::none(); };
+                                let order = sidebar::change_selection_order(source, &tab.navigation);
+                                let Some(position) = order.iter().position(|candidate| candidate == row) else { return Task::none(); };
+                                use iced::keyboard::key::Named;
+                                let next = match direction {
+                                    Named::ArrowUp => position.saturating_sub(1),
+                                    Named::ArrowDown => (position + 1).min(order.len().saturating_sub(1)),
+                                    Named::Home => 0,
+                                    Named::End => order.len().saturating_sub(1),
+                                    _ => return Task::none(),
+                                };
+                                let target = order[next].clone();
+                                tab.navigation.select_change_rows(target.clone(), if *extend { sidebar::SelectionIntent::Range { extend: false } } else { sidebar::SelectionIntent::Navigate }, &order);
+                                let scroll = tab.navigation.reveal_change_row(source, &target).map(|(id, y)| iced::widget::operation::scroll_to(id, iced::widget::operation::AbsoluteOffset { x: 0.0, y }).map(cosmic::Action::App)).unwrap_or_else(Task::none);
+                                return Task::batch([scroll, iced::widget::operation::focus(sidebar::change_row_focus_id(key, &target)).map(cosmic::Action::App)]);
                             }
                             SidebarAction::Stage { key, selection }
                                 if self.tab(id).is_some_and(|tab| {
@@ -3679,6 +3733,11 @@ impl Application for Editor {
                     };
                     let key = match &action {
                         SidebarAction::OpenFile { key, .. }
+                        | SidebarAction::SelectChangeRows { key, .. }
+                        | SidebarAction::ClearChangeSelection { key }
+                        | SidebarAction::NavigateChangeRow { key, .. }
+                        | SidebarAction::RevealChangeInFiles { key, .. }
+                        | SidebarAction::IgnoreChangePath { key, .. }
                         | SidebarAction::FileCommand { key, .. }
                         | SidebarAction::RefreshWorktree { key }
                         | SidebarAction::FilesQueryChanged { key, .. }
@@ -3935,6 +3994,7 @@ impl Application for Editor {
                                 if let Some(key) = tab.navigation.active_worktree().cloned() {
                                     let mut source = SourceControlModel::ready(key, &snapshot);
                                     source.set_mutation(tab.mutation);
+                                    tab.navigation.reconcile_change_rows(&source);
                                     tab.sidebar.source_control = Some(source);
                                 }
                                 // A remote added or retargeted since the last
@@ -7154,6 +7214,48 @@ mod tests {
             file_operation_destination(source, " renamed λ.txt ").unwrap(),
             Path::new("src/ renamed λ.txt "),
         );
+    }
+
+    #[test]
+    fn registered_change_menus_preserve_host_selection_and_discard_confirmation() {
+        use cagents::workspace_widget::GlobalShortcut as Command;
+        use cagents::repository::ChangeArea;
+        let directory = git_fixture();
+        let root = directory.path();
+        std::fs::write(root.join("a.txt"), "first\n").unwrap();
+        std::fs::write(root.join("b.txt"), "second\n").unwrap();
+        let mut app = editor();
+        let id = open_real_git(&mut app, root, None);
+        let key = app.tab(id).unwrap().navigation.active_worktree().unwrap().clone();
+        let row = |area, path| sidebar::ChangeSelectionRow { area, path: RepoPath::parse(path).unwrap() };
+        let a = row(ChangeArea::Untracked, "a.txt");
+        let b = row(ChangeArea::Untracked, "b.txt");
+        let capture = |app: &Editor, row: sidebar::ChangeSelectionRow, command| SidebarAction::RunChangeCommand {
+            command, key: key.clone(), row,
+            selection_revision: app.tab(id).unwrap().navigation.change_selection_revision(),
+        };
+        sidebar_action(&mut app, SidebarAction::SelectChangeRows { key: key.clone(), row: a.clone(), intent: sidebar::SelectionIntent::Toggle });
+        let stale = capture(&app, a.clone(), Command::StageSelectedChanges);
+        sidebar_action(&mut app, SidebarAction::SelectChangeRows { key: key.clone(), row: a.clone(), intent: sidebar::SelectionIntent::Toggle });
+        sidebar_action(&mut app, SidebarAction::SelectChangeRows { key: key.clone(), row: b.clone(), intent: sidebar::SelectionIntent::Toggle });
+        sidebar_action(&mut app, stale);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty(), "a replacement selection cannot retarget a captured menu");
+        sidebar_action(&mut app, SidebarAction::ClearChangeSelection { key: key.clone() });
+        let stage = capture(&app, a.clone(), Command::StageSelectedChanges);
+        sidebar_action(&mut app, stage);
+        assert_eq!(git(root, &["diff", "--cached", "--name-only"]), "a.txt");
+        let unstage = capture(&app, row(ChangeArea::Staged, "a.txt"), Command::UnstageSelectedChanges);
+        sidebar_action(&mut app, unstage);
+        assert!(git(root, &["diff", "--cached", "--name-only"]).is_empty());
+        let discard = capture(&app, a, Command::DiscardSelectedChanges);
+        sidebar_action(&mut app, discard);
+        assert!(root.join("a.txt").exists(), "opening discard must not mutate disk");
+        let mut request = app.tab(id).unwrap().navigation.pending_discard().expect("existing host confirmation").request.clone();
+        assert_eq!(request.untracked, [RepoPath::parse("a.txt").unwrap()]);
+        request.confirmed = true;
+        sidebar_action(&mut app, SidebarAction::ConfirmDiscard { key, request });
+        assert!(!root.join("a.txt").exists());
+        assert_eq!(std::fs::read_to_string(root.join("b.txt")).unwrap(), "second\n");
     }
 
     #[test]

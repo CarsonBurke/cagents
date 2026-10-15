@@ -2712,6 +2712,9 @@ impl SourceControlModel {
         self.mutation.is_some()
     }
 
+    /// A retained snapshot cannot accept new host commands until its read finishes.
+    pub fn is_reloading(&self) -> bool { self.reloading }
+
     /// Commit needs a message, something staged, and no mutation in flight.
     pub fn can_commit(&self, message: &str) -> bool {
         !message.trim().is_empty()
