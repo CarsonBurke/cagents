@@ -9264,17 +9264,24 @@ mod tests {
             }
             let stdout_path = evidence.path().join("stdout.log");
             let stderr_path = evidence.path().join("stderr.log");
-            command.stdin(std::process::Stdio::null())
+            command
+                .stdin(std::process::Stdio::null())
                 .stdout(fs::File::create(&stdout_path).unwrap())
                 .stderr(fs::File::create(&stderr_path).unwrap());
             let child = match command.spawn() {
                 Ok(child) => child,
                 Err(error) => {
                     let path = evidence.keep();
-                    panic!("could not spawn numstat child: {error}; private evidence: {}", path.display());
+                    panic!(
+                        "could not spawn numstat child: {error}; private evidence: {}",
+                        path.display()
+                    );
                 }
             };
-            let mut original = OriginalChild { child, reaped: false };
+            let mut original = OriginalChild {
+                child,
+                reaped: false,
+            };
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
             let result = loop {
                 match original.child.try_wait() {
@@ -9285,7 +9292,9 @@ mod tests {
                     Ok(None) if std::time::Instant::now() < deadline => {
                         thread::sleep(Duration::from_millis(10));
                     }
-                    Ok(None) => break Err("numstat child exceeded its 30-second deadline".to_owned()),
+                    Ok(None) => {
+                        break Err("numstat child exceeded its 30-second deadline".to_owned());
+                    }
                     Err(error) => break Err(format!("could not observe numstat child: {error}")),
                 }
             };
@@ -9306,7 +9315,10 @@ mod tests {
                 || !stdout.contains("test result: ok. 1 passed;")
             {
                 let path = evidence.keep();
-                panic!("numstat child failed: {result:?}; private evidence: {}\nstdout (first 64 KiB):\n{stdout}\nstderr (first 64 KiB):\n{stderr}", path.display());
+                panic!(
+                    "numstat child failed: {result:?}; private evidence: {}\nstdout (first 64 KiB):\n{stdout}\nstderr (first 64 KiB):\n{stderr}",
+                    path.display()
+                );
             }
         }
 
@@ -9969,7 +9981,9 @@ mod tests {
             if std::env::var_os(CHILD).is_none() {
                 use std::os::unix::ffi::OsStringExt;
                 let directory = tempfile::tempdir().unwrap();
-                let home = directory.path().join(OsString::from_vec(b"home-\xff".to_vec()));
+                let home = directory
+                    .path()
+                    .join(OsString::from_vec(b"home-\xff".to_vec()));
                 fs::create_dir(&home).unwrap();
                 let mut command = std::process::Command::new(std::env::current_exe().unwrap());
                 command.args([
@@ -9996,16 +10010,43 @@ mod tests {
             let service = service();
             let cancel = CancellationToken::new();
             let mut cache = SnapshotCache::default();
-            let options = SnapshotOptions { untracked_files: false, ..Default::default() };
-            let first = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().unwrap();
-            assert_eq!(measured(&first, "tracked", ChangeArea::Unstaged), (Some(1), Some(1)));
+            let options = SnapshotOptions {
+                untracked_files: false,
+                ..Default::default()
+            };
+            let first = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                measured(&first, "tracked", ChangeArea::Unstaged),
+                (Some(1), Some(1))
+            );
             let status_before = git_output(root, &["status", "--porcelain=v2", "--branch", "-z"]);
             fs::write(&attributes, "tracked -diff\n").unwrap();
-            fs::write(home.join("late-config"), format!("[core]\nattributesFile = {}\n", attributes.display())).unwrap();
-            assert_eq!(status_before, git_output(root, &["status", "--porcelain=v2", "--branch", "-z"]));
-            let changed = service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().expect("publishing the home-relative include invalidates unchanged porcelain");
-            assert_eq!(measured(&changed, "tracked", ChangeArea::Unstaged), (None, None));
-            assert!(service.snapshot_cached(root, options, &cancel, &mut cache).unwrap().is_none());
+            fs::write(
+                home.join("late-config"),
+                format!("[core]\nattributesFile = {}\n", attributes.display()),
+            )
+            .unwrap();
+            assert_eq!(
+                status_before,
+                git_output(root, &["status", "--porcelain=v2", "--branch", "-z"])
+            );
+            let changed = service
+                .snapshot_cached(root, options, &cancel, &mut cache)
+                .unwrap()
+                .expect("publishing the home-relative include invalidates unchanged porcelain");
+            assert_eq!(
+                measured(&changed, "tracked", ChangeArea::Unstaged),
+                (None, None)
+            );
+            assert!(
+                service
+                    .snapshot_cached(root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .is_none()
+            );
         }
 
         #[test]
