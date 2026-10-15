@@ -36,8 +36,8 @@ use crate::{
     design::space,
     diff_view::{
         DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffRowKind, DiffSyntax,
-        InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan, build_document_diff_sources,
-        build_line_changes, highlighter_settings, load_repository_diff_with_options,
+        InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan,
+        highlighter_settings, build_document_diff_sources_with_font, build_line_changes, load_repository_diff_with_options_and_font,
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
@@ -4259,6 +4259,7 @@ impl RepositoryRuntime {
         let cancellation = CancellationToken::new();
         let syntax_theme = self.syntax_theme;
         let ignore_whitespace = self.diff_ignore_whitespace;
+        let font = self.editor_font;
         let present = [self.diff_model().is_none_or(|model| model.present[0]), true];
         self.working_diff.active = Some(WorkingDiffJob {
             identity: identity.clone(),
@@ -4276,7 +4277,7 @@ impl RepositoryRuntime {
                 let after = snapshot.text();
                 let serialized_us = started.elapsed().as_micros() as u64;
                 let model = if rich {
-                    let mut model = build_document_diff_sources(Arc::clone(&baseline), Arc::clone(&after), &source, syntax_theme, ignore_whitespace, &cancellation)?;
+                    let mut model = build_document_diff_sources_with_font(Arc::clone(&baseline), Arc::clone(&after), &source, syntax_theme, ignore_whitespace, font, &cancellation)?;
                     model.present = present;
                     Some(model)
                 } else { None };
@@ -4722,13 +4723,26 @@ impl RepositoryRuntime {
         self.apply_diff_viewport(anchor);
     }
 
+    pub fn restore_font_viewport(&self) -> Task<RepositoryAction> { self.restore_visible_scroll() }
+
     pub fn set_editor_font(&mut self, font: Font, size: f32) {
-        if self.editor_font == font && self.editor_font_size == size {
-            return;
-        }
+        if self.editor_font == font && self.editor_font_size == size { return; }
+        let family_changed = self.editor_font != font;
+        let anchor = self.current_diff_viewport();
         self.editor_font = font;
         self.editor_font_size = size;
         self.update_diff_typography();
+        if family_changed {
+            // Widths were measured for the previous family. Completed syntax
+            // remains in the shared cache; each visible comparison remeasures
+            // on its worker, with stale callbacks fenced by removed requests.
+            self.diffs.clear();
+            self.stale_diff = None;
+            self.pending_diff_anchor = Some(anchor);
+            self.working_diff.applied = None;
+            self.working_diff.desired = None;
+            if let Some(active) = &self.working_diff.active { active.cancellation.cancel(); }
+        }
     }
 
     fn auto_save_revision(&self) -> Option<u64> {
@@ -6190,6 +6204,7 @@ impl RepositoryRuntime {
             pathspec,
             self.syntax_theme,
             self.diff_ignore_whitespace,
+            self.editor_font,
             cancellation,
         )
     }
@@ -6906,19 +6921,21 @@ fn diff_task(
     pathspec: PathBuf,
     syntax_theme: crate::settings::EditorSyntaxTheme,
     ignore_whitespace: bool,
+    font: Font,
     cancellation: CancellationToken,
 ) -> Task<RepositoryAction> {
     let worktree = identity.worktree.clone();
     let requested = basis.clone();
     cosmic::task::future(async move {
         let content = tokio::task::spawn_blocking(move || {
-            load_repository_diff_with_options(
+            load_repository_diff_with_options_and_font(
                 &worktree,
                 &pathspec,
                 &requested,
                 old_path.as_deref(),
                 syntax_theme,
                 ignore_whitespace,
+                font,
                 &cancellation,
             )
         })
@@ -11102,6 +11119,31 @@ mod tests {
     }
 
     #[test]
+    fn diff_toolbar_labels_are_visible_at_default_width_and_collapse_when_narrow() {
+        use cosmic::iced::advanced::{Layout,layout,mouse,widget::Tree};
+        let card = CardId::new();
+        let (mut runtime,_) = diff_runtime(card);
+        load_fresh_diff(&mut runtime,card,two_change_model());
+        let renderer = headless_renderer();
+        let height = |width| {
+            let mut toolbar = selected_file_toolbar(card,&runtime).unwrap();
+            let mut tree = Tree::new(toolbar.as_widget());
+            let node = toolbar.as_widget_mut().layout(&mut tree,&renderer,&layout::Limits::new(iced::Size::ZERO,iced::Size::new(width,720.0)));
+            assert!(node.size().height < 160.0,"toolbar must leave space for code");
+            let accessible = toolbar.as_widget().a11y_nodes(Layout::new(&node),&tree,mouse::Cursor::Unavailable);
+            let labels = accessible.root().iter().chain(accessible.children()).filter(|node| !node.node().is_hidden()).filter_map(|node| node.node().label()).collect::<Vec<_>>();
+            if width >= 340.0 {
+                for label in ["Stage","Unstage","Revert","Ignore whitespace","Working","Staged","Branch","History","Unified","Split","Previous","Next"] { assert!(labels.contains(&label),"missing {label}: {labels:?}"); }
+                assert!(!labels.contains(&"Diff actions ⋮"));
+            } else { assert!(labels.contains(&"Diff actions ⋮")); }
+            node.size().height
+        };
+        let normal = height(crate::design::INSPECTOR_DEFAULT_WIDTH);
+        let narrow = height(300.0);
+        assert!(normal > narrow+20.0);
+    }
+
+    #[test]
     fn shell_toolbar_actions_stay_in_the_header_when_find_is_open() {
         use cosmic::iced::Size;
         use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
@@ -14177,6 +14219,7 @@ mod tests {
             mode: DiffMode::Inline,
             layout_revision: 4,
             review_revision: (2, 3),
+            row_height: DIFF_ROW_HEIGHT,
             expected_leading: 0.0,
             expected: BTreeMap::from([(8, 99.0), (20, 80.0)]),
             // Row 8's removed discussion is deliberately absent. An offscreen
@@ -15069,6 +15112,22 @@ mod tests {
         assert_eq!(runtime.diff_typography().line_height, 25.0);
         let rows = runtime.diff_layout().unwrap().rows(DiffMode::Inline);
         assert!((rows.offset(2) - rows.offset(1) - 25.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn diff_zoom_reuses_rows_but_family_changes_remeasure_with_the_reading_anchor() {
+        let card = CardId::new();
+        let (mut runtime,_) = diff_runtime(card);
+        load_fresh_diff(&mut runtime,card,two_change_model());
+        let baseline = Arc::clone(&runtime.diff_model().unwrap().before);
+        runtime.set_editor_font(Font::MONOSPACE,20.0);
+        assert!(Arc::ptr_eq(&runtime.diff_model().unwrap().before,&baseline),"zoom scales existing logical widths");
+        let anchor = runtime.current_diff_viewport();
+        runtime.set_editor_font(Font { family:iced::font::Family::SansSerif,..Font::MONOSPACE },20.0);
+        assert!(runtime.diff_model().is_none(),"another family needs native width measurement");
+        assert_eq!(runtime.current_diff_viewport().row,anchor.row);
+        drop(runtime.refresh_diff_preferences(card));
+        assert!(matches!(runtime.diff_state(&runtime.diff_basis),Some(DiffState::Loading { .. })));
     }
 
     #[test]
