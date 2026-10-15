@@ -421,27 +421,47 @@ mod settings_typography_tests {
 
     #[test]
     fn retained_stock_input_caret_metrics_follow_typography_and_keep_explicit_overrides() {
-        use cosmic::iced::{Size, advanced::{layout, text::Paragraph, widget::Tree}};
+        use cosmic::iced::{
+            Size,
+            advanced::{layout, text::Paragraph, widget::Tree},
+        };
         let _restore = typography_test_guard();
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
         let value = "Retained iii WWWW 0123456789";
         let families = installed_font_families(false);
         let first = families.first().expect("fixture requires installed fonts");
-        let second = families.iter().find(|family| *family != first)
+        let second = families
+            .iter()
+            .find(|family| *family != first)
             .expect("fixture requires two installed families");
         let input = |fixed, line_height| -> cosmic::Element<'_, ()> {
             let widget = cosmic::widget::text_input("Query", value)
-                .padding(4.0).line_height(line_height).on_input(|_| ());
-            if fixed { widget.font(Font::MONOSPACE).size(17.0).into() }
-            else { widget.into() }
+                .padding(4.0)
+                .line_height(line_height)
+                .on_input(|_| ());
+            if fixed {
+                widget.font(Font::MONOSPACE).size(17.0).into()
+            } else {
+                widget.into()
+            }
         };
         let metrics = |mut element: cosmic::Element<'_, ()>, tree: &mut Tree| {
             element.as_widget_mut().diff(tree);
-            element.as_widget_mut().layout(tree, &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(900.0, 500.0)));
-            let state = tree.state.downcast_ref::<cosmic::widget::text_input::State>();
+            element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(900.0, 500.0)),
+            );
+            let state = tree
+                .state
+                .downcast_ref::<cosmic::widget::text_input::State>();
             let paragraph = state.value.raw();
-            (paragraph.font(), paragraph.size(), paragraph.line_height(), paragraph.min_bounds())
+            (
+                paragraph.font(),
+                paragraph.size(),
+                paragraph.line_height(),
+                paragraph.min_bounds(),
+            )
         };
         configure_typography(first, 13.0, "", 14.0);
         let normal_line = LineHeight::default();
@@ -456,15 +476,26 @@ mod settings_typography_tests {
             assert_eq!(actual.1, cosmic::iced::Pixels(size));
             assert_eq!(actual.2, normal_line);
             let mut expected: cosmic::Element<'_, ()> = cosmic::widget::text(value)
-                .font(cosmic::font::default()).size(size).line_height(normal_line)
-                .shaping(cosmic::iced::advanced::text::Shaping::Advanced).into();
+                .font(cosmic::font::default())
+                .size(size)
+                .line_height(normal_line)
+                .shaping(cosmic::iced::advanced::text::Shaping::Advanced)
+                .into();
             let mut tree = Tree::new(expected.as_widget());
-            let node = expected.as_widget_mut().layout(&mut tree, &renderer,
-                &layout::Limits::new(Size::ZERO, Size::new(900.0, 500.0)));
+            let node = expected.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(900.0, 500.0)),
+            );
             assert!((actual.3.width - node.size().width).abs() < 0.1);
             assert!((actual.3.height - node.size().height).abs() < 0.1);
-            if size == 24.0 { assert!(actual.3.height > original.3.height + 10.0); }
-            assert_eq!(metrics(input(true, normal_line), &mut fixed), fixed_original);
+            if size == 24.0 {
+                assert!(actual.3.height > original.3.height + 10.0);
+            }
+            assert_eq!(
+                metrics(input(true, normal_line), &mut fixed),
+                fixed_original
+            );
         }
         let taller_line = LineHeight::Absolute(cosmic::iced::Pixels(31.0));
         let line_changed = metrics(input(false, taller_line), &mut retained);
