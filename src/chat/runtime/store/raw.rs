@@ -591,7 +591,7 @@ mod descriptor_budget_tests {
         let still_stored=store.raw_source_page(query(id)).unwrap();assert_eq!(still_stored.text,"{}");assert_eq!(still_stored.epoch,original.epoch);
         assert!(store.earlier().unwrap());let returned=store.window().unwrap();
         let current=returned.raw_source_parts.iter().find(|part|part.item_id==id).unwrap();assert_eq!(current,&original);
-        full(&mut store,id,r#"{"changed":true}"#);let rewritten=store.raw_source_page(query(id)).unwrap();assert_ne!(rewritten.epoch,original.epoch);
+        full(&mut store,id,r#"{"changed":true}"#);assert!(matches!(store.raw_source_page(query(id)),Err(SourceError::NotFound)),"actual reused native ID is revoked rather than treated as an append");
     }
 
 }
