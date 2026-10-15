@@ -24,6 +24,8 @@
 // COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 // IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 // CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+mod brackets;
+
 use crate::editor_history::{self as history, Excerpt, TextChange};
 use cosmic::iced::advanced::text::{
     editor::Editor as _,
@@ -273,6 +275,7 @@ where
     popup_at: Option<Position>,
     on_hover: Option<Box<dyn Fn(Option<Position>) -> Message + 'a>>,
     on_definition: Option<Box<dyn Fn(Position) -> Message + 'a>>,
+    on_navigation: Option<Box<dyn Fn(bool) -> Message + 'a>>,
     find_matches: &'a [(Position, Position)],
     current_match: usize,
     placeholder: Option<text::Fragment<'a>>,
@@ -311,6 +314,7 @@ where
             popup_at: None,
             on_hover: None,
             on_definition: None,
+            on_navigation: None,
             find_matches: &[],
             current_match: 0,
             placeholder: None,
@@ -396,6 +400,10 @@ where
     /// Sets the [`Font`] of the [`TextEditor`].
     ///
     /// [`Font`]: text::Renderer::Font
+    pub fn on_navigation(mut self, on_navigation: impl Fn(bool) -> Message + 'a) -> Self {
+        self.on_navigation = Some(Box::new(on_navigation)); self
+    }
+
     pub fn font(mut self, font: impl Into<Renderer::Font>) -> Self {
         self.font = Some(font.into());
         self
@@ -447,6 +455,7 @@ where
             popup_at: self.popup_at,
             on_hover: self.on_hover,
             on_definition: self.on_definition,
+            on_navigation: self.on_navigation,
             find_matches: self.find_matches,
             current_match: self.current_match,
             placeholder: self.placeholder,
@@ -929,6 +938,9 @@ where
     canvas_width: f32,
     wrapping: Wrapping,
     indentation: crate::editor_indent::Indentation,
+    cursor_metrics: Option<(Cursor, (usize, usize, usize))>,
+    bracket_match: Option<(Cursor, Option<(Position, Position)>)>,
+    auto_close: bool,
 }
 
 impl<R> Internal<R>
@@ -1020,12 +1032,17 @@ where
             canvas_width: 0.0,
             wrapping: Wrapping::None,
             indentation: crate::editor_indent::Indentation::default(),
+            cursor_metrics: None,
+            bracket_match: None,
+            auto_close: true,
         }))
     }
 
     /// Performs an [`Action`] on the [`Content`].
     pub fn perform(&mut self, mut action: Action) {
+        if action.is_edit() { let internal = self.0.get_mut(); internal.cursor_metrics = None; internal.bracket_match = None; }
         match action {
+            Action::Edit(Edit::Insert(character)) if self.smart_insert(character) => return,
             Action::Edit(Edit::Indent) => { self.indent(false); return; }
             Action::Edit(Edit::Unindent) => { self.indent(true); return; }
             Action::Edit(Edit::Enter) => { self.enter(); return; }
@@ -1065,6 +1082,104 @@ where
         }
 
         internal.editor.perform(action);
+    }
+
+    pub fn set_auto_close(&mut self, enabled: bool) { self.0.get_mut().auto_close = enabled; }
+
+    /// Cached by caret/selection and invalidated by text edits. Large selected
+    /// regions are counted without allocating a selected-text copy every frame.
+    pub fn cursor_metrics(&self) -> (usize, usize, usize) {
+        let mut internal = self.0.borrow_mut(); let cursor = internal.editor.cursor();
+        if let Some((cached, metrics)) = internal.cursor_metrics && cached == cursor { return metrics; }
+        let lines = &internal.editor.buffer().lines;
+        let column = lines.get(cursor.position.line).map_or(0, |line| line.text()[..cursor.position.column.min(line.text().len())].chars().count());
+        let selected = cursor.selection.map_or(0, |anchor| {
+            let (start, end) = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { (anchor, cursor.position) } else { (cursor.position, anchor) };
+            if start == end { return internal.editor.copy().map_or(0, |text| text.chars().count()); }
+            let mut count = 0;
+            for line in start.line..=end.line {
+                if let Some(text) = lines.get(line) {
+                    let from = if line == start.line { start.column.min(text.text().len()) } else { 0 };
+                    let to = if line == end.line { end.column.min(text.text().len()) } else { text.text().len() };
+                    count += text.text()[from..to].chars().count();
+                    if line < end.line { count += text.ending().as_str().chars().count(); }
+                }
+            }
+            count
+        });
+        let metrics = (cursor.position.line + 1, column + 1, selected);
+        internal.cursor_metrics = Some((cursor, metrics)); metrics
+    }
+
+    pub fn matching_brackets(&self) -> Option<(Position, Position)> {
+        let mut internal = self.0.borrow_mut(); let cursor = internal.editor.cursor();
+        if let Some((cached, pair)) = internal.bracket_match && cached == cursor { return pair; }
+        let find = || {
+            if cursor.selection.is_some() { return None; }
+            let lines = &internal.editor.buffer().lines;
+            let line = lines.get(cursor.position.line)?.text(); let column = cursor.position.column.min(line.len());
+            let candidate = line.get(column..)?.chars().next().filter(|character| "()[]{}".contains(*character)).map(|character| (column, character))
+                .or_else(|| line.get(..column)?.char_indices().next_back().filter(|(_, character)| "()[]{}".contains(*character)));
+            let (column, character) = candidate?; let first = Position { line: cursor.position.line, column };
+            let (open, close, forward) = match character { '(' => ('(', ')', true), '[' => ('[', ']', true), '{' => ('{', '}', true), ')' => ('(', ')', false), ']' => ('[', ']', false), '}' => ('{', '}', false), _ => return None };
+            let current = brackets::on_line(line, false).0;
+            if !current.iter().any(|(column, _)| *column == first.column) { return None; }
+            let mut depth = 1usize; let mut budget = 8 * 1024 * 1024usize;
+            if forward {
+                let mut block = false;
+                for (line_index, line) in lines.iter().enumerate().skip(first.line) {
+                    if line.text().len() > budget { return None; } budget -= line.text().len();
+                    let (tokens, end_block, _) = brackets::on_line(line.text(), block); block = end_block;
+                    for (column, character) in tokens {
+                        if line_index == first.line && column <= first.column { continue; }
+                        if character == open { depth += 1; } else if character == close { depth -= 1; if depth == 0 { return Some((first, Position { line: line_index, column })); } }
+                    }
+                }
+            } else {
+                let mut reverse_block = false;
+                for line_index in (0..=first.line).rev() {
+                    if lines[line_index].text().len() > budget { return None; } budget -= lines[line_index].text().len();
+                    let (tokens, end_block, starts_in_block) = brackets::on_line(lines[line_index].text(), false);
+                    if reverse_block && !end_block { continue; }
+                    reverse_block = starts_in_block;
+                    for (column, character) in tokens.into_iter().rev() {
+                        if line_index == first.line && column >= first.column { continue; }
+                        if character == close { depth += 1; } else if character == open { depth -= 1; if depth == 0 { return Some((Position { line: line_index, column }, first)); } }
+                    }
+                }
+            }
+            None
+        };
+        let pair = find(); internal.bracket_match = Some((cursor, pair)); pair
+    }
+
+    fn smart_insert(&mut self, character: char) -> bool {
+        if !self.0.get_mut().auto_close { return false; }
+        let cursor = self.cursor();
+        let next = self.with_line(cursor.position.line, |line, _| line.get(cursor.position.column..).and_then(|text| text.chars().next())).flatten();
+        if cursor.selection.is_none() && next == Some(character) && matches!(character, ')' | ']' | '}' | '\'' | '"') {
+            // Type over an existing closer, still applying the blank-line
+            // dedentation contract when a paired closer follows Enter.
+            let remove = if ")]}".contains(character) {
+                let indentation = self.0.get_mut().indentation;
+                self.with_line(cursor.position.line, |line, _| { let before = &line[..cursor.position.column]; if before.bytes().all(|byte| matches!(byte, b' ' | b'\t')) { indentation.outdent_bytes(before) } else { 0 } }).unwrap_or(0)
+            } else { 0 };
+            if remove > 0 { self.replace_range_recorded(Position { line: cursor.position.line, column: cursor.position.column - remove }, cursor.position, ""); }
+            self.set_cursor(Cursor { position: Position { line: cursor.position.line, column: cursor.position.column - remove + character.len_utf8() }, selection: None });
+            return true;
+        }
+        let closer = match character { '(' => ')', '[' => ']', '{' => '}', '\'' => '\'', '"' => '"', _ => return false };
+        let previous = self.with_line(cursor.position.line, |line, _| line.get(..cursor.position.column).and_then(|text| text.chars().next_back())).flatten();
+        if matches!(character, '\'' | '"') && previous.is_some_and(|previous| previous == '\\' || previous.is_alphanumeric()) { return false; }
+        if cursor.selection.is_none() && next.is_some_and(|next| next.is_alphanumeric()) { return false; }
+        let selected = self.selection().unwrap_or_default();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        let start = if (anchor.line, anchor.column) < (cursor.position.line, cursor.position.column) { anchor } else { cursor.position };
+        let mut inserted = String::with_capacity(selected.len() + 2); inserted.push(character); inserted.push_str(&selected); inserted.push(closer);
+        self.perform(Action::Edit(Edit::Paste(Arc::new(inserted))));
+        let end = self.cursor().position;
+        self.set_cursor(Cursor { position: Position { line: end.line, column: end.column.saturating_sub(closer.len_utf8()) }, selection: cursor.selection.map(|_| Position { line: start.line, column: start.column + character.len_utf8() }) });
+        true
     }
 
     pub fn configure_indentation(&mut self, indentation: crate::editor_indent::Indentation) {
@@ -2070,6 +2185,11 @@ where
             }
             _ => {}
         }
+        if let Event::Mouse(mouse::Event::ButtonPressed(button @ (mouse::Button::Back | mouse::Button::Forward))) = event
+            && cursor.is_over(layout.bounds()) && state.focus.is_some()
+            && let Some(on_navigation) = &self.on_navigation {
+            shell.publish(on_navigation(*button == mouse::Button::Forward)); shell.capture_event(); return;
+        }
         if !geometry.scrollable {
             state.scrollbar_grab = None;
             state.scrollbar_target = None;
@@ -2549,6 +2669,7 @@ where
     ) {
         let bounds = layout.bounds();
 
+        let brackets = if tree.state.downcast_ref::<State<Highlighter>>().focus.is_some() { self.content.matching_brackets() } else { None };
         let mut internal = self.content.0.borrow_mut();
         let state = tree.state.downcast_ref::<State<Highlighter>>();
 
@@ -2617,6 +2738,18 @@ where
 
         let horizontal = Vector::new(internal.horizontal_translation(), 0.0);
         for run in internal.editor.buffer().layout_runs() {
+            if let Some((open, close)) = brackets {
+                for position in [open, close].into_iter().filter(|position| position.line == run.line_i) {
+                    for glyph in run.glyphs.iter().filter(|glyph| glyph.start <= position.column && glyph.end > position.column) {
+                        let rect = Rectangle::new(Point::new(text_bounds.x + horizontal.x + glyph.x, text_bounds.y + run.line_top), Size::new(glyph.w, run.line_height));
+                        if let Some(bounds) = text_bounds.intersection(&rect) {
+                            let mut wash = style.selection; wash.a *= 0.2;
+                            renderer.fill_quad(renderer::Quad { bounds, border: Border { width: 1.0, color: style.selection, ..Default::default() }, ..Default::default() }, wash);
+                        }
+                    }
+                }
+            }
+
             let first = self
                 .find_matches
                 .partition_point(|(_, end)| end.line < run.line_i);
@@ -5265,6 +5398,30 @@ mod tests {
         assert_eq!(content.text(), "one\r\ntwo\n");
         assert!(content.replace(at, "e\r\ntw", "E", &[]));
         assert_eq!(content.text(), "onEo\n");
+    }
+
+    #[test]
+    fn brackets_pair_highlight_type_over_and_respect_the_setting() {
+        for (open, close) in [('(', ')'), ('[', ']'), ('{', '}'), ('"', '"'), ('\'', '\'')] {
+            let mut content: Content = Content::new();
+            content.perform_edit(Edit::Insert(open)).unwrap();
+            assert_eq!(content.text(), format!("{open}{close}"));
+            assert_eq!(content.cursor().position.column, 1);
+            if open != '"' && open != '\'' { assert_eq!(content.matching_brackets(), Some((Position { line: 0, column: 0 }, Position { line: 0, column: 1 }))); }
+            assert!(content.perform_edit(Edit::Insert(close)).is_none());
+            assert_eq!(content.text(), format!("{open}{close}")); assert_eq!(content.cursor().position.column, 2);
+        }
+        let mut content: Content = Content::new(); content.set_auto_close(false);
+        content.perform_edit(Edit::Insert('(')).unwrap(); assert_eq!(content.text(), "(");
+    }
+
+    #[test]
+    fn cursor_metrics_count_unicode_and_selection_without_repeated_text_copies() {
+        let mut content: Content = Content::with_text("aé\n漢x");
+        content.set_cursor(Cursor { position: Position { line: 1, column: 3 }, selection: Some(Position { line: 0, column: 1 }) });
+        assert_eq!(content.cursor_metrics(), (2, 2, 3));
+        assert_eq!(content.cursor_metrics(), (2, 2, 3));
+        content.perform_edit(Edit::Insert('b')).unwrap(); assert_eq!(content.cursor_metrics().2, 0);
     }
 
     #[test]

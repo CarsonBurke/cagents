@@ -563,6 +563,10 @@ fn settings_category_controls<'a>(
                     },
                 );
                 options.push(setting_field(
+                    "Auto-close brackets and quotes", "Insert matching closers and type over existing closing brackets and quotes.",
+                    crate::settings_widgets::toggle("Auto-close brackets and quotes", draft.editor_auto_close, |enabled| Message::SettingsChanged { field: SettingsField::EditorAutoClose, value: enabled.to_string() }),
+                ));
+                options.push(setting_field(
                     "Tab width", "Display tab stops and default space indentation (1–16). File indentation and .editorconfig take precedence.",
                     crate::ui_controls::field::text("4", &draft.editor_tab_width)
                         .on_input(|value| Message::SettingsChanged { field: SettingsField::EditorTabWidth, value })
