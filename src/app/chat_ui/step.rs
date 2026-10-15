@@ -659,8 +659,10 @@ impl Runtime {
                 action: chat::CommandAction::Run,
                 ..
             } if coordinated.is_none() && !description.is_empty() && description != command => {
+                // Bound the text before paragraph shaping, like the primary preview.
+                let description = Self::short_description(description, 512);
                 preview.push(
-                    design::caption(turn::first_line(description).to_owned())
+                    design::caption(turn::first_line(&description).to_owned())
                         .wrapping(iced::widget::text::Wrapping::None)
                         .ellipsize(iced::advanced::text::Ellipsize::End(
                             iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -926,75 +928,82 @@ mod presentation_tests {
     #[test]
     fn command_row_renders_command_before_description() {
         use iced::advanced::{Layout, layout, widget::Tree};
-        let item = chat::Item {
-            id: "bash".into(),
-            role: chat::Role::Assistant,
-            started_at: None,
-            at: None,
-            content: ItemContent::Command {
-                label: "Run tests for module 295".into(),
-                command: "cargo test --lib module_295".into(),
-                working_directory: "/project".into(),
-                action: chat::CommandAction::Run,
-                status: ToolStatus::Succeeded,
-                exit_code: Some(0),
-                duration_ms: Some(120),
-                output: String::new(),
-            },
-        };
-        let session = fresh_chat_session(
-            Provider::Claude,
-            TerminalId::new(),
-            "/project".into(),
-            &Account::system(Provider::Claude),
-            false,
-        )
-        .unwrap();
-        let handle = Arc::new(ClientHandle::fixture(
-            session.clone(),
-            Snapshot {
-                ready: true,
-                items: vec![Arc::new(item.clone())],
-                ..Snapshot::default()
-            },
-        ));
-        let runtime = Runtime::new(
-            Target {
-                card: CardId::new(),
-                generation: 1,
-            },
-            session,
-            Connection::Live(handle),
-            true,
-            crate::settings::EditorSyntaxTheme::default(),
-        );
-        let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
-        let mut tree = Tree::new(&element);
         let renderer = crate::app::tests::headless_renderer();
-        let node = element.as_widget_mut().layout(
-            &mut tree,
-            &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(956.0, 500.0)),
-        );
-        let accessible = element.as_widget().a11y_nodes(
-            Layout::new(&node),
-            &tree,
-            iced::mouse::Cursor::Unavailable,
-        );
-        let nodes = accessible
-            .root()
-            .iter()
-            .chain(accessible.children())
-            .collect::<Vec<_>>();
-        assert!(
-            nodes
+        for (description, expected_description) in [
+            (
+                "Run tests for module 295".to_owned(),
+                "Run tests for module 295".to_owned(),
+            ),
+            ("λ".repeat(4_096), format!("{}…", "λ".repeat(512))),
+        ] {
+            let item = chat::Item {
+                id: "bash".into(),
+                role: chat::Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Command {
+                    label: description,
+                    command: "cargo test --lib module_295".into(),
+                    working_directory: "/project".into(),
+                    action: chat::CommandAction::Run,
+                    status: ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: Some(120),
+                    output: String::new(),
+                },
+            };
+            let session = fresh_chat_session(
+                Provider::Claude,
+                TerminalId::new(),
+                "/project".into(),
+                &Account::system(Provider::Claude),
+                false,
+            )
+            .unwrap();
+            let handle = Arc::new(ClientHandle::fixture(
+                session.clone(),
+                Snapshot {
+                    ready: true,
+                    items: vec![Arc::new(item.clone())],
+                    ..Snapshot::default()
+                },
+            ));
+            let runtime = Runtime::new(
+                Target {
+                    card: CardId::new(),
+                    generation: 1,
+                },
+                session,
+                Connection::Live(handle),
+                true,
+                crate::settings::EditorSyntaxTheme::default(),
+            );
+            let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, iced::Size::new(956.0, 500.0)),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            let nodes = accessible
+                .root()
                 .iter()
-                .any(|node| node.node().label() == Some("Ran cargo test --lib module_295"))
-        );
-        assert!(nodes.iter().any(
-            |node| node.node().label() == Some("Run tests for module 295")
-                || node.node().value() == Some("Run tests for module 295")
-        ));
+                .chain(accessible.children())
+                .collect::<Vec<_>>();
+            assert!(
+                nodes
+                    .iter()
+                    .any(|node| node.node().label() == Some("Ran cargo test --lib module_295"))
+            );
+            assert!(nodes.iter().any(|node| node.node().label()
+                == Some(expected_description.as_str())
+                || node.node().value() == Some(expected_description.as_str())));
+        }
     }
 
     #[test]
