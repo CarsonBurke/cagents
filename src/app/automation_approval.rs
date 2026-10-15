@@ -835,8 +835,13 @@ mod tests {
             drop(app.update(Message::AutomationApproval(Action::Decide {id,revision,generation:current,approved:true})));
             assert!(!app.automation_approval.deciding);
         }
+        drop(app.update(Message::AutomationApproval(Action::Decide {
+            id:proposal.id,revision:proposal.revision,generation:current,approved:true,
+        })));
+        assert!(app.automation_approval.deciding);
         let mut stale=proposal.clone();stale.state=ProposalState::Declined;
         drop(app.update(Message::AutomationApproval(Action::Finished {generation:old,result:Arc::new(Ok(stale))})));
+        assert!(app.automation_approval.deciding, "an old completion cannot retire the new decision");
         assert_eq!(app.automation_approval.proposal,Some(proposal));
     }
 
