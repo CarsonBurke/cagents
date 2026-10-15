@@ -38,17 +38,17 @@
 //!
 //! A home is removed by renaming it aside within its provider directory and
 //! then deleting the renamed tree. Nothing is followed on the way:
-//! the path is rebuilt from the account's key rather than taken from
-//! anywhere, every component of it is checked not to be a link, the directory
-//! must be a real one owned by this user, and the standard library's
-//! `remove_dir_all` unlinks symbolic links inside the tree rather than
-//! descending into them - so the shared entries above are unlinked, not
-//! emptied.
+//! the current operation retains the exact directory and parent descriptors.
+//! Cleanup walks beneath those descriptors and unlinks symlinks themselves.
+//! Prior parked names and unregistered homes are retained until an explicit
+//! scoped operation authenticates them; naming/age alone never authorizes a
+//! delete or rename.
 
 use std::{
     fs, io,
     io::{Read, Write},
     path::{Path, PathBuf},
+    os::{fd::AsRawFd, unix::{ffi::OsStrExt, fs::{MetadataExt, OpenOptionsExt}}},
     time::Duration,
 };
 
@@ -57,8 +57,8 @@ use uuid::Uuid;
 use crate::agent::Provider;
 
 /// Where a removal parks a home while it is deleted, so a removal that is
-/// interrupted leaves a name nothing else uses, and the next start finishes
-/// it.
+/// interrupted leaves the files intact; a later loader must not infer that
+/// no actor can still use that inode.
 const REMOVING_PREFIX: &str = ".removing-";
 const CONFIG_LIMIT: u64 = 8 * 1024 * 1024;
 
@@ -89,6 +89,96 @@ pub fn shared_entries(provider: Provider) -> &'static [&'static str] {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Homes {
     root: PathBuf,
+}
+
+/// Exact current-operation retirement, never reconstructed from a parked name.
+/// Both descriptors survive pathname replacement and are held until cleanup.
+#[derive(Debug)]
+pub(crate) struct ParkedRemoval {
+    provider: Provider,
+    key: Uuid,
+    parent: fs::File,
+    directory: fs::File,
+    name: std::ffi::OsString,
+}
+
+impl ParkedRemoval {
+    pub(crate) fn account(&self) -> (Provider, Uuid) { (self.provider, self.key) }
+    #[cfg(test)]
+    pub(crate) fn path_for_test(&self) -> PathBuf {
+        fs::read_link(descriptor_path(&self.directory)).unwrap()
+    }
+    pub(crate) fn identity(&self) -> io::Result<(u64, u64)> {
+        let metadata = self.directory.metadata()?;
+        Ok((metadata.dev(), metadata.ino()))
+    }
+    /// Delete only the tree captured by this operation. Old parked names carry
+    /// no ownership proof and are deliberately never enumerated here.
+    pub(crate) fn finish(self) -> io::Result<()> {
+        let parent = descriptor_path(&self.parent);
+        let named = parent.join(&self.name);
+        require_same_directory(&self.directory, &named)?;
+        let mut remaining = 1_000_000usize;
+        remove_contents(&self.directory, 0, &mut remaining)?;
+        require_same_directory(&self.directory, &named)?;
+        unlink_entry(&self.parent, &self.name, libc::AT_REMOVEDIR)
+    }
+}
+
+fn descriptor_path(file: &fs::File) -> PathBuf {
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+fn open_directory(path: &Path) -> io::Result<fs::File> {
+    fs::OpenOptions::new().read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)
+}
+
+fn require_same_directory(file: &fs::File, path: &Path) -> io::Result<()> {
+    let held = file.metadata()?;
+    let named = fs::symlink_metadata(path)?;
+    if !named.is_dir() || (held.dev(), held.ino()) != (named.dev(), named.ino()) {
+        return Err(io::Error::other("The parked account directory changed; its files were retained"));
+    }
+    Ok(())
+}
+
+fn unlink_entry(parent: &fs::File, name: &std::ffi::OsStr, flags: libc::c_int) -> io::Result<()> {
+    let name = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| io::Error::other("Account entry contains a zero byte"))?;
+    // SAFETY: the owned directory descriptor and CString outlive unlinkat.
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), flags) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+fn remove_contents(directory: &fs::File, depth: usize, remaining: &mut usize) -> io::Result<()> {
+    if depth > 256 { return Err(io::Error::other("Account tree exceeds the cleanup depth bound")); }
+    let anchored = descriptor_path(directory);
+    let device = directory.metadata()?.dev();
+    for entry in fs::read_dir(&anchored)? {
+        let entry = entry?;
+        *remaining = remaining.checked_sub(1)
+            .ok_or_else(|| io::Error::other("Account tree exceeds the cleanup entry bound"))?;
+        let path = anchored.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.is_dir() {
+            // Never follow a substituted link or cross a mounted filesystem.
+            let child = open_directory(&path)?;
+            require_same_directory(&child, &path)?;
+            if child.metadata()?.dev() != device {
+                return Err(io::Error::other("Account cleanup refuses a mounted filesystem"));
+            }
+            remove_contents(&child, depth + 1, remaining)?;
+            require_same_directory(&child, &path)?;
+            unlink_entry(directory, &entry.file_name(), libc::AT_REMOVEDIR)?;
+        } else {
+            // Symlinks and ordinary files are unlinked from the pinned parent.
+            unlink_entry(directory, &entry.file_name(), 0)?;
+        }
+    }
+    Ok(())
 }
 
 impl Homes {
@@ -180,14 +270,14 @@ impl Homes {
     /// an error: removing an account twice leaves it just as removed.
     pub fn remove(&self, provider: Provider, key: Uuid) -> io::Result<()> {
         if let Some(parked) = self.park(provider, key)? {
-            remove_parked(&parked)?;
+            parked.finish()?;
         }
         Ok(())
     }
 
     /// Rename under the lifecycle/registry locks; delete the parked tree only
     /// after releasing them, since provider caches can be large.
-    pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<PathBuf>> {
+    pub(crate) fn park(&self, provider: Provider, key: Uuid) -> io::Result<Option<ParkedRemoval>> {
         let path = self.path(provider, key);
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -196,87 +286,28 @@ impl Homes {
         }
         crate::secure_file::reject_symlink_components(&path)?;
         crate::secure_file::validate_owned_directory(&path)?;
-        let parked = self
-            .provider_directory(provider)
-            // An interrupted removal may still hold a parked tree when an
-            // older CLI recreates the original home. Each retirement gets a
-            // unique name, so neither tree prevents the other being removed.
-            .join(format!("{REMOVING_PREFIX}{}", Uuid::new_v4().hyphenated()));
-        fs::rename(&path, &parked)?;
-        Ok(Some(parked))
+        let parent = open_directory(&self.provider_directory(provider))?;
+        let source_name = std::ffi::OsString::from(key.hyphenated().to_string());
+        let source = descriptor_path(&parent).join(&source_name);
+        let directory = open_directory(&source)?;
+        require_same_directory(&directory, &source)?;
+        let name = std::ffi::OsString::from(format!("{REMOVING_PREFIX}{}", Uuid::new_v4().hyphenated()));
+        let from = std::ffi::CString::new(source_name.as_bytes()).unwrap();
+        let to = std::ffi::CString::new(name.as_bytes()).unwrap();
+        // SAFETY: both single-component names and the owned parent descriptor
+        // outlive renameat2. NOREPLACE preserves another operation's evidence.
+        if unsafe { libc::renameat2(parent.as_raw_fd(), from.as_ptr(), parent.as_raw_fd(), to.as_ptr(), libc::RENAME_NOREPLACE) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        require_same_directory(&directory, &descriptor_path(&parent).join(&name))?;
+        parent.sync_all()?;
+        Ok(Some(ParkedRemoval { provider, key, parent, directory, name }))
     }
 
-    /// Called only with a supported, existing registry and both locks held.
-    /// A grace period also protects homes being created by an older window
-    /// that predates atomic creation/registration.
-    pub(crate) fn park_orphans(&self, registry: &super::registry::Registry) -> io::Result<()> {
-        for provider in super::Account::PROVIDERS {
-            let directory = self.provider_directory(provider);
-            if !directory.exists() {
-                continue;
-            }
-            crate::secure_file::reject_symlink_components(&directory)?;
-            crate::secure_file::validate_owned_directory(&directory)?;
-            for entry in fs::read_dir(&directory)? {
-                let entry = entry?;
-                let Some(key) = entry
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| Uuid::parse_str(name).ok())
-                else {
-                    continue;
-                };
-                if entry.path() != self.path(provider, key) {
-                    continue;
-                }
-                if registry.contains_managed_home(self, provider, key) {
-                    continue;
-                }
-                let metadata = entry.path().symlink_metadata()?;
-                if !metadata.is_dir()
-                    || metadata.modified()?.elapsed().unwrap_or_default() < ORPHAN_AGE
-                {
-                    continue;
-                }
-                self.park(provider, key)?;
-            }
-        }
-        Ok(())
-    }
+    /// Legacy parked names have no retained operation/census authority.
+    /// Keep them until an explicit operation authenticates that exact tree.
+    pub fn finish_removals(&self) {}
 
-    /// Finishes removals an earlier run was interrupted in.
-    ///
-    /// Nothing else here is ever deleted on its own: a home the registry
-    /// does not name may belong to a registry this run cannot read - a newer
-    /// cagents, a reset configuration directory - and holds a login and its
-    /// history. Sign-ins that never finished are the registry's pending
-    /// entries, which the accounts view verifies before removing anything.
-    pub fn finish_removals(&self) {
-        for provider in super::Account::PROVIDERS {
-            let directory = self.provider_directory(provider);
-            if crate::secure_file::reject_symlink_components(&directory).is_err()
-                || crate::secure_file::validate_owned_directory(&directory).is_err()
-            {
-                continue;
-            }
-            let Ok(entries) = fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let Some(key) = name
-                    .to_str()
-                    .and_then(|name| name.strip_prefix(REMOVING_PREFIX))
-                    .and_then(|key| Uuid::parse_str(key).ok())
-                else {
-                    continue;
-                };
-                let _ = remove_parked(
-                    &directory.join(format!("{REMOVING_PREFIX}{}", key.hyphenated())),
-                );
-            }
-        }
-    }
 }
 
 /// Configuration is user-authored and can contain MCP environment/header
@@ -388,13 +419,7 @@ fn seed_claude_mcp(source: &Path, home: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Deletes a home that has been renamed aside, after checking it is still a
-/// real directory of this user's.
-fn remove_parked(parked: &Path) -> io::Result<()> {
-    crate::secure_file::reject_symlink_components(parked)?;
-    crate::secure_file::validate_owned_directory(parked)?;
-    fs::remove_dir_all(parked)
-}
+
 
 /// Links each of `provider`'s shared entries that `system_home` has and
 /// `home` does not. Best effort: an entry that cannot be linked leaves the
@@ -645,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn only_interrupted_removals_are_finished_on_their_own() {
+    fn interrupted_removal_names_never_authorize_a_global_sweep() {
         let directory = tempfile::tempdir().unwrap();
         let homes = Homes::at(directory.path().join("accounts"));
         let (_, unknown_home) = homes.create(Provider::Claude, None).unwrap();
@@ -659,7 +684,7 @@ mod tests {
         fs::create_dir_all(&foreign).unwrap();
 
         homes.finish_removals();
-        assert!(!parked.exists(), "an interrupted removal is finished");
+        assert!(parked.exists(), "a parked name alone never proves final retirement");
         assert!(
             unknown_home.exists() && codex_home.exists(),
             "a home no registry names is never taken for garbage"
@@ -669,4 +694,47 @@ mod tests {
             libc::geteuid()
         });
     }
+    #[test]
+    fn scoped_cleanup_deletes_only_its_captured_tree_and_preserves_replacements() {
+        let temporary = tempfile::tempdir().unwrap();
+        let homes = Homes::at(temporary.path().join("accounts"));
+        let (a, path_a) = homes.create(Provider::Claude, None).unwrap();
+        fs::write(path_a.join("keep"), b"unrelated").unwrap();
+        let abandoned = homes.park(Provider::Claude, a).unwrap().unwrap();
+        let parked_a = homes.provider_directory(Provider::Claude).join(&abandoned.name);
+        drop(abandoned); // An interrupted earlier operation has no current receipt.
+        let (b, path_b) = homes.create(Provider::Codex, None).unwrap();
+        fs::write(path_b.join("delete"), b"selected").unwrap();
+        homes.park(Provider::Codex, b).unwrap().unwrap().finish().unwrap();
+        homes.finish_removals();
+        assert_eq!(fs::read(parked_a.join("keep")).unwrap(), b"unrelated");
+        assert!(!path_b.exists());
+
+        let (c, path_c) = homes.create(Provider::Codex, None).unwrap();
+        fs::write(path_c.join("original"), b"kept").unwrap();
+        let receipt = homes.park(Provider::Codex, c).unwrap().unwrap();
+        let name = homes.provider_directory(Provider::Codex).join(&receipt.name);
+        let moved = temporary.path().join("moved-original");
+        fs::rename(&name, &moved).unwrap();
+        fs::create_dir(&name).unwrap();
+        fs::write(name.join("replacement"), b"untouched").unwrap();
+        assert!(receipt.finish().is_err());
+        assert_eq!(fs::read(moved.join("original")).unwrap(), b"kept");
+        assert_eq!(fs::read(name.join("replacement")).unwrap(), b"untouched");
+        let (d, path_d) = homes.create(Provider::Codex, None).unwrap();
+        fs::write(path_d.join("selected"), b"original parent").unwrap();
+        let receipt = homes.park(Provider::Codex, d).unwrap().unwrap();
+        let parked_name = receipt.name.clone();
+        let parent = homes.provider_directory(Provider::Codex);
+        let original_parent = temporary.path().join("original-provider-directory");
+        fs::rename(&parent, &original_parent).unwrap();
+        fs::create_dir(&parent).unwrap();
+        fs::create_dir(parent.join(&parked_name)).unwrap();
+        fs::write(parent.join(&parked_name).join("replacement"), b"foreign parent").unwrap();
+        receipt.finish().unwrap();
+        assert!(!original_parent.join(&parked_name).exists());
+        assert_eq!(fs::read(parent.join(&parked_name).join("replacement")).unwrap(), b"foreign parent");
+
+    }
+
 }

@@ -311,9 +311,10 @@ fn execute_with_commits(
                 Err(error) => {
                     // A launch recipe failure must not strand an unused home
                     // and pending registry entry before the terminal opens.
-                    let _ = commits
-                        .apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())));
-                    homes.finish_removals();
+                    if let Ok((_, _, Some(parked))) = commits
+                        .apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(()))) {
+                        let _ = parked.finish();
+                    }
                     return Err(error);
                 }
             };
@@ -393,9 +394,9 @@ fn execute_with_commits(
                 return Err("The provider needs this account to sign in again".into());
             }
             if !probe::confirms_login(identity.as_ref(), snapshot.status) {
-                let (registry, _) = commits
+                let (registry, _, parked) = commits
                     .apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())))?;
-                homes.finish_removals();
+                if let Some(parked) = parked { parked.finish().map_err(|error| error.to_string())?; }
                 return serde_json::to_value(Settled::Abandoned(Some(registry)))
                     .map_err(|error| error.to_string());
             }
@@ -434,10 +435,10 @@ fn execute_with_commits(
                 Err(existing) => {
                     (commits.verify)()?;
                     runtime.block_on(probe::logout_locked(account))?;
-                    let (registry, _) = commits.apply(|| {
+                    let (registry, _, parked) = commits.apply(|| {
                         store.park_home_checked(&homes, provider, key, false, || Ok(()))
                     })?;
-                    homes.finish_removals();
+                    if let Some(parked) = parked { parked.finish().map_err(|error| error.to_string())?; }
                     Settled::Duplicate {
                         existing,
                         registry: Some(registry),
@@ -459,9 +460,9 @@ fn execute_with_commits(
             let lock_cache =
                 super::cache::Cache::installation().ok_or("Account storage cannot be locked")?;
             let _probe_locks = probe::lock_accounts(&lock_cache, &[&account])?;
-            let (registry, _) = commits
+            let (registry, _, parked) = commits
                 .apply(|| store.park_home_checked(&homes, provider, key, false, || Ok(())))?;
-            homes.finish_removals();
+            if let Some(parked) = parked { parked.finish().map_err(|error| error.to_string())?; }
             serde_json::to_value(Settled::Abandoned(Some(registry)))
                 .map_err(|error| error.to_string())
         }
@@ -619,9 +620,21 @@ fn remove_account_with_commits(
             // effect. Explicit deletion still works without an installed CLI.
             let logout_error = logout(account.clone()).err();
             if let Some(permit) = &deletion_permit { permit.verify()?; }
-            let (registry, error) = commits
+            let (registry, error, parked) = commits
                 .apply(|| store.park_home_checked(homes, account.provider, key, true, || Ok(())))?;
-            homes.finish_removals();
+            let cleanup_error = parked.and_then(|parked| {
+                match &deletion_permit {
+                    Some(permit) => permit.finish_parked(parked).err(),
+                    None => {
+                        #[cfg(test)] { parked.finish().err().map(|error| error.to_string()) }
+                        #[cfg(not(test))] { let _ = parked; Some("Account cleanup lost its deletion permit; files were retained".into()) }
+                    }
+                }
+            });
+            let error = match (error, cleanup_error) {
+                (Some(error), Some(cleanup)) => Some(format!("{error}; {cleanup}")),
+                (error, cleanup) => error.or(cleanup),
+            };
             let error = match (error, annotation_warning) {
                 (Some(error), Some(warning)) => Some(format!("{error}; {warning}")),
                 (error, warning) => error.or(warning),

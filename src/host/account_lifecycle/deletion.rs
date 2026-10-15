@@ -116,6 +116,23 @@ impl DeletionPermit<'_> {
         self.verify()
     }
 
+    /// The intended registry removal/path rename has already committed. Keep
+    /// the original reservation and pinned inode authority, rather than
+    /// reauthorizing a missing original spelling or any other parked tree.
+    pub(crate) fn finish_parked(&self, parked: crate::account::home::ParkedRemoval) -> Result<(), String> {
+        if parked.account() != (self.account.provider, self.account.registry_key().ok_or("The deletion has no managed account key")?)
+            || Some(parked.identity().map_err(|error| error.to_string())?) != self.home.identity
+        { return Err("The parked tree is not this deletion's reserved physical account; its files were retained".into()); }
+        {
+            let entries = self.reservation.map.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = entries.get(&self.reservation.token).ok_or("The deletion reservation was released; parked files were retained")?;
+            if !entry.homes.iter().any(|home| home.identity == self.home.identity && home.canonical == self.home.canonical) {
+                return Err("The deletion reservation changed; parked files were retained".into());
+            }
+        }
+        parked.finish().map_err(|error| error.to_string())
+    }
+
     pub(crate) fn verify(&self) -> Result<(), String> {
         self.reservation.verify()?;
         let namespaces = self.reservation.map.lock().unwrap_or_else(|p| p.into_inner())
@@ -809,5 +826,46 @@ mod tests {
         std::fs::remove_file(path.join("keep")).unwrap();std::fs::remove_dir(&path).unwrap();std::fs::rename(retained,&path).unwrap();
         reservation.map.lock().unwrap().remove(&reservation.token);
         assert!(permit.verify().is_err(),"an invalidated reservation cannot retain deletion authority");
+        // An earlier interrupted removal can be explicitly linked and used by
+        // a live actor. Deleting a distinct B must never sweep that parked A.
+        let (parked_key, parked_source)=homes.create(Provider::Claude,None).unwrap();
+        std::fs::write(parked_source.join("keep"),b"live parked A").unwrap();
+        let parked_receipt=homes.park(Provider::Claude,parked_key).unwrap().unwrap();
+        let parked_a=parked_receipt.path_for_test();
+        drop(parked_receipt); // Prior-operation evidence intentionally lost.
+        store.update(|registry|registry.register(Registered {key:uuid::Uuid::new_v4(),provider:Provider::Claude,linked_home:Some(parked_a.clone()),label:None,email:None,organization:None,added_at:0},&[]).unwrap()).unwrap();
+        let mut parked_terminal=terminal.clone();parked_terminal.id=crate::model::TerminalId::new();
+        let parked_environment=crate::terminal_ipc::ChatExecutionEnvironment([
+            ("CLAUDE_CONFIG_DIR".into(),parked_a.display().to_string()),
+            ("CODEX_HOME".into(),root.join("home").display().to_string()),
+            ("HOME".into(),root.join("home").display().to_string()),
+            ("PATH".into(),"/usr/bin:/bin".into()),
+        ].into());
+        let live=crate::terminal::TerminalHandle::spawn(parked_terminal.clone(),crate::terminal::TerminalConfig {
+            execution_environment:Some(parked_environment.clone()),
+            holder_recovery:Some(crate::terminal::holder::Recovery {source:parked_terminal.clone(),previous_sources:Vec::new(),relaunches:Vec::new(),options:Default::default(),execution_environment:Some(parked_environment.clone())}),
+            ..Default::default()
+        },|_|{}).unwrap();
+        {
+            let mut state=host.lock().unwrap();
+            state.finish_spawn(0,parked_terminal.clone(),live.clone(),true).unwrap();
+            state.terminals.get_mut(&parked_terminal.id).unwrap().execution_environment=Some(parked_environment);
+        }
+        let (b_key,b_path)=homes.create(Provider::Codex,None).unwrap();
+        std::fs::write(b_path.join("delete"),b"selected B").unwrap();
+        store.update(|registry|registry.register(Registered {key:b_key,provider:Provider::Codex,linked_home:None,label:None,email:None,organization:None,added_at:0},&[]).unwrap()).unwrap();
+        let b=Account::managed(Provider::Codex,b_key,b_path.clone());
+        let b_reservation=Reservation::install(&host,&[b.clone()]).unwrap();
+        let b_permit=b_reservation.deletion_permit(&host,&b).unwrap();
+        let (_,warning,b_parked)=store.park_home_checked(&homes,Provider::Codex,b_key,true,||Ok(())).unwrap();
+        assert!(warning.is_none());
+        b_permit.finish_parked(b_parked.unwrap()).unwrap();
+        homes.finish_removals();store.load_and_sweep(&homes).unwrap();
+        assert!(!b_path.exists());
+        assert_eq!(std::fs::read(parked_a.join("keep")).unwrap(),b"live parked A");
+        assert!(!live.is_completed(),"unrelated parked A actor remains alive");
+        live.close_with_receipt(&parked_terminal,&proof).unwrap();
+        host.lock().unwrap().terminals.remove(&parked_terminal.id);
+
     }
 }

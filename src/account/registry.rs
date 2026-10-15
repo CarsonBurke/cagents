@@ -934,8 +934,9 @@ impl Store {
     }
 
     /// Forget and park under the same lifecycle lock as spawning. A failed
-    /// deletion cannot make an unregistered home launchable again; the sweep
-    /// finishes parked trees later. Linked aliases still protect their home.
+    /// deletion cannot make an unregistered home launchable again. Only this
+    /// operation's exact parked receipt may delete its tree; a failed cleanup
+    /// retains files for explicit recovery. Linked aliases protect their home.
     pub fn remove_home(
         &self,
         homes: &Homes,
@@ -957,9 +958,9 @@ impl Store {
         registered: bool,
         before_removal: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<(Registry, Option<String>)> {
-        let result = self.park_home_checked(homes, provider, key, registered, before_removal)?;
-        homes.finish_removals();
-        Ok(result)
+        let (registry, warning, parked) = self.park_home_checked(homes, provider, key, registered, before_removal)?;
+        let cleanup = parked.and_then(|parked| parked.finish().err()).map(|error| error.to_string());
+        Ok((registry, warning.or(cleanup)))
     }
 
     /// Short ownership/registration transaction. Tree sweeping belongs outside
@@ -971,8 +972,8 @@ impl Store {
         key: Uuid,
         registered: bool,
         before_removal: impl FnOnce() -> io::Result<()>,
-    ) -> io::Result<(Registry, Option<String>)> {
-        let (registry, error) = {
+    ) -> io::Result<(Registry, Option<String>, Option<super::home::ParkedRemoval>)> {
+        let (registry, error, parked) = {
             let _lifecycle = homes.lifecycle_lock()?;
             let (registry, retained) = self.update_checked(|registry| {
                 if registered {
@@ -986,17 +987,17 @@ impl Store {
                 }
                 Ok(retained)
             })?;
-            let error = if retained {
-                Some("The files were retained because another account still uses this home".into())
+            let (error, parked) = if retained {
+                (Some("The files were retained because another account still uses this home".into()), None)
             } else {
-                homes
-                    .park(provider, key)
-                    .err()
-                    .map(|error| error.to_string())
+                match homes.park(provider, key) {
+                    Ok(parked) => (None, parked),
+                    Err(error) => (Some(error.to_string()), None),
+                }
             };
-            (registry, error)
+            (registry, error, parked)
         };
-        Ok((registry, error))
+        Ok((registry, error, parked))
     }
 
     pub fn register_pending(
@@ -1076,23 +1077,13 @@ impl Store {
         Ok((registry, result))
     }
 
-    /// Loads the registry, then finishes any removal an earlier run was
-    /// interrupted in - outside the lock, since deleting a home can take a
-    /// while and a parked home is no account's any more.
+    /// Load without mutating unregistered or previously parked directories.
+    /// Names/age/absence from the registry never establish retirement.
     pub fn load_and_sweep(&self, homes: &Homes) -> io::Result<Registry> {
-        let registry = {
-            let _lifecycle = homes.lifecycle_lock()?;
-            let _lock = self.lock()?;
-            let exists = self.path().try_exists()?;
-            let registry = read(&self.path())?;
-            if exists && !registry.is_newer() {
-                homes.park_orphans(&registry)?;
-            }
-            registry
-        };
-        homes.finish_removals();
-        Ok(registry)
+        let _lifecycle = homes.lifecycle_lock()?;
+        self.load()
     }
+
 }
 
 fn read(path: &Path) -> io::Result<Registry> {
@@ -1291,7 +1282,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_sweep_preserves_pending_registered_linked_and_recent_homes() {
+    fn registry_loading_preserves_all_homes_without_scoped_retirement() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
@@ -1317,10 +1308,7 @@ mod tests {
             })
             .unwrap();
         store.load_and_sweep(&homes).unwrap();
-        for index in [0, 1, 2, 4] {
-            assert!(homes_created[index].1.is_dir());
-        }
-        assert!(!homes_created[3].1.exists());
+        for (_, home) in &homes_created { assert!(home.is_dir()); }
         let recipe = account_recipe(&directory.path().join("unmanaged"));
         assert!(
             store
@@ -1331,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_sweep_finishes_an_interrupted_removal_and_a_recreated_home() {
+    fn registry_loading_preserves_interrupted_and_recreated_homes() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
@@ -1345,12 +1333,12 @@ mod tests {
             .unwrap()
             .set_times(fs::FileTimes::new().set_modified(std::time::SystemTime::UNIX_EPOCH))
             .unwrap();
-        // A supported existing registry authorizes orphan cleanup.
+        // A supported registry still supplies no process retirement authority.
         store.load().unwrap();
         write(&store.directory, &store.path(), &Registry::default()).unwrap();
         store.load_and_sweep(&homes).unwrap();
-        assert!(!home.exists());
-        assert!(!parked.exists());
+        assert!(home.exists());
+        assert!(parked.exists());
     }
 
     #[test]
