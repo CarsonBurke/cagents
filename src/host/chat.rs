@@ -1064,7 +1064,7 @@ fn start_with_execution(
                     "Retry the pending terminal handoff or explicitly close it before starting another native writer",
                 ));
             }
-            if record.handle.owns_work() {
+            if !record.handle.is_completed() {
                 return Err(error(
                     "Chat already owns work; attach instead of starting another writer",
                 ));
@@ -1093,7 +1093,9 @@ fn start_with_execution(
         for record in state.chats.values() {
             let mut launch = record.session.launch.clone();
             launch.session_id = record.handle.session_id();
-            if same_conversation(&launch, &session.launch) && record.handle.owns_work() {
+            if same_conversation(&launch, &session.launch) && record.handle.owns_work()
+                && !(recovering && record.session.id == session.id && record.handle.is_completed())
+            {
                 return Err(error(
                     "This exact conversation already has a daemon writer or unconfirmed backend work; attach to its existing chat",
                 ));
