@@ -145,11 +145,7 @@ impl Confirmation {
 }
 
 pub(in crate::app) fn draft_key(session: &chat::Session) -> Option<String> {
-    let id = session.launch.session_id.as_deref()?.trim();
-    if id.is_empty() {
-        return None;
-    }
-    Some(format!("{}:{id}", session.launch.provider.label()))
+    resume_ui::placement::conversation_key(session)
 }
 
 impl Cagents {

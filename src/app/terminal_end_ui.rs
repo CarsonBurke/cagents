@@ -308,7 +308,7 @@ impl Cagents {
             Ok(Some(surface)) if current => {
                 self.retained_outputs.remove(&terminal);
                 self.cards.insert(card, CardRuntime::Terminal(surface));
-                let mut tasks = vec![self.drain_terminal(card, 0)];
+                let mut tasks = vec![self.drain_terminal(card, 0).0];
                 // Keyboard focus sat on the relaunch button while the card had
                 // no screen. Leaving it there would let one Enter reach both
                 // the button and the screen.

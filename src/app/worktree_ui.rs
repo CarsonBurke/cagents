@@ -1,6 +1,166 @@
 use super::*;
 use crate::model::ChannelId;
 
+mod owner_watch;
+pub(super) mod protection_sync;
+pub(super) mod selection;
+
+/// Canonical filesystem aliases are read on the blocking pool, once per path.
+/// Runtime selection uses lexical ownership until that immutable result arrives.
+#[derive(Default)]
+pub(super) struct OwnerPaths {
+    cached: HashMap<PathBuf, PathBuf>,
+    queued: HashSet<PathBuf>,
+    inflight: HashSet<PathBuf>,
+    inflight_generation: Option<u64>,
+    inflight_epoch: Option<u64>,
+    active: HashSet<PathBuf>,
+    watch_dirty: bool,
+    generation: u64,
+    invalidated: HashSet<PathBuf>,
+    superseded: HashSet<PathBuf>,
+    watch: Arc<owner_watch::Monitor>,
+}
+
+impl OwnerPaths {
+    fn request(&mut self, path: &Path, remote: bool) {
+        self.active.insert(path.into());
+        if remote {
+            self.cached
+                .entry(path.into())
+                .or_insert_with(|| path.into());
+        } else if !self.cached.contains_key(path) && !self.inflight.contains(path) {
+            self.queued.insert(path.into());
+        }
+    }
+
+    fn take_batch(&mut self) -> Option<(u64, Vec<PathBuf>)> {
+        if self.inflight_generation.is_some() || (self.queued.is_empty() && !self.watch_dirty) {
+            return None;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        self.inflight_epoch = Some(self.watch.epoch());
+        self.inflight_generation = Some(self.generation);
+        self.superseded.clear();
+        self.watch_dirty = false;
+        self.inflight = std::mem::take(&mut self.queued);
+        Some((self.generation, self.inflight.iter().cloned().collect()))
+    }
+
+    fn finish(&mut self, generation: u64, paths: Vec<(PathBuf, PathBuf)>) -> bool {
+        if self.inflight_generation != Some(generation) {
+            return false;
+        }
+        if self.inflight_epoch != Some(self.watch.epoch()) {
+            self.invalidate_watched();
+            self.queued.extend(
+                self.inflight
+                    .drain()
+                    .filter(|path| self.active.contains(path)),
+            );
+            self.queued.extend(self.invalidated.drain());
+            self.inflight_generation = None;
+            self.inflight_epoch = None;
+            self.superseded.clear();
+            return false;
+        }
+        for (path, resolved) in paths {
+            if self.inflight.contains(&path)
+                && self.active.contains(&path)
+                && !self.invalidated.contains(&path)
+                && !self.superseded.contains(&path)
+            {
+                self.cached.insert(path, resolved);
+            }
+        }
+        self.queued.extend(self.invalidated.drain());
+        self.inflight.clear();
+        self.superseded.clear();
+        self.inflight_generation = None;
+        self.inflight_epoch = None;
+        true
+    }
+
+    fn install_prepared(&mut self, paths: Vec<(PathBuf, PathBuf)>) {
+        for (path, resolved) in paths {
+            self.queued.remove(&path);
+            self.invalidated.remove(&path);
+            if self.inflight.contains(&path) {
+                self.superseded.insert(path.clone());
+            }
+            self.cached.insert(path, resolved);
+        }
+    }
+
+    fn retain_paths(&mut self, active: HashSet<PathBuf>) {
+        self.cached.retain(|path, _| active.contains(path));
+        self.queued.retain(|path| active.contains(path));
+        self.invalidated.retain(|path| active.contains(path));
+        self.superseded.retain(|path| active.contains(path));
+        self.watch_dirty |= self.watch.retain(&active);
+        self.active = active;
+    }
+
+    pub(super) fn invalidate_watched(&mut self) -> u64 {
+        self.watch.invalidate_failed();
+        // Take a coherent cache/epoch snapshot even when notify races this
+        // UI message. Dirty insertion and epoch publication share one mutex.
+        for _ in 0..3 {
+            let before = self.watch.epoch();
+            for path in self.watch.take_invalidated() {
+                if !self.active.contains(&path) {
+                    continue;
+                }
+                self.cached.remove(&path);
+                if self.inflight.contains(&path) {
+                    self.invalidated.insert(path);
+                } else {
+                    self.queued.insert(path);
+                }
+            }
+            let after = self.watch.epoch();
+            if before == after {
+                return after;
+            }
+        }
+        // A constantly changing filesystem must not spin on the UI thread.
+        // Start uncached work instead; its receipt still fences later changes.
+        self.cached.clear();
+        for path in &self.active {
+            if self.inflight.contains(path) {
+                self.invalidated.insert(path.clone());
+            } else {
+                self.queued.insert(path.clone());
+            }
+        }
+        self.watch.epoch()
+    }
+
+    pub(super) fn subscription(&self, focused: bool) -> Subscription<Message> {
+        self.watch.subscription(focused)
+    }
+
+    pub(in crate::app) fn canonical(&self, path: &Path) -> PathBuf {
+        self.cached
+            .get(path)
+            .cloned()
+            .unwrap_or_else(|| path.into())
+    }
+}
+
+fn canonicalize_owner_paths(
+    paths: Vec<PathBuf>,
+    mut resolve: impl FnMut(&Path) -> std::io::Result<PathBuf>,
+) -> Vec<(PathBuf, PathBuf)> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let resolved = resolve(&path).unwrap_or_else(|_| path.clone());
+            (path, resolved)
+        })
+        .collect()
+}
+
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
 pub(super) fn worktree_root<'a>(
@@ -348,40 +508,102 @@ impl Cagents {
         }
     }
 
-    pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
+    fn channel_scope_path(&self, id: ChannelId) -> Option<PathBuf> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)?;
+        let project = self.sidebar_model.project(channel.project_id)?;
+        Some(
+            project
+                .worktrees
+                .iter()
+                .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
+                .map(|worktree| worktree.path.clone())
+                .unwrap_or_else(|| {
+                    project
+                        .repository
+                        .parent()
+                        .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                        .unwrap_or(&project.repository)
+                        .to_path_buf()
+                }),
+        )
+    }
+
+    fn channel_scope_is_current(&self, id: ChannelId, path: &Path) -> bool {
+        if self.durable.active_channel != Some(id) || self.active_workspace.as_deref() != Some(path)
+        {
+            return false;
+        }
         let Some(channel) = self
             .durable
             .channels
             .iter()
             .find(|channel| channel.id == id)
         else {
-            return Task::none();
+            return false;
         };
-        let Some(project) = self.sidebar_model.project(channel.project_id) else {
-            return Task::none();
-        };
-        let path = project
-            .worktrees
+        let members = channel.cards.iter().copied().collect::<HashSet<_>>();
+        self.workspace.order().eq(self
+            .durable
+            .cards
             .iter()
-            .find(|worktree| sidebar::is_primary_worktree(&project.repository, &worktree.path))
-            .map(|worktree| worktree.path.clone())
-            .unwrap_or_else(|| {
-                project
-                    .repository
-                    .parent()
-                    .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
-                    .unwrap_or(&project.repository)
-                    .to_path_buf()
-            });
-        if self.durable.active_channel == Some(id)
-            && self.active_workspace.as_ref() == Some(&path)
-            && self.workspace.order().eq(self
-                .durable
-                .cards
-                .iter()
-                .filter(|card| card.existence.is_open() && channel.cards.contains(&card.id))
-                .map(|card| card.id))
+            .filter(|card| card.existence.is_open() && members.contains(&card.id))
+            .map(|card| card.id))
+    }
+
+    pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.select_channel_then(id, selection::Intent::Navigate)
+    }
+
+    pub(in crate::app) fn select_channel_then(
+        &mut self,
+        id: ChannelId,
+        after: selection::Intent,
+    ) -> Task<Message> {
+        let Some(path) = self.channel_scope_path(id) else {
+            let cancelled = self.cancel_worktree_selection();
+            let abandoned = self.abandon_worktree_selection(after);
+            return Task::batch([cancelled, abandoned]);
+        };
+        self.worktree_owner_paths.invalidate_watched();
+        let protected = self
+            .worktree_owner_paths
+            .cached
+            .get(&path)
+            .is_some_and(|physical| self.worktree_protections.protects_exact(physical));
+        // Re-selecting an already displayed, physically protected channel
+        // cannot expose another directory. In particular RepositoryLoaded
+        // with unchanged roots does no new filesystem work.
+        if matches!(&after, selection::Intent::Navigate)
+            && self.channel_scope_is_current(id, &path)
+            && (!crate::instance::window_is_initialized()
+                || crate::device::is_remote()
+                || protected)
         {
+            let cancelled = self.cancel_worktree_selection();
+            let initialize = self.initialize_prepared_scope_runtimes();
+            let after = self.finish_worktree_selection(after);
+            return Task::batch([cancelled, initialize, after]);
+        }
+        self.select_worktree_then(
+            path.clone(),
+            false,
+            selection::Intent::Channel {
+                id,
+                path,
+                after: Box::new(after),
+            },
+        )
+    }
+
+    fn select_channel_inner(&mut self, id: ChannelId) -> Task<Message> {
+        let Some(path) = self.channel_scope_path(id) else {
+            return self.discover_scope_automation_archives();
+        };
+        if self.channel_scope_is_current(id, &path) {
             return self.discover_scope_automation_archives();
         }
         self.snapshot_workspace_scope();
@@ -435,29 +657,41 @@ impl Cagents {
                         _ => None,
                     }),
             );
+        let remote = crate::device::is_remote();
+        let paths = self
+            .known_worktree_roots
+            .iter()
+            .cloned()
+            .chain(
+                self.durable
+                    .cards
+                    .iter()
+                    .filter(|card| card.existence.is_open())
+                    .filter_map(card_directory)
+                    .map(Path::to_owned),
+            )
+            .chain(selected.map(Path::to_owned))
+            // A prepared but uncommitted alias still authorizes a physical
+            // lease. Reloading the displayed scope must keep its watch alive.
+            .chain(self.worktree_selection.pending_paths().map(Path::to_owned))
+            .collect::<HashSet<_>>();
+        self.worktree_owner_paths.retain_paths(paths.clone());
+        for path in paths {
+            self.worktree_owner_paths.request(&path, remote);
+        }
         let roots = self
             .known_worktree_roots
             .iter()
             .map(|path| {
                 (
                     path.as_path(),
-                    if crate::device::is_remote() {
-                        path.clone()
-                    } else {
-                        path.canonicalize().unwrap_or_else(|_| path.clone())
-                    },
+                    self.worktree_owner_paths.canonical(path),
                     self.sidebar_model.worktree_at(path).is_some(),
                 )
             })
             .collect::<Vec<_>>();
         let resolve = |directory: &Path| {
-            let canonical = if crate::device::is_remote() {
-                directory.to_path_buf()
-            } else {
-                directory
-                    .canonicalize()
-                    .unwrap_or_else(|_| directory.into())
-            };
+            let canonical = self.worktree_owner_paths.canonical(directory);
             roots
                 .iter()
                 .filter(|(_, root, _)| canonical.starts_with(root))
@@ -486,6 +720,62 @@ impl Cagents {
         selected.map(resolve)
     }
 
+    pub(super) fn resolve_worktree_owner_paths(&mut self) -> Task<Message> {
+        self.resolve_worktree_owner_paths_with(|path| path.canonicalize())
+    }
+
+    fn resolve_worktree_owner_paths_with(
+        &mut self,
+        resolver: impl FnMut(&Path) -> std::io::Result<PathBuf> + Send + 'static,
+    ) -> Task<Message> {
+        let Some((generation, paths)) = self.worktree_owner_paths.take_batch() else {
+            return Task::none();
+        };
+        let watch = self.worktree_owner_paths.watch.clone();
+        cosmic::task::future(async move {
+            let paths = tokio::task::spawn_blocking(move || {
+                // Install lexical ancestor watches before the first read so
+                // an alias retarget between read and registration cannot be
+                // lost. Register physical ancestors too, then validate the
+                // initial result across that registration gap.
+                watch.register(
+                    &paths
+                        .iter()
+                        .map(|path| (path.clone(), path.clone()))
+                        .collect::<Vec<_>>(),
+                );
+                let mut resolver = resolver;
+                let first = canonicalize_owner_paths(paths.clone(), &mut resolver);
+                watch.register(&first);
+                let validated = canonicalize_owner_paths(paths, resolver);
+                watch.register(&validated);
+                validated
+            })
+            .await
+            .unwrap_or_default();
+            Message::WorktreeOwnerPathsResolved { generation, paths }
+        })
+    }
+
+    pub(super) fn worktree_owner_paths_resolved(
+        &mut self,
+        generation: u64,
+        paths: Vec<(PathBuf, PathBuf)>,
+    ) -> Task<Message> {
+        if !self.worktree_owner_paths.finish(generation, paths) {
+            return Task::none();
+        }
+        // Re-evaluate current descriptors, never a stale selection captured by
+        // the job. Late I/O cannot navigate back to a previously selected scope.
+        let selected = self.active_workspace.clone();
+        self.refresh_worktree_owners(selected.as_deref());
+        if self.durable.active_channel.is_none() && !self.worktree_selection.pending {
+            selected.map_or_else(Task::none, |path| self.select_worktree(path, false))
+        } else {
+            Task::none()
+        }
+    }
+
     /// Refresh which worktree rows hold an open pane after state changes,
     /// never during rendering.
     ///
@@ -505,12 +795,13 @@ impl Cagents {
             .iter()
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>();
+        let roots = self.indexed_worktree_roots();
         let occupied = self
             .durable
             .cards
             .iter()
             .filter(|card| card.existence.is_open() && !channeled.contains(&card.id))
-            .filter_map(|card| self.unchanneled_card_worktree(card))
+            .filter_map(|card| self.unchanneled_card_worktree_indexed(card, &roots))
             .collect::<HashSet<_>>();
         let worktrees = self
             .sidebar_model
@@ -525,6 +816,29 @@ impl Cagents {
             })
             .collect();
         self.sidebar_state.set_worktrees_with_panes(worktrees);
+    }
+
+    /// The current explicit filing is authoritative for context handoffs;
+    /// an executable cwd cannot override a channel or a recorded worktree.
+    pub(super) fn context_card_worktree(&self, card: &CardState) -> Option<PathBuf> {
+        if let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card.id))
+        {
+            return self.channel_scope_path(channel.id);
+        }
+        self.durable
+            .card_scopes
+            .get(&card.id)
+            .or_else(|| self.worktree_owners.get(&card.id))
+            .cloned()
+            .or_else(|| self.unchanneled_card_worktree(card).map(Path::to_owned))
+    }
+
+    pub(super) fn context_paths_match(&self, left: &Path, right: &Path) -> bool {
+        self.worktree_owner_paths.canonical(left) == self.worktree_owner_paths.canonical(right)
     }
 
     pub(super) fn card_worktree<'a>(&'a self, card: &'a CardState) -> Option<&'a Path> {
@@ -626,15 +940,13 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> Task<Message> {
+        self.select_worktree_then(path, create_if_empty, selection::Intent::Navigate)
+    }
+
+    fn select_worktree_inner(&mut self, path: PathBuf, create_if_empty: bool) -> Task<Message> {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
-        if let Err(error) = self.worktree_protections.protect_next(&path) {
-            self.status = Some(TransientNotice::warning(format!(
-                "Cannot open this worktree yet: {error}"
-            )));
-            return Task::none();
-        }
         let roots = self
             .known_worktree_roots
             .iter()
@@ -1792,7 +2104,16 @@ mod tests {
             cards: vec![shell.clone(), editor.clone()],
             ..WorkspaceState::default()
         });
-        let _ = app.select_worktree(alias.join("worktrees/feature"), false);
+        // Resolve aliases through the actual off-UI task before asserting the
+        // completed projection; selection itself no longer performs this I/O.
+        let selected = alias.join("worktrees/feature");
+        app.refresh_worktree_owners(Some(&selected));
+        let message = super::super::tests::task_app_message(app.resolve_worktree_owner_paths());
+        let Message::WorktreeOwnerPathsResolved { generation, paths } = message else {
+            panic!("owner task returned an unexpected message");
+        };
+        let _ = app.worktree_owner_paths_resolved(generation, paths);
+        let _ = app.select_worktree(selected, false);
         assert_eq!(app.active_workspace.as_deref(), Some(nested.as_path()));
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![shell.id]);
         assert_eq!(app.card_state(shell.id).unwrap().kind, shell.kind);
@@ -1977,6 +2298,40 @@ mod tests {
             worktree_root(Path::new("/repo-fix/src"), roots.into_iter()),
             None
         );
+    }
+
+    #[test]
+    fn indexed_worktree_projection_marks_many_cards_without_prefix_collisions() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let paths = (0..200)
+            .map(|index| format!("/repo/wt-{index}"))
+            .collect::<Vec<_>>();
+        register_worktrees(
+            &mut app,
+            &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+        );
+        let template = super::super::tests::terminal_card_state();
+        for (index, root) in paths.iter().enumerate().filter(|(index, _)| index % 2 == 0) {
+            for nested in 0..10 {
+                let mut card = template.clone();
+                card.id = CardId::new();
+                if let CardKind::Terminal(session) = &mut card.kind {
+                    session.launch.working_directory =
+                        PathBuf::from(root).join(format!("src/{nested}"));
+                }
+                Arc::make_mut(&mut app.durable).cards.push(card);
+            }
+            assert!(index < 200);
+        }
+        app.refresh_sidebar_worktree_panes();
+        let project = &app.sidebar_model.projects[0];
+        for (index, worktree) in project.worktrees.iter().enumerate() {
+            assert_eq!(
+                app.sidebar_state
+                    .worktree_has_panes(project.id, worktree.id),
+                index % 2 == 0
+            );
+        }
     }
 
     #[test]
@@ -2451,5 +2806,346 @@ mod tests {
             .collect::<Vec<_>>(),
             vec![repository.as_path(), destination.as_path(), older.as_path()]
         );
+    }
+}
+
+#[cfg(test)]
+mod owner_path_cache_tests {
+    use super::*;
+
+    #[test]
+    fn unchanged_owner_paths_never_repeat_canonicalization() {
+        let mut cache = OwnerPaths::default();
+        let mut calls = 0;
+        for pass in 0..3 {
+            for path in ["/repo", "/repo/wt", "/repo/wt/nested"] {
+                cache.request(Path::new(path), false);
+            }
+            if let Some((generation, batch)) = cache.take_batch() {
+                let paths = canonicalize_owner_paths(batch, |path| {
+                    calls += 1;
+                    Ok(path.into())
+                });
+                assert!(cache.finish(generation, paths));
+                assert_eq!(pass, 0);
+            }
+        }
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn older_owner_batch_cannot_overwrite_a_prepared_selection() {
+        let mut cache = OwnerPaths::default();
+        let alias = PathBuf::from("/alias");
+        cache.request(&alias, false);
+        let (generation, _) = cache.take_batch().unwrap();
+        cache.install_prepared(vec![(alias.clone(), "/new-target".into())]);
+        assert!(cache.finish(generation, vec![(alias.clone(), "/old-target".into())]));
+        assert_eq!(cache.canonical(&alias), PathBuf::from("/new-target"));
+        assert!(cache.take_batch().is_none());
+    }
+
+    #[test]
+    fn repository_loaded_with_unchanged_roots_schedules_no_canonicalization() {
+        use cosmic::Application as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_owned();
+        let project = ProjectId::new();
+        let repository_id = RepositoryId::new();
+        let records = (0..12)
+            .map(|index| {
+                let path = root.join(format!("worktree-{index}"));
+                std::fs::create_dir(&path).unwrap();
+                WorktreeRecord {
+                    id: crate::model::WorktreeId::new(),
+                    path,
+                    created_at_unix_ms: None,
+                    head_oid: None,
+                    branch: None,
+                    detached: false,
+                    bare: false,
+                    lock: Default::default(),
+                    prunable_reason: None,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            project,
+            repository_id,
+            "fixture".into(),
+            root.clone(),
+            records
+                .iter()
+                .map(|record| SidebarWorktree::from_repository(record, None))
+                .collect(),
+            Vec::new(),
+        )];
+        app.refresh_worktree_owners(None);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let task = app.resolve_worktree_owner_paths_with(move |path| {
+            counted.fetch_add(1, Ordering::Relaxed);
+            path.canonicalize()
+        });
+        let Message::WorktreeOwnerPathsResolved { generation, paths } =
+            super::super::tests::task_app_message(task)
+        else {
+            panic!("unexpected owner result")
+        };
+        assert!(app.worktree_owner_paths.finish(generation, paths));
+        let initial = calls.load(Ordering::Relaxed);
+        assert!(initial >= 12);
+        let selected = records[0].path.clone();
+        let destination = records[1].path.clone();
+        // Exercise the real RepositoryLoaded -> selection path as an
+        // initialized local window with a physically held directory lease.
+        drop(app.select_worktree_inner(selected.clone(), false));
+        let runtime = tempfile::tempdir().unwrap();
+        app.worktree_protections.install_prepared(Some(
+            crate::worktree_cleanup::fixture_protection(runtime.path(), &selected, false).unwrap(),
+        ));
+        app.force_local_selection_with_counter_for_test(calls.clone());
+        let loaded = LoadedRepository {
+            project: ProjectState {
+                id: project,
+                generation: 0,
+                name: "fixture".into(),
+                repository: root.clone(),
+                kind: crate::model::ProjectKind::Git,
+                existence: Existence::Open,
+            },
+            repository: Some(RepositoryInfo {
+                id: repository_id,
+                selected_path: root.clone(),
+                common_dir: root.join(".git"),
+                git_dir: root.join(".git"),
+                worktree_root: Some(root),
+                is_bare: false,
+            }),
+            worktrees: records.into_iter().map(|record| (record, None)).collect(),
+            github: GitHubAvailability::NotAssociated,
+            review_repository: None,
+            head_repositories: HashMap::new(),
+        };
+        for generation in 1..=3 {
+            app.repository_generations.insert(project, generation);
+            drop(app.update(Message::RepositoryLoaded {
+                open_cards: false,
+                project_id: project,
+                generation,
+                result: Ok(Box::new(loaded.clone())),
+            }));
+            assert!(
+                app.worktree_owner_paths.inflight_generation.is_none(),
+                "unchanged reload scheduled owner I/O"
+            );
+            assert!(app.worktree_owner_paths.take_batch().is_none());
+            assert!(
+                !app.worktree_selection.pending,
+                "unchanged active reload prepared navigation"
+            );
+            assert_eq!(app.active_workspace.as_ref(), Some(&selected));
+            assert_eq!(calls.load(Ordering::Relaxed), initial);
+        }
+        // An automatic reload of A must not cancel the explicit dependent
+        // navigation to B which is preparing while A remains displayed.
+        drop(app.select_worktree_then(destination, false, selection::Intent::EnsureDefaultPane));
+        let pending_generation = app.worktree_selection.generation_for_test();
+        assert!(app.worktree_selection.pending);
+        app.repository_generations.insert(project, 4);
+        drop(app.update(Message::RepositoryLoaded {
+            open_cards: false,
+            project_id: project,
+            generation: 4,
+            result: Ok(Box::new(loaded.clone())),
+        }));
+        assert!(app.worktree_selection.pending);
+        assert_eq!(
+            app.worktree_selection.generation_for_test(),
+            pending_generation
+        );
+        assert_eq!(app.active_workspace.as_ref(), Some(&selected));
+        assert_eq!(calls.load(Ordering::Relaxed), initial);
+        #[cfg(unix)]
+        {
+            let first = directory.path().join("unregistered-first");
+            let second = directory.path().join("unregistered-second");
+            let alias = directory.path().join("unregistered-alias");
+            std::fs::create_dir(&first).unwrap();
+            std::fs::create_dir(&second).unwrap();
+            std::os::unix::fs::symlink(&first, &alias).unwrap();
+            app.force_selection_guard_runtime_for_test(runtime.path().to_owned());
+            let task = app.select_worktree_then(
+                alias.clone(),
+                false,
+                selection::Intent::EnsureDefaultPane,
+            );
+            let prepared = super::super::tests::task_app_message(task);
+            assert!(app.worktree_selection.pending);
+            assert!(
+                matches!(
+                    crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+                ),
+                "the uncommitted receipt must actually hold the first target lease"
+            );
+            app.repository_generations.insert(project, 5);
+            drop(app.update(Message::RepositoryLoaded {
+                open_cards: false,
+                project_id: project,
+                generation: 5,
+                result: Ok(Box::new(loaded)),
+            }));
+            let Message::WorktreeSelectionPrepared {
+                generation,
+                receipt,
+                ..
+            } = &prepared
+            else {
+                panic!("expected a prepared physical selection receipt");
+            };
+            assert!(
+                app.prepared_selection_navigates(*generation, receipt),
+                "reload must leave the held receipt valid before the deliberate retarget"
+            );
+            assert_eq!(
+                app.worktree_owner_paths.watch.observed_for_test(&alias),
+                Some(first.canonicalize().unwrap()),
+                "reload must retain the exact lexical-to-physical pending mapping"
+            );
+            let epoch = app.worktree_owner_paths.watch.epoch();
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&second, &alias).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while app.worktree_owner_paths.watch.epoch() == epoch {
+                assert!(
+                    Instant::now() < deadline,
+                    "reload dropped the pending alias watch"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            // Consume the original receipt without delivering a UI notify
+            // message first; the watcher-owned epoch must fence it directly.
+            let old_generation = app.worktree_selection.generation_for_test();
+            drop(app.update(prepared));
+            assert_eq!(app.active_workspace.as_ref(), Some(&selected));
+            assert!(app.worktree_selection.pending);
+            assert_ne!(app.worktree_selection.generation_for_test(), old_generation);
+            assert!(
+                crate::worktree_cleanup::fixture_protection(runtime.path(), &first, true).is_ok(),
+                "stale physical lease must retire without exposing the retargeted alias"
+            );
+        }
+    }
+
+    #[test]
+    fn twelve_slow_owner_paths_do_not_block_input_updates() {
+        use cosmic::Application as _;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        for index in 0..12 {
+            app.worktree_owner_paths
+                .request(Path::new(&format!("/slow/worktree-{index}")), false);
+        }
+        let (entered, entered_rx) = crossbeam_channel::bounded(1);
+        let (release, release_rx) = crossbeam_channel::bounded(1);
+        let mut first = true;
+        let task = app.resolve_worktree_owner_paths_with(move |path| {
+            if first {
+                first = false;
+                entered.send(()).unwrap();
+                release_rx.recv().unwrap();
+            }
+            Ok(path.into())
+        });
+        let worker = std::thread::spawn(move || super::super::tests::task_app_message(task));
+        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let input_started = Instant::now();
+        drop(app.update(Message::SettingsSearchChanged(
+            "responsive during slow ownership".into(),
+        )));
+        eprintln!(
+            "blocked_twelve_owner_paths_input_elapsed_us={}",
+            input_started.elapsed().as_micros()
+        );
+        assert_eq!(app.settings_search, "responsive during slow ownership");
+        release.send(()).unwrap();
+        let Message::WorktreeOwnerPathsResolved { generation, paths } = worker.join().unwrap()
+        else {
+            panic!("owner task returned another message");
+        };
+        assert_eq!(paths.len(), 12);
+        assert!(app.worktree_owner_paths.finish(generation, paths));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initial_watch_registration_cannot_miss_a_retarget_after_the_first_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        std::os::unix::fs::symlink(&first, &alias).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.worktree_owner_paths.request(&alias, false);
+        let changed = alias.clone();
+        let target = second.clone();
+        let mut initial = true;
+        let task = app.resolve_worktree_owner_paths_with(move |path| {
+            let result = path.canonicalize();
+            if initial {
+                initial = false;
+                std::fs::remove_file(&changed).unwrap();
+                std::os::unix::fs::symlink(&target, &changed).unwrap();
+            }
+            result
+        });
+        let Message::WorktreeOwnerPathsResolved { paths, .. } =
+            super::super::tests::task_app_message(task)
+        else {
+            panic!("owner task returned another message");
+        };
+        assert_eq!(paths, vec![(alias, second)]);
+    }
+
+    #[test]
+    fn a_watch_change_during_resolution_cannot_install_the_old_alias() {
+        let mut cache = OwnerPaths::default();
+        cache.request(Path::new("/alias"), false);
+        let (generation, _) = cache.take_batch().unwrap();
+        cache.invalidated.insert("/alias".into());
+        assert!(cache.finish(generation, vec![("/alias".into(), "/old".into())]));
+        assert_eq!(cache.canonical(Path::new("/alias")), Path::new("/alias"));
+        assert_eq!(cache.take_batch().unwrap().1, vec![PathBuf::from("/alias")]);
+    }
+
+    #[test]
+    fn obsolete_card_directories_leave_the_owner_cache() {
+        let mut cache = OwnerPaths::default();
+        for path in ["/root", "/old/card", "/new/card"] {
+            cache.request(Path::new(path), false);
+        }
+        let (generation, batch) = cache.take_batch().unwrap();
+        assert!(cache.finish(
+            generation,
+            batch.into_iter().map(|path| (path.clone(), path)).collect()
+        ));
+        cache.retain_paths([PathBuf::from("/root"), PathBuf::from("/new/card")].into());
+        assert_eq!(cache.cached.len(), 2);
+        assert!(!cache.cached.contains_key(Path::new("/old/card")));
+    }
+
+    #[test]
+    fn stale_owner_results_do_not_replace_current_batch() {
+        let mut cache = OwnerPaths::default();
+        cache.request(Path::new("/repo"), false);
+        let (generation, _) = cache.take_batch().unwrap();
+        assert!(!cache.finish(generation.wrapping_sub(1), vec![]));
+        assert!(!cache.inflight.is_empty());
+        assert!(cache.finish(generation, vec![("/repo".into(), "/physical".into())]));
+        assert_eq!(cache.canonical(Path::new("/repo")), Path::new("/physical"));
     }
 }

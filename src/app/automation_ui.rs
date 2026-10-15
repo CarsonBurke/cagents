@@ -227,7 +227,10 @@ impl Cagents {
                         if self.sidebar_model.project(channel.project_id).is_none() {
                             return Task::none();
                         }
-                        self.select_channel(*id)
+                        return self.select_channel_then(
+                            *id,
+                            worktree_ui::selection::Intent::Agent(agent),
+                        );
                     }
                     crate::agent_execution::Placement::Worktree { path, .. } => {
                         if self.project_ui.deleting_directory(path)
@@ -238,7 +241,11 @@ impl Cagents {
                             ));
                             return Task::none();
                         }
-                        self.select_worktree(path.clone(), false)
+                        return self.select_worktree_then(
+                            path.clone(),
+                            false,
+                            worktree_ui::selection::Intent::Agent(agent),
+                        );
                     }
                 };
                 if archived {

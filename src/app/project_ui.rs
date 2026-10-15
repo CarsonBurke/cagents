@@ -304,7 +304,7 @@ impl Cagents {
         Some((checkout.path.clone(), project.repository.clone()))
     }
 
-    pub(super) fn sync_worktree_protections(&mut self) {
+    pub(super) fn sync_worktree_protections(&mut self) -> Task<Message> {
         let mut paths = Vec::new();
         if let Some(path) = &self.active_workspace {
             paths.push(path.clone());
@@ -317,13 +317,23 @@ impl Cagents {
         {
             // Drafts and parked sessions must not be discarded by an optional
             // cleanup, even before they acquire a daemon-hosted actor.
-            if matches!(&card.kind, CardKind::Chat(_) | CardKind::Terminal(_))
-                && let Some(scope) = self
+            let launch_directory = match &card.kind {
+                CardKind::Chat(session) => Some(&session.launch.recipe.working_directory),
+                CardKind::Terminal(session) => Some(&session.launch.working_directory),
+                _ => None,
+            };
+            if let Some(directory) = launch_directory {
+                // Filing is administrative and can change without rewriting
+                // an issued recipe. Protect its physical source independently
+                // before any daemon-hosted actor can own that directory.
+                paths.push(directory.clone());
+                if let Some(scope) = self
                     .worktree_owners
                     .get(&card.id)
                     .or_else(|| self.durable.card_scopes.get(&card.id))
-            {
-                paths.push(scope.clone());
+                {
+                    paths.push(scope.clone());
+                }
             }
             if let CardKind::Repository(view) = &card.kind {
                 if view.selected_file.is_some() {
@@ -341,9 +351,7 @@ impl Cagents {
                 paths.push(runtime.descriptor.worktree.clone());
             }
         }
-        if let Err(error) = self.worktree_protections.sync(paths) {
-            tracing::debug!(%error, "automatic worktree cleanup unavailable until window scopes are protected");
-        }
+        self.prepare_window_protections(paths)
     }
 
     /// Sidebar discovery only proposes a candidate. The daemon fetches its PR
@@ -1329,9 +1337,11 @@ impl Cagents {
                     }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;
-                        let select = self.select_worktree(target.path.clone(), false);
-                        let terminal = self.add_terminal(target.path);
-                        return Task::batch([select, terminal]);
+                        return self.select_worktree_then(
+                            target.path.clone(),
+                            false,
+                            worktree_ui::selection::Intent::NewTerminal(target.path),
+                        );
                     }
                     ProjectCommand::NewChannel => {
                         self.project_ui.dialog = None;
@@ -1699,16 +1709,29 @@ impl Cagents {
             .as_deref()
             .is_some_and(|active| active.starts_with(&target.path))
         {
-            self.select_worktree(target.repository.clone(), false)
+            return self.select_worktree_then(
+                target.repository.clone(),
+                false,
+                worktree_ui::selection::Intent::Delete(target),
+            );
         } else {
             Task::none()
         };
         Task::batch([leave, self.run_worktree_deletion(target)])
     }
 
+    /// A newer navigation or failed preflight did not authorize exposing an
+    /// unprotected destination. No deletion has started, so release its row.
+    pub(super) fn cancel_prepared_worktree_deletion(&mut self, target: Target) {
+        if let Some(id) = target.worktree {
+            self.project_ui.deletions.remove(&id);
+            self.sync_worktree_operation_rows();
+        }
+    }
+
     /// Runs the deletion once no session in the worktree is still starting:
     /// one that is would come up after its directory had been emptied.
-    fn run_worktree_deletion(&mut self, target: Target) -> Task<Message> {
+    pub(super) fn run_worktree_deletion(&mut self, target: Target) -> Task<Message> {
         if self.durable.cards.iter().any(|card| {
             card.existence.is_open()
                 && card_belongs_to(card, &target.path)

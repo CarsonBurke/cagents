@@ -98,6 +98,7 @@ where
                 viewport_version: 0,
                 redraw_requested: false,
                 resize_enabled: false,
+                first_frame_submitted: false,
             },
         );
 
@@ -205,6 +206,7 @@ where
     ime_state: Option<(Rectangle, input_method::Purpose)>,
     pub(crate) redraw_requested: bool,
     pub resize_enabled: bool,
+    pub(crate) first_frame_submitted: bool,
 }
 
 impl<P, C> Window<P, C>

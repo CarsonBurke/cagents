@@ -22,3 +22,9 @@ native event arrives. This change is confined to `debug::on_hotpatch`; ordinary
 proxy traffic retains the pinned implementation. The callback is inactive when
 Iced's hot feature is disabled. Remove this backport when the pinned dependency
 provides the equivalent wake-up.
+
+Local startup diagnostics record `first_frame_submitted` once per native window,
+after the compositor backend accepts its first frame. This is a GPU submission
+milestone, not physical presentation or proof that a particular card's content
+was visible. Native acceptance measurements retain compositor observations
+separately.

@@ -5,6 +5,7 @@ use crate::persistence::SavedConversation;
 use cosmic::iced::futures::StreamExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 mod catalog;
+pub(in crate::app) mod placement;
 
 /// Conversations read before the first found ones are listed, so the newest
 /// appear at once, and between later listings.
@@ -86,12 +87,6 @@ struct Row {
     /// What the query is matched against, lowercased once.
     haystack: String,
     source: Source,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum ResumeDestination {
-    Channel(crate::model::ChannelId),
-    Worktree(PathBuf),
 }
 
 enum Source {
@@ -849,7 +844,7 @@ impl Cagents {
         state.visible = resume_matches(&state.rows, &state.query, state.scope.as_ref());
     }
 
-    fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
+    pub(super) fn existing_conversation_card(&self, session: &chat::Session) -> Option<CardId> {
         self.durable
             .cards
             .iter()
@@ -889,23 +884,35 @@ impl Cagents {
         });
         if let Some(card) = existing {
             self.close_resume();
-            let scope = if let Some(channel) = self
+            if let Some(channel) = self
                 .durable
                 .channels
                 .iter()
                 .find(|channel| channel.cards.contains(&card))
                 .map(|channel| channel.id)
             {
-                self.select_channel(channel)
+                return self.select_channel_then(
+                    channel,
+                    worktree_ui::selection::Intent::Focus {
+                        card,
+                        activate: false,
+                    },
+                );
             } else {
                 let owner = self
                     .card_state(card)
                     .and_then(|card| self.card_worktree(card))
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| entry.session.launch.recipe.working_directory.clone());
-                self.select_worktree(owner, false)
-            };
-            return Task::batch([scope, cosmic::task::message(Message::FocusCard(card))]);
+                return self.select_worktree_then(
+                    owner,
+                    false,
+                    worktree_ui::selection::Intent::Focus {
+                        card,
+                        activate: false,
+                    },
+                );
+            }
         }
         if entry.open {
             self.resume_error("This conversation is open outside this window. Return to its original window before resuming.");
@@ -1218,12 +1225,6 @@ impl Cagents {
             return Task::none();
         }
         let mut session = entry.session;
-        if !session.launch.recipe.working_directory.is_dir()
-            && !session.launch.needs_read_only_history()
-        {
-            self.resume_error("This conversation's project folder is unavailable. Restore the folder before resuming.");
-            return Task::none();
-        }
         if !matches!(
             session.native_continuity,
             chat::NativeContinuity::Durable { .. }
@@ -1235,29 +1236,10 @@ impl Cagents {
         }
         let replace = self.resume_ui.replace;
         self.close_resume();
-        let destination = self.resumed_conversation_destination(entry.card, &session, &entry.title);
         let entry = SavedConversation { session, ..entry };
-        let scope = match &destination {
-            ResumeDestination::Channel(channel) => self.select_channel(*channel),
-            ResumeDestination::Worktree(path) => self.select_worktree(path.clone(), false),
-        };
-        // Selection may refuse a missing/locked destination. Never insert in
-        // the previous strip just because selecting the intended one failed.
-        let selected = match &destination {
-            ResumeDestination::Channel(id) => self.durable.active_channel == Some(*id),
-            ResumeDestination::Worktree(path) => {
-                self.durable.active_channel.is_none()
-                    && self.active_workspace.as_deref() == Some(path.as_path())
-            }
-        };
-        if !selected {
-            return scope;
-        }
-        Task::batch([scope, self.commit_resumed_conversation(entry, replace)])
+        self.select_resume_then(entry, replace)
     }
 
-    /// Called only once the exact destination has been selected. The async
-    /// selection lane carries this continuation until its guard is installed.
     pub(super) fn commit_resumed_conversation(
         &mut self,
         entry: SavedConversation,
@@ -1287,83 +1269,7 @@ impl Cagents {
         self.refresh_sidebar_worktree_panes();
         self.persist();
         Task::batch([insert, discard])
-    }
-
-    fn resumed_conversation_destination(
-        &mut self,
-        original: CardId,
-        session: &chat::Session,
-        title: &str,
-    ) -> ResumeDestination {
-        if let Some(id) = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| channel.cards.contains(&original))
-            .map(|channel| channel.id)
-        {
-            return ResumeDestination::Channel(id);
-        }
-        if let Some(id) = chat_ui::closing::draft_key(session)
-            .and_then(|key| self.durable.conversation_channels.get(&key).copied())
-            && self.durable.channels.iter().any(|channel| channel.id == id)
-        {
-            return ResumeDestination::Channel(id);
-        }
-        let directory = session
-            .launch
-            .recipe
-            .working_directory
-            .canonicalize()
-            .unwrap_or_else(|_| session.launch.recipe.working_directory.clone());
-        // A known worktree is the precise owner, even when nested inside its
-        // repository. Do not reduce it to its parent project's channel list.
-        if let Some(root) =
-            self.known_worktree_roots
-                .iter()
-                .chain(
-                    self.sidebar_model.projects.iter().flat_map(|project| {
-                        project.worktrees.iter().map(|worktree| &worktree.path)
-                    }),
-                )
-                .filter(|root| directory.starts_with(root))
-                .max_by_key(|root| root.components().count())
-        {
-            return ResumeDestination::Worktree(root.clone());
-        }
-        let project = self
-            .sidebar_model
-            .projects
-            .iter()
-            .filter(|project| directory.starts_with(&project.repository))
-            .max_by_key(|project| project.repository.components().count())
-            .map(|project| project.id);
-        if let Some(project) = project {
-            let id = crate::model::ChannelId::new();
-            let ordinal = self.next_provisional_ordinal();
-            Arc::make_mut(&mut self.durable)
-                .channels
-                .push(crate::model::ProjectChannel {
-                    id,
-                    project_id: project,
-                    title: title.to_owned(),
-                    title_source: crate::model::ChannelTitleSource::Prompt,
-                    ordinal,
-                    shared: false,
-                    cards: Vec::new(),
-                    focused: None,
-                });
-            self.publish_channel_creation(id, project);
-            return ResumeDestination::Channel(id);
-        }
-        if let Some(path) = &self.active_workspace {
-            return ResumeDestination::Worktree(path.clone());
-        }
-        if let Some(id) = self.durable.active_channel {
-            return ResumeDestination::Channel(id);
-        }
-        ResumeDestination::Worktree(directory)
-    }
+     }
 
     /// Closes the picker and stops indexing. Focus is left to whatever the
     /// caller shows next.
@@ -1566,6 +1472,32 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize
 }
 
 #[cfg(test)]
+pub(in crate::app) fn drive_resume_task_for_test(app: &mut Cagents, task: Task<Message>) {
+    use cosmic::Application as _;
+    let Some(mut stream) = iced::runtime::task::into_stream(task) else { return; };
+    let executor = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let messages = executor.block_on(async {
+        let mut messages = Vec::new();
+        while let Some(action) = stream.next().await {
+            if let iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                messages.push(message);
+            }
+            // These fixtures assert scope/identity, not widget focus. Modal
+            // focus operations can precede the actual selection receipt.
+        }
+        messages
+    });
+    for message in messages {
+        let preparing = matches!(&message, Message::ResumeConversation(Action::Prepared(..)));
+        let followup = app.update(message);
+        if preparing || app.worktree_selection.pending {
+            drive_resume_task_for_test(app, followup);
+        }
+    }
+}
+
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1585,7 +1517,8 @@ mod tests {
                 Vec::new(),
             ));
         let entry = saved(directory.path());
-        drop(app.resume_saved_conversation(entry));
+        let task = app.resume_saved_conversation(entry);
+        drive_resume_task_for_test(&mut app, task);
         let card = app.workspace.focused().unwrap();
         let channel = app
             .durable
@@ -1647,11 +1580,8 @@ mod tests {
             ));
         let entry = saved(&nested);
         let launch = entry.session.launch.clone();
-        assert_eq!(
-            app.resumed_conversation_destination(entry.card, &entry.session, &entry.title),
-            ResumeDestination::Worktree(linked.clone())
-        );
-        drop(app.resume_saved_conversation(entry));
+        let task = app.resume_saved_conversation(entry);
+        drive_resume_task_for_test(&mut app, task);
         let card = app.workspace.focused().unwrap();
         assert_eq!(app.active_workspace.as_ref(), Some(&linked));
         assert!(app.durable.active_channel.is_none());
@@ -1719,11 +1649,8 @@ mod tests {
         app.active_workspace = Some(current.path().into());
         let entry = saved(foreign.path());
         let launch = entry.session.launch.clone();
-        assert_eq!(
-            app.resumed_conversation_destination(entry.card, &entry.session, &entry.title),
-            ResumeDestination::Worktree(current.path().into())
-        );
-        drop(app.resume_saved_conversation(entry));
+        let task = app.resume_saved_conversation(entry);
+        drive_resume_task_for_test(&mut app, task);
         let card = app.workspace.focused().unwrap();
         assert_eq!(
             app.durable.card_scopes.get(&card).map(PathBuf::as_path),
@@ -2045,7 +1972,9 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let entry = saved(directory.path());
         let original = entry.session.clone();
-        let _ = app.resume_saved_conversation(entry);
+        let prepare = app.resume_saved_conversation(entry);
+        let prepared = crate::app::tests::task_app_message(prepare);
+        drop(app.update(prepared));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         let CardKind::Chat(session) = &card.kind else {
             panic!("native conversation")

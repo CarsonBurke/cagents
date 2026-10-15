@@ -9634,4 +9634,42 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn provider_conversation_channels_survive_save_lane_restart_and_legacy_state() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("conversation-channels.sqlite3");
+        let boot_id = boot("conversation-channels");
+        let mut workspace = workspace_with_terminal(&boot_id);
+        let store = StateStore::open(&database, boot_id).unwrap();
+        let mut lane = SaveLane::default();
+        lane.save(&store, &workspace).unwrap();
+        // A metadata-only follow-up must pass through the normalized lane too.
+        workspace
+            .conversation_channels
+            .insert("Codex:session-id".into(), ChannelId::new());
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            store
+                .load_workspace_manifest(workspace.id)
+                .unwrap()
+                .unwrap()
+                .conversation_channels,
+            workspace.conversation_channels
+        );
+        drop(store);
+        let store = StateStore::open(&database, boot("new-process")).unwrap();
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(
+            restored.conversation_channels,
+            workspace.conversation_channels
+        );
+        let mut legacy = serde_json::to_value(&workspace).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("conversation_channels");
+        let legacy = serde_json::from_value::<WorkspaceState>(legacy).unwrap();
+        assert!(legacy.conversation_channels.is_empty());
+    }
+
 }

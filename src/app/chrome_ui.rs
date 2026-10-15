@@ -42,6 +42,15 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
     paragraph.min_bounds().width
 }
 
+pub(super) const TITLE_STABILITY: Duration = Duration::from_secs(3);
+
+#[derive(Debug)]
+pub(super) struct ReportedTitle {
+    pub(super) value: String,
+    pub(super) changed_at: Instant,
+    pub(super) pending: bool,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct State {
     pub(super) clone_repository: Option<onboarding_ui::CloneRepository>,
@@ -50,6 +59,7 @@ pub(super) struct State {
     pub(super) user_titles: HashMap<CardId, String>,
     pub(super) terminal_ordinals: HashMap<CardId, u32>,
     pub(super) terminal_next_ordinals: HashMap<PathBuf, u32>,
+    pub(super) reported_titles: HashMap<CardId, ReportedTitle>,
     /// Tab visibility follows pane focus even when a creation path already
     /// updated durable focus before applying its viewport changes.
     pub(super) tabs_focus: Option<CardId>,
