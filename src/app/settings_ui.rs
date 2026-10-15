@@ -1457,6 +1457,56 @@ fn shortcut_input<'a>(
 mod keyboard_table_tests {
     use super::*;
 
+    fn click_actual_terminal_policy(app: &Cagents, field: SettingsField) -> Option<Message> {
+        use iced::{Event, Rectangle, Size, advanced::{clipboard, mouse, widget::Operation}, runtime::{UserInterface, user_interface::Cache}};
+        #[derive(Default)]
+        struct TerminalCheckbox(Option<Rectangle>);
+        impl Operation for TerminalCheckbox {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) { visit(self); }
+            fn text(&mut self, _: Option<&widget::Id>, bounds: Rectangle, text: &str) {
+                if text == "Terminal" { self.0 = Some(bounds); }
+            }
+        }
+        let action = field.shortcut_action().unwrap();
+        let value = app.settings_draft.keyboard_shortcuts.shortcut_values().into_iter().find(|(candidate, _)| *candidate == action).unwrap().1;
+        let row = shortcut_input(field.label(), value, field, &app.settings_draft.keyboard_shortcuts, &app.settings_invalid);
+        let element = settings_group("Keyboard", "", vec![row]).compact().view("Keyboard", "").unwrap();
+        let mut renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut ui = UserInterface::build(element, Size::new(960.0, 200.0), Cache::new(), &mut renderer);
+        let mut checkbox = TerminalCheckbox::default();
+        ui.operate(&renderer, &mut checkbox);
+        let bounds = checkbox.0?;
+        let mut messages = Vec::new();
+        let _ = ui.update(&[Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)), Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))], mouse::Cursor::Available(bounds.center()), &mut renderer, &mut clipboard::Null, &mut messages);
+        // Select the actual checkbox message, never synthesize its callback.
+        messages.into_iter().find(|message| matches!(message, Message::ShortcutTerminalPassthrough { .. }))
+    }
+
+    #[test]
+    fn actual_terminal_checkbox_click_persists_policy_and_changes_the_terminal_matcher() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.settings_path = Some(path.clone());
+        app.settings_write_blocked = false;
+        let f2 = keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(keyboard::key::Named::F2), modified_key: keyboard::Key::Named(keyboard::key::Named::F2),
+            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::F2), location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(), text: None, repeat: false,
+        };
+        for (enabled, expected) in [(false, Some(workspace_widget::GlobalShortcut::RenamePane)), (true, None)] {
+            let message = click_actual_terminal_policy(&app, SettingsField::ShortcutRenamePane).expect("actual rendered terminal checkbox must emit its message");
+            assert!(matches!(&message, Message::ShortcutTerminalPassthrough { action, enabled: actual } if action == "rename_pane" && *actual == enabled));
+            let task = app.update(message);
+            super::super::tests::settle_settings_task(&mut app, task);
+            let saved = settings::load(&path).unwrap();
+            assert_eq!(saved.keyboard_shortcuts.terminal_passthrough_actions.iter().any(|action| action == "rename_pane"), enabled);
+            assert_eq!(saved.keyboard_shortcuts, app.settings.keyboard_shortcuts);
+            assert_eq!(workspace_widget::global_shortcut(&f2, &saved.keyboard_shortcuts, workspace_widget::FocusedPane::Terminal), expected);
+        }
+        assert!(click_actual_terminal_policy(&app, SettingsField::ShortcutChatModel).is_none(), "a scoped chat action must not offer a misleading terminal toggle");
+    }
+
     #[test]
     fn default_shortcut_rows_keep_chips_and_controls_on_one_line() {
         use iced::{
