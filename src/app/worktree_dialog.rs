@@ -1041,4 +1041,14 @@ mod tests {
         dialog.edit(WorktreeField::Branch, "feature/one".into());
         assert_eq!(dialog.branch_preview(), None);
     }
+    #[test]
+    fn prepared_pr_checkout_keeps_its_head_branch_and_base_while_destination_is_editable() {
+        let mut dialog=WorktreeDialog::new(ProjectId::new(),"/repo".into(),WorktreeDraft::branch("origin/feature"));
+        dialog.set_checkout_notice("Checks out feature tracking origin/feature.".into());
+        dialog.edit(WorktreeField::Branch,"unrelated-local-branch".into());
+        dialog.edit(WorktreeField::Base,"HEAD~20".into());
+        dialog.edit(WorktreeField::Destination,"chosen-destination".into());
+        assert_eq!(dialog.draft.branch,"origin/feature");assert!(dialog.draft.base.is_empty());assert_eq!(dialog.draft.destination,"chosen-destination");
+    }
+
 }
