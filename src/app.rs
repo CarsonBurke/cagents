@@ -10289,11 +10289,7 @@ impl Cagents {
             }
             _ => return Task::none(),
         };
-        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
-            && let Some(origin) = runtime.take_location_jump_origin(card) {
-            self.editor_features.jump_origins.entry(card).or_insert(origin);
-        }
-        self.complete_cross_card_jump(card);
+        self.collect_editor_location_jump(card);
         if intents.is_empty() {
             self.finish_editor_history_restore(card);
             return auto_save;
@@ -10488,6 +10484,7 @@ impl Cagents {
                 .then(|| runtime.focus_editor(card)),
             _ => None,
         };
+        self.collect_editor_location_jump(card);
         focus.unwrap_or_else(|| {
             self.status = Some(TransientNotice::warning(format!(
                 "line {} is not in this file any more",
@@ -10764,6 +10761,14 @@ impl Cagents {
         Some(crate::editor_locations::Location { card, source: runtime.source_tab_path()?, anchor: runtime.editor_navigation_anchor()? })
     }
 
+    fn collect_editor_location_jump(&mut self, card: CardId) {
+        if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card)
+            && let Some(origin) = runtime.take_location_jump_origin(card) {
+            self.editor_features.jump_origins.entry(card).or_insert(origin);
+        }
+        self.complete_cross_card_jump(card);
+    }
+
     fn complete_cross_card_jump(&mut self, card: CardId) {
         if self.workspace.focused() != Some(card) || self.lsp_pending_jumps.contains_key(&card) || self.editor_features.history_restores.contains_key(&card) { return; }
         let Some(target) = self.capture_editor_location(card) else { return; };
@@ -10774,6 +10779,7 @@ impl Cagents {
 
     fn navigate_cross_card_location(&mut self, card: CardId, forward: bool) -> Option<Task<Message>> {
         if self.workspace.focused() != Some(card) { return None; }
+        self.collect_editor_location_jump(card);
         let from = self.capture_editor_location(card)?;
         self.editor_features.location_history.observe_origin(&from);
         let target = self.editor_features.location_history.peek(forward, |entry| {
@@ -10857,6 +10863,7 @@ impl Cagents {
                 self.status = Some(TransientNotice::warning("The source position is no longer valid"));
                 return Task::none();
             }
+            self.collect_editor_location_jump(card);
             return if self.modal_is_open() || self.workspace.focused() != Some(card) { Task::none() }
                 else { match self.cards.get(&card) { Some(CardRuntime::Repository(runtime)) => repository_task(runtime.focus_editor(card)), _ => Task::none() } };
         }
@@ -11035,12 +11042,14 @@ impl Cagents {
                         state.invalidate_answers();
                     }
                 }
-                match self.cards.get_mut(&card) {
+                let task = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => {
                         repository_task(runtime.update(RepositoryAction::Language { card, action }))
                     }
                     _ => Task::none(),
-                }
+                };
+                self.collect_editor_location_jump(card);
+                task
             }
             Action::CompleteAt { .. } | Action::Rename | Action::RenameDraft(_) | Action::SubmitRename(_) | Action::CancelRename | Action::Format { .. } | Action::CodeActions | Action::CodeActionsAt(_) | Action::ChooseCodeAction(_) | Action::Signature => Task::none(),
         }
