@@ -269,6 +269,52 @@ impl LocalHandle {
         Arc::ptr_eq(&self.0, &other.0)
     }
 }
+/// A constructor may fail after registering but before publishing its Handle.
+/// Restore only this exact unfinished binding; the Store clock is never rolled
+/// back, and a later constructor's registration must survive this guard.
+struct SourceObserverBinding {
+    store: Arc<Mutex<Store>>,
+    previous: std::sync::Weak<Inner>,
+    bound: std::sync::Weak<Inner>,
+    committed: bool,
+}
+impl SourceObserverBinding {
+    fn bind(inner: &Arc<Inner>) -> Self {
+        let bound = Arc::downgrade(inner);
+        let previous = {
+            let mut store = inner.store.lock().unwrap_or_else(|p| p.into_inner());
+            let previous = store.source_authority_observer();
+            let mut state = inner.state.lock().unwrap_or_else(|p| p.into_inner());
+            store.register_source_authority_observer(bound.clone());
+            store.publish_source_authority(&mut state);
+            *inner.source_authority.lock().unwrap_or_else(|p| p.into_inner()) = store.source_authority();
+            inner.source_unavailable.store(store.source_authority_unavailable().is_some(), Ordering::Release);
+            previous
+        };
+        Self { store: inner.store.clone(), previous, bound, committed: false }
+    }
+    fn commit(mut self) { self.committed = true; }
+}
+impl Drop for SourceObserverBinding {
+    fn drop(&mut self) {
+        if self.committed { return; }
+        let restored = {
+            let mut store = self.store.lock().unwrap_or_else(|p| p.into_inner());
+            if store.source_authority_observer().ptr_eq(&self.bound) {
+                store.register_source_authority_observer(self.previous.clone());
+                true
+            } else { false }
+        };
+        // Refresh outside Store ownership without retaining a provider Inner
+        // across cache locks/SQL. This restores publication, not process cleanup.
+        if restored { refresh_source_authority_observer(self.previous.clone()); }
+    }
+}
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_AFTER_SOURCE_OBSERVER_BIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Only bounded source metadata and the wake descriptor survive an observer
 /// lookup. This capability owns no provider Handle, holder or cleanup lease.
 struct SourceRefreshContext {
@@ -748,15 +794,12 @@ impl LocalHandle {
             history_only: matches!(spec.transport, TransportSpec::History),
             stderr_lease: stderr_lease.clone(),
         });
-        {
-            // Same retained Store, actual current reducer; register and reseed
-            // atomically after the old worker's join and before actor begin.
-            let mut store = store.lock().unwrap_or_else(|p| p.into_inner());
-            let mut state = state.lock().unwrap_or_else(|p| p.into_inner());
-            store.register_source_authority_observer(Arc::downgrade(&inner));
-            store.publish_source_authority(&mut state);
-            *inner.source_authority.lock().unwrap_or_else(|p| p.into_inner()) = store.source_authority();
-            inner.source_unavailable.store(store.source_authority_unavailable().is_some(), Ordering::Release);
+        // Same actual Store: bind/reseed before begin, but retain the previous
+        // published observer until this constructor successfully returns.
+        let source_binding = SourceObserverBinding::bind(&inner);
+        #[cfg(test)]
+        if FAIL_AFTER_SOURCE_OBSERVER_BIND.with(|failure| failure.replace(false)) {
+            return Err("Injected failure after source registration, before worker creation".into());
         }
         let launch_context = spec.execution.clone();
         let (begin, ready_to_begin) = crossbeam_channel::bounded(1);
@@ -1065,6 +1108,7 @@ impl LocalHandle {
             }
             Err(_) => {} // The host publishes the still-owned interactive actor.
         }
+        source_binding.commit();
         Ok(handle)
     }
     /// Admit a command without tying up an IPC input worker during provider
@@ -5090,6 +5134,89 @@ mod tests {
             Some("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         );
         handle.close().unwrap();
+    }
+
+    struct SourceReplacementIdle;
+    impl Adapter for SourceReplacementIdle {
+        fn initialize(&mut self) -> Result<Step, String> { Ok(Step { events: vec![Event::Ready(true)], ..Default::default() }) }
+        fn command(&mut self, _: Command) -> Result<Step, String> { Ok(Step::default()) }
+        fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+    }
+    fn closed_source_replacement_fixture() -> (tempfile::TempDir, ProcessSpec, crate::chat::Session, LocalHandle) {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let recipe = crate::model::LaunchRecipe { program: "/bin/cat".into(), arguments: vec![], working_directory: root.path().into(), environment: Default::default(), unset_environment: Default::default() };
+        let spec = ProcessSpec::from(&recipe);
+        let source = crate::chat::Session { id: crate::model::TerminalId::new(), launch: crate::chat::Launch { provider: crate::agent::Provider::Claude, recipe, session_id: None }, proof: None, terminal: None, owned_codex_listener: None, native_continuity: Default::default() };
+        let mut adapter: Box<dyn Adapter> = Box::new(SourceReplacementIdle);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let original = LocalHandle::start(spec.clone(), adapter, initial, store, None, |_| {}).unwrap();
+        until(&original, |state| state.ready);
+        original.close().unwrap();
+        (root, spec, source, original)
+    }
+    #[test]
+    fn failed_before_worker_rebind_restores_previous_observer_and_old_reader_revokes_it() {
+        let (_root, spec, source, original) = closed_source_replacement_fixture();
+        let reader = original.transcript_reader();
+        reader.read(None).unwrap();
+        let before = original.source_authority().unwrap();
+        let mut adapter: Box<dyn Adapter> = Box::new(SourceReplacementIdle);
+        let mut initial = adapter.initialize().unwrap();
+        let preparation = preflight(&spec, &mut initial).unwrap();
+        struct ClearFailure;
+        impl Drop for ClearFailure { fn drop(&mut self) { FAIL_AFTER_SOURCE_OBSERVER_BIND.with(|failure| failure.set(false)); } }
+        let _clear = ClearFailure;
+        FAIL_AFTER_SOURCE_OBSERVER_BIND.with(|failure| failure.set(true));
+        let error = LocalHandle::start_owned(spec, adapter, initial, preparation, source, Default::default(), Some(&original), |_| {}).err().expect("injected constructor failure must refuse publication");
+        assert!(error.contains("before worker creation"));
+        {
+            let mut store = original.0.store.lock().unwrap();
+            assert!(store.source_authority_observer().ptr_eq(&Arc::downgrade(&original.0)), "failed constructor must restore the still-published owner");
+            store.deny_source_release_for_test();
+        }
+        assert!(reader.read(None).is_err());
+        assert_ne!(original.source_authority().unwrap().incarnation, before.incarnation, "old cache reader refreshes the surviving published owner after rollback");
+    }
+    #[test]
+    fn failed_external_startup_restores_observer_without_discarding_its_cleanup_owner() {
+        let (root, mut spec, mut source, original) = closed_source_replacement_fixture();
+        let reader = original.transcript_reader();
+        reader.read(None).unwrap();
+        let before = original.source_authority().unwrap();
+        let context = Arc::new(super::super::protocol::ExecutionContext::capture(root.path()).unwrap());
+        spec.execution = Some(context.clone());
+        spec.program = root.path().join("missing-owned-provider").to_string_lossy().into_owned();
+        source.launch.recipe.program = spec.program.clone();
+        let mut adapter: Box<dyn Adapter> = Box::new(SourceReplacementIdle);
+        let mut initial = adapter.initialize().unwrap();
+        let preparation = preflight(&spec, &mut initial).unwrap();
+        assert!(LocalHandle::start_owned(spec, adapter, initial, preparation, source, Default::default(), Some(&original), |_| {}).is_err());
+        assert_eq!(context.outcome(), super::super::protocol::LaunchOutcome::Uncertain, "source rollback does not consume an external cleanup disposition");
+        {
+            let mut store = original.0.store.lock().unwrap();
+            assert!(store.source_authority_observer().ptr_eq(&Arc::downgrade(&original.0)));
+            store.deny_source_release_for_test();
+        }
+        assert!(reader.read(None).is_err());
+        assert_ne!(original.source_authority().unwrap().incarnation, before.incarnation);
+        assert!(matches!(context.reconcile_cleanup().unwrap(), super::super::protocol::LaunchOutcome::NoProvider | super::super::protocol::LaunchOutcome::TeardownProved));
+    }
+    #[test]
+    fn failed_binding_rollback_cannot_clobber_a_later_committed_observer() {
+        let (_root, spec, source, original) = closed_source_replacement_fixture();
+        let mut adapter: Box<dyn Adapter> = Box::new(SourceReplacementIdle);
+        let mut initial = adapter.initialize().unwrap();
+        let preparation = preflight(&spec, &mut initial).unwrap();
+        let successor = LocalHandle::start_owned(spec, adapter, initial, preparation, source, Default::default(), Some(&original), |_| {}).unwrap();
+        until(&successor, |state| state.ready);
+        successor.close().unwrap();
+        // Deterministic guard-order seam using two real joined owners of the
+        // same Store; no claim of an OS scheduling or thread-spawn failure.
+        let failed = SourceObserverBinding::bind(&original.0);
+        SourceObserverBinding::bind(&successor.0).commit();
+        drop(failed);
+        assert!(successor.0.store.lock().unwrap().source_authority_observer().ptr_eq(&Arc::downgrade(&successor.0)));
     }
 
     #[test]
