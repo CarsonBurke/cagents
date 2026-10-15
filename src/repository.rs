@@ -9363,8 +9363,17 @@ mod tests {
                 fs::create_dir(&primary).unwrap();
                 let private = directory.path().join("private");
                 if layout == "gitfile" {
-                    git(&primary, &["init", "--template=", "-b", "main",
-                        "--separate-git-dir", private.to_str().unwrap()]);
+                    git(
+                        &primary,
+                        &[
+                            "init",
+                            "--template=",
+                            "-b",
+                            "main",
+                            "--separate-git-dir",
+                            private.to_str().unwrap(),
+                        ],
+                    );
                 } else {
                     git(&primary, &["init", "--template=", "-b", "main"]);
                 }
@@ -9373,8 +9382,15 @@ mod tests {
                 git(&primary, &["commit", "-m", "base"]);
                 let root = if layout == "commondir" {
                     let linked = directory.path().join("linked");
-                    git(&primary, &["worktree", "add", "-b", "linked", linked.to_str().unwrap()]);
-                    let admin = PathBuf::from(String::from_utf8(git_output(&linked, &["rev-parse", "--absolute-git-dir"])).unwrap().trim());
+                    git(
+                        &primary,
+                        &["worktree", "add", "-b", "linked", linked.to_str().unwrap()],
+                    );
+                    let admin = PathBuf::from(
+                        String::from_utf8(git_output(&linked, &["rev-parse", "--absolute-git-dir"]))
+                            .unwrap()
+                            .trim(),
+                    );
                     fs::rename(admin.join("commondir"), admin.join("common-target")).unwrap();
                     symlink("common-target", admin.join("commondir")).unwrap();
                     linked
@@ -9383,7 +9399,8 @@ mod tests {
                         fs::rename(primary.join(".git"), &private).unwrap();
                         symlink("../private", primary.join(".git")).unwrap();
                     } else {
-                        fs::rename(primary.join(".git"), directory.path().join("git-locator")).unwrap();
+                        fs::rename(primary.join(".git"), directory.path().join("git-locator"))
+                            .unwrap();
                         symlink("../git-locator", primary.join(".git")).unwrap();
                     }
                     primary
@@ -9396,17 +9413,39 @@ mod tests {
                 assert_eq!(status.dirty.unstaged, 1, "Git accepts {layout}");
                 let options = SnapshotOptions::default();
                 let mut cache = SnapshotCache::default();
-                let first = service.snapshot_cached(&root, options, &cancel, &mut cache)
-                    .unwrap().unwrap();
+                let first = service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(first.status.dirty, status.dirty, "{layout}");
-                assert_eq!(measured(&first, "file", ChangeArea::Unstaged), (Some(1), Some(1)), "{layout}");
+                assert_eq!(
+                    measured(&first, "file", ChangeArea::Unstaged),
+                    (Some(1), Some(1)),
+                    "{layout}"
+                );
                 executor.commands.lock().unwrap().clear();
-                assert!(service.snapshot_cached(&root, options, &cancel, &mut cache).unwrap().is_none(), "{layout}");
-                assert_eq!(executor.commands.lock().unwrap().len(), 1, "{layout}: unchanged runs only status");
+                assert!(
+                    service
+                        .snapshot_cached(&root, options, &cancel, &mut cache)
+                        .unwrap()
+                        .is_none(),
+                    "{layout}"
+                );
+                assert_eq!(
+                    executor.commands.lock().unwrap().len(),
+                    1,
+                    "{layout}: unchanged runs only status"
+                );
                 fs::write(root.join("file"), "second\nline\n").unwrap();
-                let changed = service.snapshot_cached(&root, options, &cancel, &mut cache)
-                    .unwrap().unwrap();
-                assert_eq!(measured(&changed, "file", ChangeArea::Unstaged), (Some(2), Some(1)), "{layout}: missed-event content repair");
+                let changed = service
+                    .snapshot_cached(&root, options, &cancel, &mut cache)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    measured(&changed, "file", ChangeArea::Unstaged),
+                    (Some(2), Some(1)),
+                    "{layout}: missed-event content repair"
+                );
             }
         }
 
