@@ -376,7 +376,7 @@ mod tests {
         std::fs::write(home.join("provider-payload"), b"keep managed history").unwrap();
         store.update(|registry| registry.register(Registered {key,provider:Provider::Codex,linked_home:None,label:None,email:None,organization:None,added_at:1}, &[])).unwrap().1.unwrap();
         let account = Account::managed(Provider::Codex,key,home.clone());
-        let host = crate::host::account_lifecycle::tests::host();
+        let host = crate::host::AccountReservation::test_host();
         let reservation = crate::host::AccountReservation::test_install(&host, &[account.clone()], store.clone(), &homes).unwrap();
         let before = store.load().unwrap(); let inode = home.metadata().unwrap().ino();
         let error = execute_at(Operation::Remove {id:account.id()}, &reservation, homes.clone(), store.clone()).unwrap_err();

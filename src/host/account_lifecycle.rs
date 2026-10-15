@@ -307,6 +307,9 @@ impl Reservation {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_host() -> SharedHost { tests::host() }
+
+    #[cfg(test)]
     pub(crate) fn test_install(host: &SharedHost, accounts: &[Account], store: Store, homes: &crate::account::home::Homes) -> Result<Self, ProtocolError> {
         Self::install_with_store(host, accounts, store, Some(homes))
     }
