@@ -199,6 +199,12 @@ impl State {
     pub(super) fn item_revision(&self,item:&str)->u64 {self.aliases.get(item).and_then(|key|self.entries.get(key)).map_or(0,|entry|entry.revision.max(entry.render_revision))}
     /// Geometry readiness invalidates containing retained rows without
     /// pretending the immutable file source or Find document changed.
+    /// Only current loaded leaves of the selected displayed alias can renew
+    /// an accepted Find navigation after asynchronous geometry completes.
+    pub(super) fn item_matches(&self,item:&str,matches:impl Fn(&tool_text::ToolText)->bool)->bool {
+        self.aliases.get(item).and_then(|key|self.entries.get(key)).is_some_and(|entry|
+            entry.patches.iter().any(|(index,loaded)|matches(&loaded.view) && entry.current(*index).is_some()))
+    }
     pub(super) fn render_ready(&mut self,ready:impl Fn(&tool_text::ToolText)->bool)->bool {
         let mut changed=false;
         for entry in self.entries.values_mut() {
