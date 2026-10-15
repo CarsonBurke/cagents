@@ -1876,14 +1876,20 @@ mod tests {
             chat_id: TerminalId::new(),
             state: crate::agent::ActivityState::Idle,
             generation: 42,
-            outcome: Some(crate::agent::ActivityOutcome::Failed { reason: "Provider exited with status 3".into() }),
+            outcome: Some(crate::agent::ActivityOutcome::Failed {
+                reason: "Provider exited with status 3".into(),
+            }),
         };
         let binary = postcard::to_stdvec(&message).unwrap();
         let decoded: ServerMessage = postcard::from_bytes(&binary).unwrap();
-        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
         let json = serde_json::to_value(&message).unwrap();
         let decoded: ServerMessage = serde_json::from_value(json).unwrap();
-        assert!(matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3"));
+        assert!(
+            matches!(decoded, ServerMessage::ChatActivity { generation:42, outcome:Some(crate::agent::ActivityOutcome::Failed { reason }), .. } if reason == "Provider exited with status 3")
+        );
     }
 
     #[test]

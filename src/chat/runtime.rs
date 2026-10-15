@@ -286,7 +286,7 @@ impl Handle {
         nonblocking(&wake)?;
         nonblocking(&reader)?;
         let (commands, incoming) = crossbeam_channel::bounded(64);
-        let (urgent_commands, urgent_incoming)=crossbeam_channel::bounded(1);
+        let (urgent_commands, urgent_incoming) = crossbeam_channel::bounded(1);
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
             ..Snapshot::default()
@@ -619,13 +619,26 @@ impl Handle {
     }
     /// Admit a command without tying up an IPC input worker during provider
     /// acknowledgement. The shared completion broker owns the bounded wait.
-    pub(crate) fn enqueue_command(&self, command:Command) -> Result<crossbeam_channel::Receiver<Result<(),String>>,String> {
-        if self.is_completed() || self.0.draining.load(Ordering::Acquire) {return Err("Provider process exited; restart the session to continue".into());}
-        if self.0.stop.load(Ordering::Acquire) {return Err("Chat is closing".into());}
-        let urgent=matches!(&command,Command::Interrupt);
-        let (reply,response)=crossbeam_channel::bounded(1);
-        let sender=if urgent {&self.0.urgent_commands} else {&self.0.commands};
-        sender.try_send((ActorCommand::Provider {run:None,command},reply)).map_err(|error|format!("Chat command queue unavailable: {error}"))?;
+    pub(crate) fn enqueue_command(
+        &self,
+        command: Command,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+        if self.is_completed() || self.0.draining.load(Ordering::Acquire) {
+            return Err("Provider process exited; restart the session to continue".into());
+        }
+        if self.0.stop.load(Ordering::Acquire) {
+            return Err("Chat is closing".into());
+        }
+        let urgent = matches!(&command, Command::Interrupt);
+        let (reply, response) = crossbeam_channel::bounded(1);
+        let sender = if urgent {
+            &self.0.urgent_commands
+        } else {
+            &self.0.commands
+        };
+        sender
+            .try_send((ActorCommand::Provider { run: None, command }, reply))
+            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
         self.wake();
         Ok(response)
     }
@@ -693,7 +706,11 @@ impl Handle {
             return Err(Rejection::Refused("Chat is closing".into()));
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        let sender=if matches!(&command,Command::Interrupt) {&self.0.urgent_commands} else {&self.0.commands};
+        let sender = if matches!(&command, Command::Interrupt) {
+            &self.0.urgent_commands
+        } else {
+            &self.0.commands
+        };
         sender
             .try_send((ActorCommand::Provider { run, command }, reply))
             .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
@@ -715,7 +732,11 @@ impl Handle {
             return Err("The provider actor is no longer accepting ownership commands".into());
         }
         let (reply, response) = crossbeam_channel::bounded(1);
-        let sender=if matches!(&command,ActorCommand::Interrupt{..}) {&self.0.urgent_commands} else {&self.0.commands};
+        let sender = if matches!(&command, ActorCommand::Interrupt { .. }) {
+            &self.0.urgent_commands
+        } else {
+            &self.0.commands
+        };
         sender
             .try_send((command, reply))
             .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
@@ -828,10 +849,32 @@ impl Handle {
             .unwrap_or_else(|p| p.into_inner())
             .file_query(command)
     }
-    pub(crate) fn provider_exit_output(&self, log_id:&str,offset:u64) -> Result<(Vec<u8>,Option<u64>,u64),String> {
-        let current = self.0.state.lock().unwrap_or_else(|p|p.into_inner()).provider_exit.as_ref().and_then(|diagnostic|diagnostic.log.as_ref()).map(|log|log.id.clone());
-        if current.as_deref()!=Some(log_id) { return Err("This provider diagnostic is no longer current".into()); }
-        let lease = self.0.stderr_lease.lock().unwrap_or_else(|p|p.into_inner()).as_ref().filter(|lease|lease.descriptor.log.id==log_id).cloned().ok_or("Retained provider output expired or is unavailable")?;
+    pub(crate) fn provider_exit_output(
+        &self,
+        log_id: &str,
+        offset: u64,
+    ) -> Result<(Vec<u8>, Option<u64>, u64), String> {
+        let current = self
+            .0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .provider_exit
+            .as_ref()
+            .and_then(|diagnostic| diagnostic.log.as_ref())
+            .map(|log| log.id.clone());
+        if current.as_deref() != Some(log_id) {
+            return Err("This provider diagnostic is no longer current".into());
+        }
+        let lease = self
+            .0
+            .stderr_lease
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .filter(|lease| lease.descriptor.log.id == log_id)
+            .cloned()
+            .ok_or("Retained provider output expired or is unavailable")?;
         lease.read(offset)
     }
     /// Resident provider usage only: never opens the transcript store.
@@ -1348,7 +1391,10 @@ fn preflight_inner(
     // before the actor replaces their oldest inputs with omission markers.
     // Rejecting the batch here would bypass that non-fatal byte budgeting.
     if count.0 > 4 * STATE_LIMIT {
-        tracing::warn!(bytes=count.0,"Reducing large initial provider presentation metadata");
+        tracing::warn!(
+            bytes = count.0,
+            "Reducing large initial provider presentation metadata"
+        );
     }
     initial.events = metadata;
     Ok(store)
@@ -1725,9 +1771,13 @@ impl TurnAttention {
 }
 impl Actor {
     fn capture_stderr(&mut self, bytes: &[u8]) {
-        if let Some(log) = &mut self.stderr_log { log.push(bytes); }
+        if let Some(log) = &mut self.stderr_log {
+            log.push(bytes);
+        }
         for byte in bytes {
-            if self.stderr.len() == 64 * 1024 { self.stderr.pop_front(); }
+            if self.stderr.len() == 64 * 1024 {
+                self.stderr.pop_front();
+            }
             self.stderr.push_back(*byte);
         }
     }
@@ -1797,274 +1847,282 @@ impl Actor {
         nonblocking(&stdout)?;
         nonblocking(&stderr)?;
         let result = (|| {
-        self.step(initial)?;
-        let mut stdout_eof = false;
-        let mut stdout_eof_at = None;
-        let mut stderr_eof = false;
-        let mut closing = None;
-        let mut partial_started = None;
-        let mut interrupt_sent = false;
-        let mut interrupt_error = String::new();
-        let mut garbage_lines = 0usize;
-        let mut garbage_total=0u64;
-        loop {
-            let housekeeping = self.adapter.tick();
-            self.step(housekeeping)?;
-            if self.stop.load(Ordering::Acquire) {
-                if closing.is_none() {
-                    closing = Some(Instant::now());
-                }
-                let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
-                if busy && !interrupt_sent && self.pending.is_empty() {
-                    match self.adapter.command(Command::Interrupt) {
-                        Ok(step) => {
-                            self.step(step)?;
-                            interrupt_sent = true;
-                        }
-                        // A just-submitted turn may not have its provider ID yet.
-                        // Continue draining until it can be interrupted or the deadline expires.
-                        Err(error) => interrupt_error = error,
-                    }
-                }
-                if self.pending.is_empty()
-                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
-                {
-                    return Ok(());
-                }
-                if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
-                    return Err(format!(
-                        "Provider did not confirm interruption within 30 seconds ({interrupt_error}). Backend work may still be active; check it before restarting the session"
-                    ));
-                }
-            }
-            self.drain_commands(closing.is_some())?;
-            // Parse every frame that already arrived. Gating this on an empty stdin
-            // queue froze streaming for a whole turn against any provider that reads
-            // stdin only between turns, then killed the session by blaming its
-            // framing; a stalled write has its own `write_started` deadline below.
-            let mut frames_ready = false;
-            let mut parsed = 0usize;
+            self.step(initial)?;
+            let mut stdout_eof = false;
+            let mut stdout_eof_at = None;
+            let mut stderr_eof = false;
+            let mut closing = None;
+            let mut partial_started = None;
+            let mut interrupt_sent = false;
+            let mut interrupt_error = String::new();
+            let mut garbage_lines = 0usize;
+            let mut garbage_total = 0u64;
             loop {
-                let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
-                    break;
-                };
-                if newline == 0 {
-                    self.output.drain(..1);
-                    self.scanned = 0;
-                    continue;
-                }
-                if parsed == FRAMES_PER_POLL {
-                    frames_ready = true;
-                    break;
-                }
-                let frame = match self.adapter.decode(&self.output[..newline]) {
-                    Ok(frame) => {
-                        garbage_lines = 0;
-                        Some(frame)
+                let housekeeping = self.adapter.tick();
+                self.step(housekeeping)?;
+                if self.stop.load(Ordering::Acquire) {
+                    if closing.is_none() {
+                        closing = Some(Instant::now());
                     }
-                    Err(error) => {
-                        garbage_lines += 1;
-                        garbage_total=garbage_total.saturating_add(1);
-                        let preview = super::protocol::preview(&self.output[..newline], 200);
-                        if garbage_total<=3 || garbage_total.is_power_of_two() {
-                            tracing::warn!(%preview, %error, consecutive = garbage_lines, ignored_total=garbage_total, "Skipping non-JSON provider stdout line");
-                        }
-                        if garbage_lines >= 8 {
-                            return Err(format!(
-                                "Provider printed 8 consecutive invalid protocol lines. Last output: {preview}"
-                            ));
-                        }
-                        None
-                    }
-                };
-                self.output.drain(..=newline);
-                self.scanned = 0;
-                partial_started = None;
-                parsed += 1;
-                let Some(frame) = frame else {
-                    continue;
-                };
-                self.first_frame = true;
-                let step = self.adapter.receive(frame)?;
-                self.provider_step(step)?;
-            }
-            if self.output.len() > FRAME_LIMIT {
-                return Err("Provider stdout frame exceeds 32 MiB".into());
-            }
-            // Only a genuinely incomplete line is on the framing deadline.
-            if frames_ready || self.output.is_empty() {
-                partial_started = None;
-            } else {
-                let since = partial_started.get_or_insert_with(Instant::now);
-                if since.elapsed() > IO_TIMEOUT {
-                    return Err(
-                        "Provider JSON frame remained incomplete or blocked for 30 seconds".into(),
-                    );
-                }
-            }
-            if stdout_eof && self.pending.is_empty() {
-                if !self.output.is_empty() {
-                    return Err("Provider ended with an incomplete JSON line".into());
-                }
-                if let Some(status) = self
-                    .child
-                    .as_mut()
-                    .ok_or("Provider process unavailable")?
-                    .observed_exit_status()
-                    .map_err(|error| error.to_string())?
-                {
-                    // Exit notification and stdout EOF can win the poll before
-                    // the last stderr write. Drain the exact child's pipe before
-                    // constructing its diagnostic, with a bounded work budget.
-                    let mut tail_buffer = [0u8; 8192];
-                    for _ in 0..64 {
-                        match stderr.read(&mut tail_buffer) {
-                            Ok(0) => break,
-                            Ok(count) => self.capture_stderr(&tail_buffer[..count]),
-                            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                            Err(_) => break,
+                    let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+                    if busy && !interrupt_sent && self.pending.is_empty() {
+                        match self.adapter.command(Command::Interrupt) {
+                            Ok(step) => {
+                                self.step(step)?;
+                                interrupt_sent = true;
+                            }
+                            // A just-submitted turn may not have its provider ID yet.
+                            // Continue draining until it can be interrupted or the deadline expires.
+                            Err(error) => interrupt_error = error,
                         }
                     }
-                    if status.success() {
+                    if self.pending.is_empty()
+                        && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
+                    {
                         return Ok(());
                     }
-                    return Err(format!("Provider exited with {status}"));
+                    if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
+                        return Err(format!(
+                            "Provider did not confirm interruption within 30 seconds ({interrupt_error}). Backend work may still be active; check it before restarting the session"
+                        ));
+                    }
                 }
-                if stdout_eof_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(1) {
-                    return Err("Provider closed its protocol stream without exiting; restart the session".into());
+                self.drain_commands(closing.is_some())?;
+                // Parse every frame that already arrived. Gating this on an empty stdin
+                // queue froze streaming for a whole turn against any provider that reads
+                // stdin only between turns, then killed the session by blaming its
+                // framing; a stalled write has its own `write_started` deadline below.
+                let mut frames_ready = false;
+                let mut parsed = 0usize;
+                loop {
+                    let Some(newline) = next_newline(&self.output, &mut self.scanned) else {
+                        break;
+                    };
+                    if newline == 0 {
+                        self.output.drain(..1);
+                        self.scanned = 0;
+                        continue;
+                    }
+                    if parsed == FRAMES_PER_POLL {
+                        frames_ready = true;
+                        break;
+                    }
+                    let frame = match self.adapter.decode(&self.output[..newline]) {
+                        Ok(frame) => {
+                            garbage_lines = 0;
+                            Some(frame)
+                        }
+                        Err(error) => {
+                            garbage_lines += 1;
+                            garbage_total = garbage_total.saturating_add(1);
+                            let preview = super::protocol::preview(&self.output[..newline], 200);
+                            if garbage_total <= 3 || garbage_total.is_power_of_two() {
+                                tracing::warn!(%preview, %error, consecutive = garbage_lines, ignored_total=garbage_total, "Skipping non-JSON provider stdout line");
+                            }
+                            if garbage_lines >= 8 {
+                                return Err(format!(
+                                    "Provider printed 8 consecutive invalid protocol lines. Last output: {preview}"
+                                ));
+                            }
+                            None
+                        }
+                    };
+                    self.output.drain(..=newline);
+                    self.scanned = 0;
+                    partial_started = None;
+                    parsed += 1;
+                    let Some(frame) = frame else {
+                        continue;
+                    };
+                    self.first_frame = true;
+                    let step = self.adapter.receive(frame)?;
+                    self.provider_step(step)?;
                 }
-            }
-            if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
-                return Err(
-                    "Provider initialization timed out without a JSON protocol frame".into(),
-                );
-            }
-            if self
-                .write_started
-                .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
-            {
-                return Err("Provider stdin stalled for 30 seconds".into());
-            }
-            if self.dirty
-                && self.visible.load(Ordering::Acquire)
-                && self.last_present.elapsed() >= PRESENT_INTERVAL
-            {
-                self.dirty = false;
-                self.last_present = Instant::now();
-                (self.notify)(Update::Presentation);
-            }
-            let mut fds = [
-                libc::pollfd {
-                    fd: self.wake.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if stdout_eof || self.output.len() > FRAME_LIMIT {
-                        -1
-                    } else {
-                        stdout.as_raw_fd()
-                    },
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: if self.pending.is_empty() {
-                        -1
-                    } else {
-                        stdin.as_raw_fd()
-                    },
-                    events: libc::POLLOUT,
-                    revents: 0,
-                },
-            ];
-            let timeout = if frames_ready
-                || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
-            {
-                0
-            } else if self.dirty && self.visible.load(Ordering::Acquire) {
-                50
-            } else if !self.first_frame
-                || stdout_eof
-                || !self.output.is_empty()
-                || self.write_started.is_some()
-                || closing.is_some()
-            {
-                250
-            } else {
-                -1
-            };
-            let timeout = self.adapter.deadline().map_or(timeout, |deadline| {
-                let remaining = deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis()
-                    .min(i32::MAX as u128) as i32;
-                if timeout < 0 {
-                    remaining
+                if self.output.len() > FRAME_LIMIT {
+                    return Err("Provider stdout frame exceeds 32 MiB".into());
+                }
+                // Only a genuinely incomplete line is on the framing deadline.
+                if frames_ready || self.output.is_empty() {
+                    partial_started = None;
                 } else {
-                    timeout.min(remaining)
+                    let since = partial_started.get_or_insert_with(Instant::now);
+                    if since.elapsed() > IO_TIMEOUT {
+                        return Err(
+                            "Provider JSON frame remained incomplete or blocked for 30 seconds"
+                                .into(),
+                        );
+                    }
                 }
-            });
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error.to_string());
-                }
-            }
-            let mut buffer = [0u8; 8192];
-            if fds[0].revents != 0 {
-                while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
-            }
-            if fds[3].revents != 0 {
-                if let Some(line) = self.pending.front() {
-                    match stdin.write(&line[self.offset..]) {
-                        Ok(0) => return Err("Provider closed stdin".into()),
-                        Ok(n) => {
-                            self.offset += n;
-                            self.queued -= n;
-                            if self.offset == line.len() {
-                                self.pending.pop_front();
-                                self.offset = 0;
-                                self.write_started = if self.pending.is_empty() {
-                                    None
-                                } else {
-                                    Some(Instant::now())
-                                };
+                if stdout_eof && self.pending.is_empty() {
+                    if !self.output.is_empty() {
+                        return Err("Provider ended with an incomplete JSON line".into());
+                    }
+                    if let Some(status) = self
+                        .child
+                        .as_mut()
+                        .ok_or("Provider process unavailable")?
+                        .observed_exit_status()
+                        .map_err(|error| error.to_string())?
+                    {
+                        // Exit notification and stdout EOF can win the poll before
+                        // the last stderr write. Drain the exact child's pipe before
+                        // constructing its diagnostic, with a bounded work budget.
+                        let mut tail_buffer = [0u8; 8192];
+                        for _ in 0..64 {
+                            match stderr.read(&mut tail_buffer) {
+                                Ok(0) => break,
+                                Ok(count) => self.capture_stderr(&tail_buffer[..count]),
+                                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                                    continue;
+                                }
+                                Err(_) => break,
                             }
                         }
+                        if status.success() {
+                            return Ok(());
+                        }
+                        return Err(format!("Provider exited with {status}"));
+                    }
+                    if stdout_eof_at.get_or_insert_with(Instant::now).elapsed()
+                        >= Duration::from_secs(1)
+                    {
+                        return Err("Provider closed its protocol stream without exiting; restart the session".into());
+                    }
+                }
+                if !self.first_frame && self.started.elapsed() > IO_TIMEOUT {
+                    return Err(
+                        "Provider initialization timed out without a JSON protocol frame".into(),
+                    );
+                }
+                if self
+                    .write_started
+                    .is_some_and(|at| at.elapsed() > IO_TIMEOUT)
+                {
+                    return Err("Provider stdin stalled for 30 seconds".into());
+                }
+                if self.dirty
+                    && self.visible.load(Ordering::Acquire)
+                    && self.last_present.elapsed() >= PRESENT_INTERVAL
+                {
+                    self.dirty = false;
+                    self.last_present = Instant::now();
+                    (self.notify)(Update::Presentation);
+                }
+                let mut fds = [
+                    libc::pollfd {
+                        fd: self.wake.as_raw_fd(),
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if stdout_eof || self.output.len() > FRAME_LIMIT {
+                            -1
+                        } else {
+                            stdout.as_raw_fd()
+                        },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if stderr_eof { -1 } else { stderr.as_raw_fd() },
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                    libc::pollfd {
+                        fd: if self.pending.is_empty() {
+                            -1
+                        } else {
+                            stdin.as_raw_fd()
+                        },
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    },
+                ];
+                let timeout = if frames_ready
+                    || (self.queued <= QUEUE_BACKPRESSURE && !self.incoming.is_empty())
+                {
+                    0
+                } else if self.dirty && self.visible.load(Ordering::Acquire) {
+                    50
+                } else if !self.first_frame
+                    || stdout_eof
+                    || !self.output.is_empty()
+                    || self.write_started.is_some()
+                    || closing.is_some()
+                {
+                    250
+                } else {
+                    -1
+                };
+                let timeout = self.adapter.deadline().map_or(timeout, |deadline| {
+                    let remaining = deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_millis()
+                        .min(i32::MAX as u128) as i32;
+                    if timeout < 0 {
+                        remaining
+                    } else {
+                        timeout.min(remaining)
+                    }
+                });
+                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } < 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error.to_string());
+                    }
+                }
+                let mut buffer = [0u8; 8192];
+                if fds[0].revents != 0 {
+                    while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
+                }
+                if fds[3].revents != 0 {
+                    if let Some(line) = self.pending.front() {
+                        match stdin.write(&line[self.offset..]) {
+                            Ok(0) => return Err("Provider closed stdin".into()),
+                            Ok(n) => {
+                                self.offset += n;
+                                self.queued -= n;
+                                if self.offset == line.len() {
+                                    self.pending.pop_front();
+                                    self.offset = 0;
+                                    self.write_started = if self.pending.is_empty() {
+                                        None
+                                    } else {
+                                        Some(Instant::now())
+                                    };
+                                }
+                            }
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                            Err(e) => return Err(format!("Provider stdin: {e}")),
+                        }
+                    }
+                }
+                if fds[1].revents != 0 {
+                    let available = buffer.len().min(FRAME_LIMIT + 1 - self.output.len());
+                    match stdout.read(&mut buffer[..available]) {
+                        Ok(0) => {
+                            stdout_eof = true;
+                            stdout_eof_at.get_or_insert_with(Instant::now);
+                        }
+                        Ok(n) => {
+                            reserve_frame(&mut self.output, n)?;
+                            self.output.extend_from_slice(&buffer[..n]);
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                        Err(e) => return Err(format!("Provider stdin: {e}")),
+                        Err(e) => return Err(format!("Provider stdout: {e}")),
+                    }
+                }
+                if fds[2].revents != 0 {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => stderr_eof = true,
+                        Ok(n) => self.capture_stderr(&buffer[..n]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(e) => return Err(format!("Provider stderr: {e}")),
                     }
                 }
             }
-            if fds[1].revents != 0 {
-                let available = buffer.len().min(FRAME_LIMIT + 1 - self.output.len());
-                match stdout.read(&mut buffer[..available]) {
-                    Ok(0) => { stdout_eof = true; stdout_eof_at.get_or_insert_with(Instant::now); },
-                    Ok(n) => {
-                        reserve_frame(&mut self.output, n)?;
-                        self.output.extend_from_slice(&buffer[..n]);
-                    }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(format!("Provider stdout: {e}")),
-                }
-            }
-            if fds[2].revents != 0 {
-                match stderr.read(&mut buffer) {
-                    Ok(0) => stderr_eof = true,
-                    Ok(n) => self.capture_stderr(&buffer[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(format!("Provider stderr: {e}")),
-                }
-            }
-        }
         })();
-        self.stderr_reader=Some(stderr);
+        self.stderr_reader = Some(stderr);
         result
     }
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
@@ -2073,10 +2131,14 @@ impl Actor {
             // queued write: a provider that reads stdin only between turns keeps
             // `pending` non-empty for the whole turn, and refusing to drain there left
             // UI commands unacknowledged until the caller's 10 second timeout.
-            let request=self.urgent_incoming.try_recv().ok().or_else(|| {
-                (self.queued<=QUEUE_BACKPRESSURE).then(||self.incoming.try_recv().ok()).flatten()
+            let request = self.urgent_incoming.try_recv().ok().or_else(|| {
+                (self.queued <= QUEUE_BACKPRESSURE)
+                    .then(|| self.incoming.try_recv().ok())
+                    .flatten()
             });
-            let Some((command,reply))=request else {break;};
+            let Some((command, reply)) = request else {
+                break;
+            };
             if closing || self.stop.load(Ordering::Acquire) {
                 let _ = reply.send(Err("Chat is closing".into()));
                 continue;
@@ -2227,7 +2289,8 @@ impl Actor {
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
-            }.map_err(|error|super::protocol::preview(error.as_bytes(),1024));
+            }
+            .map_err(|error| super::protocol::preview(error.as_bytes(), 1024));
             match prepared {
                 Ok(step) => {
                     let acknowledgement = self.adapter.command_ack();
@@ -2266,7 +2329,12 @@ impl Actor {
         Ok(())
     }
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
-        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() || !self.control_replies.is_empty() {
+        if !state.ready
+            || state.exited
+            || !self.pending.is_empty()
+            || !self.output.is_empty()
+            || !self.control_replies.is_empty()
+        {
             UpdateReadiness::Unready
         } else if state.is_working() || state.waiting || !state.requests.is_empty() {
             UpdateReadiness::Busy
@@ -2623,8 +2691,13 @@ fn provider_exit_diagnostic(
         .chars()
         .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
         .collect::<String>();
-    let output = output[output.ceil_char_boundary(output.len().saturating_sub(64 * 1024))..].to_owned();
-    let lower = format!("{output} {}",super::protocol::preview(error.as_bytes(),1024)).to_lowercase();
+    let output =
+        output[output.ceil_char_boundary(output.len().saturating_sub(64 * 1024))..].to_owned();
+    let lower = format!(
+        "{output} {}",
+        super::protocol::preview(error.as_bytes(), 1024)
+    )
+    .to_lowercase();
     let hint = if lower.contains("unauthorized")
         || lower.contains("authentication")
         || lower.contains("api key")
@@ -2671,7 +2744,11 @@ fn provider_exit_diagnostic(
     } else {
         format!("{reason}.\n{tail}\n{}", hint.trim())
     };
-    super::ProviderExitDiagnostic { summary, output, log:None }
+    super::ProviderExitDiagnostic {
+        summary,
+        output,
+        log: None,
+    }
 }
 
 // Presentation history must never turn a healthy provider into a failed actor.
@@ -2692,8 +2769,13 @@ fn trim_metadata(state: &mut Snapshot) -> usize {
         "Trimming provider presentation metadata to budget"
     );
     for index in 0..state.permission_denials.len() {
-        const OMITTED: &str = "{\"_cagents_preview\":\"Older tool input omitted to fit the presentation budget\"}";
-        if state.permission_denials[index].tool_input.as_ref().is_some_and(|input| input.len() > OMITTED.len()) {
+        const OMITTED: &str =
+            "{\"_cagents_preview\":\"Older tool input omitted to fit the presentation budget\"}";
+        if state.permission_denials[index]
+            .tool_input
+            .as_ref()
+            .is_some_and(|input| input.len() > OMITTED.len())
+        {
             state.permission_denials[index].tool_input = Some(OMITTED.into());
             retained = bytes(state);
             if retained <= STATE_LIMIT {
@@ -2836,9 +2918,12 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::TurnFinished { outcome, .. } => {
             use crate::{agent::ActivityOutcome, notifications::Kind};
             match outcome {
-                Kind::Cancelled=> {let all=state.capabilities.interrupt_stops_background;finish_snapshot_work(state,ToolStatus::Stopped,all);}
-                Kind::Failed=>finish_snapshot_work(state,ToolStatus::Failed,false),
-                _=>{}
+                Kind::Cancelled => {
+                    let all = state.capabilities.interrupt_stops_background;
+                    finish_snapshot_work(state, ToolStatus::Stopped, all);
+                }
+                Kind::Failed => finish_snapshot_work(state, ToolStatus::Failed, false),
+                _ => {}
             }
             state.outcome = match outcome {
                 Kind::Succeeded => Some(ActivityOutcome::Succeeded),
@@ -3260,7 +3345,9 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
         Event::Composer { text } => state.composer = Some(text),
         Event::OpenUrl { url, instructions } => state.open_url = Some((url, instructions)),
         Event::Error { message, fatal } => {
-            if let Some(crate::agent::ActivityOutcome::Failed { reason }) = &mut state.outcome { *reason = message.clone(); }
+            if let Some(crate::agent::ActivityOutcome::Failed { reason }) = &mut state.outcome {
+                *reason = message.clone();
+            }
             state.error = Some(message);
             if fatal {
                 state.prompt_suggestion = None;
@@ -3289,17 +3376,33 @@ fn apply_event(state: &mut Snapshot, indices: &mut BTreeMap<String, usize>, even
     }
 }
 
-fn finish_snapshot_work(state:&mut Snapshot,status:ToolStatus,include_background:bool) {
-    fn finish_items(items:&mut [Arc<Item>],status:ToolStatus) {
+fn finish_snapshot_work(state: &mut Snapshot, status: ToolStatus, include_background: bool) {
+    fn finish_items(items: &mut [Arc<Item>], status: ToolStatus) {
         for item in items {
-            if item.content.status()!=Some(ToolStatus::Running) {continue;}
-            match &mut Arc::make_mut(item).content {ItemContent::Tool {status:current,..}|ItemContent::Command {status:current,..}|ItemContent::Changes {status:current,..}=>*current=status,_=>{}}
+            if item.content.status() != Some(ToolStatus::Running) {
+                continue;
+            }
+            match &mut Arc::make_mut(item).content {
+                ItemContent::Tool {
+                    status: current, ..
+                }
+                | ItemContent::Command {
+                    status: current, ..
+                }
+                | ItemContent::Changes {
+                    status: current, ..
+                } => *current = status,
+                _ => {}
+            }
         }
     }
-    finish_items(&mut state.items,status);
+    finish_items(&mut state.items, status);
     for child in &mut state.subagents {
-        if child.status==ToolStatus::Running && (!child.background || include_background) {
-            child.status=status;child.waiting=false;child.detail.clear();finish_items(&mut child.items,status);
+        if child.status == ToolStatus::Running && (!child.background || include_background) {
+            child.status = status;
+            child.waiting = false;
+            child.detail.clear();
+            finish_items(&mut child.items, status);
         }
     }
 }
@@ -3373,31 +3476,64 @@ mod tests {
         struct ActivityFixture;
         impl Adapter for ActivityFixture {
             fn initialize(&mut self) -> Result<Step, String> {
-                Ok(Step { events: vec![Event::Ready(true)], ..Default::default() })
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
             }
-            fn command(&mut self, _: Command) -> Result<Step, String> { Ok(Step::default()) }
-            fn receive(&mut self, _: Value) -> Result<Step, String> { Ok(Step::default()) }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let spec = ProcessSpec { execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,
-            program:"/bin/cat".into(),arguments:Vec::new(),working_directory:std::env::temp_dir(),environment:BTreeMap::new() };
-        let mut adapter:Box<dyn Adapter> = Box::new(ActivityFixture);
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: std::env::temp_dir(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(ActivityFixture);
         let mut initial = adapter.initialize().unwrap();
-        let store = preflight(&spec,&mut initial).unwrap();
-        let (send,receive) = crossbeam_channel::unbounded();
-        let handle = Handle::start(spec,adapter,initial,store,None,move |update| { let _ = send.send(update); }).unwrap();
-        until(&handle,|snapshot| snapshot.ready);
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = Handle::start(spec, adapter, initial, store, None, move |update| {
+            let _ = send.send(update);
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
         receive.try_iter().for_each(drop);
-        for outcome in [crate::agent::ActivityOutcome::Failed { reason:"Provider exited with status 3".into() }, crate::agent::ActivityOutcome::Succeeded] {
+        for outcome in [
+            crate::agent::ActivityOutcome::Failed {
+                reason: "Provider exited with status 3".into(),
+            },
+            crate::agent::ActivityOutcome::Succeeded,
+        ] {
             {
                 let mut state = handle.0.state.lock().unwrap();
                 state.outcome = Some(outcome.clone());
                 state.generation += 1;
             }
             handle.command(Command::Compact).unwrap();
-            let updates = receive.try_iter().filter_map(|update| match update { Update::Activity { state,outcome,.. } => Some((state,outcome)), _ => None }).collect::<Vec<_>>();
-            assert_eq!(updates,vec![(ActivityState::Idle,Some(outcome))]);
+            let updates = receive
+                .try_iter()
+                .filter_map(|update| match update {
+                    Update::Activity { state, outcome, .. } => Some((state, outcome)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(updates, vec![(ActivityState::Idle, Some(outcome))]);
             handle.command(Command::Compact).unwrap();
-            assert!(!receive.try_iter().any(|update| matches!(update,Update::Activity { .. })));
+            assert!(
+                !receive
+                    .try_iter()
+                    .any(|update| matches!(update, Update::Activity { .. }))
+            );
         }
         handle.close().unwrap();
     }
@@ -3411,16 +3547,30 @@ mod tests {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "chat::runtime::tests::isolated_stdout_noise_is_tolerated_and_consecutive_noise_is_bounded", "--nocapture"])
                 .env(LOG,&log).output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
             let warnings = std::fs::read_to_string(log).unwrap();
             assert!(warnings.contains("Skipping non-JSON provider stdout line"));
             assert!(warnings.contains("stray plain output"));
-            assert!(!warnings.contains(&"x".repeat(201)), "provider preview must remain bounded");
-            assert!(!warnings.contains('\x1b'), "provider controls must be escaped in logs");
+            assert!(
+                !warnings.contains(&"x".repeat(201)),
+                "provider preview must remain bounded"
+            );
+            assert!(
+                !warnings.contains('\x1b'),
+                "provider controls must be escaped in logs"
+            );
             return;
         };
-        let collector = tracing_subscriber::fmt().with_ansi(false).with_max_level(tracing::Level::WARN)
-            .with_writer(std::sync::Mutex::new(std::fs::File::create(log).unwrap())).finish();
+        let collector = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(log).unwrap()))
+            .finish();
         tracing::subscriber::set_global_default(collector).unwrap();
         for (lines, fails) in [
             (
@@ -3473,27 +3623,62 @@ mod tests {
         struct Denials;
         impl Adapter for Denials {
             fn initialize(&mut self) -> Result<Step, String> {
-                let mut events = (0..64).map(|index| Event::PermissionDenied(super::super::PermissionDenial {
-                    tool_use_id:index.to_string(),tool_name:"Write".into(),tool_input:Some("x".repeat(64*1024)),reason:"denied".into(),reason_type:None,agent_id:None,
-                })).collect::<Vec<_>>();
+                let mut events = (0..64)
+                    .map(|index| {
+                        Event::PermissionDenied(super::super::PermissionDenial {
+                            tool_use_id: index.to_string(),
+                            tool_name: "Write".into(),
+                            tool_input: Some("x".repeat(64 * 1024)),
+                            reason: "denied".into(),
+                            reason_type: None,
+                            agent_id: None,
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 events.push(Event::Ready(true));
-                Ok(Step {events,..Default::default()})
+                Ok(Step {
+                    events,
+                    ..Default::default()
+                })
             }
-            fn command(&mut self, _:Command) -> Result<Step,String> { Ok(Step::default()) }
-            fn receive(&mut self, _:Value) -> Result<Step,String> { Ok(Step::default()) }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec = ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut adapter:Box<dyn Adapter> = Box::new(Denials);
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Denials);
         let mut initial = adapter.initialize().unwrap();
-        let store = preflight(&spec,&mut initial).unwrap();
-        let handle = Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
-        let snapshot = until(&handle,|state| state.ready);
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let snapshot = until(&handle, |state| state.ready);
         assert!(!snapshot.exited);
         assert!(snapshot.error.is_none());
-        assert_eq!(snapshot.permission_denials.len(),64);
-        assert_eq!(snapshot.permission_denials.last().unwrap().tool_input.as_ref().unwrap().len(),64*1024);
-        assert!(serde_json::to_vec(&snapshot).unwrap().len()<=STATE_LIMIT);
+        assert_eq!(snapshot.permission_denials.len(), 64);
+        assert_eq!(
+            snapshot
+                .permission_denials
+                .last()
+                .unwrap()
+                .tool_input
+                .as_ref()
+                .unwrap()
+                .len(),
+            64 * 1024
+        );
+        assert!(serde_json::to_vec(&snapshot).unwrap().len() <= STATE_LIMIT);
         handle.command(Command::Compact).unwrap();
         assert!(!handle.snapshot(None).unwrap().exited);
         handle.close().unwrap();
@@ -3516,7 +3701,13 @@ mod tests {
         }
         assert!(trim_metadata(&mut state) <= STATE_LIMIT);
         assert_eq!(state.permission_denials.len(), 64);
-        assert!(state.permission_denials[0].tool_input.as_deref().unwrap().contains("omitted"));
+        assert!(
+            state.permission_denials[0]
+                .tool_input
+                .as_deref()
+                .unwrap()
+                .contains("omitted")
+        );
         assert_eq!(
             state.permission_denials[63]
                 .tool_input
@@ -3529,40 +3720,85 @@ mod tests {
 
     #[test]
     fn default_provider_exit_retains_complete_private_stderr_without_general_log_exposure() {
-        const STAGE:&str="CAGENTS_PRIVATE_STDERR_RUNTIME_TEST";
-        let Some(directory)=std::env::var_os(STAGE) else {
-            let directory=tempfile::tempdir_in("/var/tmp").unwrap();
+        const STAGE: &str = "CAGENTS_PRIVATE_STDERR_RUNTIME_TEST";
+        let Some(directory) = std::env::var_os(STAGE) else {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let output=std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact","chat::runtime::tests::default_provider_exit_retains_complete_private_stderr_without_general_log_exposure","--nocapture"])
                 .env(STAGE,directory.path()).env("XDG_CACHE_HOME",directory.path().join("cache"))
                 .env("CAGENTS_LOCAL_DEBUG","0").output().unwrap();
-            assert!(output.status.success(),"stdout={} stderr={}",String::from_utf8_lossy(&output.stdout),String::from_utf8_lossy(&output.stderr));
-            let general=std::fs::read_to_string(directory.path().join("general.log")).unwrap();
-            assert!(!general.contains("private-api-token"),"raw stderr must stay in the private diagnostic log");
+            assert!(
+                output.status.success(),
+                "stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let general = std::fs::read_to_string(directory.path().join("general.log")).unwrap();
+            assert!(
+                !general.contains("private-api-token"),
+                "raw stderr must stay in the private diagnostic log"
+            );
             return;
         };
-        let directory=std::path::PathBuf::from(directory);
-        let collector=tracing_subscriber::fmt().with_ansi(false).with_max_level(tracing::Level::TRACE)
-            .with_writer(std::sync::Mutex::new(std::fs::File::create(directory.join("general.log")).unwrap())).finish();
+        let directory = std::path::PathBuf::from(directory);
+        let collector = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::sync::Mutex::new(
+                std::fs::File::create(directory.join("general.log")).unwrap(),
+            ))
+            .finish();
         tracing::subscriber::set_global_default(collector).unwrap();
-        let payload=format!("<<private-api-token>>\n{}\x1b[31mAuthentication failed: last diagnostic\x1b[0m\n","trace detail\n".repeat(10000));
-        let source=directory.join("provider-stderr");std::fs::write(&source,&payload).unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,
-            program:"/bin/sh".into(),arguments:vec!["-c".into(),"cat -- \"$1\" >&2; exit 3".into(),"provider".into(),source.to_string_lossy().into_owned()],working_directory:directory.clone(),environment:BTreeMap::new()};
-        let mut adapter:Box<dyn Adapter>=Box::new(Echo);let mut initial=adapter.initialize().unwrap();
-        let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();
-        let state=until(&handle,|state|state.exited);
-        let diagnostic=state.provider_exit.as_ref().unwrap();
-        assert!(diagnostic.summary.len()<=1024 && diagnostic.summary.lines().count()<=5);
-        assert!(diagnostic.summary.contains("status 3"));assert!(!diagnostic.summary.contains('\x1b'));
-        assert!(diagnostic.output.len()<=64*1024);
-        let log=diagnostic.log.as_ref().unwrap();assert_eq!(log.bytes,payload.len() as u64);assert_eq!(log.omitted,0);
-        let mut bytes=Vec::new();let mut cursor=0;
-        loop {let (page,next,omitted)=handle.provider_exit_output(&log.id,cursor).unwrap();assert!(page.len()<=256*1024);assert_eq!(omitted,0);bytes.extend(page);if let Some(next)=next {cursor=next;} else {break;}}
-        assert_eq!(bytes,payload.as_bytes());
-        assert!(handle.provider_exit_output("another-run",0).is_err());
-        assert!(handle.provider_exit_output(&log.id,log.bytes+1).is_err());
+        let payload = format!(
+            "<<private-api-token>>\n{}\x1b[31mAuthentication failed: last diagnostic\x1b[0m\n",
+            "trace detail\n".repeat(10000)
+        );
+        let source = directory.join("provider-stderr");
+        std::fs::write(&source, &payload).unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "cat -- \"$1\" >&2; exit 3".into(),
+                "provider".into(),
+                source.to_string_lossy().into_owned(),
+            ],
+            working_directory: directory.clone(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Echo);
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        let state = until(&handle, |state| state.exited);
+        let diagnostic = state.provider_exit.as_ref().unwrap();
+        assert!(diagnostic.summary.len() <= 1024 && diagnostic.summary.lines().count() <= 5);
+        assert!(diagnostic.summary.contains("status 3"));
+        assert!(!diagnostic.summary.contains('\x1b'));
+        assert!(diagnostic.output.len() <= 64 * 1024);
+        let log = diagnostic.log.as_ref().unwrap();
+        assert_eq!(log.bytes, payload.len() as u64);
+        assert_eq!(log.omitted, 0);
+        let mut bytes = Vec::new();
+        let mut cursor = 0;
+        loop {
+            let (page, next, omitted) = handle.provider_exit_output(&log.id, cursor).unwrap();
+            assert!(page.len() <= 256 * 1024);
+            assert_eq!(omitted, 0);
+            bytes.extend(page);
+            if let Some(next) = next {
+                cursor = next;
+            } else {
+                break;
+            }
+        }
+        assert_eq!(bytes, payload.as_bytes());
+        assert!(handle.provider_exit_output("another-run", 0).is_err());
+        assert!(handle.provider_exit_output(&log.id, log.bytes + 1).is_err());
         handle.close().unwrap();
     }
 
@@ -3586,36 +3822,83 @@ mod tests {
         assert!(!diagnostic.summary.contains('\x1b'));
         assert!(!diagnostic.output.contains('\x1b'));
         assert!(diagnostic.output.len() > diagnostic.summary.len());
-        let missing=provider_exit_diagnostic(None,"Provider executable not found","");assert!(missing.summary.contains("Install or configure"));
-        let killed=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(9)),"socket closed","");assert!(killed.summary.contains("signal 9") && killed.summary.contains("Free memory"));
-        let invalid=provider_exit_diagnostic(Some(std::process::ExitStatus::from_raw(0)),"Provider printed 8 consecutive invalid protocol lines. Last output: garbage","");
+        let missing = provider_exit_diagnostic(None, "Provider executable not found", "");
+        assert!(missing.summary.contains("Install or configure"));
+        let killed = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(9)),
+            "socket closed",
+            "",
+        );
+        assert!(killed.summary.contains("signal 9") && killed.summary.contains("Free memory"));
+        let invalid = provider_exit_diagnostic(
+            Some(std::process::ExitStatus::from_raw(0)),
+            "Provider printed 8 consecutive invalid protocol lines. Last output: garbage",
+            "",
+        );
         assert!(invalid.summary.contains("status 0"));
-        assert!(invalid.summary.contains("8 consecutive invalid protocol lines. Last output: garbage"),"a status must not erase the bounded framing diagnosis");
+        assert!(
+            invalid
+                .summary
+                .contains("8 consecutive invalid protocol lines. Last output: garbage"),
+            "a status must not erase the bounded framing diagnosis"
+        );
     }
 
     #[test]
     fn adapter_refusals_and_fatal_provider_errors_are_bounded_at_the_runtime_boundary() {
         struct Verbose;
         impl Adapter for Verbose {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Step::default())}
-            fn command(&mut self,command:Command)->Result<Step,String> {
-                if matches!(command,Command::Compact) {Ok(Step {writes:vec![serde_json::json!({"fail":true})],..Default::default()})}
-                else {Err(format!("Provider refusal: {}\x1b", "x".repeat(1024*1024)))}
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
             }
-            fn receive(&mut self,_:Value)->Result<Step,String> {Err(format!("Provider failure: {}\x1b", "x".repeat(1024*1024)))}
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if matches!(command, Command::Compact) {
+                    Ok(Step {
+                        writes: vec![serde_json::json!({"fail":true})],
+                        ..Default::default()
+                    })
+                } else {
+                    Err(format!("Provider refusal: {}\x1b", "x".repeat(1024 * 1024)))
+                }
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Err(format!("Provider failure: {}\x1b", "x".repeat(1024 * 1024)))
+            }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut initial=Step{events:vec![Event::Ready(true)],..Default::default()};let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,Box::new(Verbose),initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
-        let refusal=handle.command(Command::SetModel{model:"fixture".into(),reasoning:None}).unwrap_err();
-        assert!(refusal.len()<=1024 && refusal.starts_with("Provider refusal:"));
-        assert!(!refusal.contains('\x1b'));assert!(handle.snapshot(None).unwrap().error.is_none());
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut initial = Step {
+            events: vec![Event::Ready(true)],
+            ..Default::default()
+        };
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, Box::new(Verbose), initial, store, None, |_| {}).unwrap();
+        until(&handle, |state| state.ready);
+        let refusal = handle
+            .command(Command::SetModel {
+                model: "fixture".into(),
+                reasoning: None,
+            })
+            .unwrap_err();
+        assert!(refusal.len() <= 1024 && refusal.starts_with("Provider refusal:"));
+        assert!(!refusal.contains('\x1b'));
+        assert!(handle.snapshot(None).unwrap().error.is_none());
         handle.command(Command::Compact).unwrap();
-        let snapshot=until(&handle,|state|state.exited);
-        let error=snapshot.error.as_deref().unwrap();
-        assert!(error.len()<=1024 && error.contains("Provider failure:"));assert!(!error.contains('\x1b'));
-        let failure=handle.failure().unwrap();assert!(failure.len()<=1024 && failure.starts_with("Provider failure:"));
+        let snapshot = until(&handle, |state| state.exited);
+        let error = snapshot.error.as_deref().unwrap();
+        assert!(error.len() <= 1024 && error.contains("Provider failure:"));
+        assert!(!error.contains('\x1b'));
+        let failure = handle.failure().unwrap();
+        assert!(failure.len() <= 1024 && failure.starts_with("Provider failure:"));
         handle.close().unwrap();
     }
 
@@ -3623,36 +3906,107 @@ mod tests {
     fn unacknowledged_controls_keep_upgrade_readiness_fenced_without_blocking_input() {
         struct Controls(Option<String>);
         impl Adapter for Controls {
-            fn initialize(&mut self)->Result<Step,String> {Ok(Step {events:vec![Event::Ready(true)],..Default::default()})}
-            fn command(&mut self,command:Command)->Result<Step,String> {if matches!(command,Command::SetPermissionMode{..}) {self.0=Some("mode".into());}Ok(Step::default())}
-            fn command_ack(&mut self)->Option<String> {self.0.take()}
-            fn receive(&mut self,_:Value)->Result<Step,String> {Ok(Step::default())}
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    events: vec![Event::Ready(true)],
+                    ..Default::default()
+                })
+            }
+            fn command(&mut self, command: Command) -> Result<Step, String> {
+                if matches!(command, Command::SetPermissionMode { .. }) {
+                    self.0 = Some("mode".into());
+                }
+                Ok(Step::default())
+            }
+            fn command_ack(&mut self) -> Option<String> {
+                self.0.take()
+            }
+            fn receive(&mut self, _: Value) -> Result<Step, String> {
+                Ok(Step::default())
+            }
         }
-        let directory=tempfile::tempdir_in("/var/tmp").unwrap();
-        let spec=ProcessSpec {execution:None,messages:None,unset_environment:Default::default(),transport:TransportSpec::JsonLines,program:"/bin/cat".into(),arguments:Vec::new(),working_directory:directory.path().into(),environment:BTreeMap::new()};
-        let mut adapter:Box<dyn Adapter>=Box::new(Controls(None));let mut initial=adapter.initialize().unwrap();let store=preflight(&spec,&mut initial).unwrap();
-        let handle=Handle::start(spec,adapter,initial,store,None,|_|{}).unwrap();until(&handle,|state|state.ready);
-        let pending=handle.enqueue_command(Command::SetPermissionMode {mode:"manual".into()}).unwrap();
-        assert_eq!(handle.check_update_readiness().unwrap(),UpdateReadiness::Unready);
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            unset_environment: Default::default(),
+            transport: TransportSpec::JsonLines,
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+        };
+        let mut adapter: Box<dyn Adapter> = Box::new(Controls(None));
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = Handle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        until(&handle, |state| state.ready);
+        let pending = handle
+            .enqueue_command(Command::SetPermissionMode {
+                mode: "manual".into(),
+            })
+            .unwrap();
+        assert_eq!(
+            handle.check_update_readiness().unwrap(),
+            UpdateReadiness::Unready
+        );
         assert!(pending.try_recv().is_err());
         assert!(handle.snapshot(None).unwrap().error.is_none());
-        handle.close().unwrap();assert!(pending.recv_timeout(Duration::from_secs(1)).unwrap().is_err());
+        handle.close().unwrap();
+        assert!(
+            pending
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap()
+                .is_err()
+        );
     }
 
     #[test]
     fn cancelled_work_does_not_become_running_again_when_the_next_turn_starts() {
-        let tool=Arc::new(Item {id:"old-tool".into(),role:Role::Assistant,started_at:None,at:None,content:ItemContent::Tool {name:"Bash".into(),input:"work".into(),output:String::new(),status:ToolStatus::Running}});
-        let mut state=Snapshot {items:vec![tool],..Default::default()};
-        subagent(&mut state,"foreground");subagent(&mut state,"background").background=true;
-        let mut indices=BTreeMap::new();
-        apply_event(&mut state,&mut indices,Event::TurnFinished {key:None,outcome:crate::notifications::Kind::Cancelled});
-        assert_eq!(state.items[0].content.status(),Some(ToolStatus::Stopped));
-        assert_eq!(state.subagents[0].status,ToolStatus::Stopped);
-        assert_eq!(state.subagents[1].status,ToolStatus::Running,"a background child outside interruption ownership remains live");
-        apply_event(&mut state,&mut indices,Event::TurnStarted);
-        assert!(state.outcome.is_none());assert_eq!(state.items[0].content.status(),Some(ToolStatus::Stopped));assert_eq!(state.subagents[0].status,ToolStatus::Stopped);
-        finish_snapshot_work(&mut state,ToolStatus::Failed,true);
-        assert_eq!(state.subagents[1].status,ToolStatus::Failed,"confirmed provider teardown settles all owned children");
+        let tool = Arc::new(Item {
+            id: "old-tool".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "work".into(),
+                output: String::new(),
+                status: ToolStatus::Running,
+            },
+        });
+        let mut state = Snapshot {
+            items: vec![tool],
+            ..Default::default()
+        };
+        subagent(&mut state, "foreground");
+        subagent(&mut state, "background").background = true;
+        let mut indices = BTreeMap::new();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::TurnFinished {
+                key: None,
+                outcome: crate::notifications::Kind::Cancelled,
+            },
+        );
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert_eq!(
+            state.subagents[1].status,
+            ToolStatus::Running,
+            "a background child outside interruption ownership remains live"
+        );
+        apply_event(&mut state, &mut indices, Event::TurnStarted);
+        assert!(state.outcome.is_none());
+        assert_eq!(state.items[0].content.status(), Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        finish_snapshot_work(&mut state, ToolStatus::Failed, true);
+        assert_eq!(
+            state.subagents[1].status,
+            ToolStatus::Failed,
+            "confirmed provider teardown settles all owned children"
+        );
     }
 
     #[test]

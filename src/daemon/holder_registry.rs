@@ -56,7 +56,11 @@ impl BuildIdentity {
                 .and_then(|metadata| metadata.split('.').next())
                 .map(str::to_owned),
             capabilities: match kind {
-                Kind::Native => vec!["event-driven-orphan-reaping".into(), "provider-exit-diagnostics".into(), "provider-retained-output".into()],
+                Kind::Native => vec![
+                    "event-driven-orphan-reaping".into(),
+                    "provider-exit-diagnostics".into(),
+                    "provider-retained-output".into(),
+                ],
                 Kind::Terminal => Vec::new(),
             },
         }
@@ -166,12 +170,21 @@ impl Record {
     pub(crate) fn is_outdated(&self) -> bool {
         self.build.as_ref().is_none_or(|build| {
             build.version != crate::VERSION
-                || (self.kind == Kind::Native && !build.capabilities.iter()
-                    .any(|capability| capability == "event-driven-orphan-reaping"))
-                || (self.kind == Kind::Native && !build.capabilities.iter()
-                    .any(|capability| capability == "provider-exit-diagnostics"))
-                || (self.kind == Kind::Native && !build.capabilities.iter()
-                    .any(|capability| capability == "provider-retained-output"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "event-driven-orphan-reaping"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-exit-diagnostics"))
+                || (self.kind == Kind::Native
+                    && !build
+                        .capabilities
+                        .iter()
+                        .any(|capability| capability == "provider-retained-output"))
         })
     }
 
@@ -191,12 +204,16 @@ impl Record {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) => return Err(error),
             };
-            children.extend(raw.split_whitespace().filter_map(|pid| pid.parse::<i32>().ok()));
+            children.extend(
+                raw.split_whitespace()
+                    .filter_map(|pid| pid.parse::<i32>().ok()),
+            );
         }
         let zombies = children
             .into_iter()
             .filter(|pid| {
-                fs::read_to_string(format!("/proc/{pid}/stat")).ok()
+                fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .ok()
                     .and_then(|stat| {
                         stat.rsplit_once(')').map(|(_, fields)| {
                             let mut fields = fields.split_whitespace();
