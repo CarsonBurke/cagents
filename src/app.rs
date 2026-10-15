@@ -12618,10 +12618,10 @@ impl Cagents {
         })
     }
 
-    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) {
+    fn acknowledge_settings_save(&mut self, saved: SettingsSaved) -> bool {
         if saved.generation >= self.settings_ack_generation {
             self.settings_ack_generation = saved.generation;
-            self.settings_base = saved.settings;
+            let previous = std::mem::replace(&mut self.settings_base, saved.settings);
             self.settings_path = Some(saved.path);
             if self
                 .settings_reset_generation
@@ -12629,7 +12629,11 @@ impl Cagents {
             {
                 self.settings_reset_generation = None;
             }
+            // All accepted acknowledgements fence metadata, including a
+            // workspace flush that overtakes an ordinary settings save.
+            return self.invalidate_account_policy(&previous);
         }
+        false
     }
 
     fn save_settings_now(&mut self) -> Result<(), String> {
@@ -15230,26 +15234,22 @@ impl Application for Cagents {
                 Task::batch([drafts, open])
             }
             Message::NewWindowOpened { saved, result } => {
-                if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
-                }
+                let refresh = saved.is_ok_and(|saved| self.acknowledge_settings_save(saved));
                 if let Err(error) = result {
                     self.status = Some(TransientNotice::error(format!(
                         "Could not open a new window: {error}"
                     )));
                 }
-                Task::none()
+                if refresh { self.refresh_account_policy() } else { Task::none() }
             }
             Message::SettingsSaved { generation, result } => {
-                let previous_policy = self.settings_base.clone();
                 let mut refresh_accounts = false;
                 match result {
                     Ok(saved) => {
                         if saved.generation >= self.settings_ack_generation {
                             self.settings_save_error = None;
-                            refresh_accounts = saved.settings.agents != self.settings_base.agents;
                         }
-                        self.acknowledge_settings_save(saved);
+                        refresh_accounts = self.acknowledge_settings_save(saved);
                     }
                     Err(error) if generation >= self.settings_ack_generation => {
                         self.status = Some(TransientNotice::warning(format!(
@@ -15264,7 +15264,7 @@ impl Application for Cagents {
                     // Discovery reads saved execution policy. Run after the
                     // write acknowledgement, so it cannot observe old paths
                     // or environment while the settings save is still queued.
-                    self.accounts_policy_changed(&previous_policy)
+                    self.refresh_account_policy()
                 } else {
                     Task::none()
                 }
@@ -15360,13 +15360,11 @@ impl Application for Cagents {
                 saved,
                 result,
             } => {
-                if let Ok(saved) = saved {
-                    self.acknowledge_settings_save(saved);
-                }
+                let refresh = saved.is_ok_and(|saved| self.acknowledge_settings_save(saved));
                 if generation != self.update_generation || !self.update_prepared {
                     let _ =
                         response.try_send("error: window update preparation was cancelled".into());
-                    return Task::none();
+                    return if refresh { self.refresh_account_policy() } else { Task::none() };
                 }
                 self.update_flush_pending = false;
                 match result {
@@ -15376,7 +15374,7 @@ impl Application for Cagents {
                             self.status = Some(TransientNotice::warning(
                                 "Updater disconnected; window is ready.",
                             ));
-                            return Task::none();
+                            return if refresh { self.refresh_account_policy() } else { Task::none() };
                         }
                         if committing {
                             self.update_committed = true;
@@ -15389,7 +15387,7 @@ impl Application for Cagents {
                         let _ = response.try_send(format!("error: {error}").replace('\n', " "));
                     }
                 }
-                Task::none()
+                if refresh { self.refresh_account_policy() } else { Task::none() }
             }
             Message::UiUpdateWatchdog(generation) => {
                 if self.update_prepared

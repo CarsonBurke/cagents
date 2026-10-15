@@ -118,16 +118,24 @@ impl Cache {
         cli: &super::probe::Cli,
     ) -> Self {
         use sha2::{Digest, Sha256};
-        let bytes = serde_json::to_vec(&(
-            &cli.program, &cli.configuration.arguments, &cli.configuration.environment,
-        )).expect("execution policy serializes");
+        use std::os::unix::ffi::OsStrExt;
+        let program = cli.program.as_os_str().as_bytes();
+        // PathBuf's JSON serializer rejects non-UTF8 paths; PATH discovery is
+        // byte-preserving. Length framing keeps the byte and UTF8 fields distinct.
+        let configuration = serde_json::to_vec(&(
+            &cli.configuration.arguments, &cli.configuration.environment,
+        )).expect("string execution arguments and environment serialize");
+        let digest = Sha256::new().chain_update(b"cagents-cli-metadata-v1\0")
+            .chain_update((program.len() as u64).to_le_bytes()).chain_update(program)
+            .chain_update((configuration.len() as u64).to_le_bytes()).chain_update(configuration)
+            .finalize();
         Self {
             // One bounded document per provider, not one directory per edit.
             // A writer from another policy may cost a cache hit, never relabel
             // its metadata as the current policy.
             directory: self.directory.join("cli-metadata-v1")
                 .join(crate::settings::agents::provider_key(provider)),
-            execution_policy: Some(format!("{:x}", Sha256::digest(bytes))),
+            execution_policy: Some(format!("{digest:x}")),
         }
     }
 
@@ -362,6 +370,27 @@ mod tests {
         assert_eq!(scope.catalogs(100)[&Provider::Claude].models[0].id, "original-model");
         assert!(cache.load(100).is_empty(), "unqualified live cache is distinct");
         assert!(cache.for_cli(Provider::Codex, &cli(&original)).load(100).is_empty());
+    }
+
+    #[test]
+    fn non_utf8_discovered_executable_has_exact_cache_identity() {
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(std::ffi::OsString::from_vec(b"tools-\xff".to_vec()));
+        let other = directory.path().join("tools-\u{fffd}");
+        for path in [&path, &other] {
+            fs::create_dir(path).unwrap();
+            fs::write(path.join("claude"), "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(path.join("claude"), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let cli = |path: &Path| super::super::probe::Cli::configured(Provider::Claude, Some(path.as_os_str()), Default::default()).ok().expect("real PATH candidate");
+        let original = cli(&path);
+        assert!(original.program.to_str().is_none());
+        let alias = cli(&other);
+        let cache = Cache::at(directory.path().join("cache"));
+        cache.for_cli(Provider::Claude, &original).store("claude:/owned", entry(10, "byte path")).unwrap();
+        assert!(cache.for_cli(Provider::Claude, &alias).load(100).is_empty());
+        assert_eq!(cache.for_cli(Provider::Claude, &original).load(100)["claude:/owned"].snapshot.detail.as_deref(), Some("byte path"));
     }
 
     #[test]

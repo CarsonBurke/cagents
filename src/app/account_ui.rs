@@ -514,7 +514,7 @@ impl State {
     /// starting at once would only compete for the same machine.
     fn provider_busy(&self, provider: Provider, except: &AccountId, now: Millis) -> bool {
         self.of(provider)
-            .any(|account| &account.id != except && account.schedule.in_flight(now))
+            .any(|account| &account.id != except && (account.probe_owner.is_some() || account.schedule.in_flight(now)))
     }
 
     /// Takes what a load found for each account: whether it has a CLI to ask,
@@ -720,6 +720,7 @@ struct AccountState {
     /// being probed, and starts once that one answers.
     queued: Option<Trigger>,
     probe_revision: Option<u64>,
+    probe_owner: Option<u64>,
     policy_refresh: bool,
     /// The login the account reported when the reader started signing it
     /// in, while that sign-in is watched for.
@@ -751,6 +752,7 @@ impl AccountState {
             failure: None,
             queued: None,
             probe_revision: None,
+            probe_owner: None,
             policy_refresh: false,
             signing_in_from: None,
             sign_in_terminal: None,
@@ -1763,6 +1765,7 @@ impl Cagents {
             return Task::none();
         }
         self.account_ui.locating = Some(self.account_ui.metadata_revisions.clone());
+        self.account_ui.locate_pending = false;
         let accounts: Vec<Account> = self
             .account_ui
             .accounts
@@ -1878,8 +1881,8 @@ impl Cagents {
 
     /// A local persisted policy changed. Keep an old worker's real slot
     /// until it returns, then force one probe of the latest accepted policy.
-    pub(super) fn accounts_policy_changed(&mut self, previous: &AppSettings) -> Task<Message> {
-        if crate::device::is_remote() { return Task::none(); }
+    pub(super) fn invalidate_account_policy(&mut self, previous: &AppSettings) -> bool {
+        if crate::device::is_remote() { return false; }
         let mut changed = false;
         for provider in Provider::ALL {
             let before = policy_for(&previous.agents, provider);
@@ -1896,8 +1899,14 @@ impl Cagents {
                 state.queued = Some(Trigger::Focus);
             }
         }
-        if !changed { return Task::none(); }
-        self.refresh_chat_drafts();
+        if changed {
+            self.account_ui.locate_pending = true;
+            self.refresh_chat_drafts();
+        }
+        changed
+    }
+
+    pub(super) fn refresh_account_policy(&mut self) -> Task<Message> {
         Task::batch([self.locate_accounts(), self.probe_accounts(Trigger::Focus)])
     }
 
@@ -1994,6 +2003,9 @@ impl Cagents {
         let configuration = policy_for(&self.settings_base.agents, provider);
         let busy = self.account_ui.provider_busy(provider, id, now);
         let state = self.account_ui.account_mut(id)?;
+        // A scheduling timestamp is not worker completion. Preparation may
+        // still be waiting on filesystem metadata after its display timeout.
+        if state.probe_owner.is_some() { return None; }
         // Figures from before a reset are wrong however recent they are, so
         // they are refreshed as eagerly as on the reader's return.
         let trigger = match trigger {
@@ -2024,6 +2036,7 @@ impl Cagents {
         // what a reader asking again, or signing in, is trying to get past.
         let force = state.policy_refresh || trigger == Trigger::Manual || state.schedule.awaiting_login(now);
         state.probe_revision = Some(revision);
+        state.probe_owner = Some(state.owner);
         state.schedule.start(trigger, now);
         let account = state.account.clone();
         let id = state.id.clone();
@@ -2406,18 +2419,22 @@ impl Cagents {
                 Task::none()
             }
             Action::Probed { revision, installed, owner, id, outcome } => {
-                let Some(state) = self.account_ui.account(&id).filter(|state| state.owner == owner) else { return Task::none(); };
+                let Some(state) = self.account_ui.account(&id) else { return Task::none(); };
                 let provider = state.account.provider;
-                if revision != self.account_ui.metadata_revisions.get(&provider).copied().unwrap_or(0) {
-                    if state.probe_revision != Some(revision) { return Task::none(); }
+                let current = state.owner == owner && revision == self.account_ui.metadata_revisions.get(&provider).copied().unwrap_or(0);
+                let releases_slot = state.probe_owner == Some(owner) && state.probe_revision == Some(revision);
+                if !current {
+                    if !releases_slot { return Task::none(); }
                     let state = self.account_ui.account_mut(&id).unwrap();
                     state.schedule.abandon();
                     state.probe_revision = None;
-                    return self.probe_account(&id, Trigger::Focus, now_ms()).unwrap_or_else(Task::none);
+                    state.probe_owner = None;
+                    let current = self.probe_account(&id, Trigger::Focus, now_ms()).unwrap_or_else(Task::none);
+                    return Task::batch([current, self.probe_queued(provider)]);
                 }
                 if let Some(installed) = installed { self.account_ui.installed.insert(provider, installed); }
                 let state = self.account_ui.account_mut(&id).unwrap();
-                state.probe_revision = None;
+                if releases_slot { state.probe_revision = None; state.probe_owner = None; }
                 if !matches!(&outcome, Outcome::Busy) { state.policy_refresh = false; }
                 self.account_probed(id, owner, outcome)
             },
@@ -5312,8 +5329,9 @@ mod tests {
         for state in &mut app.account_ui.accounts { state.schedule.succeed(now); }
         let owner = app.account_ui.account(&id).unwrap().owner;
         let state = app.account_ui.account_mut(&id).unwrap();
-        state.schedule.start(Trigger::Focus, now);
+        state.schedule.start(Trigger::Focus, now.saturating_sub(schedule::IN_FLIGHT_LIMIT + 1));
         state.probe_revision = Some(0);
+        state.probe_owner = Some(owner);
         app.account_ui.installed.insert(Provider::Claude, true);
         let model = |id: &str| crate::chat::Model { id: id.into(), label: id.into(), reasoning: Vec::new() };
         app.account_ui.catalogs.insert(Provider::Claude, Catalog { models: vec![model("old")], observed_at: now });
@@ -5324,7 +5342,8 @@ mod tests {
             app.settings.agents.entry("claude".into()).or_default().executable = Some(pin.into());
             drop(app.update(Message::SettingsSaved { generation, result: Ok(SettingsSaved { generation, path: PathBuf::from("/unused/settings.toml"), settings: app.settings.clone() }) }));
             let state = app.account_ui.account(&id).unwrap();
-            assert!(state.schedule.in_flight(now));
+            assert!(!state.schedule.in_flight(now), "expired display timestamp is not worker completion");
+            assert_eq!(state.probe_owner, Some(owner));
             assert_eq!(state.probe_revision, Some(0), "old worker retains the slot");
             assert!(state.policy_refresh);
         }
@@ -5374,6 +5393,45 @@ mod tests {
         drop(app.update(Message::SettingsSaved { generation: 3, result: Ok(SettingsSaved { generation: 3, path: PathBuf::from("/unused/settings.toml"), settings: next }) }));
         assert_eq!(app.account_ui.metadata_revisions[&Provider::Claude], revision);
         assert_eq!(app.account_ui.catalog(Provider::Claude).unwrap().models[0].id, "latest");
+    }
+
+    #[test]
+    fn workspace_acknowledgements_fence_metadata_before_older_settings_result() {
+        for flush in [false, true] {
+            let mut app = context_inspector_test_app(false);
+            app.refresh_ui.focused = true;
+            app.settings.show_status_bar = true;
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 9102);
+            let now = now_ms();
+            for state in &mut app.account_ui.accounts { state.schedule.succeed(now); }
+            let owner = app.account_ui.account(&id).unwrap().owner;
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.schedule.start(Trigger::Focus, now);
+            state.probe_revision = Some(0);
+            state.probe_owner = Some(owner);
+            let before = app.settings_base.clone();
+            let mut after = before.clone();
+            after.agents.entry("claude".into()).or_default().executable = Some("/saved/cli".into());
+            app.settings = after.clone();
+            let saved = SettingsSaved { generation: 2, path: PathBuf::from("/unused/settings.toml"), settings: after };
+            let (response, receiver) = std::sync::mpsc::sync_channel(1);
+            let message = if flush {
+                app.update_prepared = true;
+                Message::UiUpdateFlushed { generation: app.update_generation, committing: false, response, saved: Ok(saved), result: Ok(()) }
+            } else { Message::NewWindowOpened { saved: Ok(saved), result: Ok(()) } };
+            drop(app.update(message));
+            if flush { assert_eq!(receiver.try_recv().unwrap(), "ok"); }
+            assert_eq!(app.account_ui.metadata_revisions[&Provider::Claude], 1);
+            drop(app.update(Message::SettingsSaved { generation: 1, result: Ok(SettingsSaved { generation: 1, path: PathBuf::from("/unused/settings.toml"), settings: before }) }));
+            drop(app.update(Message::AccountUi(Action::Probed {
+                revision: 0, installed: Some(false), owner, id: id.clone(),
+                outcome: Outcome::Answered { identity: None, snapshot: UsageSnapshot::state(UsageStatus::Ok, "stale", now), catalog: Some(Catalog { models: vec![crate::chat::Model { id: "stale".into(), label: "stale".into(), reasoning: Vec::new() }], observed_at: now }) },
+            })));
+            assert_eq!(app.settings_base.agents["claude"].executable.as_deref(), Some("/saved/cli"));
+            assert!(app.account_ui.catalog(Provider::Claude).is_none());
+            assert!(!app.account_ui.installed.contains_key(&Provider::Claude));
+            assert_eq!(app.account_ui.account(&id).unwrap().probe_revision, Some(1));
+        }
     }
 
     #[test]
