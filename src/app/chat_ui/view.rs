@@ -4903,42 +4903,110 @@ mod tests {
     fn recorded_tool_timestamp_reserves_hover_space_at_narrow_and_wide_widths() {
         use iced::advanced::{Layout, Shell, clipboard, layout, widget::Tree};
         let item = chat::Item {
-            id: "dated-tool-command".into(), role: chat::Role::Assistant, at: Some(1_700_000_000_000), started_at: None,
-            content: ItemContent::Command { label: "Run focused tests".into(), command: "cargo test --lib recorded_timestamp".into(),
-                working_directory: "/project".into(), action: chat::CommandAction::Run, status: chat::ToolStatus::Succeeded,
-                exit_code: Some(0), duration_ms: Some(1000), output: "all tests passed".into() },
+            id: "dated-tool-command".into(),
+            role: chat::Role::Assistant,
+            at: Some(1_700_000_000_000),
+            started_at: None,
+            content: ItemContent::Command {
+                label: "Run focused tests".into(),
+                command: "cargo test --lib recorded_timestamp".into(),
+                working_directory: "/project".into(),
+                action: chat::CommandAction::Run,
+                status: chat::ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: Some(1000),
+                output: "all tests passed".into(),
+            },
         };
         let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&item));
         let renderer = crate::app::tests::headless_renderer();
         for width in [240.0, 600.0] {
             let mut element = runtime.step_header(&item, &runtime.cache[&item.id], false);
             let mut tree = Tree::new(element.as_widget());
-            let limits = layout::Limits::new(iced::Size::new(width, 0.0), iced::Size::new(width, 1000.0));
-            let node = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let limits =
+                layout::Limits::new(iced::Size::new(width, 0.0), iced::Size::new(width, 1000.0));
+            let node = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
             let layout = Layout::new(&node);
             let mut children = layout.children();
             let header = children.next().unwrap().bounds();
             let actions = children.next().unwrap().bounds();
-            assert!(header.intersection(&actions).is_none(), "recorded time and Copy never cover the command/status");
+            assert!(
+                header.intersection(&actions).is_none(),
+                "recorded time and Copy never cover the command/status"
+            );
             assert!(actions.x >= 0.0 && actions.x + actions.width <= width + 0.1);
-            if width == 240.0 { assert!(actions.y >= header.y + header.height, "narrow history dates use their own reserved line"); }
-            else { assert!(actions.x >= header.x + header.width, "wide rows keep actions beside the header"); }
-            let accessible = element.as_widget().a11y_nodes(layout, &tree, iced::mouse::Cursor::Unavailable);
-            let copy = accessible.root().iter().chain(accessible.children()).find(|node| node.node().role() == iced_accessibility::accesskit::Role::Button
-                && node.node().label() == Some("Copy this message")).unwrap().node().bounds().unwrap();
-            let cursor = iced::Point::new(((copy.x0 + copy.x1) / 2.0) as f32, ((copy.y0 + copy.y1) / 2.0) as f32);
+            if width == 240.0 {
+                assert!(
+                    actions.y >= header.y + header.height,
+                    "narrow history dates use their own reserved line"
+                );
+            } else {
+                assert!(
+                    actions.x >= header.x + header.width,
+                    "wide rows keep actions beside the header"
+                );
+            }
+            let accessible =
+                element
+                    .as_widget()
+                    .a11y_nodes(layout, &tree, iced::mouse::Cursor::Unavailable);
+            let copy = accessible
+                .root()
+                .iter()
+                .chain(accessible.children())
+                .find(|node| {
+                    node.node().role() == iced_accessibility::accesskit::Role::Button
+                        && node.node().label() == Some("Copy this message")
+                })
+                .unwrap()
+                .node()
+                .bounds()
+                .unwrap();
+            let cursor = iced::Point::new(
+                ((copy.x0 + copy.x1) / 2.0) as f32,
+                ((copy.y0 + copy.y1) / 2.0) as f32,
+            );
             let viewport = iced::Rectangle::with_size(iced::Size::new(width, 1000.0));
             let mut messages = Vec::new();
-            element.as_widget_mut().update(&mut tree, &iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: cursor }), layout,
-                iced::mouse::Cursor::Available(cursor), &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
-            for button in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
-                element.as_widget_mut().update(&mut tree, &iced::Event::Mouse(button), layout, iced::mouse::Cursor::Available(cursor),
-                    &renderer, &mut clipboard::Null, &mut Shell::new(&mut messages), &viewport);
+            element.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: cursor }),
+                layout,
+                iced::mouse::Cursor::Available(cursor),
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            for button in [
+                iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left),
+                iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left),
+            ] {
+                element.as_widget_mut().update(
+                    &mut tree,
+                    &iced::Event::Mouse(button),
+                    layout,
+                    iced::mouse::Cursor::Available(cursor),
+                    &renderer,
+                    &mut clipboard::Null,
+                    &mut Shell::new(&mut messages),
+                    &viewport,
+                );
             }
             assert_eq!(messages.len(), 1);
-            assert!(matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id));
-            let after = element.as_widget_mut().layout(&mut tree, &renderer, &limits);
-            assert_eq!(node.size(), after.size(), "hover/copy does not change the reserved row height");
+            assert!(
+                matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text)) if *target == runtime.target && id == &item.id)
+            );
+            let after = element
+                .as_widget_mut()
+                .layout(&mut tree, &renderer, &limits);
+            assert_eq!(
+                node.size(),
+                after.size(),
+                "hover/copy does not change the reserved row height"
+            );
         }
     }
 

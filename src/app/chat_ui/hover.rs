@@ -102,20 +102,30 @@ where
             // The hidden actions reserve exactly the space they will paint.
             // A long date moves below the header in narrow panes, leaving at
             // least half the row for the command rather than covering it.
-            let top = self.top.as_widget_mut().layout(
-                &mut tree.children[1], renderer, &limits.loose(),
-            );
+            let top =
+                self.top
+                    .as_widget_mut()
+                    .layout(&mut tree.children[1], renderer, &limits.loose());
             let stacked = top.size().width + self.spacing > limits.max().width / 2.0;
             let base_limits = if stacked {
                 limits.shrink(Size::new(0.0, top.size().height + self.spacing))
             } else {
                 limits.shrink(Size::new(top.size().width + self.spacing, 0.0))
             };
-            let base = self.base.as_widget_mut().layout(&mut tree.children[0], renderer, &base_limits);
+            let base =
+                self.base
+                    .as_widget_mut()
+                    .layout(&mut tree.children[0], renderer, &base_limits);
             let natural = if stacked {
-                Size::new(base.size().width.max(top.size().width), base.size().height + self.spacing + top.size().height)
+                Size::new(
+                    base.size().width.max(top.size().width),
+                    base.size().height + self.spacing + top.size().height,
+                )
             } else {
-                Size::new(base.size().width + self.spacing + top.size().width, base.size().height.max(top.size().height))
+                Size::new(
+                    base.size().width + self.spacing + top.size().width,
+                    base.size().height.max(top.size().height),
+                )
             };
             let size = limits.resolve(Length::Fill, Length::Shrink, natural);
             let (base, top) = if stacked {
@@ -126,7 +136,10 @@ where
                 let base_y = (size.height - base.size().height) / 2.0;
                 let top_y = (size.height - top.size().height) / 2.0;
                 let x = (size.width - top.size().width).max(0.0);
-                (base.move_to(iced::Point::new(0.0, base_y)), top.move_to(iced::Point::new(x, top_y)))
+                (
+                    base.move_to(iced::Point::new(0.0, base_y)),
+                    top.move_to(iced::Point::new(x, top_y)),
+                )
             };
             layout::Node::with_children(size, vec![base, top])
         }
