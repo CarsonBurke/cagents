@@ -153,7 +153,7 @@ pub(super) struct ClosedAuthority {
     stamp: ClosureStamp,
     // Contains answers only for identities actually requested in this process.
     // A new closure discards answers before its transaction can commit.
-    answers: HashMap<ClosureKey, (ClosureQuery, bool)>,
+    answers: HashMap<ClosureKey, (ClosureQuery, std::result::Result<bool, ()>)>,
     changed: bool,
     pending_commit: bool,
 }
@@ -166,9 +166,9 @@ impl ClosedAuthority {
             pending_commit: false,
         })
     }
-    fn lookup(&self, query: &ClosureQuery) -> Option<bool> {
+    fn lookup(&self, query: &ClosureQuery) -> Option<std::result::Result<bool, ()>> {
         if matches!(query, ClosureQuery::Terminal(_)) && self.stamp.unknown {
-            return Some(true);
+            return Some(Err(()));
         }
         if self.pending_commit {
             return None;
@@ -178,7 +178,7 @@ impl ClosedAuthority {
                 return Some(*closed);
             }
         }
-        (self.stamp.sequence == 0).then_some(false)
+        (self.stamp.sequence == 0).then_some(Ok(false))
     }
 }
 
@@ -217,10 +217,19 @@ impl StateStore {
     /// Metadata-only current observation. None is pending/refused, never a
     /// certificate that this identity was not previously closed.
     pub(crate) fn cached_closure(&self, query: &ClosureQuery) -> Option<bool> {
-        self.closed_authority
-            .read()
-            .ok()
-            .and_then(|authority| authority.lookup(query))
+        self.cached_closure_result(query)
+            .and_then(std::result::Result::ok)
+    }
+    /// Outer None requests a worker lookup. Inner Err is a cached refusal,
+    /// never evidence that this card was closed and never an automatic retry.
+    pub(crate) fn cached_closure_result(
+        &self,
+        query: &ClosureQuery,
+    ) -> Option<std::result::Result<bool, ()>> {
+        match self.closed_authority.read() {
+            Ok(authority) => authority.lookup(query),
+            Err(_) => Some(Err(())),
+        }
     }
     pub(crate) fn take_closure_updates(&self) -> bool {
         self.closed_authority
@@ -236,7 +245,7 @@ impl StateStore {
             Err(error) => {
                 if let Ok(mut authority) = self.closed_authority.write() {
                     authority.stamp.unknown = true;
-                    authority.answers.insert(query.key(), (query, true));
+                    authority.answers.insert(query.key(), (query, Err(())));
                     authority.changed = true;
                 }
                 return Err(error);
@@ -247,7 +256,9 @@ impl StateStore {
             let stamp = ClosureStamp::read(&inner.connection)?;
             actual_stamp = Some(stamp);
             if stamp.unknown && matches!(query, ClosureQuery::Terminal(_)) {
-                return Ok(true);
+                return Err(StoreError::InvalidState(
+                    "closed terminal attribution is unavailable".into(),
+                ));
             }
             self.query_closure(&inner.connection, &query)
         });
@@ -270,7 +281,7 @@ impl StateStore {
         }
         authority.answers.insert(
             query.key(),
-            (query, result.as_ref().copied().unwrap_or(true)),
+            (query, result.as_ref().copied().map_err(|_| ())),
         );
         authority.changed = true;
         result
@@ -282,7 +293,9 @@ impl StateStore {
                 .query_row([id.to_string()], |row| row.get(0))?),
             ClosureQuery::Terminal(receipt) => {
                 if self.has_unknown_closed_claims() {
-                    return Ok(true);
+                    return Err(StoreError::InvalidState(
+                        "closed terminal attribution is unavailable".into(),
+                    ));
                 }
                 if connection.prepare_cached("SELECT EXISTS(SELECT 1 FROM closed_terminal_claim_keys WHERE terminal_id=?1)")?
                     .query_row([receipt.id.to_string()], |row| row.get::<_, bool>(0))? { return Ok(true); }

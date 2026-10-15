@@ -929,8 +929,8 @@ impl SessionRuntime {
 
     /// Pending metadata is refused until the existing persistence worker has
     /// checked the requested identity. No SQLite call runs on the UI thread.
-    fn closure_observation(&self, query: ClosureQuery) -> Option<bool> {
-        let answer = self.operation_store.cached_closure(&query);
+    fn closure_observation(&self, query: ClosureQuery) -> Option<Result<bool, ()>> {
+        let answer = self.operation_store.cached_closure_result(&query);
         if answer.is_none() {
             let (lock, changed) = &*self.queue;
             if let Ok(mut state) = lock.lock() {
@@ -947,12 +947,16 @@ impl SessionRuntime {
     }
     pub(crate) fn card_closure_observation(&self, id: CardId) -> Option<bool> {
         self.closure_observation(ClosureQuery::Card(id))
+            .and_then(Result::ok)
     }
     pub fn terminal_was_closed(&self, session: &TerminalSession) -> bool {
         self.terminal_closure_observation(session).unwrap_or(true)
     }
     pub(crate) fn terminal_closure_observation(&self, session: &TerminalSession) -> Option<bool> {
+        // Inventory discards a refused descriptor; it does not turn that
+        // refusal into a card-close fact or retain its full pending payload.
         self.closure_observation(ClosureQuery::terminal(session))
+            .map(|answer| answer.unwrap_or(true))
     }
     pub(crate) fn take_closure_updates(&self) -> bool {
         self.operation_store.take_closure_updates()
@@ -3443,6 +3447,25 @@ mod tests {
         );
         runtime.flush(Duration::from_secs(10)).unwrap();
         assert!(runtime.card_was_closed(open));
+        runtime.operation_store.shutdown().unwrap();
+        let unavailable = CardId::new();
+        assert_eq!(runtime.card_closure_observation(unavailable), None);
+        runtime.flush(Duration::from_secs(10)).unwrap();
+        assert_eq!(
+            runtime
+                .operation_store
+                .cached_closure_result(&ClosureQuery::Card(unavailable)),
+            Some(Err(()))
+        );
+        assert_eq!(
+            runtime.card_closure_observation(unavailable),
+            None,
+            "refusal is not proven closure"
+        );
+        assert!(
+            runtime.queue.0.lock().unwrap().closure_queries.is_empty(),
+            "cached refusal must not rearm a lookup loop"
+        );
         runtime.shutdown();
     }
 

@@ -1995,6 +1995,76 @@ mod tests {
     }
 
     #[test]
+    fn closed_refused_projection_preserves_the_open_alias_and_runtime() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let mut canonical = app.durable.cards[0].clone();
+        let alias = canonical.id;
+        canonical.id = CardId::new();
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(ProjectChannel {
+            id: channel,
+            project_id: ProjectId::new(),
+            title: "current view".into(),
+            title_source: Default::default(),
+            ordinal: 0,
+            shared: true,
+            cards: vec![alias],
+            focused: Some(alias),
+        });
+        let mut unrelated = canonical.clone();
+        unrelated.id = CardId::new();
+        unrelated.kind = CardKind::Settings;
+        unrelated.existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("unrelated history".into()),
+            },
+        };
+        durable.cards.push(unrelated);
+        let (runtime, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("refused-view"),
+        )
+        .unwrap();
+        runtime.snapshot(Arc::clone(&app.durable));
+        runtime.flush(Duration::from_secs(5)).unwrap();
+        let store = runtime.operation_store();
+        app.session = Some(runtime);
+        let mut view = View::empty(Scope::Channel(channel));
+        view.panes.push(Pane::from_card(&canonical, None).unwrap());
+        app.workspace_model.views = vec![view.clone()];
+        app.shared_views.initialized.insert(view.scope.clone());
+        let owned = HashSet::from([canonical.id]);
+        let focus = app.workspace.focused();
+        // The real existing worker encounters an unavailable Store. Its Err
+        // must be retained as refusal rather than synthesized closure proof.
+        store.shutdown().unwrap();
+        let pending = app.closure_projection(std::slice::from_ref(&view));
+        app.prepare_shared_aliases(std::slice::from_ref(&view), &owned, &pending);
+        let query = crate::persistence::ClosureQuery::Card(canonical.id);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.cached_closure_result(&query) != Some(Err(())) {
+            assert!(
+                Instant::now() < deadline,
+                "real worker did not publish refusal"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let refused = app.closure_projection(std::slice::from_ref(&view));
+        assert_eq!(refused.get(&canonical.id), Some(&None));
+        app.prepare_shared_aliases(std::slice::from_ref(&view), &owned, &refused);
+        drop(app.project_shared_view_with_cards(&view, &owned, vec![alias], &refused));
+        assert!(app.card_state(alias).unwrap().existence.is_open());
+        assert!(matches!(app.cards.get(&alias), Some(CardRuntime::Loading)));
+        assert_eq!(app.workspace.focused(), focus);
+        assert!(app.card_state(canonical.id).is_none());
+        assert!(app.shared_views.blocked.contains(&view.scope));
+    }
+
+    #[test]
     fn closed_terminal_shared_adoption_preserves_closure_and_both_drafts() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = super::super::tests::context_inspector_test_app(true);
