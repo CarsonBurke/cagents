@@ -1608,6 +1608,84 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    async fn running_generic_creation_keeps_its_source_through_unchanged_refresh() {
+        use std::os::unix::fs::PermissionsExt;
+        const TEST: &str = "app::worktree_dialog::tests::running_generic_creation_keeps_its_source_through_unchanged_refresh";
+        if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
+        let (mut fixture, _files, root, oid) = real_history_source();
+        let source = open_generic_fixture(&mut fixture, &oid);
+        let original_generation = fixture.app.project_creation_generation(fixture.project).unwrap();
+        let (project, operation, request) = resolve_history_input(fixture.app.submit_worktree_dialog()).await;
+        let hooks = root.join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("reference-transaction");
+        std::fs::write(&hook, r#"#!/bin/sh
+if [ "$1" = prepared ]; then
+    while read -r old new reference; do
+        if [ "$reference" = refs/heads/generic-topic ]; then
+            : > "$0.entered"
+            attempts=0
+            while [ ! -f "$0.release" ]; do
+                attempts=$((attempts + 1))
+                [ "$attempts" -lt 1000 ] || exit 1
+                sleep 0.01
+            done
+        fi
+    done
+fi
+exit 0
+"#).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // The fixture builder disables hooks only on its own setup commands;
+        // the actual production creation command runs this repository policy.
+        isolated_git(&root, &["config", "core.hooksPath", hooks.to_str().unwrap()]);
+        let entered = hook.with_extension("entered");
+        let release = hook.with_extension("release");
+        struct ReleaseOnDrop(PathBuf);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) { let _ = std::fs::write(&self.0, b"release"); }
+        }
+        let release_on_drop = ReleaseOnDrop(release.clone());
+        let creation = fixture.app.finish_worktree_input(project, operation, Ok(request));
+        let completion = first_creation_message(creation);
+        tokio::pin!(completion);
+        let wait_for_policy = async {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !entered.exists() { tokio::time::sleep(Duration::from_millis(5)).await; }
+            }).await.expect("the actual creation Git command reaches the finite policy barrier");
+        };
+        tokio::select! {
+            _ = &mut completion => panic!("the actual worker must remain blocked at its native policy boundary"),
+            _ = wait_for_policy => {},
+        }
+        assert!(source.lifetime.lock().unwrap().readers.iter().any(|reader| reader.strong_count() != 0),
+            "the running blocking worker retains its cancellation lease");
+        let refresh = fixture.app.repository_load_task(root.clone(), Some(project), false);
+        assert!(fixture.app.project_creation_source(project).is_none());
+        assert!(fixture.app.current_project_creation_source(project, source.id()));
+        let loaded = first_creation_message(refresh).await;
+        assert!(matches!(loaded, Message::RepositoryLoaded { .. }));
+        drop(fixture.app.update(loaded));
+        assert_eq!(fixture.app.project_creation_generation(project), Some(original_generation));
+        assert_eq!(fixture.app.project_creation_source(project).unwrap().id(), source.id());
+        assert!(source.is_available());
+        std::fs::write(&release, b"release").unwrap();
+        let finished = completion.await;
+        drop(release_on_drop);
+        let (report, final_message) = creation_final_message(&mut fixture.app, cosmic::task::message(finished)).await;
+        assert_eq!(report.state, WorktreeOperationState::Created, "{report:?}");
+        let Message::ProjectWorktreeCreated { result: Ok(WorktreeCreationOutcome::Created { worktree, .. }), .. } = &final_message else {
+            panic!("the running operation must retain its exact guarded final receipt");
+        };
+        let created = worktree.id;
+        drop(fixture.app.update(final_message));
+        assert!(fixture.app.sidebar_model.project(project).unwrap().worktrees.iter().any(|row| row.id == created));
+        fixture.app.session.as_ref().unwrap().flush(Duration::from_secs(5)).unwrap();
+        assert!(fixture.app.session.as_ref().unwrap().operation_store().load_worktree(created).unwrap().is_some());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
     async fn queued_project_publication_refuses_changed_generation_for_generic_and_history() {
         const TEST: &str = "app::worktree_dialog::tests::queued_project_publication_refuses_changed_generation_for_generic_and_history";
         if !crate::git_watch::tests::fixture_isolated(TEST) { return; }
