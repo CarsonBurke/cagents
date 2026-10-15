@@ -10,7 +10,7 @@ struct CreationState { sealed: bool, in_flight: usize }
 struct CreationGuard(Arc<Mutex<CreationState>>);
 impl Drop for CreationGuard {
     fn drop(&mut self) {
-        // Counter-only test admission: no I/O, waits, hidden FDs or native
+        // Counter-only test admission: no I/O, hidden FDs or native
         // production issuer substitution. The SAME slot also retains context.
         let mut state = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         state.in_flight = state.in_flight.checked_sub(1).expect("one admission per guard");
