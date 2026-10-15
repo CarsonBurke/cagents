@@ -402,10 +402,9 @@ fn restore(
                     && restored.proof.as_ref() == Some(proof)
                     && restored.launch.provider == session.launch.provider =>
             {
-                if session.launch.session_id.is_some()
-                    && (session.launch.session_id != restored.launch.session_id
-                        || session.launch.recipe != restored.launch.recipe)
-                {
+                // Proof-only upgrades still need a durable intermediate
+                // receipt when a same-daemon console restart follows attachment.
+                if session.launch.session_id.is_some() {
                     if !super::is_upgrade_recovery(&session, &restored) {
                         return Err("The daemon's upgrade replacement changed the saved conversation configuration".into());
                     }
@@ -2656,8 +2655,8 @@ mod tests {
 
     #[test]
     fn restart_receipt_is_correlated_with_exact_attach_and_composes_with_upgrade_lineage() {
-        for mismatch in 0..3 {
-            let source=omp_card(None,Some(host_proof("prior")));
+        for mismatch in 0..4 {
+            let source=omp_card(Some(if mismatch==3{CONVERSATION}else{"prior-conversation"}),Some(host_proof("prior")));
             let mut resolved=source.clone();resolved.proof=Some(host_proof("live"));resolved.launch.session_id=Some(CONVERSATION.into());
             let result=restore_with_lineage(source,Some(resolved.clone()),move |request| {
                 let ClientRequest::ChatAttach{session}=request else{panic!("expected exact attach")};
@@ -2675,7 +2674,7 @@ mod tests {
                 let snapshot=Snapshot{session_id:Some(if mismatch==2{"invented-thread".into()}else{CONVERSATION.into()}),ready:true,..Default::default()};
                 ServerMessage::Response{response:ServerResponse::ChatRestarted{receipt,snapshot}}
             });
-            if mismatch==0 {let handle=result.unwrap();assert!(handle.upgrade_recovery().is_some());assert!(handle.restart_recovery().unwrap().is_valid());assert!(handle.session().terminal.is_some());}
+            if mismatch==0 || mismatch==3 {let handle=result.unwrap();assert!(handle.upgrade_recovery().is_some());assert!(handle.restart_recovery().unwrap().is_valid());assert!(handle.session().terminal.is_some());}
             else {assert!(result.err().unwrap().message.contains("restart receipt"));}
         }
     }

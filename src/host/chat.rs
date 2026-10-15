@@ -2035,6 +2035,12 @@ pub(super) fn restart_completed_with_execution(
     source: &Session,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
 ) -> Result<Option<ServerResponse>, ProtocolError> {
+    let transition=restart::transition_gate(host,source.id);
+    let _transition=match transition.try_lock(){
+        Ok(guard)=>guard,
+        Err(std::sync::TryLockError::Poisoned(poison))=>poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock)=>return Err(unavailable("This exact conversation already has a lifecycle transition in progress; retry its current pane")),
+    };
     restart::run(host,client,source,execution)
 }
 
@@ -2124,7 +2130,7 @@ fn process_inner(
     // Keep explicit close/return and a restart's full pair publication mutually
     // exclusive. Weak entries retain only currently executing transitions.
     let transition = match &request {
-        ClientRequest::ChatAttach {session} | ClientRequest::ChatStart {session,..}=>Some(session.id),
+        ClientRequest::ChatStart {session,..}=>Some(session.id),
         ClientRequest::ChatClose {chat_id} | ClientRequest::ChatReturnTerminal {chat_id}=>Some(*chat_id),
         _=>None,
     }.map(|id|restart::transition_gate(host,id));
@@ -3137,6 +3143,12 @@ pub(super) fn close_terminal_actor(
     terminal_id: TerminalId,
     handle: &Handle,
 ) -> Result<(), ProtocolError> {
+    let transition=restart::transition_gate(host,terminal_id);
+    let _transition=match transition.try_lock(){
+        Ok(guard)=>guard,
+        Err(std::sync::TryLockError::Poisoned(poison))=>poison.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock)=>return Err(unavailable("The paired conversation is restarting; its owner was retained. Retry close after that transition finishes")),
+    };
     handle.close().map_err(unavailable)?;
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     let removed = if state

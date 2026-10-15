@@ -187,3 +187,57 @@ mod tests {
         assert!(!aliases_fit(&[large]));
     }
 }
+
+#[cfg(test)]
+mod process_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    #[test]
+    fn repeated_restart_and_lost_reply_keep_one_exact_provider_actor() {
+        const CHILD:&str="CAGENTS_EXACT_RESTART_FIXTURE";
+        if std::env::var_os(CHILD).is_none(){
+            let directory=tempfile::tempdir().unwrap();let root=directory.path();std::fs::create_dir(root.join("run")).unwrap();
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact","host::chat::restart::process_tests::repeated_restart_and_lost_reply_keep_one_exact_provider_actor","--nocapture"])
+                .env_clear().env(CHILD,root).env("HOME",root).env("XDG_RUNTIME_DIR",root.join("run"))
+                .env("XDG_DATA_HOME",root.join("data")).env("XDG_CONFIG_HOME",root.join("config")).env("XDG_CACHE_HOME",root.join("cache"))
+                .env("PATH","/usr/bin:/bin").status().unwrap().success());return;
+        }
+        let root=std::path::PathBuf::from(std::env::var_os(CHILD).unwrap());let executable=root.join("omp");
+        std::fs::write(&executable,r#"#!/usr/bin/python3
+import json,os,sys
+root=os.environ['CAGENTS_EXACT_RESTART_FIXTURE']
+with open(root+'/spawns','a') as f:f.write(str(os.getpid())+'\n')
+identity=sys.argv[sys.argv.index('--resume')+1]
+print(json.dumps({'type':'ready'}),flush=True)
+for line in sys.stdin:
+    if os.path.exists(root+'/crash'):os._exit(17)
+    request=json.loads(line)
+    data={'sessionId':identity,'messages':[],'isStreaming':False,'isCompacting':False}
+    print(json.dumps({'type':'response','id':request['id'],'command':request['type'],'success':True,'data':data}),flush=True)
+"#).unwrap();std::fs::set_permissions(&executable,std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proof=HostSessionProof{host_session_id:"exact-restart".into(),boot_id:crate::daemon::read_boot_id().unwrap(),host_incarnation:"same-daemon".into()};
+        let host=Arc::new(HostLock::new(HostState::new(proof.clone())));host.lock().unwrap().register_client(1);
+        let mut source=Session{id:TerminalId::new(),launch:chat::Launch{provider:crate::agent::Provider::Omp,recipe:crate::model::LaunchRecipe{program:executable.to_string_lossy().into_owned(),arguments:vec![],working_directory:root.clone(),environment:Default::default(),unset_environment:Default::default()},session_id:Some("11111111-1111-4111-8111-111111111111".into())},proof:Some(proof),terminal:None,owned_codex_listener:None,native_continuity:Default::default()};
+        super::super::start(&host,1,source.clone(),None,false,None,Default::default()).unwrap();
+        let mut actor=host.lock().unwrap().chats[&source.id].handle.clone();wait_ready(&actor).unwrap();
+        for generation in 0..2 {
+            std::fs::write(root.join("crash"),b"1").unwrap();let _=actor.command(chat::Command::Refresh);
+            let deadline=Instant::now()+Duration::from_secs(5);
+            while !actor.is_completed(){assert!(Instant::now()<deadline);thread::sleep(Duration::from_millis(10));}
+            std::fs::remove_file(root.join("crash")).unwrap();
+            let gate=transition_gate(&host,source.id);let held=gate.lock().unwrap();
+            assert!(super::super::process(&host,1,ClientRequest::ChatAttach{session:source.clone()}).is_err());drop(held);
+            let ServerResponse::ChatRestarted{receipt,..}=super::super::process(&host,1,ClientRequest::ChatAttach{session:source.clone()}).unwrap() else {panic!("missing typed receipt")};
+            assert_eq!(receipt.source(),&source);assert_eq!(receipt.replacement().launch,source.launch);
+            let replacement=host.lock().unwrap().chats[&source.id].handle.clone();assert!(!replacement.same_actor(&actor));
+            // Lost acknowledgment retries the same private actor, not a new process.
+            assert!(matches!(super::super::process(&host,1,ClientRequest::ChatAttach{session:source.clone()}).unwrap(),ServerResponse::ChatRestarted{..}));
+            assert!(host.lock().unwrap().chats[&source.id].handle.same_actor(&replacement));
+            assert_eq!(std::fs::read_to_string(root.join("spawns")).unwrap().lines().count(),generation+2);
+            source=receipt.replacement().clone();actor=replacement;
+        }
+        super::super::process(&host,1,ClientRequest::ChatClose{chat_id:source.id}).unwrap();
+        assert!(actor.is_completed());assert!(!host.lock().unwrap().chat_restarts.contains_key(&source.id));
+    }
+}
