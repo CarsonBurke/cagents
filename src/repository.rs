@@ -8006,16 +8006,23 @@ fn trusted_fsmonitor(output: &[u8], worktree: &Path) -> Option<OsString> {
         _ if matches!(scope, "global" | "system" | "command") => {
             // Git interprets hook values as commands. Relative commands and
             // shell syntax can select code supplied by the current checkout.
-            if !Path::new(value).is_absolute()
-                || !value
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(&byte))
-            {
+            let is_command_path = |path: &Path| {
+                path.is_absolute()
+                    && path
+                        .as_os_str()
+                        .as_encoded_bytes()
+                        .iter()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-".contains(byte))
+            };
+            if !is_command_path(Path::new(value)) {
                 return None;
             }
             let executable = fs::canonicalize(value).ok()?;
             let worktree = fs::canonicalize(worktree).unwrap_or_else(|_| worktree.to_path_buf());
-            if executable.starts_with(&worktree)
+            // Git receives the canonical path as a command string, so a safe
+            // symlink name must not introduce shell syntax through its target.
+            if !is_command_path(&executable)
+                || executable.starts_with(&worktree)
                 || executable
                     .ancestors()
                     .skip(1)
@@ -8752,6 +8759,34 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn snapshot_fsmonitor_rejects_unsafe_canonical_symlink_targets() {
+        use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let worktree = directory.path().join("repo");
+        fs::create_dir(&worktree).unwrap();
+        let names = [
+            OsString::from("monitor space"),
+            OsString::from("monitor;marker"),
+            OsString::from("monitor$(marker)"),
+            OsString::from("monitor'quoted"),
+            OsString::from("monitor\nline"),
+            OsString::from_vec(b"monitor-\xff".to_vec()),
+            OsString::from("monitor-safe"),
+        ];
+        for (index, name) in names.into_iter().enumerate() {
+            let target = directory.path().join(name);
+            fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+            let link = directory.path().join(format!("safe-link-{index}"));
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            let config = format!("global\t{}\n", link.display());
+            let expected = (target.file_name() == Some(OsStr::new("monitor-safe")))
+                .then(|| target.into_os_string());
+            assert_eq!(trusted_fsmonitor(config.as_bytes(), &worktree), expected);
+        }
     }
 
     fn snapshot_status(entries: &[u8]) -> Vec<u8> {
