@@ -6340,15 +6340,21 @@ mod tests {
             let message = worker
                 .pty_rx
                 .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                .unwrap();
+                .unwrap_or_else(|error| panic!(
+                    "Integrated Bash prompt did not finish: {error}; output={:?}; exit={:?}",
+                    String::from_utf8_lossy(&prompt_bytes), worker.child_exit_rx.try_recv(),
+                ));
             if let PtyMessage::Bytes(bytes) = &message {
                 prompt_bytes.extend_from_slice(bytes);
             }
             let ready = prompt_bytes
                 .windows(b"\x1b]133;B\x07".len())
                 .any(|word| word == b"\x1b]133;B\x07");
-            worker.handle_pty_message(Some(message));
+            // handle_pty_message coalesces additional reader messages. Feed
+            // the full startup batch only after collecting the delimiter, so
+            // that coalescing cannot consume the marker behind this observer.
             if ready {
+                worker.process_output(prompt_bytes);
                 break;
             }
         }
