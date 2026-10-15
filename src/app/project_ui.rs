@@ -704,6 +704,7 @@ impl Cagents {
         // A Repository descriptor can retain its card/path through checkout
         // replacement. Any newer inventory intake invalidates old UI custody.
         let same_device = completed.device == stop_device_key();
+        if !same_device { return Task::none(); }
         let same_inventory = same_device && self.repository_generations.get(&target.project).copied()
             == completed.repository_generation;
         let current = completed.owners.into_iter().filter(|owner| {
@@ -779,6 +780,7 @@ impl Cagents {
                 client.matches(surface) && before.id == after.id && before.launch == after.launch
                     && surface.terminal_id() == after.id && surface.host_proof().as_ref().is_some_and(crate::model::HostSessionProof::is_complete)
                     && before.continuity.live_proof() == surface.host_proof()
+                    && after.continuity.live_proof() == surface.host_proof()
             }
             (RemovalRuntimeOwner::Descriptor, _, _, runtime) => current == &owner.card
                 && (!matches!(current.kind, CardKind::Chat(_) | CardKind::Terminal(_))
@@ -5996,6 +5998,68 @@ mod tests {
             drop(app.complete_removal_projections(custody));
             assert_eq!(app.card_state(card).unwrap().existence.is_open(), replacement,
                 "same-ID/same-descriptor client replacement survives; unchanged original client retires despite mutable title");
+        }
+    }
+
+    #[test]
+    fn terminal_removal_custody_requires_current_descriptor_proof_and_original_surface() {
+        use crate::terminal::ipc::{self, ClientEnvelope, ClientRequest, ServerEnvelope, ServerMessage, ServerResponse, TerminalDescriptor};
+        for mode in 0..4 {
+            let repository = PathBuf::from("/repo");
+            let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
+            let linked = SidebarWorktree::from_durable(WorktreeId::new(), repository.join("linked"), Some("feature".into()));
+            let (mut app, directory, project) = deletable_app(&repository, &linked, &primary);
+            drop(app.add_terminal(linked.path.clone()));
+            let card = app.durable.cards.last().unwrap().id;
+            let CardKind::Terminal(mut session) = app.card_state(card).unwrap().kind.clone() else { panic!("terminal"); };
+            session.continuity = crate::model::TerminalContinuity::Live {host_session_id: crate::model::HostSessionId::new("original"), boot_id: crate::model::BootId::new("boot"), host_incarnation: crate::model::HostIncarnation::new("original-incarnation")};
+            let proof = session.continuity.live_proof().unwrap();
+            app.card_state_mut(card).unwrap().kind = CardKind::Terminal(session.clone());
+            // Actual attachment acknowledgement supplies surface proof; merely
+            // giving connect_at an expected proof would not qualify this test.
+            let socket = directory.path().join("terminal.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let handle = crate::terminal::HostedTerminalHandle::connect_at(socket, session.id, Some(proof.clone()), |_| {}).unwrap();
+            let until = Instant::now() + Duration::from_secs(5);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < until, "terminal client did not connect");
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("terminal accept: {error}"),
+                }
+            };
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+            let connect: ClientEnvelope = ipc::read_frame(&mut stream).unwrap().unwrap();
+            ipc::write_frame(&mut stream, &ServerEnvelope {version: ipc::PROTOCOL_VERSION, request_id: Some(connect.request_id), proof: proof.clone(), message: ServerMessage::Response {response: ServerResponse::Connected {proof: proof.clone(), resumed: Vec::new()}}}).unwrap();
+            let attach: ClientEnvelope = ipc::read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(attach.request, ClientRequest::Attach {terminal_id, ..} if terminal_id == session.id));
+            let terminal = TerminalDescriptor {session, generation: 0, event_sequence: 0, oldest_event_sequence: 1,
+                activity: None, agent_activity: None, upgrade_sources: Vec::new(), upgrade_relaunches: Vec::new(), attached: true, transcript: None, screen_lost_after_crash: false};
+            ipc::write_frame(&mut stream, &ServerEnvelope {version: ipc::PROTOCOL_VERSION, request_id: Some(attach.request_id), proof: proof.clone(), message: ServerMessage::Response {response: ServerResponse::Attached {terminal}}}).unwrap();
+            handle.wait_until_attached(Duration::from_secs(5)).unwrap();
+            assert_eq!(handle.proof(), Some(proof));
+            app.cards.insert(card, CardRuntime::Terminal(TerminalSurface::from(handle.clone())));
+            let target = app.project_target(project, Some(linked.id)).unwrap();
+            let custody = app.capture_removal_projections(target);
+            app.card_state_mut(card).unwrap().title = "Settled terminal".into();
+            if let CardKind::Terminal(current) = &mut app.card_state_mut(card).unwrap().kind {
+                if mode == 1 {
+                    current.continuity = crate::model::TerminalContinuity::Live {host_session_id: crate::model::HostSessionId::new("successor"), boot_id: crate::model::BootId::new("boot"), host_incarnation: crate::model::HostIncarnation::new("successor-incarnation")};
+                } else if mode == 2 {
+                    current.continuity = crate::model::TerminalContinuity::Exited {last_exit: crate::model::TerminalExit {code: Some(0), signal: None, occurred_at_unix_ms: 1}};
+                }
+            }
+            if mode == 3 { app.cards.insert(card, CardRuntime::Terminal(TerminalSurface::from(handle.clone()))); }
+            drop(app.complete_removal_projections(custody));
+            assert_eq!(app.card_state(card).unwrap().existence.is_open(), mode != 0,
+                "only the still-proven original descriptor+surface retires; proof replacement, unknown exited proof and surface replacement survive");
+            // Both stream and original handle have bounded I/O/drop custody;
+            // there is no native terminal or provider process in this fixture.
         }
     }
 
