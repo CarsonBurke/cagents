@@ -196,7 +196,7 @@ impl Registry {
         // published pane. Exact replay is allowed after normal publication.
         if read(&tx, requirement.session)?.is_none() {
             let published = super::views::all(&tx)?.iter().flat_map(|view| &view.panes)
-                .any(|pane| match &pane.kind {
+                .any(|pane| pane.id == requirement.card || match &pane.kind {
                     crate::model::CardKind::Terminal(session) => session.id == requirement.session,
                     crate::model::CardKind::Chat(session) => session.id == requirement.session,
                     _ => false,
@@ -318,6 +318,13 @@ mod tests {
         let late = requirement();
         seed(&mut registry, a, pane(&late));
         assert!(registry.require_created_start(&late).is_err());
+        let before_replacement = registry.model().unwrap();
+        let mut replacement_obligation = requirement();
+        replacement_obligation.card = late.card;
+        assert_ne!(replacement_obligation.session, late.session);
+        assert!(registry.require_created_start(&replacement_obligation).is_err(),
+            "new-session metadata cannot retroactively fence an existing published card");
+        assert_eq!(registry.model().unwrap(), before_replacement);
         let required = requirement();
         registry.require_created_start(&required).unwrap();
         let mut replacement = pane(&required);
