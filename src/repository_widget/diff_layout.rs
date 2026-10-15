@@ -20,7 +20,7 @@ pub(super) struct RowOffsets {
     offsets: Vec<f64>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum Anchor {
     Leading(f64),
     Row { row: usize, fraction: f64 },

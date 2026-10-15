@@ -324,16 +324,13 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 }
                 match fs_safety::open_beneath(root, path.as_path()).and_then(|file| {
                     let opened = fs_safety::metadata_of(&file).map_err(|error| {
-                        fs_safety::ResolveError::Io {
-                            path: root.path().join(path.as_path()),
-                            message: error.to_string(),
-                        }
+                        fs_safety::ResolveError::io(&root.path().join(path.as_path()), &error)
                     })?;
                     if metadata_version(&metadata) != metadata_version(&opened) {
-                        return Err(fs_safety::ResolveError::Io {
-                            path: root.path().join(path.as_path()),
-                            message: "file changed while opening its backup".into(),
-                        });
+                        return Err(fs_safety::ResolveError::io(
+                            &root.path().join(path.as_path()),
+                            &io::Error::other("file changed while opening its backup"),
+                        ));
                     }
                     Ok((file, opened))
                 }) {

@@ -223,7 +223,7 @@ impl ResolveError {
         }
     }
 
-    fn io(path: &Path, error: &io::Error) -> Self {
+    pub(crate) fn io(path: &Path, error: &io::Error) -> Self {
         // `EACCES`, `EPERM` and `EROFS` are the three ways the kernel says "not
         // by you": the permission bits refuse it, a file attribute or a missing
         // capability refuses it, or the whole filesystem is mounted read-only.
