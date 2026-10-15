@@ -244,7 +244,10 @@ impl Holding {
             if let Some(error) = publication.publication_error() {
                 return Err(FileIoError::Io(error.into()));
             }
-            context.placement().validate_payload_root(publication.directory()).map_err(io_error)?;
+            // Enroll this exact held directory before any payload byte or
+            // public acquisition. An uncertain handoff is retained by the
+            // SAME owned lease and the typed failure below.
+            context.placement().register_payload_root(publication.directory()).map_err(io_error)?;
             fs_safety::set_directory_permissions(publication.directory(), 0o700)
                 .map_err(io_error)?;
             let metadata = publication.directory().metadata().map_err(io_error)?;
@@ -684,19 +687,9 @@ pub(super) fn fixture_context(root: &Root) -> FilesystemRecoveryContext {
 }
 #[cfg(test)]
 fn fixture_context_with_guard(root: &Root, guard: impl Send + Sync + 'static) -> FilesystemRecoveryContext {
-    use std::sync::Arc;
-    let outside = tempfile::tempdir().unwrap();
-    let runtime = tempfile::tempdir().unwrap();
-    let source = Arc::new(root.try_clone().unwrap());
-    let outside_root = Arc::new(Root::open(outside.path()).unwrap());
-    FIXTURE_PLACEMENTS.with(|placements| placements.borrow_mut().insert(root.path().to_owned(), outside.path().to_owned()));
-    let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), root.path(), false).unwrap()));
-    // Test-only: the entire isolated topology is known; these TempDirs and
-    // a non-FD test guard stay alive with its registry callback. Production
-    // intake must supply actual adoption/registration authority instead.
-    let registry = fs_safety::RecoveryRegistryCheck::new(Arc::new(move || { let _ = (&outside, &runtime, &guard); Ok(()) }), 0);
-    let placement = fs_safety::RecoveryPlacement::acquire(outside_root, source.clone(), Arc::from([source]), registry).unwrap();
-    FilesystemRecoveryContext::new(root, protection, placement).unwrap()
+    let context = crate::filesystem_recovery_context::fixtures::fixture_context_with_guard(root, guard).unwrap();
+    FIXTURE_PLACEMENTS.with(|placements| placements.borrow_mut().insert(root.path().to_owned(), context.placement().directory().path().to_owned()));
+    context
 }
 
 #[cfg(test)]
