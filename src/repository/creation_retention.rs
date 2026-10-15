@@ -81,6 +81,11 @@ impl SettledCreatedWorktree {
         self.source.validate()?;
         self.destination.validate()
     }
+    /// Pure identity check for the actual SessionRuntime-issued store token.
+    /// This does not expose the connection or grant any journal/start authority.
+    pub(crate) fn uses_original_store(&self, store: &Arc<StateStore>) -> bool {
+        Arc::ptr_eq(&self._retention.original_store, store)
+    }
     /// Blocking-worker evidence read through the SAME connection retained by
     /// the actual creator. No caller-provided store or path can substitute it.
     /// The result is producer evidence, not host audience/start authority.

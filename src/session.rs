@@ -443,6 +443,26 @@ pub struct SessionRuntime {
     operation_store: Arc<StateStore>,
 }
 
+/// UI-owned provenance only: the actual configured SessionRuntime and its
+/// original existing connection. No constructor accepts a caller store/path.
+/// This is not serializable and grants no host directory/start authority.
+pub(crate) struct OriginalUiJournalStore {
+    store: Arc<StateStore>,
+    window: String,
+    process: u32,
+}
+impl OriginalUiJournalStore {
+    pub(crate) fn validate_creation(&self, created: &crate::repository::SettledCreatedWorktree,
+        window: &str) -> Result<(), SessionError> {
+        if self.process != std::process::id() || self.window != window
+            || self.window != instance::window_slot() || !created.uses_original_store(&self.store) {
+            return Err(SessionError::Store(StoreError::InvalidState(
+                "The creation response does not belong to this original UI session store".into())));
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Debug for SessionRuntime {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -916,6 +936,18 @@ impl SessionRuntime {
     /// Shares the existing connection, never opens a second startup-reconciling store.
     pub fn operation_store(&self) -> Arc<StateStore> {
         Arc::clone(&self.operation_store)
+    }
+
+    /// Capture this from the actual UI SessionRuntime before moving the
+    /// creation response to a blocking worker. The path equality establishes
+    /// configured logical ownership only; it is NOT a SQLite inode claim.
+    pub(crate) fn original_creation_journal_store(&self) -> Result<OriginalUiJournalStore, SessionError> {
+        if self.database_path != Self::default_database_path()? {
+            return Err(SessionError::Store(StoreError::InvalidState(
+                "Creation responses require this configured window's actual session store".into())));
+        }
+        Ok(OriginalUiJournalStore {store:Arc::clone(&self.operation_store),
+            window:instance::window_slot().to_owned(),process:std::process::id()})
     }
 
     pub fn last_error(&self) -> Option<String> {

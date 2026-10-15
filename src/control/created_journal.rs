@@ -4,7 +4,8 @@
 //! consumed host-issued transaction can authenticate its bytes; repository
 //! validation must still check the complete durable row and original six roles.
 //! The owning host reader must close the connection on every phase failure.
-use crate::model::{DirectoryStartRequirement, HostSessionProof, OperationId};
+use crate::{model::{DirectoryStartRequirement, HostSessionProof, OperationId},
+    fs_safety::Root, process::CancellationToken};
 use serde::{Deserialize, Serialize};
 use std::{io, time::Instant};
 
@@ -41,6 +42,43 @@ impl UiJournalChallenge {
         }
         Ok(())
     }
+    /// UI blocking-worker producer. The carrier retains the exact connection
+    /// used for creation; no store/path/report parameter can substitute it.
+    /// `current_requirement` is the original immutable pending UI intent, and
+    /// `current_proof` is the actual ControlClient handshake, not echoed data.
+    #[cfg(feature = "ui")]
+    pub(crate) fn answer_original(
+        &self,
+        created: &crate::repository::SettledCreatedWorktree,
+        original_store: &crate::session::OriginalUiJournalStore,
+        current_request: u64,
+        current_proof: &HostSessionProof,
+        current_requirement: &DirectoryStartRequirement,
+        deadline: Instant,
+        cancellation: &crate::process::CancellationToken,
+    ) -> io::Result<UiJournalResponse> {
+        check_active(deadline,cancellation)?;
+        self.validate_shape()?;
+        original_store.validate_creation(created,&self.window).map_err(|error|io::Error::other(error.to_string()))?;
+        validate_echo(self,self,current_request,current_proof,current_requirement)?;
+        if self.window != crate::instance::window_slot()
+            || self.requirement.operation != created.operation()
+            || self.requirement.generation != created.generation() {
+            return Err(refused("The journal challenge does not name this original UI creation"));
+        }
+        let roots=created.transport_roots().map_err(|error|io::Error::other(error.to_string()))?;
+        let roots=[roots.source.0,roots.source.1,roots.source.2,
+            roots.destination.0,roots.destination.1,roots.destination.2];
+        if role_identities(&roots)? != self.roles {
+            return Err(refused("The journal challenge retargets the original six creation roles"));
+        }
+        let checked=created.read_original_journal().map_err(|error|io::Error::other(error.to_string()))?;
+        let row=crate::repository::creation_journal::encode_original_creation_operation(&checked)
+            .map_err(|error|io::Error::other(error.to_string()))?;
+        created.validate().map_err(|error|io::Error::other(error.to_string()))?;
+        check_active(deadline,cancellation)?;
+        UiJournalResponse::from_wire(self.clone(),row)
+    }
 }
 
 /// Untrusted private-phase data. There is intentionally no conversion from
@@ -69,7 +107,7 @@ impl UiJournalResponse {
 #[cfg(all(target_os = "linux", feature = "host"))]
 mod host {
     use super::*;
-    use crate::{fs_safety::Root, instance::OriginalUiJournalPeer, process::CancellationToken};
+    use crate::instance::OriginalUiJournalPeer;
     use std::os::unix::net::UnixStream;
 
     /// Own this only inside the original connection's special request phase.
@@ -90,7 +128,7 @@ mod host {
             deadline: Instant,
             cancellation: CancellationToken,
         ) -> io::Result<Self> {
-            active(deadline, &cancellation)?;
+            check_active(deadline, &cancellation)?;
             let audience = OriginalUiJournalPeer::capture(stream, deadline)?;
             let (device, inode) = audience.database_identity()?;
             let challenge = UiJournalChallenge {
@@ -103,7 +141,7 @@ mod host {
                 roles,
             };
             challenge.validate_shape()?;
-            active(deadline, &cancellation)?;
+            check_active(deadline, &cancellation)?;
             Ok(Self {
                 audience,
                 challenge,
@@ -126,7 +164,7 @@ mod host {
             current_proof: &HostSessionProof,
             current_requirement: &DirectoryStartRequirement,
         ) -> io::Result<AuthenticatedCreationOperation> {
-            active(self.deadline, &self.cancellation)?;
+            check_active(self.deadline, &self.cancellation)?;
             validate_echo(
                 &self.challenge,
                 &response.challenge,
@@ -141,7 +179,7 @@ mod host {
                 ));
             }
             self.audience.validate(self.deadline)?;
-            active(self.deadline, &self.cancellation)?;
+            check_active(self.deadline, &self.cancellation)?;
             Ok(AuthenticatedCreationOperation {
                 audience: self.audience,
                 challenge: self.challenge,
@@ -179,7 +217,7 @@ mod host {
             current_requirement: &DirectoryStartRequirement,
             roots: &[Root; 6],
         ) -> io::Result<()> {
-            active(self.deadline, &self.cancellation)?;
+            check_active(self.deadline, &self.cancellation)?;
             validate_echo(
                 &self.challenge,
                 &self.challenge,
@@ -193,10 +231,15 @@ mod host {
                 ));
             }
             self.audience.validate(self.deadline)?;
-            active(self.deadline, &self.cancellation)
+            check_active(self.deadline, &self.cancellation)
         }
     }
-    fn role_identities(roots: &[Root; 6]) -> io::Result<RoleIdentities> {
+
+}
+#[cfg(all(target_os = "linux", feature = "host"))]
+pub(crate) use host::{AuthenticatedCreationOperation, IssuedUiJournalChallenge};
+
+fn role_identities(roots: &[Root; 6]) -> io::Result<RoleIdentities> {
         use std::os::unix::fs::MetadataExt;
         let mut result = [[0; 2]; 6];
         for (root, identity) in roots.iter().zip(&mut result) {
@@ -205,7 +248,7 @@ mod host {
         }
         Ok(result)
     }
-    fn active(deadline: Instant, cancellation: &CancellationToken) -> io::Result<()> {
+fn check_active(deadline: Instant, cancellation: &CancellationToken) -> io::Result<()> {
         if cancellation.is_cancelled() {
             return Err(io::ErrorKind::Interrupted.into());
         }
@@ -214,9 +257,6 @@ mod host {
         }
         Ok(())
     }
-}
-#[cfg(all(target_os = "linux", feature = "host"))]
-pub(crate) use host::{AuthenticatedCreationOperation, IssuedUiJournalChallenge};
 
 fn validate_echo(
     expected: &UiJournalChallenge,
