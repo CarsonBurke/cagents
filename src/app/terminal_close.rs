@@ -268,9 +268,19 @@ impl Cagents {
     pub(super) fn pane_close_batch_for(&self,card:CardId)->Option<uuid::Uuid> {
         self.terminal_close_bindings.selected.get(&card).copied().filter(|batch|self.pane_close_batch_current(Some(*batch)))
     }
-    fn pane_close_decision_current(&self,card:CardId,batch:Option<uuid::Uuid>)->bool {
+    pub(super) fn pane_close_decision_current(&self,card:CardId,batch:Option<uuid::Uuid>)->bool {
         self.pane_close_batch_current(batch) && batch.is_none_or(|batch|self.terminal_close_bindings.selected.get(&card)==Some(&batch))
     }
+    /// Retire only an acknowledged presentation step from its captured batch.
+    /// The caller separately validates its exact source before hiding a pane.
+    /// This never changes shared membership, execution state, or history.
+    pub(super) fn finish_selected_pane_close(&mut self,card:CardId,batch:Option<uuid::Uuid>)->Task<Message> {
+        let Some(batch)=batch.filter(|batch|self.pane_close_decision_current(card,Some(*batch))) else{return Task::none();};
+        self.terminal_close_bindings.selected.remove(&card);
+        self.queued_card_closes.retain(|queued|queued.card!=card || queued.batch!=Some(batch));
+        self.next_queued_card_close()
+    }
+
     /// Revoke only this batch. Independent direct/login closes have no token.
     pub(super) fn stop_pane_close_batch(&mut self,batch:Option<uuid::Uuid>)->bool {
         let Some(batch)=batch.filter(|batch|self.pane_close_batch_current(Some(*batch))) else{return false;};
@@ -1945,6 +1955,34 @@ mod tests {
             !app.core.keyboard_nav(),
             "dismissal keeps the reader's newer choice"
         );
+    }
+
+    #[test]
+    fn presentation_step_advances_only_its_selected_batch_without_closing_cards() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let first = app.workspace.focused().unwrap();
+        let second = super::super::tests::terminal_card_state();
+        let second_id = second.id;
+        Arc::make_mut(&mut app.durable).cards.push(second);
+        let Message::CloseQueuedCard(first_step)=super::super::tests::task_app_message(app.close_cards_in_order(vec![first,second_id])) else {panic!()};
+        let batch=first_step.batch;
+        assert!(app.pane_close_decision_current(first,batch));
+        let Message::CloseQueuedCard(next)=super::super::tests::task_app_message(app.finish_selected_pane_close(first,batch)) else {panic!()};
+        assert_eq!(next.card,second_id);
+        assert!(!app.pane_close_decision_current(first,batch));
+        assert!(app.pane_close_decision_current(second_id,batch));
+        assert!(app.card_state(first).unwrap().existence.is_open());
+        assert!(app.card_state(second_id).unwrap().existence.is_open());
+        assert!(app.closed_terminal_cards.is_empty());
+        let _=app.finish_selected_pane_close(second_id,batch);
+        assert!(!app.project_recovery_ui.closing_panes);
+        let _=app.close_cards_in_order(vec![first]);
+        let current=app.pane_close_batch_for(first);
+        assert!(current.is_some()); assert_ne!(current,batch);
+        let _=app.finish_selected_pane_close(first,batch);
+        let _=app.finish_selected_pane_close(first,None);
+        assert_eq!(app.pane_close_batch_for(first),current,"old or direct steps cannot drain a newer batch");
+        assert!(app.card_state(first).unwrap().existence.is_open());
     }
 
     #[test]
