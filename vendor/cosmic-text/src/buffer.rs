@@ -371,10 +371,11 @@ impl Clone for Buffer {
 impl Buffer {
     /// Consume already shaped, fully laid-out paragraphs into an immutable
     /// display snapshot, releasing redundant shaping caches. Returns the
-    /// original Buffer unchanged if any physical line is not laid out yet.
+    /// original Buffer unchanged if pending configuration changes exist or any
+    /// physical line is not laid out yet.
     /// This method does not shape missing text or estimate missing geometry.
     pub fn into_layout_snapshot(self) -> Result<crate::LayoutSnapshot, Self> {
-        if self.lines.iter().any(|line| line.shape_opt().is_none() || line.layout_opt().is_none()) {
+        if !self.dirty.is_empty() || self.lines.iter().any(|line| line.shape_opt().is_none() || line.layout_opt().is_none()) {
             return Err(self);
         }
         let metrics = self.metrics;
