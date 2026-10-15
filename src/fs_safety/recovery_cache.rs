@@ -117,6 +117,8 @@ struct PendingDirectory {
     context: FilesystemRecoveryContext,
     setup_attempted: bool,
     setup_complete: bool,
+    enrollment_attempted: bool,
+    enrollment_confirmed: bool,
 }
 impl PendingDirectory {
     fn initialize_private_mode(&mut self) -> io::Result<()> {
@@ -148,18 +150,26 @@ impl PendingDirectory {
         Ok(())
     }
     fn finish_setup(&mut self) -> io::Result<()> {
-        self.context.validate_payload_root(self.publication.directory())?;
+        // No payload exists yet. Resolve producer pending work, then apply
+        // witnessed private access before ancestry walking an umask000 inode.
         self.initialize_private_mode()?;
-        // A failed/unknown handoff retains this SAME lease and exact H. The
-        // issuer already reserved its hard payload capacity before effects.
+        self.enrollment_attempted = true;
         self.context.register_payload_root(self.publication.directory())?;
+        self.enrollment_confirmed = true;
+        self.context.validate_payload_root(self.publication.directory())?;
         sync_directory(self.publication.directory())?;
         sync_directory(self.context.placement().directory())
     }
     fn retry_failed_preparation(&mut self) -> Result<(), String> {
         if !self.publication.is_removed() {
-            self.context.validate_payload_root(self.publication.directory()).map_err(|e| e.to_string())?;
             self.initialize_private_mode().map_err(|e| e.to_string())?;
+            if self.enrollment_attempted && !self.enrollment_confirmed {
+                // Unknown handoff is not canceled by removing H. Complete the
+                // SAME original-root idempotent enrollment before settlement.
+                self.context.register_payload_root(self.publication.directory()).map_err(|e| e.to_string())?;
+                self.enrollment_confirmed = true;
+            }
+            self.context.validate_payload_root(self.publication.directory()).map_err(|e| e.to_string())?;
             self.publication.resolve_recovery().map_err(|e| e.to_string())?;
             self.publication.cleanup_empty().map_err(|e| e.to_string())?;
         }
@@ -220,7 +230,8 @@ pub(crate) fn prepare_recovery_directory(
             return Err(RecoveryDirectoryError::Retained { cause, recovery });
         }
     };
-    let mut pending = PendingDirectory { publication, context, setup_attempted: false, setup_complete: false };
+    let mut pending = PendingDirectory { publication, context, setup_attempted: false, setup_complete: false,
+        enrollment_attempted: false, enrollment_confirmed: false };
     let result = if cancelled() { Err(io::Error::new(io::ErrorKind::Interrupted,
         "Recovery holding creation cancelled after publication; original authority retained")) }
         else { pending.finish_setup() };
@@ -349,4 +360,75 @@ mod tests {
         fs::rename(source.path().join("moved-holding"), parent.path().join("holding")).unwrap();
         recovery.retry().unwrap(); assert!(recovery.is_resolved()); assert!(names(parent).is_empty());
     }
+    struct UnknownEnrollment {
+        attempts: std::sync::atomic::AtomicUsize,
+        payload: std::sync::Mutex<Option<Root>>,
+        _outside: tempfile::TempDir,
+        _runtime: tempfile::TempDir,
+    }
+    impl RecoveryRegistrationLease for UnknownEnrollment {
+        fn validate(&self) -> io::Result<()> { Ok(()) }
+        fn descriptor_budget(&self) -> usize { 1 }
+        fn register_payload(&self, root: &Root) -> io::Result<()> {
+            let mut held = self.payload.lock().unwrap();
+            if let Some(original) = held.as_ref() {
+                if recovery_directory_stamp(original)? != recovery_directory_stamp(root)? {
+                    return Err(io::Error::other("Fixture refused a successor payload"));
+                }
+            } else { *held = Some(root.try_clone()?); }
+            let attempt = self.attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if attempt < 2 { Err(io::Error::other("Injected unknown enrollment after retained handoff")) }
+                else { Ok(()) }
+        }
+    }
+
+    #[test]
+    fn unknown_enrollment_retries_same_holding_before_cleanup_or_resolution() {
+        let source_fixture = tempfile::tempdir().unwrap();
+        let source = Arc::new(Root::open(source_fixture.path()).unwrap());
+        let outside = tempfile::tempdir_in(source.path().parent().unwrap()).unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let protection = Arc::new(Some(crate::worktree_cleanup::fixture_protection(runtime.path(), source.path(), false).unwrap()));
+        let parent = Arc::new(Root::open(outside.path()).unwrap());
+        // Complete isolated topology; the owned lease deliberately records the
+        // real original Root BEFORE returning unknown, as a daemon handoff can.
+        let registry = Arc::new(UnknownEnrollment { attempts: std::sync::atomic::AtomicUsize::new(0),
+            payload: std::sync::Mutex::new(None), _outside: outside, _runtime: runtime });
+        let placement = Arc::new(RecoveryPlacement::acquire(parent.clone(), source.clone(), Arc::from([source.clone()]),
+            RecoveryRegistryCheck::from_lease(registry.clone())).unwrap());
+        let context = FilesystemRecoveryContext::new(&source, protection, placement).unwrap();
+        let error = prepare_recovery_directory(context.reserve_directory().unwrap(), OsStr::new("holding"), || false).unwrap_err();
+        let recovery = error.recovery().unwrap();
+        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(recovery.retry().is_err()); assert!(!recovery.is_resolved());
+        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(parent.path().join("holding").is_dir(), "unknown enrollment must not remove H");
+        recovery.retry().unwrap(); assert!(recovery.is_resolved());
+        assert_eq!(registry.attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(names(&parent).is_empty());
+    }
+
+    #[test]
+    fn restrictive_umask_holding_is_private_and_enrolled_before_payload_admission() {
+        const CHILD: &str = "CAGENTS_FACTORY_RESTRICTIVE_UMASK_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "fs_safety::recovery_cache::tests::restrictive_umask_holding_is_private_and_enrolled_before_payload_admission", "--test-threads=1", "--nocapture"])
+                .env(CHILD, "1").status().unwrap();
+            assert!(status.success()); return;
+        }
+        let (_source, context) = context();
+        let admission = context.reserve_directory().unwrap();
+        // Only this exact isolated child changes its process-global umask.
+        let previous = unsafe { libc::umask(0o777) };
+        let result = prepare_recovery_directory(admission, OsStr::new("holding"), || false);
+        unsafe { libc::umask(previous); }
+        let holding = result.unwrap();
+        assert_eq!(holding.directory().metadata().unwrap().mode() & 0o7777, 0o700);
+        holding.context().validate_payload_root(holding.directory()).unwrap();
+        let (mut publication, retained, _slot) = holding.into_parts();
+        publication.cleanup_empty().unwrap(); sync_directory(retained.placement().directory()).unwrap();
+        assert!(publication.is_removed());
+    }
+
 }
