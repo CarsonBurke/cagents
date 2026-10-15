@@ -165,7 +165,7 @@ mod authority_regression {
         // Startup can authenticate the terminal half first, but it remains
         // provisional until native recovery authenticates/installs its actor.
         let mut current = source.clone();
-        current.continuity = TerminalContinuity::Live { host_session_id: next.host_session_id, boot_id: next.boot_id, host_incarnation: next.host_incarnation };
+        current.continuity = TerminalContinuity::RelaunchAvailable { recipe: current.launch.clone(), last_exit: None };
         let handle = TerminalHandle::spawn(current.clone(), TerminalConfig::default(), |_| {}).unwrap();
         struct Cleanup(TerminalHandle);
         impl Drop for Cleanup { fn drop(&mut self) { let _ = self.0.shutdown(); } }
@@ -182,7 +182,43 @@ mod authority_regression {
         assert!(state.terminals[&source.id].handle.same_worker(&handle));
         assert!(matches!(state.descriptor(1, source.id).unwrap().session.continuity, TerminalContinuity::Failed { .. }));
         assert!(state.attach(1, source.id).is_err());
-        assert_eq!(state.execution_registry.as_ref().unwrap().lock().unwrap().agent_authority_source(&token).unwrap(), Some(HostedSession::Chat(owner)));
+        assert_eq!(state.execution_registry.as_ref().unwrap().lock().unwrap().agent_authority_source(&token).unwrap(), Some(HostedSession::Chat(owner.clone())));
+        drop(state);
+        // Typed native recovery commits the exact Chat successor first, then
+        // installs its actor and paired worker under the host lock.
+        struct Quiet;
+        impl crate::chat::protocol::Adapter for Quiet {
+            fn initialize(&mut self) -> Result<crate::chat::protocol::Step, String> { Ok(Default::default()) }
+            fn command(&mut self, _: crate::chat::Command) -> Result<crate::chat::protocol::Step, String> { Ok(Default::default()) }
+            fn receive(&mut self, _: serde_json::Value) -> Result<crate::chat::protocol::Step, String> { Ok(Default::default()) }
+        }
+        let mut actor_recipe = source.launch.clone(); actor_recipe.program = "/bin/cat".into(); actor_recipe.arguments.clear();
+        let spec = crate::chat::protocol::ProcessSpec::from(&actor_recipe);
+        let mut initial = crate::chat::protocol::Step::default();
+        let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+        let actor = crate::chat::runtime::Handle::start(spec, Box::new(Quiet), initial, store, Some("native-console-owner".into()), |_| {}).unwrap();
+        struct ActorCleanup(crate::chat::runtime::Handle);
+        impl Drop for ActorCleanup { fn drop(&mut self) { let _ = self.0.close(); } }
+        let _actor_cleanup = ActorCleanup(actor.clone());
+        let mut successor = owner.clone(); successor.proof = Some(next.clone());
+        let mut pair = source.clone(); pair.continuity = TerminalContinuity::Live { host_session_id: next.host_session_id,
+            boot_id: next.boot_id, host_incarnation: next.host_incarnation };
+        successor.terminal = Some(pair);
+        {
+            let mut state = host.lock().unwrap();
+            state.execution_registry.as_ref().unwrap().lock().unwrap()
+                .adopt_authenticated_agent_session(&[HostedSession::Chat(owner)], &HostedSession::Chat(successor.clone())).unwrap();
+            state.chats.insert(source.id, super::super::super::chat::Record {
+                execution_instance: uuid::Uuid::new_v4(), console_recipe: Some(source.launch.clone()), paired_terminal: Some(handle.clone()),
+                session: successor, handle: actor, source_process: None, subscribers: Default::default(), observations: Default::default(),
+                completion_observed: false, returning_terminal: false,
+            });
+            assert!(matches!(state.terminals[&source.id].session.continuity, TerminalContinuity::RelaunchAvailable { .. }));
+            assert!(state.confirm_native_terminal_binding(source.id), "the private worker projection must not reject raw unhosted continuity");
+        }
+        let recovered = reconcile(&host, 1, &source).unwrap();
+        assert!(recovered.session.continuity.live_proof().is_some());
+        assert!(host.lock().unwrap().terminals[&source.id].handle.same_worker(&handle));
     }
 
     #[test]

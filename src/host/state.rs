@@ -1255,14 +1255,20 @@ impl HostState {
         let Some(terminal) = self.terminals.get(&id) else { return false; };
         let Some(chat) = self.chats.get(&id) else { return false; };
         let Some(pair) = chat.session.terminal.as_ref() else { return false; };
-        if chat.handle.is_completed()
+        if chat.handle.is_completed() || chat.session.proof.as_ref() != Some(self.proof())
             || !chat.paired_terminal.as_ref().is_some_and(|expected| expected.same_worker(&terminal.handle))
-            || pair.continuity.live_proof().as_ref() != Some(self.proof())
-            || terminal.session.continuity.live_proof().as_ref() != Some(self.proof()) { return false; }
+            || pair.continuity.live_proof().as_ref() != Some(self.proof()) { return false; }
+        // An authenticated current worker can retain its original unhosted
+        // launch continuity. Project its private owner directly: descriptor()
+        // intentionally masks this provisional record as Failed.
+        let proof = self.proof();
+        let mut current = terminal.session.clone();
+        current.continuity = TerminalContinuity::Live { host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(), host_incarnation: proof.host_incarnation.clone() };
         let mut pair = pair.clone();
-        pair.continuity = terminal.session.continuity.clone();
-        pair.resume_hint = terminal.session.resume_hint.clone();
-        pair == terminal.session
+        pair.continuity = current.continuity.clone();
+        pair.resume_hint = current.resume_hint.clone();
+        pair == current
     }
 
     pub(super) fn confirm_native_terminal_binding(&mut self, id: TerminalId) -> bool {
