@@ -46,7 +46,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     let handle = host.lock().unwrap().chats[&id].handle.clone();
     let identity = handle.actor_identity().expect("the test opts into a real retained actor");
     let active_proof = Arc::new(std::sync::Mutex::new(first.clone()));
-    struct Cleanup { owner: crate::daemon::holder_registry::Record, proof: Arc<std::sync::Mutex<HostSessionProof>> }
+    struct Cleanup { owner: crate::daemon::holder_registry::Record, pair: Option<crate::daemon::holder_registry::Record>, proof: Arc<std::sync::Mutex<HostSessionProof>> }
     impl Drop for Cleanup {
         fn drop(&mut self) {
             let proof = self.proof.lock().unwrap().clone();
@@ -54,16 +54,38 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
                 && let Ok(handle) = Handle::adopt_remote(&self.owner, inspection.source, proof, |_| {})
                 && handle.close().is_ok() && handle.finish_retained_close().is_ok() { return; }
             // Only this fixture's exact process incarnations; no name/group sweep.
-            for process in [&self.owner.root, &self.owner.holder] { if process.is_current() { unsafe { libc::kill(process.pid, libc::SIGKILL); } } }
+            for owner in std::iter::once(&self.owner).chain(self.pair.iter()) {
+                for process in [&owner.root,&owner.holder] { if process.is_current() { unsafe {libc::kill(process.pid,libc::SIGKILL);} } }
+            }
         }
     }
-    let _cleanup = Cleanup { owner: identity.record.clone(), proof: active_proof.clone() };
+    let mut cleanup = Cleanup { owner: identity.record.clone(), pair:None, proof: active_proof.clone() };
+    // A real holder-owned thin console shares this native actor's exact ID.
+    // The raw terminal record will retain RelaunchAvailable on later adoption;
+    // recovery must project the authenticated current worker, not trust that raw
+    // saved continuity or replace its PTY process.
+    host.lock().unwrap().enable_holder_recovery();
+    let console_recipe=crate::model::LaunchRecipe {program:"/bin/cat".into(),arguments:Vec::new(),working_directory:root.join("project"),environment:Default::default(),unset_environment:Default::default()};
+    host.lock().unwrap().chats.get_mut(&id).unwrap().console_recipe=Some(console_recipe.clone());
+    let terminal=crate::terminal_ipc::TerminalDescriptor::relaunchable(id,console_recipe.clone(),None).session;
+    let (descriptor,console)=super::super::state::spawn_terminal_view_owned(&host,0,terminal,crate::terminal_ipc::TerminalSpawnOptions::default(),None,true).unwrap();
+    let pair=console.holder_identity().expect("fixture requires actual terminal holder").clone();
+    cleanup.pair=Some(pair.clone());
+    let mut paired_source=handle.actor_identity().and_then(|owner|Handle::inspect_remote(&owner.record,first.clone()).ok()).unwrap().source;
+    paired_source.terminal=Some(descriptor.session.clone());
+    handle.update_native_source(paired_source.clone(),Some(console_recipe.clone()),Some(pair.clone())).unwrap();
+    {
+        let mut state=host.lock().unwrap();let record=state.chats.get_mut(&id).unwrap();
+        record.session=paired_source;record.paired_terminal=Some(console.clone());
+    }
     let registry = super::super::agent_execution::registry(&host).unwrap();
     let hosted_source = host.lock().unwrap().chats[&id].session.clone();
     registry.lock().unwrap().bind_agent(accepted.agent.id, None, crate::agent_execution::HostedSession::Chat(hosted_source)).unwrap();
     handle.command_for_run(accepted.run.id, chat::Command::Prompt { text: "One exact slow turn".into(), attachments: Vec::new(), mode: chat::PromptMode::Send }).unwrap();
     wait_until(|| fs::read_to_string(root.join("produced")).unwrap_or_default().lines().count() >= 3, "provider never began its slow turn");
     assert_eq!(registry.lock().unwrap().agent_run(accepted.run.id).unwrap().state, State::Running);
+    console.preserve_for_restart().unwrap();
+    drop(console);
     drop(handle);
     drop(notifications);
     drop(host);
@@ -76,11 +98,21 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     lease = Some(crate::daemon::HostLease::acquire(&paths, &next).unwrap());
     *active_proof.lock().unwrap() = next.clone();
     let mut state = HostState::new(next);
+    state.enable_holder_recovery();
     state.install_model(super::super::model::Registry::at(&path).unwrap());
     let successor = Arc::new(HostLock::new(state));
     let _notifications = super::super::notifications::Broker::start(&successor, crate::notifications::Application::Cagents).unwrap();
     successor.lock().unwrap().notifications = Some(_notifications.handle());
+    super::super::state::restore_orphaned_holders(&successor).unwrap();
+    assert!(matches!(successor.lock().unwrap().terminals[&id].session.continuity,crate::model::TerminalContinuity::RelaunchAvailable {..}),"raw restored console intentionally remains unpublished until native binding");
     restore_orphaned_native(&successor, &[]).unwrap();
+    {
+        let state=successor.lock().unwrap();let record=&state.chats[&id];
+        assert_eq!(state.terminals[&id].handle.holder_identity(),Some(&pair));
+        assert!(pair.root.is_current(),"the exact original console process must survive");
+        assert_eq!(record.session.terminal.as_ref(),Some(&state.native_terminal_projection(id).unwrap()));
+        assert!(record.paired_terminal.as_ref().unwrap().same_worker(&state.terminals[&id].handle));
+    }
     let handle = successor.lock().unwrap().chats[&id].handle.clone();
     assert_eq!(handle.actor_identity(), Some(identity.clone()), "adoption must retain both helper and original provider incarnations");
     let retained = retained_actor::retained_runs(&successor);
@@ -96,7 +128,7 @@ fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
     for index in 0..40 { assert_eq!(transcript.matches(&format!("FRAME_{index:03}|")).count(), 1); }
     assert_eq!(fs::read_to_string(root.join("prompts")).unwrap().lines().count(), 1, "adoption must never resend the accepted prompt");
     super::super::agent_execution::close(&successor, &Authority::default(), accepted.agent.id).unwrap();
-    wait_until(|| !identity.record.holder.is_current() && !identity.record.root.is_current(), "explicit close left a native owner");
+    wait_until(|| !identity.record.holder.is_current() && !identity.record.root.is_current() && !pair.holder.is_current() && !pair.root.is_current(), "explicit close left a native or paired owner");
     drop(lease);
 }
 
