@@ -21,6 +21,43 @@ fn owned(scope: &Scope, model: &WorkspaceModel, relocation: &Relocation) -> bool
     }
 }
 
+/// Capture before any destructive handoff or account switch. The returned
+/// context owns an independent FD pin, never the source actor's cleanup owner.
+pub(super) fn verified_chat_directory(host: &SharedHost, source: &crate::chat::Session, expected: &Handle) -> Result<(std::path::PathBuf, std::sync::Arc<crate::chat::protocol::ExecutionContext>), String> {
+    use crate::chat::protocol::ExecutionContext;
+    use std::sync::Arc;
+    let current = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state.chats.get(&source.id).ok_or("The original native provider is no longer hosted")?;
+        if !record.handle.same_actor(expected) { return Err("The native provider changed before its directory could be captured".into()); }
+        record.session.clone()
+    };
+    let registry = super::agent_execution::registry(host)?;
+    let binding = {
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if !registry.authenticated_session_alias(&HostedSession::Chat(source.clone()), &HostedSession::Chat(current.clone()))? {
+            return Err("The pane does not name this original provider incarnation; refresh its ownership before retrying".into());
+        }
+        registry.session_location(&HostedSession::Chat(current.clone()))?
+    };
+    if let Some(reason) = binding.as_ref().and_then(|binding| binding.refusal.as_ref()) { return Err(reason.clone()); }
+    let directory = binding.as_ref().map(|binding| binding.directory.clone()).unwrap_or_else(|| current.launch.recipe.working_directory.clone());
+    let context = if expected.is_completed() {
+        if binding.as_ref().and_then(|binding| binding.approved).is_none() { return Err("The completed source has no verified operational directory binding; create a new session explicitly".into()); }
+        expected.pinned_execution_directory(&directory)?
+    } else {
+        let proof = expected.capture_execution_directory(&directory)?;
+        Arc::new(ExecutionContext::new(Some(proof.directory)))
+    };
+    if let Some(approved) = binding.as_ref().and_then(|binding| binding.approved)
+        && context.directory_identity()? != Some(approved) { return Err("The original provider directory no longer matches its approved identity".into()); }
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if !state.chats.get(&source.id).is_some_and(|record| record.handle.same_actor(expected) && HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(current))) {
+        return Err("The native provider changed while its directory was being captured; retry without stopping it".into());
+    }
+    Ok((directory, context))
+}
+
 pub(super) fn relocate(host: &SharedHost, origin: ClientId, relocation: Relocation) -> Result<WorkspaceModel, ProtocolError> {
     let edit = ModelEdit::RelocateProject { relocation }.canonicalized().map_err(error)?;
     let ModelEdit::RelocateProject { relocation } = &edit else { unreachable!() };
@@ -46,21 +83,30 @@ pub(super) fn relocate(host: &SharedHost, origin: ClientId, relocation: Relocati
                 sources.insert(source.id(), source.clone());
             }
         }
-        // Exact host records supersede cached presentation descriptors. No
-        // source recipe, holder checkpoint or observed shell cwd is rewritten.
+        // A numeric ID locates a possible owner; exact source or authenticated
+        // retained lineage must still prove the association outside this lock.
         sources.into_iter().map(|(id, source)| {
-            if let Some(record) = state.chats.get(&id) {
-                (HostedSession::Chat(record.session.clone()), Owner::Chat(record.handle.clone()))
-            } else if let Some(record) = state.terminals.get(&id) {
-                (HostedSession::Terminal(record.session.clone()), Owner::Terminal(record.handle.clone()))
-            } else { (source, Owner::Unavailable) }
-        }).collect::<Vec<_>>()
+            let owner = if let HostedSession::Chat(_) = &source
+                && let Some(record) = state.chats.get(&id) {
+                (source, HostedSession::Chat(record.session.clone()), Owner::Chat(record.handle.clone()))
+            } else if let HostedSession::Terminal(_) = &source
+                && let Some(record) = state.terminals.get(&id) {
+                // Raw records retain launch continuity. Only HostState projects
+                // the authenticated current daemon proof for a live worker.
+                state.descriptor(0, id).map(|descriptor| (source, HostedSession::Terminal(descriptor.session), Owner::Terminal(record.handle.clone())))?
+            } else { (source.clone(), source, Owner::Unavailable) };
+            Ok(owner)
+        }).collect::<Result<Vec<_>,ProtocolError>>()?
     };
     let agent_inputs = registry.lock().unwrap_or_else(|p| p.into_inner()).agent_relocation_inputs(relocation).map_err(error)?;
     let agent_moves = agent_inputs.into_iter().map(|input| input.verify()).collect::<Vec<_>>();
     let mut prepared = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(5);
-    for (source, owner) in sources {
+    for (cached, source, owner) in sources {
+        if !matches!(owner, Owner::Unavailable)
+            && !registry.lock().unwrap_or_else(|p| p.into_inner()).authenticated_session_alias(&cached, &source).map_err(error)? {
+            return Err(error("A saved pane names a different provider incarnation or issued launch. Refresh this pane from its original owner before locating its project; no session was moved"));
+        }
         let previous = registry.lock().unwrap_or_else(|p| p.into_inner()).session_location(&source).map_err(error)?;
         let directory = previous.as_ref().map(|location| location.blocked_directory.as_deref().unwrap_or(&location.directory)).unwrap_or_else(|| issued_directory(&source));
         let candidate = relocation.mapped(directory);
@@ -88,7 +134,7 @@ pub(super) fn relocate(host: &SharedHost, origin: ClientId, relocation: Relocati
             let id = item.movement.source.id();
             let unchanged = match (&item.owner, &item.movement.source) {
                 (Owner::Chat(handle), HostedSession::Chat(source)) => state.chats.get(&id).is_some_and(|record| record.handle.same_actor(handle) && HostedSession::Chat(record.session.clone()).same_process(&HostedSession::Chat(source.clone()))),
-                (Owner::Terminal(handle), HostedSession::Terminal(source)) => state.terminals.get(&id).is_some_and(|record| record.handle.same_worker(handle) && HostedSession::Terminal(record.session.clone()).same_process(&HostedSession::Terminal(source.clone()))),
+                (Owner::Terminal(handle), HostedSession::Terminal(source)) => state.terminals.get(&id).is_some_and(|record| record.handle.same_worker(handle)) && state.descriptor(0,id).is_ok_and(|descriptor| HostedSession::Terminal(descriptor.session).same_process(&HostedSession::Terminal(source.clone()))),
                 (Owner::Unavailable, _) => !state.chats.contains_key(&id) && !state.terminals.contains_key(&id),
                 _ => false,
             };
