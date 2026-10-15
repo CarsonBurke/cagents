@@ -1228,6 +1228,21 @@ fn create_console_with_restart(
         environment: Default::default(),
         unset_environment: Default::default(),
     };
+    create_console_from_recipe(host, registry, agent, session, handle, restart, recipe)
+}
+
+// The production caller validates the matched CLI and resolves its directory
+// above. Keeping pairing publication in one function also lets owning tests
+// exercise its actual source/holder/Registry order with a private PTY command.
+fn create_console_from_recipe(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: AgentId,
+    session: &chat::Session,
+    handle: &chat::runtime::Handle,
+    restart: Option<(&Agent, &chat::Session)>,
+    recipe: crate::model::LaunchRecipe,
+) -> Result<Option<chat::RestartReceipt>, ConsoleError> {
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state

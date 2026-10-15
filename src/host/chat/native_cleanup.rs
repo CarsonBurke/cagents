@@ -105,7 +105,19 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
             else {
                 unreachable!()
             };
-            if record.session != *source
+            // A fresh managed console publishes its pair to the authenticated
+            // helper and hosted record while Agent.session keeps the exact
+            // earlier no-pair source. require_current above authenticated that
+            // complete source against this same owner lineage and backend;
+            // this exception grants only the exact inspected consent/instance.
+            // Ordinary close still requires its original descriptor policy.
+            let consented_alias = consent.is_some_and(|(_, target)| {
+                target.observation.source
+                    == crate::agent_execution::HostedSession::Chat(source.clone())
+                    && target.actor_instance == Some(record.execution_instance)
+            });
+            if !consented_alias
+                && record.session != *source
                 && observed != *source
                 && !state
                     .upgrade_chats
@@ -307,6 +319,8 @@ fn close_retained_inner(host: &SharedHost, source: &Session, restart: bool,
             }
         }
         if !pending.closed {
+            #[cfg(test)]
+            if let Some(hook) = PRESENTATION_CLOSE_BEFORE_PROVIDER.lock().unwrap().take() { hook(); }
             pending.owner.close_retaining_receipt()?;
             pending.closed = true;
             host.lock()
@@ -576,4 +590,13 @@ static PRESENTATION_CLOSE_AFTER_COMMIT: std::sync::Mutex<Option<Box<dyn FnOnce()
 #[cfg(test)]
 pub(in crate::host) fn after_presentation_close_commit(hook: impl FnOnce() + Send + 'static) {
     *PRESENTATION_CLOSE_AFTER_COMMIT.lock().unwrap() = Some(Box::new(hook));
+}
+
+#[cfg(test)]
+static PRESENTATION_CLOSE_BEFORE_PROVIDER: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>> = std::sync::Mutex::new(None);
+
+/// One-shot failure scheduling only; never supplies ownership/cleanup proof.
+#[cfg(test)]
+pub(in crate::host) fn before_presentation_provider_close(hook: impl FnOnce() + Send + 'static) {
+    *PRESENTATION_CLOSE_BEFORE_PROVIDER.lock().unwrap() = Some(Box::new(hook));
 }
