@@ -234,7 +234,8 @@ impl DeletionHead {
                 && pr.belongs_to_head(&self.head_repository)
                 && snapshot.branch.as_deref() == Some(self.branch.as_str())
                 && snapshot.head_oid.as_deref() == Some(self.head_oid.as_str())
-                && snapshot.head_repository.as_ref() == Some(&self.head_repository)
+                && snapshot.head_repository.as_ref().is_some_and(|source|
+                    source.same_repository(&self.head_repository))
         })
     }
 }
@@ -725,7 +726,8 @@ impl Cagents {
         self.sidebar_model.project(target.project)
             .and_then(|project| project.worktrees.iter().find(|row| Some(row.id) == target.worktree && row.path == target.path))
             .is_some_and(|row| row.branch.as_deref() == Some(expected.branch.as_str())
-                && row.head_repository.as_ref() == Some(&expected.head_repository))
+                && row.head_repository.as_ref().is_some_and(|source|
+                    source.same_repository(&expected.head_repository)))
     }
 
     fn open_worktree_delete_dialog(&mut self, target: Target) -> Task<Message> {
@@ -2039,7 +2041,8 @@ impl Cagents {
                         if !expected_source_matches || dialog.expected_head.as_ref().is_some_and(|expected|
                             snapshot.branch.as_deref() != Some(expected.branch.as_str())
                                 || snapshot.head_oid.as_deref() != Some(expected.head_oid.as_str())
-                                || snapshot.head_repository.as_ref() != Some(&expected.head_repository))
+                                || snapshot.head_repository.as_ref().is_none_or(|source|
+                                    !source.same_repository(&expected.head_repository)))
                         {
                             dialog.safety = None;
                             dialog.busy_confirmed = None;
@@ -2717,7 +2720,8 @@ impl Cagents {
         else {
             return false;
         };
-        if snapshot.head_repository.as_ref() != Some(source) {
+        if snapshot.head_repository.as_ref().is_none_or(|current|
+            !current.same_repository(source)) {
             return false;
         }
         let Some(branch) = snapshot.branch.as_deref() else {
@@ -2728,7 +2732,8 @@ impl Cagents {
                 && pr.head_ref == branch
                 && pr.head_oid.as_ref() == snapshot.head_oid.as_ref()
                 && snapshot.head_oid.is_some()
-                && pr.head_repository.as_ref() == Some(source)
+                && pr.head_repository.as_ref().is_some_and(|head|
+                    head.same_repository(source))
         })
     }
 
@@ -4208,6 +4213,10 @@ mod tests {
         snapshot.head_repository = Some(source);
         app.sidebar_model.projects[0].pull_requests.push(pr);
         assert!(app.delete_branch_default(&target, &snapshot));
+        snapshot.head_repository = Some(GitHubRepoKey::new("github.com", None, "EXAMPLE", "Repo").unwrap());
+        app.sidebar_model.projects[0].pull_requests[0].head_repository = Some(GitHubRepoKey::new("github.com", None, "Example", "REPO").unwrap());
+        assert!(app.delete_branch_default(&target, &snapshot),
+            "GitHub API and remote URL spelling do not change repository identity");
         // The safety snapshot already contains a local name, including a
         // literal name that itself begins with refs/heads/.
         snapshot.branch = Some("refs/heads/feature".into());
@@ -4234,7 +4243,7 @@ mod tests {
 
     #[test]
     fn post_merge_receipt_defaults_branch_without_waiting_for_sidebar_cache() {
-        for changed in 0..8 {
+        for changed in 0..9 {
             let repository = PathBuf::from("/repo");
             let primary = SidebarWorktree::from_durable(WorktreeId::new(), repository.clone(), Some("main".into()));
             let source = GitHubRepoKey::new("github.com", None, "example", "repo").unwrap();
@@ -4255,8 +4264,11 @@ mod tests {
                 4 => pr.head_repository_owner.as_mut().unwrap().login = "fork".into(),
                 _ => {},
             }
+            let expected_source = if changed == 8 {
+                GitHubRepoKey::new("github.com", None, "ExAmPlE", "Repo").unwrap()
+            } else { source.clone() };
             drop(app.open_worktree_delete_dialog_for_head(project, linked.id, DeletionHead {
-                head_repository: source.clone(), branch: "feature".into(), head_oid: "a".repeat(40),
+                head_repository: expected_source, branch: "feature".into(), head_oid: "a".repeat(40),
                 merged_pull_request: (changed != 5).then(|| Arc::new(pr)),
             }));
             let request = app.project_ui.dialog.as_ref().unwrap().request;
@@ -4266,9 +4278,10 @@ mod tests {
             let mut snapshot = clean_snapshot();
             snapshot.head_oid = Some("a".repeat(40)); snapshot.head_repository = Some(source);
             if changed == 7 { snapshot.head_repository = None; }
+            if changed == 8 { snapshot.head_repository = Some(GitHubRepoKey::new("github.com", None, "EXAMPLE", "REPO").unwrap()); }
             drop(app.handle_project_action(Action::SafetyRead {request, confirming: false,
                 result: Ok((snapshot, AgentCensus::default()))}));
-            assert_eq!(app.project_ui.dialog.as_ref().unwrap().delete_branch, changed == 0,
+            assert_eq!(app.project_ui.dialog.as_ref().unwrap().delete_branch, changed == 0 || changed == 8,
                 "only the actual merged receipt, current source/head and available branch allow the default");
         }
     }
