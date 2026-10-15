@@ -939,6 +939,8 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
         let identity = || {
             let stat = fs::read_to_string(format!("/proc/{holder}/stat")).expect("fixture holder vanished");
             let fields = stat.rsplit_once(')').unwrap().1.split_whitespace().collect::<Vec<_>>();
+            assert!(!matches!(fields.first(), Some(&"Z") | Some(&"X") | Some(&"x")),
+                "the original holder must remain live; reparented children cannot prove reaping");
             fields[19].parse::<u64>().unwrap()
         };
         assert_eq!(identity(), holder_start, "the fixture holder incarnation changed");
@@ -981,8 +983,12 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
     fs::write(fixture.root.path().join("project/stop-orphan-loop"), b"settle").unwrap();
     until(Duration::from_secs(30), "the fixture orphan loop to settle", || {
         let snapshot = window.read(chat.id);
-        (!snapshot.busy && snapshot.requests.is_empty()).then_some(())
+        assert!(!snapshot.exited, "the provider exited instead of completing its fixture loop");
+        (snapshot.ready && !snapshot.busy && snapshot.requests.is_empty()).then_some(())
     });
+    let final_provider = window.read(chat.id);
+    assert!(final_provider.ready && !final_provider.exited,
+        "the original provider must remain alive for the final holder census");
     let settle_deadline = Instant::now() + Duration::from_secs(2);
     let final_zombies = loop {
         let zombies = census();
@@ -991,7 +997,8 @@ fn ten_minutes_of_background_tools_leave_no_holder_zombies() {
     };
     let tools = fs::read_to_string(fixture.root.path().join("project/orphan-pids")).unwrap().lines().count();
     let report = json!({"provider":fixture.version, "seconds":started.elapsed().as_secs_f64(),
-        "holder":holder, "holder_start":holder_start, "samples":samples, "background_children":tools,
+        "holder":holder, "holder_start":holder_start, "provider_exited":final_provider.exited,
+        "provider_ready":final_provider.ready, "samples":samples, "background_children":tools,
         "raw_zombie_observations":observed, "persistent_zombies_250ms":persistent, "final_zombies":final_zombies});
     eprintln!("{report}");
     if let Some(path) = std::env::var_os("CAGENTS_QUALIFICATION_EVIDENCE") {
