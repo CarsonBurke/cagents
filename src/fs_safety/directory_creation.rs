@@ -45,6 +45,15 @@ impl DirectoryCreation {
     }
 }
 
+/// Result of explicitly resolving an acquired cleanup entry. Restored does not
+/// mean the original directory was removed; callers must preserve that distinction.
+#[derive(Debug,Clone,Copy,PartialEq,Eq)]
+pub enum DirectoryRecovery {
+    OriginalRemoved,
+    OriginalRestored,
+    ReplacementRestored,
+}
+
 /// Prepublication identity, retained even if later private staging cleanup fails.
 ///
 /// Publication is not an fsync/durability claim. Callers must sync the relevant
@@ -83,6 +92,42 @@ impl DirectoryPublication {
     }
     pub fn is_removed(&self) -> bool { self.removed }
 
+    fn cleanup_private_staging(&mut self)->Result<(),ResolveError> {
+        let Some((held,name))=&self.private_staging else {return Ok(());};
+        namespace_protected(&self.namespace.directory).map_err(|e|ResolveError::io(&self.namespace.directory.path,&e))?;
+        let named=resolve_directory(&self.namespace.directory,Path::new(name))?;
+        let expected=held.metadata().map_err(|e|ResolveError::io(&held.path,&e))?;
+        let actual=named.metadata().map_err(|e|ResolveError::io(&named.path,&e))?;
+        if (expected.dev(),expected.ino())!=(actual.dev(),actual.ino()) {
+            return Err(ResolveError::message(&named.path,"private staging name no longer identifies the retained directory; no replacement was removed"));
+        }
+        // Protected INTERNAL namespace bootstrap contract applies here; public
+        // cleanup below uses acquire-before-check instead of this name check.
+        remove_directory_within(&self.namespace.directory,name)?;
+        self.private_staging=None;
+        self.publication_error=None;
+        Ok(())
+    }
+
+    /// Worker-only retry using the retained receipt, never a diagnostic path.
+    /// Removes only the exact empty original; all other acquired entries are
+    /// restored with no-clobber. A collision/error retains recovery ownership.
+    /// OriginalRestored can still require user resolution of nonempty contents.
+    pub fn resolve_recovery(&mut self)->Result<Option<DirectoryRecovery>,ResolveError> {
+        self.cleanup_private_staging()?;
+        let Some(name)=self.quarantined.clone() else {return Ok(None);};
+        namespace_protected(&self.namespace.directory).map_err(|e|ResolveError::io(&self.namespace.directory.path,&e))?;
+        let acquired=metadata_beneath(&self.namespace.directory,Path::new(&name))?;
+        let original=(acquired.dev(),acquired.ino())==self.identity() && acquired.is_dir();
+        if original && remove_directory_within(&self.namespace.directory,&name).is_ok() {
+            self.quarantined=None;self.removed=true;
+            return Ok(Some(DirectoryRecovery::OriginalRemoved));
+        }
+        rename_new_between(&self.namespace.directory,&name,&self.parent,&self.name)?;
+        self.quarantined=None;
+        Ok(Some(if original {DirectoryRecovery::OriginalRestored}else{DirectoryRecovery::ReplacementRestored}))
+    }
+
     /// Acquire the public entry into the protected namespace before checking
     /// identity. A mismatched replacement is never chmod'ed or removed. If a
     /// no-clobber restoration is impossible, preserve it at recovery_path and
@@ -91,6 +136,7 @@ impl DirectoryPublication {
         self.cleanup_empty_with_hooks(|| {},|| {})
     }
     fn cleanup_empty_with_hooks(&mut self, before_acquire: impl FnOnce(),after_acquire:impl FnOnce()) -> Result<(), ResolveError> {
+        self.cleanup_private_staging()?;
         if self.removed { return Ok(()); }
         if self.quarantined.is_some() {
             return Err(ResolveError::message(&self.parent.path.join(&self.name),
@@ -131,28 +177,30 @@ impl DirectoryPublication {
 /// is a separate caller action on the Published receipt's retained Root.
 pub fn create_directory_beneath(root: &Root, relative: &Path, mode: u32) -> Result<DirectoryCreation,ResolveError> {
     if let Some(existing)=existing_directory(root,relative)? {return Ok(DirectoryCreation::Existing(existing));}
-    match DirectoryNamespace::acquire(root) {
-        Ok(namespace) => create_directory_in_namespace(&namespace,root,relative,mode),
-        Err(reason) => {
-            let (parent,name)=open_parent_beneath(root,relative)?;
-            let leaf=c_component(&name,&parent.path)?;
-            // SAFETY: held parent and C leaf remain live; no creation ownership
-            // is inferred from this syscall followed by name resolution.
-            let status=unsafe {libc::mkdirat(parent.descriptor(),leaf.as_ptr(),mode)};
-            if status<0 {
-                let error=io::Error::last_os_error();
-                if error.kind()!=io::ErrorKind::AlreadyExists {return Err(ResolveError::io(&parent.path.join(&name),&error));}
-                return resolve_directory(&parent,Path::new(&name)).map(DirectoryCreation::Existing);
-            }
-            let directory=resolve_directory(&parent,Path::new(&name))?;
-            Ok(DirectoryCreation::Unverified {directory,reason:reason.to_string()})
-        }
+    let (parent,name)=open_parent_beneath(root,relative)?;
+    match DirectoryNamespace::acquire(&parent) {
+        Ok(namespace) => create_directory_in_namespace(&namespace,&parent,Path::new(&name),mode),
+        Err(reason) => create_unverified(&parent,&name,mode,reason.to_string()),
     }
+}
+fn create_unverified(parent:&Root,name:&OsStr,mode:u32,reason:String)->Result<DirectoryCreation,ResolveError> {
+    let leaf=c_component(name,&parent.path)?;
+    // No creation authority is inferred from mkdir followed by name resolution.
+    let status=unsafe {libc::mkdirat(parent.descriptor(),leaf.as_ptr(),mode)};
+    if status<0 {
+        let error=io::Error::last_os_error();
+        if error.kind()!=io::ErrorKind::AlreadyExists {return Err(ResolveError::io(&parent.path.join(name),&error));}
+        return resolve_directory(parent,Path::new(name)).map(DirectoryCreation::Existing);
+    }
+    let directory=resolve_directory(parent,Path::new(name))?;
+    Ok(DirectoryCreation::Unverified {directory,reason})
 }
 
 /// Publish a directory captured in an explicitly retained protected namespace.
-/// This also supports shared nested parents when a protected worktree namespace
-/// is available on the same filesystem. EXDEV refuses; there is no path fallback.
+/// The namespace must be the exact retained actual parent: unrelated staging
+/// cannot reproduce every native directory inheritance policy. Different
+/// parents create with ordinary mkdir semantics and return Unverified, never
+/// a falsely owned receipt. Callers may acquire the actual protected parent.
 pub fn create_directory_in_namespace(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mode:u32)->Result<DirectoryCreation,ResolveError> {
     create_with_hooks(namespace,root,relative,mode,|_,_|{},|_,_|{})
 }
@@ -161,6 +209,12 @@ fn create_with_hooks(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mod
     // Borrowing an existing target never requires staging write permission.
     if let Some(existing)=existing_directory(root,relative)? {return Ok(DirectoryCreation::Existing(existing));}
     let (parent,name)=open_parent_beneath(root,relative)?;
+    let parent_metadata=parent.metadata().map_err(|e|ResolveError::io(&parent.path,&e))?;
+    let namespace_metadata=namespace.directory.metadata().map_err(|e|ResolveError::io(&namespace.directory.path,&e))?;
+    if (parent_metadata.dev(),parent_metadata.ino())!=(namespace_metadata.dev(),namespace_metadata.ino()) {
+        return create_unverified(&parent,&name,mode,
+            "owned directory publication requires the exact protected destination parent; different-parent inheritance remains unverified".into());
+    }
     namespace_protected(&namespace.directory).map_err(|e|ResolveError::io(&namespace.directory.path,&e))?;
     let retained_namespace=DirectoryNamespace {directory:namespace.directory.try_clone()
         .map_err(|e|ResolveError::io(&namespace.directory.path,&e))?};
@@ -175,16 +229,21 @@ fn create_with_hooks(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mod
         let outer=resolve_directory(&namespace.directory,Path::new(&stage))?;
         // Repair only this captured internal boundary, never public payload
         // permissions. O_PATH/O_EVTONLY acquisition is separately qualified.
-        set_directory_permissions(&outer,0o700).map_err(|e|ResolveError::io(&outer.path,&e))?;
+        let inherited=outer.metadata().map_err(|e|ResolveError::io(&outer.path,&e))?;
+        set_directory_permissions(&outer,0o700|(inherited.mode()&0o2000)).map_err(|e|ResolveError::io(&outer.path,&e))?;
         namespace_protected(&outer).map_err(|e|ResolveError::io(&outer.path,&e))?;
+        let repaired=outer.metadata().map_err(|e|ResolveError::io(&outer.path,&e))?;
+        if repaired.gid()!=parent_metadata.gid() || repaired.mode()&0o2000!=parent_metadata.mode()&0o2000 {
+            return Ok((outer,None));
+        }
         if unsafe {libc::mkdirat(outer.descriptor(),c"directory".as_ptr(),mode)}!=0 {
             return Err(ResolveError::io(&outer.path.join("directory"),&io::Error::last_os_error()));
         }
         let payload=resolve_directory(&outer,Path::new("directory"))?;
         let identity=payload.metadata().map_err(|e|ResolveError::io(&payload.path,&e))?;
-        Ok((outer,payload,identity))
+        Ok((outer,Some((payload,identity))))
     })();
-    let (outer,mut directory,identity)=match prepare {
+    let (outer,payload)=match prepare {
         Ok(result)=>result,
         Err(error)=>{
             // Only private internal entries are addressed here. The payload
@@ -196,6 +255,11 @@ fn create_with_hooks(namespace:&DirectoryNamespace,root:&Root,relative:&Path,mod
             return Err(match cleanup {Ok(())=>error,Err(cleanup)=>ResolveError::message(
                 &namespace.directory.path.join(&stage),&format!("{error}; private staging cleanup failed: {cleanup}"))});
         }
+    };
+    let Some((mut directory,identity))=payload else {
+        remove_directory_within(&namespace.directory,&stage)?;
+        return create_unverified(&parent,&name,mode,
+            "internal owner-access repair could not preserve destination gid/SGID; creation ownership is unverified".into());
     };
     after_capture(&parent,&name);
     if let Err(error)=rename_exclusive(&outer,OsStr::new("directory"),&parent,&name) {
@@ -289,7 +353,7 @@ fn native_acl_absent(root:&Root)->io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs,os::unix::fs::PermissionsExt};
+    use std::{fs,os::unix::fs::{PermissionsExt,DirBuilderExt}};
     fn published(result:DirectoryCreation)->DirectoryPublication {
         match result {DirectoryCreation::Published(p)=>p, other=>panic!("expected published receipt, got {other:?}")}
     }
@@ -306,7 +370,7 @@ mod tests {
             }).unwrap());
         assert!(receipt.publication_error().is_none());
         assert_eq!(receipt.directory().metadata().unwrap().ino(),fs::metadata(dir.path().join("retained")).unwrap().ino());
-        assert_eq!(fs::metadata(dir.path().join("retained")).unwrap().mode()&0o777,0o750);
+        assert_eq!(fs::metadata(dir.path().join("retained")).unwrap().mode()&0o777,receipt.initial_metadata().mode()&0o777);
         assert_eq!(fs::metadata(dir.path().join("target")).unwrap().mode()&0o777,0o711);
     }
     #[test]
@@ -366,17 +430,71 @@ mod tests {
         assert!(dir.path().join("original").is_dir());
     }
     #[test]
-    fn explicit_protected_namespace_supports_shared_nested_parent() {
+    fn different_parent_preserves_native_creation_as_unverified() {
         let dir=tempfile::tempdir().unwrap();
         fs::create_dir(dir.path().join("shared")).unwrap();
-        fs::set_permissions(dir.path().join("shared"),fs::Permissions::from_mode(0o777)).unwrap();
+        fs::set_permissions(dir.path().join("shared"),fs::Permissions::from_mode(0o2777)).unwrap();
         let root=Root::open(dir.path()).unwrap();
         let namespace=DirectoryNamespace::acquire(&root).unwrap();
         let shared=open_directory_beneath(&root,Path::new("shared")).unwrap();
-        let receipt=published(create_directory_in_namespace(&namespace,&shared,Path::new("target"),0o750).unwrap());
-        assert!(receipt.publication_error().is_none());
-        assert_eq!(receipt.directory().metadata().unwrap().mode()&0o777,0o750);
-        assert!(dir.path().join("shared/target").is_dir());
+        let result=create_directory_in_namespace(&namespace,&shared,Path::new("target"),0o750).unwrap();
+        assert!(matches!(result,DirectoryCreation::Unverified{..}));
+        fs::DirBuilder::new().mode(0o750).create(dir.path().join("shared/native-reference")).unwrap();
+        let actual=fs::metadata(dir.path().join("shared/target")).unwrap();
+        let reference=fs::metadata(dir.path().join("shared/native-reference")).unwrap();
+        assert_eq!(actual.gid(),reference.gid());
+        assert_eq!(actual.mode()&0o7777,reference.mode()&0o7777);
+    }
+    #[test]
+    fn same_parent_published_payload_preserves_native_gid_and_setgid() {
+        let dir=tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(),fs::Permissions::from_mode(0o2755)).unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        if root.metadata().unwrap().mode()&0o2000==0 {
+            eprintln!("SGID fixture unavailable: kernel cleared requested flag (group membership/platform policy)");return;
+        }
+        fs::create_dir(dir.path().join("native-reference")).unwrap();
+        let receipt=published(create_directory_beneath(&root,Path::new("target"),0o777).unwrap());
+        let reference=fs::metadata(dir.path().join("native-reference")).unwrap();
+        let actual=receipt.directory().metadata().unwrap();
+        assert_eq!(actual.gid(),reference.gid());
+        assert_eq!(actual.mode()&0o7777,reference.mode()&0o7777);
+    }
+    #[cfg(target_os="linux")]
+    #[test]
+    fn same_parent_published_payload_preserves_native_default_acl() {
+        let dir=tempfile::tempdir().unwrap();
+        let cpath=CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        // Linux POSIX ACL xattr v2, independently seeded through the path API:
+        // user_obj=rwx, group_obj=r-x, other=---. Not a production writer seam.
+        let mut acl=2u32.to_le_bytes().to_vec();
+        for (tag,permissions) in [(1u16,7u16),(4,5),(32,0)] {
+            acl.extend(tag.to_le_bytes());acl.extend(permissions.to_le_bytes());
+            acl.extend(u32::MAX.to_le_bytes());
+        }
+        if unsafe {libc::setxattr(cpath.as_ptr(),c"system.posix_acl_default".as_ptr(),acl.as_ptr().cast(),acl.len(),0)}!=0 {
+            let error=io::Error::last_os_error();
+            if error.raw_os_error()==Some(libc::EOPNOTSUPP) {
+                eprintln!("default ACL fixture unavailable on this filesystem: {error}");return;
+            }
+            panic!("seed independent native default ACL: {error}");
+        }
+        fn observed(path:&Path)->Vec<u8> {
+            let path=CString::new(path.as_os_str().as_bytes()).unwrap();
+            let mut bytes=vec![0;65536];
+            let size=unsafe {libc::getxattr(path.as_ptr(),c"system.posix_acl_default".as_ptr(),bytes.as_mut_ptr().cast(),bytes.len())};
+            assert!(size>0,"fixture must retain an actual default ACL: {}",io::Error::last_os_error());
+            bytes.truncate(size as usize);bytes
+        }
+        assert_eq!(observed(dir.path()),acl);
+        fs::create_dir(dir.path().join("native-reference")).unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let receipt=published(create_directory_beneath(&root,Path::new("target"),0o777).unwrap());
+        let reference=fs::metadata(dir.path().join("native-reference")).unwrap();
+        let actual=receipt.directory().metadata().unwrap();
+        assert_eq!(actual.gid(),reference.gid());
+        assert_eq!(actual.mode()&0o7777,reference.mode()&0o7777);
+        assert_eq!(observed(&dir.path().join("target")),observed(&dir.path().join("native-reference")));
     }
     #[cfg(target_os="macos")]
     #[test]
@@ -446,6 +564,30 @@ mod tests {
         assert_eq!(fs::read(dir.path().join("target/newer")).unwrap(),b"newer");
         assert!(dir.path().join("original").is_dir());
         assert!(receipt.cleanup_empty().is_err(),"unresolved acquired entry cannot be replayed");
+        assert!(receipt.resolve_recovery().is_err(),"collision remains authoritative");
+        fs::remove_file(dir.path().join("target/newer")).unwrap();
+        fs::remove_dir(dir.path().join("target")).unwrap();
+        assert_eq!(receipt.resolve_recovery().unwrap(),Some(DirectoryRecovery::ReplacementRestored));
+        assert!(receipt.recovery_path().is_none());
+        assert_eq!(fs::read(dir.path().join("target/foreign")).unwrap(),b"foreign");
+        assert!(!receipt.is_removed(),"restoring a replacement never claims original cleanup");
+    }
+    #[test]
+    fn retained_nonempty_original_can_restore_then_retry_after_contents_resolved() {
+        let dir=tempfile::tempdir().unwrap();
+        let root=Root::open(dir.path()).unwrap();
+        let mut receipt=published(create_directory_beneath(&root,Path::new("target"),0o700).unwrap());
+        fs::write(dir.path().join("target/keep"),b"owned").unwrap();
+        assert!(receipt.cleanup_empty_with_hooks(||{},||{
+            fs::create_dir(dir.path().join("target")).unwrap();
+        }).is_err());
+        fs::remove_dir(dir.path().join("target")).unwrap();
+        assert_eq!(receipt.resolve_recovery().unwrap(),Some(DirectoryRecovery::OriginalRestored));
+        assert_eq!(fs::read(dir.path().join("target/keep")).unwrap(),b"owned");
+        assert!(!receipt.is_removed());
+        fs::remove_file(dir.path().join("target/keep")).unwrap();
+        receipt.cleanup_empty().unwrap();
+        assert!(receipt.is_removed());
     }
     #[test]
     fn postpublication_cleanup_error_retains_cached_identity_and_stage() {
@@ -457,12 +599,16 @@ mod tests {
             fs::set_permissions(dir.path(),fs::Permissions::from_mode(0o555)).unwrap();
         });
         fs::set_permissions(dir.path(),fs::Permissions::from_mode(0o700)).unwrap();
-        let receipt=published(result.unwrap());
+        let mut receipt=published(result.unwrap());
         assert!(receipt.publication_error().is_some());
         assert!(receipt.pending_staging_path().unwrap().is_dir());
         let actual=fs::metadata(dir.path().join("target")).unwrap();
         assert_eq!(receipt.identity(),(actual.dev(),actual.ino()));
         assert_eq!(receipt.initial_metadata().ino(),actual.ino());
+        receipt.cleanup_empty().unwrap();
+        assert!(receipt.is_removed());
+        assert!(receipt.pending_staging_path().is_none());
+        assert!(receipt.publication_error().is_none());
     }
     #[test]
     fn restrictive_umask_creation_uses_retained_descriptor() {
