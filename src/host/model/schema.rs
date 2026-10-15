@@ -97,7 +97,7 @@ pub(super) fn migrate(db: &Connection) -> Result<(), String> {
     migrate_after_read(db, || Ok(()))
 }
 
-fn migrate_after_read(db: &Connection, after_read: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+pub(super) fn migrate_after_read(db: &Connection, after_read: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     migrate_with_hooks(db, after_read, |_| Ok(()))
 }
 
@@ -208,6 +208,37 @@ mod tests {
             assert!(Registry::at(&path).is_err());
             assert_eq!((image(&path), image(&wal)), before, "version {checkpoint}");
         }
+    }
+
+    #[test]
+    fn stale_writer_rejection_preserves_retained_wal_through_the_actual_constructor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("registry.sqlite3");
+        legacy(&path, 12);
+        let wal = std::path::PathBuf::from(format!("{}-wal", path.display()));
+        let seed = Connection::open(&path).unwrap();
+        seed.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
+        seed.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+        seed.execute("UPDATE projects SET name='retained before admission'", []).unwrap();
+        drop(seed);
+        let mut expected = None;
+        let result = Registry::at_with_migration(&path, |db| {
+            migrate_after_read(db, || {
+                let writer = Connection::open(&path).unwrap();
+                writer.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true).unwrap();
+                let tx = writer.unchecked_transaction().unwrap();
+                tx.pragma_update(None, "user_version", 18).unwrap();
+                tx.execute("UPDATE projects SET name='newer writer owns this image'", []).unwrap();
+                tx.commit().unwrap();
+                drop(writer);
+                expected = Some((image(&path), image(&wal)));
+                Ok(())
+            })
+        });
+        assert!(result.is_err());
+        let expected = expected.expect("the second writer must run after outer admission");
+        assert!(!expected.1.is_empty());
+        assert_eq!((image(&path), image(&wal)), expected);
     }
 
     #[test]

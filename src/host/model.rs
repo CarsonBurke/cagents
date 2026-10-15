@@ -78,6 +78,10 @@ impl Registry {
 
     /// Opens or creates the registry at `path`.
     pub(crate) fn at(path: &Path) -> Result<Self, String> {
+        Self::at_with_migration(path, migrate)
+    }
+
+    fn at_with_migration(path: &Path, migration: impl FnOnce(&Connection) -> Result<(), String>) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             create_private_directory(parent)
                 .map_err(|error| format!("cannot create {}: {error}", parent.display()))?;
@@ -100,7 +104,7 @@ impl Registry {
             .map_err(|error| error.to_string())?;
         schema::check_readonly(&db)?;
         configure_connection(&db)?;
-        migrate(&db)?;
+        migration(&db)?;
         configure(&db)?;
         db.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)
             .map_err(|error| error.to_string())?;
