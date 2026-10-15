@@ -173,7 +173,7 @@ impl Entry {
             && loaded.record.source==self.part.source && &loaded.record.file==file)
     }
     fn demand(&mut self,expanded:bool,find:bool) {
-        let old=(self.requested.len(),self.patch_requests.len(),self.patches.len());
+        let old=(self.requested.len(),self.patch_requests.len(),self.patches.len(),self.suspended.len(),self.wanted_pages.len());
         if self.copy_all && self.copy_intent.as_ref().is_none_or(|intent|!intent.current()) {
             self.copy_all=false;self.copy_intent=None;self.revision=attempt();
         }
@@ -203,7 +203,7 @@ impl Entry {
         let ready:Vec<_>=wanted.into_iter().filter(|index|self.file(*index).is_some()
             && self.current(*index).is_none() && !self.patch_errors.contains_key(index)).collect();
         for index in ready {self.patch_requests.entry(index).or_insert_with(attempt);}
-        if old!=(self.requested.len(),self.patch_requests.len(),self.patches.len()) {self.revision=attempt();}
+        if old!=(self.requested.len(),self.patch_requests.len(),self.patches.len(),self.suspended.len(),self.wanted_pages.len()) {self.revision=attempt();}
     }
 }
 impl State {
@@ -263,8 +263,7 @@ impl State {
         for index in &entry.suspended {
             // demand() prunes deliberate close/Find-only removals. A demanded
             // same-source retry error still preserves cheap selection intent.
-            let waiting=entry.suspended.contains(index);
-            if waiting && let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}
+            if let Ok(index)=u32::try_from(*index) {paths.push(vec![6,index]);}
         }
         paths.sort_by_key(|path|(path[1],if path[0]==6 {2}else {path[2]}));paths
     }
@@ -954,7 +953,8 @@ mod tests {
         // It was shown by Find, and manually closed while Find kept it exposed.
         state.entries.get_mut(&page.source).unwrap().opened.clear();state.evict(true);
         state.project(source,None,&expanded,true);assert!(state.entries[&page.source].suspended.contains(&0));
-        state.reconcile_demand(&expanded,false);
+        let revision=state.revision();state.reconcile_demand(&expanded,false);
+        assert!(state.revision()>revision,"removing pending intent must invalidate the cached Catalog even with no loaded body");
         assert!(!state.entries[&page.source].suspended.contains(&0));
         assert!(!state.suspended_paths(&page.source.source_id).contains(&vec![6,0]));
     }
