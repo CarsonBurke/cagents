@@ -501,16 +501,21 @@ impl Server {
             if !self.installed && disconnected(&startup)? {self.actor.close()?;reap_orphans()?;break;}
             match self.listener.accept() {
                 Ok((control,_))=>{
+                    let mut finished=false;
                     let response=(|| {
                         let request:Invocation=receive(&control,TIMEOUT)?;
                         authorize(&control,&request.proof)?;
                         let close=matches!(request.method.as_str(),"close"|"close_if_idle");
                         let result=self.invoke(request);
-                        let finished=close && result.is_ok();
-                        send(&control,&result,TIMEOUT)?;
-                        Ok::<_,String>(finished)
+                        finished=close&&result.is_ok();
+                        result
                     })();
-                    if matches!(response,Ok(true)) {break;}
+                    // Send authentication failures through the same named
+                    // result boundary. Closing succeeds independently of ACK
+                    // delivery because exact cleanup proof is already durable.
+                    let _=send(&control,&response,TIMEOUT);
+                    if finished {break;}
+
                 },
                 Err(error) if error.kind()==std::io::ErrorKind::WouldBlock=>thread::sleep(Duration::from_millis(20)),
                 Err(error) if error.kind()==std::io::ErrorKind::Interrupted=>{},
@@ -534,8 +539,8 @@ fn verify_peer(control:&UnixStream,record:&Record)->Result<(),String> {
 fn authorize(control:&UnixStream,proof:&HostSessionProof)->Result<(),String> {
     let credentials=peer(control)?;
     let paths=crate::daemon::RuntimePaths::discover().map_err(|error|error.to_string())?;
-    let owner=crate::daemon::lease_owner(&paths.lock,proof).map_err(|error|error.to_string())?;
-    if credentials.uid!=crate::daemon::current_uid() || u32::try_from(credentials.pid).ok()!=Some(owner) {return Err("Retained actor caller does not own the current daemon lease".into());}Ok(())
+    let owner=authority_result(crate::daemon::lease_owner(&paths.lock,proof))?;
+    if credentials.uid!=crate::daemon::current_uid() || u32::try_from(credentials.pid).ok()!=Some(owner) {return Err("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED: Retained actor caller does not own the current daemon lease".into());}Ok(())
 }
 fn peer(control:&UnixStream)->Result<libc::ucred,String> {
     let mut credentials:libc::ucred=unsafe {std::mem::zeroed()};let mut length=std::mem::size_of::<libc::ucred>() as libc::socklen_t;
@@ -589,8 +594,11 @@ extern "C" fn serve_if_requested() {
     std::process::exit(73);
 }
 
+fn authority_result<T,E:std::fmt::Display>(result:Result<T,E>)->Result<T,String> {
+    result.map_err(|error|format!("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED: {error}"))
+}
 fn terminal_endpoint_error(error:&str,holder_current:bool)->bool {
-    !holder_current || error.contains("attachment was superseded") || error.contains("does not own the current daemon lease")
+    !holder_current || error.contains("attachment was superseded") || error.starts_with("CAGENTS_ACTOR_AUTHORITY_UNCONFIRMED:")
 }
 
 #[cfg(test)]
@@ -632,7 +640,10 @@ mod tests {
     fn connection_loss_requires_death_or_positive_authority_loss_evidence() {
         assert!(terminal_endpoint_error("connection reset",false));
         assert!(terminal_endpoint_error("Retained actor attachment was superseded; stale input and ACKs are refused",true));
-        assert!(terminal_endpoint_error("Retained actor caller does not own the current daemon lease",true));
+        for detail in ["daemon lease does not match its discovery proof","daemon ownership is not held"] {
+            let error=authority_result::<(),_>(Err(std::io::Error::other(detail))).unwrap_err();
+            assert!(error.contains(detail));assert!(terminal_endpoint_error(&error,true));
+        }
         assert!(!terminal_endpoint_error("Resource temporarily unavailable (os error 11)",true));
         assert!(!terminal_endpoint_error("timed out",true));
     }
