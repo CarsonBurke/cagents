@@ -3610,8 +3610,12 @@ fn start_terminal_view_owned(
         holder_recovery,
         ..TerminalConfig::default()
     };
+    let wake_instance=Arc::new(std::sync::OnceLock::<uuid::Uuid>::new());
+    let callback_instance=Arc::clone(&wake_instance);
     let handle = match TerminalHandle::spawn(session.clone(), config, move |wake| {
-        broadcast_redraw(&weak, terminal_id, wake.generation);
+        if let Some(instance)=callback_instance.get() {
+            broadcast_redraw_from(&weak, terminal_id, wake.generation,Some(*instance));
+        }
     }) {
         Ok(handle) => handle,
         Err(error) => {
@@ -3626,9 +3630,10 @@ fn start_terminal_view_owned(
             ));
         }
     };
+    let instance=handle.execution_instance();
+    let _=wake_instance.set(instance);
     let output_host = Arc::downgrade(shared);
-    handle
-        .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
+    handle.set_output_observer(move |sequence|broadcast_output_from(&output_host,terminal_id,sequence,Some(instance)));
 
     let redraw_handle = handle.clone();
     let descriptor = {
@@ -3703,7 +3708,7 @@ fn start_terminal_view_owned(
         if completed {
             // Completion certifies the final grid, including a reveal queued
             // just as the terminal stopped accepting parser commands.
-            broadcast_redraw(&event_host, terminal_id, handle.generation());
+            broadcast_redraw_from(&event_host, terminal_id, handle.generation(),Some(handle.execution_instance()));
         }
     });
     Ok((descriptor, redraw_handle))
@@ -3785,9 +3790,14 @@ fn validate_spawn_options(options: &TerminalSpawnOptions) -> Result<(), Protocol
     Ok(())
 }
 
+#[cfg(test)]
 fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u64) {
+    broadcast_output_from(host,terminal_id,sequence,None);
+}
+fn broadcast_output_from(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u64,expected:Option<uuid::Uuid>) {
     let Some(host) = host.upgrade() else { return };
     let mut state = host.lock().unwrap_or_else(|error| error.into_inner());
+    if expected.is_some_and(|instance|state.terminals.get(&terminal_id).is_none_or(|record|record.handle.execution_instance()!=instance)) {return;}
     let HostState {
         proof,
         subscriptions,
@@ -3852,13 +3862,18 @@ fn broadcast_output(host: &Weak<HostLock>, terminal_id: TerminalId, sequence: u6
 /// every delta chained to the previous delivery; an unapplicable delta is
 /// detected by `base_generation` and answered with a full repaint, so a client
 /// that misses a push still recovers.
+#[cfg(test)]
 fn broadcast_redraw(host: &Weak<HostLock>, terminal_id: TerminalId, generation: u64) {
+    broadcast_redraw_from(host,terminal_id,generation,None);
+}
+fn broadcast_redraw_from(host: &Weak<HostLock>, terminal_id: TerminalId, generation: u64,expected:Option<uuid::Uuid>) {
     let Some(host) = host.upgrade() else {
         return;
     };
     let mut pending = Vec::new();
     {
         let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if expected.is_some_and(|instance|state.terminals.get(&terminal_id).is_none_or(|record|record.handle.execution_instance()!=instance)) {return;}
         let visible = state
             .subscriptions
             .by_terminal
@@ -4519,6 +4534,9 @@ mod tests {
         assert!(state.surface_handle(2,id).unwrap().same_worker(&successor));
         assert!(!successor.is_completed(),"refusing stale input must preserve the new owner");
         let shared=Arc::new(crate::host::state::HostLock::new(state));
+        record_event_from(&Arc::downgrade(&shared),id,TerminalEvent::TitleChanged("STALE_OLD_WORKER".into()),Some(&original));
+        broadcast_redraw_from(&Arc::downgrade(&shared),id,999,Some(original.execution_instance()));
+        broadcast_output_from(&Arc::downgrade(&shared),id,999,Some(original.execution_instance()));
         record_event_from(&Arc::downgrade(&shared),id,TerminalEvent::TitleChanged("successor-only".into()),Some(&successor));
         old_delivery.close_after_drain();fresh_delivery.close_after_drain();
         assert!(old_delivery.pop().is_none(),"new worker semantic payload must never inherit old subscription authority");
